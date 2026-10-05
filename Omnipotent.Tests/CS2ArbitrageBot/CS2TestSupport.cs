@@ -63,7 +63,28 @@ internal static class CS2Fixtures
         $"{{\"data\":{{\"success\":true,\"data\":{{\"amtMaxBuyOrder\":{maxBuy},\"amtMinSellOrder\":{minSell},\"eCurrency\":{currency},\"cBuyOrders\":{buyOrders},\"cSellOrders\":{sellOrders}," +
         $"\"rgCompactBuyOrders\":[{compactBuys ?? $"{maxBuy},10,{maxBuy - 1},40"}],\"rgCompactSellOrders\":[{compactSells ?? $"{minSell},5,{minSell + 1},20"}]}}}}}}";
 
-    public const string Account = "{\"user\":{\"steam_id\":\"76561190000000002\",\"username\":\"bot\",\"flags\":48,\"avatar\":\"\",\"email\":\"x@example.com\",\"phone_number\":\"\",\"balance\":9846,\"pending_balance\":120," +
+    /// <summary>CSFloat's daily sales graph in the live shape: only days with sales appear, newest first.</summary>
+    public static string SalesGraph(DateTime todayUtc, Func<int, int> salesDaysAgo, double averagePriceCents, int days = 60) =>
+        "[" + string.Join(",", Enumerable.Range(0, days).Select(d => (Day: d, Count: salesDaysAgo(d))).Where(x => x.Count > 0)
+            .Select(x => $"{{\"count\":{x.Count},\"day\":\"{todayUtc.Date.AddDays(-x.Day):yyyy-MM-ddT00:00:00Z}\",\"avg_price\":{averagePriceCents.ToString(System.Globalization.CultureInfo.InvariantCulture)}}}")) + "]";
+
+    /// <summary>CSFloat's per-sale history in the live shape (newest first); each sale's reference is its value at sale time.</summary>
+    public static string RecentSales(DateTime nowUtc, IEnumerable<(int Price, int Value, double HoursListed, double SoldHoursAgo)> sales, Func<int, int>? stickersOfSale = null) =>
+        "[" + string.Join(",", sales.OrderBy(s => s.SoldHoursAgo).Select((s, i) =>
+        {
+            DateTime sold = nowUtc.AddHours(-s.SoldHoursAgo), listed = sold.AddHours(-s.HoursListed);
+            string stickers = string.Join(",", Enumerable.Repeat("{\"slot\":0}", stickersOfSale?.Invoke(i) ?? 0));
+            return $"{{\"id\":\"s{i}\",\"created_at\":\"{listed:yyyy-MM-ddTHH:mm:ss.ffffffZ}\",\"type\":\"buy_now\",\"price\":{s.Price},\"state\":\"sold\"," +
+                   $"\"reference\":{{\"base_price\":{s.Value},\"float_factor\":1,\"predicted_price\":{s.Value},\"quantity\":500,\"last_updated\":\"{sold:yyyy-MM-ddTHH:mm:ssZ}\"}}," +
+                   $"\"item\":{{\"asset_id\":\"1{i}\",\"market_hash_name\":\"x\",\"float_value\":0.2,\"stickers\":[{stickers}]}},\"sold_at\":\"{sold:yyyy-MM-ddTHH:mm:ss.ffffffZ}\"}}";
+        })) + "]";
+
+    /// <summary>Steam's QueryPriceHistory response: one point per day at noon, price(daysAgo) in GBP.</summary>
+    public static string SteamHistory(DateTime nowUtc, Func<int, double> priceDaysAgo, int days = 120, int purchasesPerDay = 40) =>
+        "{\"data\":{\"ecurrency\":2,\"prices\":[" + string.Join(",", Enumerable.Range(0, days).Reverse().Select(d =>
+            $"{{\"time\":{new DateTimeOffset(nowUtc.Date.AddDays(-d).AddHours(12), TimeSpan.Zero).ToUnixTimeSeconds()},\"price_median\":{priceDaysAgo(d).ToString("R", System.Globalization.CultureInfo.InvariantCulture)},\"purchases\":{purchasesPerDay}}}")) + "]}}";
+
+    public const string Account ="{\"user\":{\"steam_id\":\"76561190000000002\",\"username\":\"bot\",\"flags\":48,\"avatar\":\"\",\"email\":\"x@example.com\",\"phone_number\":\"\",\"balance\":9846,\"pending_balance\":120," +
         "\"stall_public\":true,\"away\":false,\"trade_token\":\"t\",\"payment_accounts\":{\"stripe_connect\":\"\",\"stripe_customer\":\"\"}," +
         "\"statistics\":{\"total_sales\":51465,\"total_purchases\":50452,\"median_trade_time\":68,\"total_avoided_trades\":1,\"total_failed_trades\":0,\"total_verified_trades\":2273,\"total_trades\":2273}," +
         "\"preferences\":{\"offers_enabled\":true,\"max_offer_discount\":10},\"know_your_customer\":\"verified\",\"extension_setup_at\":\"2024-01-01T00:00:00Z\"," +

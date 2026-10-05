@@ -82,6 +82,25 @@ public class TradeProgressTests
     }
 
     [Fact]
+    public void AResaleClosesTheListingsEvidenceWindowAtTheMomentItSold()
+    {
+        // Listed 4 days ago at a price expected to sell in 2 days; a buyer bought it a day ago.
+        var p = Purchase(StrategicStages.WaitingForCSFloatResale);
+        p.CSFloatResalePriceCents = 900;
+        p.RelistBaseDaysToSell = 2;
+        p.RelistExposureUpdatedUtc = Now.AddDays(-4);
+        var pending = JObject.Parse("{\"state\":\"pending\",\"created_at\":\"2026-10-03T10:00:00Z\",\"contract\":{\"price\":900,\"state\":\"sold\"}}");
+        Assert.Equal(TradeTransition.ResaleSold, TradeProgress.ApplyResaleTrade(p, pending, Now, 0.75));
+        Assert.Equal(Now.AddDays(-1), p.ResaleSoldAtUtc);
+        Assert.Equal(1.5, p.RelistTotalExposure, 9); // 3 days ÷ 2 expected
+        Assert.Equal(1.5, p.RelistModelExposure, 9);
+
+        // The account's real fee is used for the realised profit.
+        Assert.Equal(TradeTransition.ResaleCompleted, TradeProgress.ApplyResaleTrade(p, JObject.Parse("{\"state\":\"verified\",\"contract\":{\"price\":900}}"), Now, 0.75, sellerFee: 0.05));
+        Assert.Equal((855 * 0.75 / 100.0) - 5, p.ActualAbsoluteProfitInPounds, 2);
+    }
+
+    [Fact]
     public void StaleLegacyPositionsAndRepeatedFailuresAreNotAutoSold()
     {
         var fresh = Purchase(StrategicStages.JustRetrieved);

@@ -120,6 +120,7 @@ namespace Omnipotent.Services.OmniDefence
                 var reads = new OmniDefenceReadSnapshotCache(Path.Combine(
                     OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory), "read-snapshots"),
                     ex => _ = ServiceLogError(ex, "OmniDefence read snapshot refresh failed."));
+                reads.RemoveLegacyAuditSnapshots();
                 readSnapshots = reads;
                 var readCts = new CancellationTokenSource();
                 ServiceQuitRequest += () => readCts.Cancel();

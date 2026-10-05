@@ -74,9 +74,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         public int SteamBuyOrderCount { get; set; }
         public DateTime? SteamBookFetchedUtc { get; set; }
 
-        /// <summary>Projected price factor over the hold that was applied (1 = flat or rising / unknown).</summary>
-        public double TrendFactor { get; set; } = 1.0;
-
         /// <summary>Set when the Steam lookup was skipped: an upper bound from bulk prices already ruled it out.</summary>
         public double? SteamPrefilterUpperRoi { get; set; }
 
@@ -90,19 +87,33 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         public bool ShouldBuy { get; set; }
         /// <summary>Why it should (or should not) be bought — shown in alerts and the status route.</summary>
         public string Reason { get; set; } = "";
+
+        // ── Full exit model (run on listings the screen above passes, right before buying) ──
+        /// <summary>True once <see cref="ExitPlanner"/> has valued this listing with live market evidence.</summary>
+        public bool ExitModelChecked { get; set; }
+        /// <summary>The screen's best ROI before the exit model replaced it (BestRoi then holds the model's).</summary>
+        public double ScreenBestRoi { get; set; }
+        public double ExpectedDaysToSell { get; set; }
+        public double SellProbability { get; set; }
+        public int PlannedPrice { get; set; }
+        public double CSFloatSalesPerDay { get; set; }
+        public string? ExitModelSummary { get; set; }
+        public List<string>? MissingSignals { get; set; }
+        [Newtonsoft.Json.JsonIgnore]
+        public ExitPlan? ExitPlan { get; set; }
     }
 
     public static class OpportunityEvaluator
     {
         /// <summary>
-        /// Values a CSFloat listing against both exits. Pure: every input is passed in, so the decision
-        /// that spends money is fully unit-testable.
+        /// The screen: values a CSFloat listing against both exits from what is already in hand (the listing and
+        /// a cached Steam book), cheaply enough to run on every new listing. Listings it passes are confirmed by
+        /// the full exit model (<see cref="ExitPlanner"/>) with live market evidence before any money is spent.
+        /// Pure: every input is passed in, so it is fully unit-testable.
         /// </summary>
-        /// <param name="trendFactor">Projected price change over the hold (≤ 1; see <see cref="PriceTrend"/>), applied to both exits.</param>
         public static OpportunityEvaluation Evaluate(CSFloatListing listing, SteamOrderBook? book, double conversionCoefficient,
-            double gbpPerUsd, EvaluationSettings settings, DateTime nowUtc, string source = "", double trendFactor = 1.0)
+            double gbpPerUsd, EvaluationSettings settings, DateTime nowUtc, string source = "")
         {
-            trendFactor = Math.Clamp(trendFactor, 0.0, 1.0);
             int cost = ArbitrageMath.UsdCentsToPenceCeil(listing.PriceCents, gbpPerUsd);
             var evaluation = new OpportunityEvaluation
             {
@@ -126,9 +137,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 return evaluation;
             }
 
-            evaluation.TrendFactor = trendFactor;
-            evaluation.Steam = EvaluateSteamExit(book, cost, conversionCoefficient, settings, trendFactor);
-            evaluation.Relist = EvaluateRelistExit(listing, book, cost, gbpPerUsd, settings, trendFactor);
+            evaluation.Steam = EvaluateSteamExit(book, cost, conversionCoefficient, settings);
+            evaluation.Relist = EvaluateRelistExit(listing, book, cost, gbpPerUsd, settings);
 
             var passing = new[] { evaluation.Steam, evaluation.Relist }.Where(e => e.MeetsThreshold).ToList();
             var bestForStats = new[] { evaluation.Steam, evaluation.Relist }
@@ -140,6 +150,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 evaluation.BestRoi = chosen.Roi;
                 evaluation.BestProfitPence = chosen.ProfitPence;
             }
+            evaluation.ScreenBestRoi = evaluation.BestRoi;
 
             string? gate = ListingGate(listing, settings);
             if (passing.Count == 0)
@@ -161,6 +172,45 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             return evaluation;
         }
 
+        /// <summary>
+        /// Replaces the screen's estimate with the exit model's verdict: the listing is bought only if the model's
+        /// best exit clears that route's bar on its risk-adjusted present value (after time, fees, conversion,
+        /// the chance it never sells, and price risk), and the seller gates still pass.
+        /// </summary>
+        public static void ApplyExitPlan(OpportunityEvaluation evaluation, CSFloatListing listing, ExitPlan plan, EvaluationSettings settings, IReadOnlyList<string>? missingSignals = null)
+        {
+            evaluation.ExitModelChecked = true;
+            evaluation.ExitPlan = plan;
+            evaluation.ExitModelSummary = plan.Rationale;
+            evaluation.MissingSignals = missingSignals is { Count: > 0 } ? missingSignals.ToList() : null;
+            evaluation.CSFloatSalesPerDay = plan.SalesPerDay;
+            var best = plan.Best;
+            if (best == null)
+            {
+                evaluation.ShouldBuy = false;
+                evaluation.BestRoute = ExitRoute.None;
+                evaluation.BestRoi = -1;
+                evaluation.BestProfitPence = 0;
+                evaluation.Reason = "exit model: " + plan.Rationale;
+                return;
+            }
+            evaluation.BestRoute = best.Route;
+            evaluation.BestRoi = plan.Roi;
+            evaluation.BestProfitPence = plan.ProfitPence;
+            evaluation.ExpectedDaysToSell = best.ExpectedDaysToSell;
+            evaluation.SellProbability = best.SellProbability;
+            evaluation.PlannedPrice = best.Price;
+
+            double bar = best.Route == ExitRoute.SteamMarket ? settings.MinimumSteamRoiPercent : settings.MinimumRelistRoiPercent;
+            bool clears = plan.Roi * 100 >= bar && plan.ProfitPence >= settings.MinimumProfitPence;
+            string? gate = ListingGate(listing, settings);
+            evaluation.ShouldBuy = clears && gate == null;
+            evaluation.Reason = !clears
+                ? $"exit model: best exit worth {plan.Roi:P1} (£{plan.ProfitPence / 100.0:F2}) after time, risk and fees, below the bar (≥{bar:F0}% and ≥£{settings.MinimumProfitPence / 100.0:F2}) — {plan.Rationale}"
+                : gate != null ? "profitable but rejected: " + gate
+                : $"exit model: {plan.Rationale} (ROI {plan.Roi:P1}, profit £{plan.ProfitPence / 100.0:F2} after time, risk and fees)";
+        }
+
         /// <summary>Reasons a listing must not be bought regardless of price. Null when it is acceptable.</summary>
         public static string? ListingGate(CSFloatListing listing, EvaluationSettings settings)
         {
@@ -178,7 +228,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             return null;
         }
 
-        public static ExitEstimate EvaluateSteamExit(SteamOrderBook? book, int costPence, double conversionCoefficient, EvaluationSettings settings, double trendFactor = 1.0)
+        public static ExitEstimate EvaluateSteamExit(SteamOrderBook? book, int costPence, double conversionCoefficient, EvaluationSettings settings)
         {
             const ExitRoute route = ExitRoute.SteamMarket;
             if (book == null) return ExitEstimate.Unavailable(route, "no Steam order book");
@@ -191,7 +241,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 return ExitEstimate.Unavailable(route, "crossed Steam book (stale data)");
 
             // The epsilon keeps binary rounding (e.g. 1400 × 0.95 = 1329.9999…) from shaving a penny.
-            int salePrice = (int)Math.Floor(depthPrice * (1 - settings.SteamPriceHaircutPercent / 100.0) * trendFactor + 1e-6);
+            int salePrice = (int)Math.Floor(depthPrice * (1 - settings.SteamPriceHaircutPercent / 100.0) + 1e-6);
             int sellerReceives = ArbitrageMath.SteamSellerReceives(salePrice);
             int netCash = (int)Math.Floor(sellerReceives * conversionCoefficient + 1e-9);
             var estimate = new ExitEstimate
@@ -207,7 +257,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             return estimate;
         }
 
-        public static ExitEstimate EvaluateRelistExit(CSFloatListing listing, SteamOrderBook? book, int costPence, double gbpPerUsd, EvaluationSettings settings, double trendFactor = 1.0)
+        public static ExitEstimate EvaluateRelistExit(CSFloatListing listing, SteamOrderBook? book, int costPence, double gbpPerUsd, EvaluationSettings settings)
         {
             const ExitRoute route = ExitRoute.CSFloatRelist;
             if (!settings.AllowRelistExit) return ExitEstimate.Unavailable(route, "relist exit disabled");
@@ -232,7 +282,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             }
 
             double keep = 1 - (settings.RelistUndercutPercent + settings.RelistPriceHaircutPercent) / 100.0;
-            int salePriceCents = (int)Math.Floor(value * keep * trendFactor + 1e-6);
+            int salePriceCents = (int)Math.Floor(value * keep + 1e-6);
             int netCents = ArbitrageMath.CSFloatNetProceedsCents(salePriceCents, settings.CSFloatSellerFee);
             int netPence = ArbitrageMath.UsdCentsToPenceFloor(netCents, gbpPerUsd);
             var estimate = new ExitEstimate

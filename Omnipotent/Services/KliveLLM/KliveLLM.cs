@@ -299,7 +299,7 @@ namespace Omnipotent.Services.KliveLLM
 
         private async void KliveLLM_OnOmniSettingsChanged(object? sender, OmniSettingsChangedEventArgs e)
         {
-            bool valueChanged = string.Equals(e.PreviousValue, e.Setting.Value, StringComparison.Ordinal) == false;
+            bool valueChanged = e.ValueChanged;
 
             if (e.Setting.Name == "ThinkingType" && valueChanged)
             {

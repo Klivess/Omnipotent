@@ -122,6 +122,7 @@ namespace Omnipotent.Services.KliveAPI.Caching
             if (rec == null || scope == null) return false;
             if (!rec.Completed || rec.IsStreaming) return false;
             if (rec.StatusCode != 200) return false;
+            if (HttpResponseHelpers.HasNoStore(rec.ExtraHeaders?["Cache-Control"])) return false;
             if (scope.WroteDuringFill) return false;
             if (scope.UncacheableReason != null) return false;
             if (scope.ReadCount == 0) return false;                 // touched nothing tracked
@@ -149,6 +150,7 @@ namespace Omnipotent.Services.KliveAPI.Caching
         {
             if (scope == null || body == null) return false;
             if (statusCode != 200) return false;
+            if (HttpResponseHelpers.HasNoStore(headers?["Cache-Control"])) return false;
             if (scope.WroteDuringFill || scope.UncacheableReason != null || scope.ReadCount == 0) return false;
             if (body.LongLength > PerEntryCapBytes) return false;
 

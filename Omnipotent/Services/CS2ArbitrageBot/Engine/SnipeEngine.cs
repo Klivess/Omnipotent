@@ -36,6 +36,19 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         public string? Categories { get; set; }
         public int SteamRequestSpacingMs { get; set; } = 1000;
         public bool AlertOnUnboughtOpportunities { get; set; } = true;
+        /// <summary>Economics of the exit model (capital cost, risk aversion, settlement times).</summary>
+        public ExitModelSettings Exit { get; set; } = new();
+        /// <summary>Let listing reviews re-price or withdraw CSFloat relists on their own (otherwise they only advise).</summary>
+        public bool AutoManageRelists { get; set; } = true;
+        /// <summary>How long confirming a Steam Market listing in the mobile app typically takes (it is a person).</summary>
+        public double SteamConfirmHours { get; set; } = 12;
+        /// <summary>Steam's wallet cap (≈ $2,000-equivalent): a Market listing that would exceed it is refused.</summary>
+        public double SteamWalletCapUsd { get; set; } = 2000;
+        /// <summary>Steam's maximum Market listing price (≈ $1,800-equivalent).</summary>
+        public double SteamMaxListingUsd { get; set; } = 1800;
+        /// <summary>How often a few random items are sampled to keep the market drift and forecast calibration current.</summary>
+        public TimeSpan MarketPanelInterval { get; set; } = TimeSpan.FromMinutes(90);
+        public int MarketPanelItems { get; set; } = 4;
     }
 
     /// <summary>What the engine needs from its owning service. Implemented by CS2ArbitrageBot (and fakes in tests).</summary>
@@ -55,6 +68,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         int OpenPositionsFor(string marketHashName);
         int SpentTodayPence { get; }
         double TargetConversionVolumePence { get; }
+        ExitSignalsProvider ExitSignals { get; }
+        MarketDriftModel MarketModel { get; }
+        ExitCalibrationSnapshot ExitCalibration { get; }
+        /// <summary>Trade locks and holds (measured), the conversion route's hold risk, and account limits.</summary>
+        ExitEnvironment ExitEnvironment { get; }
+        /// <summary>The account's Steam id (its own listings are not competition); null when unknown.</summary>
+        string? OwnSteamId { get; }
         Task OnPurchasedAsync(CSFloatListing listing, OpportunityEvaluation evaluation, SteamOrderBook? book);
         Task OnOpportunityNotBoughtAsync(CSFloatListing listing, OpportunityEvaluation evaluation, string why);
         Task OnConversionModelComputedAsync(ConversionModelSnapshot snapshot, LiquidityPlan plan);
@@ -121,7 +141,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         private DateTime nextConversionRunUtc = DateTime.MinValue;
         private DateTime nextStructuralRunUtc = DateTime.MinValue;
         private DateTime nextSweepUtc = DateTime.MinValue;
+        private DateTime nextPanelUtc = DateTime.MinValue;
         private int sweepRotation;
+        private int panelRotation;
         private double observedListingsPerMinute;
 
         private readonly EngineStatus status = new();
@@ -446,16 +468,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                     }
                 }
 
-                // Don't catch a falling knife: value both exits at the price projected for the end of the hold.
-                double trend = await GetTrendFactorAsync(listing.MarketHashName, ct);
-                if (trend < 0.999)
+                // The screen valued the exits from the listing alone. Before spending, value them with live
+                // evidence: does the item actually sell on CSFloat and how fast, what buyers really pay, how
+                // volatile it is over the hold, the market's drift, and the bot's own track record.
+                evaluation = await ConfirmWithExitModelAsync(listing, evaluation, book, ct);
+                if (!evaluation.ShouldBuy)
                 {
-                    evaluation = OpportunityEvaluator.Evaluate(listing, book, host.ConversionCoefficient, host.GbpPerUsd, settings.Evaluation, utcNow(), evaluation.Source, trend);
-                    if (!evaluation.ShouldBuy)
-                    {
-                        host.Log($"Skipped {listing.MarketHashName} ({listing.Id}): projected {1 - trend:P1} price fall over the hold; {evaluation.Reason}");
-                        return false;
-                    }
+                    host.Log($"Skipped {listing.MarketHashName} ({listing.Id}) after the exit model: {evaluation.Reason}");
+                    await host.OnOpportunityNotBoughtAsync(listing, evaluation, evaluation.Reason);
+                    return false;
                 }
 
                 string? blocker = await PurchaseBlockerAsync(listing, evaluation, settings, ct);
@@ -490,29 +511,61 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             }
         }
 
-        private readonly Dictionary<string, (DateTime FetchedUtc, double Factor)> trendCache = new(StringComparer.Ordinal);
-
-        /// <summary>Projected price factor over the hold for an item (cached 6 h; 1 when history is unavailable).</summary>
-        private async Task<double> GetTrendFactorAsync(string marketHashName, CancellationToken ct)
+        /// <summary>Re-values a listing the screen passed with the full exit model and live market evidence.</summary>
+        public async Task<OpportunityEvaluation> ConfirmWithExitModelAsync(CSFloatListing listing, OpportunityEvaluation evaluation, SteamOrderBook? book, CancellationToken ct)
         {
-            lock (trendCache)
-            {
-                if (trendCache.TryGetValue(marketHashName, out var cached) && utcNow() - cached.FetchedUtc < TimeSpan.FromHours(6))
-                    return cached.Factor;
-            }
-            double factor = 1;
-            try
-            {
-                var history = await host.SteamMarket.GetPriceHistoryAsync(marketHashName, RequestPriority.Critical, ct);
-                factor = PriceTrend.ProjectedDeclineFactor(history, utcNow());
-            }
-            catch (Exception ex) when (ex is not OperationCanceledException)
-            {
-                NoteError($"price history for {marketHashName}: {ex.Message}");
-            }
-            lock (trendCache) trendCache[marketHashName] = (utcNow(), factor);
-            return factor;
+            var settings = host.Settings;
+            var signals = await host.ExitSignals.GetAsync(listing.MarketHashName, SignalUse.Purchase, ct, book);
+            var plan = PlanPurchase(listing, evaluation.CostPence, signals, settings, host, utcNow());
+            OpportunityEvaluator.ApplyExitPlan(evaluation, listing, plan, settings.Evaluation, signals.Missing);
+            return evaluation;
         }
+
+        /// <summary>Plans both exits for a listing as if bought now, as of the day it becomes tradable.</summary>
+        public static ExitPlan PlanPurchase(CSFloatListing listing, int costPence, ExitSignals signals, EngineSettings settings, ISnipeHost host, DateTime nowUtc)
+        {
+            int anchor = PurchaseAnchorCents(listing);
+            var demand = anchor > 0
+                ? CSFloatDemand.Build(listing.MarketHashName, anchor, signals.SalesGraph, signals.RecentSales, signals.Competitors,
+                    listing.ReferenceQuantity ?? signals.ReferenceQuantity, host.OwnSteamId, listing.Id, nowUtc)
+                : null;
+            var environment = host.ExitEnvironment;
+            var context = new ExitContext
+            {
+                MarketHashName = listing.MarketHashName,
+                CostPence = costPence,
+                DaysUntilTradable = DaysUntilTradable(listing, environment.Timeline, nowUtc),
+                AnchorCents = anchor,
+                GbpPerUsd = host.GbpPerUsd,
+                ConversionCoefficient = host.ConversionCoefficient,
+                Book = signals.Book,
+                Forecast = PriceForecaster.Forecast(signals.SteamHistory, listing.MarketHashName, nowUtc, host.MarketModel),
+                Demand = demand,
+                AllowRelist = settings.Evaluation.AllowRelistExit,
+                Calibration = host.ExitCalibration,
+                // The account's away mode only blocks selling now; by the time this unit unlocks it may be back.
+                Environment = environment with { CSFloatSellingPaused = false },
+                TradeFailureProbability = environment.Timeline.PurchaseFailureProbability(listing.SellerTotalTrades, listing.SellerFailedTrades + listing.SellerAvoidedTrades),
+            };
+            return ExitPlanner.Plan(context, settings.Exit, nowUtc);
+        }
+
+        /// <summary>CSFloat's value for the unit being bought, never counting a float premium (as the screen).</summary>
+        public static int PurchaseAnchorCents(CSFloatListing listing)
+        {
+            int? baseValue = listing.BasePriceCents is > 0 ? listing.BasePriceCents : null;
+            int? predicted = listing.PredictedPriceCents is > 0 ? listing.PredictedPriceCents : null;
+            if (baseValue is int b && predicted is int p) return Math.Min(b, p);
+            return baseValue ?? predicted ?? 0;
+        }
+
+        /// <summary>
+        /// Days from buying <paramref name="listing"/> now until the unit can be sold: this seller's handover (their
+        /// median trade time, capped at two days, never quicker than the account's measured handover), then Valve's
+        /// 7-day trade protection, which ends on its daily boundary, then an hour's buffer.
+        /// </summary>
+        public static double DaysUntilTradable(CSFloatListing listing, TradeTimeline timeline, DateTime nowUtc) =>
+            timeline.DaysUntilTradable(nowUtc, Math.Max(0, listing.SellerMedianTradeTimeSeconds) / 86400.0);
 
         /// <summary>Why an otherwise-qualifying listing must not be bought right now (null = buy).</summary>
         private async Task<string?> PurchaseBlockerAsync(CSFloatListing listing, OpportunityEvaluation evaluation, EngineSettings settings, CancellationToken ct)
@@ -714,6 +767,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                         bool ok = await RunConversionModelAsync(ct);
                         nextConversionRunUtc = utcNow() + (ok ? TimeSpan.FromHours(3) : TimeSpan.FromMinutes(20));
                     }
+                    if (utcNow() >= nextPanelUtc)
+                    {
+                        int observed = await RunMarketPanelAsync(ct);
+                        nextPanelUtc = utcNow() + (observed > 0 ? host.Settings.MarketPanelInterval : TimeSpan.FromMinutes(20));
+                    }
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -759,7 +817,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 if (graph != null) ConversionModel.ApplySalesGraph(candidate, graph, fx, options);
             }
 
-            var snapshot = ConversionModel.Combine(candidates, host.TargetConversionVolumePence, host.Settings.DefaultConversionCoefficient, options, utcNow());
+            // Converters bought on Steam sit in Steam's 7-day hold before they can go to a CSFloat buyer: value each at
+            // the price its category is expected to have by then.
+            double holdDays = host.ExitEnvironment.Timeline.ConverterHoldDays;
+            double HoldGrowth(string name) => Math.Exp(host.MarketModel.DriftPerDay(ItemCategories.Of(name)) * holdDays);
+            var snapshot = ConversionModel.Combine(candidates, host.TargetConversionVolumePence, host.Settings.DefaultConversionCoefficient, options, utcNow(),
+                HoldGrowth, Math.Exp(host.MarketModel.DriftPerDay(ItemCategory.Container) * holdDays));
             var histories = new Dictionary<string, List<SteamPricePoint>>(StringComparer.Ordinal);
             foreach (var converter in snapshot.Converters.Where(c => c.VerifiedBySales).Take(5))
             {
@@ -770,6 +833,40 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             await host.OnConversionModelComputedAsync(snapshot, plan);
             lock (statusGate) status.LastConversionModelUtc = utcNow();
             return true;
+        }
+
+        /// <summary>Skins and stickers are where deals happen, so they are sampled twice as often.</summary>
+        private static readonly ItemCategory[] PanelCategories =
+            { ItemCategory.Skin, ItemCategory.Sticker, ItemCategory.Container, ItemCategory.Charm, ItemCategory.Skin, ItemCategory.Sticker, ItemCategory.Patch, ItemCategory.Other };
+
+        /// <summary>
+        /// Samples a few random items (not deal candidates, which are biased towards falling prices) and feeds
+        /// the market model: each item's realised drift over the last month, and how far a forecast made from
+        /// its history 9 days ago landed from what happened. This keeps the category drift and the forecast's
+        /// uncertainty calibrated against live evidence. Costs a few low-priority Steam requests.
+        /// </summary>
+        public async Task<int> RunMarketPanelAsync(CancellationToken ct)
+        {
+            var list = await GetPriceListAsync(ct);
+            if (list == null || list.Count == 0) return 0;
+            var pools = list.Where(e => e.MinPriceCents is >= 100 and <= 4000 && e.Quantity >= 15)
+                .GroupBy(e => ItemCategories.Of(e.MarketHashName))
+                .ToDictionary(g => g.Key, g => g.ToList());
+            int observed = 0;
+            for (int i = 0; i < host.Settings.MarketPanelItems; i++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var category = PanelCategories[panelRotation++ % PanelCategories.Length];
+                if (!pools.TryGetValue(category, out var pool) || pool.Count == 0) continue;
+                var entry = pool[Random.Shared.Next(pool.Count)];
+                var history = await host.SteamMarket.GetPriceHistoryAsync(entry.MarketHashName, RequestPriority.Low, ct);
+                if (history == null || history.Count == 0) continue;
+                DateTime now = utcNow();
+                double? drift = PriceForecaster.TrailingDrift(PriceForecaster.Daily(history), now);
+                double? z = PriceForecaster.WalkForwardZ(history, entry.MarketHashName, now, host.MarketModel);
+                if (host.MarketModel.Observe(entry.MarketHashName, category, drift, z, now)) observed++;
+            }
+            return observed;
         }
 
         private async Task<List<CSFloatWrapper.SalesGraphPoint>?> GetSalesGraphCachedAsync(string marketHashName, CancellationToken ct)

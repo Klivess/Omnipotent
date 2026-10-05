@@ -155,13 +155,19 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         /// <summary>
         /// Stage 4: the coefficient for decisions — the capacity-weighted average of the best verified
         /// converters, taking only as many as are needed to absorb <paramref name="targetVolumePence"/>.
+        /// Converters bought on Steam cannot be traded to a CSFloat buyer for 7 days, so each one's coefficient is
+        /// taken at the price expected once that hold lifts (<paramref name="holdGrowth"/>: its category drift
+        /// over the hold); cases barely drift, stickers and charms lose a little.
         /// </summary>
-        public static ConversionModelSnapshot Combine(IEnumerable<ConverterCandidate> candidates, double targetVolumePence, double fallbackCoefficient, Options options, DateTime nowUtc)
+        public static ConversionModelSnapshot Combine(IEnumerable<ConverterCandidate> candidates, double targetVolumePence, double fallbackCoefficient, Options options, DateTime nowUtc,
+            Func<string, double>? holdGrowth = null, double fallbackHoldGrowth = 1)
         {
+            double AfterHold(ConverterCandidate c) => c.Coefficient * (holdGrowth?.Invoke(c.MarketHashName) ?? 1);
             var verified = candidates
                 .Where(c => c.VerifiedBySales && c.Coefficient > 0 && c.WeeklyCapacityPence > 0 && c.Coefficient <= 1.3)
-                .OrderByDescending(c => c.Coefficient)
+                .OrderByDescending(AfterHold)
                 .ToList();
+            fallbackCoefficient *= fallbackHoldGrowth;
             var snapshot = new ConversionModelSnapshot
             {
                 ComputedAtUtc = nowUtc,
@@ -182,20 +188,51 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             {
                 double take = Math.Min(c.WeeklyCapacityPence, target - covered);
                 if (take <= 0) break;
-                weighted += c.Coefficient * take;
+                weighted += AfterHold(c) * take;
                 covered += take;
                 used++;
             }
             // Volume beyond what the good converters absorb goes through the fallback route (cases convert
             // without limit, just at a worse rate) — never assume the best rate scales.
             double remainder = Math.Max(0, target - covered);
-            double raw = (weighted + remainder * Math.Min(fallbackCoefficient, verified[0].Coefficient)) / target;
+            double raw = (weighted + remainder * Math.Min(fallbackCoefficient, AfterHold(verified[0]))) / target;
             snapshot.BestRawCoefficient = verified[0].Coefficient;
             snapshot.CapacityCoveredPence = covered;
             snapshot.Coefficient = Math.Clamp(raw * options.SafetyHaircut, options.MinimumCoefficient, options.MaximumCoefficient);
             snapshot.Basis = $"capacity-weighted over {used} verified converter(s) covering £{covered / 100:F0} of £{target / 100:F0}/week"
-                + (remainder > 0 ? $", remainder at {fallbackCoefficient:F2}" : "") + $", ×{options.SafetyHaircut:F2} haircut";
+                + (remainder > 0 ? $", remainder at {fallbackCoefficient:F2}" : "")
+                + (holdGrowth != null ? ", at prices expected after Steam's 7-day hold" : "") + $", ×{options.SafetyHaircut:F2} haircut";
             return snapshot;
+        }
+
+        /// <summary>
+        /// The price risk of carrying the Steam wallet back through converters: they cannot be traded to a CSFloat
+        /// buyer for <paramref name="holdDays"/>, so their price can move (category drift, and σ over the hold).
+        /// Capacity-weighted over the converters the coefficient uses; cases when none are verified yet.
+        /// </summary>
+        public static (double Growth, double Sigma) HoldRisk(ConversionModelSnapshot? snapshot, MarketDriftModel market, double holdDays)
+        {
+            (double Growth, double Variance) Of(string name)
+            {
+                var category = ItemCategories.Of(name);
+                double sigma = market.VolatilityScale * PriceForecaster.DefaultSigma8[category] * Math.Pow(Math.Max(holdDays, 0.1) / 8.0, PriceForecaster.DefaultHorizonExponent);
+                return (Math.Exp(market.DriftPerDay(category) * holdDays), sigma * sigma);
+            }
+            var used = snapshot?.Converters.Where(c => c.VerifiedBySales && c.Coefficient > 0 && c.WeeklyCapacityPence > 0).ToList();
+            if (used == null || used.Count == 0)
+            {
+                var (growth, variance) = Of("Recoil Case");
+                return (growth, Math.Sqrt(variance));
+            }
+            double weight = used.Sum(c => c.WeeklyCapacityPence);
+            double g = 0, v = 0;
+            foreach (var c in used)
+            {
+                var (growth, variance) = Of(c.MarketHashName);
+                g += growth * c.WeeklyCapacityPence / weight;
+                v += variance * c.WeeklyCapacityPence / weight;
+            }
+            return (g, Math.Sqrt(v));
         }
     }
 }

@@ -500,7 +500,9 @@ namespace Omnipotent.Services.OmniTumblr
         private async Task<bool> PopulateFromLegacySettingIfMissingAsync(OmniTumblrAccount account, string settingName, Action<string> applyValue)
         {
             var settingsManager = await service.GetOmniGlobalSettingsManager();
-            string? legacyValue = settingsManager.FindExistingSetting(settingName)?.Value;
+            var setting = settingsManager.FindExistingSetting(settingName);
+            string? legacyValue = setting == null ? null : await settingsManager.GetStringOmniSetting(settingName, sensitive: true,
+                parentServiceId: setting.ParentServiceId, parentServiceName: setting.ParentServiceName);
             if (string.IsNullOrWhiteSpace(legacyValue))
             {
                 return false;
@@ -513,10 +515,12 @@ namespace Omnipotent.Services.OmniTumblr
         private async Task DeleteLegacyCredentialSettingsAsync(string blogName)
         {
             var settingsManager = await service.GetOmniGlobalSettingsManager();
-            await settingsManager.DeleteOmniSetting($"OmniTumblr_ConsumerKey_{blogName}");
-            await settingsManager.DeleteOmniSetting($"OmniTumblr_ConsumerSecret_{blogName}");
-            await settingsManager.DeleteOmniSetting($"OmniTumblr_OAuthToken_{blogName}");
-            await settingsManager.DeleteOmniSetting($"OmniTumblr_OAuthTokenSecret_{blogName}");
+            foreach (string settingName in new[] { $"OmniTumblr_ConsumerKey_{blogName}", $"OmniTumblr_ConsumerSecret_{blogName}",
+                $"OmniTumblr_OAuthToken_{blogName}", $"OmniTumblr_OAuthTokenSecret_{blogName}" })
+            {
+                var setting = settingsManager.FindExistingSetting(settingName);
+                if (setting != null) await settingsManager.DeleteOmniSetting(setting.Name, setting.ParentServiceId);
+            }
         }
     }
 }

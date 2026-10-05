@@ -12,6 +12,17 @@ namespace Omnipotent.Services.KliveAPI
     /// </summary>
     internal static class HttpResponseHelpers
     {
+        internal static bool HasNoStore(string? cacheControl)
+        {
+            if (string.IsNullOrWhiteSpace(cacheControl)) return false;
+            foreach (string directive in cacheControl.Split(','))
+            {
+                string name = directive.Split('=', 2)[0].Trim();
+                if (name.Equals("no-store", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
         internal enum ContentEncoding
         {
             None,

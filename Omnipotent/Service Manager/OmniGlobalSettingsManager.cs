@@ -1,23 +1,13 @@
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
-using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI.Caching;
-using Omnipotent.Services.KliveBot_Discord;
 using System.Collections.Concurrent;
 using System.Net;
 
 namespace Omnipotent.Service_Manager
 {
-    public enum OmniSettingType
-    {
-        String = 0,
-        Bool = 1,
-        Int = 2,
-        Dropdown = 3,
-        // A dynamic, ordered list of strings. The list is stored JSON-serialized
-        // in Value (e.g. ["a","b"]); entries can be added, edited, and removed.
-        StringList = 4,
-    }
+    public enum OmniSettingType { String = 0, Bool = 1, Int = 2, Dropdown = 3, StringList = 4 }
 
     public class OmniSetting
     {
@@ -25,300 +15,534 @@ namespace Omnipotent.Service_Manager
         public OmniSettingType Type { get; set; }
         public bool Sensitive { get; set; }
         public string Value { get; set; }
-        // Parent service information
         public string ParentServiceName { get; set; }
         public string ParentServiceId { get; set; }
         public List<string> DropdownOptions { get; set; } = new();
-
-        [JsonIgnore]
-        public bool WasUsedThisSession { get; set; }
+        [JsonIgnore] public bool WasUsedThisSession { get; set; }
+        [JsonIgnore] public bool HasValue { get; set; }
     }
 
     public class OmniSettingsChangedEventArgs : EventArgs
     {
+        // Secret values are redacted. Consumers needing them must use typed getters.
         public OmniSetting Setting { get; init; }
         public string PreviousValue { get; init; }
         public bool IsNewSetting { get; init; }
+        public bool ValueChanged { get; init; }
     }
 
     public class OmniGlobalSettingsManager : OmniService
     {
-        private readonly string settingsDirectory = OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGlobalSettingsDirectory);
-        private readonly string settingsFilePath;
-
-        // Response-cache dependency key: coarse (any setting change invalidates
-        // cached responses that read a setting). Settings rarely change at runtime.
         private const string CacheKey = "omnisettings";
-
-        private readonly ConcurrentDictionary<string, OmniSetting> settings = new(StringComparer.OrdinalIgnoreCase);
+        internal const string SecretMask = "********";
+        internal const int MaxValueLength = 65536;
+        // Encryption/base64 can expand a previously valid plaintext settings document.
+        private const int MaxSettingsFileBytes = 64 * 1024 * 1024;
+        private const long MaxRequestBodyBytes = 384 * 1024;
+        private readonly string settingsDirectory;
+        private readonly string settingsFilePath;
+        private readonly OmniSettingsProtector protector;
+        // Published records are snapshots. Sensitive values stay encrypted in memory.
+        private ConcurrentDictionary<string, OmniSetting> settings = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, string> pendingFulfillmentPromptIds = new(StringComparer.OrdinalIgnoreCase);
-        private static readonly SemaphoreSlim _fileIOLock = new SemaphoreSlim(1, 1);
+        private readonly ConcurrentDictionary<string, TaskCompletionSource<bool>> pendingSensitiveFulfillments = new(StringComparer.OrdinalIgnoreCase);
+        // Only trusted getters establish these aliases; HTTP requests always resolve explicit scopes.
+        private readonly Dictionary<(string Id, string Owner, string Name), ServiceSettingAlias> serviceSettingAliases = new();
+        private sealed record ServiceSettingAlias(string TargetKey, string[] OwnerKeys);
+        private readonly SemaphoreSlim stateGate = new(1, 1);
+        private static readonly SemaphoreSlim FileIOLock = new(1, 1);
         private readonly TaskCompletionSource<bool> settingsLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
-
         public event EventHandler<OmniSettingsChangedEventArgs> OnSettingsChanged;
 
-        public OmniGlobalSettingsManager()
+        private sealed class SettingsDocument
+        {
+            public int FormatVersion { get; set; } = 1;
+            public List<OmniSetting> Settings { get; set; } = new();
+        }
+        private sealed class SecretPayload
+        {
+            public string Value { get; set; } = "";
+            public List<string> DropdownOptions { get; set; } = new();
+            // Optional for earlier v1 payloads; all new writes authenticate the stable owner name.
+            public string? ParentServiceName { get; set; }
+        }
+
+        public OmniGlobalSettingsManager() : this(
+            OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniGlobalSettingsDirectory), new OmniSettingsProtector()) { }
+
+        internal OmniGlobalSettingsManager(string directory, OmniSettingsProtector protector)
         {
             name = "Omni Global Settings Manager";
             threadAnteriority = ThreadAnteriority.Critical;
+            settingsDirectory = Path.GetFullPath(directory);
             settingsFilePath = Path.Combine(settingsDirectory, "settings.json");
+            this.protector = protector;
         }
 
         protected override async void ServiceMain()
         {
             try
             {
-                Directory.CreateDirectory(settingsDirectory);
-                await LoadSavedSettings();
+                await InitializeAsync();
                 await CreateRoutesAsync();
-                await ServiceLog("OmniGlobalSettings routes registered.");
+                await ServiceLog("OmniGlobalSettings routes registered with protected storage.");
             }
-            catch (Exception ex)
+            catch
             {
-                await ServiceLogError(ex, "Failed to start OmniGlobalSettingsManager");
+                // Parser exceptions can contain input data. Never log them.
+                await ServiceLogError("OmniGlobalSettings startup failed. Protected settings remain unavailable.");
             }
-            finally
+        }
+
+        internal async Task InitializeAsync()
+        {
+            await stateGate.WaitAsync();
+            try
             {
+                if (settingsLoaded.Task.IsCompleted) { await settingsLoaded.Task; return; }
+                await LoadSavedSettings();
                 settingsLoaded.TrySetResult(true);
             }
+            catch
+            {
+                settingsLoaded.TrySetException(new InvalidDataException("Protected settings could not be loaded safely."));
+                throw new InvalidDataException("Protected settings could not be loaded safely.");
+            }
+            finally { stateGate.Release(); }
         }
 
         private Task EnsureSettingsLoadedAsync() => settingsLoaded.Task;
 
         private async Task LoadSavedSettings()
         {
-            bool dedupedAtLoad = false;
-            await _fileIOLock.WaitAsync();
+            await FileIOLock.WaitAsync();
             try
             {
-                if (File.Exists(settingsFilePath))
+                OmniSettingsProtector.HardenDirectory(settingsDirectory);
+                bool previouslyMigrated = protector.WasMigrated(settingsFilePath);
+                string sourceFilePath = settingsFilePath;
+                if (!File.Exists(settingsFilePath))
                 {
-                    string json = await File.ReadAllTextAsync(settingsFilePath);
-                    var list = JsonConvert.DeserializeObject<List<OmniSetting>>(json) ?? new List<OmniSetting>();
-
-                    foreach (var s in list)
+                    if (previouslyMigrated) throw new InvalidDataException("The protected settings file is missing. Restore the saved document.");
+                    // A first-write crash in the old version may have left the sole copy in its staging file.
+                    string legacyStagingPath = settingsFilePath + ".tmp";
+                    OmniSettingsProtector.ValidatePath(legacyStagingPath);
+                    if (File.Exists(legacyStagingPath)) sourceFilePath = legacyStagingPath;
+                    else
                     {
-                        s.Name = NormalizeSettingName(s.Name);
-                        if (string.IsNullOrEmpty(s.ParentServiceName)) s.ParentServiceName = "UnknownService";
-                        s.ParentServiceId = NormalizeParentServiceId(s.ParentServiceId);
-                        s.DropdownOptions = NormalizeDropdownOptions(s.DropdownOptions);
-
-                        if (s.Type == OmniSettingType.Dropdown && s.DropdownOptions.Count > 0)
-                        {
-                            s.Value = NormalizeDropdownValue(s.Value, s.DropdownOptions);
-                        }
-
-                        if (string.IsNullOrWhiteSpace(s.Name))
-                        {
-                            await ServiceLogError("Skipped loading an omni setting without a name.");
-                            continue;
-                        }
-
-                        var key = ComposeKey(s.ParentServiceId, s.Name);
-                        if (settings.ContainsKey(key)) dedupedAtLoad = true;
-                        settings[key] = s;
+                        await PersistSettingsLocked(Array.Empty<OmniSetting>());
+                        protector.MarkMigrated(settingsFilePath);
+                        return;
                     }
                 }
-            }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "Failed to load saved omni settings");
-            }
-            finally
-            {
-                _fileIOLock.Release();
-            }
-
-            if (dedupedAtLoad)
-            {
-                await SaveSettings();
-            }
-        }
-
-        private async Task SaveSettings()
-        {
-            await _fileIOLock.WaitAsync();
-            try
-            {
-                var list = settings.Values.ToList();
-                string json = JsonConvert.SerializeObject(list, Formatting.Indented);
-                
-                string tempPath = settingsFilePath + ".tmp";
-                await File.WriteAllTextAsync(tempPath, json);
-                
-                if (File.Exists(settingsFilePath))
+                OmniSettingsProtector.HardenFile(sourceFilePath);
+                if (new FileInfo(sourceFilePath).Length > MaxSettingsFileBytes)
+                    throw new InvalidDataException("Settings file exceeds its size limit.");
+                string json;
+                await using (var stream = new FileStream(sourceFilePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    4096, FileOptions.Asynchronous))
                 {
-                    File.Replace(tempPath, settingsFilePath, null);
+                    if (stream.Length > MaxSettingsFileBytes) throw new InvalidDataException("Settings file exceeds its size limit.");
+                    using var reader = new StreamReader(stream);
+                    json = await reader.ReadToEndAsync();
                 }
+                var token = JToken.Parse(json);
+                bool legacy = token.Type == JTokenType.Array;
+                if (legacy && previouslyMigrated)
+                    throw new InvalidDataException("Protected settings cannot be downgraded to legacy storage.");
+                List<OmniSetting> list;
+                if (legacy) list = token.ToObject<List<OmniSetting>>() ?? throw new InvalidDataException("Invalid settings document.");
                 else
                 {
-                    File.Move(tempPath, settingsFilePath);
+                    var document = token.ToObject<SettingsDocument>();
+                    if (document?.FormatVersion != 1 || token["FormatVersion"]?.Type != JTokenType.Integer
+                        || token["FormatVersion"]!.Value<int>() != 1 || token["Settings"]?.Type != JTokenType.Array)
+                        throw new InvalidDataException("Unsupported settings format.");
+                    list = document.Settings;
                 }
-                // Settings changed on disk — invalidate cached responses that read one.
-                CacheDeps.Bump(CacheKey);
+                // Older releases skipped nameless records and used the last normalized duplicate.
+                // Only the legacy format receives that tolerance; encrypted documents stay strict.
+                if (legacy) list = list.Where(s => s != null && !string.IsNullOrWhiteSpace(s.Name)).ToList();
+                var loaded = new ConcurrentDictionary<string, OmniSetting>(StringComparer.OrdinalIgnoreCase);
+                var sensitiveNames = list.Where(s => s != null && (s.Sensitive || IsCredentialName(s.Name ?? "")
+                    || (legacy && OmniSettingsProtector.IsProtected(s.Value))))
+                    .Select(s => NormalizeSettingName(s.Name)).ToHashSet(StringComparer.OrdinalIgnoreCase);
+                if (legacy)
+                {
+                    var lastSaved = new Dictionary<string, OmniSetting>(StringComparer.OrdinalIgnoreCase);
+                    foreach (var setting in list) lastSaved[ComposeKey(setting.ParentServiceId, setting.Name)] = setting;
+                    list = lastSaved.Values.ToList();
+                }
+                // Verify protected documents before any migration creates or writes key material.
+                foreach (var s in list)
+                {
+                    if (s == null) throw new InvalidDataException("Invalid setting.");
+                    s.Name = NormalizeSettingName(s.Name);
+                    s.ParentServiceId = NormalizeParentServiceId(s.ParentServiceId);
+                    ValidateStoredIdentity(s.Name, s.ParentServiceId);
+                    if (!Enum.IsDefined(s.Type)) throw new InvalidDataException("Invalid setting type.");
+                    // The old array format stored every Value literally, even strings resembling an envelope.
+                    if (!legacy && OmniSettingsProtector.IsProtected(s.Value))
+                    {
+                        if (!s.Sensitive || s.DropdownOptions?.Count > 0)
+                            throw new InvalidDataException("Invalid protected setting metadata.");
+                        _ = DecodeSetting(s);
+                    }
+                    else if (!legacy && sensitiveNames.Contains(s.Name))
+                        throw new InvalidDataException("Sensitive setting is missing encryption.");
+                }
+                foreach (var s in list)
+                {
+                    var plain = !legacy && OmniSettingsProtector.IsProtected(s.Value) ? DecodeSetting(s) : Copy(s);
+                    plain.Sensitive |= sensitiveNames.Contains(plain.Name);
+                    plain.ParentServiceName = string.IsNullOrWhiteSpace(plain.ParentServiceName) ? "UnknownService" : plain.ParentServiceName;
+                    plain.DropdownOptions = NormalizeDropdownOptions(plain.DropdownOptions, enforceInputLimits: false);
+                    string key = ComposeKey(plain.ParentServiceId, plain.Name);
+                    if (!legacy && loaded.ContainsKey(key)) throw new InvalidDataException("Duplicate setting identity.");
+                    loaded[key] = EncodeSetting(plain);
+                }
+                // Complete an atomic migration before making settings available to services.
+                await PersistSettingsLocked(loaded.Values);
+                protector.MarkMigrated(settingsFilePath);
+                // Previous releases used this fixed staging name and could leave plaintext after a crash.
+                string legacyTempPath = settingsFilePath + ".tmp";
+                OmniSettingsProtector.ValidatePath(legacyTempPath);
+                if (File.Exists(legacyTempPath))
+                {
+                    OmniSettingsProtector.HardenFile(legacyTempPath);
+                    File.Delete(legacyTempPath);
+                }
+                settings = loaded;
             }
-            catch (Exception ex)
+            finally { FileIOLock.Release(); }
+        }
+
+        private async Task PersistSettingsLocked(IEnumerable<OmniSetting> values)
+        {
+            OmniSettingsProtector.HardenDirectory(settingsDirectory);
+            OmniSettingsProtector.ValidatePath(settingsFilePath);
+            if (!File.Exists(settingsFilePath) && protector.WasMigrated(settingsFilePath))
+                throw new InvalidDataException("The protected settings file is missing. Restore the saved document.");
+            string json = JsonConvert.SerializeObject(new SettingsDocument { Settings = values.ToList() }, Formatting.Indented);
+            if (System.Text.Encoding.UTF8.GetByteCount(json) > MaxSettingsFileBytes)
+                throw new InvalidDataException("Settings file exceeds its size limit.");
+            string tempPath = Path.Combine(settingsDirectory, $"settings-{Guid.NewGuid():N}.tmp");
+            try
             {
-                await ServiceLogError(ex, "Failed to save omni settings to disk");
+                // The parent ACL protects this file from its first byte.
+                await using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
+                    4096, FileOptions.Asynchronous | FileOptions.WriteThrough))
+                {
+                    OmniSettingsProtector.HardenFile(tempPath);
+                    await stream.WriteAsync(System.Text.Encoding.UTF8.GetBytes(json));
+                    stream.Flush(flushToDisk: true);
+                }
+                OmniSettingsProtector.ValidatePath(settingsFilePath);
+                if (File.Exists(settingsFilePath))
+                {
+                    OmniSettingsProtector.HardenFile(settingsFilePath);
+                    File.Replace(tempPath, settingsFilePath, null);
+                }
+                else File.Move(tempPath, settingsFilePath);
             }
-            finally
+            finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
+        }
+
+        private async Task CommitSetting(OmniSetting stored, IEnumerable<OmniSetting>? ownerCopies = null)
+        {
+            var next = new ConcurrentDictionary<string, OmniSetting>(settings, StringComparer.OrdinalIgnoreCase);
+            next[ComposeKey(stored.ParentServiceId, stored.Name)] = stored;
+            if (ownerCopies != null)
+                foreach (var copy in ownerCopies) next[ComposeKey(copy.ParentServiceId, copy.Name)] = copy;
+            // Old shared-name fallback could copy a secret into an unclassified sibling.
+            // Promoting any owner must protect every persisted copy in the same transaction.
+            if (stored.Sensitive)
             {
-                _fileIOLock.Release();
+                foreach (var sibling in next.Values.Where(s => !s.Sensitive
+                    && s.Name.Equals(stored.Name, StringComparison.OrdinalIgnoreCase)).ToList())
+                {
+                    var plain = DecodeSetting(sibling);
+                    plain.Sensitive = true;
+                    next[ComposeKey(plain.ParentServiceId, plain.Name)] = EncodeSetting(plain);
+                }
+            }
+            protector.MarkMigrated(settingsFilePath);
+            await FileIOLock.WaitAsync();
+            try { await PersistSettingsLocked(next.Values); }
+            finally { FileIOLock.Release(); }
+            settings = next;
+            CacheDeps.Bump(CacheKey);
+        }
+
+        private OmniSetting EncodeSetting(OmniSetting plain)
+        {
+            if (!plain.Sensitive && OmniSettingsProtector.IsProtected(plain.Value))
+                throw new ArgumentException("This value prefix is reserved for protected settings.");
+            var stored = Copy(plain);
+            stored.HasValue = !string.IsNullOrEmpty(plain.Value);
+            if (stored.Sensitive)
+            {
+                stored.Value = protector.Protect(JsonConvert.SerializeObject(new SecretPayload
+                    { Value = plain.Value ?? "", DropdownOptions = plain.DropdownOptions,
+                      ParentServiceName = plain.ParentServiceName ?? "" }), stored);
+                stored.DropdownOptions = new();
+            }
+            return stored;
+        }
+
+        private OmniSetting DecodeSetting(OmniSetting stored)
+        {
+            var plain = Copy(stored);
+            if (stored.Sensitive)
+            {
+                var payload = JsonConvert.DeserializeObject<SecretPayload>(protector.Unprotect(stored.Value, stored))
+                    ?? throw new InvalidDataException("Invalid protected payload.");
+                if (payload.ParentServiceName != null
+                    && !string.Equals(payload.ParentServiceName, stored.ParentServiceName ?? "", StringComparison.Ordinal))
+                    throw new InvalidDataException("Protected setting owner metadata was changed.");
+                plain.Value = payload.Value;
+                plain.DropdownOptions = payload.DropdownOptions ?? new();
+            }
+            plain.HasValue = !string.IsNullOrEmpty(plain.Value);
+            return plain;
+        }
+
+        private static OmniSetting Copy(OmniSetting s) => new()
+        {
+            Name = s.Name, Type = s.Type, Sensitive = s.Sensitive, Value = s.Value,
+            ParentServiceId = s.ParentServiceId, ParentServiceName = s.ParentServiceName,
+            DropdownOptions = s.DropdownOptions?.ToList() ?? new(),
+            WasUsedThisSession = s.WasUsedThisSession, HasValue = s.HasValue
+        };
+
+        internal static OmniSetting Redact(OmniSetting s)
+        {
+            var result = Copy(s);
+            if (s.Sensitive) { result.Value = s.HasValue ? SecretMask : ""; result.DropdownOptions = new(); }
+            return result;
+        }
+
+        private OmniSetting? ResolveExisting(string name, string? parentServiceId)
+        {
+            if (!string.IsNullOrWhiteSpace(parentServiceId))
+            {
+                settings.TryGetValue(ComposeKey(parentServiceId, name), out var exact);
+                return exact;
+            }
+            var matches = settings.Values.Where(s => s.Name.Equals(name.Trim(), StringComparison.OrdinalIgnoreCase)).Take(2).ToList();
+            if (matches.Count > 1) throw new ArgumentException("Specify parentServiceId for an ambiguous setting.");
+            return matches.SingleOrDefault();
+        }
+
+        // Trusted service lookups must survive historical copies and changing runtime service IDs.
+        // API ownership resolution remains strict in ResolveExisting.
+        private OmniSetting? ResolveServiceSetting(string name, string parentId, string? parentName)
+        {
+            if (settings.TryGetValue(ComposeKey(parentId, name), out var exact)) return exact;
+            var matches = settings.Values.Where(s => s.Name.Equals(name.Trim(), StringComparison.OrdinalIgnoreCase)).ToList();
+            if (IsKnownServiceName(parentName))
+            {
+                var owned = matches.Where(s => s.ParentServiceName?.Trim().Equals(parentName!.Trim(), StringComparison.OrdinalIgnoreCase) == true).ToList();
+                if (owned.Count > 0) return SelectCompatibleSetting(owned);
+            }
+            var global = matches.FirstOrDefault(s => s.ParentServiceId == "0");
+            if (global != null) return global;
+            return parentId == "0" ? SelectCompatibleSetting(matches) : null;
+        }
+
+        private static bool IsKnownServiceName(string? parentName) => !string.IsNullOrWhiteSpace(parentName)
+            && !parentName.Trim().Equals("UnknownService", StringComparison.OrdinalIgnoreCase)
+            && !parentName.Trim().Equals("API/Global", StringComparison.OrdinalIgnoreCase);
+
+        private static bool SameOwner(string? first, string? second) => IsKnownServiceName(first)
+            && string.Equals(first!.Trim(), second?.Trim(), StringComparison.OrdinalIgnoreCase);
+
+        private static (string Id, string Owner, string Name) ServiceAliasKey(string name, string id, string? owner) =>
+            (NormalizeParentServiceId(id).ToUpperInvariant(), (owner ?? "").Trim().ToUpperInvariant(), NormalizeSettingName(name).ToUpperInvariant());
+
+        private static bool SameConfiguration(OmniSetting first, OmniSetting second) => first.Type == second.Type
+            && string.Equals(first.Value, second.Value, StringComparison.Ordinal)
+            && first.DropdownOptions.SequenceEqual(second.DropdownOptions, StringComparer.OrdinalIgnoreCase);
+
+        private string[] CompatibleOwnerKeys(OmniSetting existing)
+        {
+            var plain = DecodeSetting(existing);
+            return settings.Values.Where(s => s.Name.Equals(existing.Name, StringComparison.OrdinalIgnoreCase)
+                && SameOwner(s.ParentServiceName, existing.ParentServiceName) && SameConfiguration(DecodeSetting(s), plain))
+                .Select(s => ComposeKey(s.ParentServiceId, s.Name)).ToArray();
+        }
+
+        private IEnumerable<OmniSetting> UpdatedOwnerCopies(OmniSetting replacement, IEnumerable<string> ownerKeys)
+        {
+            string targetKey = ComposeKey(replacement.ParentServiceId, replacement.Name);
+            foreach (string key in ownerKeys)
+            {
+                if (key.Equals(targetKey, StringComparison.OrdinalIgnoreCase) || !settings.TryGetValue(key, out var stored)) continue;
+                var copy = DecodeSetting(stored);
+                copy.Value = replacement.Value;
+                copy.Type = replacement.Type;
+                copy.DropdownOptions = replacement.DropdownOptions.ToList();
+                copy.Sensitive |= replacement.Sensitive;
+                yield return EncodeSetting(copy);
             }
         }
 
-        private async Task<OmniSetting> GetOrCreateSettingAsync(string name, OmniSettingType type, string defaultValue, bool sensitive, bool askKlivesForFulfillment, string parentServiceId, string parentServiceName, IEnumerable<string>? dropdownOptions = null)
+        private OmniSetting? SelectCompatibleSetting(IEnumerable<OmniSetting> candidates)
+        {
+            var ordered = candidates.OrderByDescending(s => s.WasUsedThisSession)
+                .ThenBy(s => s.ParentServiceId, StringComparer.OrdinalIgnoreCase).ToList();
+            if (ordered.Count == 0) return null;
+            var populated = ordered.Where(s => !IsEmptySettingValue(DecodeSetting(s))).ToList();
+            if (populated.Count > 0) ordered = populated;
+            var first = DecodeSetting(ordered[0]);
+            foreach (var candidate in ordered.Skip(1))
+            {
+                var plain = DecodeSetting(candidate);
+                if (!SameConfiguration(plain, first))
+                    throw new ArgumentException("Specify parentServiceId for conflicting setting values.");
+            }
+            return ordered[0];
+        }
+
+        private static bool IsEmptySettingValue(OmniSetting plain)
+        {
+            // A persisted [] is an intentional list clear, not a missing value.
+            return string.IsNullOrEmpty(plain.Value);
+        }
+
+        private OmniSetting? ResolvePopulatedSibling(string name, OmniSettingType type, string? parentName)
+        {
+            var candidates = settings.Values.Where(s => s.Type == type && s.Name.Equals(name, StringComparison.OrdinalIgnoreCase)
+                && !IsEmptySettingValue(DecodeSetting(s))).ToList();
+            if (IsKnownServiceName(parentName))
+            {
+                var owned = candidates.Where(s => s.ParentServiceName?.Trim().Equals(parentName!.Trim(), StringComparison.OrdinalIgnoreCase) == true).ToList();
+                if (owned.Count > 0) candidates = owned;
+            }
+            return SelectCompatibleSetting(candidates);
+        }
+
+        private async Task<OmniSetting> GetOrCreateSettingAsync(string name, OmniSettingType type, string defaultValue,
+            bool sensitive, bool askKlivesForFulfillment, string parentServiceId, string parentServiceName,
+            IEnumerable<string>? dropdownOptions = null)
         {
             await EnsureSettingsLoadedAsync();
             CacheDeps.NoteRead(CacheKey);
-
             name = NormalizeSettingName(name);
             parentServiceId = NormalizeParentServiceId(parentServiceId);
-            List<string> normalizedDropdownOptions = NormalizeDropdownOptions(dropdownOptions);
-
-            if (type == OmniSettingType.Dropdown)
+            ValidateStoredIdentity(name, parentServiceId);
+            var options = NormalizeDropdownOptions(dropdownOptions, enforceInputLimits: false);
+            if (type == OmniSettingType.Dropdown && options.Count == 0) throw new ArgumentException("Dropdown settings need options.");
+            OmniSetting result;
+            OmniSettingsChangedEventArgs? change = null;
+            await stateGate.WaitAsync();
+            try
             {
-                if (normalizedDropdownOptions.Count == 0)
+                var existing = ResolveServiceSetting(name, parentServiceId, parentServiceName);
+                bool isNew = existing == null;
+                bool followsSavedOwner = existing != null
+                    && !existing.ParentServiceId.Equals(parentServiceId, StringComparison.OrdinalIgnoreCase)
+                    && SameOwner(existing.ParentServiceName, parentServiceName);
+                var ownerKeys = followsSavedOwner ? CompatibleOwnerKeys(existing!) : Array.Empty<string>();
+                var plain = existing == null ? new OmniSetting
                 {
-                    throw new ArgumentException("Dropdown settings must provide at least one option.", nameof(dropdownOptions));
-                }
-
-                defaultValue = NormalizeDropdownValue(defaultValue, normalizedDropdownOptions);
-            }
-
-            var key = ComposeKey(parentServiceId, name);
-            bool isNewOrModified = false;
-            bool isNewSetting = false;
-            string previousValue = null;
-            
-            // Fix async thread context loss causing misidentified callers:
-            // If the parentServiceId is unknown (0), we try to find any existing setting with the same name.
-            OmniSetting setting = null;
-            if (settings.TryGetValue(key, out var exactMatch))
-            {
-                setting = exactMatch;
-            }
-            else if (parentServiceId == "0")
-            {
-                setting = settings.Values.FirstOrDefault(x => NormalizeSettingName(x.Name).Equals(name, StringComparison.OrdinalIgnoreCase));
-            }
-
-            if (setting == null)
-            {
-                setting = new OmniSetting
+                    Name = name, Type = type, Value = defaultValue ?? "", ParentServiceId = parentServiceId,
+                    ParentServiceName = parentServiceName ?? "UnknownService", DropdownOptions = options
+                } : DecodeSetting(existing);
+                string previousValue = plain.Value;
+                var previousOptions = plain.DropdownOptions.ToList();
+                plain.Sensitive |= sensitive || IsCredentialName(name) || settings.Values.Any(s => s.Sensitive
+                    && s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                // Preserve existing shared values across changing service IDs; reject conflicts.
+                if (IsEmptySettingValue(plain) || (isNew && type == OmniSettingType.StringList
+                    && DeserializeStringList(plain.Value).Count == 0))
                 {
-                    Name = name,
-                    Type = type,
-                    Sensitive = sensitive,
-                    Value = defaultValue ?? string.Empty,
-                    ParentServiceId = parentServiceId,
-                    ParentServiceName = parentServiceName,
-                    DropdownOptions = normalizedDropdownOptions,
-                };
-                
-                key = ComposeKey(setting.ParentServiceId, setting.Name);
-                settings[key] = setting;
-                isNewOrModified = true;
-                isNewSetting = true;
-            }
-
-            if (setting.Type != type)
-            {
-                setting.Type = type;
-                isNewOrModified = true;
-            }
-
-            if (setting.Sensitive != sensitive)
-            {
-                setting.Sensitive = sensitive;
-                isNewOrModified = true;
-            }
-
-            if (type == OmniSettingType.Dropdown)
-            {
-                if (DropdownOptionsMatch(setting.DropdownOptions, normalizedDropdownOptions) == false)
-                {
-                    setting.DropdownOptions = normalizedDropdownOptions;
-                    isNewOrModified = true;
-                }
-
-                string normalizedValue = NormalizeDropdownValue(setting.Value, normalizedDropdownOptions);
-                if (string.Equals(setting.Value, normalizedValue, StringComparison.Ordinal) == false)
-                {
-                    previousValue ??= setting.Value;
-                    setting.Value = normalizedValue;
-                    isNewOrModified = true;
-                }
-            }
-            else if (setting.DropdownOptions.Count > 0)
-            {
-                setting.DropdownOptions = new List<string>();
-                isNewOrModified = true;
-            }
-
-            MarkSettingUsedThisSession(setting);
-
-            if (string.IsNullOrEmpty(setting.Value))
-            {
-                var populatedMatch = settings.Values.FirstOrDefault(x =>
-                    x.Type == type &&
-                    NormalizeSettingName(x.Name).Equals(name, StringComparison.OrdinalIgnoreCase) &&
-                    !string.IsNullOrEmpty(x.Value));
-
-                if (populatedMatch != null)
-                {
-                    previousValue = setting.Value;
-                    setting.Value = populatedMatch.Value;
-                    settings[ComposeKey(setting.ParentServiceId, setting.Name)] = setting;
-                    isNewOrModified = true;
-                }
-            }
-
-            if (string.IsNullOrEmpty(setting.Value) && askKlivesForFulfillment)
-            {
-                await Task.Delay(2000);
-                if (settings.TryGetValue(ComposeKey(setting.ParentServiceId, setting.Name), out var recheck) && !string.IsNullOrEmpty(recheck.Value))
-                {
-                    MarkSettingUsedThisSession(recheck);
-                    return recheck;
-                }
-
-                var trackedSettingKey = ComposeKey(setting.ParentServiceId, setting.Name);
-                var trackingId = $"setting-fulfillment:{trackedSettingKey}:{Guid.NewGuid():N}";
-                pendingFulfillmentPromptIds[trackedSettingKey] = trackingId;
-
-                try
-                {
-                    var prompt = $"Please provide value for setting '{name}' ({type})";
-                    var instructions = $"Enter the value for setting '{name}'.";
-                    var response = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscordTracked",
-                        trackingId, prompt, instructions, TimeSpan.FromDays(7), "Setting value", "Value");
-
-                    if (!string.IsNullOrEmpty(response))
+                    var populated = ResolvePopulatedSibling(name, type, parentServiceName);
+                    if (populated != null)
                     {
-                        previousValue = setting.Value;
-                        setting.Value = response.Trim();
-                        settings[ComposeKey(setting.ParentServiceId, setting.Name)] = setting;
-                        isNewOrModified = true;
+                        var saved = DecodeSetting(populated);
+                        plain.Value = saved.Value;
+                        plain.Sensitive |= saved.Sensitive;
                     }
                 }
-                catch { /* Ignore prompt failures */ }
-                finally
+                plain.Type = type;
+                plain.DropdownOptions = type == OmniSettingType.Dropdown ? options : new();
+                if (type == OmniSettingType.Dropdown) plain.Value = NormalizeDropdownValue(plain.Value, options);
+                bool modified = isNew || existing!.Sensitive != plain.Sensitive || existing.Type != plain.Type
+                    || previousValue != plain.Value || !previousOptions.SequenceEqual(plain.DropdownOptions);
+                plain.WasUsedThisSession = true;
+                plain.HasValue = !string.IsNullOrEmpty(plain.Value);
+                if (modified)
                 {
-                    pendingFulfillmentPromptIds.TryRemove(trackedSettingKey, out _);
+                    await CommitSetting(EncodeSetting(plain), UpdatedOwnerCopies(plain, ownerKeys));
+                    change = CreateChange(plain, previousValue, isNew);
                 }
+                else if (!existing!.WasUsedThisSession)
+                {
+                    var used = Copy(existing);
+                    used.WasUsedThisSession = true;
+                    settings[ComposeKey(used.ParentServiceId, used.Name)] = used;
+                    CacheDeps.Bump(CacheKey);
+                }
+                var aliasKey = ServiceAliasKey(name, parentServiceId, parentServiceName);
+                if (followsSavedOwner) serviceSettingAliases[aliasKey] = new(ComposeKey(plain.ParentServiceId, plain.Name), ownerKeys);
+                else serviceSettingAliases.Remove(aliasKey);
+                result = plain;
             }
-
-            if (isNewOrModified)
+            finally { stateGate.Release(); }
+            RaiseSettingsChanged(change);
+            if (!result.HasValue && result.Sensitive && askKlivesForFulfillment)
+                return await FulfillSensitiveSetting(result);
+            if (!result.HasValue && askKlivesForFulfillment)
             {
-                await SaveSettings();
-                RaiseSettingsChanged(setting, previousValue, isNewSetting);
+                string key = ComposeKey(result.ParentServiceId, result.Name);
+                string trackingId = $"setting-fulfillment:{key}:{Guid.NewGuid():N}";
+                if (pendingFulfillmentPromptIds.TryAdd(key, trackingId))
+                {
+                    try
+                    {
+                        var response = (string?)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscordTracked",
+                            trackingId, $"Please provide value for setting '{name}' ({type})", $"Enter the value for setting '{name}'.",
+                            TimeSpan.FromDays(7), "Setting value", "Value");
+                        if (!string.IsNullOrEmpty(response))
+                            await SetOmniSetting(name, response.Trim(), result.ParentServiceId, result.ParentServiceName, type, dropdownOptions: options);
+                    }
+                    catch { }
+                    finally { pendingFulfillmentPromptIds.TryRemove(key, out _); }
+                }
+                if (settings.TryGetValue(key, out var refreshed)) result = DecodeSetting(refreshed);
             }
-
-            return setting;
+            return result;
         }
 
-        // --- Typed Getters ---
+        private async Task<OmniSetting> FulfillSensitiveSetting(OmniSetting setting)
+        {
+            string key = ComposeKey(setting.ParentServiceId, setting.Name);
+            var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            var pending = pendingSensitiveFulfillments.GetOrAdd(key, completion);
+            try
+            {
+                if (settings.TryGetValue(key, out var recheck) && recheck.HasValue) return DecodeSetting(recheck);
+                if (ReferenceEquals(pending, completion))
+                {
+                    // A notice has no text-entry modal: credentials never pass through Discord.
+                    await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                        $"Sensitive setting '{setting.Name}' needs a value. Enter it in the OmniSettings management page over HTTPS.");
+                }
+                await pending.Task.WaitAsync(TimeSpan.FromDays(7));
+            }
+            catch { /* Timeout/notification failure leaves the setting unfulfilled. */ }
+            finally
+            {
+                if (ReferenceEquals(pending, completion))
+                {
+                    pendingSensitiveFulfillments.TryRemove(new KeyValuePair<string, TaskCompletionSource<bool>>(key, completion));
+                    completion.TrySetResult(false);
+                }
+            }
+            return settings.TryGetValue(key, out var refreshed) ? DecodeSetting(refreshed) : setting;
+        }
+
         public async Task<bool> GetBoolOmniSetting(string name, bool defaultValue = false, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
         {
             if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
@@ -336,11 +560,7 @@ namespace Omnipotent.Service_Manager
                 var setting = await GetOrCreateSettingAsync(name, OmniSettingType.Bool, defaultValue.ToString(), sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
                 return bool.TryParse(setting.Value, out var parsed) ? parsed : defaultValue;
             }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "GetBoolOmniSetting failed");
-                return defaultValue;
-            }
+            catch { throw new InvalidDataException("Protected settings could not be read safely."); }
         }
 
         public async Task<int> GetIntOmniSetting(string name, int defaultValue = 0, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
@@ -360,11 +580,7 @@ namespace Omnipotent.Service_Manager
                 var setting = await GetOrCreateSettingAsync(name, OmniSettingType.Int, defaultValue.ToString(), sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
                 return int.TryParse(setting.Value, out var parsed) ? parsed : defaultValue;
             }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "GetIntOmniSetting failed");
-                return defaultValue;
-            }
+            catch { throw new InvalidDataException("Protected settings could not be read safely."); }
         }
 
         public async Task<string> GetStringOmniSetting(string name, string defaultValue = null, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
@@ -384,11 +600,7 @@ namespace Omnipotent.Service_Manager
                 var setting = await GetOrCreateSettingAsync(name, OmniSettingType.String, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
                 return string.IsNullOrEmpty(setting.Value) ? defaultValue : setting.Value;
             }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "GetStringOmniSetting failed");
-                return defaultValue;
-            }
+            catch { throw new InvalidDataException("Protected settings could not be read safely."); }
         }
 
         public async Task<string> GetDropdownOmniSetting(string name, string defaultValue, IEnumerable<string> dropdownOptions, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
@@ -403,18 +615,14 @@ namespace Omnipotent.Service_Manager
                 parentServiceName = string.IsNullOrEmpty(parentServiceName) ? callerInfo.serviceName : parentServiceName;
             }
 
-            List<string> normalizedDropdownOptions = NormalizeDropdownOptions(dropdownOptions);
+            List<string> normalizedDropdownOptions = NormalizeDropdownOptions(dropdownOptions, enforceInputLimits: false);
 
             try
             {
                 var setting = await GetOrCreateSettingAsync(name, OmniSettingType.Dropdown, defaultValue, sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName, normalizedDropdownOptions);
                 return NormalizeDropdownValue(setting.Value, normalizedDropdownOptions);
             }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "GetDropdownOmniSetting failed");
-                return NormalizeDropdownValue(defaultValue, normalizedDropdownOptions);
-            }
+            catch { throw new InvalidDataException("Protected settings could not be read safely."); }
         }
 
         public async Task<List<string>> GetStringListOmniSetting(string name, IEnumerable<string> defaultValue = null, bool sensitive = false, bool askKlivesForFulfillment = false, string parentServiceId = null, string parentServiceName = null)
@@ -436,95 +644,87 @@ namespace Omnipotent.Service_Manager
                 var setting = await GetOrCreateSettingAsync(name, OmniSettingType.StringList, SerializeStringList(fallback), sensitive, askKlivesForFulfillment, parentServiceId, parentServiceName);
                 return DeserializeStringList(setting.Value);
             }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "GetStringListOmniSetting failed");
-                return fallback;
-            }
+            catch { throw new InvalidDataException("Protected settings could not be read safely."); }
         }
 
-        // --- Setters ---
-        public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null, OmniSettingType type = OmniSettingType.String, bool fulfilledViaApi = false, IEnumerable<string>? dropdownOptions = null)
+
+        public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null,
+            OmniSettingType type = OmniSettingType.String, bool fulfilledViaApi = false, IEnumerable<string>? dropdownOptions = null,
+            bool sensitive = false)
         {
             await EnsureSettingsLoadedAsync();
-
-            if (string.IsNullOrWhiteSpace(name)) throw new ArgumentException("Omni setting must have a name.", nameof(name));
             name = NormalizeSettingName(name);
-
-            List<string> normalizedDropdownOptions = NormalizeDropdownOptions(dropdownOptions);
-
-            if (type == OmniSettingType.Dropdown)
-            {
-                if (normalizedDropdownOptions.Count == 0)
-                {
-                    throw new ArgumentException("Dropdown settings must provide at least one option.", nameof(dropdownOptions));
-                }
-
-                value = NormalizeDropdownValue(value, normalizedDropdownOptions);
-            }
-
             if (string.IsNullOrEmpty(parentServiceId) || string.IsNullOrEmpty(parentServiceName))
             {
-                var ci = GetCallingServiceInfo();
-                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? ci.serviceId : parentServiceId;
-                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? ci.serviceName : parentServiceName;
+                var info = GetCallingServiceInfo();
+                parentServiceId = string.IsNullOrEmpty(parentServiceId) ? info.serviceId : parentServiceId;
+                parentServiceName = string.IsNullOrEmpty(parentServiceName) ? info.serviceName : parentServiceName;
             }
-
             parentServiceId = NormalizeParentServiceId(parentServiceId);
-
+            ValidateIdentityForAccess(name, parentServiceId);
+            if (fulfilledViaApi) ValidateValue(value);
+            if (!Enum.IsDefined(type)) throw new ArgumentException("Invalid setting type.");
+            OmniSettingsChangedEventArgs? change = null;
+            string resolvedKey = "";
+            await stateGate.WaitAsync();
             try
             {
-                var key = ComposeKey(parentServiceId, name);
-                bool isNewSetting = false;
-
-                if (!settings.TryGetValue(key, out var s))
+                var existing = ResolveExisting(name, parentServiceId);
+                string[] ownerKeys = Array.Empty<string>();
+                if (existing == null && !fulfilledViaApi
+                    && serviceSettingAliases.TryGetValue(ServiceAliasKey(name, parentServiceId, parentServiceName), out var alias))
                 {
-                    // Fallback to searching by name if ID was unfound (0) as it likely already exists
-                    if (parentServiceId == "0")
+                    if (settings.TryGetValue(alias.TargetKey, out var target) && SameOwner(target.ParentServiceName, parentServiceName))
                     {
-                        s = settings.Values.FirstOrDefault(x => NormalizeSettingName(x.Name).Equals(name, StringComparison.OrdinalIgnoreCase));
+                        var targetPlain = DecodeSetting(target);
+                        foreach (string key in alias.OwnerKeys)
+                        {
+                            if (settings.TryGetValue(key, out var sibling)
+                                && (!SameOwner(sibling.ParentServiceName, target.ParentServiceName)
+                                    || !SameConfiguration(DecodeSetting(sibling), targetPlain)))
+                                throw new ArgumentException("The saved service setting changed. Read its explicit scope again.");
+                        }
+                        existing = target;
+                        ownerKeys = alias.OwnerKeys;
                     }
-
-                    if (s == null)
-                    {
-                        s = new OmniSetting { Name = name, Type = type, Sensitive = false, ParentServiceId = parentServiceId, ParentServiceName = parentServiceName };
-                        settings[key] = s;
-                        isNewSetting = true;
-                    }
+                    else serviceSettingAliases.Remove(ServiceAliasKey(name, parentServiceId, parentServiceName));
                 }
-
-                MarkSettingUsedThisSession(s);
-
-                s.Type = type;
-                s.DropdownOptions = type == OmniSettingType.Dropdown ? normalizedDropdownOptions : new List<string>();
-
-                var resolvedKey = ComposeKey(s.ParentServiceId, s.Name);
-                if (fulfilledViaApi && pendingFulfillmentPromptIds.TryGetValue(resolvedKey, out var trackingId))
-                {
-                    try
-                    {
-                        await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("CancelTrackedTextPrompt",
-                            trackingId, $"Notification cancelled as {s.Name} was fulfilled via API instead.");
-                    }
-                    catch { }
-                }
-
-                var previousValue = s.Value;
-                if (!isNewSetting && string.Equals(previousValue, value, StringComparison.Ordinal))
-                {
-                    return true;
-                }
-
-                s.Value = value;
-                await SaveSettings();
-                RaiseSettingsChanged(s, previousValue, isNewSetting);
-                return true;
+                if (existing == null && parentServiceId == "0" && !fulfilledViaApi)
+                    existing = ResolveServiceSetting(name, parentServiceId, parentServiceName);
+                var plain = existing == null ? new OmniSetting { Name = name, Type = type, ParentServiceId = parentServiceId,
+                    ParentServiceName = parentServiceName, Value = "" } : DecodeSetting(existing);
+                string previousValue = plain.Value;
+                plain.Sensitive |= sensitive || IsCredentialName(name) || settings.Values.Any(s => s.Sensitive
+                    && s.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+                if (fulfilledViaApi && plain.Sensitive && value == SecretMask)
+                    throw new ArgumentException("Supply a replacement secret, not its mask.");
+                plain.Type = type;
+                plain.DropdownOptions = type == OmniSettingType.Dropdown
+                    ? NormalizeDropdownOptions(dropdownOptions ?? plain.DropdownOptions,
+                        enforceInputLimits: fulfilledViaApi && dropdownOptions != null) : new();
+                if (type == OmniSettingType.Dropdown && plain.DropdownOptions.Count == 0)
+                    throw new ArgumentException("Dropdown settings need options.");
+                if (fulfilledViaApi) ValidateApiValue(value, type, plain.DropdownOptions);
+                plain.Value = type == OmniSettingType.Dropdown ? NormalizeDropdownValue(value, plain.DropdownOptions) : value ?? "";
+                plain.HasValue = !string.IsNullOrEmpty(plain.Value);
+                plain.WasUsedThisSession = true;
+                await CommitSetting(EncodeSetting(plain), UpdatedOwnerCopies(plain, ownerKeys));
+                change = CreateChange(plain, previousValue, existing == null);
+                resolvedKey = ComposeKey(plain.ParentServiceId, plain.Name);
             }
-            catch (Exception ex)
+            catch (ArgumentException) { throw; }
+            catch { return false; }
+            finally { stateGate.Release(); }
+            RaiseSettingsChanged(change);
+            if (pendingSensitiveFulfillments.TryRemove(resolvedKey, out var sensitiveCompletion))
+                sensitiveCompletion.TrySetResult(true);
+            if (fulfilledViaApi && pendingFulfillmentPromptIds.TryRemove(resolvedKey, out var trackingId))
             {
-                await ServiceLogError(ex, "SetOmniSetting failed");
-                return false;
+                try { await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("CancelTrackedTextPrompt",
+                    trackingId, "Setting was fulfilled through the management API."); }
+                catch { }
             }
+            return true;
         }
 
         public Task<bool> SetBoolOmniSetting(string name, bool value, string parentServiceId = null, string parentServiceName = null) =>
@@ -575,325 +775,238 @@ namespace Omnipotent.Service_Manager
             return await SetStringListOmniSetting(name, current, parentServiceId, parentServiceName);
         }
 
-        public OmniSetting? FindExistingSetting(string name, string parentServiceId = null)
-        {
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                return null;
-            }
 
-            name = NormalizeSettingName(name);
-            string? normalizedParentServiceId = string.IsNullOrWhiteSpace(parentServiceId) ? null : NormalizeParentServiceId(parentServiceId);
 
-            if (normalizedParentServiceId != null && settings.TryGetValue(ComposeKey(normalizedParentServiceId, name), out var exactSetting))
-            {
-                return exactSetting;
-            }
-
-            return settings.Values.FirstOrDefault(setting =>
-                NormalizeSettingName(setting.Name).Equals(name, StringComparison.OrdinalIgnoreCase)
-                && (normalizedParentServiceId == null || NormalizeParentServiceId(setting.ParentServiceId) == normalizedParentServiceId));
-        }
+        // Metadata-only snapshots cannot expose or mutate the manager's stored records.
+        public OmniSetting? FindExistingSetting(string name, string parentServiceId = null) =>
+            string.IsNullOrWhiteSpace(name) ? null : (string.IsNullOrWhiteSpace(parentServiceId)
+                ? SelectCompatibleSetting(settings.Values.Where(s => s.Name.Equals(name.Trim(), StringComparison.OrdinalIgnoreCase)))
+                : ResolveExisting(name, parentServiceId)) is { } setting ? Redact(setting) : null;
 
         public async Task<bool> DeleteOmniSetting(string name, string parentServiceId = null)
         {
             await EnsureSettingsLoadedAsync();
-
-            if (string.IsNullOrWhiteSpace(name))
+            if (string.IsNullOrWhiteSpace(name)) return false;
+            await stateGate.WaitAsync();
+            try
             {
-                return false;
+                var existing = ResolveExisting(name, parentServiceId);
+                if (existing == null) return false;
+                string key = ComposeKey(existing.ParentServiceId, existing.Name);
+                var next = new ConcurrentDictionary<string, OmniSetting>(settings, StringComparer.OrdinalIgnoreCase);
+                next.TryRemove(key, out _);
+                protector.MarkMigrated(settingsFilePath);
+                await FileIOLock.WaitAsync();
+                try { await PersistSettingsLocked(next.Values); }
+                finally { FileIOLock.Release(); }
+                settings = next;
+                pendingFulfillmentPromptIds.TryRemove(key, out _);
+                if (pendingSensitiveFulfillments.TryRemove(key, out var pending)) pending.TrySetResult(false);
+                CacheDeps.Bump(CacheKey);
+                return true;
             }
-
-            OmniSetting? existingSetting = FindExistingSetting(name, parentServiceId);
-            if (existingSetting == null)
-            {
-                return false;
-            }
-
-            string resolvedKey = ComposeKey(existingSetting.ParentServiceId, existingSetting.Name);
-            bool removed = settings.TryRemove(resolvedKey, out _);
-            if (!removed)
-            {
-                return false;
-            }
-
-            pendingFulfillmentPromptIds.TryRemove(resolvedKey, out _);
-            await SaveSettings();
-            return true;
+            finally { stateGate.Release(); }
         }
 
-
-        // --- Utilities & Routes ---
         private (string serviceName, string serviceId) GetCallingServiceInfo()
         {
             try
             {
-                var current = Thread.CurrentThread;
-                var svc = GetActiveServices().FirstOrDefault(s => s.GetThread() == current);
-                if (svc != null)
-                {
-                    return (svc.GetName(), svc.serviceID);
-                }
+                var svc = GetActiveServices().FirstOrDefault(s => s.GetThread() == Thread.CurrentThread);
+                if (svc != null) return (svc.GetName(), svc.serviceID);
             }
             catch { }
             return ("UnknownService", "0");
         }
-
-        private static string NormalizeSettingName(string name) => (name ?? string.Empty).Trim();
-
+        private static string NormalizeSettingName(string name) => (name ?? "").Trim();
         private static string NormalizeParentServiceId(string parentServiceId) => string.IsNullOrWhiteSpace(parentServiceId) ? "0" : parentServiceId.Trim();
-
-        private static List<string> NormalizeDropdownOptions(IEnumerable<string>? dropdownOptions)
+        private static string ComposeKey(string parentServiceId, string name)
         {
-            return (dropdownOptions ?? Enumerable.Empty<string>())
-                .Select(option => option?.Trim())
-                .Where(option => string.IsNullOrWhiteSpace(option) == false)
-                .Cast<string>()
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            string parent = NormalizeParentServiceId(parentServiceId);
+            return $"{parent.Length}:{parent}{NormalizeSettingName(name)}";
         }
-
-        // Trims entries and drops null/whitespace-only ones, preserving order and duplicates.
-        private static List<string> NormalizeStringList(IEnumerable<string>? values)
+        private static void ValidateStoredIdentity(string name, string parentId)
         {
-            return (values ?? Enumerable.Empty<string>())
-                .Select(value => value?.Trim())
-                .Where(value => string.IsNullOrWhiteSpace(value) == false)
-                .Cast<string>()
-                .ToList();
+            if (string.IsNullOrWhiteSpace(name) || name.Length > OmniSettingsProtector.MaxIdentityCharacters
+                || parentId.Length > OmniSettingsProtector.MaxIdentityCharacters)
+                throw new ArgumentException("Invalid stored setting identity.");
         }
-
-        private static string SerializeStringList(IEnumerable<string>? values)
+        private void ValidateIdentityForAccess(string name, string parentId)
         {
-            return JsonConvert.SerializeObject(NormalizeStringList(values));
+            if (settings.Values.Any(s => s.Name.Equals(name, StringComparison.OrdinalIgnoreCase))) ValidateStoredIdentity(name, parentId);
+            else ValidateIdentity(name, parentId);
         }
-
-        // Parses a StringList setting's Value. Handles the normal JSON-array form and
-        // tolerates a legacy plain/newline-separated string so older values don't break.
-        private static List<string> DeserializeStringList(string? value)
+        private static void ValidateIdentity(string name, string parentId)
         {
-            if (string.IsNullOrWhiteSpace(value)) return new List<string>();
-
-            string trimmed = value.Trim();
-            if (trimmed.StartsWith("["))
+            if (string.IsNullOrWhiteSpace(name) || name.Length > 256 || parentId.Length > 128
+                || name.Any(char.IsControl) || parentId.Any(char.IsControl)) throw new ArgumentException("Invalid setting identity.");
+        }
+        private static void ValidateValue(string? value)
+        {
+            if (value?.Length > MaxValueLength) throw new ArgumentException("Setting value exceeds its size limit.");
+        }
+        private static void ValidateApiValue(string? value, OmniSettingType type, IReadOnlyList<string> options)
+        {
+            bool valid = type switch
+            {
+                OmniSettingType.Bool => bool.TryParse(value, out _),
+                OmniSettingType.Int => int.TryParse(value, out _),
+                OmniSettingType.Dropdown => options.Any(option => option.Equals(value?.Trim(), StringComparison.OrdinalIgnoreCase)),
+                _ => true
+            };
+            if (type == OmniSettingType.StringList)
             {
                 try
                 {
-                    var parsed = JsonConvert.DeserializeObject<List<string>>(trimmed);
-                    return NormalizeStringList(parsed);
+                    using var reader = new JsonTextReader(new StringReader(value ?? "")) { MaxDepth = 4 };
+                    var list = JArray.Load(reader);
+                    valid = list.All(entry => entry.Type == JTokenType.String) && !reader.Read();
                 }
-                catch { /* Fall through to legacy handling. */ }
+                catch (JsonException) { valid = false; }
             }
-
-            return NormalizeStringList(trimmed.Split('\n'));
+            if (!valid) throw new ArgumentException("Invalid value for this setting type.");
         }
-
-        private static bool DropdownOptionsMatch(IReadOnlyCollection<string>? left, IReadOnlyCollection<string>? right)
+        internal static bool IsCredentialName(string name)
         {
-            left ??= Array.Empty<string>();
-            right ??= Array.Empty<string>();
-
-            return left.Count == right.Count && left.SequenceEqual(right, StringComparer.OrdinalIgnoreCase);
+            string compact = new(name.Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
+            return new[] { "apikey", "password", "secret", "credential", "privatekey", "signingkey", "accesskey",
+                "connectionstring", "refreshtoken", "accesstoken", "authtoken", "oauthtoken", "bearertoken" }.Any(compact.Contains)
+                || compact.EndsWith("token") || compact.EndsWith("cookie") || compact.EndsWith("cookies");
         }
-
-        private static string NormalizeDropdownValue(string? value, IReadOnlyList<string> dropdownOptions)
+        private static List<string> NormalizeDropdownOptions(IEnumerable<string>? values, bool enforceInputLimits = true)
         {
-            if (dropdownOptions.Count == 0)
+            var result = NormalizeStringList(values).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            if (enforceInputLimits && (result.Count > 1024 || result.Sum(s => (long)s.Length) > MaxValueLength))
+                throw new ArgumentException("Too many dropdown options.");
+            return result;
+        }
+        private static List<string> NormalizeStringList(IEnumerable<string>? values) => (values ?? Enumerable.Empty<string>())
+            .Select(s => s?.Trim()).Where(s => !string.IsNullOrWhiteSpace(s)).Cast<string>().ToList();
+        private static string SerializeStringList(IEnumerable<string>? values) => JsonConvert.SerializeObject(NormalizeStringList(values));
+        private static List<string> DeserializeStringList(string? value)
+        {
+            if (string.IsNullOrWhiteSpace(value)) return new();
+            if (value.Trim().StartsWith("["))
             {
-                return string.Empty;
+                try { return NormalizeStringList(JsonConvert.DeserializeObject<List<string>>(value)); }
+                catch (JsonException) { }
             }
+            return NormalizeStringList(value.Split('\n'));
+        }
+        private static string NormalizeDropdownValue(string? value, IReadOnlyList<string> options) => options.Count == 0 ? ""
+            : options.FirstOrDefault(s => s.Equals(value?.Trim(), StringComparison.OrdinalIgnoreCase)) ?? options[0];
 
-            if (string.IsNullOrWhiteSpace(value))
+        private static OmniSettingsChangedEventArgs CreateChange(OmniSetting plain, string previous, bool isNew) => new()
+        {
+            Setting = Redact(plain), PreviousValue = plain.Sensitive ? (string.IsNullOrEmpty(previous) ? "" : SecretMask) : previous,
+            IsNewSetting = isNew, ValueChanged = !string.Equals(previous, plain.Value, StringComparison.Ordinal)
+        };
+        private void RaiseSettingsChanged(OmniSettingsChangedEventArgs? change)
+        {
+            if (change == null || OnSettingsChanged == null) return;
+            foreach (EventHandler<OmniSettingsChangedEventArgs> subscriber in OnSettingsChanged.GetInvocationList())
             {
-                return dropdownOptions[0];
+                try { subscriber(this, new() { Setting = Copy(change.Setting), PreviousValue = change.PreviousValue,
+                    IsNewSetting = change.IsNewSetting, ValueChanged = change.ValueChanged }); }
+                catch { }
             }
-
-            string trimmedValue = value.Trim();
-            string? matchedValue = dropdownOptions.FirstOrDefault(option => option.Equals(trimmedValue, StringComparison.OrdinalIgnoreCase));
-            return matchedValue ?? dropdownOptions[0];
         }
-
-        private static void MarkSettingUsedThisSession(OmniSetting setting)
+        private static object ApiView(OmniSetting s)
         {
-            // WasUsedThisSession is exposed by /List and /Get but never persisted, so
-            // SaveSettings won't fire on the flip — bump directly (once, on false→true).
-            if (!setting.WasUsedThisSession)
+            var safe = Redact(s);
+            return new { safe.Name, safe.Type, safe.Sensitive, safe.ParentServiceId, safe.ParentServiceName,
+                safe.WasUsedThisSession, safe.HasValue, safe.DropdownOptions, safe.Value };
+        }
+        private static JObject ParseRequest(string content)
+        {
+            if (string.IsNullOrEmpty(content) || content.Length > MaxRequestBodyBytes) throw new ArgumentException("Invalid settings request.");
+            using var reader = new JsonTextReader(new StringReader(content)) { MaxDepth = 8 };
+            var obj = JObject.Load(reader, new JsonLoadSettings { DuplicatePropertyNameHandling = DuplicatePropertyNameHandling.Error });
+            if (reader.Read()) throw new ArgumentException("Invalid settings request.");
+            return obj;
+        }
+        private static string? RequestString(JObject obj, string field, bool required = false)
+        {
+            var value = obj[field];
+            if (value == null || value.Type == JTokenType.Null)
             {
-                setting.WasUsedThisSession = true;
-                CacheDeps.Bump(CacheKey);
+                if (required) throw new ArgumentException("Missing setting field.");
+                return null;
             }
-        }
-
-        private string ComposeKey(string parentServiceId, string name) => $"{NormalizeParentServiceId(parentServiceId)}:{NormalizeSettingName(name)}";
-
-        private void RaiseSettingsChanged(OmniSetting setting, string previousValue, bool isNewSetting)
-        {
-            OnSettingsChanged?.Invoke(this, new OmniSettingsChangedEventArgs
-            {
-                Setting = setting,
-                PreviousValue = previousValue,
-                IsNewSetting = isNewSetting
-            });
-        }
-
-        private string MaskSensitive(string v)
-        {
-            if (string.IsNullOrEmpty(v)) return v;
-            if (v.Length <= 4) return new string('*', v.Length);
-            return new string('*', v.Length - 4) + v.Substring(v.Length - 4);
+            if (value.Type != JTokenType.String) throw new ArgumentException("Invalid setting field.");
+            return value.Value<string>();
         }
 
         private async Task CreateRoutesAsync()
         {
-            await CreateAPIRoute("/OmniGlobalSettings/List", async (req) =>
+            await CreateAPIRoute("/OmniGlobalSettings/List", async req =>
             {
-                try
-                {
-                    CacheDeps.NoteRead(CacheKey);
-                    var reveal = req.userParameters?.Get("revealSensitive");
-                    bool revealSensitive = false;
-                    if (!string.IsNullOrEmpty(reveal) && bool.TryParse(reveal, out var rv)) revealSensitive = rv;
-
-                    var list = settings.Values.Select(s => new
-                    {
-                        s.Name,
-                        s.Type,
-                        s.Sensitive,
-                        s.ParentServiceId,
-                        s.ParentServiceName,
-                        s.WasUsedThisSession,
-                        s.DropdownOptions,
-                        Value = (s.Sensitive && !revealSensitive) ? MaskSensitive(s.Value) : s.Value
-                    }).ToList();
-
-                    await req.ReturnResponse(JsonConvert.SerializeObject(list), "application/json");
-                }
-                catch (Exception ex)
-                {
-                    await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
+                CacheDeps.MarkUncacheable("protected-settings");
+                await req.ReturnResponse(JsonConvert.SerializeObject(settings.Values.Select(ApiView)), "application/json");
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Klives);
 
-            await CreateAPIRoute("/OmniGlobalSettings/Get", async (req) =>
+            await CreateAPIRoute("/OmniGlobalSettings/Get", async req =>
             {
+                CacheDeps.MarkUncacheable("protected-settings");
                 try
                 {
-                    CacheDeps.NoteRead(CacheKey);
-                    var name = req.userParameters.Get("name");
-                    var parentId = req.userParameters.Get("parentServiceId");
-
-                    if (string.IsNullOrEmpty(name)) { await req.ReturnResponse("MissingName", code: HttpStatusCode.BadRequest); return; }
-
-                    OmniSetting s = null;
-                    if (!string.IsNullOrEmpty(parentId))
-                    {
-                        settings.TryGetValue(ComposeKey(parentId, name), out s);
-                    }
-                    
-                    if (s == null)
-                    {
-                        s = settings.Values.FirstOrDefault(x => NormalizeSettingName(x.Name).Equals(NormalizeSettingName(name), StringComparison.OrdinalIgnoreCase));
-                    }
-
-                    if (s == null) { await req.ReturnResponse("NotFound", code: HttpStatusCode.NotFound); return; }
-
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        s.Name,
-                        s.Type,
-                        s.Sensitive,
-                        s.ParentServiceId,
-                        s.ParentServiceName,
-                        s.WasUsedThisSession,
-                        s.DropdownOptions,
-                        Value = s.Sensitive ? MaskSensitive(s.Value) : s.Value
-                    }), "application/json");
+                    string name = req.userParameters?.Get("name");
+                    string parentId = req.userParameters?.Get("parentServiceId");
+                    ValidateIdentityForAccess(NormalizeSettingName(name), NormalizeParentServiceId(parentId));
+                    var setting = ResolveExisting(name, parentId);
+                    if (setting == null) { await req.ReturnResponse("NotFound", code: HttpStatusCode.NotFound); return; }
+                    await req.ReturnResponse(JsonConvert.SerializeObject(ApiView(setting)), "application/json");
                 }
-                catch (Exception ex)
-                {
-                    await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
+                catch (ArgumentException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
+                catch { await req.ReturnResponse("SettingsUnavailable", code: HttpStatusCode.InternalServerError); }
             }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Klives);
 
-            await CreateAPIRoute("/OmniGlobalSettings/Set", async (req) =>
+            await CreateBufferedAPIRoute("/OmniGlobalSettings/Set", async req =>
             {
+                CacheDeps.MarkUncacheable("protected-settings");
                 try
                 {
-                    var obj = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
-                    string name = obj.name;
-                    string value = obj.value;
-                    string parentId = obj.parentServiceId;
-                    string parentName = obj.parentServiceName;
-
-                    if (string.IsNullOrEmpty(name)) { await req.ReturnResponse("MissingName", code: HttpStatusCode.BadRequest); return; }
-
-                    OmniSetting existingSetting = null;
-
-                    if (!string.IsNullOrEmpty(parentId))
+                    var obj = ParseRequest(req.userMessageContent);
+                    string name = RequestString(obj, "name", required: true);
+                    string value = RequestString(obj, "value", required: true);
+                    string parentId = RequestString(obj, "parentServiceId");
+                    string parentName = RequestString(obj, "parentServiceName");
+                    ValidateIdentityForAccess(NormalizeSettingName(name), NormalizeParentServiceId(parentId));
+                    ValidateValue(value);
+                    bool sensitive = false;
+                    if (obj["sensitive"] != null)
                     {
-                        settings.TryGetValue(ComposeKey(parentId, name), out existingSetting);
+                        if (obj["sensitive"]!.Type != JTokenType.Boolean) throw new ArgumentException("Invalid sensitive flag.");
+                        sensitive = obj["sensitive"]!.Value<bool>();
                     }
-
-                    if (string.IsNullOrEmpty(parentId))
-                    {
-                        var existing = settings.Values.FirstOrDefault(x => x.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
-                        if (existing != null)
-                        {
-                            existingSetting = existing;
-                            parentId = existing.ParentServiceId;
-                            parentName = existing.ParentServiceName;
-                        }
-                        else
-                        {
-                            parentId = "0";
-                            parentName = "API/Global";
-                        }
-                    }
-
-                    await SetOmniSetting(
-                        name,
-                        value,
-                        parentId,
-                        parentName,
-                        existingSetting?.Type ?? OmniSettingType.String,
-                        fulfilledViaApi: true,
-                        dropdownOptions: existingSetting?.DropdownOptions);
-                    await req.ReturnResponse("OK");
+                    var existing = ResolveExisting(name, parentId);
+                    parentId = existing?.ParentServiceId ?? parentId ?? "0";
+                    parentName = existing?.ParentServiceName ?? parentName ?? "API/Global";
+                    bool saved = await SetOmniSetting(name, value, parentId, parentName, existing?.Type ?? OmniSettingType.String,
+                        fulfilledViaApi: true, sensitive: sensitive);
+                    await req.ReturnResponse(saved ? "OK" : "SettingsUnavailable", code: saved ? HttpStatusCode.OK : HttpStatusCode.InternalServerError);
                 }
-                catch (Exception ex)
-                {
-                    await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
+                catch (ArgumentException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
+                catch (JsonException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
+                catch { await req.ReturnResponse("SettingsUnavailable", code: HttpStatusCode.InternalServerError); }
+            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives, MaxRequestBodyBytes);
 
-            await CreateAPIRoute("/OmniGlobalSettings/Delete", async (req) =>
+            await CreateBufferedAPIRoute("/OmniGlobalSettings/Delete", async req =>
             {
+                CacheDeps.MarkUncacheable("protected-settings");
                 try
                 {
-                    var obj = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
-                    string name = obj?.name;
-                    string parentId = obj?.parentServiceId;
-
-                    if (string.IsNullOrWhiteSpace(name))
-                    {
-                        await req.ReturnResponse("MissingName", code: HttpStatusCode.BadRequest);
-                        return;
-                    }
-
+                    var obj = ParseRequest(req.userMessageContent);
+                    string name = RequestString(obj, "name", required: true);
+                    string parentId = RequestString(obj, "parentServiceId");
+                    ValidateIdentityForAccess(NormalizeSettingName(name), NormalizeParentServiceId(parentId));
                     bool deleted = await DeleteOmniSetting(name, parentId);
-                    if (!deleted)
-                    {
-                        await req.ReturnResponse("NotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-
-                    await req.ReturnResponse("Deleted", code: HttpStatusCode.OK);
+                    await req.ReturnResponse(deleted ? "Deleted" : "NotFound", code: deleted ? HttpStatusCode.OK : HttpStatusCode.NotFound);
                 }
-                catch (Exception ex)
-                {
-                    await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
+                catch (ArgumentException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
+                catch (JsonException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
+                catch { await req.ReturnResponse("SettingsUnavailable", code: HttpStatusCode.InternalServerError); }
+            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives, MaxRequestBodyBytes);
         }
     }
 }

@@ -486,13 +486,16 @@ namespace Omnipotent.Services.OmniGram
         private async Task<string?> GetLegacySettingValueAsync(string settingName)
         {
             var settingsManager = await service.GetOmniGlobalSettingsManager();
-            return settingsManager.FindExistingSetting(settingName)?.Value;
+            var setting = settingsManager.FindExistingSetting(settingName);
+            return setting == null ? null : await settingsManager.GetStringOmniSetting(settingName, sensitive: true,
+                parentServiceId: setting.ParentServiceId, parentServiceName: setting.ParentServiceName);
         }
 
         private async Task DeleteLegacyPasswordSettingAsync(string username)
         {
             var settingsManager = await service.GetOmniGlobalSettingsManager();
-            await settingsManager.DeleteOmniSetting($"OmniGram_AccountPassword_{username}");
+            var setting = settingsManager.FindExistingSetting($"OmniGram_AccountPassword_{username}");
+            if (setting != null) await settingsManager.DeleteOmniSetting(setting.Name, setting.ParentServiceId);
         }
 
         public async Task SaveAllAccountsToDisk()

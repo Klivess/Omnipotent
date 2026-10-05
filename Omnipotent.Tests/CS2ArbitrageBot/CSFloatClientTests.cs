@@ -131,6 +131,69 @@ public class CSFloatClientTests
     }
 
     [Fact]
+    public void ParsesRecentSalesWithTimeOnMarketAndValueAtSaleTime()
+    {
+        // Trimmed from a live /history/{name}/sales response (Oct 2026).
+        string body = "[{\"id\":\"1021205477226315826\",\"created_at\":\"2026-09-18T23:45:58.852003Z\",\"type\":\"buy_now\",\"price\":383,\"state\":\"sold\"," +
+                      "\"reference\":{\"base_price\":377,\"float_factor\":0.998091,\"predicted_price\":376,\"quantity\":10132,\"last_updated\":\"2026-10-04T17:57:14.496848Z\",\"sticker_overpay\":{}}," +
+                      "\"item\":{\"asset_id\":\"34531654000\",\"float_value\":0.3400673270225525,\"market_hash_name\":\"AK-47 | Slate (Field-Tested)\",\"stickers\":[{},{}]},\"sold_at\":\"2026-10-04T21:15:29.919442Z\"}," +
+                      "{\"id\":\"2\",\"price\":0,\"sold_at\":\"2026-10-04T21:00:00Z\"},{\"id\":\"3\",\"price\":400}]";
+        var sale = Assert.Single(CSFloatWrapper.ParseRecentSales(body));
+        Assert.Equal(383, sale.PriceCents);
+        Assert.Equal(376, sale.PredictedPriceCents);
+        Assert.Equal(383 / 376.0, sale.ValueRatio!.Value, 9);
+        Assert.InRange(sale.DaysOnMarket, 15.8, 15.9);
+        Assert.Equal(2, sale.StickerCount);
+        Assert.Equal(0.3400673270225525, sale.FloatValue);
+    }
+
+    [Fact]
+    public void TheDailyGraphKeepsOnlyRealDays()
+    {
+        var graph = CSFloatWrapper.ParseSalesGraph("[{\"count\":62,\"day\":\"2026-10-04T00:00:00Z\",\"avg_price\":476.2},{\"count\":84,\"day\":\"2026-10-03T00:00:00Z\",\"avg_price\":541.6},{\"count\":3}]");
+        Assert.Equal(2, graph.Count);
+        Assert.Equal(new DateTime(2026, 10, 4, 0, 0, 0, DateTimeKind.Utc), graph[0].DayUtc);
+        Assert.Equal(62, graph[0].Count);
+    }
+
+    [Fact]
+    public async Task RepricingAndDelistingUseTheBulkEndpoints()
+    {
+        var handler = new FakeHttpHandler((request, _) => request.RequestUri!.AbsolutePath.EndsWith("bulk-modify")
+            ? FakeHttpHandler.Json("{\"data\":[{\"id\":\"777\",\"price\":412,\"state\":\"listed\"}]}")
+            : FakeHttpHandler.Json("{\"message\":\"delisted\"}"));
+        var client = new CSFloatWrapper(null, new HttpClient(handler));
+
+        Assert.Equal(412, await client.UpdateListingPriceAsync("777", 412));
+        await client.DelistAsync("777");
+
+        var (method, url, body) = handler.Requests[0];
+        Assert.Equal(HttpMethod.Patch, method);
+        Assert.Equal("https://csfloat.com/api/v1/listings/bulk-modify", url);
+        var modification = JObject.Parse(body!)["modifications"]![0]!;
+        Assert.Equal("777", (string)modification["contract_id"]!);
+        Assert.Equal(412, (int)modification["price"]!);
+
+        (method, url, body) = handler.Requests[1];
+        Assert.Equal(HttpMethod.Patch, method);
+        Assert.Equal("https://csfloat.com/api/v1/listings/bulk-delist", url);
+        Assert.Equal("777", (string)JObject.Parse(body!)["contract_ids"]![0]!);
+    }
+
+    [Fact]
+    public async Task PerSaleHistoryHasItsOwnRateWindow()
+    {
+        // Measured: /sales and /graph report different remaining counts and resets, i.e. separate windows.
+        long reset = DateTimeOffset.UtcNow.AddHours(10).ToUnixTimeSeconds();
+        var handler = new FakeHttpHandler((_, _) => FakeHttpHandler.Json("[]", headers: new() { ["x-ratelimit-limit"] = "500", ["x-ratelimit-remaining"] = "3", ["x-ratelimit-reset"] = reset.ToString() }));
+        var client = new CSFloatWrapper(null, new HttpClient(handler));
+        await client.GetRecentSalesAsync("Recoil Case");
+        Assert.Equal(3, client.RateLimits.Get(CSFloatWrapper.HistorySalesBucket).Remaining);
+        Assert.True(client.RateLimits.CanSpend(CSFloatWrapper.HistoryBucket, 100));
+        Assert.EndsWith("/history/Recoil%20Case/sales", handler.Requests.Single().Url);
+    }
+
+    [Fact]
     public async Task ExchangeRatesExposeGbpPerUsd()
     {
         var handler = new FakeHttpHandler((_, _) => FakeHttpHandler.Json("{\"data\":{\"gbp\":0.755163,\"eur\":0.888662,\"usd\":1}}"));

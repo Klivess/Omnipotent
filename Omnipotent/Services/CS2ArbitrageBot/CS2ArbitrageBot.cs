@@ -26,7 +26,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
     /// offers, its conversion coefficient was silently a hard-coded 0.75, and its startup loaded every
     /// listing it had ever evaluated before registering routes. See Engine/ for the replacement pipeline.
     /// </summary>
-    public class CS2ArbitrageBot : OmniService, ISnipeHost
+    public class CS2ArbitrageBot : OmniService, ISnipeHost, IExitHost
     {
         // ── Public state other code reads ──
         public double? ExchangeRate;
@@ -37,6 +37,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public CSFloatWrapper.CSFloatAccountInformation? csfloatAccountInformation;
         public SteamAPIProfileWrapper.SteamBalance? steamBalance;
         public SnipeEngine? Engine { get; private set; }
+        public ExitManager? Exits { get; private set; }
         public LiquidityPlan? CurrentLiquidityPlan { get; private set; }
         public ConversionModelSnapshot? CurrentConversionModel { get; private set; }
 
@@ -63,6 +64,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private DateTime? lastTradePollUtc;
         private string? lastTradePollError;
         private bool automationEnabled;
+        private ExitSignalsProvider exitSignals = null!;
+        private MarketDriftModel marketModel = new();
+        private volatile TradeTimeline tradeTimeline = new();
+        private (DateTime At, ExitCalibrationSnapshot Value) exitCalibration = (DateTime.MinValue, ExitCalibrationSnapshot.Neutral);
+        private readonly ConcurrentDictionary<string, byte> reviewsInFlight = new();
 
         private sealed class JsonSnapshot
         {
@@ -94,6 +100,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private static string LiquidityPlanSnapshotPath => Path.Combine(LabsDirectory, "liquidity-plan.snapshot.json");
         private static string ConversionModelPath => Path.Combine(LabsDirectory, "conversion-model.json");
         private static string BookCachePath => Path.Combine(LabsDirectory, "steam-book-cache.json");
+        private static string MarketModelPath => Path.Combine(LabsDirectory, "market-drift-model.json");
+        private static string TradeTimelinePath => Path.Combine(LabsDirectory, "trade-timeline.json");
 
         // ───────────────────────────── Startup ─────────────────────────────
 
@@ -137,6 +145,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             Engine!.Start(ct);
             _ = Task.Run(() => TradeMonitorLoopAsync(ct));
             _ = Task.Run(() => SaleSchedulerLoopAsync(ct));
+            _ = Task.Run(() => ListingReviewLoopAsync(ct));
             _ = Task.Run(() => HealthLoopAsync(ct));
             if (await GetTimeManagerService().GetTask("RecordCSFloatAndSteamBalance") == null) _ = RecordDailyBalancesAsync();
             startupState = "running";
@@ -159,7 +168,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             scanalytics = new Scanalytics(this);
             await scanalytics.LoadAsync();
             await LoadSnapshotsAsync();
+            exitSignals = new ExitSignalsProvider(csFloatWrapper, steamAPIWrapper.Market);
             Engine = new SnipeEngine(this);
+            Exits = new ExitManager(this);
             try { await RefreshBalanceAsync(true, cancellationToken.Token); }
             catch (Exception ex) { await ServiceLogError(ex, "Couldn't read the CSFloat balance at startup.", false); }
             QueueAnalyticsRefresh();
@@ -195,6 +206,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
             }
             catch (Exception ex) { await ServiceLogError(ex, "Couldn't read the saved Steam order-book cache.", false); }
+            try
+            {
+                if (File.Exists(MarketModelPath))
+                    marketModel = JsonConvert.DeserializeObject<MarketDriftModel>(await File.ReadAllTextAsync(MarketModelPath)) ?? new MarketDriftModel();
+            }
+            catch (Exception ex) { await ServiceLogError(ex, "Couldn't read the saved market drift model; starting from the backtested defaults.", false); }
+            try
+            {
+                if (File.Exists(TradeTimelinePath))
+                    tradeTimeline = JsonConvert.DeserializeObject<TradeTimeline>(await File.ReadAllTextAsync(TradeTimelinePath)) ?? new TradeTimeline();
+            }
+            catch (Exception ex) { await ServiceLogError(ex, "Couldn't read the saved trade timeline; using the measured defaults.", false); }
         }
 
         private async Task<EngineSettings> LoadEngineSettingsAsync()
@@ -221,7 +244,19 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             s.SteamRequestSpacingMs = Math.Max(250, await GetIntOmniSetting("CS2ArbitrageSteamRequestSpacingMs", 1000));
             s.AlertOnUnboughtOpportunities = await GetBoolOmniSetting("CS2ArbitrageAlertOnUnboughtOpportunities", true);
             // The relist exit pays this account's actual CSFloat seller fee (2% today, read from /me).
-            if (csfloatAccountInformation?.Fee is double fee and > 0 and < 0.5) s.Evaluation.CSFloatSellerFee = fee;
+            if (csfloatAccountInformation?.Fee is double fee and > 0 and < 0.5)
+            {
+                s.Evaluation.CSFloatSellerFee = fee;
+                s.Exit.SellerFee = fee;
+            }
+            // Exit model economics (see Docs/cs2-arbitrage-bot.md, "Exit model").
+            s.Exit.CapitalCostPerDay = Math.Clamp(await GetIntOmniSetting("CS2ArbitrageCapitalCostBasisPointsPerDay", 20), 0, 500) / 10_000.0;
+            s.Exit.RiskAversion = Math.Clamp(await GetIntOmniSetting("CS2ArbitrageRiskAversionTenths", 20), 0, 200) / 10.0;
+            s.Exit.RelistHorizonDays = Math.Clamp(await GetIntOmniSetting("CS2ArbitrageRelistHorizonDays", 21), 3, 120);
+            s.Exit.MinimumSteamBuyOrders = s.Evaluation.MinimumSteamBuyOrders;
+            s.AutoManageRelists = await GetBoolOmniSetting("CS2ArbitrageAutoManageRelists", true);
+            s.SteamConfirmHours = Math.Clamp(await GetIntOmniSetting("CS2ArbitrageSteamConfirmHours", 12), 0, 168);
+            s.SteamWalletCapUsd = Math.Max(0, await GetIntOmniSetting("CS2ArbitrageSteamWalletCapDollars", 2000));
             return s;
         }
 
@@ -281,6 +316,111 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         double ISnipeHost.GbpPerUsd => ExchangeRate ?? 0;
         double ISnipeHost.ConversionCoefficient => CurrentConversionCoefficient;
         int? ISnipeHost.BalanceCents => csfloatAccountInformation?.BalanceInCents;
+        ExitSignalsProvider ISnipeHost.ExitSignals => exitSignals;
+        MarketDriftModel ISnipeHost.MarketModel => marketModel;
+        ExitCalibrationSnapshot ISnipeHost.ExitCalibration => CurrentExitCalibration;
+        string? ISnipeHost.OwnSteamId => OwnSteamId;
+
+        /// <summary>What the bot's own exits say about the exit model (recomputed at most every 10 minutes).</summary>
+        public ExitCalibrationSnapshot CurrentExitCalibration
+        {
+            get
+            {
+                var cached = exitCalibration;
+                if (DateTime.UtcNow - cached.At < TimeSpan.FromMinutes(10)) return cached.Value;
+                var fresh = scanalytics == null ? ExitCalibrationSnapshot.Neutral : ExitCalibration.Compute(scanalytics.PurchasesSnapshot(), DateTime.UtcNow);
+                exitCalibration = (DateTime.UtcNow, fresh);
+                return fresh;
+            }
+        }
+
+        public string? OwnSteamId => string.IsNullOrEmpty(csfloatAccountInformation?.SteamID) ? null : csfloatAccountInformation.SteamID;
+
+        private object CurrentExitEnvironmentSummary()
+        {
+            var env = CurrentExitEnvironment;
+            return new
+            {
+                timeline = env.Timeline.Describe(),
+                converterHoldGrowth = Math.Round(env.ConverterHoldGrowth, 4),
+                converterHoldSigma = Math.Round(env.ConverterHoldSigma, 4),
+                steamWalletHeadroomGbp = env.SteamWalletHeadroomPence is double h ? Math.Round(h / 100, 2) : (double?)null,
+                csfloatSellingPaused = env.CSFloatSellingPaused,
+            };
+        }
+
+        ExitEnvironment ISnipeHost.ExitEnvironment => CurrentExitEnvironment;
+        ExitEnvironment IExitHost.ExitEnvironment => CurrentExitEnvironment;
+
+        /// <summary>
+        /// The locks, holds and limits every exit decision runs against: the measured trade timeline (with the human
+        /// confirmation step from settings), the converters' price risk over Steam's 7-day hold, the room left in the
+        /// Steam wallet (after Steam sales still pending), Steam's listing limit, and whether CSFloat selling is paused.
+        /// </summary>
+        public ExitEnvironment CurrentExitEnvironment
+        {
+            get
+            {
+                var settings = engineSettings;
+                var timeline = tradeTimeline.Clone();
+                timeline.SteamConfirmDays = settings.SteamConfirmHours / 24.0;
+                var (growth, sigma) = ConversionModel.HoldRisk(CurrentConversionModel, marketModel, timeline.ConverterHoldDays);
+                double fx = ExchangeRate ?? 0;
+                double? headroom = null;
+                if (steamBalance is { } wallet && fx > 0 && settings.SteamWalletCapUsd > 0)
+                {
+                    double pendingProceeds = scanalytics?.PurchasesSnapshot()
+                        .Where(p => p.CurrentStrategicStage == StrategicStages.WaitingForMarketSaleOnSteam && p.ActualSalePriceOnSteam > 0)
+                        .Sum(p => ArbitrageMath.SteamSellerReceives((int)Math.Round(p.ActualSalePriceOnSteam * 100))) ?? 0;
+                    headroom = settings.SteamWalletCapUsd * 100 * fx - wallet.TotalBalanceInPounds * 100 - pendingProceeds;
+                }
+                return new ExitEnvironment
+                {
+                    Timeline = timeline,
+                    ConverterHoldGrowth = growth,
+                    ConverterHoldSigma = sigma,
+                    SteamWalletHeadroomPence = headroom,
+                    SteamMaxListingPence = fx > 0 && settings.SteamMaxListingUsd > 0 ? settings.SteamMaxListingUsd * 100 * fx : null,
+                    CSFloatSellingPaused = csfloatAccountInformation?.Away ?? false,
+                };
+            }
+        }
+
+        // ───────────────────────────── IExitHost ─────────────────────────────
+
+        ExitSignalsProvider IExitHost.ExitSignals => exitSignals;
+        EngineSettings IExitHost.Settings => engineSettings;
+        double IExitHost.GbpPerUsd => ExchangeRate ?? 0;
+        double IExitHost.ConversionCoefficient => CurrentConversionCoefficient;
+        MarketDriftModel IExitHost.MarketModel => marketModel;
+        ExitCalibrationSnapshot IExitHost.ExitCalibration => CurrentExitCalibration;
+        string? IExitHost.OwnSteamId => OwnSteamId;
+        Task<bool> IExitHost.SellOnSteamAsync(PurchasedListing position, int pricePence) => SellSkinOnSteam(position, pricePence);
+        Task<string?> IExitHost.ListOnCSFloatAsync(PurchasedListing position, int priceCents, CancellationToken ct) => ListOnCSFloatAsync(position, priceCents, ct);
+        Task IExitHost.SaveAsync(PurchasedListing position) => scanalytics.UpdatePurchasedListing(position);
+        Task IExitHost.NotifyAsync(PurchasedListing position, string title, string message) =>
+            SendEmbedAsync(title, message, DiscordColor.Teal, position.comparison?.CSFloatListing.ImageURL);
+        Task IExitHost.AlertAsync(string key, string title, string message) => AlertKlivesAsync(key, title, message, TimeSpan.FromHours(12));
+        void IExitHost.Log(string message) => _ = ServiceLog(message, false);
+
+        async Task<bool> IExitHost.RepriceOnCSFloatAsync(PurchasedListing position, int priceCents, CancellationToken ct)
+        {
+            try
+            {
+                int? confirmed = await csFloatWrapper.UpdateListingPriceAsync(position.CSFloatResaleListingID, priceCents, ct);
+                if (confirmed is int c && c != priceCents)
+                    await ServiceLogError($"CSFloat re-priced {position.ItemMarketHashName} to {c}c instead of {priceCents}c.", false);
+                return true;
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                await ServiceLogError(ex, $"Couldn't re-price the CSFloat listing for {position.ItemMarketHashName}.", false);
+                return false;
+            }
+        }
+
+        async Task IExitHost.DelistFromCSFloatAsync(PurchasedListing position, CancellationToken ct) =>
+            await csFloatWrapper.DelistAsync(position.CSFloatResaleListingID, ct);
 
         public async Task RefreshBalanceAsync(bool force, CancellationToken ct)
         {
@@ -341,6 +481,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             double fx = ExchangeRate ?? 0;
             var chosen = evaluation.BestRoute == ExitRoute.CSFloatRelist ? evaluation.Relist : evaluation.Steam;
+            // The exit model's valuation (risk-adjusted, after time and fees) when it ran; the screen's otherwise.
+            var plan = evaluation.ExitPlan;
+            int expectedCash = plan?.Best != null ? (int)Math.Floor(plan.Best.CertaintyEquivalentPence) : chosen.NetCashPence;
+            int expectedProfit = plan?.Best != null ? plan.ProfitPence : chosen.ProfitPence;
+            double expectedRoi = plan?.Best != null ? plan.Roi : chosen.Roi;
+            int anchor = SnipeEngine.PurchaseAnchorCents(listing);
             var purchase = new PurchasedListing
             {
                 comparison = ScannedComparison.FromEvaluation(listing, book, evaluation, fx),
@@ -352,12 +498,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 PlannedExit = evaluation.BestRoute.ToString(),
                 PurchasePriceCents = listing.PriceCents,
                 PurchaseCostPence = evaluation.CostPence,
-                ExpectedNetCashPence = chosen.NetCashPence,
-                ExpectedAbsoluteProfitInPence = chosen.ProfitPence,
-                ExpectedAbsoluteProfitInPounds = chosen.ProfitPence / 100f,
-                ExpectedProfitPercentage = (float)(chosen.Roi * 100),
+                ExpectedNetCashPence = expectedCash,
+                ExpectedAbsoluteProfitInPence = expectedProfit,
+                ExpectedAbsoluteProfitInPounds = expectedProfit / 100f,
+                ExpectedProfitPercentage = (float)(expectedRoi * 100),
                 ConversionCoefficientAtPurchase = evaluation.ConversionCoefficient,
                 PurchaseSource = evaluation.Source,
+                AnchorCentsAtPurchase = anchor,
+                AnchorFloatFactor = listing.BasePriceCents is > 0 && anchor > 0 ? anchor / (double)listing.BasePriceCents.Value : 1,
+                PurchasePlan = plan == null ? null : ExitDecision.From(plan, "purchase", "buy", book?.PriceAtBuyDepth(3) ?? 0, anchor),
             };
             await scanalytics.UpdatePurchasedListing(purchase);
             await ServiceLog($"Bought {listing.MarketHashName} ({listing.Id}) for ${listing.PriceCents / 100.0:F2}: {evaluation.Reason}");
@@ -415,9 +564,24 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                    $"Steam: buy order £{e.SteamHighestBuyOrderPence / 100.0:F2}, ask £{e.SteamLowestSellOrderPence / 100.0:F2}, {e.SteamBuyOrderCount} orders\n" +
                    Exit(e.Steam, $"Sell on Steam (k={e.ConversionCoefficient:F2})") + "\n" +
                    Exit(e.Relist, "Relist on CSFloat") + "\n" +
-                   (e.TrendFactor < 0.999 ? $"Projected price change over the 7-day hold: {e.TrendFactor - 1:P1} (already priced in)\n" : "") +
-                   $"Found via {e.Source}, listed {(DateTime.UtcNow - listing.CreatedAtUtc).TotalSeconds:F0}s ago\n" +
+                   (e.ExitModelChecked
+                       ? $"**Exit model** (live evidence; worth {e.BestRoi:P1} after time, risk and fees): {e.ExitModelSummary}" +
+                         (e.CSFloatSalesPerDay > 0 ? $"\nCSFloat demand: {e.CSFloatSalesPerDay:0.##} sales/day" : "") +
+                         (e.MissingSignals is { Count: > 0 } missing ? $"\nMissing evidence: {string.Join("; ", missing)}" : "") + "\n"
+                       : "") +
+                   $"Found via {e.Source}, listed {FormatAgo(DateTime.UtcNow - listing.CreatedAtUtc)}\n" +
                    $"{listing.ListingUrl}\nhttps://steamcommunity.com/market/listings/730/{Uri.EscapeDataString(listing.MarketHashName)}";
+        }
+
+        /// <summary>"45 seconds ago", "12 minutes ago", "3 hours ago", "9 days ago" — largest whole unit, rounded down.</summary>
+        internal static string FormatAgo(TimeSpan age)
+        {
+            static string Unit(double n, string unit) => $"{(long)n} {unit}{((long)n == 1 ? "" : "s")} ago";
+            if (age < TimeSpan.FromSeconds(1)) return "just now";
+            if (age.TotalMinutes < 1) return Unit(age.TotalSeconds, "second");
+            if (age.TotalHours < 1) return Unit(age.TotalMinutes, "minute");
+            if (age.TotalDays < 1) return Unit(age.TotalHours, "hour");
+            return Unit(age.TotalDays, "day");
         }
 
         // ───────────────────────────── Trades ─────────────────────────────
@@ -467,6 +631,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private async Task PollTradesOnceAsync(List<PurchasedListing> purchases, CancellationToken ct)
         {
             JArray trades = await csFloatWrapper.GetTradesAsync(100, ct);
+            // The same trades measure the locks and holds every exit decision depends on.
+            var measured = tradeTimeline.Clone();
+            measured.Measure(trades, DateTime.UtcNow);
+            tradeTimeline = measured;
             // Newest first: a contract can have an old cancelled trade and a newer live one.
             var newestByContract = new Dictionary<string, JObject>(StringComparer.Ordinal);
             foreach (var trade in trades.OfType<JObject>())
@@ -493,7 +661,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 }
                 else if (purchase.CurrentStrategicStage == StrategicStages.WaitingForCSFloatResale && !string.IsNullOrEmpty(purchase.CSFloatResaleListingID)
                          && newestByContract.TryGetValue(purchase.CSFloatResaleListingID, out var resale))
-                    transition = TradeProgress.ApplyResaleTrade(purchase, resale, DateTime.UtcNow, ExchangeRate ?? 0);
+                    transition = TradeProgress.ApplyResaleTrade(purchase, resale, DateTime.UtcNow, ExchangeRate ?? 0, csfloatAccountInformation?.Fee is double fee and > 0 and < 0.5 ? fee : 0.02);
                 else
                     continue;
 
@@ -548,11 +716,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 try
                 {
-                    foreach (var p in scanalytics.PurchasesSnapshot())
+                    // Only items whose trade protection has lifted (the exact moment CSFloat reported) can be sold.
+                    var due = scanalytics.PurchasesSnapshot().Where(p =>
+                        p.CurrentStrategicStage == StrategicStages.JustRetrieved
+                        && p.PredictedTimeToBeResoldOnSteam != default && p.PredictedTimeToBeResoldOnSteam.ToUniversalTime() <= DateTime.UtcNow
+                        && p.SaleDeferredUntilUtc <= DateTime.UtcNow
+                        && (p.LastSaleAttemptUtc == default || DateTime.UtcNow - p.LastSaleAttemptUtc >= TimeSpan.FromHours(6))).ToList();
+                    if (due.Count > 0) await RefreshAccountForExitsAsync(ct);
+                    foreach (var p in due)
                     {
-                        if (p.CurrentStrategicStage != StrategicStages.JustRetrieved) continue;
-                        if (p.PredictedTimeToBeResoldOnSteam == default || p.PredictedTimeToBeResoldOnSteam.ToUniversalTime() > DateTime.UtcNow) continue;
-                        if (p.LastSaleAttemptUtc != default && DateTime.UtcNow - p.LastSaleAttemptUtc < TimeSpan.FromHours(6)) continue;
                         if (!IsAutoSellable(p, DateTime.UtcNow))
                         {
                             await AlertKlivesAsync("not-auto-selling:" + p.CSFloatListingID, "CS2 Arbitrage — position needs a manual look",
@@ -564,7 +736,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         if (!salesInFlight.TryAdd(p.CSFloatListingID, 0)) continue;
                         _ = Task.Run(async () =>
                         {
-                            try { await RunSaleAsync(p, ct); }
+                            try
+                            {
+                                string outcome = await Exits!.RunSaleAsync(p, ct);
+                                await ServiceLog($"Sale decision for {p.ItemMarketHashName} ({p.CSFloatListingID}): {outcome}.", false);
+                            }
                             catch (Exception ex) { await ServiceLogError(ex, $"Selling {p.ItemMarketHashName} failed."); }
                             finally { salesInFlight.TryRemove(p.CSFloatListingID, out _); }
                         }, CancellationToken.None);
@@ -582,6 +758,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         public const int MaxSaleAttempts = 5;
 
         /// <summary>
+        /// Exit decisions depend on the account's state (away mode blocks CSFloat selling; the fee is the account's),
+        /// so it is refreshed (at most once a minute) before any are made. A failure keeps the last known state.
+        /// </summary>
+        private async Task RefreshAccountForExitsAsync(CancellationToken ct)
+        {
+            try { await RefreshBalanceAsync(false, ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { await ServiceLogError(ex, "Couldn't refresh the CSFloat account before exit decisions; using the last known state.", false); }
+        }
+
+        /// <summary>
         /// Whether the scheduler may sell this position. Old (pre-rewrite) positions whose sale date passed
         /// weeks ago were most likely handled by hand; retrying them would just spam failure alerts.
         /// </summary>
@@ -592,58 +778,48 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             return !(legacy && p.PredictedTimeToBeResoldOnSteam.ToUniversalTime() < nowUtc.AddDays(-30));
         }
 
-        /// <summary>Picks the better exit with fresh prices, then sells on Steam or relists on CSFloat.</summary>
-        private async Task RunSaleAsync(PurchasedListing p, CancellationToken ct)
+        /// <summary>
+        /// Re-checks live CSFloat relists with the exit model (see <see cref="ExitManager.ReviewListingAsync"/>):
+        /// a listing that is not selling is re-priced, or withdrawn and sold on Steam, once the evidence says so.
+        /// </summary>
+        private async Task ListingReviewLoopAsync(CancellationToken ct)
         {
-            p.SaleAttempts++;
-            p.LastSaleAttemptUtc = DateTime.UtcNow;
-            await scanalytics.UpdatePurchasedListing(p);
-            double fx = ExchangeRate ?? 0;
-            double k = CurrentConversionCoefficient;
-
-            SteamOrderBook? book = await steamAPIWrapper.Market.GetOrderBookAsync(p.ItemMarketHashName, TimeSpan.FromMinutes(2), RequestPriority.Normal, ct);
-            int steamSalePence = book?.HighestBuyOrderPence ?? 0;
-            double steamCash = ArbitrageMath.SteamSellerReceives(steamSalePence) * k;
-
-            int? relistCents = null;
-            if (engineSettings.Evaluation.AllowRelistExit && fx > 0)
+            await Task.Delay(TimeSpan.FromMinutes(2), ct);
+            while (!ct.IsCancellationRequested)
             {
-                try { relistCents = await EstimateRelistPriceCentsAsync(p.ItemMarketHashName, ct); }
-                catch (Exception ex) when (ex is not OperationCanceledException) { await ServiceLogError(ex, $"Couldn't price a CSFloat relist for {p.ItemMarketHashName}.", false); }
-            }
-            double relistCash = relistCents is int c ? ArbitrageMath.CSFloatNetProceedsCents(c, csfloatAccountInformation?.Fee ?? 0.02) * fx : 0;
-
-            bool relist = relistCash > 0 && (steamCash <= 0 || relistCash > steamCash * 1.02 || (p.PlannedExit == nameof(ExitRoute.CSFloatRelist) && relistCash >= steamCash * 0.98));
-            if (relist)
-            {
-                await RelistOnCSFloatAsync(p, relistCents!.Value, ct);
-            }
-            else if (steamSalePence > 0)
-            {
-                await SellSkinOnSteam(p, steamSalePence);
-            }
-            else
-            {
-                await AlertKlivesAsync("unsellable:" + p.CSFloatListingID, "CS2 Arbitrage — can't price a sale",
-                    $"No Steam buy orders or CSFloat price for **{p.ItemMarketHashName}**; will retry in 6 hours.", TimeSpan.FromHours(12));
+                try
+                {
+                    var due = scanalytics.PurchasesSnapshot().Where(p =>
+                        p.CurrentStrategicStage == StrategicStages.WaitingForCSFloatResale && !string.IsNullOrEmpty(p.CSFloatResaleListingID)
+                        && p.NextExitReviewUtc <= DateTime.UtcNow).ToList();
+                    if (due.Count > 0) await RefreshAccountForExitsAsync(ct);
+                    foreach (var p in due)
+                    {
+                        if (!reviewsInFlight.TryAdd(p.CSFloatListingID, 0)) continue;
+                        try
+                        {
+                            string outcome = await Exits!.ReviewListingAsync(p, ct);
+                            if (outcome is not ("keep" or "skip" or "deferred")) await ServiceLog($"Relist review for {p.ItemMarketHashName}: {outcome}.", false);
+                        }
+                        catch (Exception ex) when (ex is not OperationCanceledException)
+                        {
+                            p.NextExitReviewUtc = DateTime.UtcNow.AddHours(1);
+                            await ServiceLogError(ex, $"Reviewing the relist of {p.ItemMarketHashName} failed.", false);
+                        }
+                        finally { reviewsInFlight.TryRemove(p.CSFloatListingID, out _); }
+                    }
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    await ServiceLogError(ex, "CS2 relist review tick failed.", false);
+                }
+                try { await Task.Delay(TimeSpan.FromMinutes(10), ct); }
+                catch (OperationCanceledException) { return; }
             }
         }
 
-        /// <summary>One cent under the cheapest competing CSFloat listing (never above CSFloat's market value).</summary>
-        private async Task<int?> EstimateRelistPriceCentsAsync(string marketHashName, CancellationToken ct)
-        {
-            if (!csFloatWrapper.RateLimits.CanSpend(CSFloatWrapper.ListingsBucket, 3)) return null;
-            var page = await csFloatWrapper.SearchListingsAsync(new CSFloatWrapper.ListingQuery { SortBy = "lowest_price", Limit = 10, MarketHashName = marketHashName }, ct);
-            var competitors = page.Listings.Where(l => l.SellerSteamId != (csfloatAccountInformation?.SteamID ?? "")).ToList();
-            if (competitors.Count == 0) return null;
-            int lowest = competitors.Min(l => l.PriceCents);
-            int? marketValue = competitors.Select(l => l.BasePriceCents).FirstOrDefault(v => v is > 0);
-            int price = lowest - 1;
-            if (marketValue is int v) price = Math.Min(price, (int)Math.Floor(v * 1.02));
-            return price > 0 ? price : null;
-        }
-
-        private async Task RelistOnCSFloatAsync(PurchasedListing p, int priceCents, CancellationToken ct)
+        /// <summary>Lists the unit on CSFloat at the price the exit model chose; null when it is not tradable there yet.</summary>
+        private async Task<string?> ListOnCSFloatAsync(PurchasedListing p, int priceCents, CancellationToken ct)
         {
             var inventory = await csFloatWrapper.GetInventoryAsync(ct);
             var candidates = inventory.Where(i => i.MarketHashName == p.ItemMarketHashName && i.Tradable).ToList();
@@ -651,17 +827,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             if (item == null)
             {
                 await ServiceLog($"{p.ItemMarketHashName} isn't tradable in the CSFloat inventory yet; retrying the sale later.");
-                return;
+                return null;
             }
             string? listingId = await csFloatWrapper.CreateListingAsync(item.AssetId, priceCents, ct);
-            p.CSFloatResaleListingID = listingId ?? "";
-            p.CSFloatResalePriceCents = priceCents;
-            p.CurrentStrategicStage = StrategicStages.WaitingForCSFloatResale;
-            await scanalytics.UpdatePurchasedListing(p);
-            await SendEmbedAsync("CS2 item relisted on CSFloat", $"**{p.ItemMarketHashName}** listed at **${priceCents / 100.0:F2}** (bought for {p.comparison?.CSFloatListing.PriceText}).\nYou'll be told when it sells.", DiscordColor.Teal, p.comparison?.CSFloatListing.ImageURL);
+            if (string.IsNullOrEmpty(listingId)) throw new InvalidOperationException($"CSFloat created a listing for {p.ItemMarketHashName} without returning its id.");
+            return listingId;
         }
 
-        private async Task SellSkinOnSteam(PurchasedListing data, int salePriceInPence)
+        private async Task<bool> SellSkinOnSteam(PurchasedListing data, int salePriceInPence)
         {
             try
             {
@@ -678,16 +851,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     data.ActualTimeResoldOnSteam = DateTime.Now;
                     await scanalytics.UpdatePurchasedListing(data);
                     await SendEmbedAsync("CS2 Arbitrage — Listed on Steam ✓", $"Item: {data.ItemMarketHashName}\nListed for: **£{data.ActualSalePriceOnSteam:F2}**\nConvert the Steam wallet back with the liquidity plan (KM → CS2 Arbitrage).", DiscordColor.Green, null);
+                    return true;
                 }
-                else
-                {
-                    await ServiceLogError($"Failed to list {data.ItemMarketHashName} on Steam Market.");
-                    await SendEmbedAsync("CS2 Arbitrage — Failed to List", $"Item: {data.ItemMarketHashName}\nCould not list on the Steam Market; will retry in 6 hours.", DiscordColor.Red, null);
-                }
+                await ServiceLogError($"Failed to list {data.ItemMarketHashName} on Steam Market.");
+                await SendEmbedAsync("CS2 Arbitrage — Failed to List", $"Item: {data.ItemMarketHashName}\nCould not list on the Steam Market; will retry in 6 hours.", DiscordColor.Red, null);
+                return false;
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, $"Error in SellSkinOnSteam for {data.ItemMarketHashName}");
+                return false;
             }
         }
 
@@ -701,6 +874,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                           ?? throw new Exception($"CSFloat listing {CSFloatListingID} was not found.");
             var book = await steamAPIWrapper.Market.GetOrderBookAsync(listing.MarketHashName, TimeSpan.FromMinutes(2), RequestPriority.Critical, cancellationToken.Token);
             var evaluation = OpportunityEvaluator.Evaluate(listing, book, CurrentConversionCoefficient, ExchangeRate ?? 0, engineSettings.Evaluation, DateTime.UtcNow, "manual");
+            // A manual buy goes ahead regardless, but its plan (exit, trade lock, value) is still made and recorded
+            // so the sale and the track record treat it like any other position.
+            if (Engine != null)
+            {
+                try { evaluation = await Engine.ConfirmWithExitModelAsync(listing, evaluation, book, cancellationToken.Token); }
+                catch (Exception ex) when (ex is not OperationCanceledException) { await ServiceLogError(ex, "Couldn't plan the exit of a manual purchase; buying anyway.", false); }
+            }
             await RefreshBalanceAsync(true, cancellationToken.Token);
             if ((csfloatAccountInformation?.BalanceInCents ?? 0) < listing.PriceCents) return null;
             var result = await csFloatWrapper.BuyListingAsync(listing.Id, listing.PriceCents, cancellationToken.Token);
@@ -737,6 +917,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                             .Where(b => DateTime.UtcNow - b.FetchedAtUtc < TimeSpan.FromHours(24))
                             .OrderByDescending(b => b.FetchedAtUtc).Take(8000).ToList();
                         await GetDataHandler().WriteToFile(BookCachePath, JsonConvert.SerializeObject(books));
+                        await GetDataHandler().WriteToFile(MarketModelPath, marketModel.ToJson());
+                        await GetDataHandler().WriteToFile(TradeTimelinePath, JsonConvert.SerializeObject(tradeTimeline));
                         nextBookSave = DateTime.UtcNow.AddMinutes(15);
                     }
                     if (automationEnabled && DateTime.UtcNow.Minute % 10 == 0)
@@ -981,7 +1163,24 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 },
                 bulkSteamPrices = new { referencePrices.Count, referencePrices.LoadedAtUtc, referencePrices.LastError },
                 trades = new { lastPollUtc = lastTradePollUtc, lastError = lastTradePollError },
-                positions = purchases.Where(IsOpen).Select(p => new { p.ItemMarketHashName, p.CSFloatListingID, stage = p.CurrentStrategicStage.ToString(), p.PlannedExit, p.PredictedTimeToBeResoldOnSteam, p.LastTradeState }),
+                exitModel = !ready ? null : new
+                {
+                    settings = engineSettings.Exit,
+                    autoManageRelists = engineSettings.AutoManageRelists,
+                    locks = CurrentExitEnvironmentSummary(),
+                    market = marketModel.Describe(),
+                    calibration = CurrentExitCalibration,
+                    signals = new { exitSignals.Fetches, exitSignals.CacheHits, exitSignals.SkippedForBudget },
+                },
+                positions = purchases.Where(IsOpen).Select(p => new
+                {
+                    p.ItemMarketHashName, p.CSFloatListingID, stage = p.CurrentStrategicStage.ToString(), p.PlannedExit, p.PredictedTimeToBeResoldOnSteam, p.LastTradeState,
+                    relist = p.CurrentStrategicStage == StrategicStages.WaitingForCSFloatResale
+                        ? new { priceCents = p.CSFloatResalePriceCents, listedUtc = p.ListedOnCSFloatAtUtc, p.RelistRepriceCount, expectedDaysToSell = p.RelistBaseDaysToSell, p.RelistModelExposure, nextReviewUtc = p.NextExitReviewUtc }
+                        : null,
+                    saleDeferrals = p.SaleDeferrals,
+                    lastDecision = p.ExitHistory?.LastOrDefault() ?? p.PurchasePlan,
+                }),
                 totals = aggregate == null ? null : new { aggregate.TotalEvaluated, aggregate.QualifiedOpportunities, aggregate.PurchaseAttempts, aggregate.Purchases, aggregate.HighestRoi, aggregate.HighestRoiItem },
                 legacyFilesOnDisk = Interlocked.Read(ref legacyFilesOnDisk),
             };

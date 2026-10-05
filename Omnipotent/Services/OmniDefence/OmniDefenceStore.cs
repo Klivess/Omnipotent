@@ -23,6 +23,7 @@ namespace Omnipotent.Services.OmniDefence
         private readonly string connectionString;
         private readonly SemaphoreSlim writeLock = new(1, 1);
         private SqliteConnection? sharedConnection;
+        internal bool SensitiveAuditMigrationChangedRows { get; private set; }
 
         // ── read path ──
         // Separate connections so a SELECT never queues behind the audit-write backlog.
@@ -66,7 +67,7 @@ namespace Omnipotent.Services.OmniDefence
             await sharedConnection.OpenAsync();
 
             using var pragma = sharedConnection.CreateCommand();
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;";
+            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;";
             await pragma.ExecuteNonQueryAsync();
 
             string[] schema = new[]
@@ -263,7 +264,67 @@ namespace Omnipotent.Services.OmniDefence
             await EnsureColumnAsync("ip_records", "timezone", "TEXT");
             await EnsureColumnAsync("ip_records", "as_name", "TEXT");
 
+            SensitiveAuditMigrationChangedRows = await ScrubLegacySensitiveSettingsAuditsAsync();
             StartAuditFlusher();
+        }
+
+        private async Task<bool> ScrubLegacySensitiveSettingsAuditsAsync()
+        {
+            const int batchSize = 500;
+            long afterId = 0;
+            bool changed = false;
+            while (true)
+            {
+                var redactIds = new List<long>(batchSize);
+                int scanned = 0;
+                using (var select = Connection.CreateCommand())
+                {
+                    select.CommandText = @"SELECT id, route, body_text FROM requests
+                        WHERE id > $after AND
+                            (route = '/OmniGlobalSettings' COLLATE NOCASE OR route LIKE '/OmniGlobalSettings/%'
+                             OR route = '/batch' COLLATE NOCASE) AND
+                            (query IS NOT NULL OR body_text IS NOT NULL OR body_hash IS NOT NULL OR body_length != 0
+                             OR body_truncated != 0 OR headers_json IS NOT NULL OR user_agent IS NOT NULL OR client_page IS NOT NULL)
+                        ORDER BY id LIMIT $limit";
+                    select.Parameters.AddWithValue("$after", afterId);
+                    select.Parameters.AddWithValue("$limit", batchSize);
+                    using var reader = await select.ExecuteReaderAsync();
+                    while (await reader.ReadAsync())
+                    {
+                        afterId = reader.GetInt64(0);
+                        scanned++;
+                        string? route = reader.IsDBNull(1) ? null : reader.GetString(1);
+                        string? body = reader.IsDBNull(2) ? null : reader.GetString(2);
+                        if (KliveAPI.KliveAPI.ShouldRedactSensitiveSettingsAudit(route, body)) redactIds.Add(afterId);
+                    }
+                }
+                if (scanned == 0) break;
+                if (redactIds.Count == 0) continue;
+
+                // Each transaction touches at most 500 rows. Do not hold a large
+                // transaction or copy the entire historical request table in memory.
+                using var transaction = (SqliteTransaction)await Connection.BeginTransactionAsync();
+                using var update = Connection.CreateCommand();
+                update.Transaction = transaction;
+                string[] parameterNames = redactIds.Select((_, index) => "$id" + index).ToArray();
+                update.CommandText = @"UPDATE requests SET query=NULL, body_text=NULL, body_hash=NULL,
+                    body_length=0, body_truncated=0, headers_json=NULL, user_agent=NULL, client_page=NULL
+                    WHERE id IN (" + string.Join(",", parameterNames) + ")";
+                for (int index = 0; index < redactIds.Count; index++)
+                    update.Parameters.AddWithValue(parameterNames[index], redactIds[index]);
+                await update.ExecuteNonQueryAsync();
+                await transaction.CommitAsync();
+                changed = true;
+            }
+            if (changed)
+            {
+                // This runs before audit workers and readers start. Checkpoint the
+                // scrubbed pages and truncate the old WAL; backups remain external.
+                using var checkpoint = Connection.CreateCommand();
+                checkpoint.CommandText = "PRAGMA wal_checkpoint(TRUNCATE)";
+                await checkpoint.ExecuteNonQueryAsync();
+            }
+            return changed;
         }
 
         /// <summary>
@@ -466,6 +527,7 @@ namespace Omnipotent.Services.OmniDefence
 
         private static void BindRequestParameters(SqliteCommand cmd, RequestRow row)
         {
+            KliveAPI.KliveAPI.RedactSensitiveSettingsRequestAudit(row);
             cmd.Parameters.AddWithValue("$ts", row.UtcTimestamp);
             cmd.Parameters.AddWithValue("$ip", (object?)row.Ip ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$method", (object?)row.Method ?? DBNull.Value);
@@ -491,6 +553,7 @@ namespace Omnipotent.Services.OmniDefence
 
         private static void SetRequestParameters(SqliteCommand cmd, RequestRow row)
         {
+            KliveAPI.KliveAPI.RedactSensitiveSettingsRequestAudit(row);
             cmd.Parameters["$ts"].Value = row.UtcTimestamp;
             cmd.Parameters["$ip"].Value = (object?)row.Ip ?? DBNull.Value;
             cmd.Parameters["$method"].Value = (object?)row.Method ?? DBNull.Value;
@@ -518,6 +581,7 @@ namespace Omnipotent.Services.OmniDefence
 
         public Task InsertRequestAsync(RequestRow row) => WithLockAsync(async conn =>
         {
+            KliveAPI.KliveAPI.RedactSensitiveSettingsRequestAudit(row);
             using var cmd = conn.CreateCommand();
             cmd.CommandText = RequestInsertSql;
             cmd.Parameters.AddWithValue("$ts", row.UtcTimestamp);

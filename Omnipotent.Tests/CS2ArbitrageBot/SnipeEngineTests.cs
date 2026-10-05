@@ -20,8 +20,14 @@ internal sealed class FakeSnipeHost : ISnipeHost
         if (referenceJson != null)
             Assert.True(ReferencePrices.RefreshAsync(new HttpClient(new FakeHttpHandler((_, _) => FakeHttpHandler.Json(referenceJson))), default, minimumItems: 1).GetAwaiter().GetResult());
         Analytics = new Scanalytics(null!);
+        ExitSignals = new ExitSignalsProvider(CSFloat, SteamMarket);
     }
 
+    public ExitSignalsProvider ExitSignals { get; }
+    public MarketDriftModel MarketModel { get; } = new();
+    public ExitCalibrationSnapshot ExitCalibration { get; set; } = ExitCalibrationSnapshot.Neutral;
+    public ExitEnvironment ExitEnvironment { get; set; } = ExitEnvironment.Default;
+    public string? OwnSteamId { get; set; } = "76561190000000002";
     public CSFloatWrapper CSFloat { get; }
     public SteamMarketClient SteamMarket { get; }
     public SteamReferencePrices ReferencePrices { get; }
@@ -98,26 +104,67 @@ public class SnipeEngineTests
         .Select(r => { var j = JObject.Parse(r.Body!); return ((string)j["contract_ids"]![0]!, (int)j["total_price"]!); })
         .ToList();
 
-    [Fact]
-    public async Task BuysAProfitableRelistWithoutSpendingASteamRequestWhenBulkPricesRuleSteamOut()
+    /// <summary>CSFloat sales evidence for an item: <paramref name="salesPerDay"/> a day at ~0.97 of a $15 value, two rivals.</summary>
+    private static Func<HttpRequestMessage, string?, HttpResponseMessage?> Evidence(string name, int salesPerDay, int daysSinceLastSale = 0) => (request, _) =>
     {
-        var csfloat = CSFloat();
+        string path = Uri.UnescapeDataString(request.RequestUri!.AbsolutePath);
+        if (path == $"/api/v1/history/{name}/graph")
+            return FakeHttpHandler.Json(CS2Fixtures.SalesGraph(DateTime.UtcNow, d => d >= daysSinceLastSale ? salesPerDay : 0, 1450, days: 200));
+        if (path == $"/api/v1/history/{name}/sales")
+            return FakeHttpHandler.Json(CS2Fixtures.RecentSales(DateTime.UtcNow, Enumerable.Range(0, 25)
+                .Select(i => (1430 + 10 * (i % 5), 1500, 20.0, daysSinceLastSale * 24 + i * 24.0 / Math.Max(1, salesPerDay)))));
+        if (path == "/api/v1/listings" && request.Method == HttpMethod.Get && request.RequestUri.Query.Contains("market_hash_name"))
+            return FakeHttpHandler.Json(CS2Fixtures.ListingPage(CS2Fixtures.Listing("1", name, 1000, 1500, 1500), CS2Fixtures.Listing("r1", name, 1470, 1500, 1500), CS2Fixtures.Listing("r2", name, 1490, 1500, 1500)));
+        return null;
+    };
+
+    [Fact]
+    public async Task ScreensWithoutSteamThenConfirmsTheRelistWithLiveEvidenceBeforeBuying()
+    {
+        const string name = "AK-47 | Redline (Field-Tested)";
+        var csfloat = CSFloat(Evidence(name, salesPerDay: 6));
         var steam = Steam(new());
         // Bulk feed: Steam sells this for ~$9, far too low for the Steam exit at a $10 cost.
         var host = new FakeSnipeHost(csfloat, steam, "{\"AK-47 | Redline (Field-Tested)\":{\"last_24h\":9.0,\"last_7d\":9.0,\"last_30d\":9.0,\"last_90d\":9.0}}");
         var engine = new SnipeEngine(host);
         var cycle = new ScanCycleSummary();
-        await engine.ProcessListingsAsync(new[] { L("1", "AK-47 | Redline (Field-Tested)", 1000, 1500) }, "feed", cycle, CancellationToken.None);
+        await engine.ProcessListingsAsync(new[] { L("1", name, 1000, 1500) }, "feed", cycle, CancellationToken.None);
 
-        // No order book was needed; the only Steam call is the pre-purchase price-trend check.
-        Assert.DoesNotContain(steam.Requests, r => r.Url.Contains("/market/orderbook"));
-        Assert.Single(steam.Requests, r => r.Url.Contains("QueryPriceHistory"));
+        // The screen needed no order book (bulk prices ruled the Steam exit out)…
         Assert.Equal(1, cycle.Prefiltered);
+        Assert.Equal(1, cycle.Opportunities);
+        // …the confirmation then fetched the evidence: CSFloat demand and competition, Steam history.
+        Assert.Contains(csfloat.Requests, r => r.Url.EndsWith("/sales"));
+        Assert.Contains(csfloat.Requests, r => r.Url.EndsWith("/graph"));
+        Assert.Contains(csfloat.Requests, r => r.Url.Contains("market_hash_name="));
+        Assert.Single(steam.Requests, r => r.Url.Contains("QueryPriceHistory"));
         Assert.Equal(new[] { ("1", 1000) }, Buys(csfloat));
         var (_, evaluation) = Assert.Single(host.Purchased);
+        Assert.True(evaluation.ExitModelChecked);
         Assert.Equal(ExitRoute.CSFloatRelist, evaluation.BestRoute);
+        Assert.True(evaluation.CSFloatSalesPerDay > 4);
+        Assert.InRange(evaluation.PlannedPrice, 1250, 1560);
+        Assert.True(evaluation.BestRoi < evaluation.ScreenBestRoi + 0.05); // the risk-adjusted value is not rosier than the screen
         Assert.Equal(99_000, host.BalanceCents);
         Assert.Equal(1, cycle.Purchased);
+    }
+
+    [Fact]
+    public async Task AListingThatLooksCheapIsNotBoughtWhenTheItemNoLongerSells()
+    {
+        // Same 33% discount to CSFloat's value, but nobody has bought one on CSFloat for four months.
+        const string name = "AK-47 | Redline (Field-Tested)";
+        var csfloat = CSFloat(Evidence(name, salesPerDay: 1, daysSinceLastSale: 120));
+        var host = new FakeSnipeHost(csfloat, Steam(new()), "{\"AK-47 | Redline (Field-Tested)\":{\"last_24h\":9.0,\"last_7d\":9.0,\"last_30d\":9.0,\"last_90d\":9.0}}");
+        var engine = new SnipeEngine(host);
+        var cycle = new ScanCycleSummary();
+        await engine.ProcessListingsAsync(new[] { L("1", name, 1000, 1500) }, "feed", cycle, CancellationToken.None);
+
+        Assert.Equal(1, cycle.Opportunities); // the screen liked it
+        Assert.Empty(Buys(csfloat));          // the evidence did not
+        var (_, why) = Assert.Single(host.NotBought);
+        Assert.StartsWith("exit model", why);
+        Assert.Empty(host.Purchased);
     }
 
     [Fact]

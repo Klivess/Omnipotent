@@ -97,6 +97,12 @@ public class CS2LiveTests
     {
         public required CSFloatWrapper CSFloat { get; init; }
         public required SteamMarketClient SteamMarket { get; init; }
+        private ExitSignalsProvider? exitSignals;
+        public ExitSignalsProvider ExitSignals => exitSignals ??= new ExitSignalsProvider(CSFloat, SteamMarket);
+        public MarketDriftModel MarketModel { get; } = new();
+        public ExitCalibrationSnapshot ExitCalibration => ExitCalibrationSnapshot.Neutral;
+        public ExitEnvironment ExitEnvironment => ExitEnvironment.Default;
+        public string? OwnSteamId => null;
         public required SteamReferencePrices ReferencePrices { get; init; }
         public Scanalytics Analytics { get; } = new(null!);
         public EngineSettings Settings { get; } = new() { PurchasingEnabled = false };
@@ -132,6 +138,79 @@ public class CS2LiveTests
         }
         public void Log(string message) { }
         public void LogError(Exception? ex, string message) { lock (Errors) Errors.Add(message + " " + ex?.Message); }
+    }
+
+    /// <summary>
+    /// The exit model on real data (read-only): for items from a case that sells constantly to a sticker that
+    /// has not sold in months, what each exit is worth and how long a relist would take.
+    /// </summary>
+    [CS2LiveFact]
+    public async Task ExitModelAgainstTheLiveMarkets()
+    {
+        string? key = CSFloatKey();
+        Assert.False(string.IsNullOrEmpty(key), "No CSFloat API key (set CS2_CSFLOAT_KEY).");
+        var r = await Rates();
+        double fx = r["gbp"];
+        var http = new HttpClient(new ReadOnlyGuardHandler(new SocketsHttpHandler { AutomaticDecompression = System.Net.DecompressionMethods.All })) { Timeout = TimeSpan.FromSeconds(25) };
+        http.DefaultRequestHeaders.TryAddWithoutValidation("Authorization", key);
+        var csfloat = new CSFloatWrapper(null, http);
+        using var steam = new SteamMarketClient(() => r, _ => null, TimeSpan.FromMilliseconds(1200));
+        var signalsProvider = new ExitSignalsProvider(csfloat, steam);
+        var market = new MarketDriftModel();
+        var plans = new Dictionary<string, ExitPlan>();
+
+        // The locks every decision runs against, measured from the account's own trades.
+        var timeline = new TradeTimeline();
+        timeline.Measure(await csfloat.GetTradesAsync(100), DateTime.UtcNow);
+        var (holdGrowth, holdSigma) = ConversionModel.HoldRisk(null, market, timeline.ConverterHoldDays);
+        var environment = new ExitEnvironment { Timeline = timeline, ConverterHoldGrowth = holdGrowth, ConverterHoldSigma = holdSigma };
+        output.WriteLine("Trade timeline (measured): " + Newtonsoft.Json.JsonConvert.SerializeObject(timeline.Describe()));
+        output.WriteLine($"A purchase now unlocks in {timeline.DaysUntilTradable(DateTime.UtcNow, 0):F2} days (protection ends {timeline.ProtectionEnd(DateTime.UtcNow.AddDays(timeline.HandoverDays)):dd/MM HH:mm} UTC)");
+        Assert.InRange(timeline.CSFloatSaleToCashDays, 7, 9);
+        Assert.InRange(timeline.SteamSaleToCashDays, 14, 18);
+
+        foreach (string name in new[] { "Recoil Case", "Sticker | Vitality (Holo) | Austin 2025", "Sticker | chrisJ | Cologne 2016", "AK-47 | Slate (Field-Tested)" })
+        {
+            var signals = await signalsProvider.GetAsync(name, SignalUse.Sale, CancellationToken.None);
+            int anchor = signals.ReferenceBaseCents ?? 0;
+            var demand = CSFloatDemand.Build(name, anchor, signals.SalesGraph, signals.RecentSales, signals.Competitors, signals.ReferenceQuantity, null, null, DateTime.UtcNow);
+            var forecast = PriceForecaster.Forecast(signals.SteamHistory, name, DateTime.UtcNow, market);
+            var plan = ExitPlanner.Plan(new ExitContext
+            {
+                MarketHashName = name,
+                CostPence = (int)(anchor * 0.85 * fx),
+                AnchorCents = anchor,
+                GbpPerUsd = fx,
+                ConversionCoefficient = 0.66,
+                Book = signals.Book,
+                Forecast = forecast,
+                Demand = anchor > 0 ? demand : null,
+                Environment = environment,
+            }, new ExitModelSettings(), DateTime.UtcNow);
+            plans[name] = plan;
+            output.WriteLine($"── {name}: value ${anchor / 100.0:F2}; {demand.SalesPerDay:0.###} sales/day ({demand.SalesRateBasis}), last sale {demand.DaysSinceLastSale:F1}d ago, buyers pay ~{demand.MedianValueRatio:P0}, {demand.CompetitorRatios.Count} rivals from ${demand.LowestCompetitorCents / 100.0:F2}");
+            output.WriteLine($"   Steam history: {forecast.Basis}; σ(8d) {forecast.Sigma8:P1}, exponent {forecast.HorizonExponent:F2}, drift {forecast.DriftPerDay * 30:P1}/30d, {forecast.SteamSalesPerDay:F1} Steam sales/day");
+            output.WriteLine($"   → {plan.Rationale}");
+            if (signals.Missing.Count > 0) output.WriteLine("   missing: " + string.Join("; ", signals.Missing));
+        }
+
+        Assert.All(plans.Values, p => Assert.NotNull(p.Best));
+        Assert.True(plans["Recoil Case"].BestRelist!.ExpectedDaysToSell < 1, "a case that sells constantly should relist within a day");
+        var dead = plans["Sticker | chrisJ | Cologne 2016"];
+        Assert.True(dead.SalesPerDay < 0.1, $"chrisJ sells {dead.SalesPerDay:F3}/day");
+        Assert.True(dead.BestRelist == null || dead.BestRelist.SellProbability < 0.5, "an item that has not sold in months must not be valued as if it will");
+
+        // Walk-forward calibration of the forecaster on live histories: (realised − forecast) / σ should be ~N(0,1)-sized.
+        var zs = new List<double>();
+        foreach (string name in new[] { "Recoil Case", "Dreams & Nightmares Case", "Sticker | Vitality (Holo) | Austin 2025", "AK-47 | Slate (Field-Tested)", "Charm | Lil' Serpent", "Sticker | s1mple (Holo) | Paris 2023" })
+        {
+            var history = await steam.GetPriceHistoryAsync(name, RequestPriority.Normal);
+            if (PriceForecaster.WalkForwardZ(history, name, DateTime.UtcNow) is double z) { zs.Add(z); output.WriteLine($"walk-forward z {z,6:F2}  {name}"); }
+        }
+        Assert.True(zs.Count >= 4);
+        double rms = Math.Sqrt(zs.Average(z => z * z));
+        output.WriteLine($"RMS z over {zs.Count} items: {rms:F2} (1 = calibrated)");
+        Assert.InRange(rms, 0.2, 3.0);
     }
 
     [CS2LiveFact]
@@ -182,7 +261,8 @@ public class CS2LiveTests
         foreach (var cycle in host.Analytics.RecentCycles())
             output.WriteLine($"  {cycle.Strategy,-24} returned {cycle.ListingsReturned,3} new {cycle.NewListings,3} eval {cycle.Evaluated,3} steam {cycle.SteamLookups,3} opp {cycle.Opportunities} {cycle.DurationMs,6:F0}ms best {cycle.BestRoi:P1} {cycle.BestItem} {cycle.Note}");
         foreach (var (listing, evaluation, why) in host.WouldBuy.Take(15))
-            output.WriteLine($"WOULD BUY {listing.MarketHashName} ${listing.PriceCents / 100.0:F2} via {evaluation.BestRoute} ROI {evaluation.BestRoi:P1} profit £{evaluation.BestProfitPence / 100.0:F2} ({why}) {listing.ListingUrl}");
+            output.WriteLine((evaluation.ShouldBuy ? "WOULD BUY " : "SCREEN PASSED, NOT BOUGHT ") +
+                $"{listing.MarketHashName} ${listing.PriceCents / 100.0:F2} via {evaluation.BestRoute} ROI {evaluation.BestRoi:P1} (screen {evaluation.ScreenBestRoi:P1}) profit £{evaluation.BestProfitPence / 100.0:F2} ({why}) {listing.ListingUrl}");
         foreach (var e in host.Analytics.RecentNotable(15).OrderByDescending(e => e.BestRoi))
             output.WriteLine($"notable {e.BestRoi,7:P1} {e.BestRoute,-13} {e.MarketHashName} ${e.PriceCents / 100.0:F2} — {e.Reason}");
         foreach (var err in status.RecentErrors.Take(10)) output.WriteLine("error: " + err);

@@ -50,25 +50,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             {
                 try
                 {
-                    if (!await wrapper.AskKlivesReadyForSteamMobileAction("approve the Steam login confirmation"))
-                    {
-                        wrapper.parent.parent.ServiceLogError("Klives is not ready to approve Steam login confirmation.");
-                        return false;
-                    }
-
+                    // One prompt (it used to be "are you ready?" then "confirmed"): approve in the app, tap Done.
                     string response = (string)await wrapper.parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
                         "SendButtonsPromptToKlivesDiscord",
-                        "CS2 Arbitrage Bot — Steam Login Confirmation Required",
-                        "Please approve the Steam mobile login confirmation in your Steam app, then press **Confirmed**.",
+                        "CS2 Arbitrage — approve the Steam login",
+                        "The bot is logging in to Steam. Approve the sign-in request in your Steam app, then tap **Done**.",
                         new Dictionary<string, DSharpPlus.ButtonStyle>
                         {
-                            { "Confirmed", DSharpPlus.ButtonStyle.Success },
-                            { "Failed", DSharpPlus.ButtonStyle.Danger }
+                            { "Done", DSharpPlus.ButtonStyle.Success },
+                            { "Not now", DSharpPlus.ButtonStyle.Secondary }
                         },
                         TimeSpan.FromHours(24)
                     );
 
-                    return response == "Confirmed";
+                    return response == "Done";
                 }
                 catch (Exception ex)
                 {
@@ -296,39 +291,34 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             return false;
         }
 
+        /// <summary>
+        /// One Discord prompt per listing (it used to be "are you ready?" followed by "confirmed?"):
+        /// confirm it in the Steam app, then tap Done.
+        /// </summary>
         private async Task<bool> WaitForSteamMobileConfirmation(string itemName, int salePriceInPence)
         {
             try
             {
-                if (!await AskKlivesReadyForSteamMobileAction($"confirm Steam Market listing for {itemName}"))
-                {
-                    parent.parent.ServiceLogError($"Klives is not ready to confirm Steam Market listing for {itemName}.");
-                    return false;
-                }
-
                 string confirmResponse = (string)await parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
                     "SendButtonsPromptToKlivesDiscord",
-                    "CS2 Arbitrage Bot — Steam Mobile Confirmation Required",
-                    $"A Steam Market listing for **{itemName}** at **£{salePriceInPence / 100.0:F2}** needs to be confirmed on your Steam mobile app.\n\n" +
-                    $"Please open the Steam app → Confirmations → Confirm the market listing, then press **Confirmed** below.",
+                    "CS2 Arbitrage — confirm the Steam listing",
+                    $"**{itemName}** is listed on the Steam Market at **£{salePriceInPence / 100.0:F2}** and needs your confirmation.\n" +
+                    "Steam app → Confirmations → Confirm, then tap **Done**.",
                     new Dictionary<string, DSharpPlus.ButtonStyle>
                     {
-                        { "Confirmed", DSharpPlus.ButtonStyle.Success },
-                        { "Failed", DSharpPlus.ButtonStyle.Danger }
+                        { "Done", DSharpPlus.ButtonStyle.Success },
+                        { "Skip", DSharpPlus.ButtonStyle.Secondary }
                     },
                     TimeSpan.FromHours(24)
                 );
 
-                if (confirmResponse == "Confirmed")
+                if (confirmResponse == "Done")
                 {
                     parent.parent.ServiceLog($"Mobile confirmation acknowledged for {itemName}.");
                     return true;
                 }
-                else
-                {
-                    parent.parent.ServiceLogError($"Mobile confirmation was not completed for {itemName}. Response: {confirmResponse}");
-                    return false;
-                }
+                parent.parent.ServiceLogError($"Mobile confirmation was not completed for {itemName}. Response: {confirmResponse}");
+                return false;
             }
             catch (Exception ex)
             {
@@ -576,6 +566,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     return false;
                 }
 
+                if (string.IsNullOrWhiteSpace(credentials.Value.Username) || string.IsNullOrWhiteSpace(credentials.Value.Password))
+                {
+                    parent.parent.ServiceLogError("Steam username/password settings are empty. Cannot log in to Steam.");
+                    return false;
+                }
+
                 var authSession = await client.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
                 {
                     Username = credentials.Value.Username,
@@ -613,6 +609,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 state.AccessToken = steamAccessToken;
                 state.UpdatedAtUtc = DateTime.UtcNow;
                 await parent.parent.GetDataHandler().WriteToFile(statePath, JsonConvert.SerializeObject(state, Formatting.Indented));
+                await parent.parent.GetDataHandler().WriteToFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamRefreshToken), steamRefreshToken);
 
                 parent.parent.ServiceLog("Programmatically obtained Steam refresh token via SteamKit2 credentials flow.");
                 return true;
@@ -731,31 +728,6 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
         }
 
-        private async Task<bool> AskKlivesReadyForSteamMobileAction(string actionDescription)
-        {
-            try
-            {
-                string response = (string)await parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
-                    "SendButtonsPromptToKlivesDiscord",
-                    "CS2 Arbitrage Bot — Are You Ready?",
-                    $"Are you ready to {actionDescription} in the Steam mobile app now?",
-                    new Dictionary<string, DSharpPlus.ButtonStyle>
-                    {
-                        { "Ready", DSharpPlus.ButtonStyle.Primary },
-                        { "Not Ready", DSharpPlus.ButtonStyle.Secondary }
-                    },
-                    TimeSpan.FromHours(24)
-                );
-
-                return response == "Ready";
-            }
-            catch (Exception ex)
-            {
-                parent.parent.ServiceLogError(ex, "Error while asking Klives if he is ready for Steam mobile action.");
-                return false;
-            }
-        }
-
         private async Task<(string Username, string Password, string? GuardData)?> LoadSteamCredentialsFromDisk()
         {
             string username = await parent.parent.GetStringOmniSetting("CS2ArbitrageBotSteamLoginUsername", "", false, true);
@@ -814,15 +786,23 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
         private async Task SaveSteamAuthStateToDisk()
         {
-            SteamAuthState state = new()
+            // Merge: GuardData (it spares a re-approval of this machine on the next login) must survive token refreshes.
+            string statePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamAuthState);
+            SteamAuthState state;
+            try
             {
-                RefreshToken = steamRefreshToken,
-                AccessToken = steamAccessToken,
-                UpdatedAtUtc = DateTime.UtcNow
-            };
+                string existing = await parent.parent.GetDataHandler().ReadDataFromFile(statePath);
+                state = string.IsNullOrWhiteSpace(existing) ? new SteamAuthState() : JsonConvert.DeserializeObject<SteamAuthState>(existing) ?? new SteamAuthState();
+            }
+            catch
+            {
+                state = new SteamAuthState();
+            }
+            state.RefreshToken = steamRefreshToken;
+            state.AccessToken = steamAccessToken;
+            state.UpdatedAtUtc = DateTime.UtcNow;
 
             string stateJson = JsonConvert.SerializeObject(state, Formatting.Indented);
-            string statePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamAuthState);
             await parent.parent.GetDataHandler().WriteToFile(statePath, stateJson);
 
             if (!string.IsNullOrWhiteSpace(steamRefreshToken))

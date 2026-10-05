@@ -26,6 +26,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
     {
         /// <summary>Steam trade offer states that mean the offer is dead.</summary>
         private static readonly HashSet<int> DeadOfferStates = new() { 5, 6, 7, 8, 10 };
+        private static readonly TradeTimeline DefaultTimeline = new();
 
         public static TradeTransition ApplyPurchaseTrade(PurchasedListing purchase, JObject trade, DateTime nowUtc)
         {
@@ -56,8 +57,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 purchase.TimeOfSellerToAcceptSale = purchase.TimeOfSellerToAcceptSale == default && acceptedAt is { } a ? a : purchase.TimeOfSellerToAcceptSale;
                 purchase.TimeOfSellerToSendTradeOffer = purchase.TimeOfSellerToSendTradeOffer == default && sentAt is { } s ? s : purchase.TimeOfSellerToSendTradeOffer;
                 purchase.TimeOfItemRetrieval = ReadUtc(offer?["updated_at"]) ?? nowUtc;
-                // Valve's trade protection blocks market sales for 7 days; sell an hour after it lifts.
-                DateTime resellAt = (protectionEnds ?? verifySaleAt ?? purchase.TimeOfItemRetrieval.AddDays(7)).AddHours(1);
+                // Valve's trade protection blocks trading and Market sales until it lifts, on the first daily boundary
+                // after 7 days. CSFloat reports that moment; without it, compute it (verify_sale_at is a day later
+                // than the unlock, so it would waste a day). Sell an hour after it lifts.
+                DateTime resellAt = (protectionEnds ?? DefaultTimeline.ProtectionEnd(purchase.TimeOfItemRetrieval)).AddDays(TradeTimeline.UnlockBufferDays);
                 purchase.PredictedTimeToBeResoldOnSteam = resellAt;
                 purchase.CurrentStrategicStage = StrategicStages.JustRetrieved;
                 return TradeTransition.Retrieved;
@@ -83,7 +86,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         }
 
         /// <summary>Applies the trade for an item the bot relisted on CSFloat (the account is the seller).</summary>
-        public static TradeTransition ApplyResaleTrade(PurchasedListing purchase, JObject trade, DateTime nowUtc, double gbpPerUsd)
+        public static TradeTransition ApplyResaleTrade(PurchasedListing purchase, JObject trade, DateTime nowUtc, double gbpPerUsd, double sellerFee = 0.02)
         {
             string state = trade.Value<string>("state")?.ToLowerInvariant() ?? "";
             if (purchase.CurrentStrategicStage != StrategicStages.WaitingForCSFloatResale) return TradeTransition.None;
@@ -92,6 +95,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             if (state is "cancelled" or "failed")
             {
                 if (previous == purchase.LastTradeState) return TradeTransition.None;
+                // The buyer backed out: the listing's clock (and the exit model's evidence) resumes from now.
+                purchase.ResaleSoldAtUtc = default;
+                purchase.RelistExposureUpdatedUtc = nowUtc;
                 // A cancelled sale normally puts the listing back up ("listed"); if CSFloat delisted it
                 // instead, hand the item back to the sale scheduler to decide again.
                 string contractState = (trade["contract"] as JObject)?.Value<string>("state")?.ToLowerInvariant() ?? "";
@@ -103,10 +109,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 }
                 return TradeTransition.ResaleCancelled;
             }
+            if (purchase.ResaleSoldAtUtc == default)
+            {
+                // A buyer bought it: close the listing's evidence window (how long it took vs the model).
+                DateTime soldAt = ReadUtc(trade["created_at"]) is DateTime created && created <= nowUtc ? created : nowUtc;
+                if (soldAt > purchase.RelistExposureUpdatedUtc) ExitManager.AccrueExposure(purchase, soldAt);
+                purchase.ResaleSoldAtUtc = soldAt;
+            }
             if (state == "verified")
             {
                 int priceCents = (trade["contract"] as JObject)?.Value<int?>("price") ?? purchase.CSFloatResalePriceCents;
-                double netPounds = ArbitrageMath.CSFloatNetProceedsCents(priceCents, 0.02) * gbpPerUsd / 100.0;
+                double netPounds = ArbitrageMath.CSFloatNetProceedsCents(priceCents, sellerFee) * gbpPerUsd / 100.0;
                 double costPounds = purchase.PurchaseCostPence > 0 ? purchase.PurchaseCostPence / 100.0 : purchase.comparison?.CSFloatListing.PriceInPounds ?? 0;
                 purchase.ActualAbsoluteProfitInPounds = (float)(netPounds - costPounds);
                 purchase.ActualAbsoluteProfitInPence = (float)Math.Round((netPounds - costPounds) * 100);

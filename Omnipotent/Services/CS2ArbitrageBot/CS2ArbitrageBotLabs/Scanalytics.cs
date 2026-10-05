@@ -404,6 +404,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 sb.AppendLine($"Item: {gap.csfloatContainer.MarketHashName} — buy on Steam at ≤ £{gap.IdealPriceToPurchaseOnSteamInPounds:F2}, sell on CSFloat at ~£{gap.csfloatContainer.PriceInPounds:F2} " +
                               $"(returns {gap.ReturnCoefficientFromSteamToCSFloatTaxIncluded:P0} buying at the ask, {gap.IdealReturnCoefficientFromSteamToCSFloatTaxIncluded:P0} via buy order).");
             }
+            sb.AppendLine("Steam holds Market purchases for 7 days before they can be traded to a CSFloat buyer, and the CSFloat sale then pays out " +
+                          "after the buyer's own 7-day protection: allow ~15 days from wallet to spendable CSFloat cash. The coefficient above is at " +
+                          "prices expected after the hold; prefer converters that sell daily, so the hold is the only wait.");
             plan.LiquidityPlanDescription = sb.ToString().TrimEnd();
             return plan;
         }
@@ -496,6 +499,41 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public string CSFloatResaleListingID = "";
             public int CSFloatResalePriceCents;
             public string Notes = "";
+
+            // ── v3 fields: the exit model (absent in old files → defaults) ──
+            /// <summary>The exit plan made at purchase, with its forecasts for when the item becomes tradable.</summary>
+            public ExitDecision? PurchasePlan;
+            /// <summary>Exit decisions since (the sale decision, listing reviews), oldest first; bounded.</summary>
+            public List<ExitDecision> ExitHistory = new();
+            /// <summary>CSFloat's value for this unit at purchase (float-adjusted), USD cents, and that ÷ the item's base value.</summary>
+            public int AnchorCentsAtPurchase;
+            public double AnchorFloatFactor = 1;
+            public DateTime ListedOnCSFloatAtUtc;
+            /// <summary>
+            /// No-sale evidence at the current price: sales the model expected by now without one happening (Σ time ÷
+            /// expected days). A re-price carries over only the part that bears on the new price.
+            /// </summary>
+            public double RelistModelExposure;
+            /// <summary>The same, accumulated over the whole relist and never reduced (the track record calibrates on it).</summary>
+            public double RelistTotalExposure;
+            public DateTime RelistExposureUpdatedUtc;
+            /// <summary>Expected days to sell (base model) of the current listing price; exposure accrues against it.</summary>
+            public double RelistBaseDaysToSell;
+            public int RelistRepriceCount;
+            public DateTime LastRelistChangeUtc;
+            /// <summary>When a buyer bought the relisted item (the trade still has to be sent and verified).</summary>
+            public DateTime ResaleSoldAtUtc;
+            public DateTime NextExitReviewUtc;
+            /// <summary>Sale decisions postponed because the market data to make them was unavailable.</summary>
+            public int SaleDeferrals;
+            public DateTime SaleDeferredUntilUtc;
+
+            public void RecordExitDecision(ExitDecision decision)
+            {
+                ExitHistory ??= new List<ExitDecision>();
+                ExitHistory.Add(decision);
+                if (ExitHistory.Count > 40) ExitHistory.RemoveRange(1, ExitHistory.Count - 40); // keep the first (the sale decision) for calibration
+            }
         }
 
         /// <summary>A CSFloat listing paired with Steam data at evaluation time (persisted inside purchases).</summary>

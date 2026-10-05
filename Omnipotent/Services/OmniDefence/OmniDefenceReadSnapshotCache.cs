@@ -16,6 +16,7 @@ namespace Omnipotent.Services.OmniDefence
     internal sealed class OmniDefenceReadSnapshotCache
     {
         private const int MaxEntries = 128;
+        private const int CurrentSecurityVersion = 1;
         private static readonly TimeSpan MaxAge = TimeSpan.FromSeconds(45);
         private static readonly TimeSpan RetryDelay = TimeSpan.FromSeconds(5);
         private readonly string directory;
@@ -44,6 +45,8 @@ namespace Omnipotent.Services.OmniDefence
 
         private sealed class SavedEntry
         {
+            [JsonProperty(Order = -1)]
+            public int SecurityVersion { get; set; }
             public string Key { get; set; } = "";
             public bool IsIp { get; set; }
             public string Json { get; set; } = "";
@@ -60,6 +63,36 @@ namespace Omnipotent.Services.OmniDefence
         {
             byte[] bytes = SHA256.HashData(Encoding.UTF8.GetBytes(value));
             return kind + ":" + Convert.ToHexString(bytes);
+        }
+
+        internal void RemoveLegacyAuditSnapshots()
+        {
+            if (!Directory.Exists(directory)) return;
+            // These are disposable projections of the request database. Clearing
+            // them prevents old plaintext audit payloads being restored after scrub.
+            string root = Path.GetFullPath(directory).TrimEnd(Path.DirectorySeparatorChar) + Path.DirectorySeparatorChar;
+            foreach (string candidate in Directory.EnumerateFiles(root, "*", SearchOption.TopDirectoryOnly))
+            {
+                string path = Path.GetFullPath(candidate);
+                string name = Path.GetFileName(path);
+                if (!path.StartsWith(root, StringComparison.OrdinalIgnoreCase)) continue;
+                if (!(name.StartsWith("requests-", StringComparison.Ordinal) || name.StartsWith("ip-", StringComparison.Ordinal))) continue;
+                if (!(name.EndsWith(".json", StringComparison.OrdinalIgnoreCase) || name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))) continue;
+                if (name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase) || !HasCurrentSecurityVersion(path)) File.Delete(path);
+            }
+        }
+
+        private static bool HasCurrentSecurityVersion(string path)
+        {
+            try
+            {
+                using var text = File.OpenText(path);
+                using var reader = new JsonTextReader(text) { MaxDepth = 4 };
+                return reader.Read() && reader.TokenType == JsonToken.StartObject
+                    && reader.Read() && reader.TokenType == JsonToken.PropertyName && (string?)reader.Value == nameof(SavedEntry.SecurityVersion)
+                    && reader.Read() && reader.TokenType == JsonToken.Integer && Convert.ToInt32(reader.Value) == CurrentSecurityVersion;
+            }
+            catch { return false; }
         }
 
         public void Start(CancellationToken cancellationToken)
@@ -245,7 +278,7 @@ namespace Omnipotent.Services.OmniDefence
                 if (!File.Exists(path)) return null;
                 string text = await File.ReadAllTextAsync(path, cancellationToken);
                 SavedEntry? saved = JsonConvert.DeserializeObject<SavedEntry>(text);
-                if (saved == null || saved.Key != entry.Key || saved.IsIp != entry.IsIp
+                if (saved == null || saved.SecurityVersion != CurrentSecurityVersion || saved.Key != entry.Key || saved.IsIp != entry.IsIp
                     || !IsFresh(saved.AsOfUtc, DateTimeOffset.UtcNow)) return null;
                 ValidateBody(entry.IsIp, saved.Json);
                 return saved;
@@ -264,7 +297,7 @@ namespace Omnipotent.Services.OmniDefence
                 string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
                 try
                 {
-                    var saved = new SavedEntry { Key = entry.Key, IsIp = entry.IsIp, Json = json, AsOfUtc = asOfUtc };
+                    var saved = new SavedEntry { SecurityVersion = CurrentSecurityVersion, Key = entry.Key, IsIp = entry.IsIp, Json = json, AsOfUtc = asOfUtc };
                     await File.WriteAllTextAsync(temp, JsonConvert.SerializeObject(saved), cancellationToken);
                     File.Move(temp, path, overwrite: true);
                 }

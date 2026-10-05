@@ -326,6 +326,9 @@ namespace Omnipotent.Services.KliveAPI
                     resp.Headers.Set("Access-Control-Allow-Origin", "*");
                     resp.Headers.Set("Access-Control-Expose-Headers", "*");
 
+                    bool confidentialResponse = IsSensitiveSettingsRoute(route);
+                    if (confidentialResponse) ApplySensitiveSettingsResponseHeaders(resp.Headers);
+
                     byte[] buffer = Encoding.UTF8.GetBytes(response);
                     if (trace != null) trace.ResponseRawBytes = buffer.Length;
 
@@ -341,6 +344,7 @@ namespace Omnipotent.Services.KliveAPI
                     // before compression so matches cost no compression CPU.
                     const int MaxETagPayloadBytes = 8 * 1024 * 1024;
                     if (req.HttpMethod == "GET" && code == HttpStatusCode.OK
+                        && !HttpResponseHelpers.HasNoStore(resp.Headers["Cache-Control"])
                         && buffer.Length > 0 && buffer.Length <= MaxETagPayloadBytes)
                     {
                         trace?.Enter(TelemetryStage.ETag);
@@ -361,7 +365,7 @@ namespace Omnipotent.Services.KliveAPI
                     }
 
                     // Negotiated compression for compressible payloads worth the CPU.
-                    if (HttpResponseHelpers.IsCompressibleContentType(contentType) && req.HttpMethod != "HEAD")
+                    if (!confidentialResponse && HttpResponseHelpers.IsCompressibleContentType(contentType) && req.HttpMethod != "HEAD")
                     {
                         resp.Headers.Set("Vary", "Accept-Encoding");
                         if (buffer.Length >= 1024 && string.IsNullOrEmpty(resp.Headers["Content-Encoding"]))
@@ -410,7 +414,7 @@ namespace Omnipotent.Services.KliveAPI
                     {
                         if (trace != null) trace.ClientDisconnected = true;
                         _ = ParentService.ServiceLog($"Client disconnected before response completed for route: " +
-                            $"{context.Request?.RawUrl} ({ex.GetType().Name}: {ex.Message})");
+                            (IsSensitiveSettingsRoute(route) ? $"{route} ({ex.GetType().Name})" : $"{context.Request?.RawUrl} ({ex.GetType().Name}: {ex.Message})"));
                         if (capture != null)
                         {
                             capture.StatusCode = (int)HttpStatusCode.InternalServerError;
@@ -420,7 +424,10 @@ namespace Omnipotent.Services.KliveAPI
                         return;
                     }
 
-                    ParentService.ServiceLogError(ex, "Error while returning response for route: " + context.Request.RawUrl);
+                    if (IsSensitiveSettingsRoute(route))
+                        _ = ParentService.ServiceLogError($"Error while returning response for route: {route} ({ex.GetType().Name})");
+                    else
+                        _ = ParentService.ServiceLogError(ex, "Error while returning response for route: " + context.Request.RawUrl);
                     if (capture != null)
                     {
                         capture.StatusCode = (int)HttpStatusCode.InternalServerError;
@@ -479,6 +486,9 @@ namespace Omnipotent.Services.KliveAPI
                     resp.Headers.Set("Access-Control-Allow-Origin", "*");
                     resp.Headers.Set("Access-Control-Expose-Headers", "*");
 
+                    bool confidentialResponse = IsSensitiveSettingsRoute(route);
+                    if (confidentialResponse) ApplySensitiveSettingsResponseHeaders(resp.Headers);
+
                     byte[] buffer = data;
                     if (trace != null) trace.ResponseRawBytes = buffer?.Length ?? 0;
 
@@ -487,7 +497,7 @@ namespace Omnipotent.Services.KliveAPI
 
                     // Same negotiated compression as ReturnResponse; the content-type
                     // allowlist naturally skips already-compressed media/archives.
-                    if (HttpResponseHelpers.IsCompressibleContentType(contentType) && req.HttpMethod != "HEAD")
+                    if (!confidentialResponse && HttpResponseHelpers.IsCompressibleContentType(contentType) && req.HttpMethod != "HEAD")
                     {
                         resp.Headers.Set("Vary", "Accept-Encoding");
                         if (buffer.Length >= 1024 && string.IsNullOrEmpty(resp.Headers["Content-Encoding"]))
@@ -524,7 +534,10 @@ namespace Omnipotent.Services.KliveAPI
                     {
                         trace.ClientDisconnected = true;
                     }
-                    ParentService.ServiceLogError(ex, "Error while returning binary response for route: " + context.Request.RawUrl);
+                    if (IsSensitiveSettingsRoute(route))
+                        _ = ParentService.ServiceLogError($"Error while returning binary response for route: {route} ({ex.GetType().Name})");
+                    else
+                        _ = ParentService.ServiceLogError(ex, "Error while returning binary response for route: " + context.Request.RawUrl);
                 }
             }
 
@@ -550,6 +563,7 @@ namespace Omnipotent.Services.KliveAPI
                 }
                 resp.Headers.Set("Access-Control-Allow-Origin", "*");
                 resp.Headers.Set("Access-Control-Expose-Headers", "*");
+                if (IsSensitiveSettingsRoute(route)) ApplySensitiveSettingsResponseHeaders(resp.Headers);
                 SetTimingHeaders(resp);
                 if (trace != null)
                 {
@@ -970,6 +984,10 @@ namespace Omnipotent.Services.KliveAPI
                 }
 
                 string normalized = NormalizeRoute(pathPart);
+                // A batch uses the outer request's connection and audit policy. Keep
+                // secret-setting requests on the dedicated, TLS-only pipeline.
+                if (IsSensitiveSettingsRoute(normalized))
+                    return BatchError(result, 400, "OmniSettings routes must be requested directly over HTTPS.");
                 if (string.Equals(normalized, "/batch", StringComparison.OrdinalIgnoreCase))
                     return BatchError(result, 400, "Nested /batch is not allowed.");
 
@@ -1443,6 +1461,59 @@ namespace Omnipotent.Services.KliveAPI
         private static string NormalizeMethod(string method)
         {
             return (method ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        internal static bool IsSensitiveSettingsRoute(string? route)
+        {
+            const string prefix = "/OmniGlobalSettings";
+            if (string.IsNullOrWhiteSpace(route)) return false;
+            string normalized = NormalizeRoute(route);
+            return normalized.Equals(prefix, StringComparison.OrdinalIgnoreCase)
+                || normalized.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static void ApplySensitiveSettingsResponseHeaders(NameValueCollection headers)
+        {
+            headers.Set("Cache-Control", "no-store, private");
+            headers.Set("Pragma", "no-cache");
+            headers.Set("Expires", "0");
+            headers.Set("X-Content-Type-Options", "nosniff");
+            headers.Set("Referrer-Policy", "no-referrer");
+            headers.Set("Strict-Transport-Security", "max-age=31536000");
+            headers.Remove("ETag");
+        }
+
+        internal static void RedactSensitiveSettingsRequestAudit(RequestRow row)
+        {
+            if (!ShouldRedactSensitiveSettingsAudit(row.Route, row.BodyText)) return;
+            // Do not retain secret JSON, password-verification hashes, or untrusted
+            // header/query values alongside an otherwise encrypted settings file.
+            row.Query = null;
+            row.BodyText = null;
+            row.BodyHash = null;
+            row.BodyLength = 0;
+            row.BodyTruncated = false;
+            row.HeadersJson = null;
+            row.UserAgent = null;
+            row.ClientPage = null;
+        }
+
+        internal static bool ShouldRedactSensitiveSettingsAudit(string? route, string? bodyText)
+        {
+            if (IsSensitiveSettingsRoute(route)) return true;
+            if (!NormalizeRoute(route ?? "").Equals("/batch", StringComparison.OrdinalIgnoreCase)) return false;
+            // Truncated or malformed bodies cannot prove that no secret-setting
+            // path was present. Redact those conservatively, including old audits.
+            if (string.IsNullOrWhiteSpace(bodyText)) return true;
+            try
+            {
+                using var reader = new JsonTextReader(new StringReader(bodyText)) { MaxDepth = 32 };
+                JToken token = JToken.Load(reader);
+                if (token is not JArray) return true;
+                IEnumerable<JToken> values = ((JContainer)token).DescendantsAndSelf();
+                return values.Any(value => value.Type == JTokenType.String && IsSensitiveSettingsRoute(value.Value<string>()));
+            }
+            catch (JsonException) { return true; }
         }
 
         private static bool CanRequestCarryBody(string method)
@@ -1947,6 +2018,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             RequestTrace? trace = request.trace;
             if (!cacheEnabled
+                || IsSensitiveSettingsRoute(route)
                 || NormalizeMethod(request.req.HttpMethod) != "GET"
                 || IsRouteDenylisted(route))
             {
@@ -2015,6 +2087,7 @@ namespace Omnipotent.Services.KliveAPI
             }
             bool matchedRoute = false;
             bool shouldRecordStatistics = true;
+            bool sensitiveSettingsRequest = false;
             string statsRoute = context?.Request?.Url?.AbsolutePath ?? context?.Request?.RawUrl ?? "/";
             string statsMethod = NormalizeMethod(context?.Request?.HttpMethod ?? string.Empty);
 
@@ -2040,6 +2113,7 @@ namespace Omnipotent.Services.KliveAPI
             RequestSignals? defenceSignals = null;
             RequestBodyAuditState? defenceBodyAudit = null;
             AuditedRequestBodyStream? streamingBodyStream = null;
+            byte[]? sensitiveRequestBodyBytes = null;
             const int MaxStoredBodyBytes = 65536; // 64KB cap for stored body text
 
             try
@@ -2047,16 +2121,17 @@ namespace Omnipotent.Services.KliveAPI
                 HttpListenerRequest req = context.Request;
                 string query = req.Url?.Query ?? string.Empty;
                 string route = NormalizeRoute(req.Url?.AbsolutePath ?? req.RawUrl);
+                sensitiveSettingsRequest = IsSensitiveSettingsRoute(route);
                 statsRoute = route;
                 statsMethod = NormalizeMethod(req.HttpMethod);
                 defenceIp = OmniDefenceService.ExtractClientIp(req);
-                defenceUserAgent = req.UserAgent;
-                defenceQueryString = query;
+                defenceUserAgent = sensitiveSettingsRequest ? null : req.UserAgent;
+                defenceQueryString = sensitiveSettingsRequest ? null : query;
                 defenceFromWebsite = IsWebsiteClientRequest(req);
-                defenceClientPage = req.Headers["X-Klive-Page"] ?? req.Headers["Referer"];
-                defenceHeadersJson = CaptureHeadersJson(req);
+                defenceClientPage = sensitiveSettingsRequest ? null : req.Headers["X-Klive-Page"] ?? req.Headers["Referer"];
+                defenceHeadersJson = sensitiveSettingsRequest ? null : CaptureHeadersJson(req);
                 // Headers are copied now, while the request is live; the outcome is filled in the finally.
-                defenceSignals = RequestSignals.Capture(req, defenceIp);
+                defenceSignals = sensitiveSettingsRequest ? null : RequestSignals.Capture(req, defenceIp);
                 string defenceAuthHeader = req.Headers["Authorization"] ?? string.Empty;
                 defenceRequestOrigin = defenceFromWebsite ? (string.IsNullOrWhiteSpace(defenceAuthHeader) ? "WebsiteNoProfile" : "WebsiteInvalidProfile") : "DirectApi";
                 NameValueCollection nameValueCollection = string.IsNullOrEmpty(query)
@@ -2073,6 +2148,22 @@ namespace Omnipotent.Services.KliveAPI
                 request.user = null;
                 request.userMessageBytes = Array.Empty<byte>();
                 request.userMessageContent = string.Empty;
+
+                if (sensitiveSettingsRequest)
+                {
+                    ApplySensitiveSettingsResponseHeaders(context.Response.Headers);
+                    // HTTP is also exposed for health checks. Never accept settings
+                    // credentials or bodies on it, and never trust client-provided
+                    // X-Forwarded-Proto as evidence of an encrypted connection.
+                    if (!req.IsSecureConnection)
+                    {
+                        defenceOutcome = RequestOutcome.ClientError;
+                        defenceDenyReason = "HTTPSRequired";
+                        context.Response.KeepAlive = false;
+                        await request.ReturnResponse("HTTPSRequired", code: HttpStatusCode.Forbidden);
+                        return;
+                    }
+                }
 
                 //HANDLE PREFLIGHT REQUESTS
                 if (NormalizeMethod(request.req.HttpMethod) == "OPTIONS")
@@ -2166,6 +2257,8 @@ namespace Omnipotent.Services.KliveAPI
 
                 if (ControllerLookup.TryGetValue(route, out RouteInfo routeData))
                 {
+                    if (sensitiveSettingsRequest)
+                        routeData.maxBodyBytes = Math.Min(routeData.maxBodyBytes ?? 1024 * 1024, 1024 * 1024);
                     matchedRoute = true;
                     defencePermRequired = (int)routeData.authenticationLevelRequired;
                     if (!IsRequestMethodAllowed(req.HttpMethod, routeData.normalizedMethod))
@@ -2236,11 +2329,15 @@ namespace Omnipotent.Services.KliveAPI
                         {
                             trace?.Enter(TelemetryStage.RequestBodyRead);
                             (request.userMessageBytes, request.userMessageContent) = await ReadRequestBodyAsync(req, routeData.maxBodyBytes);
+                            if (sensitiveSettingsRequest) sensitiveRequestBodyBytes = request.userMessageBytes;
                             trace?.Enter(TelemetryStage.Prologue);
                             defenceBodyLength = request.userMessageBytes?.LongLength ?? 0;
-                            defenceBodyHash = OmniDefenceService.HashBody(request.userMessageBytes ?? Array.Empty<byte>());
-                            (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(
-                                request.userMessageBytes, request.userMessageContent, MaxStoredBodyBytes);
+                            if (!sensitiveSettingsRequest)
+                            {
+                                defenceBodyHash = OmniDefenceService.HashBody(request.userMessageBytes ?? Array.Empty<byte>());
+                                (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(
+                                    request.userMessageBytes, request.userMessageContent, MaxStoredBodyBytes);
+                            }
                         }
                     }
 
@@ -2351,17 +2448,21 @@ namespace Omnipotent.Services.KliveAPI
                 else
                 {
                     defenceOutcome = RequestOutcome.NotFound;
-                    if (CanRequestCarryBody(req.HttpMethod))
+                    if (!sensitiveSettingsRequest && CanRequestCarryBody(req.HttpMethod))
                     {
                         try
                         {
                             var (bodyBytes, bodyText) = await ReadRequestBodyAsync(req);
                             defenceBodyLength = bodyBytes?.LongLength ?? 0;
-                            defenceBodyHash = OmniDefenceService.HashBody(bodyBytes ?? Array.Empty<byte>());
-                            (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(bodyBytes, bodyText, MaxStoredBodyBytes);
+                            if (!sensitiveSettingsRequest)
+                            {
+                                defenceBodyHash = OmniDefenceService.HashBody(bodyBytes ?? Array.Empty<byte>());
+                                (defenceBodyText, defenceBodyTruncated) = TruncateBodyForStorage(bodyBytes, bodyText, MaxStoredBodyBytes);
+                            }
                         }
                         catch { }
                     }
+                    if (sensitiveSettingsRequest && req.HasEntityBody) context.Response.KeepAlive = false;
                     await request.ReturnResponse("Route not found", "text/plain", null, HttpStatusCode.NotFound);
                 }
             }
@@ -2375,7 +2476,10 @@ namespace Omnipotent.Services.KliveAPI
             catch (Exception ex)
             {
                 if (trace != null) trace.Exception = true;
-                ServiceLogError(ex, "Error processing request: " + context.Request?.RawUrl);
+                if (sensitiveSettingsRequest)
+                    _ = ServiceLogError($"Error processing request: {statsRoute} ({ex.GetType().Name})");
+                else
+                    _ = ServiceLogError(ex, "Error processing request: " + context.Request?.RawUrl);
                 defenceOutcome = RequestOutcome.ServerError;
                 try
                 {
@@ -2386,8 +2490,8 @@ namespace Omnipotent.Services.KliveAPI
                         byte[] errorBytes = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new
                         {
                             Error = "Unhandled exception while processing request.",
-                            Route = context.Request?.RawUrl,
-                            Message = ex.Message
+                            Route = sensitiveSettingsRequest ? statsRoute : context.Request?.RawUrl,
+                            Message = sensitiveSettingsRequest ? "Sensitive settings request failed." : ex.Message
                         }));
                         context.Response.ContentLength64 = errorBytes.Length;
                         await context.Response.OutputStream.WriteAsync(errorBytes, 0, errorBytes.Length);
@@ -2400,6 +2504,7 @@ namespace Omnipotent.Services.KliveAPI
             }
             finally
             {
+                if (sensitiveRequestBodyBytes != null) CryptographicOperations.ZeroMemory(sensitiveRequestBodyBytes);
                 trace?.Enter(TelemetryStage.Teardown);
                 Interlocked.Decrement(ref _inFlightRequests);
                 Interlocked.Exchange(ref _lastRequestCompletedUtcTicks, DateTime.UtcNow.Ticks);
@@ -2484,6 +2589,7 @@ namespace Omnipotent.Services.KliveAPI
                                 BodyTruncated = defenceBodyTruncated,
                                 HeadersJson = defenceHeadersJson
                             };
+                            RedactSensitiveSettingsRequestAudit(row);
                             _ = defence.RecordRequestAsync(row, defenceOutcome);
 
                             if (defenceSignals != null)

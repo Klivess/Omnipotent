@@ -42,7 +42,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
         public const string BuyBucket = "buy";
         public const string PriceListBucket = "price-list";
         public const string HistoryBucket = "history";
+        /// <summary>Per-sale history: its own 500/day window, separate from the daily graph's (measured Oct 2026).</summary>
+        public const string HistorySalesBucket = "history-sales";
         public const string CreateListingBucket = "create-listing";
+        public const string ModifyListingBucket = "modify-listing";
+        public const string DelistBucket = "delist";
         public const string SingleListingBucket = "single-listing";
         public const string InventoryBucket = "inventory";
 
@@ -254,6 +258,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
         public async Task<List<SalesGraphPoint>> GetSalesGraphAsync(string marketHashName, CancellationToken ct = default)
         {
             string body = await SendAsync(HistoryBucket, HttpMethod.Get, BaseUrl + "/history/" + Uri.EscapeDataString(marketHashName) + "/graph", null, ct);
+            return ParseSalesGraph(body);
+        }
+
+        /// <summary>Parses the daily sales graph. CSFloat lists only days with sales, so gaps are days without any.</summary>
+        public static List<SalesGraphPoint> ParseSalesGraph(string body)
+        {
             var result = new List<SalesGraphPoint>();
             if (JToken.Parse(body) is not JArray array) return result;
             foreach (var token in array.OfType<JObject>())
@@ -268,6 +278,67 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
                 });
             }
             return result.OrderByDescending(p => p.DayUtc).ToList();
+        }
+
+        /// <summary>One completed CSFloat sale of an item, with the reference price CSFloat held when it sold.</summary>
+        public sealed class RecentSale
+        {
+            public string Id { get; set; } = "";
+            public int PriceCents { get; set; }
+            /// <summary>When the seller listed it. Sold minus listed is the time it spent on the market.</summary>
+            public DateTime ListedAtUtc { get; set; }
+            public DateTime SoldAtUtc { get; set; }
+            public int? BasePriceCents { get; set; }
+            /// <summary>CSFloat's float-adjusted value for that exact item at sale time.</summary>
+            public int? PredictedPriceCents { get; set; }
+            public double? FloatValue { get; set; }
+            public int StickerCount { get; set; }
+
+            public double DaysOnMarket => ListedAtUtc == default || SoldAtUtc < ListedAtUtc ? 0 : (SoldAtUtc - ListedAtUtc).TotalDays;
+
+            /// <summary>Price paid relative to CSFloat's value for that item at the time; null without a reference.</summary>
+            public double? ValueRatio
+            {
+                get
+                {
+                    int? anchor = PredictedPriceCents is > 0 ? PredictedPriceCents : BasePriceCents;
+                    return anchor is > 0 && PriceCents > 0 ? PriceCents / (double)anchor.Value : null;
+                }
+            }
+        }
+
+        /// <summary>The item's 40 most recent CSFloat sales, newest first (500 requests/day budget).</summary>
+        public async Task<List<RecentSale>> GetRecentSalesAsync(string marketHashName, CancellationToken ct = default)
+        {
+            string body = await SendAsync(HistorySalesBucket, HttpMethod.Get, BaseUrl + "/history/" + Uri.EscapeDataString(marketHashName) + "/sales", null, ct);
+            return ParseRecentSales(body);
+        }
+
+        public static List<RecentSale> ParseRecentSales(string body)
+        {
+            var result = new List<RecentSale>();
+            JToken root = JToken.Parse(body);
+            if ((root as JArray ?? root["data"] as JArray) is not JArray array) return result;
+            foreach (var o in array.OfType<JObject>())
+            {
+                int price = CSFloatListing.ReadInt(o["price"]) ?? 0;
+                DateTime? sold = TradeProgress.ReadUtc(o["sold_at"]);
+                if (price <= 0 || sold == null) continue;
+                var reference = o["reference"] as JObject;
+                var item = o["item"] as JObject;
+                result.Add(new RecentSale
+                {
+                    Id = o.Value<string>("id") ?? "",
+                    PriceCents = price,
+                    ListedAtUtc = TradeProgress.ReadUtc(o["created_at"]) ?? default,
+                    SoldAtUtc = sold.Value,
+                    BasePriceCents = CSFloatListing.ReadInt(reference?["base_price"]),
+                    PredictedPriceCents = CSFloatListing.ReadInt(reference?["predicted_price"]),
+                    FloatValue = item?["float_value"]?.Type is JTokenType.Float or JTokenType.Integer ? item.Value<double>("float_value") : null,
+                    StickerCount = (item?["stickers"] as JArray)?.Count ?? 0,
+                });
+            }
+            return result.OrderByDescending(s => s.SoldAtUtc).ToList();
         }
 
         // ───────────────────────────── Buying / selling ─────────────────────────────
@@ -320,6 +391,27 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             string payload = JsonConvert.SerializeObject(new { asset_id = assetId, type = "buy_now", price = priceCents });
             string body = await SendAsync(CreateListingBucket, HttpMethod.Post, BaseUrl + "/listings", payload, ct);
             return JToken.Parse(body).Value<string>("id");
+        }
+
+        /// <summary>
+        /// Changes the price of one of the account's listings (the listing keeps its id). Returns the price
+        /// CSFloat reports back, or null when the response did not include the listing.
+        /// </summary>
+        public async Task<int?> UpdateListingPriceAsync(string listingId, int priceCents, CancellationToken ct = default)
+        {
+            string payload = JsonConvert.SerializeObject(new { modifications = new[] { new { contract_id = listingId, price = priceCents } } });
+            string body = await SendAsync(ModifyListingBucket, HttpMethod.Patch, BaseUrl + "/listings/bulk-modify", payload, ct);
+            JToken root = JToken.Parse(body);
+            var listings = root as JArray ?? root["data"] as JArray;
+            var updated = listings?.OfType<JObject>().FirstOrDefault(l => l.Value<string>("id") == listingId);
+            return updated == null ? null : CSFloatListing.ReadInt(updated["price"]);
+        }
+
+        /// <summary>Takes one of the account's listings off the market; the item stays in the Steam inventory.</summary>
+        public async Task DelistAsync(string listingId, CancellationToken ct = default)
+        {
+            string payload = JsonConvert.SerializeObject(new { contract_ids = new[] { listingId } });
+            await SendAsync(DelistBucket, HttpMethod.Patch, BaseUrl + "/listings/bulk-delist", payload, ct);
         }
 
         public sealed class InventoryItem
