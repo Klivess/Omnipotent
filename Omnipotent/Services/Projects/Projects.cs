@@ -3279,23 +3279,28 @@ namespace Omnipotent.Services.Projects
                 msg => ServiceLog(msg),
                 imageForProject: pid => Settings.Get(pid).DesktopImage,
                 dockerUri: ProjectContainerConfig.ResolveDockerUri());
-            manager.DesktopChanged += (record, change) => EventLog.Append(new ProjectEvent
+            manager.DesktopChanged += (record, change) =>
             {
-                ProjectID = record.ProjectID,
-                AgentID = record.AgentID,
-                Type = ProjectEventTypes.DesktopChanged,
-                Author = "system",
-                Text = $"Desktop {change}{(record.AgentID == null ? " (shared)" : $" for {record.AgentID}")}.",
-                PayloadJson = JsonConvert.SerializeObject(new
+                // KliveAgent's own computer shares the fleet but has no project event log.
+                if (ExternalDesktopOwners.IsExternal(record.ProjectID)) return;
+                EventLog.Append(new ProjectEvent
                 {
-                    change,
-                    record.ContainerID,
-                    record.AgentID,
-                    record.Width,
-                    record.Height,
-                    record.Lost,
-                }),
-            });
+                    ProjectID = record.ProjectID,
+                    AgentID = record.AgentID,
+                    Type = ProjectEventTypes.DesktopChanged,
+                    Author = "system",
+                    Text = $"Desktop {change}{(record.AgentID == null ? " (shared)" : $" for {record.AgentID}")}.",
+                    PayloadJson = JsonConvert.SerializeObject(new
+                    {
+                        change,
+                        record.ContainerID,
+                        record.AgentID,
+                        record.Width,
+                        record.Height,
+                        record.Lost,
+                    }),
+                });
+            };
             Desktops = manager;
 
             // Screen-diff hooks need the desktop subsystem; hand it to the adapter manager and
@@ -3767,8 +3772,13 @@ namespace Omnipotent.Services.Projects
                         // event simply retries against a fresh gate wait.
                         using var evCts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
                         await actionGate.WaitAsync(evCts.Token);
-                        try { if (await ContainerRemoteInput.ApplyAsync(transport, ev, evCts.Token)) applied++; }
+                        bool appliedThis = false;
+                        try { if (await ContainerRemoteInput.ApplyAsync(transport, ev, evCts.Token)) { applied++; appliedThis = true; } }
                         finally { actionGate.Release(); }
+                        if (appliedThis && ExternalDesktopOwners.IsExternal(record.ProjectID))
+                        {
+                            try { ExternalDesktopInputApplied?.Invoke(record); } catch { }
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -3790,9 +3800,25 @@ namespace Omnipotent.Services.Projects
                 try { await transport.ReleaseAllAsync(CancellationToken.None); } catch { }
                 try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
                 ServiceLog($"Projects: remote-control session on container {shortID} ended ({applied} input event(s) applied).");
-                if (applied > 0) NotifyAgentOfRemoteControl(record, applied);
+                if (applied > 0)
+                {
+                    if (ExternalDesktopOwners.IsExternal(record.ProjectID))
+                    {
+                        // No project agent owns this desktop; its owner (KliveAgent) listens instead.
+                        try { ExternalDesktopRemoteControlEnded?.Invoke(record, applied); } catch { }
+                    }
+                    else NotifyAgentOfRemoteControl(record, applied);
+                }
             }
         }
+
+        /// <summary>Raised for every input event Klives applies to a desktop owned outside Projects
+        /// (see <see cref="ExternalDesktopOwners"/>), so its owner can tell a takeover is under way.</summary>
+        public event Action<DesktopContainerRecord>? ExternalDesktopInputApplied;
+
+        /// <summary>Raised when Klives' remote-control session on an externally-owned desktop ends
+        /// after he actually sent input — the owner's cue to re-check its screen and resume.</summary>
+        public event Action<DesktopContainerRecord, int>? ExternalDesktopRemoteControlEnded;
 
         /// <summary>
         /// After a remote-control session in which Klives actually sent input, tell the desktop's

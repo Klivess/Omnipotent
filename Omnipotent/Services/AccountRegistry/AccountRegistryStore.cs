@@ -281,6 +281,22 @@ namespace Omnipotent.Services.AccountRegistry
             }
         }
 
+        /// <summary>Corrects the login name (e.g. the site rejected the one chosen before signup).</summary>
+        public bool UpdateUsername(string accountID, string username)
+        {
+            if (string.IsNullOrWhiteSpace(username)) return false;
+            lock (gate)
+            {
+                var all = LoadLocked();
+                var a = all.FirstOrDefault(x => x.AccountID == accountID);
+                if (a == null) return false;
+                a.Username = username.Trim();
+                a.UpdatedAt = DateTime.UtcNow;
+                SaveLocked(all);
+                return true;
+            }
+        }
+
         public bool UpdateEmail(string accountID, string? email)
         {
             lock (gate)
@@ -419,6 +435,39 @@ namespace Omnipotent.Services.AccountRegistry
                     usedSink?.Add($"{serviceKey}/{field}");
                     return value;
                 }
+            });
+        }
+
+        /// <summary>
+        /// Display-time substitution for Klives' own authenticated views: every {account:...} reference
+        /// that resolves to exactly one stored secret is replaced by its value; anything unknown,
+        /// ambiguous or malformed is left exactly as written. Unlike typing-time resolution this never
+        /// throws, never marks an account used and never claims ownership — it only reads.
+        ///
+        /// This is how an agent hands Klives the credentials he asked for without the value ever
+        /// passing through a model, the persisted conversation, or a notification: the reply keeps
+        /// the reference, and only the dashboard response that renders it carries the value.
+        /// </summary>
+        public string RevealPlaceholders(string? text)
+        {
+            if (string.IsNullOrEmpty(text) || !text.Contains("{account:", StringComparison.OrdinalIgnoreCase))
+                return text ?? "";
+            List<RegisteredAccount> all;
+            lock (gate) all = LoadLocked();
+            return PlaceholderRegex.Replace(text, m =>
+            {
+                try
+                {
+                    var (serviceKey, username, field, error) = ParseRef(m.Groups[1].Value);
+                    if (error != null) return m.Value;
+                    var candidates = all.Where(a => a.ServiceKey == serviceKey
+                        && (username == null || string.Equals(a.Username, username, StringComparison.OrdinalIgnoreCase))).ToList();
+                    if (candidates.Count != 1) return m.Value;
+                    var secret = candidates[0].Secrets.FirstOrDefault(s => string.Equals(s.Name, field, StringComparison.OrdinalIgnoreCase));
+                    if (secret == null) return m.Value;
+                    return Decrypt(candidates[0].AccountID, secret.CipherB64) ?? m.Value;
+                }
+                catch { return m.Value; }
             });
         }
 

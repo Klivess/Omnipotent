@@ -954,6 +954,40 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
+        /// <summary>
+        /// Removes every image from a tool session, keeping each message's text, for a caller whose model
+        /// turned out to reject image input. Returns how many image-bearing messages were rewritten.
+        /// Only standalone user messages carry images, so the tool-call protocol is untouched.
+        /// </summary>
+        public int StripToolSessionImages(string sessionId)
+        {
+            lock (sessions)
+            {
+                if (!sessions.TryGetValue(sessionId, out var s)) return 0;
+                int rewritten = 0;
+                for (int i = 0; i < s.structuredMessages.Count; i++)
+                {
+                    var m = s.structuredMessages[i];
+                    if (m.role != "user" || !MessageHasImage(m)) continue;
+                    var texts = new List<string>();
+                    foreach (var part in (System.Collections.IEnumerable)m.content)
+                    {
+                        string? text = part switch
+                        {
+                            HFWrapper.HFTextPart t => t.text,
+                            Newtonsoft.Json.Linq.JObject jo when (string?)jo["type"] == "text" => (string?)jo["text"],
+                            _ => null,
+                        };
+                        if (!string.IsNullOrWhiteSpace(text)) texts.Add(text);
+                    }
+                    texts.Add("[Screenshot removed: the active model does not accept images.]");
+                    s.structuredMessages[i] = new HFWrapper.HFMessage { role = "user", content = string.Join("\n", texts) };
+                    rewritten++;
+                }
+                return rewritten;
+            }
+        }
+
         private static bool MessageHasImage(HFWrapper.HFMessage m)
         {
             if (m.content is string) return false;
@@ -1877,8 +1911,26 @@ namespace Omnipotent.Services.KliveLLM
         {
             if (remoteProvider.Provider != LLMProvider.AIRouter) return null;
             var ticket = BuildWorkTicket(cachePrefixHint, workClass, payload.model ?? remoteProvider.Model, intent);
-            return await FairUse.AcquireAsync(EstimateRequestTokens(payload), ticket, cancellationToken);
+            var acquire = FairUse.AcquireAsync(EstimateRequestTokens(payload), ticket, cancellationToken);
+            if (acquire.IsCompleted || CurrentActivityScope == null) return await acquire;
+
+            // A queued request is healthy but silent. Say so, so a caller's stall detector can tell
+            // "waiting for one of three shared slots" from "wedged".
+            var limiter = FairUse;
+            using var pulse = StartActivityPulse(KliveLLMActivityKind.Queued, () => DescribeQueue(limiter));
+            return await acquire;
         }
+
+        private static string DescribeQueue(AIRouterFairUseLimiter limiter)
+        {
+            var state = limiter.Describe();
+            string penalty = state.PenaltyRemaining > TimeSpan.Zero
+                ? $"; provider cool-off {state.PenaltyRemaining.TotalSeconds:0}s"
+                : string.Empty;
+            return $"waiting for an AIRouter slot ({state.InFlight}/{PolicyMaxParallelForDisplay} busy, {state.Waiting} queued{penalty})";
+        }
+
+        private const int PolicyMaxParallelForDisplay = AIRouterFairUseLimiter.PolicyMaxParallelRequests;
 
         /// <summary>
         /// Identity of the cached prefix this request will extend.
@@ -2478,6 +2530,13 @@ namespace Omnipotent.Services.KliveLLM
             {
                 throw;
             }
+            catch (KliveLLMStreamStalledException)
+            {
+                // The buffered fallback exists for streams that fail to START (connect, headers,
+                // auth). A provider that went silent mid-request would hold a buffered retry for the
+                // full HttpClient timeout as well; hand the stall to the caller's own retry instead.
+                throw;
+            }
             catch (RemoteLLMException ex) when (!ex.IsRetryable
                 || (ex.Kind == RemoteLLMFailureKind.RateLimited && ex.RetryAfter > AIRouterMaxCoolOff))
             {
@@ -2537,6 +2596,13 @@ namespace Omnipotent.Services.KliveLLM
             using AIRouterFairUseLease? fairUse = await AcquireFairUseAsync(remoteProvider, payload,
                 cancellationToken, cachePrefixHint, workClass, AIRouterSlotIntent.Turn);
             var providerStopwatch = System.Diagnostics.Stopwatch.StartNew();
+            // Only an observing caller opts into the idle bound; everyone else keeps the historical
+            // unbounded read. The pulse is legitimate only because every wait it covers is bounded:
+            // headers by the HttpClient timeout, each silent read by the idle limit.
+            TimeSpan? idleLimit = CurrentActivityScope?.StreamIdleTimeout;
+            string providerName = remoteProvider.DisplayName;
+            using var pulse = StartActivityPulse(KliveLLMActivityKind.AwaitingProvider,
+                () => $"waiting for {providerName} to start answering");
 
             using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
             {
@@ -2610,10 +2676,26 @@ namespace Omnipotent.Services.KliveLLM
             {
                 await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
                 using var reader = new StreamReader(stream, Encoding.UTF8);
+                using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                if (idleLimit is { } firstLimit) idle.CancelAfter(firstLimit);
+                long reasoningChars = 0;
 
                 string line;
-                while ((line = await reader.ReadLineAsync(cancellationToken)) != null)
+                while (true)
                 {
+                    try
+                    {
+                        line = await reader.ReadLineAsync(idle.Token);
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && idleLimit.HasValue)
+                    {
+                        throw new KliveLLMStreamStalledException(idleLimit.Value,
+                            contentSb.Length > 0 || toolCallsByIndex.Count > 0);
+                    }
+                    if (line == null) break;
+                    // Any line — data, keep-alive comment or blank separator — proves the connection
+                    // is alive, so each one restarts the silence clock.
+                    if (idleLimit is { } limit) idle.CancelAfter(limit);
                     cancellationToken.ThrowIfCancellationRequested();
                     if (line.Length == 0) continue;
                     if (!line.StartsWith("data:", StringComparison.Ordinal)) continue;
@@ -2638,14 +2720,26 @@ namespace Omnipotent.Services.KliveLLM
                     var delta = choice.delta;
                     if (delta == null) continue;
 
+                    // Reasoning never reaches the visible answer, but it is the provider working. A
+                    // long think used to read as total silence to anyone watching only content.
+                    string? reasoning = delta.ReasoningText;
+                    if (!string.IsNullOrEmpty(reasoning))
+                    {
+                        reasoningChars += reasoning.Length;
+                        pulse?.Set(KliveLLMActivityKind.Reasoning,
+                            () => $"reasoning ({Interlocked.Read(ref reasoningChars):N0} chars so far)");
+                    }
+
                     if (!string.IsNullOrEmpty(delta.content))
                     {
                         contentSb.Append(delta.content);
                         try { onToken(delta.content); } catch { }
+                        pulse?.Set(KliveLLMActivityKind.Streaming, () => "writing the reply");
                     }
 
                     if (delta.tool_calls != null)
                     {
+                        pulse?.Set(KliveLLMActivityKind.Streaming, () => "writing tool calls");
                         foreach (var tcd in delta.tool_calls)
                         {
                             if (!toolCallsByIndex.TryGetValue(tcd.index, out var tc))
@@ -2672,10 +2766,12 @@ namespace Omnipotent.Services.KliveLLM
             {
                 throw;
             }
-            catch when (contentSb.Length > 0 || toolCallsByIndex.Count > 0)
+            catch (Exception ex) when (ex is not KliveLLMStreamStalledException
+                && (contentSb.Length > 0 || toolCallsByIndex.Count > 0))
             {
                 // Mid-stream drop after we already emitted output — return the partial answer rather
-                // than failing the whole turn.
+                // than failing the whole turn. A stall is different: the caller asked for it to be
+                // bounded, and a half-streamed tool call is worse than a clean retry.
             }
 
             // Stream finished (or dropped mid-way) — every remaining tool_call is now complete.
@@ -2807,8 +2903,16 @@ namespace Omnipotent.Services.KliveLLM
                         ApplyOpenRouterHeaders(request);
 
                     providerStopwatch = System.Diagnostics.Stopwatch.StartNew();
-                    response = await client.SendAsync(request, cancellationToken);
-                    responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
+                    // A buffered call shows nothing until the whole completion is back. The
+                    // exchange is bounded by the HttpClient timeout, so pulsing it is honest.
+                    string bufferedProvider = remoteProvider.DisplayName;
+                    int bufferedAttempt = attempt;
+                    using (StartActivityPulse(KliveLLMActivityKind.AwaitingProvider,
+                        () => $"waiting for {bufferedProvider}'s complete reply (attempt {bufferedAttempt})"))
+                    {
+                        response = await client.SendAsync(request, cancellationToken);
+                        responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
+                    }
                     responseCacheStatus = ReadHeader(response, "X-OpenRouter-Cache-Status");
                 }
                 // A deliberate cancellation (manual Stop / stall watchdog) surfaces as an
@@ -3152,6 +3256,9 @@ namespace Omnipotent.Services.KliveLLM
                 if (rateLimited) ms = Math.Min(ms, RateLimitMaxDelayMs); // cap so a wake isn't blocked for minutes
                 delay = TimeSpan.FromMilliseconds(ms + Random.Shared.Next(0, 250)); // exp backoff + jitter
             }
+            string reason = rateLimited ? "provider rate-limited the request" : "transient provider error";
+            using var pulse = StartActivityPulse(KliveLLMActivityKind.Retrying,
+                () => $"{reason}; retrying in {delay.TotalSeconds:0}s (attempt {attempt + 1})");
             await Task.Delay(delay, cancellationToken);
         }
 

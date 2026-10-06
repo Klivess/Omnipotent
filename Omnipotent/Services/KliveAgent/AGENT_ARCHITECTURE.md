@@ -66,7 +66,8 @@ Implemented in [KliveAgentBrain.cs](KliveAgentBrain.cs) `ProcessMessageAsync`:
 6. **Stop** when the model replies with no scripts (the final answer). Guardrails (as actually
    implemented): a 2-strike breaker on XML/JSON tool-envelope or empty no-op turns; adaptive
    reasoning/model escalation as a task shows difficulty; a per-run **token + wall-clock budget**
-   (`KliveAgent_MaxRunTokens` / `KliveAgent_MaxRunMinutes`) that warns at 80% and force-finalises at
+   (`KliveAgent_MaxRunBillableTokens` / `KliveAgent_MaxTaskMinutes`; the token cap counts billable
+   tokens and is skipped on a flat-fee provider) that warns at 80% and force-finalises at
    100%; and an external zero-progress stall watchdog. There is deliberately **no fixed iteration
    cap** — the earlier "same script twice / same error 3× / hard cap at 30" logic was removed in
    favour of these signals, so the loop can take as many steps as a task genuinely needs while the
@@ -132,6 +133,57 @@ killable (process-isolated) script sandbox — a timed-out Roslyn script is aban
   nudge and 100% force-finalise; brain-level retry of a transient LLM turn; background-task
   restore-or-orphan on restart; shared-memory dedup-on-save + recency ranking + one-pass document
   frequency. Deliberately still open: a process-isolated, force-killable script sandbox.
+
+## Long multi-step tasks (computer, mail, accounts)
+
+The bar: a request like "make a Tumblr account with a KliveMail address, create its API keys and
+send me the details" runs top to bottom unattended, survives refreshes and restarts, and ends by
+messaging Klives. What makes that work:
+
+- **Liveness, not silence.** `KliveLLM.ObserveActivity` (an `AsyncLocal` scope) reports what the
+  model call is doing every 10s: queued for an AIRouter slot, awaiting the provider, reasoning
+  (reasoning deltas are parsed), streaming, retrying. Tools are pulsed the same way (`WithToolPulse`,
+  20-min ceiling). The stall watchdog only kills runs that are genuinely silent, and skips turns
+  parked in the AIRouter queue. A stream that goes quiet for `KliveAgent_ModelStreamIdleSeconds`
+  (240) raises `KliveLLMStreamStalledException` instead of hanging. The original bug: a healthy
+  first call queued behind the Projects fleet was killed and the run labelled "Done".
+- **Truthful endings.** `AgentChatRunControl` records why a run stopped (user | stall | shutdown)
+  *before* cancelling it. The service token reads as "shutdown". `DescribeStop` writes the closing
+  line, and the website badge shows Done / Stopped / Failed / Interrupted from status + `stopReason`.
+- **Patient retries.** `KliveAgent_ModelRetryAttempts` (6), backoff 3s→3min honouring Retry-After.
+  Permanent provider errors fail fast; unknown exceptions get one retry.
+- **Task mode.** The first world-acting tool (`computer_*`, `klivemail_*`, account tools,
+  `notify_klives`) switches the per-step guidance from "answer now" to "continue until every part is
+  done". A text reply that only announces its next step gets sent back to work (at most 2 times). A
+  checkpoint nudge fires every 40 steps. If the model rejects screenshots, images are stripped and
+  the run continues on DOM/OCR perception.
+- **The computer.** `KliveAgent_ComputerTarget` = auto | container | host. The container is a
+  Projects desktop owned by `kliveagent` (`ExternalDesktopOwners`), driven through the same
+  `ContainerToolAdapter`: structured browser inspect/act, verified fills, overlay dismissal, free
+  `solve_challenge`, uploads, a terminal. Host = `HostControlManager`. For a human-only blocker,
+  `request_human` posts a takeover card carrying the `containerId`. The website then embeds
+  `ContainerRemoteDesktop` in place, and the run resumes when Klives goes idle after input, presses
+  Done, or ends remote control.
+- **Task tools.** `klivemail_create_mailbox/list/get/wait_for_email` (returns codes plus links
+  ranked verification-first; catches near-miss addresses). `account_register` takes `{generate}`
+  passwords; `account_update` stores obtained keys. `notify_klives` sends a Discord DM plus a
+  Results entry.
+- **Secrets.** The model only ever handles `{account:service/field}` references. Klives'
+  authenticated views (`/chat/pending`, `/chat/runs`, `/conversations/get`, served `no-store`) reveal
+  them at display time. Stored history, notifications (OS toasts) and Discord never carry values.
+- **Come back later.**
+  - Deep links: `/kliveagent?conversation=…&takeover=1`.
+  - A reload restores each finished turn's activity, tokens and outcome.
+  - A run that finishes while watched is filed as read.
+  - An unwatched run of 3+ minutes sends a Discord DM (`KliveAgent_DiscordDmOnFinish`,
+    `KliveAgent_FinishedDmMinMinutes`).
+  - A run interrupted by a process restart **or** a KliveAgent service stop/restart is persisted
+    `autoResumePending`. It is continued exactly once at the next start, with a System message that
+    carries the request, steering and activity timeline (`KliveAgent_AutoResumeInterruptedRuns`,
+    `KliveAgent_AutoResumeMaxAgeHours`, at most 2 chained).
+- **Settings note.** OmniSettings persist their default on first read, so a changed default needs a
+  new setting name. The settings above supersede `KliveAgent_MaxRunTokens`,
+  `KliveAgent_MaxRunMinutes` and `KliveAgent_MaxLlmRetries`, which are no longer read.
 
 ## KliveRAG — cross-system knowledge (shared with Projects)
 

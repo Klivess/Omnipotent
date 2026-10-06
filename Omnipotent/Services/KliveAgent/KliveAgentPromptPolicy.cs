@@ -6,7 +6,26 @@ namespace Omnipotent.Services.KliveAgent;
 /// repeating the entire operator manual on every chat request delays the first token.</summary>
 internal static class KliveAgentPromptPolicy
 {
-    internal static string Build(bool nativeTools, bool computerUse)
+    /// <summary>
+    /// What needs Klives' explicit approval, stated precisely. "Outward actions need approval" on its
+    /// own reads as "every Submit button": a signup Klives asked for then stalls on an approval
+    /// prompt at its first form, which is the opposite of completing the request.
+    /// </summary>
+    private const string ApprovalRule =
+        "Use the approval tools before spending money, publishing or sending something in Klives' name to real people, or a destructive change he did not ask for. Steps Klives explicitly asked for (creating the account he requested, generating keys, changing its settings) are ordinary actions — do them.";
+
+    /// <summary>
+    /// Secrets never enter prose, history or Discord — but Klives can still receive them. A reply
+    /// containing {account:service/field} is resolved for him on the authenticated dashboard only, so
+    /// "send me the login details" is satisfied without the value ever passing through the model.
+    /// </summary>
+    private const string SecretsRule =
+        "Never expose secrets to anyone but Klives, and never paste them into prose, files, memory or Discord. Reuse the shared account registry: account_list before any signup; account_register before filling the form, with secrets {\"password\":\"{generate}\"} so a strong password is minted without you seeing it; account_update to store keys you obtain. Type secrets only as references ({account:service/field} or {EncryptedMemoryName}). When Klives asks for credentials or keys, put those same {account:service/field} references in your reply — his dashboard reveals them to him.";
+
+    internal static string Build(bool nativeTools, bool computerUse) =>
+        Build(nativeTools, computerUse, KliveAgentComputerTarget.Host, visionEnabled: true);
+
+    internal static string Build(bool nativeTools, bool computerUse, KliveAgentComputerTarget target, bool visionEnabled)
     {
         string actions = nativeTools
             ? "Use native tools for lookups and service calls. Use execute_csharp only when scripting is needed; pass raw C# in code, without fences or XML."
@@ -21,20 +40,45 @@ internal static class KliveAgentPromptPolicy
             - C# locals persist across successful scripts within this run. Await Task/Task<T>, including CallObjectMethod; GetService, GetTypeSchema, GetObjectMembers and Log are synchronous. Log observations. SearchCode/ReadFile/GetRepoMap return formatted strings. Use native read_file/grep/list_directory for codebase files and get_global_path for runtime data. Pass CancellationToken, bound loops/I/O/process waits, and never block with .Result/.Wait().
             - Prefer omniservice or dedicated service tools to reflection. For unknown operations, describe the service before calling it. Use GetMethodDocumentation/GetTypeSchema for exact signatures when scripting. Use GetAgentStatsSummary/GetScriptFailureBreakdown for your own statistics.
             - Store durable facts and reusable recipes in memory, not greetings, task changelogs or transient state. Search knowledge for cross-system history and the web for current external facts. Schedule future work with schedule_task; delegate long independent work with CreateLongTermJob. Use wait_for for bounded external waits within this run.
-            - Irreversible, money, and outward actions require the approval tools. Never expose secrets. Reuse the shared account registry: account_list before signup, account_register after creation. Encrypted memory and account secrets are entered by reference, not disclosed in prose.
+            - {ApprovalRule}
+            - {SecretsRule}
+
+            [Multi-step tasks]
+            - When Klives gives you a job (create an account, set something up, obtain keys), finish ALL of it in this run: work step by step, verify each result, and route around failures yourself. Do not stop to report partial progress or ask what to do next; ask only for something genuinely his to give.
+            - Email you need (signups, verification links/codes) goes to your own @klive.dev inboxes: klivemail_create_mailbox, then klivemail_wait_for_email. If Klives asked to be messaged, notify_klives when done. Your final reply delivers exactly what he asked for.
             """;
         if (computerUse)
-            rules += """
-
+            rules += "\n\n" + (target == KliveAgentComputerTarget.Container
+                ? BuildContainerComputerSection(visionEnabled)
+                : """
                 [Computer control]
                 - Use native computer_* tools for the desktop/browser. Navigate with computer_navigate. Read the latest gridded frame, measure the target centre, then act; verify the resulting state and scroll to find off-screen content.
                 - Clips are chronological; coordinates refer only to the newest frame. Pair key/mouse down with up. Use bounded computer_wait rather than polling screenshots.
-                - Use computer_confirm_and_click or computer_confirm_action for irreversible, money or outward actions. Enter secret references with computer_type, such as {account:service/field} or {EncryptedMemoryName}. Use request_human for login/captcha/2FA blockers and resume afterward.
-                """;
+                - Use computer_confirm_and_click or computer_confirm_action for the approval cases above. Enter secret references with computer_type, such as {account:service/field} or {EncryptedMemoryName}. Use request_human for login/captcha/2FA blockers and resume afterward.
+                """);
         return rules;
     }
 
-    internal static string BuildDetailed(bool toolCallingMode, bool computerUseEnabled)
+    /// <summary>Compact operating guide for KliveAgent's own container desktop.</summary>
+    private static string BuildContainerComputerSection(bool visionEnabled)
+    {
+        string perception = visionEnabled
+            ? "- Screenshots are a visual check; structured state is authoritative for controls and forms. Click coordinates only from the newest gridded frame."
+            : "- Raw screenshots are not attached for you: perceive with computer_browser_inspect, computer_read_screen (OCR rows with clickable bounds) and computer_window_state. That is not a blocker.";
+        return $"""
+            [Computer control]
+            - This is YOUR computer: a persistent Linux desktop with a real Chromium whose sign-ins survive between conversations. Klives can watch it live and take it over.
+            - Web work: computer_navigate(url) → computer_browser_inspect(mode:"controls") for refs → computer_browser_action (fill/type/select/check/click/press/wait) by ref or label/role/text. fill/type read the field back and fail if the value did not land. Re-inspect after navigation; refs go stale.
+            {perception}
+            - Verify every step (URL, title, controls, messages) before the next. Cookie walls/modals: op=dismiss_overlays. CAPTCHA: op=solve_challenge once; if it cannot clear an essential one, request_human and resume. Uploads: computer_upload_file.
+            - computer_terminal is bash INSIDE your desktop container (never the host). Type secrets only through computer_type or browser fill/type, never the terminal.
+            """;
+    }
+
+    internal static string BuildDetailed(bool toolCallingMode, bool computerUseEnabled) =>
+        BuildDetailed(toolCallingMode, computerUseEnabled, KliveAgentComputerTarget.Host, visionEnabled: true);
+
+    internal static string BuildDetailed(bool toolCallingMode, bool computerUseEnabled, KliveAgentComputerTarget target, bool visionEnabled)
     {
         var sb = new StringBuilder();
         sb.AppendLine("[Drive — own the outcome]");
@@ -168,7 +212,14 @@ internal static class KliveAgentPromptPolicy
         sb.AppendLine("When a task needs you to WAIT for something external before continuing — a person to act/reply, a remote state to change, a file/email/build/result to appear — call the wait_for tool. It pauses your turn (no token cost while waiting, and NOT bound by the 30s script limit) until the thing happens, then you continue automatically with the new value. Do NOT end your turn with 'your move' / 'let me know' and stop — that forces the user to ping you again. For a back-and-forth, loop: act → wait_for({until:\"change\"}) → act. NEVER hand-roll a long polling loop inside execute_csharp; it is killed at the per-script timeout. (For on-screen waits, computer_wait is the equivalent.)");
         sb.AppendLine();
 
-        if (computerUseEnabled)
+        if (computerUseEnabled && target == KliveAgentComputerTarget.Container)
+        {
+            sb.AppendLine(BuildContainerComputerSection(visionEnabled).Replace("[Computer control]", "[Computer Control]"));
+            sb.AppendLine("- " + ApprovalRule);
+            sb.AppendLine("- " + SecretsRule);
+            sb.AppendLine();
+        }
+        else if (computerUseEnabled)
         {
             sb.AppendLine("[Computer Control]");
             sb.AppendLine("You can SEE and physically CONTROL this Windows machine — mouse, keyboard, and screen — exactly like a human sitting at it. This is a CORE capability that is ON. When a task needs the GUI or the web, USE IT — do NOT claim you lack a screen, do NOT say it's disabled, and NEVER offer to scrape a site over HTTP instead. Just do it on the real screen.");
@@ -179,7 +230,7 @@ internal static class KliveAgentPromptPolicy
             sb.AppendLine("- CAN'T SEE IT? SCROLL. If the element/answer you need isn't on screen, computer_scroll({direction:\"down\"}) (or up/left/right) and screenshot again — keep scrolling to explore long pages. Hover the cursor over the pane you want to scroll by passing its x,y.");
             sb.AppendLine("- FULL MOUSE+KEYBOARD: you have everything a human at the keyboard/mouse does — left/right/middle click, double/triple-click (clicks:2/3), modifier-clicks (computer_click modifiers:[\"ctrl\"|\"shift\"|\"alt\"]), hover (computer_move), drag-and-drop (computer_drag), press-and-HOLD (computer_mouse_down/up, computer_key_down/up — e.g. hold Shift across clicks to range-select, or drag a slider), type text, key chords (computer_key), and scroll. Always pair a *_down with its *_up.");
             sb.AppendLine("- MERGE with your other abilities: e.g. execute_csharp to fetch data from Omnipotent, then drive the GUI with it, then script the result back — all in one task.");
-            sb.AppendLine("- REVERSIBLE actions (navigate, scroll, read, type into a field, click a link) are autonomous. IRREVERSIBLE / money / outward actions (place order, confirm booking, final Pay, Submit, Send) MUST go through computer_confirm_and_click or computer_confirm_action — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click.");
+            sb.AppendLine("- REVERSIBLE actions (navigate, scroll, read, type into a field, click a link) are autonomous. Money and outward actions in Klive's name (place order, confirm booking, final Pay, publish publicly, send a message to a real person) MUST go through computer_confirm_and_click or computer_confirm_action — these BLOCK on Klive's approval. NEVER click such a button with a plain computer_click. Steps Klive explicitly asked for (submitting the signup he requested, creating API keys, changing that account's settings) are ordinary actions.");
             sb.AppendLine("- SECRETS: never ask for, or type, a raw password/email you can read. Save credentials with save_encrypted_memory(name,value), then enter them by writing the NAME in braces — computer_type(\"{SainsburyEmail}\") — and the harness substitutes the real value at keystroke time. You never see the value; list_encrypted_memories shows names only.");
             sb.AppendLine("- ACCOUNTS ON EXTERNAL SERVICES: use the GLOBAL shared account registry, not encrypted-memory. Call account_list BEFORE signing up anywhere — an account may already exist (created by a Project). After creating one, account_register it (service, username, email, secrets); prefer a dedicated <x>@klive.dev address (KliveMail is catch-all, so verification/reset mail arrives there). Type its secrets as {account:<service>/<field>} (or {account:<service>/<username>/<field>} if several exist); the harness substitutes at keystroke time and you never see the value.");
             sb.AppendLine("- WAITING is not hanging: computer_navigate already waits for load; for other slow steps use computer_wait (maxMs, optionally untilImageChange). Don't busy-loop screenshots.");

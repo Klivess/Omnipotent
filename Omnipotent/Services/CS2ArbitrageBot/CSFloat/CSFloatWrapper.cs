@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Omnipotent.Service_Manager;
 using Omnipotent.Services.CS2ArbitrageBot.Engine;
 using System.Globalization;
 using System.Net;
@@ -55,11 +56,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
         public CS2ArbitrageBot parent;
         public int SentRequests => (int)Math.Min(int.MaxValue, Interlocked.Read(ref sentRequests));
         private long sentRequests;
+        private readonly Func<Task<string>>? apiKeyProvider;
 
         public CSFloatWrapper(CS2ArbitrageBot parent, string CSFloatAPIKey)
         {
             this.parent = parent;
             Client = CreateHttpClient(CSFloatAPIKey);
+            apiKeyProvider = () => parent.GetStringOmniSetting("CSFloatAPIKey", sensitive: true);
         }
 
         /// <summary>For tests and tools: an explicit client (e.g. over a fake handler) and no owning service.</summary>
@@ -67,6 +70,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
         {
             this.parent = parent!;
             Client = client;
+            if (parent != null) apiKeyProvider = () => parent.GetStringOmniSetting("CSFloatAPIKey", sensitive: true);
+        }
+
+        internal CSFloatWrapper(HttpClient client, Func<Task<string>> apiKeyProvider) : this(null, client)
+        {
+            this.apiKeyProvider = apiKeyProvider ?? throw new ArgumentNullException(nameof(apiKeyProvider));
         }
 
         internal static HttpClient CreateHttpClient(string? apiKey)
@@ -361,6 +370,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             {
                 Content = new StringContent(payload, Encoding.UTF8, "application/json"),
             };
+            await ApplyCurrentAuthorizationAsync(request, ct);
             using var response = await Client.SendAsync(request, ct);
             Interlocked.Increment(ref sentRequests);
             RateLimits.Observe(BuyBucket, response);
@@ -560,6 +570,19 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
 
         // ───────────────────────────── Transport ─────────────────────────────
 
+        private async Task ApplyCurrentAuthorizationAsync(HttpRequestMessage request, CancellationToken ct)
+        {
+            if (apiKeyProvider == null) return; // Explicit clients used by tools retain their own authentication.
+            // Read the decrypted setting for each request. Never mutate shared default headers:
+            // simultaneous calls and key replacements each get their own credential snapshot.
+            string apiKey = (await apiKeyProvider().WaitAsync(ct))?.Trim() ?? "";
+            if (apiKey.Length == 0 || apiKey == OmniGlobalSettingsManager.SecretMask
+                || OmniSettingsProtector.IsProtected(apiKey) || apiKey.Any(char.IsControl))
+                throw new CSFloatAuthException("CSFloatAPIKey is unavailable or invalid. Replace it in OmniSettings.");
+            if (!request.Headers.TryAddWithoutValidation("Authorization", apiKey))
+                throw new CSFloatAuthException("CSFloatAPIKey could not be applied to the request.");
+        }
+
         private async Task<string> SendAsync(string bucket, HttpMethod method, string url, string? jsonBody, CancellationToken ct)
         {
             if (!RateLimits.CanSpend(bucket))
@@ -567,6 +590,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
 
             using var request = new HttpRequestMessage(method, url);
             if (jsonBody != null) request.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
+            await ApplyCurrentAuthorizationAsync(request, ct);
             using var response = await Client.SendAsync(request, ct);
             Interlocked.Increment(ref sentRequests);
             RateLimits.Observe(bucket, response);

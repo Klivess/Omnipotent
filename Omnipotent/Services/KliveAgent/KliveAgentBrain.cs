@@ -120,7 +120,8 @@ namespace Omnipotent.Services.KliveAgent
 
         // â”€â”€ Prompt Assembly â”€â”€
 
-        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation, bool toolCallingMode = false, bool computerUseEnabled = false)
+        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation, bool toolCallingMode = false, bool computerUseEnabled = false,
+            KliveAgentComputerTarget computerTarget = KliveAgentComputerTarget.Host, bool visionEnabled = true)
         {
             var personalityTask = agentService.GetStringOmniSetting(
                 "KliveAgent_Personality",
@@ -171,12 +172,12 @@ namespace Omnipotent.Services.KliveAgent
             bool compactPrompt = await compactPromptTask;
             if (compactPrompt)
             {
-                sb.AppendLine(KliveAgentPromptPolicy.Build(toolCallingMode, computerUseEnabled));
+                sb.AppendLine(KliveAgentPromptPolicy.Build(toolCallingMode, computerUseEnabled, computerTarget, visionEnabled));
                 sb.AppendLine();
             }
             else
             {
-                sb.AppendLine(KliveAgentPromptPolicy.BuildDetailed(toolCallingMode, computerUseEnabled));
+                sb.AppendLine(KliveAgentPromptPolicy.BuildDetailed(toolCallingMode, computerUseEnabled, computerTarget, visionEnabled));
             }
 
             // The Service Surface index — which services exist and what each is for. It belongs ABOVE the
@@ -369,7 +370,9 @@ namespace Omnipotent.Services.KliveAgent
         private static readonly HashSet<string> NativeNonMemoryTools = new(StringComparer.Ordinal)
         {
             "grep", "read_file", "list_directory", "get_global_path", "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
-            "account_list", "account_register",
+            "account_list", "account_register", "account_update",
+            "klivemail_create_mailbox", "klivemail_list_messages", "klivemail_get_message", "klivemail_wait_for_email",
+            "notify_klives",
             "schedule_task", "list_scheduled_tasks", "cancel_scheduled_task"
         };
 
@@ -386,7 +389,11 @@ namespace Omnipotent.Services.KliveAgent
             "computer_wait", "computer_focus_window", "computer_launch_app", "computer_open_browser", "computer_navigate",
             "computer_clipboard_get", "computer_clipboard_set", "computer_confirm_action", "computer_confirm_and_click",
             "request_human",
-            "save_encrypted_memory", "list_encrypted_memories", "delete_encrypted_memory"
+            "save_encrypted_memory", "list_encrypted_memories", "delete_encrypted_memory",
+            // KliveAgent's own desktop (container target) adds structured browser control and a
+            // container-local terminal on top of the shared visual vocabulary.
+            "computer_browser_inspect", "computer_browser_action", "computer_click_browser_control",
+            "computer_upload_file", "computer_terminal"
         };
 
         private static bool IsComputerTool(string name) => ComputerUseToolNames.Contains(name);
@@ -414,7 +421,8 @@ namespace Omnipotent.Services.KliveAgent
             "grep" or "read_file" or "list_directory" or "get_global_path"
                 or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts"
                 or "search_knowledge" or "read_knowledge_doc" or "web_search" or "web_fetch"
-                or "account_list" or "list_scheduled_tasks" => true,
+                or "account_list" or "list_scheduled_tasks"
+                or "klivemail_list_messages" or "klivemail_get_message" => true,
             _ => KliveAgentServiceTools.IsParallelSafe(name, argsJson)
         };
 
@@ -597,7 +605,7 @@ namespace Omnipotent.Services.KliveAgent
                     }, required = Array.Empty<string>() }),
 
                 Tool("account_register",
-                    "Record an account you created on an external service into the GLOBAL shared registry so no project re-creates it. Prefer a dedicated <something>@klive.dev email (KliveMail is catch-all; verification/reset mail arrives there). Secrets are stored encrypted and NEVER shown back — type them as {account:<service>/<field>}. If the service already has an account this returns it and registers nothing unless allowDuplicate=true with a reason.",
+                    "Record an account in the GLOBAL shared registry so no project re-creates it — call it BEFORE filling a signup form, then type its secrets into the form as {account:<service>/<field>}. Pass secrets {\"password\":\"{generate}\"} to have a strong password minted for you without ever seeing it. Prefer a dedicated <something>@klive.dev email (create it with klivemail_create_mailbox; verification/reset mail arrives there). Secrets are stored encrypted and NEVER shown back. If the service already has an account this returns it and registers nothing unless allowDuplicate=true with a reason.",
                     new { type = "object", properties = new {
                         service = new { type = "string", description = "Service name or URL, e.g. \"github.com\"." },
                         username = new { type = "string", description = "The account's username/login." },
@@ -607,6 +615,56 @@ namespace Omnipotent.Services.KliveAgent
                         allowDuplicate = new { type = "boolean", description = "Set true ONLY to intentionally create a second account for a service that already has one." },
                         reason = new { type = "string", description = "Required when allowDuplicate=true: why a separate account is needed." }
                     }, required = new[] { "service", "username" } }),
+
+                Tool("account_update",
+                    "Update a registered account: add or replace a named secret (e.g. the API key/secret you just obtained — stored encrypted, never shown back, typed or reported as {account:<service>/<username>/<name>}), or change its status/notes. Identify it by service (+ username if the service has several).",
+                    new { type = "object", properties = new {
+                        service = new { type = "string", description = "Service name or URL, as registered." },
+                        username = new { type = "string", description = "Username, needed only when the service has several accounts." },
+                        addSecretName = new { type = "string", description = "Name of the secret to add/replace, e.g. \"consumerKey\"." },
+                        addSecretValue = new { type = "string", description = "Its value (\"{generate}\" mints a strong password)." },
+                        status = new { type = "string", description = "active | dead | banned." },
+                        notes = new { type = "string", description = "Free-form notes." },
+                        newUsername = new { type = "string", description = "Correct the login/username (e.g. the site rejected the one you registered)." },
+                        newEmail = new { type = "string", description = "Correct the email used." }
+                    }, required = new[] { "service" } }),
+
+                Tool("klivemail_create_mailbox",
+                    "Create (or reuse) an inbox on Klives' own @klive.dev mail server for a signup — e.g. address \"tumblr.klives\" → tumblr.klives@klive.dev. It receives mail immediately. Runs in-process: no HTTP, auth or reflection.",
+                    new { type = "object", properties = new {
+                        address = new { type = "string", description = "Local part or full @klive.dev address." },
+                        displayName = new { type = "string", description = "Optional label shown in the mail client." }
+                    }, required = new[] { "address" } }),
+
+                Tool("klivemail_wait_for_email",
+                    "Block (no LLM cost) until an email arrives at a @klive.dev inbox, then return it with its verification CODE and its LINKS ranked verification-first (open the link with computer_navigate). Also accepts mail that arrived up to lookbackSeconds before the call, and notices if the site sent it to a slightly different @klive.dev address. Use right after submitting a signup or clicking 'send code'.",
+                    new { type = "object", properties = new {
+                        mailbox = new { type = "string", description = "The @klive.dev address you used on the site." },
+                        fromContains = new { type = "string", description = "Optional sender filter, e.g. \"tumblr\"." },
+                        subjectContains = new { type = "string", description = "Optional subject filter." },
+                        timeoutSeconds = new { type = "integer", description = "How long to wait (default 300, max 900)." },
+                        lookbackSeconds = new { type = "integer", description = "Also accept mail received this long before the call (default 900)." }
+                    }, required = new[] { "mailbox" } }),
+
+                Tool("klivemail_list_messages",
+                    "List KliveMail messages newest first (id, time, sender, subject, snippet), optionally for one @klive.dev inbox.",
+                    new { type = "object", properties = new {
+                        mailbox = new { type = "string", description = "Optional @klive.dev inbox." },
+                        limit = new { type = "integer", description = "Max messages (default 20, max 100)." },
+                        unreadOnly = new { type = "boolean", description = "Only unread (default false)." }
+                    }, required = Array.Empty<string>() }),
+
+                Tool("klivemail_get_message",
+                    "Read one KliveMail message in full by id: headers, verification code, ranked links and body text.",
+                    new { type = "object", properties = new {
+                        id = new { type = "string", description = "Message id from klivemail_list_messages." }
+                    }, required = new[] { "id" } }),
+
+                Tool("notify_klives",
+                    "Message Klives directly on Discord (also listed in the website's Results panel). Use it when he asked to be messaged when something is done, or for something he must know before this run ends. Keep it short; never put passwords or keys in it — those go in your chat reply as {account:...} references.",
+                    new { type = "object", properties = new {
+                        message = new { type = "string", description = "What to tell him." }
+                    }, required = new[] { "message" } }),
 
                 Tool("wait_for",
                     "PAUSE until an external event happens, then continue — without ending your turn and without the 30s script limit. " +
@@ -826,6 +884,32 @@ namespace Omnipotent.Services.KliveAgent
                             secrets[p.Name] = p.Value.ValueKind == System.Text.Json.JsonValueKind.String ? (p.Value.GetString() ?? "") : p.Value.ToString();
                     return await globals.RegisterAccount(service, username, Str("email"), secrets, Str("description"), BoolOr("allowDuplicate", false), Str("reason"));
                 }
+                case "account_update":
+                {
+                    var service = Str("service");
+                    if (string.IsNullOrWhiteSpace(service)) return "Error: 'service' is required.";
+                    return await globals.UpdateAccount(service, Str("username"), Str("addSecretName"), Str("addSecretValue"), Str("status"), Str("notes"),
+                        Str("newUsername"), Str("newEmail"));
+                }
+                case "klivemail_create_mailbox":
+                    return globals.AgentService == null ? "KliveAgent is not ready." :
+                        await KliveAgentMailTools.CreateMailboxAsync(globals.AgentService, Str("address"), Str("displayName"), globals.CancellationToken);
+                case "klivemail_list_messages":
+                    return globals.AgentService == null ? "KliveAgent is not ready." :
+                        await KliveAgentMailTools.ListMessagesAsync(globals.AgentService, Str("mailbox"), IntOr("limit", 20), BoolOr("unreadOnly", false), globals.CancellationToken);
+                case "klivemail_get_message":
+                    return globals.AgentService == null ? "KliveAgent is not ready." :
+                        await KliveAgentMailTools.GetMessageAsync(globals.AgentService, Str("id"), globals.CancellationToken);
+                case "klivemail_wait_for_email":
+                    return globals.AgentService == null ? "KliveAgent is not ready." :
+                        await KliveAgentMailTools.WaitForEmailAsync(globals.AgentService, Str("mailbox"), Str("fromContains") ?? Str("senderContains"),
+                            Str("subjectContains"), IntOr("timeoutSeconds", 300), IntOr("lookbackSeconds", 900), globals.CancellationToken);
+                case "notify_klives":
+                {
+                    var message = Str("message") ?? Str("text");
+                    if (string.IsNullOrWhiteSpace(message)) return "Error: 'message' is required.";
+                    return await globals.NotifyKlives(message);
+                }
                 case "recall_memories":
                     return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10), Str("since"), Str("until")));
                 case "recall_memories_by_tag":
@@ -918,6 +1002,135 @@ namespace Omnipotent.Services.KliveAgent
         /// conversation history. Recent turns are where "what did I just run / what did it return"
         /// matters most; older turns stay text-only to keep prompt cost bounded.</summary>
         private const int HistoryScriptRecentTurns = 3;
+
+        /// <summary>How often a long-running tool reports that it is still running.</summary>
+        internal static TimeSpan ToolPulseInterval { get; set; } = TimeSpan.FromSeconds(10);
+
+        /// <summary>A tool still running after this long stops being pulsed, so the stall watchdog can
+        /// reclaim a tool that turned out to be unbounded. Every real tool finishes well inside it.</summary>
+        internal static readonly TimeSpan ToolPulseCeiling = TimeSpan.FromMinutes(20);
+
+        internal static string FormatElapsed(TimeSpan elapsed) =>
+            elapsed.TotalHours >= 1 ? $"{(int)elapsed.TotalHours}h {elapsed.Minutes:00}m"
+            : elapsed.TotalMinutes >= 1 ? $"{(int)elapsed.TotalMinutes}m {elapsed.Seconds:00}s"
+            : $"{Math.Max(0, (int)elapsed.TotalSeconds)}s";
+
+        /// <summary>Backoff between failed model calls. A long computer task must ride out a provider
+        /// blip at step forty; the old 1.5s/3s pair gave up inside five seconds.</summary>
+        private static readonly double[] ModelRetryScheduleSeconds = { 3, 10, 30, 60, 120, 180 };
+        private static readonly TimeSpan MaxModelRetryDelay = TimeSpan.FromMinutes(5);
+
+        internal static TimeSpan ModelRetryDelay(int failedAttempt, Exception error)
+        {
+            if (error is RemoteLLMException { RetryAfter: { } retryAfter } && retryAfter > TimeSpan.Zero)
+                return retryAfter > MaxModelRetryDelay ? MaxModelRetryDelay : retryAfter;
+            int index = Math.Clamp(failedAttempt, 0, ModelRetryScheduleSeconds.Length - 1);
+            return TimeSpan.FromSeconds(ModelRetryScheduleSeconds[index]);
+        }
+
+        /// <summary>A provider refusing the request because it carries images (the model has no vision).</summary>
+        internal static bool LooksLikeImageRejection(Exception error)
+        {
+            if (error is not RemoteLLMException { Kind: RemoteLLMFailureKind.InvalidRequest or RemoteLLMFailureKind.ModelUnavailable } remote)
+                return false;
+            string message = remote.Message ?? "";
+            return message.Contains("image", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("vision", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("multimodal", StringComparison.OrdinalIgnoreCase)
+                || message.Contains("modalit", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>Permanent provider errors fail fast; transport trouble (network, timeouts, rate
+        /// limits, 5xx, a stalled stream, a malformed body) gets the full patient backoff. Anything
+        /// else is more likely a bug than a blip: one quick retry, then the honest answer.</summary>
+        internal static bool IsRetryableModelFailure(Exception error, int failedAttempt = 0) => error switch
+        {
+            RemoteLLMException remote => remote.IsRetryable,
+            KliveLLMStreamStalledException or HttpRequestException or IOException or TimeoutException
+                or TaskCanceledException or Newtonsoft.Json.JsonException or System.Text.Json.JsonException => true,
+            _ => failedAttempt == 0,
+        };
+
+        internal static string DescribeModelError(Exception error) => error switch
+        {
+            KliveLLMStreamStalledException stalled => $"the model provider went silent for {stalled.Idle.TotalSeconds:0}s",
+            RemoteLLMException { Kind: RemoteLLMFailureKind.RateLimited } => "the model provider is rate-limiting",
+            RemoteLLMException { Kind: RemoteLLMFailureKind.Timeout } => "the model provider timed out",
+            RemoteLLMException { Kind: RemoteLLMFailureKind.ProviderUnavailable } => "the model provider is unavailable",
+            RemoteLLMException { Kind: RemoteLLMFailureKind.EmptyResponse } => "the model provider returned nothing",
+            RemoteLLMException { Kind: RemoteLLMFailureKind.Network } => "a network error reaching the model provider",
+            TaskCanceledException or TimeoutException => "the model provider timed out",
+            HttpRequestException => "a network error reaching the model provider",
+            _ => "the model call failed",
+        };
+
+        /// <summary>The final answer when the model layer could not be reached at all. Keeps whatever
+        /// the run already said, and says plainly that nothing more was attempted.</summary>
+        internal static string DescribeModelFailure(Exception error, int attempts, string progressSoFar)
+        {
+            string cause = error is RemoteLLMException remote && !remote.IsRetryable
+                ? $"The model provider rejected the request ({remote.Kind}): {Trim(remote.Message, 300)}"
+                : $"I couldn't reach the model after {attempts} attempt{(attempts == 1 ? "" : "s")} — {DescribeModelError(error)}.";
+            string body = $"_({cause} I stopped here; send the message again to retry.)_";
+            return string.IsNullOrWhiteSpace(progressSoFar) ? body : progressSoFar.Trim() + "\n\n" + body;
+
+            static string Trim(string text, int max) => text.Length <= max ? text : text[..max] + "…";
+        }
+
+        /// <summary>Tools that act on the outside world. Using one turns the run into a multi-step task.</summary>
+        internal static bool IsTaskTool(string toolName) =>
+            toolName.StartsWith("computer_", StringComparison.Ordinal)
+            || toolName.StartsWith("klivemail_", StringComparison.Ordinal)
+            || toolName is "account_register" or "account_update" or "request_human" or "notify_klives";
+
+        /// <summary>
+        /// What the model is told after a step. A question-answering turn should stop the moment it has
+        /// its answer; a TASK should not — "those calls succeeded, answer now" after the first successful
+        /// click on a signup page is how a twenty-step job ends at step two with a progress report.
+        /// </summary>
+        internal static string BuildStepGuidance(bool outputBroken, bool cleanProgress, bool taskMode)
+        {
+            if (outputBroken)
+                return "[Output error] Your recent replies weren't valid actions (empty, or malformed tool/XML envelopes that ran nothing). STOP and reply with a final text-only answer that honestly reports what you tried, what worked, and what blocked you.";
+            if (taskMode)
+                return cleanProgress
+                    ? "Those steps succeeded. Verify the new state if it matters, then continue with the NEXT step of the task. Give your final answer only when EVERY part of Klives' request is done and verified (or something genuinely cannot be done) — never stop to report partial progress."
+                    : "Read the result above and adjust — a failed step means change the approach (re-inspect the page, use a different control, wait for the page, dismiss an overlay), not repeat it. Keep going until every part of the request is done; finalize only if something is genuinely impossible after trying alternatives.";
+            return cleanProgress
+                ? "Those calls succeeded. If they answer the user's question, give the final text-only answer NOW (no scripts/tools) — do NOT run more lookups 'to be safe'. Continue only if a SPECIFIC, named piece of the answer is still genuinely missing."
+                : "If you have what you need, give the final answer now (no scripts). Otherwise run your next script — prefer ONE composite block over several tiny ones.";
+        }
+
+        /// <summary>Truthful closing line for a run that was stopped rather than finished.</summary>
+        internal static string DescribeStop(string? reason, string? detail, string lastStatus, TimeSpan elapsed, bool producedOutput,
+            bool resumes = false)
+        {
+            // Status notes are often markdown-italicised ("_…thinking (step 3)_"); quote the words only.
+            string status = (lastStatus ?? "").Trim().Trim('_').Trim().TrimStart('…').Trim().TrimEnd('.');
+            string doing = status.Length == 0 ? "" : $" I was {status} at the time.";
+            return reason switch
+            {
+                AgentChatRunControl.StopReasonUser => $"_(Stopped by you after {FormatElapsed(elapsed)}.)_",
+                AgentChatRunControl.StopReasonStall =>
+                    $"_(Stopped automatically: {(string.IsNullOrWhiteSpace(detail) ? "no progress for too long" : detail)}."
+                    + $"{(detail?.Contains("last activity", StringComparison.OrdinalIgnoreCase) == true ? "" : doing)} Send the message again to retry.)_",
+                AgentChatRunControl.StopReasonShutdown => resumes
+                    ? $"_(Interrupted: KliveAgent was restarted or shut down.{doing} I'll continue automatically once it's back.)_"
+                    : $"_(Interrupted: KliveAgent was restarted or shut down.{doing} Send the message again to continue.)_",
+                _ => producedOutput
+                    ? "_(Run stopped before completion.)_"
+                    : $"_(Run stopped before I produced any output.{doing})_",
+            };
+        }
+
+        /// <summary>What one model call costs against the run budget: uncached prompt plus completion,
+        /// with cached reads at the ~10% price providers charge for them. Cumulative raw prompt tokens
+        /// would instead count the same transcript once per step.</summary>
+        internal static long BillableTokens(int promptTokens, int cachedPromptTokens, int completionTokens)
+        {
+            int cached = Math.Clamp(cachedPromptTokens, 0, Math.Max(0, promptTokens));
+            return (long)Math.Max(0, promptTokens - cached) + Math.Max(0, completionTokens) + cached / 10;
+        }
 
         /// <summary>
         /// Implements the wait_for tool: poll an observable (an HTTP url, or a C# probe script) on an
@@ -1095,7 +1308,15 @@ namespace Omnipotent.Services.KliveAgent
                 // Accumulates the agent's conversational prose across iterations so the user can be
                 // shown it "talking" (via onProgress) while its scripts are still running.
                 var progressText = new StringBuilder();
+                // Background pulses (model activity, long tools) report concurrently with the loop.
+                var progressGate = new object();
+                string lastStatusNote = "preparing";
+                // The container desktop this run drives (once known) — the website streams it live.
+                string? computerContainerId = null;
                 var llmSessionId = $"kliveagent-{conversation.ConversationId}";
+                // The first progress used to arrive only once the system prompt, tool catalogue and
+                // attachments were all built; report immediately so the run is visibly alive.
+                Pulse("preparing", "preparing context");
                 var cacheRunId = Guid.NewGuid().ToString("N");
 
                 var llmServices = await agentService.GetServicesByType<KliveLLM.KliveLLM>();
@@ -1136,10 +1357,20 @@ namespace Omnipotent.Services.KliveAgent
                 // is surfaced token-by-token as it generates. Configurable so it can be turned off.
                 bool streamTokens = onProgress != null && settings.StreamTokens;
 
-                // Computer-use ("host control") tools are ON by default (set KliveAgent_ComputerUseEnabled=false
-                // to disable) and only available on the structured tool-calling path (they require vision + a
-                // tool channel). Irreversible actions still route through the human approval gate.
-                bool computerUseEnabled = useToolCalling && settings.ComputerUseEnabled;
+                // Computer-use tools are ON by default (set KliveAgent_ComputerUseEnabled=false to disable)
+                // and only available on the structured tool-calling path. The computer itself is chosen
+                // once per run: KliveAgent's own isolated desktop by default, the host desktop when
+                // configured (KliveAgent_ComputerTarget). Irreversible actions still route through the
+                // human approval gate on either.
+                var computerTarget = useToolCalling && settings.ComputerUseEnabled
+                    ? agentService.Computer.ResolveTarget(settings.ComputerTarget)
+                    : KliveAgentComputerTarget.None;
+                bool computerUseEnabled = computerTarget != KliveAgentComputerTarget.None;
+                if (computerTarget == KliveAgentComputerTarget.Container)
+                    computerContainerId = agentService.Computer.DesktopContainerID;
+                // Raw screenshots reach the model only when this is on; DOM, OCR and terminal
+                // perception keep working without it.
+                bool visionEnabled = settings.VisionEnabled;
 
                 // Context compaction for the vision loop: how many recent screenshots to keep in the tool
                 // session (older ones are flattened to a one-line note so a long GUI task can't overflow the
@@ -1147,8 +1378,13 @@ namespace Omnipotent.Services.KliveAgent
                 int retainedScreenshots = settings.RetainedScreenshots;
 
                 var systemPromptTask = performance.MeasureAsync("systemPrompt", () =>
-                    BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled));
-                var toolDefinitions = useToolCalling ? BuildToolDefinitions(computerUseEnabled) : null;
+                    BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled,
+                        computerTarget: computerTarget, visionEnabled: visionEnabled));
+                var toolDefinitions = useToolCalling
+                    ? BuildToolDefinitions(includeComputerUse: computerTarget == KliveAgentComputerTarget.Host)
+                    : null;
+                if (toolDefinitions != null && computerTarget == KliveAgentComputerTarget.Container)
+                    toolDefinitions.AddRange(KliveAgentComputer.BuildContainerToolDefinitions(visionEnabled));
                 async Task<List<HFWrapper.HFTool>> PrepareServiceToolsAsync()
                 {
                     if (toolDefinitions == null || agentService.ServiceTools == null) return new();
@@ -1202,10 +1438,14 @@ namespace Omnipotent.Services.KliveAgent
                 // Per-run guardrails: the agentic loop has no iteration cap by design, but an unbounded
                 // token/time budget can burn real money if the model never emits a final answer. Soft
                 // warn at 80% (nudge it to wrap up), hard-stop at 100% (demand a final answer, then end).
-                // 0 disables either cap. Defaults are generous so normal tasks never hit them.
-                int maxRunTokens = settings.MaxRunTokens;
-                int maxRunMinutes = settings.MaxRunMinutes;
-                int maxLlmRetries = settings.MaxLlmRetries;
+                // 0 disables either cap. The token cap measures BILLABLE tokens and is skipped entirely
+                // on a flat-fee provider: a computer task re-sends its whole context every step, so
+                // cumulative prompt tokens measure step count, not spend.
+                int maxRunTokens = flatFeeProvider ? 0 : settings.MaxRunBillableTokens;
+                int maxRunMinutes = settings.MaxTaskMinutes;
+                int maxLlmRetries = settings.ModelRetryAttempts;
+                long billableTokens = 0;
+                var streamIdleLimit = TimeSpan.FromSeconds(settings.ModelStreamIdleSeconds);
 
                 string userPrompt;
                 using (performance.Measure("conversationPrompt"))
@@ -1275,6 +1515,10 @@ namespace Omnipotent.Services.KliveAgent
                 // Per-run budget state (see maxRunTokens/maxRunMinutes above).
                 bool budgetWarned = false;
                 bool budgetForceFinal = false;
+                // Set once the run acts on the world (desktop, mail, accounts); see BuildStepGuidance.
+                bool taskMode = false;
+                int unfinishedTaskNudges = 0;
+                bool visionFallbackUsed = false;
                 // Number of consecutive iterations whose scripts produced at least one error. Drives the
                 // adaptive thinking budget: a clean cheap turn asks for low reasoning effort; we escalate
                 // toward the user's ceiling as the task shows it's hard.
@@ -1291,30 +1535,37 @@ namespace Omnipotent.Services.KliveAgent
                 // overwrite the bubble with filler; status/activity still flow.
                 void ReportProgress(string phase, string runningNote, AgentActivityEvent newActivity = null, string? liveText = null, byte[] frame = null, PendingApproval approval = null)
                 {
+                    if (!string.IsNullOrWhiteSpace(runningNote)) lastStatusNote = runningNote;
                     if (onProgress == null) return;
                     // Compose: committed prose from prior turns + the tokens streaming in this turn (if any)
                     // + an optional status note. liveText is the in-flight model output for the CURRENT turn,
                     // shown token-by-token before it's parsed and committed to progressText.
-                    var composed = new StringBuilder();
-                    var committed = progressText.ToString();
-                    if (committed.Length > 0) composed.Append(committed);
-                    if (!string.IsNullOrEmpty(liveText))
+                    string? body;
+                    List<AgentScriptResult> scriptsSnapshot;
+                    lock (progressGate)
                     {
-                        if (composed.Length > 0) composed.Append("\n\n");
-                        composed.Append(liveText);
+                        var composed = new StringBuilder();
+                        var committed = progressText.ToString();
+                        if (committed.Length > 0) composed.Append(committed);
+                        if (!string.IsNullOrEmpty(liveText))
+                        {
+                            if (composed.Length > 0) composed.Append("\n\n");
+                            composed.Append(liveText);
+                        }
+                        if (!string.IsNullOrWhiteSpace(runningNote))
+                        {
+                            if (composed.Length > 0) composed.Append("\n\n");
+                            composed.Append(runningNote);
+                        }
+                        body = composed.Length > 0 ? composed.ToString() : null;
+                        scriptsSnapshot = new List<AgentScriptResult>(allScriptsExecuted);
                     }
-                    if (!string.IsNullOrWhiteSpace(runningNote))
-                    {
-                        if (composed.Length > 0) composed.Append("\n\n");
-                        composed.Append(runningNote);
-                    }
-                    string? body = composed.Length > 0 ? composed.ToString() : null;
                     try
                     {
                         onProgress(new AgentProgressUpdate
                         {
                             Text = body,
-                            Scripts = new List<AgentScriptResult>(allScriptsExecuted),
+                            Scripts = scriptsSnapshot,
                             Iteration = iterationsDone,
                             Phase = phase,
                             StatusNote = runningNote,
@@ -1322,10 +1573,84 @@ namespace Omnipotent.Services.KliveAgent
                             CompletionTokens = totalCompletionTokens,
                             NewActivity = newActivity,
                             Frame = frame,
-                            Approval = approval
+                            Approval = approval,
+                            ComputerContainerId = computerContainerId
                         });
                     }
                     catch { }
+                }
+
+                // A liveness update that leaves the answer text alone: only phase/status (and an optional
+                // timeline entry) change. Background pulses use this, so a heartbeat can never overwrite
+                // tokens that are streaming into the bubble at the same moment.
+                void Pulse(string phase, string statusNote, AgentActivityEvent? newActivity = null)
+                {
+                    if (!string.IsNullOrWhiteSpace(statusNote)) lastStatusNote = statusNote;
+                    if (onProgress == null) return;
+                    try
+                    {
+                        onProgress(new AgentProgressUpdate
+                        {
+                            Text = null,
+                            Scripts = null,
+                            Iteration = iterationsDone,
+                            Phase = phase,
+                            StatusNote = statusNote,
+                            PromptTokens = totalPromptTokens,
+                            CompletionTokens = totalCompletionTokens,
+                            NewActivity = newActivity,
+                        });
+                    }
+                    catch { }
+                }
+
+                // What the model layer is doing, translated for the person watching. Every report is
+                // evidence the request is alive (queued for a slot, prefilling, reasoning, retrying),
+                // which is what keeps the stall watchdog from killing a healthy-but-silent call.
+                KliveLLM.KliveLLMActivityKind? lastModelActivity = null;
+                void OnModelActivity(KliveLLM.KliveLLMActivity activity)
+                {
+                    int step = Math.Max(1, iterationsDone);
+                    string elapsed = activity.Elapsed >= TimeSpan.FromSeconds(1) ? $" · {FormatElapsed(activity.Elapsed)}" : "";
+                    bool transition = lastModelActivity != activity.Kind;
+                    lastModelActivity = activity.Kind;
+                    switch (activity.Kind)
+                    {
+                        case KliveLLM.KliveLLMActivityKind.Queued:
+                            Pulse("queued", $"{activity.Detail}{elapsed}",
+                                transition ? new AgentActivityEvent { Iteration = step, Kind = "wait", Text = "queued for a model slot" } : null);
+                            break;
+                        case KliveLLM.KliveLLMActivityKind.Retrying:
+                            Pulse("retrying", activity.Detail,
+                                transition ? new AgentActivityEvent { Iteration = step, Kind = "wait", Text = activity.Detail } : null);
+                            break;
+                        case KliveLLM.KliveLLMActivityKind.Reasoning:
+                            Pulse("thinking", $"thinking (step {step}) — {activity.Detail}{elapsed}");
+                            break;
+                        case KliveLLM.KliveLLMActivityKind.Streaming:
+                            Pulse("thinking", $"{activity.Detail} (step {step})");
+                            break;
+                        default:
+                            Pulse("thinking", $"{activity.Detail}{elapsed} (step {step})");
+                            break;
+                    }
+                }
+
+                // Runs a tool while reporting that it is still running. Tools are individually bounded
+                // (script timeout, container action deadlines, HTTP timeouts), so pulsing them is honest;
+                // the ceiling stops an unexpectedly unbounded one from being kept alive forever.
+                async Task<T> WithToolPulse<T>(Task<T> work, string label, TimeSpan? ceiling = null)
+                {
+                    if (onProgress == null || work.IsCompleted) return await work;
+                    var limit = ceiling ?? ToolPulseCeiling;
+                    var running = System.Diagnostics.Stopwatch.StartNew();
+                    while (!work.IsCompleted)
+                    {
+                        await Task.WhenAny(work, Task.Delay(ToolPulseInterval));
+                        if (!work.IsCompleted && running.Elapsed < limit && !cancellationToken.IsCancellationRequested)
+                            Pulse("running", $"{label} · {FormatElapsed(running.Elapsed)}");
+                    }
+                    return await work;
                 }
 
                 // Deliver a retry/guidance/observation prompt the right way for the active mode: a user-role
@@ -1393,10 +1718,12 @@ namespace Omnipotent.Services.KliveAgent
                 AgentChatResponse BuildStoppedResponse()
                 {
                     performance.Outcome = "stopped";
-                    var partial = progressText.ToString().Trim();
-                    var finalText = partial.Length > 0
-                        ? partial + "\n\n_(Run stopped before completion.)_"
-                        : "_(Run stopped before completion — no output was produced yet.)_";
+                    string partial;
+                    lock (progressGate) partial = progressText.ToString().Trim();
+                    string closing = DescribeStop(runControl?.StopReason, runControl?.StopDetail, lastStatusNote,
+                        turnStopwatch.Elapsed, partial.Length > 0 || allScriptsExecuted.Count > 0,
+                        resumes: runControl?.ResumesAfterShutdown ?? false);
+                    var finalText = partial.Length > 0 ? partial + "\n\n" + closing : closing;
                     try { llm.ResetSession(llmSessionId); } catch { }
                     agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                         allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
@@ -1407,7 +1734,13 @@ namespace Omnipotent.Services.KliveAgent
                         Response = finalText,
                         ScriptsExecuted = allScriptsExecuted,
                         Success = false,
-                        ErrorMessage = "Run was stopped (manual cancel or stall watchdog).",
+                        ErrorMessage = runControl?.StopReason switch
+                        {
+                            AgentChatRunControl.StopReasonUser => "Run was stopped by Klives.",
+                            AgentChatRunControl.StopReasonStall => "Run was stopped by the stall watchdog: " + (runControl.StopDetail ?? "no progress"),
+                            AgentChatRunControl.StopReasonShutdown => "Run was interrupted by a service shutdown.",
+                            _ => "Run was stopped.",
+                        },
                         PromptTokens = totalPromptTokens,
                         CompletionTokens = totalCompletionTokens,
                         Iterations = iterationsDone
@@ -1436,7 +1769,7 @@ namespace Omnipotent.Services.KliveAgent
                     // Per-run budget guardrail (token/wall-clock). Soft-warn once at 80%; at 100% demand a
                     // final answer this turn and finalize regardless of what the model returns.
                     {
-                        int usedTokens = totalPromptTokens + totalCompletionTokens;
+                        long usedTokens = billableTokens;
                         double elapsedMin = turnStopwatch.Elapsed.TotalMinutes;
                         bool tokenHard = maxRunTokens > 0 && usedTokens >= maxRunTokens;
                         bool timeHard = maxRunMinutes > 0 && elapsedMin >= maxRunMinutes;
@@ -1511,7 +1844,9 @@ namespace Omnipotent.Services.KliveAgent
                                     performance.Add("firstToken", modelTimer.ElapsedMilliseconds);
                                 tokenSink?.Invoke(token);
                             };
+                            lastModelActivity = null;
                             using (performance.Measure("model"))
+                            using (KliveLLM.KliveLLM.ObserveActivity(OnModelActivity, streamIdleLimit))
                             {
                                 if (useToolCalling)
                                 {
@@ -1540,22 +1875,61 @@ namespace Omnipotent.Services.KliveAgent
                         catch (Exception llmEx)
                         {
                             performance.Add("modelError", 0);
-                            if (llmAttempt >= maxLlmRetries)
+                            // A model that turns out not to accept screenshots must not end a desktop task:
+                            // drop the images, say so once, and carry on with DOM/OCR/terminal perception.
+                            if (useToolCalling && visionEnabled && !visionFallbackUsed && LooksLikeImageRejection(llmEx))
                             {
+                                visionFallbackUsed = true;
+                                visionEnabled = false;
+                                llm.StripToolSessionImages(llmSessionId);
+                                llm.AppendUserMessageToToolSession(llmSessionId,
+                                    "[Vision unavailable] The active model rejected screenshots, so images are no longer attached. "
+                                    + "Perceive the desktop with computer_browser_inspect (mode:\"controls\"/\"dom\"), computer_read_screen "
+                                    + "(OCR rows with clickable bounds) and computer_window_state, and continue the task.");
+                                Pulse("thinking", "the model can't take screenshots — continuing with text perception",
+                                    new AgentActivityEvent { Iteration = Math.Max(1, iterationsDone), Kind = "error", Text = "vision rejected by the model; switched to text perception" });
+                                llmAttempt--; // not a failed attempt: the request itself changed
+                                continue;
+                            }
+                            // A permanent provider error (bad key, unknown model, rejected request) will
+                            // not fix itself; retrying it for minutes only delays the honest answer.
+                            if (llmAttempt >= maxLlmRetries || !IsRetryableModelFailure(llmEx, llmAttempt))
+                            {
+                                string progressed;
+                                lock (progressGate) progressed = progressText.ToString().Trim();
+                                agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
+                                    allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
+                                    turnStopwatch.ElapsedMilliseconds, conversation.SourceChannel, flatFeeProvider);
                                 return new AgentChatResponse
                                 {
                                     ConversationId = conversation.ConversationId,
-                                    Response = $"LLM query failed: {llmEx.Message}",
+                                    Response = DescribeModelFailure(llmEx, llmAttempt + 1, progressed),
+                                    ScriptsExecuted = allScriptsExecuted,
                                     Success = false,
-                                    ErrorMessage = llmEx.ToString()
+                                    ErrorMessage = llmEx.ToString(),
+                                    PromptTokens = totalPromptTokens,
+                                    CompletionTokens = totalCompletionTokens,
+                                    Iterations = iterationsDone
                                 };
                             }
                             performance.Add("modelRetry", 0);
-                            ReportProgress("thinking", $"_…transient error, retrying (attempt {llmAttempt + 2})_");
+                            var backoff = ModelRetryDelay(llmAttempt, llmEx);
+                            string why = DescribeModelError(llmEx);
+                            Pulse("retrying", $"{why} — retrying in {FormatElapsed(backoff)} (attempt {llmAttempt + 2} of {maxLlmRetries + 1})",
+                                new AgentActivityEvent { Iteration = Math.Max(1, iterationsDone), Kind = "wait", Text = $"model call failed ({why}); retrying" });
                             try
                             {
                                 using (performance.Measure("retryBackoff"))
-                                    await Task.Delay(TimeSpan.FromSeconds(1.5 * (llmAttempt + 1)), cancellationToken);
+                                {
+                                    var waited = System.Diagnostics.Stopwatch.StartNew();
+                                    while (waited.Elapsed < backoff)
+                                    {
+                                        var slice = backoff - waited.Elapsed;
+                                        await Task.Delay(slice < ToolPulseInterval ? slice : ToolPulseInterval, cancellationToken);
+                                        if (waited.Elapsed < backoff)
+                                            Pulse("retrying", $"{why} — retrying in {FormatElapsed(backoff - waited.Elapsed)} (attempt {llmAttempt + 2} of {maxLlmRetries + 1})");
+                                    }
+                                }
                             }
                             catch (OperationCanceledException) { return BuildStoppedResponse(); }
                         }
@@ -1577,6 +1951,8 @@ namespace Omnipotent.Services.KliveAgent
 
                     totalPromptTokens += llmResponse.PromptTokens;
                     totalCompletionTokens += llmResponse.CompletionTokens;
+                    billableTokens += BillableTokens(llmResponse.PromptTokens, llmResponse.CachedPromptTokens,
+                        llmResponse.CompletionTokens);
                     try { agentService.PromptCache.Record(cacheRunId, iteration + 1, llmResponse); }
                     catch (Exception telemetryError)
                     {
@@ -1622,8 +1998,11 @@ namespace Omnipotent.Services.KliveAgent
                         AgentActivityEvent thoughtEvent = null;
                         if (thought.Length > 0)
                         {
-                            if (progressText.Length > 0) progressText.AppendLine().AppendLine();
-                            progressText.Append(thought);
+                            lock (progressGate)
+                            {
+                                if (progressText.Length > 0) progressText.AppendLine().AppendLine();
+                                progressText.Append(thought);
+                            }
                             thoughtEvent = new AgentActivityEvent
                             {
                                 Iteration = iteration + 1,
@@ -1726,6 +2105,29 @@ namespace Omnipotent.Services.KliveAgent
                             continue;
                         }
 
+                        // A task whose "final" reply just announces the next step would end right here
+                        // with that step never taken. Keep the words as visible progress and send the
+                        // model back to work (bounded, so a model that insists still gets to finish).
+                        if (taskMode && !stuckForceFinal && !budgetForceFinal && unfinishedTaskNudges < 2
+                            && LooksLikeUnfinishedTaskReply(finalText))
+                        {
+                            unfinishedTaskNudges++;
+                            lock (progressGate)
+                            {
+                                if (progressText.Length > 0) progressText.AppendLine().AppendLine();
+                                progressText.Append(finalText);
+                            }
+                            ReportProgress("running", "continuing the task", new AgentActivityEvent
+                            {
+                                Iteration = iteration + 1,
+                                Kind = "think",
+                                Text = finalText.Length > 200 ? finalText.Substring(0, 200) + "…" : finalText
+                            });
+                            SendModelPrompt("[Not finished] Your reply announces what you will do next, but this run ENDS the moment you reply without a tool call — that next step would never happen. "
+                                + "Do it now with your tools, and keep going until everything Klives asked for is done. Reply in text only when it is all done (or something is genuinely impossible).");
+                            continue;
+                        }
+
                         // Atomically close the steering inbox immediately before the actual return. If
                         // guidance raced with this answer, apply it and give the model another turn.
                         bool finalRetryForSteering = false;
@@ -1820,20 +2222,17 @@ namespace Omnipotent.Services.KliveAgent
                             if (IsComputerTool(segment.ToolName))
                             {
                                 ComputerToolResult cr;
-                                if (sharedGlobals.GetService("HostControlManager") is HostControlManager hcm)
-                                {
-                                    using (performance.Measure("computerTool"))
-                                        cr = await hcm.ExecuteToolAsync(segment.ToolName, segment.Content, cancellationToken, hcp =>
+                                int actingIteration = iteration + 1;
+                                using (performance.Measure("computerTool"))
+                                    cr = await WithToolPulse(agentService.Computer.ExecuteAsync(computerTarget, segment.ToolName,
+                                        segment.Content, conversation.ConversationId, cancellationToken, hcp =>
                                         {
                                             var act = hcp.Activity == null ? null
-                                                : new AgentActivityEvent { Iteration = iteration + 1, Kind = hcp.Activity.Kind, Text = hcp.Activity.Text };
+                                                : new AgentActivityEvent { Iteration = actingIteration, Kind = hcp.Activity.Kind, Text = hcp.Activity.Text };
                                             ReportProgress("running", hcp.Note, act, frame: hcp.AnnotatedFrameJpeg, approval: hcp.Approval);
-                                        });
-                                }
-                                else
-                                {
-                                    cr = ComputerToolResult.Fail("HostControlManager service is not running.");
-                                }
+                                        }), $"running {segment.ToolName}");
+                                if (computerTarget == KliveAgentComputerTarget.Container)
+                                    computerContainerId = agentService.Computer.DesktopContainerID ?? computerContainerId;
 
                                 if (!cr.Success) errorCountThisIter++;
 
@@ -1852,7 +2251,7 @@ namespace Omnipotent.Services.KliveAgent
                                     llm.AppendToolResult(llmSessionId, segment.ToolCallId, segment.ToolName, crText);
                                     anyToolResultsAppended = true;
                                 }
-                                if (useToolCalling)
+                                if (useToolCalling && visionEnabled)
                                 {
                                     // Feed the whole clip (oldest→newest) so the model sees what happened during
                                     // the action, not just the end-state. Fall back to the single settled frame.
@@ -1902,9 +2301,9 @@ namespace Omnipotent.Services.KliveAgent
 
                             bool memOk; string memOut;
                             if (prelaunchedTools.TryGetValue(segment, out var preTask))
-                                (memOk, memOut) = await preTask;        // parallel-safe read-only tool: started up front
+                                (memOk, memOut) = await WithToolPulse(preTask, $"running {segment.ToolName}");        // parallel-safe read-only tool: started up front
                             else
-                                (memOk, memOut) = await RunNativeToolMeasuredAsync(segment.ToolName, segment.Content); // write tool: serial, in order
+                                (memOk, memOut) = await WithToolPulse(RunNativeToolMeasuredAsync(segment.ToolName, segment.Content), $"running {segment.ToolName}"); // write tool: serial, in order
                             if (!memOk) errorCountThisIter++;
 
                             var memText = KliveAgentContextBudget.TruncateToTokens(memOut ?? string.Empty,
@@ -1931,7 +2330,7 @@ namespace Omnipotent.Services.KliveAgent
 
                         scriptCountThisIter++;
 
-                        var result = await scriptSession.ExecuteAsync(segment.Content ?? string.Empty, scriptTimeout);
+                        var result = await WithToolPulse(scriptSession.ExecuteAsync(segment.Content ?? string.Empty, scriptTimeout), "running a C# script");
                         performance.Add("script", result.ExecutionTimeMs);
                         allScriptsExecuted.Add(result);
 
@@ -2004,12 +2403,24 @@ namespace Omnipotent.Services.KliveAgent
                     if (errorCountThisIter > 0) consecutiveErrorIters++;
                     else consecutiveErrorIters = 0;
 
-                    // Soft nudge once the task has gone deep — informational, not a stop.
+                    // A run becomes a TASK the moment it acts on the world (desktop, mail, accounts):
+                    // from then on, success means "every part of the request is done", not "this lookup
+                    // answered a question", and the guidance below has to say so.
+                    if (!taskMode && segments.Any(s => s.ToolName != null && IsTaskTool(s.ToolName)))
+                        taskMode = true;
+
+                    // Soft nudge once the work has gone deep — informational, not a stop.
                     string nudge = string.Empty;
-                    if (iteration + 1 == 12 && !stuckForceFinal)
+                    if (!taskMode && iteration + 1 == 12 && !stuckForceFinal)
                     {
                         nudge = "\n\n[Nudge] You've taken 12 steps on this. If you're making real progress, keep going. " +
                             "If you're spiralling, consider SaveMemory(\"...\") for what you've learned and giving the final answer.";
+                    }
+                    else if (taskMode && (iteration + 1) % 40 == 0 && !stuckForceFinal)
+                    {
+                        nudge = $"\n\n[Checkpoint] {iteration + 1} steps into this task. If you are progressing, keep going. If the last few steps "
+                            + "repeated the same obstacle, change approach now (inspect the page's controls, dismiss overlays, solve_challenge, "
+                            + "a different route, or request_human for a human-only blocker) instead of retrying it.";
                     }
 
                     // No hard iteration cap and no failure ceiling: the loop runs until the model
@@ -2025,11 +2436,7 @@ namespace Omnipotent.Services.KliveAgent
                     // has. This is a prompt nudge only — never a forced stop or iteration cap — so a task
                     // that genuinely needs more steps can still take them.
                     bool madeCleanProgress = hasScripts && errorCountThisIter == 0;
-                    string guidance = stuckForceFinal
-                        ? "[Output error] Your recent replies weren't valid actions (empty, or malformed tool/XML envelopes that ran nothing). STOP and reply with a final text-only answer that honestly reports what you tried, what worked, and what blocked you."
-                        : (madeCleanProgress
-                            ? "Those calls succeeded. If they answer the user's question, give the final text-only answer NOW (no scripts/tools) — do NOT run more lookups 'to be safe'. Continue only if a SPECIFIC, named piece of the answer is still genuinely missing."
-                            : "If you have what you need, give the final answer now (no scripts). Otherwise run your next script — prefer ONE composite block over several tiny ones.");
+                    string guidance = BuildStepGuidance(stuckForceFinal, madeCleanProgress, taskMode);
                     guidance += nudge;
 
                     if (useToolCalling && anyToolResultsAppended)
@@ -2478,6 +2885,33 @@ namespace Omnipotent.Services.KliveAgent
             if (errMsg.StartsWith("Compilation failed", StringComparison.Ordinal)) return "Compile";
             if (errMsg.Contains("timed out", StringComparison.OrdinalIgnoreCase)) return "Timeout";
             return "Runtime";
+        }
+
+        private static readonly Regex OfferOrQuestion = new(
+            @"\b(if you|would you like|want me to|should i|shall i|let me know|do you want)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        private static readonly Regex ForwardCommitment = new(
+            @"\b(?:(?:next|now|then)[,]?\s+(?:i(?:'|’| wi)ll|let me|i(?:'|’)m going to|i am going to)"
+            + @"|i(?:'|’| wi)ll (?:now|next|then)\b"
+            + @"|let me (?:now|next)\b"
+            + @"|i(?:'|’)m (?:now )?going to (?:proceed|continue|create|register|sign|click|navigate|open|fill|submit|verify|check|retrieve|generate|set up|try)"
+            + @"|proceeding to|moving on to)",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        /// <summary>
+        /// A text-only reply that ends by announcing the next step ("Account created — next I'll register
+        /// the app") is not a final answer: the run ends the moment the model replies without tools, so
+        /// the next step would silently never happen. Offers and questions ("if you want, I'll…",
+        /// "let me know…") are left alone — those are legitimate endings.
+        /// </summary>
+        internal static bool LooksLikeUnfinishedTaskReply(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string tail = text.Trim();
+            if (tail.Length > 280) tail = tail[^280..];
+            if (OfferOrQuestion.IsMatch(tail)) return false;
+            return ForwardCommitment.IsMatch(tail);
         }
 
         /// <summary>

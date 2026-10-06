@@ -28,6 +28,9 @@ namespace Omnipotent.Services.KliveAgent
         public KliveAgentAttachments Attachments => attachments ??= new KliveAgentAttachments();
         private KliveAgentPromptCache? promptCache;
         public KliveAgentPromptCache PromptCache => promptCache ??= new KliveAgentPromptCache();
+        private KliveAgentComputer? computer;
+        /// <summary>KliveAgent's computer: its own isolated desktop by default, or the host desktop.</summary>
+        public KliveAgentComputer Computer => computer ??= new KliveAgentComputer(this);
 
         // Codebase intelligence subsystems (spec Ch. 3, 4, 7)
         public KliveAgentCodebaseIndex CodebaseIndex { get; private set; }
@@ -294,6 +297,9 @@ namespace Omnipotent.Services.KliveAgent
                 // came due while offline fire on the first tick with an explicit lateness note.
                 Scheduler.StartLoop(serviceToken);
 
+                // Work the last process was doing when it went down picks up where it left off.
+                _ = Task.Run(() => ResumeInterruptedRunsAsync(serviceToken, generation), serviceToken);
+
                 await ServiceLog("[KliveAgent] Chat is ready; codebase intelligence is warming in the background.");
             }
             catch (Exception ex)
@@ -486,7 +492,8 @@ namespace Omnipotent.Services.KliveAgent
                 throw new OperationCanceledException(
                     "KliveAgent restarted before this run could commit its terminal state.");
             await CompleteConversationTurnAsync(conversation, requestId, response,
-                cancellationToken.IsCancellationRequested ? "cancelled" : response.Success ? "completed" : "failed");
+                !cancellationToken.IsCancellationRequested ? (response.Success ? "completed" : "failed")
+                : runControl?.StopReason == AgentChatRunControl.StopReasonShutdown ? "interrupted" : "cancelled");
 
             // CompleteConversationTurnAsync already awaited the durable conversation write.
 
@@ -651,7 +658,8 @@ namespace Omnipotent.Services.KliveAgent
             string conversationId = null,
             string senderName = null,
             string clientMessageId = null,
-            IReadOnlyList<AgentAttachment>? messageAttachments = null)
+            IReadOnlyList<AgentAttachment>? messageAttachments = null,
+            AgentPendingChatResponse? resumedFrom = null)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
                 return new AgentChatResponse { Success = false, Response = availabilityMessage, ErrorMessage = availabilityMessage };
@@ -771,6 +779,10 @@ namespace Omnipotent.Services.KliveAgent
                         return PendingReceipt(active, wasSteering: true, acceptedMessageId: steered.MessageId);
                 }
 
+                int resumeCount = resumedFrom == null ? 0 : resumedFrom.ResumeCount + 1;
+                bool resumesAfterShutdown = resumeCount < MaxAutoResumes
+                    && await GetBoolOmniSetting("KliveAgent_AutoResumeInterruptedRuns", defaultValue: true);
+                var serviceToken = cancellationToken.Token;
                 var pending = new AgentPendingChatResponse
                 {
                     ConversationId = conversationId,
@@ -779,8 +791,10 @@ namespace Omnipotent.Services.KliveAgent
                     Attachments = messageAttachments?.ToList() ?? new(),
                     SenderName = senderName ?? "API",
                     Response = string.Empty,
-                    CancellationSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken.Token),
-                    Control = new AgentChatRunControl()
+                    CancellationSource = CancellationTokenSource.CreateLinkedTokenSource(serviceToken),
+                    Control = new AgentChatRunControl { ServiceToken = serviceToken, ResumesAfterShutdown = resumesAfterShutdown },
+                    ResumedFromRequestId = resumedFrom?.RequestId,
+                    ResumeCount = resumeCount,
                 };
 
                 pendingApiResponses[pending.RequestId] = pending;
@@ -849,11 +863,16 @@ namespace Omnipotent.Services.KliveAgent
                                     pending.CompletionTokens = update.CompletionTokens;
                                     if (update.NewActivity != null)
                                         pending.Activity = new List<AgentActivityEvent>(pending.Activity) { update.NewActivity };
-                                    if (update.Frame != null)
-                                        pending.LatestFrame = Convert.ToBase64String(update.Frame);
                                     if (update.Approval != null)
                                         pending.PendingApproval = update.Approval.Status == "pending" ? update.Approval : null;
+                                    if (!string.IsNullOrWhiteSpace(update.ComputerContainerId))
+                                        pending.ComputerContainerId = update.ComputerContainerId;
                                     TouchRunLocked(pending);
+                                    if (update.Frame != null)
+                                    {
+                                        pending.LatestFrame = Convert.ToBase64String(update.Frame);
+                                        pending.LatestFrameSequence = pending.Sequence;
+                                    }
                                 }
                                 ScheduleRunPersist(pending, 0, runGeneration);
                             },
@@ -880,9 +899,9 @@ namespace Omnipotent.Services.KliveAgent
                         {
                             pending.FinalResponse = response;
                             pending.Phase = "final";
-                            pending.Status = runToken.IsCancellationRequested
-                                ? AgentTaskStatus.Cancelled
-                                : response.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed;
+                            pending.Status = !runToken.IsCancellationRequested
+                                ? response.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed
+                                : MarkStopped(pending);
                             pending.ErrorMessage = response.Success ? null : response.ErrorMessage;
                             TouchRunLocked(pending);
                         }
@@ -891,23 +910,28 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         lock (pending)
                         {
-                            pending.Status = AgentTaskStatus.Cancelled;
-                            pending.ErrorMessage = "Run was stopped.";
+                            pending.Status = MarkStopped(pending);
+                            pending.ErrorMessage = pending.Status == AgentTaskStatus.Interrupted
+                                ? "Interrupted by a KliveAgent restart or shutdown." : "Run was stopped.";
+                            string closing = KliveAgentBrain.DescribeStop(pending.Control?.StopReason,
+                                pending.Control?.StopDetail, pending.StatusNote ?? "",
+                                DateTime.UtcNow - pending.CreatedAt, !string.IsNullOrWhiteSpace(pending.Response),
+                                resumes: pending.AutoResumePending);
                             pending.FinalResponse = new AgentChatResponse
                             {
                                 Success = false,
                                 ConversationId = conversationId,
                                 PendingRequestId = pending.RequestId,
                                 Response = string.IsNullOrWhiteSpace(pending.Response)
-                                    ? "_(Run stopped before completion.)_"
-                                    : pending.Response,
-                                ErrorMessage = "Run was stopped."
+                                    ? closing
+                                    : pending.Response + "\n\n" + closing,
+                                ErrorMessage = pending.ErrorMessage
                             };
                             TouchRunLocked(pending);
                         }
                         if (runGeneration == Volatile.Read(ref serviceGeneration))
-                            await CompleteConversationTurnAsync(
-                                conversation, pending.RequestId, pending.FinalResponse, "cancelled");
+                            await CompleteConversationTurnAsync(conversation, pending.RequestId, pending.FinalResponse,
+                                pending.Status == AgentTaskStatus.Interrupted ? "interrupted" : "cancelled");
                     }
                     catch (Exception ex)
                     {
@@ -968,17 +992,26 @@ namespace Omnipotent.Services.KliveAgent
                                     ?? "Run ended without a response.";
                                 if (notificationBody.Length > 4000)
                                     notificationBody = notificationBody.Substring(0, 4000) + "...";
+                                // Someone watched it finish: the result is already in front of them, so
+                                // the record is kept but does not count as unread.
+                                bool watched = DateTime.UtcNow - pending.LastObservedAt < WatchedRunWindow;
+                                bool interrupted = pending.Status == AgentTaskStatus.Interrupted;
                                 await AddNotificationAsync(new AgentNotification
                                 {
                                     NotificationId = "run" + pending.RequestId,
-                                    Kind = "chat-completed",
+                                    Kind = interrupted ? "chat-interrupted" : "chat-completed",
                                     Title = pending.Status == AgentTaskStatus.Completed
                                         ? "KliveAgent finished a conversation"
+                                        : interrupted ? "KliveAgent run was interrupted by a restart"
                                         : $"KliveAgent run ended: {pending.Status}",
                                     Body = notificationBody,
                                     ConversationId = pending.ConversationId,
-                                    RequestId = pending.RequestId
+                                    RequestId = pending.RequestId,
+                                    ReadAt = watched ? DateTime.UtcNow : null,
                                 });
+                                // A run that continues automatically after the restart reports when that
+                                // continuation finishes; the interruption itself is not news.
+                                if (!watched && !pending.AutoResumePending) await NotifyRunFinishedOffSiteAsync(pending);
                             }
                             catch (Exception ex)
                             {
@@ -1006,8 +1039,11 @@ namespace Omnipotent.Services.KliveAgent
         public async Task<AgentPendingChatResponse?> WaitForPendingApiResponseAsync(string requestId, long afterSequence, int waitMs)
         {
             if (!pendingApiResponses.TryGetValue(requestId, out var pending)) return null;
+            pending.LastObservedAt = DateTime.UtcNow;
             await pending.WaitForChangeAsync(afterSequence, waitMs, cancellationToken.Token);
-            return SnapshotRun(pending);
+            pending.LastObservedAt = DateTime.UtcNow;
+            // The client keeps its last frame when the field is absent, so only ship a new one.
+            return SnapshotRun(pending, includeFrame: afterSequence <= 0 || pending.LatestFrameSequence > afterSequence);
         }
 
         public List<AgentPendingChatResponse> GetPendingApiResponses(
@@ -1203,6 +1239,7 @@ namespace Omnipotent.Services.KliveAgent
             if (string.IsNullOrWhiteSpace(requestId)) return false;
             if (!pendingApiResponses.TryGetValue(requestId, out var pending)) return false;
             if (pending.CompletedAt != null) return false;
+            pending.Control?.RecordStop(AgentChatRunControl.StopReasonUser);
             pending.Control?.Seal();
             try { pending.CancellationSource?.Cancel(); } catch { }
             lock (pending)
@@ -1249,14 +1286,22 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         var pending = kvp.Value;
 
-                        // Running but silent for too long → treat as hung, cancel it.
+                        // Running but silent for too long → treat as hung, cancel it. A turn parked in
+                        // the shared AIRouter queue is waiting for one of three slots, not wedged; the
+                        // queue reports progress itself, and this check is the backstop if it cannot.
                         if (pending.CompletedAt == null
                             && pending.CancellationSource != null
                             && !pending.CancellationSource.IsCancellationRequested
-                            && now - pending.LastProgressAt > stallWindow)
+                            && now - pending.LastProgressAt > stallWindow
+                            && !Omnipotent.Services.KliveLLM.KliveLLM.AIRouterHasQueuedWork(
+                                "kliveagent-" + pending.ConversationId + "#"))
                         {
+                            string lastActivity = string.IsNullOrWhiteSpace(pending.StatusNote)
+                                ? "" : $" (last activity: {pending.StatusNote.Trim().Trim('_').TrimStart('…')})";
+                            pending.Control?.RecordStop(AgentChatRunControl.StopReasonStall,
+                                $"no progress for {stallMinutes:0} minutes{lastActivity}");
                             try { pending.CancellationSource.Cancel(); } catch { }
-                            try { await ServiceLog($"[KliveAgent] Stall watchdog cancelled run {kvp.Key} after {stallMinutes:0}min of no progress."); } catch { }
+                            try { await ServiceLog($"[KliveAgent] Stall watchdog cancelled run {kvp.Key} after {stallMinutes:0}min of no progress{lastActivity}."); } catch { }
                         }
 
                         // Completed long ago → evict (durable record lives in the persisted conversation).
@@ -1470,6 +1515,17 @@ namespace Omnipotent.Services.KliveAgent
             pending.AdvanceRevision();
         }
 
+        /// <summary>Terminal status for a run whose token was cancelled (caller holds its lock). One cut
+        /// off by the service stopping or restarting is Interrupted, and flagged so the next start
+        /// continues it; anything else was stopped on purpose (Klives or the stall watchdog).</summary>
+        internal static AgentTaskStatus MarkStopped(AgentPendingChatResponse run)
+        {
+            run.StopReason = run.Control?.StopReason;
+            if (run.StopReason != AgentChatRunControl.StopReasonShutdown) return AgentTaskStatus.Cancelled;
+            run.AutoResumePending = run.Control?.ResumesAfterShutdown ?? false;
+            return AgentTaskStatus.Interrupted;
+        }
+
         private static bool SameAttachments(IEnumerable<AgentAttachment>? left, IEnumerable<AgentAttachment>? right) =>
             (left ?? []).Select(x => x.Id).SequenceEqual((right ?? []).Select(x => x.Id), StringComparer.Ordinal);
 
@@ -1513,7 +1569,13 @@ namespace Omnipotent.Services.KliveAgent
                     UpdatedAt = source.UpdatedAt,
                     Sequence = source.Sequence,
                     ErrorMessage = source.ErrorMessage,
-                    LastProgressAt = source.LastProgressAt
+                    LastProgressAt = source.LastProgressAt,
+                    StopReason = source.StopReason,
+                    ComputerContainerId = source.ComputerContainerId,
+                    ResumedFromRequestId = source.ResumedFromRequestId,
+                    ResumeCount = source.ResumeCount,
+                    AutoResumePending = source.AutoResumePending,
+                    LastObservedAt = source.LastObservedAt
                 };
             }
         }
@@ -1672,6 +1734,7 @@ namespace Omnipotent.Services.KliveAgent
                                 : run.Response + "\n\n_(Interrupted by an Omnipotent restart.)_",
                             ErrorMessage = run.ErrorMessage
                         };
+                        run.AutoResumePending = true;
                         await PersistRunAsync(run);
                         await AddNotificationAsync(new AgentNotification
                         {
@@ -1684,6 +1747,11 @@ namespace Omnipotent.Services.KliveAgent
                         });
                         interrupted++;
                     }
+
+                    // Mid-flight at the crash above, or cut off by a service shutdown and persisted as
+                    // Interrupted: either way, continuation is considered once, after the load.
+                    if (run.Status == AgentTaskStatus.Interrupted && run.AutoResumePending)
+                        lock (interruptedAtBoot) interruptedAtBoot.Add(run);
 
                     run.FinalResponse ??= new AgentChatResponse
                     {
@@ -2196,6 +2264,296 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
+        // ── Automatic continuation after a restart ──
+
+        /// <summary>Runs found mid-flight at load (the process restarted under them).</summary>
+        private readonly List<AgentPendingChatResponse> interruptedAtBoot = new();
+
+        /// <summary>At most this many automatic continuations chain from one request, so a crash
+        /// loop cannot keep restarting the same work.</summary>
+        internal const int MaxAutoResumes = 2;
+
+        /// <summary>How long a continuation waits for the interrupted run to finish unwinding.</summary>
+        private static readonly TimeSpan InterruptedRunUnwindWait = TimeSpan.FromMinutes(3);
+
+        internal static bool ShouldAutoResume(AgentPendingChatResponse run, DateTime nowUtc, int maxAgeHours) =>
+            run != null
+            && run.Status == AgentTaskStatus.Interrupted
+            && run.ResumeCount < MaxAutoResumes
+            && !string.IsNullOrWhiteSpace(run.UserMessage)
+            && nowUtc - run.CreatedAt <= TimeSpan.FromHours(Math.Max(1, maxAgeHours));
+
+        /// <summary>
+        /// The turn that continues an interrupted run. The conversation history already carries the
+        /// request and the interrupted reply; what it does NOT carry is the computer/mail/account work
+        /// in between, which only exists in the run's activity timeline — so that is spelled out.
+        /// </summary>
+        internal static string BuildContinuationMessage(AgentPendingChatResponse run)
+        {
+            static string Clip(string? s, int max)
+            {
+                s = (s ?? "").Trim();
+                return s.Length <= max ? s : s[..max] + "…";
+            }
+            var sb = new System.Text.StringBuilder();
+            sb.AppendLine("[Automatic continuation after an Omnipotent restart]");
+            sb.AppendLine($"Omnipotent restarted while you were working on this request from Klives (started {TemporalFormat.StampMinute(run.CreatedAt)}):");
+            sb.AppendLine();
+            sb.AppendLine("“" + Clip(run.UserMessage, 4000) + "”");
+            var steering = run.SteeringMessages?.Where(s => s.Status == "applied").ToList() ?? new();
+            if (steering.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("Guidance he added while you worked:");
+                foreach (var s in steering) sb.AppendLine("- " + Clip(s.Message, 600));
+            }
+            var activity = run.Activity ?? new();
+            if (activity.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("What you had done before the restart (oldest first):");
+                foreach (var a in activity.TakeLast(60))
+                    sb.AppendLine($"- [{TemporalFormat.StampMinute(a.Timestamp)}] step {a.Iteration} {a.Kind}: {Clip(a.Text, 200)}");
+            }
+            if (!string.IsNullOrWhiteSpace(run.Response))
+            {
+                sb.AppendLine();
+                sb.AppendLine("What you had told him so far:");
+                sb.AppendLine(Clip(run.Response, 1500));
+            }
+            sb.AppendLine();
+            sb.Append("Your desktop, its browser sign-ins, KliveMail and the account registry kept their state. Re-check where things "
+                + "actually stand (inspect the page, the mailbox, account_list) and CONTINUE from there. Do not redo steps that already "
+                + "succeeded — never create a second account — and finish everything he asked for.");
+            return sb.ToString();
+        }
+
+        private async Task ResumeInterruptedRunsAsync(CancellationToken serviceToken, long generation)
+        {
+            List<AgentPendingChatResponse> candidates;
+            lock (interruptedAtBoot)
+            {
+                candidates = interruptedAtBoot.ToList();
+                interruptedAtBoot.Clear();
+            }
+            if (candidates.Count == 0) return;
+            try
+            {
+                bool enabled = await GetBoolOmniSetting("KliveAgent_AutoResumeInterruptedRuns", defaultValue: true);
+                int maxAgeHours = await GetIntOmniSetting("KliveAgent_AutoResumeMaxAgeHours", 6);
+                // One continuation per conversation: only its most recent interrupted run matters.
+                var latestPerConversation = candidates.GroupBy(r => r.ConversationId, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => g.OrderByDescending(r => r.CreatedAt).First())
+                    .ToHashSet();
+                foreach (var run in candidates.OrderBy(r => r.CreatedAt))
+                {
+                    if (serviceToken.IsCancellationRequested || generation != Volatile.Read(ref serviceGeneration)) return;
+                    // After an in-process restart the interrupted run itself can still be unwinding (a
+                    // tool running out its own deadline). A message sent now would become steering for
+                    // that dead run, so wait for it, then drop its stale mapping.
+                    var unwindDeadline = DateTime.UtcNow + InterruptedRunUnwindWait;
+                    while (activeRunByConversation.TryGetValue(run.ConversationId, out var activeId)
+                           && string.Equals(activeId, run.RequestId, StringComparison.Ordinal)
+                           && DateTime.UtcNow < unwindDeadline)
+                    {
+                        try { await Task.Delay(1000, serviceToken); }
+                        catch (OperationCanceledException) { return; }
+                    }
+                    ((ICollection<KeyValuePair<string, string>>)activeRunByConversation)
+                        .Remove(new KeyValuePair<string, string>(run.ConversationId, run.RequestId));
+
+                    bool resume = enabled
+                        && latestPerConversation.Contains(run)
+                        && ShouldAutoResume(run, DateTime.UtcNow, maxAgeHours)
+                        && !activeRunByConversation.ContainsKey(run.ConversationId)
+                        && !pendingApiResponses.Values.Any(r => r.ResumedFromRequestId == run.RequestId);
+                    if (resume)
+                    {
+                        var receipt = await QueueIncomingApiMessageAsync(BuildContinuationMessage(run), run.ConversationId,
+                            "System", "resume_" + run.RequestId, null, resumedFrom: run);
+                        if (receipt.IsPending)
+                        {
+                            // The interruption is being handled; it no longer needs Klives' attention.
+                            try { await MarkNotificationReadAsync("run" + run.RequestId); } catch { }
+                            await ServiceLog($"[KliveAgent] Automatically continuing run {run.RequestId} (interrupted by a restart) as {receipt.PendingRequestId}.");
+                        }
+                        else
+                        {
+                            await ServiceLog($"[KliveAgent] Could not continue interrupted run {run.RequestId}: {receipt.ErrorMessage ?? receipt.Response}");
+                        }
+                    }
+
+                    // Considered exactly once: a later restart must not continue the same work again.
+                    lock (run)
+                    {
+                        run.AutoResumePending = false;
+                        TouchRunLocked(run);
+                    }
+                    try { await PersistRunAsync(run); }
+                    catch (Exception ex)
+                    {
+                        try { await ServiceLogError(ex, $"[KliveAgent] Could not persist the resume decision for run {run.RequestId}.", false); } catch { }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                try { await ServiceLogError(ex, "[KliveAgent] Automatic continuation of interrupted runs failed.", false); } catch { }
+            }
+        }
+
+        // ── Display-time secret reveal (Klives' authenticated views only) ──
+
+        /// <summary>Resolves {account:service/field} references for Klives' own dashboard. The stored
+        /// conversation, the model's history and every notification keep the reference; only the
+        /// response rendered to Klives carries the value. Fail-soft: unresolvable text is unchanged.</summary>
+        public string RevealForKlives(string? text)
+        {
+            if (string.IsNullOrEmpty(text) || !text.Contains("{account:", StringComparison.OrdinalIgnoreCase)) return text ?? "";
+            try
+            {
+                var registry = GetActiveServices().OfType<Omnipotent.Services.AccountRegistry.AccountRegistry>()
+                    .FirstOrDefault(s => s.IsServiceActive());
+                return registry?.Store?.RevealPlaceholders(text) ?? text;
+            }
+            catch { return text; }
+        }
+
+        /// <summary>A reveal-applied copy of a run snapshot. FinalResponse is cloned first: snapshots
+        /// share it with the live run, and the live run must keep the reference.</summary>
+        public AgentPendingChatResponse? RevealRunForKlives(AgentPendingChatResponse? run)
+        {
+            if (run == null) return null;
+            run.Response = RevealForKlives(run.Response);
+            if (run.FinalResponse != null)
+            {
+                var final = run.FinalResponse;
+                run.FinalResponse = new AgentChatResponse
+                {
+                    Response = RevealForKlives(final.Response),
+                    ConversationId = final.ConversationId,
+                    ClientMessageId = final.ClientMessageId,
+                    ScriptsExecuted = final.ScriptsExecuted,
+                    Success = final.Success,
+                    ErrorMessage = final.ErrorMessage,
+                    PromptTokens = final.PromptTokens,
+                    CompletionTokens = final.CompletionTokens,
+                    Iterations = final.Iterations,
+                    IsPending = final.IsPending,
+                    PendingRequestId = final.PendingRequestId,
+                    WasSteering = final.WasSteering,
+                    AcceptedMessageId = final.AcceptedMessageId,
+                };
+            }
+            return run;
+        }
+
+        /// <summary>A reveal-applied conversation view (its messages are already clones).</summary>
+        public AgentConversationView? RevealConversationForKlives(AgentConversationView? view)
+        {
+            if (view == null) return null;
+            foreach (var message in view.Messages) message.Content = RevealForKlives(message.Content);
+            for (int i = 0; i < view.RecentRuns.Count; i++) view.RecentRuns[i] = RevealRunForKlives(view.RecentRuns[i])!;
+            return view;
+        }
+
+        // ── Reaching Klives off-site ──
+
+        /// <summary>The dashboard origin used in links sent to Klives (Discord, notifications).</summary>
+        internal const string WebsiteBaseUrl = "https://klive.uk";
+
+        /// <summary>A run whose result someone was polling this recently was watched as it finished.</summary>
+        internal static readonly TimeSpan WatchedRunWindow = TimeSpan.FromSeconds(45);
+
+        /// <summary>conversationId → when the agent last messaged Klives itself (notify_klives), so the
+        /// automatic "finished" DM never repeats a message the agent already chose to send.</summary>
+        private readonly ConcurrentDictionary<string, DateTime> directMessagesToKlives = new(StringComparer.OrdinalIgnoreCase);
+
+        internal static string ConversationLink(string conversationId) =>
+            $"{WebsiteBaseUrl}/kliveagent?conversation={Uri.EscapeDataString(conversationId ?? "")}";
+
+        internal static string BuildFinishedDm(AgentPendingChatResponse run, TimeSpan duration)
+        {
+            string prompt = (run.UserMessage ?? "").Trim().ReplaceLineEndings(" ");
+            if (prompt.Length > 140) prompt = prompt[..140].TrimEnd() + "…";
+            string head = run.Status switch
+            {
+                AgentTaskStatus.Completed => "✅ **KliveAgent finished** your request",
+                AgentTaskStatus.Interrupted => "⚠️ **KliveAgent was interrupted** working on",
+                AgentTaskStatus.Cancelled => "⚠️ **KliveAgent stopped** working on",
+                _ => "⚠️ **KliveAgent couldn't finish**",
+            };
+            // Deliberately never the reply itself: it may carry credentials Klives asked for, and
+            // those belong on the authenticated dashboard, not in a Discord message.
+            return $"{head}: “{prompt}” ({KliveAgentBrain.FormatElapsed(duration)}).\n"
+                + $"The full reply is waiting here: {ConversationLink(run.ConversationId)}";
+        }
+
+        /// <summary>Discord DM for a long run that finished while nobody was watching, so "come back
+        /// later" has something to come back to. Never fires for a run Klives stopped himself.</summary>
+        private async Task NotifyRunFinishedOffSiteAsync(AgentPendingChatResponse run)
+        {
+            try
+            {
+                if (run.StopReason == AgentChatRunControl.StopReasonUser) return;
+                if (!await GetBoolOmniSetting("KliveAgent_DiscordDmOnFinish", defaultValue: true)) return;
+                int minMinutes = await GetIntOmniSetting("KliveAgent_FinishedDmMinMinutes", 3);
+                var duration = (run.CompletedAt ?? DateTime.UtcNow) - run.CreatedAt;
+                if (duration < TimeSpan.FromMinutes(Math.Max(0, minMinutes))) return;
+                if (directMessagesToKlives.TryGetValue(run.ConversationId ?? "", out var messagedAt)
+                    && messagedAt >= run.CreatedAt
+                    && run.Status == AgentTaskStatus.Completed) return;
+                await SendDiscordToKlivesAsync(BuildFinishedDm(run, duration));
+            }
+            catch (Exception ex)
+            {
+                try { await ServiceLogError(ex, "[KliveAgent] Could not send the run-finished Discord message.", false); } catch { }
+            }
+        }
+
+        private async Task SendDiscordToKlivesAsync(string text)
+        {
+            await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", text);
+        }
+
+        /// <summary>The notify_klives tool: a Discord DM plus a website result entry. Used when Klives
+        /// asked to be messaged, or for something he must know before the run ends.</summary>
+        public async Task<string> NotifyKlivesAsync(string message, string? conversationId)
+        {
+            if (string.IsNullOrWhiteSpace(message)) return "Error: 'message' is required.";
+            string text = message.Trim();
+            if (text.Length > 1800) text = text[..1800] + "…";
+            string? link = !string.IsNullOrWhiteSpace(conversationId) && IsSafeIdentifier(conversationId)
+                ? ConversationLink(conversationId) : null;
+            bool discordOk = false;
+            string? discordError = null;
+            try
+            {
+                await SendDiscordToKlivesAsync(link == null ? text : $"{text}\n{link}");
+                discordOk = true;
+            }
+            catch (Exception ex) { discordError = ex.Message; }
+
+            try
+            {
+                await AddNotificationAsync(new AgentNotification
+                {
+                    NotificationId = "msg" + Guid.NewGuid().ToString("N"),
+                    Kind = "agent-message",
+                    Title = "KliveAgent messaged you",
+                    Body = text,
+                    ConversationId = IsSafeIdentifier(conversationId) ? conversationId : null,
+                });
+            }
+            catch { /* the Discord message is the primary channel */ }
+
+            if (!string.IsNullOrWhiteSpace(conversationId))
+                directMessagesToKlives[conversationId] = DateTime.UtcNow;
+            return discordOk
+                ? $"Sent to Klives on Discord at {Data_Handling.TemporalFormat.NowStamp()} (also listed in the website's Results panel)."
+                : $"Discord delivery failed ({discordError}); the message is listed in the website's Results panel only.";
+        }
+
         public List<AgentNotification> GetNotifications(bool unreadOnly = false, int? limit = null) =>
             ApplyNotificationQuery(notifications.Values, unreadOnly, limit);
 
@@ -2220,6 +2578,21 @@ namespace Omnipotent.Services.KliveAgent
             notification.ReadAt ??= DateTime.UtcNow;
             await PersistNotificationAsync(notification);
             return true;
+        }
+
+        public async Task<int> MarkAllNotificationsReadAsync()
+        {
+            int marked = 0;
+            foreach (var notification in notifications.Values.Where(n => n.ReadAt == null).ToList())
+            {
+                notification.ReadAt = DateTime.UtcNow;
+                try { await PersistNotificationAsync(notification); marked++; }
+                catch (Exception ex)
+                {
+                    try { await ServiceLogError(ex, "[KliveAgent] Could not persist a notification read-mark.", false); } catch { }
+                }
+            }
+            return marked;
         }
 
         private async Task AddNotificationAsync(AgentNotification notification)

@@ -902,6 +902,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("latestFrame")]
         public string LatestFrame { get; set; }
 
+        /// <summary>The revision at which <see cref="LatestFrame"/> last changed. A poll that has
+        /// already seen that revision gets the snapshot without re-downloading the same image —
+        /// liveness pulses advance the revision every few seconds while the frame stays put.</summary>
+        [JsonIgnore]
+        public long LatestFrameSequence { get; set; }
+
         /// <summary>Set while a computer-use action is blocked awaiting Klive's approval (the website renders
         /// an inline approve/deny card with the target screenshot). Null when nothing is pending.</summary>
         [JsonProperty("pendingApproval")]
@@ -941,6 +947,36 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("errorMessage")]
         public string ErrorMessage { get; set; }
+
+        /// <summary>Why a stopped run stopped: user | stall | shutdown (null while running or when it
+        /// finished on its own). Lets the website label the outcome instead of calling it "Done".</summary>
+        [JsonProperty("stopReason")]
+        public string? StopReason { get; set; }
+
+        /// <summary>The container desktop this run drives, when its computer is a KliveAgent desktop,
+        /// so the website can stream it live and hand control to Klives.</summary>
+        [JsonProperty("computerContainerId")]
+        public string? ComputerContainerId { get; set; }
+
+        /// <summary>For a run that continues one interrupted by a restart: the interrupted run's id.</summary>
+        [JsonProperty("resumedFromRequestId")]
+        public string? ResumedFromRequestId { get; set; }
+
+        /// <summary>How many automatic continuations led to this run (0 for a run Klives started).
+        /// Bounds the resume chain so a crash loop cannot keep restarting the same work.</summary>
+        [JsonProperty("resumeCount")]
+        public int ResumeCount { get; set; }
+
+        /// <summary>Interrupted (process restart or service shutdown) and not yet considered for an
+        /// automatic continuation. The first start that considers it clears it, so a later restart
+        /// never continues the same work twice.</summary>
+        [JsonProperty("autoResumePending")]
+        public bool AutoResumePending { get; set; }
+
+        /// <summary>Last time a client polled this run. A run that finishes while someone is watching
+        /// does not need an unread "finished" notification.</summary>
+        [JsonIgnore]
+        public DateTime LastObservedAt { get; set; } = DateTime.MinValue;
     }
 
     /// <summary>
@@ -949,10 +985,44 @@ namespace Omnipotent.Services.KliveAgent.Models
     /// </summary>
     public sealed class AgentChatRunControl
     {
+        public const string StopReasonUser = "user";
+        public const string StopReasonStall = "stall";
+        public const string StopReasonShutdown = "shutdown";
+
         private readonly object sync = new();
         private readonly Queue<AgentSteeringMessage> queued = new();
         private readonly HashSet<string> reservations = new(StringComparer.Ordinal);
         private bool accepting = true;
+        private string? stopReason;
+        private string? stopDetail;
+
+        /// <summary>The owning service's token. Runs are cancelled through it when the service itself
+        /// stops or restarts, which nobody records beforehand — so it is read as the reason.</summary>
+        public CancellationToken ServiceToken { get; init; }
+
+        /// <summary>Whether a run interrupted by a shutdown will be continued automatically at the
+        /// next start (the setting is on and the resume chain is not exhausted).</summary>
+        public bool ResumesAfterShutdown { get; init; }
+
+        /// <summary>Why the run's token was cancelled (user | stall | shutdown), recorded BEFORE the
+        /// cancellation so the brain's closing message can say what actually happened.</summary>
+        public string? StopReason
+        {
+            get { lock (sync) return stopReason ?? (ServiceToken.IsCancellationRequested ? StopReasonShutdown : null); }
+        }
+        public string? StopDetail { get { lock (sync) return stopDetail; } }
+
+        /// <summary>Records the first stop reason; a later one (e.g. the watchdog after a manual
+        /// Stop) never overwrites it.</summary>
+        public void RecordStop(string reason, string? detail = null)
+        {
+            lock (sync)
+            {
+                if (stopReason != null || ServiceToken.IsCancellationRequested) return;
+                stopReason = reason;
+                stopDetail = detail;
+            }
+        }
 
         public bool TryEnqueue(AgentSteeringMessage message)
         {
@@ -1230,6 +1300,11 @@ namespace Omnipotent.Services.KliveAgent.Models
         /// over. Null for a plain approval.</summary>
         [JsonProperty("solveUrl")]
         public string SolveUrl { get; set; }
+
+        /// <summary>For an intervention on a KliveAgent container desktop: the container Klives takes
+        /// over in the page itself (live stream + input), instead of opening a separate solve link.</summary>
+        [JsonProperty("containerId")]
+        public string? ContainerId { get; set; }
     }
 
     /// <summary>One entry in a run's live activity timeline.</summary>
@@ -1269,5 +1344,8 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         /// <summary>A computer-use approval request/resolution to surface to the website, if any.</summary>
         public PendingApproval Approval { get; set; }
+
+        /// <summary>The container desktop the run is driving, once known (null = unchanged).</summary>
+        public string? ComputerContainerId { get; set; }
     }
 }

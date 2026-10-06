@@ -168,7 +168,7 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
-                    await req.ReturnResponse(JsonConvert.SerializeObject(pendingResponse), headers: new WebHeaderCollection
+                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealRunForKlives(pendingResponse)), headers: new WebHeaderCollection
                     {
                         ["Cache-Control"] = "no-store",
                         ["X-Klive-Pending-Wait"] = "supported"
@@ -199,8 +199,10 @@ namespace Omnipotent.Services.KliveAgent
                     }
                     bool includeCompleted = !string.Equals(
                         req.userParameters["includeCompleted"], "false", StringComparison.OrdinalIgnoreCase);
-                    var runs = service.GetPendingApiResponses(conversationId, includeCompleted);
-                    await req.ReturnResponse(JsonConvert.SerializeObject(runs));
+                    var runs = service.GetPendingApiResponses(conversationId, includeCompleted)
+                        .Select(run => service.RevealRunForKlives(run))
+                        .ToList();
+                    await req.ReturnResponse(JsonConvert.SerializeObject(runs), headers: NoStore());
                 }
                 catch (Exception ex)
                 {
@@ -301,6 +303,58 @@ namespace Omnipotent.Services.KliveAgent
                         code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Hand KliveAgent's desktop back after a takeover (the "Done — continue" button), or decline
+            // it. The waiting request_human call resumes immediately either way.
+            await CreateDurableRoute("/kliveagent/chat/handoff/resolve", async (req) =>
+            {
+                try
+                {
+                    var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                    string approvalId = body?.approvalId;
+                    string outcome = body?.outcome ?? "done";
+                    if (string.IsNullOrWhiteSpace(approvalId))
+                    {
+                        await req.ReturnResponse(
+                            JsonConvert.SerializeObject(new { error = "approvalId is required." }),
+                            code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    bool resolved = service.Computer.ResolveHandoff(approvalId, outcome);
+                    // A host-desktop takeover (HostControl) is resolved through its own broker.
+                    if (!resolved) resolved = await service.SubmitApprovalAsync(approvalId, outcome != "cancel");
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = resolved }));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            // Which computer KliveAgent uses and, for its own desktop, the container to stream — so the
+            // page can show it live even before (or between) runs.
+            await CreateDurableRoute("/kliveagent/computer", async (req) =>
+            {
+                try
+                {
+                    string setting = await service.GetDropdownOmniSetting("KliveAgent_ComputerTarget",
+                        KliveAgentRunSettings.ComputerTargetAuto, KliveAgentRunSettings.ComputerTargets);
+                    bool enabled = await service.GetBoolOmniSetting("KliveAgent_ComputerUseEnabled", defaultValue: true);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        enabled,
+                        computer = enabled ? service.Computer.Describe(setting) : null,
+                    }), headers: NoStore());
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(
+                        JsonConvert.SerializeObject(new ErrorInformation(ex)),
+                        code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, KMPermissions.Klives);
         }
 
         private async Task RegisterAttachmentRoutes()
@@ -460,7 +514,10 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
-                    await req.ReturnResponse(JsonConvert.SerializeObject(conversation));
+                    // Requested credentials appear as {account:...} references in the stored reply and
+                    // are resolved only here, for Klives' own authenticated view.
+                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealConversationForKlives(conversation)),
+                        headers: NoStore());
                 }
                 catch (Exception ex)
                 {
@@ -633,6 +690,12 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { success = marked }),
                     code: marked ? HttpStatusCode.OK : HttpStatusCode.NotFound);
+            }, HttpMethod.Post, KMPermissions.Klives);
+
+            await CreateDurableRoute("/kliveagent/notifications/read-all", async req =>
+            {
+                int marked = await service.MarkAllNotificationsReadAsync();
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, marked }));
             }, HttpMethod.Post, KMPermissions.Klives);
         }
 
@@ -851,6 +914,9 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }, HttpMethod.Get, KMPermissions.Klives);
         }
+
+        /// <summary>Responses that may carry revealed credentials or live run state are never cached.</summary>
+        private static WebHeaderCollection NoStore() => new() { ["Cache-Control"] = "no-store" };
 
         internal static int? ParseOptionalLimit(string? value)
         {

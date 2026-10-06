@@ -240,6 +240,57 @@ namespace Omnipotent.Services.KliveAgent
             catch (Exception ex) { return $"Account register failed: {ex.Message}"; }
         }
 
+        /// <summary>Update an account in the shared registry, found by service (+ username when the service
+        /// has several): add/replace a named secret (stored encrypted, never shown back — "{generate}"
+        /// mints a strong password), change status (active/dead/banned) or notes.</summary>
+        public Task<string> UpdateAccount(string service, string? username = null, string? addSecretName = null,
+            string? addSecretValue = null, string? status = null, string? notes = null,
+            string? newUsername = null, string? newEmail = null)
+        {
+            var reg = GetAccountRegistry();
+            if (reg == null) return Task.FromResult("Account registry unavailable.");
+            try
+            {
+                var candidates = reg.List(service);
+                if (!string.IsNullOrWhiteSpace(username))
+                    candidates = candidates.Where(a => string.Equals(a.Username, username.Trim(), StringComparison.OrdinalIgnoreCase)).ToList();
+                if (candidates.Count == 0)
+                    return Task.FromResult($"No registered account for '{service}'{(string.IsNullOrWhiteSpace(username) ? "" : $" / '{username}'")}. account_list shows what exists; account_register adds one.");
+                if (candidates.Count > 1)
+                    return Task.FromResult($"'{service}' has {candidates.Count} accounts ({string.Join(", ", candidates.Select(a => a.Username))}); pass the username too.");
+                var account = candidates[0];
+                var done = new List<string>();
+                if (!string.IsNullOrWhiteSpace(addSecretName) && addSecretValue != null
+                    && reg.AddSecret(account.AccountID, addSecretName.Trim(), addSecretValue))
+                    done.Add($"secret '{addSecretName.Trim()}' (type it as {{account:{account.ServiceKey}/{account.Username}/{addSecretName.Trim()}}})");
+                if (!string.IsNullOrWhiteSpace(status)
+                    && Enum.TryParse<Omnipotent.Services.AccountRegistry.AccountStatus>(status.Trim(), true, out var parsed)
+                    && reg.UpdateStatus(account.AccountID, parsed))
+                    done.Add($"status={parsed}");
+                if (notes != null && reg.UpdateNotes(account.AccountID, notes)) done.Add("notes");
+                if (!string.IsNullOrWhiteSpace(newUsername) && reg.Store.UpdateUsername(account.AccountID, newUsername))
+                    done.Add($"username={newUsername.Trim()}");
+                if (!string.IsNullOrWhiteSpace(newEmail))
+                {
+                    if (reg.Store.UpdateEmail(account.AccountID, newEmail.Trim()))
+                    {
+                        done.Add($"email={newEmail.Trim()}");
+                        var updated = reg.Get(account.AccountID);
+                        if (updated != null) _ = reg.EnsureMailboxForAccountAsync(updated);
+                    }
+                }
+                reg.ClaimForOwner(account.AccountID, "KliveAgent");
+                return Task.FromResult(done.Count == 0
+                    ? $"Nothing changed on {account.ServiceKey} · {account.Username} — pass addSecretName+addSecretValue, status or notes."
+                    : $"Updated {account.ServiceKey} · {account.Username}: {string.Join(", ", done)}. Secret values are never shown back.");
+            }
+            catch (Exception ex) { return Task.FromResult($"Account update failed: {ex.Message}"); }
+        }
+
+        /// <summary>Message Klives directly (Discord DM + a website result entry) — when he asked to be
+        /// messaged, or for something he must know before this run ends. Never put secrets in it.</summary>
+        public Task<string> NotifyKlives(string message) => agentService.NotifyKlivesAsync(message, ConversationId);
+
         /// <summary>Semantic + lexical search across Klives' whole knowledge base (Projects, KliveAgent memory,
         /// Omniscience, repo docs, cached web). Returns cited results; follow up with ReadKnowledgeDoc(docId).
         /// Set includeMessages to also search Omniscience's raw message corpus.</summary>

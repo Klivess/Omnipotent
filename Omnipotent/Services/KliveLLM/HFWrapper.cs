@@ -639,6 +639,20 @@ namespace Omnipotent.Services.KliveLLM
                 [JsonProperty("content")]
                 public string content { get; set; }
 
+                // Reasoning ("thinking") deltas. OpenRouter streams them as `reasoning`; DeepSeek,
+                // Qwen and vLLM-style servers use `reasoning_content`. Neither is part of the answer,
+                // but both are proof the provider is working rather than wedged. Typed as object: a
+                // provider that sends a structured value here must not make the whole chunk — and
+                // the content riding in it — fail to deserialize.
+                [JsonProperty("reasoning")]
+                public object reasoning { get; set; }
+
+                [JsonProperty("reasoning_content")]
+                public object reasoning_content { get; set; }
+
+                [JsonIgnore]
+                public string ReasoningText => reasoning as string ?? reasoning_content as string;
+
                 [JsonProperty("tool_calls")]
                 public List<StreamToolCallDelta> tool_calls { get; set; }
             }
