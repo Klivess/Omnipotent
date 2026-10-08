@@ -332,6 +332,9 @@ namespace Omnipotent.Services.KliveAgent
                 CodebaseIndex = index;
                 SymbolGraph = graph;
                 RepoMap = new KliveAgentRepoMap(index, graph);
+                // The script tools' class catalogue (FindProjectClass, GetMethodDocumentation…) is built
+                // on first use; build it here so no script pays for it inside its 30s limit.
+                try { new ScriptGlobals(this, serviceToken).FindProjectClass(nameof(KliveAgent)); } catch { }
                 codebaseProgress = 100;
                 codebaseMessage = "Codebase intelligence is ready.";
                 await ServiceLog("[KliveAgent] Codebase intelligence is ready.");
@@ -469,6 +472,18 @@ namespace Omnipotent.Services.KliveAgent
                 return InvalidIdentifierResponse("conversationId", conversationId);
 
             var executionGate = conversationExecutionGates.GetOrAdd(conversationId, _ => new SemaphoreSlim(1, 1));
+            if (executionGate.CurrentCount == 0)
+            {
+                try
+                {
+                    onProgress?.Invoke(new AgentProgressUpdate
+                    {
+                        Phase = "waiting",
+                        StatusNote = "waiting for the previous run in this conversation to finish stopping",
+                    });
+                }
+                catch { }
+            }
             await executionGate.WaitAsync(cancellationToken);
             try
             {
@@ -1269,6 +1284,23 @@ namespace Omnipotent.Services.KliveAgent
         // pending entries after a generous window so the in-memory dict can't grow unbounded.
         private static readonly TimeSpan PendingRetentionWindow = TimeSpan.FromDays(7);
 
+        /// <summary>
+        /// Stops a run the stall watchdog has given up on, exactly as a manual Stop does: the reason is
+        /// recorded first, steering intake is sealed, then the token is cancelled. Without the seal, a
+        /// "??" sent to a run that was still unwinding was accepted as steering and silently dropped
+        /// when the run ended, instead of starting a fresh run. Returns the "(last activity: …)" suffix.
+        /// </summary>
+        internal static string StopStalledRun(AgentPendingChatResponse pending, double stallMinutes)
+        {
+            string lastActivity = string.IsNullOrWhiteSpace(pending.StatusNote)
+                ? "" : $" (last activity: {pending.StatusNote.Trim().Trim('_').TrimStart('…')})";
+            pending.Control?.RecordStop(AgentChatRunControl.StopReasonStall,
+                $"no progress for {stallMinutes:0} minutes{lastActivity}");
+            pending.Control?.Seal();
+            try { pending.CancellationSource?.Cancel(); } catch { }
+            return lastActivity;
+        }
+
         private async Task RunPendingRunWatchdogAsync(CancellationToken serviceToken)
         {
             while (!serviceToken.IsCancellationRequested)
@@ -1296,11 +1328,7 @@ namespace Omnipotent.Services.KliveAgent
                             && !Omnipotent.Services.KliveLLM.KliveLLM.AIRouterHasQueuedWork(
                                 "kliveagent-" + pending.ConversationId + "#"))
                         {
-                            string lastActivity = string.IsNullOrWhiteSpace(pending.StatusNote)
-                                ? "" : $" (last activity: {pending.StatusNote.Trim().Trim('_').TrimStart('…')})";
-                            pending.Control?.RecordStop(AgentChatRunControl.StopReasonStall,
-                                $"no progress for {stallMinutes:0} minutes{lastActivity}");
-                            try { pending.CancellationSource.Cancel(); } catch { }
+                            string lastActivity = StopStalledRun(pending, stallMinutes);
                             try { await ServiceLog($"[KliveAgent] Stall watchdog cancelled run {kvp.Key} after {stallMinutes:0}min of no progress{lastActivity}."); } catch { }
                         }
 

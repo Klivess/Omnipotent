@@ -433,12 +433,16 @@ public sealed class KliveAgentComputer
         var waited = System.Diagnostics.Stopwatch.StartNew();
         long lastHeartbeat = 0;
         string outcome = "timeout";
+        var desktops = ResolveProjects()?.Desktops;
         try
         {
             while (handoff.IsPending)
             {
                 if (ct.IsCancellationRequested) { handoff.Completion.TrySetResult("cancelled"); break; }
                 if (DateTime.UtcNow >= deadline) { handoff.Completion.TrySetResult("timeout"); break; }
+                // A desktop awaiting Klives counts as in use: idle suspension would stop the container
+                // under him and lose the very page (and any solved CAPTCHA) he was asked to work on.
+                desktops?.MarkViewed(containerID);
                 await Task.WhenAny(handoff.Completion.Task, Task.Delay(1000, CancellationToken.None));
                 if (!handoff.IsPending) break;
 

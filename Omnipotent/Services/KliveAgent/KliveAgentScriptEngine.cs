@@ -1911,7 +1911,10 @@ namespace Omnipotent.Services.KliveAgent
                     return projectClassIndexCache;
 
                 var classes = new List<ProjectClassInfo>();
-                foreach (var file in Directory.EnumerateFiles(CodebaseRoot, "*.cs", SearchOption.AllDirectories)
+                // Pruned walk: filtering paths after a plain recursive enumeration still visited every
+                // file under SavedData and serverBuild, so the first GetMethodDocumentation /
+                // FindProjectClass of a process could outlast the 30s script limit on the server.
+                foreach (var file in KliveAgentCodebaseIndex.EnumerateSourceFiles(CodebaseRoot)
                     .Where(IsSourceIndexFile))
                 {
                     try
@@ -2420,7 +2423,9 @@ namespace Omnipotent.Services.KliveAgent
                 .AddReferences(assemblies)
                 .AddImports(
                     "System",
+                    "System.IO",
                     "System.Linq",
+                    "System.Text",
                     "System.Collections.Generic",
                     "System.Threading.Tasks",
                     "Omnipotent.Services.KliveAgent",
@@ -2498,6 +2503,7 @@ namespace Omnipotent.Services.KliveAgent
             {
                 var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(30);
                 var stopwatch = Stopwatch.StartNew();
+                bool compiling = false;
 
                 try
                 {
@@ -2512,7 +2518,9 @@ namespace Omnipotent.Services.KliveAgent
                         // First script in the session: compile explicitly to surface structured
                         // diagnostics before running. ScriptGlobals is the top-level globals type.
                         var script = CSharpScript.Create(code, scriptOptions, typeof(ScriptGlobals));
+                        compiling = true;
                         var diagnostics = script.Compile(cts.Token);
+                        compiling = false;
                         var errors = diagnostics.Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error).ToList();
                         if (errors.Count > 0)
                         {
@@ -2611,7 +2619,11 @@ namespace Omnipotent.Services.KliveAgent
                     {
                         Code = code,
                         Success = false,
-                        ErrorMessage = $"Script execution timed out after {effectiveTimeout.TotalSeconds}s.",
+                        // A compile that runs out the clock says nothing about the code: the server was
+                        // busy. Saying "execution timed out" sent the model off rewriting working code.
+                        ErrorMessage = compiling && !globals.CancellationToken.IsCancellationRequested
+                            ? $"Compiling the script took longer than {effectiveTimeout.TotalSeconds:0}s, so nothing ran — the server is busy, not your code. Send the same script again, or use a native tool (no compile step) if one fits."
+                            : $"Script execution timed out after {effectiveTimeout.TotalSeconds}s.",
                         ExecutionTimeMs = stopwatch.ElapsedMilliseconds
                     };
                 }

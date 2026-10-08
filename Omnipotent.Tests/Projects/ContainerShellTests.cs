@@ -327,6 +327,18 @@ namespace Omnipotent.Tests.Projects
         }
 
         [Fact]
+        public void BrowserLauncher_NeverOpensOnARestorePagesBubble()
+        {
+            // Every relaunch follows a kill, and Chromium's "Restore pages?" bubble then takes the
+            // keyboard: KliveAgent's typing and clicks went into it instead of the page.
+            string script = ContainerOrchestrator.BrowserLaunchScriptForExec;
+
+            Assert.Contains("--hide-crash-restore-bubble", script);
+            Assert.Contains("['exit_type'] = 'Normal'", script);
+            Assert.Contains("['exited_cleanly'] = True", script);
+        }
+
+        [Fact]
         public void BrowserInspection_ChallengeIsElevatedWithTheToolThatClearsIt()
         {
             // A captcha used to end the run on a human. The banner must now name the op that solves

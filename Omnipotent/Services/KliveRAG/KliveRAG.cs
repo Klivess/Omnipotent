@@ -152,6 +152,7 @@ namespace Omnipotent.Services.KliveRAG
         public async Task<List<RagHit>> SearchAsync(string query, RagSearchOptions opts, CancellationToken ct = default)
         {
             if (!ready) return new List<RagHit>();
+            opts.Deadline ??= ToolSearchDeadline;
             var hits = await Retriever.SearchAsync(query, opts, ct);
             if (opts.IncludeMessages && federation != null)
             {
@@ -165,38 +166,53 @@ namespace Omnipotent.Services.KliveRAG
             return hits;
         }
 
+        /// <summary>Prompt injection only looks at the newest this-many chunks: a constant cost however
+        /// large the Projects event log grows, and fresh material is what injection is for anyway.</summary>
+        internal const int InjectionRecentWindow = 150_000;
+
+        /// <summary>The tool/route path reads the whole corpus, but a search still has to end.</summary>
+        internal static readonly TimeSpan ToolSearchDeadline = TimeSpan.FromSeconds(15);
+
+        /// <summary>Headroom past the retrieval deadline for hydration and scheduling before an injection
+        /// caller stops waiting and goes on without knowledge.</summary>
+        private static readonly TimeSpan InjectionOverrun = TimeSpan.FromMilliseconds(600);
+
         /// <summary>
-        /// Budget-fitted knowledge block for automatic prompt injection. Races an internal timeout and
-        /// returns "" on timeout / not-ready / any error, so a slow or cold index never blocks a prompt build.
+        /// Budget-fitted knowledge block for automatic prompt injection. Returns "" when the deadline
+        /// passes or on not-ready / any error, so a slow or cold index never holds up a prompt build.
         /// </summary>
         public async Task<string> SearchForPromptAsync(string query, int maxTokens, TimeSpan timeout, string? excludeProjectId = null)
         {
             if (!ready || string.IsNullOrWhiteSpace(query)) return "";
-            try
-            {
-                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-                timeoutCts.CancelAfter(timeout);
-                var opts = new RagSearchOptions { MaxResults = 6, ExcludeProjectId = excludeProjectId, ExcludeSources = InjectionExcludedSources };
-                var hits = await Retriever.SearchAsync(query, opts, timeoutCts.Token);
-                return HybridRetriever.FormatForPrompt(hits, maxTokens,
-                    "[Relevant Knowledge] (Klives' cross-system knowledge base — search_knowledge / read_knowledge_doc for more)");
-            }
-            catch { return ""; }
+            var hits = await SearchForInjectionAsync(query, 6, timeout, excludeProjectId);
+            return HybridRetriever.FormatForPrompt(hits, maxTokens,
+                "[Relevant Knowledge] (Klives' cross-system knowledge base — search_knowledge / read_knowledge_doc for more)");
         }
 
         /// <summary>Injection hits for Projects wake seeds (rendered + budgeted by the caller).</summary>
         public async Task<List<KnowledgeHit>> SearchKnowledgeHitsAsync(string query, int maxResults, TimeSpan timeout, string? excludeProjectId = null)
         {
             if (!ready || string.IsNullOrWhiteSpace(query)) return new List<KnowledgeHit>();
-            try
+            return HybridRetriever.ToKnowledgeHits(await SearchForInjectionAsync(query, maxResults, timeout, excludeProjectId));
+        }
+
+        private async Task<List<RagHit>> SearchForInjectionAsync(string query, int maxResults, TimeSpan timeout, string? excludeProjectId)
+        {
+            var opts = new RagSearchOptions
             {
-                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cts.Token);
-                timeoutCts.CancelAfter(timeout);
-                var opts = new RagSearchOptions { MaxResults = maxResults, ExcludeProjectId = excludeProjectId, ExcludeSources = InjectionExcludedSources };
-                var hits = await Retriever.SearchAsync(query, opts, timeoutCts.Token);
-                return HybridRetriever.ToKnowledgeHits(hits);
+                MaxResults = maxResults,
+                ExcludeProjectId = excludeProjectId,
+                ExcludeSources = InjectionExcludedSources,
+                Deadline = timeout,
+                RecentWindow = InjectionRecentWindow,
+            };
+            var search = Task.Run(() => Retriever.SearchAsync(query, opts, cts.Token));
+            try { return await search.WaitAsync(timeout + InjectionOverrun); }
+            catch
+            {
+                _ = search.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                return new List<RagHit>();
             }
-            catch { return new List<KnowledgeHit>(); }
         }
 
         /// <summary>search_knowledge tool: formatted, citation-tagged result list.</summary>

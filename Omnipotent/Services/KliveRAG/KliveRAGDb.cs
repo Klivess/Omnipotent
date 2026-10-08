@@ -59,6 +59,45 @@ namespace Omnipotent.Services.KliveRAG
             return conn;
         }
 
+        /// <summary>VM steps between deadline checks: a few microseconds of work, so a deadline lands
+        /// within milliseconds while the managed callback stays a negligible cost.</summary>
+        private const int DeadlineCheckSteps = 1000;
+
+        /// <summary>
+        /// Bounds every statement run on <paramref name="conn"/> by <paramref name="ct"/>: SQLite polls
+        /// a progress handler as it steps and aborts the statement (SQLITE_INTERRUPT, surfaced as a
+        /// <see cref="SqliteException"/>) once the token is cancelled. Microsoft.Data.Sqlite does not
+        /// stop a statement that is already stepping, which is how one full-text query held KliveAgent's
+        /// prompt build for minutes. A one-off sqlite3_interrupt would also miss a statement that starts
+        /// just after the deadline; the handler cannot. Dispose before the connection goes back to the pool.
+        /// </summary>
+        public static IDisposable BindDeadline(SqliteConnection conn, CancellationToken ct)
+        {
+            var handle = conn.Handle;
+            if (handle == null || !ct.CanBeCanceled) return NoDeadline.Instance;
+            SQLitePCL.raw.sqlite3_progress_handler(handle, DeadlineCheckSteps,
+                static state => ((CancellationToken)state).IsCancellationRequested ? 1 : 0, ct);
+            return new StatementDeadline(handle);
+        }
+
+        private sealed class StatementDeadline : IDisposable
+        {
+            private SQLitePCL.sqlite3? handle;
+            public StatementDeadline(SQLitePCL.sqlite3 handle) => this.handle = handle;
+
+            public void Dispose()
+            {
+                var h = Interlocked.Exchange(ref handle, null);
+                if (h != null) SQLitePCL.raw.sqlite3_progress_handler(h, 0, null, null);
+            }
+        }
+
+        private sealed class NoDeadline : IDisposable
+        {
+            public static readonly NoDeadline Instance = new();
+            public void Dispose() { }
+        }
+
         public void Migrate()
         {
             using var conn = Open();

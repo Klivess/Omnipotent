@@ -120,49 +120,88 @@ namespace Omnipotent.Services.KliveAgent
 
         // â”€â”€ Prompt Assembly â”€â”€
 
-        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation, bool toolCallingMode = false, bool computerUseEnabled = false,
-            KliveAgentComputerTarget computerTarget = KliveAgentComputerTarget.Host, bool visionEnabled = true)
+        /// <summary>How long one prompt section may take before the run goes on without it.</summary>
+        internal static readonly TimeSpan PromptSectionBudget = TimeSpan.FromMilliseconds(1500);
+
+        /// <summary>
+        /// Builds one prompt section on the thread pool and waits at most <paramref name="budget"/> for it.
+        /// Every section is enrichment the run can do without, and some do synchronous work underneath
+        /// (SQLite, ONNX, CPU-bound ranking): awaited inline, one slow section once held the whole run at
+        /// "preparing context" until the stall watchdog fired. A late or failed section yields
+        /// <paramref name="fallback"/>; <paramref name="onDone"/> reports (milliseconds, missedBudget).
+        /// </summary>
+        internal static async Task<T> BoundedSectionAsync<T>(Func<Task<T>> section, TimeSpan budget, T fallback,
+            Action<long, bool>? onDone = null)
         {
-            var personalityTask = agentService.GetStringOmniSetting(
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            var work = Task.Run(section);
+            try
+            {
+                var value = await work.WaitAsync(budget).ConfigureAwait(false);
+                onDone?.Invoke(timer.ElapsedMilliseconds, false);
+                return value;
+            }
+            catch (TimeoutException)
+            {
+                _ = work.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                onDone?.Invoke(timer.ElapsedMilliseconds, true);
+                return fallback;
+            }
+            catch
+            {
+                onDone?.Invoke(timer.ElapsedMilliseconds, false);
+                return fallback;
+            }
+        }
+
+        public async Task<string> BuildSystemPrompt(string userMessage, AgentConversation conversation, bool toolCallingMode = false, bool computerUseEnabled = false,
+            KliveAgentComputerTarget computerTarget = KliveAgentComputerTarget.Host, bool visionEnabled = true,
+            KliveAgentPerformance? performance = null)
+        {
+            var missed = new System.Collections.Concurrent.ConcurrentQueue<string>();
+            Task<T> Section<T>(string name, Func<Task<T>> build, T fallback) =>
+                BoundedSectionAsync(build, PromptSectionBudget, fallback, (ms, late) =>
+                {
+                    performance?.Add("prompt." + name, ms);
+                    if (late) missed.Enqueue(name);
+                });
+
+            var personalityTask = Section("personality", () => agentService.GetStringOmniSetting(
                 "KliveAgent_Personality",
-                defaultValue: KliveAgentPersonality.Default);
-            var compactPromptTask = agentService.GetBoolOmniSetting("KliveAgent_CompactPrompt", defaultValue: true);
-            var surfaceTask = agentService.ServiceTools?.BuildPromptBlockAsync() ?? Task.FromResult(string.Empty);
+                defaultValue: KliveAgentPersonality.Default), KliveAgentPersonality.Default);
+            var compactPromptTask = Section("settings", () => agentService.GetBoolOmniSetting("KliveAgent_CompactPrompt", defaultValue: true), true);
+            var surfaceTask = Section("serviceSurface",
+                () => agentService.ServiceTools?.BuildPromptBlockAsync() ?? Task.FromResult(string.Empty), string.Empty);
 
             // Extract PascalCase seed words from the user message for repo map personalisation
             var seeds = KliveAgentRepoMap.ExtractSeedsFromText(userMessage);
 
-            // Kick off the async BM25 memory recall FIRST so it overlaps with the synchronous, CPU-bound
-            // repo-map build below — the two are independent, so there's no reason to pay for them serially
-            // on the critical path before the first LLM call.
-            var memoriesTask = memory.FormatMemoriesForPrompt(
+            // All sections start together; the slowest one, capped at its budget, sets the build time.
+            var memoriesTask = Section("memories", () => memory.FormatMemoriesForPrompt(
                 userMessage,
                 maxMemories: 4,
                 maxShortcuts: 3,
-                maxTokens: KliveAgentContextBudget.MemoryBudget);
+                maxTokens: KliveAgentContextBudget.MemoryBudget), string.Empty);
 
-            // Cross-system knowledge (KliveRAG) recall, overlapped with memory + repo map. Fail-soft:
-            // returns "" if the service is absent/cold/slow so it never blocks or breaks the prompt build.
-            var knowledgeTask = agentService.SearchKnowledgeForPromptAsync(
-                userMessage, KliveAgentContextBudget.KnowledgeBudget);
+            // Cross-system knowledge (KliveRAG) recall. KliveRAG bounds its own search; the section
+            // budget here is the backstop if that ever stops being true.
+            var knowledgeTask = Section("knowledge", () => agentService.SearchKnowledgeForPromptAsync(
+                userMessage, KliveAgentContextBudget.KnowledgeBudget), string.Empty);
 
             // Known accounts from the global shared registry, so you reuse them before creating
             // duplicates. Fail-soft (returns "" if the registry is absent).
-            var accountsTask = agentService.DescribeAccountsForPromptAsync(KliveAgentContextBudget.KnownAccountsBudget);
+            var accountsTask = Section("accounts",
+                () => agentService.DescribeAccountsForPromptAsync(KliveAgentContextBudget.KnownAccountsBudget), string.Empty);
 
-            // Build token-budgeted, task-personalised repo map (only when the task has code signals).
-            var repoMap = string.Empty;
-            try
-            {
-                if (agentService.RepoMap != null && seeds.Count > 0)
-                    repoMap = agentService.RepoMap.GetRepoMap(KliveAgentContextBudget.RepoMapBudget, seeds);
-            }
-            catch { /* best-effort */ }
+            // Token-budgeted, task-personalised repo map (only when the task has code signals).
+            var repoMapper = agentService.RepoMap;
+            var repoMapTask = repoMapper != null && seeds.Count > 0
+                ? Section("repoMap", () => Task.FromResult(
+                    repoMapper.GetRepoMap(KliveAgentContextBudget.RepoMapBudget, seeds)), string.Empty)
+                : Task.FromResult(string.Empty);
 
-            // BM25-ranked memories, budget-capped (started above; await the overlapped result here).
-            var memoriesSection = string.Empty;
-            try { memoriesSection = await memoriesTask; }
-            catch { }
+            var repoMap = await repoMapTask;
+            var memoriesSection = await memoriesTask;
 
             var sb = new StringBuilder();
 
@@ -236,6 +275,11 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("[Known Accounts] (global shared registry — account_list for full details, account_register before any new signup)");
                 sb.Append(accountsSection);
             }
+
+            if (!missed.IsEmpty)
+                _ = agentService.ServiceLog(
+                    $"[KliveAgent] Prompt sections skipped after {PromptSectionBudget.TotalMilliseconds:0}ms: {string.Join(", ", missed)}. The run continued without them.",
+                    false);
 
             // No hard truncation here: the system prompt is composed of bounded, deliberate
             // sections (slim personality + short rule block + tool names + budgeted repo map
@@ -1379,7 +1423,7 @@ namespace Omnipotent.Services.KliveAgent
 
                 var systemPromptTask = performance.MeasureAsync("systemPrompt", () =>
                     BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled,
-                        computerTarget: computerTarget, visionEnabled: visionEnabled));
+                        computerTarget: computerTarget, visionEnabled: visionEnabled, performance: performance));
                 var toolDefinitions = useToolCalling
                     ? BuildToolDefinitions(includeComputerUse: computerTarget == KliveAgentComputerTarget.Host)
                     : null;
@@ -1518,6 +1562,10 @@ namespace Omnipotent.Services.KliveAgent
                 // Set once the run acts on the world (desktop, mail, accounts); see BuildStepGuidance.
                 bool taskMode = false;
                 int unfinishedTaskNudges = 0;
+                // Hand-back guard: a run that ends to ask Klives to clear a CAPTCHA loses its live desktop
+                // session; request_human keeps it. Off once a takeover has timed out or been declined.
+                int handBackNudges = 0;
+                bool humanHandoffUnavailable = false;
                 bool visionFallbackUsed = false;
                 // Number of consecutive iterations whose scripts produced at least one error. Drives the
                 // adaptive thinking budget: a clean cheap turn asks for low reasoning effort; we escalate
@@ -2128,6 +2176,32 @@ namespace Omnipotent.Services.KliveAgent
                             continue;
                         }
 
+                        // A reply that hands a CAPTCHA or human check back to Klives ends the run, and with
+                        // it the live page: a solved reCAPTCHA expires in about two minutes, so by the time
+                        // he answers and a new run starts, his work is void. request_human keeps this run
+                        // alive while he does it in place. Once per run, and not after a takeover failed.
+                        if (taskMode && computerUseEnabled && !stuckForceFinal && !budgetForceFinal && handBackNudges < 1
+                            && !humanHandoffUnavailable && LooksLikeHumanCheckHandBack(finalText))
+                        {
+                            handBackNudges++;
+                            lock (progressGate)
+                            {
+                                if (progressText.Length > 0) progressText.AppendLine().AppendLine();
+                                progressText.Append(finalText);
+                            }
+                            ReportProgress("running", "handing the human check over instead of ending the run", new AgentActivityEvent
+                            {
+                                Iteration = iteration + 1,
+                                Kind = "think",
+                                Text = "asked to use request_human instead of ending the run on a human check"
+                            });
+                            SendModelPrompt("[Use request_human] This reply ends the run to ask Klives to clear a human check (CAPTCHA, \"I'm not a robot\", verification). "
+                                + "Ending the run loses the live page: a solved CAPTCHA expires in about two minutes, so by the time he answers and a new run starts it is void. "
+                                + "Call request_human with that reason now — he takes over your desktop right here in the chat, and you resume the moment he hands it back. Then finish the rest of the task. "
+                                + "If nothing is actually waiting on him, repeat your final answer unchanged.");
+                            continue;
+                        }
+
                         // Atomically close the steering inbox immediately before the actual return. If
                         // guidance raced with this answer, apply it and give the model another turn.
                         bool finalRetryForSteering = false;
@@ -2233,6 +2307,10 @@ namespace Omnipotent.Services.KliveAgent
                                         }), $"running {segment.ToolName}");
                                 if (computerTarget == KliveAgentComputerTarget.Container)
                                     computerContainerId = agentService.Computer.DesktopContainerID ?? computerContainerId;
+                                // A takeover that timed out or was declined means Klives is not at hand,
+                                // so ending the run with a request to him is then the honest option.
+                                if (segment.ToolName == "request_human")
+                                    humanHandoffUnavailable = !cr.Success;
 
                                 if (!cr.Success) errorCountThisIter++;
 
@@ -2912,6 +2990,32 @@ namespace Omnipotent.Services.KliveAgent
             if (tail.Length > 280) tail = tail[^280..];
             if (OfferOrQuestion.IsMatch(tail)) return false;
             return ForwardCommitment.IsMatch(tail);
+        }
+
+        private static readonly Regex HumanCheckMention = new(
+            @"\b(?:re-?captcha|h-?captcha|captcha|turnstile|i'?m not a robot|not a robot|human[- ]verification"
+            + @"|confirm (?:your|you're|you are) human(?:ity)?|verify (?:that )?you(?:'re| are) (?:a )?human|are you (?:a )?human)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        private static readonly Regex AskOfKlives = new(
+            @"(?:^|[.!?:]\s+|\n\s*(?:[-*]\s+)?)(?:just\s+|then\s+)?(?:tick|check|click|solve|complete|clear)\b"
+            + @"|\b(?:can|could|would) you\b|\bplease\b|\bonce you(?:'ve| have)?\b|\bwhen you(?:'ve| have)?\b|\blet me know\b"
+            + @"|\bsend me the word\b|\bping me\b|\btell me when\b|\byou(?:'ll| will)? (?:need|have) to\b|\bneeds? you\b"
+            + @"|\bfor you to\b|\bover to you\b|\byour (?:turn|move)\b",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        /// <summary>
+        /// A reply asking Klives to clear a CAPTCHA or human check himself ("Tick the box and hit
+        /// Register — send me the word"). Both the check and the request must sit in the same paragraph,
+        /// so a report that merely mentions a CAPTCHA it already cleared is left alone.
+        /// </summary>
+        internal static bool LooksLikeHumanCheckHandBack(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            foreach (var paragraph in Regex.Split(text.Trim(), @"\n\s*\n"))
+                if (HumanCheckMention.IsMatch(paragraph) && AskOfKlives.IsMatch(paragraph))
+                    return true;
+            return false;
         }
 
         /// <summary>

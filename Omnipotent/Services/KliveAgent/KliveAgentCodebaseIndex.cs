@@ -240,8 +240,10 @@ namespace Omnipotent.Services.KliveAgent
 
         // ── Internal build logic ──
 
+        // serverBuild and SavedData are the deployed build and its runtime data (project volumes,
+        // scraped media, indexes): not source, and on the server by far the largest trees under the root.
         private static readonly HashSet<string> IgnoredSourceDirectories = new(StringComparer.OrdinalIgnoreCase)
-        { "bin", "obj", "node_modules", ".git", ".vs", ".nuxt", ".output", ".idea" };
+        { "bin", "obj", "node_modules", ".git", ".vs", ".nuxt", ".output", ".idea", "serverBuild", "SavedData" };
 
         internal static IEnumerable<string> EnumerateSourceFiles(string root, CancellationToken cancellationToken = default)
         {

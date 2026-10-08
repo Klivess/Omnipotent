@@ -140,6 +140,11 @@ The bar: a request like "make a Tumblr account with a KliveMail address, create 
 send me the details" runs top to bottom unattended, survives refreshes and restarts, and ends by
 messaging Klives. What makes that work:
 
+- **A bounded start.** Every optional system-prompt section (knowledge, memories, accounts, service
+  index, repo map, personality) is built on the thread pool through `BoundedSectionAsync` and waited
+  on for at most 1.5 s. A late section is left out, logged and timed as `prompt.<name>`. The run never
+  sits at "preparing context" behind an enrichment. A stall stop seals steering the way a manual Stop
+  does, so a follow-up message starts a fresh run.
 - **Liveness, not silence.** `KliveLLM.ObserveActivity` (an `AsyncLocal` scope) reports what the
   model call is doing every 10s: queued for an AIRouter slot, awaiting the provider, reasoning
   (reasoning deltas are parsed), streaming, retrying. Tools are pulsed the same way (`WithToolPulse`,
@@ -164,6 +169,15 @@ messaging Klives. What makes that work:
   `request_human` posts a takeover card carrying the `containerId`. The website then embeds
   `ContainerRemoteDesktop` in place, and the run resumes when Klives goes idle after input, presses
   Done, or ends remote control.
+- **CAPTCHAs stay in the run.** A solved reCAPTCHA expires in about two minutes, so handing one back
+  to Klives by ending the run voids his work before the next run reaches the page. Once
+  `solve_challenge` fails, the policy says to call `request_human` straight away. A final reply that asks
+  him to tick a box (`LooksLikeHumanCheckHandBack`) is sent back once with that instruction, unless a
+  takeover has already timed out or been declined. While a takeover is pending the desktop counts as
+  watched (`MarkViewed`), so the 20-minute idle suspension cannot stop it under him.
+- **The browser restarts clean.** Every relaunch of the container's Chromium follows a kill, so the
+  launcher marks the profile's last exit as clean and passes `--hide-crash-restore-bubble`. Before this,
+  a "Restore pages?" bubble took the keyboard and swallowed typing and clicks.
 - **Task tools.** `klivemail_create_mailbox/list/get/wait_for_email` (returns codes plus links
   ranked verification-first; catches near-miss addresses). `account_register` takes `{generate}`
   passwords; `account_update` stores obtained keys. `notify_klives` sends a Discord DM plus a
@@ -199,7 +213,17 @@ search (no API keys).
   cached web pages (TTL'd). Omniscience's raw-message corpus is **federated at query time** (not
   re-embedded) through its existing `MessageEmbeddingIndex`.
 - **Retrieval:** embed + FTS5 in parallel → Reciprocal Rank Fusion → recency boost → per-doc
-  diversity cap. `SearchForPromptAsync` races a ~300–400 ms timeout and fails soft (returns "").
+  diversity cap. Both legs run on the thread pool and every SQLite statement is bound to the search
+  deadline by a progress handler (`KliveRAGDb.BindDeadline`, SQLITE_INTERRUPT). Prompt injection uses a
+  400 ms deadline over the newest 150K chunks and drops stopwords from the FTS query; the tool/route
+  path searches everything with a 15 s deadline. A search that runs out of time returns what its legs
+  had, often nothing; it never waits.
+- **Why the bound matters:** until Oct 2026 the lexical leg ran synchronously on the caller's thread
+  with no deadline. With the Projects event log indexed, a message full of common words ("use your
+  computer to make a tumblr account…") made bm25 score millions of rows. That held KliveAgent at
+  "preparing context" for 5–12 minutes, and every Projects wake ran the same query. A "??" nudge has
+  no searchable words, which is why the nudges always got through. Measured on a synthetic
+  1M-chunk index: 3.3 s warm and growing linearly with size before the fix; 0.2–0.5 s after.
 - **Delivery:** a budgeted `[Relevant Knowledge]` block auto-injected into KliveAgent's system prompt
   (below the cache breakpoint, `KnowledgeBudget`) and into Projects wake seeds (a `RELEVANT KNOWLEDGE`
   section, own-project events excluded), **plus** the native tools `search_knowledge`,

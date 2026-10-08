@@ -100,6 +100,13 @@ namespace Omnipotent.Services.KliveRAG
         public string? ExcludeProjectId;
         /// <summary>Also federate into Omniscience's raw-message semantic index (tool path only).</summary>
         public bool IncludeMessages;
+        /// <summary>Wall-clock budget for the retrieval legs. When it passes, the running SQLite statements
+        /// are aborted and the search returns whatever the legs had found (often nothing) instead of
+        /// waiting. Null = no budget of its own (the caller's token still applies).</summary>
+        public TimeSpan? Deadline;
+        /// <summary>When positive, only the newest this-many chunks are considered by each leg. Keeps a
+        /// query's cost flat as the corpus grows; 0 = the whole corpus.</summary>
+        public int RecentWindow;
     }
 
     /// <summary>

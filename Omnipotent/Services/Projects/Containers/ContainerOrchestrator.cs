@@ -388,6 +388,11 @@ namespace Omnipotent.Services.Projects.Containers
             prefs['credentials_enable_service'] = False
             prefs['credentials_enable_autosignin'] = False
             branch(prefs, 'profile')['password_manager_enabled'] = False
+            # Every restart of this browser follows a kill (idle-stopped container, the pkill above), so
+            # Chromium would open with a "Restore pages?" bubble that takes the keyboard and swallows the
+            # agent's typing and clicks. Record the last exit as clean so it never appears.
+            branch(prefs, 'profile')['exit_type'] = 'Normal'
+            branch(prefs, 'profile')['exited_cleanly'] = True
             branch(prefs, 'profile', 'default_content_setting_values')['notifications'] = 2
             branch(prefs, 'profile', 'default_content_setting_values')['geolocation'] = 2
             branch(prefs, 'translate')['enabled'] = False
@@ -424,7 +429,7 @@ namespace Omnipotent.Services.Projects.Containers
             # structured inspection keeps working. A bash array preserves the literal "*" and any
             # spaces in the profile path across the two launch forms.
             common_args=(--no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check \
-              --password-store=basic --disable-blink-features=AutomationControlled \
+              --hide-crash-restore-bubble --password-store=basic --disable-blink-features=AutomationControlled \
               "--lang=${OMNIPOTENT_BROWSER_LANG:-en-US}" --start-maximized \
               --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "--remote-allow-origins=*" \
               --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE")

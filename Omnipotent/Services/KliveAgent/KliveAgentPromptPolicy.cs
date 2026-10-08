@@ -20,7 +20,7 @@ internal static class KliveAgentPromptPolicy
     /// "send me the login details" is satisfied without the value ever passing through the model.
     /// </summary>
     private const string SecretsRule =
-        "Never expose secrets to anyone but Klives, and never paste them into prose, files, memory or Discord. Reuse the shared account registry: account_list before any signup; account_register before filling the form, with secrets {\"password\":\"{generate}\"} so a strong password is minted without you seeing it; account_update to store keys you obtain. Type secrets only as references ({account:service/field} or {EncryptedMemoryName}). When Klives asks for credentials or keys, put those same {account:service/field} references in your reply — his dashboard reveals them to him.";
+        "Never expose secrets to anyone but Klives, and never paste them into prose, files, memory, logs, Discord or a network listener — including from a script: never Log a resolved secret, write one to disk, or serve one over HTTP to get it somewhere. Reuse the shared account registry: account_list before any signup; account_register before filling the form, with secrets {\"password\":\"{generate}\"} so a strong password is minted without you seeing it; account_update to store keys you obtain. Type secrets only as references ({account:service/field} or {EncryptedMemoryName}). When Klives asks for credentials or keys, put those same {account:service/field} references in your reply — his dashboard reveals them to him.";
 
     internal static string Build(bool nativeTools, bool computerUse) =>
         Build(nativeTools, computerUse, KliveAgentComputerTarget.Host, visionEnabled: true);
@@ -70,8 +70,9 @@ internal static class KliveAgentPromptPolicy
             - This is YOUR computer: a persistent Linux desktop with a real Chromium whose sign-ins survive between conversations. Klives can watch it live and take it over.
             - Web work: computer_navigate(url) → computer_browser_inspect(mode:"controls") for refs → computer_browser_action (fill/type/select/check/click/press/wait) by ref or label/role/text. fill/type read the field back and fail if the value did not land. Re-inspect after navigation; refs go stale.
             {perception}
-            - Verify every step (URL, title, controls, messages) before the next. Cookie walls/modals: op=dismiss_overlays. CAPTCHA: op=solve_challenge once; if it cannot clear an essential one, request_human and resume. Uploads: computer_upload_file.
-            - computer_terminal is bash INSIDE your desktop container (never the host). Type secrets only through computer_type or browser fill/type, never the terminal.
+            - Verify every step (URL, title, controls, messages) before the next. Cookie walls/modals: op=dismiss_overlays. Uploads: computer_upload_file.
+            - CAPTCHA / "I'm not a robot": op=solve_challenge once; if it does not clear, call request_human straight away — Klives is usually watching and it takes him seconds. Don't keep clicking the checkbox yourself (automated clicks get scored as a bot), and never end the run asking him to tick it: a solved CAPTCHA expires in about two minutes, so it has to be used by this live run.
+            - computer_terminal is bash INSIDE your desktop container (never the host). Type secrets only through computer_type or browser fill/type — never the terminal, and never by copying them into the desktop yourself. If a fill will not land, fix the page (dismiss_overlays, re-inspect, request_human) rather than routing around the tools.
             """;
     }
 
