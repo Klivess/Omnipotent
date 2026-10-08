@@ -53,7 +53,7 @@ namespace Omnipotent.Services.Projects.Containers
         internal static readonly string[] DesktopBuildContextFiles =
         {
             "desktop.Dockerfile", "desktop-entrypoint.sh", "browser-inspect.py", "browser-service.py",
-            "klive-fp-manifest.json", "klive-fp-patch.js",
+            "klive-fp-manifest.json", "klive-fp-patch.js", "klive-cdp",
         };
 
         public ContainerOrchestrator(
@@ -781,11 +781,94 @@ namespace Omnipotent.Services.Projects.Containers
             return ms;
         }
 
-        /// <summary>A context file's bytes as they enter the build: .sh normalised to LF.</summary>
+        /// <summary>A context file's bytes as they enter the build: scripts and the Dockerfile
+        /// normalised to LF, so a CRLF checkout cannot leak '\r' into a shebang or a RUN line.</summary>
         private static byte[] ReadContextFile(string file) =>
             file.EndsWith(".sh", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".py", StringComparison.OrdinalIgnoreCase)
+            || file.EndsWith(".Dockerfile", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Path.GetFileName(file), "klive-cdp", StringComparison.Ordinal)
                 ? System.Text.Encoding.UTF8.GetBytes(File.ReadAllText(file).Replace("\r\n", "\n").Replace('\r', '\n'))
                 : File.ReadAllBytes(file);
+
+        /// <summary>
+        /// The harness's in-container helpers. They are refreshed in place on a running desktop when
+        /// they differ from the shipped ones, because image changes otherwise reach only newly created
+        /// computers — and an existing computer is never recreated, since that would discard the
+        /// software its agent installed. Without this, a fix to the helper (the browser-service
+        /// framing bug above all) would never reach the desktops that were actually failing.
+        /// </summary>
+        internal static readonly string[] LiveHelperFiles = { "browser-inspect.py", "browser-service.py", "klive-cdp" };
+
+        /// <summary>SHA-256 of each shipped helper exactly as it would be installed.</summary>
+        internal static Dictionary<string, string> ShippedHelperHashes(string contextDir) =>
+            LiveHelperFiles.ToDictionary(name => name,
+                name => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(ReadContextFile(Path.Combine(contextDir, name))))
+                    .ToLowerInvariant(),
+                StringComparer.Ordinal);
+
+        /// <summary>Which helpers a desktop needs refreshed, from `sha256sum` output of its copies.</summary>
+        internal static List<string> StaleHelpers(string sha256sumOutput, IReadOnlyDictionary<string, string> shipped)
+        {
+            var installed = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (string line in (sha256sumOutput ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                int space = line.IndexOf(' ');
+                if (space <= 0) continue;
+                string hash = line[..space].Trim().ToLowerInvariant();
+                string name = Path.GetFileName(line[(space + 1)..].Trim().TrimStart('*'));
+                if (hash.Length == 64) installed[name] = hash;
+            }
+            return shipped.Where(pair => !installed.TryGetValue(pair.Key, out var hash) || hash != pair.Value)
+                .Select(pair => pair.Key).ToList();
+        }
+
+        /// <summary>
+        /// Brings a running desktop's helpers up to the shipped versions. One read-only exec decides;
+        /// stale files are written into /usr/local/bin through the Docker archive API, and the helper
+        /// service is restarted (the entrypoint's supervisor brings it back within seconds; callers
+        /// fall back to exec meanwhile). Returns what was refreshed, or null when already current.
+        /// </summary>
+        public async Task<string?> SyncDesktopHelpersAsync(string containerID, string contextDir, CancellationToken ct = default)
+        {
+            var shipped = ShippedHelperHashes(contextDir);
+            var probe = await ExecuteDesktopShellAsync(containerID,
+                "sha256sum " + string.Join(" ", LiveHelperFiles.Select(name => "/usr/local/bin/" + name)) + " 2>/dev/null; true",
+                "/home/agent", 15, ct);
+            if (probe.TimedOut)
+                throw new ContainerDaemonTimeoutException("The helper version probe timed out.");
+            var stale = StaleHelpers(probe.Stdout, shipped);
+            if (stale.Count == 0) return null;
+
+            using var archive = new MemoryStream();
+            using (var writer = new System.Formats.Tar.TarWriter(archive, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: true))
+            {
+                foreach (string name in stale)
+                {
+                    writer.WriteEntry(new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile, name)
+                    {
+                        DataStream = new MemoryStream(ReadContextFile(Path.Combine(contextDir, name))),
+                        Mode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                             | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                             | UnixFileMode.OtherRead | UnixFileMode.OtherExecute,
+                        Uid = 0,
+                        Gid = 0,
+                    });
+                }
+            }
+            archive.Position = 0;
+            await WithDeadlineAsync(async token =>
+            {
+                var docker = await GetClientAsync(token);
+                await docker.Containers.ExtractArchiveToContainerAsync(containerID,
+                    new ContainerPathStatParameters { Path = "/usr/local/bin", AllowOverwriteDirWithFile = false }, archive, token);
+                return true;
+            }, TimeSpan.FromSeconds(30), $"helper refresh in container {containerID[..Math.Min(12, containerID.Length)]}", ct);
+
+            if (stale.Contains("browser-service.py"))
+                await ExecuteDesktopShellAsync(containerID, "pkill -f /usr/local/bin/browser-service.py >/dev/null 2>&1; true",
+                    "/home/agent", 10, ct);
+            return "refreshed " + string.Join(", ", stale);
+        }
 
         /// <summary>SHA-256 over the context's file names + normalised contents (order-stable), so
         /// the staleness check sees exactly what the build would see.</summary>

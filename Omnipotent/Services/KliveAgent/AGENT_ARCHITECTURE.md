@@ -178,6 +178,58 @@ messaging Klives. What makes that work:
 - **The browser restarts clean.** Every relaunch of the container's Chromium follows a kill, so the
   launcher marks the profile's last exit as clean and passes `--hide-crash-restore-bubble`. Before this,
   a "Restore pages?" bubble took the keyboard and swallowed typing and clicks.
+- **Computer-use reliability (Oct 2026).** See the next section.
+
+## Computer-use reliability (October 2026)
+
+KliveAgent's own report (`computer-use-report.pdf`, 8 Oct 2026) found structured browser tools ~85%
+reliable, coordinate clicks on web content ~40%, typing "silently lost" behind overlays, uploads 0 for 2,
+and reCAPTCHA unbeatable by synthetic input. What was actually wrong, and what fixed it:
+
+- **The structured tools were down, not flaky (stall #6).** `BrowserServiceClient` posted with
+  `PostAsJsonAsync`, which streams a chunked body with no Content-Length; `browser-service.py` read
+  exactly Content-Length bytes and answered every `/run` with 400. Since the service shipped (Sep 16),
+  every structured browser action on a desktop that published it failed — and 4xx was deliberately
+  not a fallback trigger. That is why the agent kept hand-rolling CDP in the terminal. Now the client
+  sends a buffered body, the service also accepts chunked bodies, and a 4xx is logged and falls back
+  to `docker exec` (per endpoint+mode, 10 min) instead of failing the agent. A test runs the real
+  Python service against the real client.
+- **Helpers reach existing desktops.** Image changes only apply to new computers (existing ones keep
+  their installed software), so `ContainerDesktopManager.EnsureHelpersCurrentAsync` compares the
+  desktop's `/usr/local/bin` helpers with the shipped ones by SHA-256 once per process and refreshes
+  them in place through the Docker archive API, restarting the helper service.
+- **Verified physical clicks.** `computer_click`, `computer_click_text`, `computer_click_browser_control`
+  and approved clicks run through `VerifiedClickAsync`: the helper's `preflight` hit-tests the point
+  (through cross-origin frames), closes a browser bubble/menu that holds the keyboard, and arms a
+  receipt in a private isolated world (`klive-input`, found again by stored context id — no
+  `Runtime.enable`, a known bot-detection signal); `receipt` then says whether the press arrived. The
+  result names what was hit, or the exact coordinates of the nearest controls. A click that provably
+  never reached the page (no press and the pointer's final approach unseen) is re-delivered once
+  through CDP; one the page saw but swallowed is reported, never repeated. OCR clicks whose text centre
+  is not on a control move onto the control the text labels.
+- **Verified typing.** `computer_type` refuses when no text field has focus (`force:true` for games),
+  records the field, types, and reads it back; keystrokes that never arrived are re-entered into that
+  same field through CDP, rejected ones are reported. Secrets are compared by SHA-256 only.
+- **`computer_cdp`** — evaluate (top-level await, any frame), raw commands, trusted click/type/key,
+  JavaScript dialogs, `set_files`, targets, a page-only screenshot. Sign-in wipes are refused, cookie
+  values redacted, and every value substituted from the vault/registry on this desktop is masked in
+  all tool output (`SecretEchoScrubber`). `klive-cdp` is the same engine for the terminal. Project
+  agents keep their browser-first contract: their `evaluate`/`send` are limited to non-hidden work.
+- **Uploads by interception.** `computer_upload_file` takes `trigger` (the site's upload button) and
+  presses it with `Page.setInterceptFileChooserDialog` on, so no GTK dialog opens and inputs the page
+  builds on the fly (the Tumblr-avatar case, invisible to any DOM search) still receive the file. A
+  chooser that is already open is closed and the remembered last click re-pressed with interception.
+- **One automated attempt per CAPTCHA.** `HumanGateRegistry` records the outcome of a click on a
+  challenge frame or a free `solve_challenge`; after one failure further synthetic attempts on that
+  site are refused (`HUMAN_GATE`, `ContainerToolFailureKind.HumanRequired`) until a human has driven
+  the desktop. KliveAgent hands the desktop over automatically on that kind
+  (`KliveAgent_AutoHandOffHumanGates`, default on), pings Discord again after
+  `KliveAgent_TakeoverReminderMinutes` (4) if nobody has touched it, and on resume says to submit at
+  once — a solved token lives about two minutes.
+- **Known dead ends are named in results.** Inspection adds `JS_DIALOG_OPEN` and `PAYMENT_FRAME`
+  advisories beside the existing CHALLENGE/NATIVE_DIALOG banners; navigation answers "Leave site?".
+- Kill switch: `PROJECTS_INPUT_VERIFICATION=0` turns preflight/receipt off (input then goes out exactly
+  as before). Desktop image v13.
 - **Task tools.** `klivemail_create_mailbox/list/get/wait_for_email` (returns codes plus links
   ranked verification-first; catches near-miss addresses). `account_register` takes `{generate}`
   passwords; `account_update` stores obtained keys. `notify_klives` sends a Discord DM plus a

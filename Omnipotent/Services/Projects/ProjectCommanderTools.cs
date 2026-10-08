@@ -1104,7 +1104,7 @@ namespace Omnipotent.Services.Projects
                     if (ProjectUploadCapability.IsFileDialogRescueRequest(what, title, rationale))
                         return FailedResult(
                             "UPLOAD_IS_NOT_HUMAN_ONLY: a browser file dialog is a tool call, not an obstacle for Klives. " +
-                            "Call computer_upload_file with the file's container path (path:'/project/...'): if the native chooser is already open it types the path into that dialog's location bar and confirms it, and otherwise it attaches the file to the page's own file input — including the hidden input behind a styled upload button. " +
+                            "Call computer_upload_file with the file's container path (path:'/project/...') and trigger set to the site's upload button: it presses the button itself with the browser's file request intercepted, so no native dialog opens — even when the page builds its file input on the fly. If a chooser is already open it closes it and re-presses the control that opened it; without a trigger it attaches to the page's own file input, hidden ones included. " +
                             "Do it yourself, then finish the site's submit/publish step. Even a CAPTCHA is yours now (browser op=solve_challenge); only SMS/phone and identity verification are human-only.");
                     if (title.Length > 0) what = title + ": " + what;
                     if (rationale.Length > 0) what += "\nWhy a human is required: " + rationale;

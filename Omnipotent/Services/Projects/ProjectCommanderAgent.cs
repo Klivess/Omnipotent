@@ -109,7 +109,7 @@ THE ESCALATION BAR (this is where your judgment carries the safety of the whole 
 - Never fabricate progress. Only claim something is done if an event in your context proves it. For anything that touched the outside world — an account created, an email sent, an application submitted, content published — the EXTERNAL ACTION LEDGER is the proof: record it with record_external_action (account registrations and klivemail sends record themselves), and treat any claim that is not on that ledger, including your own workers' claims, as not yet done. A worker reporting 'sent ✅' with no ledger entry and no successful tool call has not sent anything; ask for the evidence. For a genuinely human-only obstacle (phone verification, an ID check), use request_human and continue other useful work.
 
 {perceptionContract}
-- OCR is for ordinary visible controls only. For a CAPTCHA, call browser op=solve_challenge once. It waits for the free, keyless browser extension in the same persistent desktop and verifies response state. The free quota is shared by public IP; it is not unlimited. Do not create paid solver accounts, invent keys, rotate IPs to evade quota, or repeatedly retry an unchanged challenge. If unresolved, use an official API/alternative route; for an essential page use request_human and resume after the intervention. A response present is not proof the form succeeded: inspect and verify the result. SMS/phone 2FA and identity checks still need request_human. An EMAIL verification wall is not human-only: request the code through the site, call klivemail op=wait_for_code, enter it with browser op=fill/type or desktop op=type, and verify the resulting DOM/OCR state (plus visual state when image input is available).
+- OCR is for ordinary visible controls only. For a CAPTCHA, call browser op=solve_challenge once. It waits for the free, keyless browser extension in the same persistent desktop and verifies response state. A HUMAN_GATE result means the widget's one automated attempt is used: do not click it again by any route — hand that same desktop to Klives with request_human right away (a solved token lives about two minutes, so submit as soon as it is handed back). The free quota is shared by public IP; it is not unlimited. Do not create paid solver accounts, invent keys, rotate IPs to evade quota, or repeatedly retry an unchanged challenge. If unresolved, use an official API/alternative route; for an essential page use request_human and resume after the intervention. A response present is not proof the form succeeded: inspect and verify the result. SMS/phone 2FA and identity checks still need request_human. An EMAIL verification wall is not human-only: request the code through the site, call klivemail op=wait_for_code, enter it with browser op=fill/type or desktop op=type, and verify the resulting DOM/OCR state (plus visual state when image input is available).
 - UPLOADS ARE YOURS: browser op=upload accepts container paths under /project and handles both native GTK choosers and hidden page inputs. A file dialog is never a reason to ask Klives for a click.
 - Native file/print/permission dialogs are operating-system windows and invisible to page DOM. Inspection reports them explicitly; clear them with browser upload, desktop key=escape, or their OCR-visible controls before retrying page actions.
 - KEEP ONE BROWSER, FEW TABS: browser op=navigate reuses the active tab and prunes blank/duplicate/cold tabs. Inspect tabs before targeting a background tab; activation and close are structured operations.
@@ -743,16 +743,116 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                     frameId = ProjectStr("For op=script only: optional frame id from inspect mode=controls; defaults to the top document."),
                     script = ProjectStr("For op=script only: JavaScript body executed in the selected live page. Do not read secrets/cookies/storage or perform hidden network requests."),
                 }, "op")));
+            var triggerSchema = new
+            {
+                type = "object",
+                description = "The page's upload control (the button/link you would click to choose a file): a ref from inspect mode=controls, or name/text/role/css/label, or x,y screenshot pixels.",
+                properties = new
+                {
+                    @ref = ProjectStr("Opaque control ref from computer_browser_inspect(mode:'controls')."),
+                    name = ProjectStr("Accessible name, e.g. 'Change avatar'."),
+                    text = ProjectStr("Visible text fragment."),
+                    role = ProjectStr("Accessible role, e.g. button."),
+                    css = ProjectStr("CSS selector."),
+                    x = ProjectNum("Screenshot X pixel of the control."),
+                    y = ProjectNum("Screenshot Y pixel of the control."),
+                },
+            };
             tools.Add(Tool("computer_upload_file",
-                "Attach a file from THIS desktop container to a website's upload control, and observe the result. Use it for every upload. If the browser's native file chooser is already open it types the path into that dialog and confirms it; otherwise it attaches the file straight to the page's file input (including the hidden inputs behind styled 'Upload' buttons, which no click can reach) and fires the same change event a manual selection would. Uploading NEVER requires Klives — do not request human help for a file dialog. Afterwards, complete the site's own submit/publish step yourself.",
+                "Attach a file from THIS desktop container to a website's upload, and observe the result. Use it for every upload — never operate a native file dialog. " +
+                "Best: pass trigger = the page's upload button. The tool presses it itself with the browser's file request intercepted, so no dialog ever opens, and it works even when the page builds its file input on the fly (inputs no DOM search can find). " +
+                "Without trigger it attaches straight to the page's file input (including the hidden inputs behind styled 'Upload' buttons) and fires the same change event a manual selection would; " +
+                "if a native file chooser is already open it closes it and re-presses the control that opened it. Uploading NEVER requires Klives — do not request human help for a file dialog. Afterwards, complete the site's own submit/publish step yourself.",
                 ProjectObj(new
                 {
                     path = ProjectStr("Absolute path INSIDE the desktop container, e.g. /project/render/day24.mp4."),
                     paths = new { type = "array", items = ProjectStr("Absolute container path"), description = "Several files for one multi-file input." },
+                    trigger = triggerSchema,
                     name = ProjectStr("Optional name/id/aria-label fragment of the target file input when a page has more than one."),
+                    css = ProjectStr("Optional CSS selector of the target <input type=file> (searched through frames and shadow roots)."),
                     occurrence = ProjectNum("Zero-based occurrence among matching file inputs; default 0."),
                     tabIndex = ProjectNum("Optional tab index; omit for the active tab."),
                 })));
+            var modifierSchema = new { type = "array", items = ProjectStr("ctrl | alt | shift | super"), description = "Optional modifiers physically held during the click." };
+            Replace("computer_click", Tool("computer_click",
+                "Physically click screenshot coordinates with the real mouse. The harness hit-tests the point first and confirms afterwards that the page received the click: " +
+                "the result names the element it landed on — or, when nothing clickable is there, the exact coordinates of the nearest controls — closes a browser pop-up that had stolen input, " +
+                "and re-delivers the click through the browser once if it provably never reached the page. For web controls prefer computer_click_browser_control or computer_browser_action, which target the element itself. " +
+                "A human-verification checkbox gets ONE automated attempt; after that call request_human. Irreversible clicks (pay/send/publish) go through computer_confirm_and_click.",
+                ProjectObj(new
+                {
+                    x = ProjectNum("X pixel in the latest screenshot."),
+                    y = ProjectNum("Y pixel in the latest screenshot."),
+                    button = ProjectStr("left | middle | right"),
+                    clicks = ProjectNum("1 or 2."),
+                    modifiers = modifierSchema,
+                }, "x", "y")));
+            Replace("computer_click_text", Tool("computer_click_text",
+                "Find visible text with local OCR and click it. If the text's centre is not on a control (a label beside or inside a styled button), the control it labels is clicked instead, " +
+                "and delivery is verified like computer_click. Prefer structured browser tools for web pages; never use it on CAPTCHA text.",
+                ProjectObj(new
+                {
+                    text = ProjectStr("Visible text to click."),
+                    occurrence = ProjectNum("0-based match index, default 0."),
+                    button = ProjectStr("left | middle | right"),
+                    clicks = ProjectNum("1 or 2."),
+                    modifiers = modifierSchema,
+                }, "text")));
+            Replace("computer_type", Tool("computer_type",
+                "Type at the current keyboard focus with human cadence, and verify it. The harness first checks that a text field has focus — it refuses rather than typing into nothing (pass force:true for a game or canvas) — " +
+                "then reads the field back: the result says it verified, or that the keystrokes never arrived (they are then re-entered once into the same field through the browser), or that the page rejected them. " +
+                "Vault/account placeholders ({Name}, {account:service/field}) are substituted only at input time and never returned. For web form fields prefer computer_browser_action op=fill.",
+                ProjectObj(new
+                {
+                    text = ProjectStr("Text to type."),
+                    force = ProjectBool("Type even though no text field has focus (games, canvas editors). Default false."),
+                }, "text")));
+            tools.Add(Tool("computer_cdp",
+                "The browser's DevTools protocol, for whatever the structured tools cannot do — use it instead of writing websocket scripts in computer_terminal. " +
+                "action=evaluate runs JavaScript in the active tab's page (top-level await works; frameId, or target 'frame:<url fragment>' for a cross-origin iframe; world 'isolated' hides it from page scripts) and returns the value. " +
+                "action=send runs any raw CDP command (method + params) on the tab, on target 'browser', or on a target id from action=targets; waitEvent/waitMs capture an event that follows. " +
+                "action=click / type / key deliver trusted input straight to the page, past anything drawn over it: click by selector/ref/name, by x,y screenshot pixels, or by viewportX/viewportY. " +
+                "action=set_files attaches container files to a file input (selector) or, with trigger, presses the upload control and catches the file request — no native dialog. " +
+                "action=dialog answers a JavaScript alert/confirm/prompt or 'Leave site?' dialog (accept true/false, promptText). action=targets lists tabs, frames and workers; " +
+                "action=screenshot captures the page viewport itself, which shows what a desktop overlay is hiding. Clearing cookies/storage and closing the browser are refused, and cookie values are redacted.",
+                ProjectObj(new
+                {
+                    action = new
+                    {
+                        type = "string",
+                        @enum = Containers.ContainerToolAdapter.CdpActions,
+                        description = "The DevTools operation.",
+                    },
+                    expression = ProjectStr("For evaluate: a JavaScript expression (top-level await allowed)."),
+                    world = ProjectStr("For evaluate: main (default, the page's own scripts) or isolated."),
+                    frameId = ProjectStr("For evaluate: run in this frame (ids from computer_browser_inspect mode=controls or action=targets)."),
+                    target = ProjectStr("page (default, active tab) | browser | a target id | frame:<url fragment>."),
+                    method = ProjectStr("For send: Domain.command, e.g. Page.getNavigationHistory or DOM.getDocument."),
+                    @params = new { type = "object", description = "For send: the command's parameters." },
+                    waitEvent = ProjectStr("For send: an event name to wait for after the command, e.g. Page.loadEventFired."),
+                    waitMs = ProjectNum("For send: how long to wait for waitEvent, up to 60000; default 5000."),
+                    selector = ProjectStr("For click/type/set_files: CSS selector (searched through frames and open shadow roots)."),
+                    @ref = ProjectStr("For click/type: control ref from computer_browser_inspect(mode:'controls')."),
+                    name = ProjectStr("For click/type: accessible name of the target control."),
+                    role = ProjectStr("For click/type: accessible role of the target control."),
+                    text = ProjectStr("For type: the text (vault/account placeholders allowed; never echoed back)."),
+                    x = ProjectNum("For click: screenshot X pixel."),
+                    y = ProjectNum("For click: screenshot Y pixel."),
+                    viewportX = ProjectNum("For click: page viewport X in CSS pixels."),
+                    viewportY = ProjectNum("For click: page viewport Y in CSS pixels."),
+                    button = ProjectStr("For click: left | middle | right."),
+                    clicks = ProjectNum("For click: 1 or 2."),
+                    key = ProjectStr("For key: a key or chord, e.g. Enter, Tab, ctrl+a."),
+                    repeats = ProjectNum("For key: repeat 1-50 times."),
+                    path = ProjectStr("For set_files: absolute container path."),
+                    paths = new { type = "array", items = ProjectStr("Absolute container path"), description = "For set_files: several files." },
+                    trigger = triggerSchema,
+                    accept = ProjectBool("For dialog: true to confirm/OK (default), false to cancel/dismiss."),
+                    promptText = ProjectStr("For dialog: text to enter into a prompt() before accepting."),
+                    awaitPromise = ProjectBool("For evaluate: await a returned promise (default true)."),
+                    timeoutMs = ProjectNum("Bound for evaluate/send, 100-120000; default 15000."),
+                    tabIndex = ProjectNum("Optional tab index; omit for the active tab."),
+                }, "action")));
             tools.Add(Tool("computer_click_browser_control", "Locate a visible browser control by its accessible name/role/tag using read-only DOM geometry, reject disabled or overlay-intercepted targets, then click it with the real VNC mouse. This is the structured browser action for text agents and custom controls such as role=combobox; it never invokes a page event through CDP. Re-inspect after the click to verify state.", ProjectObj(new
             {
                 @ref = ProjectStr("Optional opaque ref from mode=controls. Re-inspect if stale."),

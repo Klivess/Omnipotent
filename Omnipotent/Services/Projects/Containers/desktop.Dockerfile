@@ -41,11 +41,18 @@ RUN useradd -m -s /bin/bash agent && mkdir -p /project && chown agent:agent /pro
 # The supported website path is the visible system Chromium session. Structured inspection uses
 # the small read-only browser-inspect helper and Debian's python3-websocket package; no hidden
 # Playwright/Selenium runtime is baked into the image or required for readiness.
+#
+# python3-websocket IS the websocket-client package (`import websocket`). It is already here, so
+# nothing should `pip install websocket-client` — Debian blocks system-wide pip (PEP 668), which is
+# how an agent rebuilding a CDP client every session lost ~30s and a failure mode each time.
+# klive-cdp is that client, baked: the same engine as the computer_cdp tool, for terminal use.
 
 COPY desktop-entrypoint.sh /usr/local/bin/desktop-entrypoint.sh
 COPY browser-inspect.py /usr/local/bin/browser-inspect.py
 COPY browser-service.py /usr/local/bin/browser-service.py
-RUN chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect.py /usr/local/bin/browser-service.py
+COPY klive-cdp /usr/local/bin/klive-cdp
+RUN sed -i 's/\r$//' /usr/local/bin/klive-cdp \
+    && chmod +x /usr/local/bin/desktop-entrypoint.sh /usr/local/bin/browser-inspect.py /usr/local/bin/browser-service.py /usr/local/bin/klive-cdp
 
 # Baked template for the per-desktop main-world fingerprint extension. The launcher copies this into
 # a writable dir and adds a one-line persona.js before loading it, so the page-visible environment
@@ -67,7 +74,7 @@ RUN curl --fail --location --retry 3 \
 # tool. Bump "imageVersion" whenever the baked capability set changes so the staleness check and
 # the readiness summary stay meaningful.
 RUN printf '%s\n' \
-    '{"imageVersion":"12","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","verified-text-entry","overlay-dismissal","challenge-solving","free-captcha-extension","python3","ffmpeg","human-fonts","browser-fingerprint","browser-service"],"display":":1"}' \
+    '{"imageVersion":"13","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","verified-text-entry","overlay-dismissal","challenge-solving","free-captcha-extension","python3","ffmpeg","human-fonts","browser-fingerprint","browser-service","input-receipts","cdp-tool","file-chooser-intercept","klive-cdp"],"display":":1"}' \
     > /etc/klive-desktop.json && chmod 0444 /etc/klive-desktop.json
 
 USER agent

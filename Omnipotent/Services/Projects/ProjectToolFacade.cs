@@ -194,6 +194,9 @@ public static class ProjectToolFacade
                 // sites whose trusted-event handling specifically requires physical desktop input.
                 ("physical_click", "computer_click_browser_control"),
                 ("upload", "computer_upload_file"),
+                // The DevTools escape hatch. Its own sub-operation is `action`, so it never collides
+                // with the facade's `op` selector.
+                ("cdp", "computer_cdp"),
                 ("*", "computer_browser_action"),
             }),
 

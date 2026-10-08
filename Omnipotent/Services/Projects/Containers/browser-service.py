@@ -31,14 +31,18 @@ import sys
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-HELPER = "/usr/local/bin/browser-inspect.py"
-CDP_ROOT = "http://127.0.0.1:9222"
+HELPER = os.environ.get("KLIVE_BROWSER_HELPER", "/usr/local/bin/browser-inspect.py")
+CDP_ROOT = os.environ.get("KLIVE_CDP_ROOT", "http://127.0.0.1:9222")
 LISTEN_PORT = int(os.environ.get("KLIVE_BROWSER_SERVICE_PORT", "5902"))
+MAX_BODY_BYTES = 4 * 1024 * 1024
 
 # The helper's full surface. Read-only modes take positional argv; action modes take one payload.
+# preflight/receipt verify that pointer and keyboard input actually reached the page; cdp is the
+# agent-facing DevTools tool. All three are ordinary helper modes with the same payload contract.
 ALLOWED_MODES = frozenset((
     "tabs", "dom", "controls", "accessibility", "network", "locate",
     "navigate", "closetabs", "upload", "dialog", "control", "action",
+    "preflight", "receipt", "cdp",
 ))
 # base64url, unpadded — exactly what ContainerToolAdapter.EncodePayload produces.
 PAYLOAD_RE = re.compile(r"^[A-Za-z0-9_-]{0,262144}$")
@@ -106,22 +110,55 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._reply(200, {"ok": True, "browserUp": browser_is_up()})
 
+    def _read_body(self):
+        """The request body, from either framing an HTTP/1.1 client may choose.
+
+        The harness sends Content-Length. Chunked transfer encoding is accepted as well because
+        .NET's JSON helpers stream with it by default, and refusing it is exactly how every request
+        from the C# client came to be rejected with 400 until October 2026. Returns None when the
+        body is missing, malformed or over the size limit.
+        """
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            body = bytearray()
+            while True:
+                size_line = self.rfile.readline(64)
+                try:
+                    size = int(size_line.split(b";", 1)[0].strip() or b"0", 16)
+                except ValueError:
+                    return None
+                if size == 0:
+                    # Trailer section ends with an empty line.
+                    while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
+                        pass
+                    break
+                if len(body) + size > MAX_BODY_BYTES:
+                    return None
+                body += self.rfile.read(size)
+                self.rfile.readline(4)  # CRLF after each chunk
+            return bytes(body) if body else None
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            return None
+        if length <= 0 or length > MAX_BODY_BYTES:
+            return None
+        return self.rfile.read(length)
+
     def do_POST(self):
         if self.path != "/run":
             self._reply(404, {"error": "not found"})
             return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            self._reply(400, {"error": "bad Content-Length"})
-            return
-        if length <= 0 or length > 4 * 1024 * 1024:
-            self._reply(400, {"error": "request body must be 1..4MiB"})
+        raw = self._read_body()
+        if raw is None:
+            self._reply(400, {"error": "request body must be 1..4MiB of JSON (Content-Length or chunked)"})
             return
         try:
-            request = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+            request = json.loads(raw.decode("utf-8", "replace"))
         except ValueError:
             self._reply(400, {"error": "body must be JSON"})
+            return
+        if not isinstance(request, dict):
+            self._reply(400, {"error": "body must be a JSON object"})
             return
 
         mode = request.get("mode") or ""

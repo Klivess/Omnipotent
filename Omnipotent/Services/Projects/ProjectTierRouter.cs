@@ -75,6 +75,7 @@ namespace Omnipotent.Services.Projects
             "computer_wait", "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_browser_action", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
             "computer_upload_file",
             "computer_terminal",
+            "computer_cdp",
             "computer_clipboard_get", "computer_clipboard_set",
             "computer_confirm_action", "computer_confirm_and_click",
             // Not a computer_* perception tool, but a desktop-preflight — gate it to the tiers that
@@ -128,7 +129,7 @@ namespace Omnipotent.Services.Projects
         public static bool CanRunWithoutFramebuffer(string toolName) => toolName is
             "computer_terminal" or "computer_window_state" or
             "computer_open_browser" or "computer_navigate" or
-            "computer_browser_inspect" or "computer_browser_action";
+            "computer_browser_inspect" or "computer_browser_action" or "computer_cdp";
 
         /// <summary>Commander-only tools (complete_project, budget increase) are gated out of sub-agent loops.</summary>
         public static bool IsCommanderOnly(string toolName) => CommanderOnlyTools.Contains(toolName);

@@ -1,0 +1,107 @@
+#!/usr/bin/env python3
+"""klive-cdp — this desktop's browser DevTools protocol from a terminal.
+
+The same engine as the computer_cdp tool (browser-inspect.py cdp), for the rare script that needs
+it. Agents used to rebuild a websocket client against 127.0.0.1:9222 at the start of every session;
+this ships with the image instead. Prints JSON; exits 2 when the browser reports a failure.
+
+  klive-cdp eval 'document.title'                     evaluate in the active tab (await works)
+  klive-cdp eval --frame accounts.google 'location.href'   ... inside a cross-origin frame
+  klive-cdp send Page.getNavigationHistory            raw command on the active tab
+  klive-cdp send Target.getTargets --browser          raw command on the browser itself
+  klive-cdp send DOM.getDocument '{"depth":1}'        command with JSON params
+  klive-cdp targets                                   tabs, frames and workers
+  klive-cdp click '#submit'                           trusted click on an element (CSS)
+  klive-cdp key Enter                                 trusted key press
+  klive-cdp upload /project/a.png --trigger '#avatar-button'
+                                                      attach a file by pressing the upload control
+                                                      with the browser's file request intercepted
+  klive-cdp dialog accept|dismiss [--text TEXT]       answer a JavaScript alert/confirm/prompt
+"""
+import argparse
+import base64
+import json
+import subprocess
+import sys
+
+HELPER = "/usr/local/bin/browser-inspect.py"
+
+
+def run(payload):
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode("utf-8")).decode("ascii").rstrip("=")
+    return subprocess.run([sys.executable, HELPER, "cdp", encoded]).returncode
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="klive-cdp", description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    evaluate = commands.add_parser("eval", help="evaluate JavaScript in the page")
+    evaluate.add_argument("expression")
+    evaluate.add_argument("--frame", help="URL fragment of a cross-origin frame to run in")
+    evaluate.add_argument("--isolated", action="store_true", help="run in an isolated world")
+    evaluate.add_argument("--timeout-ms", type=int, default=15000)
+
+    send = commands.add_parser("send", help="send a raw CDP command")
+    send.add_argument("method")
+    send.add_argument("params", nargs="?", default="{}")
+    send.add_argument("--browser", action="store_true", help="send to the browser target")
+    send.add_argument("--wait-event", help="also wait for this event")
+    send.add_argument("--wait-ms", type=int, default=5000)
+
+    commands.add_parser("targets", help="list tabs, frames and workers")
+
+    click = commands.add_parser("click", help="trusted click on a CSS selector")
+    click.add_argument("selector")
+
+    key = commands.add_parser("key", help="trusted key press, e.g. Enter or ctrl+a")
+    key.add_argument("key")
+
+    upload = commands.add_parser("upload", help="attach files to an upload")
+    upload.add_argument("paths", nargs="+")
+    upload.add_argument("--trigger", help="CSS selector of the upload control to press")
+    upload.add_argument("--input", help="CSS selector of the <input type=file> itself")
+
+    dialog = commands.add_parser("dialog", help="answer a JavaScript dialog")
+    dialog.add_argument("answer", choices=("accept", "dismiss"))
+    dialog.add_argument("--text", help="text for a prompt() dialog")
+
+    args = parser.parse_args(argv)
+    if args.command == "eval":
+        payload = {"action": "evaluate", "expression": args.expression, "timeoutMs": args.timeout_ms}
+        if args.frame:
+            payload["target"] = "frame:" + args.frame
+        if args.isolated:
+            payload["world"] = "isolated"
+    elif args.command == "send":
+        try:
+            params = json.loads(args.params)
+        except ValueError:
+            parser.error("params must be JSON")
+        payload = {"action": "send", "method": args.method, "params": params}
+        if args.browser:
+            payload["target"] = "browser"
+        if args.wait_event:
+            payload.update(waitEvent=args.wait_event, waitMs=args.wait_ms)
+    elif args.command == "targets":
+        payload = {"action": "targets"}
+    elif args.command == "click":
+        payload = {"action": "click", "selector": args.selector}
+    elif args.command == "key":
+        payload = {"action": "key", "key": args.key}
+    elif args.command == "upload":
+        payload = {"action": "set_files", "paths": args.paths}
+        if args.trigger:
+            payload["trigger"] = {"css": args.trigger}
+        if args.input:
+            payload["css"] = args.input
+    else:
+        payload = {"action": "dialog", "accept": args.answer == "accept"}
+        if args.text is not None:
+            payload["promptText"] = args.text
+    return run(payload)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

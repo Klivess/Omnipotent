@@ -1,3 +1,5 @@
+using System.Collections.Concurrent;
+using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text.Json;
 
@@ -29,6 +31,22 @@ namespace Omnipotent.Services.Projects.Containers
         /// trying to remove.</summary>
         private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(3);
 
+        /// <summary>
+        /// How long a (service, mode) pair that rejected a well-formed request is skipped in favour of
+        /// <c>docker exec</c>. Long enough that a broken service is not re-asked on every action, short
+        /// enough that a recreated container is picked up again within one task.
+        /// </summary>
+        internal static readonly TimeSpan RejectionBackoff = TimeSpan.FromMinutes(10);
+
+        /// <summary>Endpoint+mode pairs whose service answered 4xx, and until when to skip them.</summary>
+        private static readonly ConcurrentDictionary<string, DateTime> Rejected = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Where a rejection is reported. A 4xx means the harness and the in-container service
+        /// disagree about the protocol — a bug worth a log line, never a reason to fail the agent.
+        /// </summary>
+        internal static Action<string>? Diagnostics { get; set; }
+
         private readonly int hostPort;
         private readonly string host;
 
@@ -39,6 +57,30 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         internal bool Available => hostPort > 0;
+
+        private string Endpoint => $"{host}:{hostPort}";
+
+        /// <summary>
+        /// The request body, serialised up front so it carries a Content-Length.
+        ///
+        /// <c>PostAsJsonAsync</c> streams its body with chunked transfer encoding and no length, and
+        /// browser-service.py — like any <c>BaseHTTPRequestHandler</c> — reads exactly Content-Length
+        /// bytes. It therefore answered every request with 400 "request body must be 1..4MiB", so from
+        /// the day the service shipped every structured browser action on a desktop that published it
+        /// failed outright. That is the "browser-service ops returning 400 while CDP worked" stall in
+        /// KliveAgent's October 2026 computer-use report.
+        /// </summary>
+        internal static ByteArrayContent BuildRunContent(string mode, string? payload, IReadOnlyList<string>? args)
+        {
+            byte[] body = JsonSerializer.SerializeToUtf8Bytes(
+                new { mode, payload = payload ?? "", args = args ?? Array.Empty<string>() });
+            var content = new ByteArrayContent(body);
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
+            content.Headers.ContentLength = body.Length;
+            return content;
+        }
+
+        internal static void ResetRejectionsForTests() => Rejected.Clear();
 
         /// <summary>
         /// Whether Chromium's debugger is answering inside the container.
@@ -73,17 +115,38 @@ namespace Omnipotent.Services.Projects.Containers
             string mode, string? payload, IReadOnlyList<string>? args, int timeoutSeconds, CancellationToken ct)
         {
             if (!Available) return null;
+            string rejectionKey = Endpoint + "|" + mode;
+            if (Rejected.TryGetValue(rejectionKey, out var skipUntil))
+            {
+                if (DateTime.UtcNow < skipUntil) return null;
+                Rejected.TryRemove(rejectionKey, out _);
+            }
             try
             {
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 timeout.CancelAfter(TimeSpan.FromSeconds(Math.Clamp(timeoutSeconds, 5, 900)));
-                using var response = await Http.PostAsJsonAsync($"http://{host}:{hostPort}/run",
-                    new { mode, payload = payload ?? "", args = args ?? Array.Empty<string>() }, timeout.Token);
+                using var response = await Http.PostAsync($"http://{host}:{hostPort}/run",
+                    BuildRunContent(mode, payload, args), timeout.Token);
 
-                // A 4xx is the service rejecting the request, which is a harness bug rather than a
-                // transport problem: repeating it through exec would only hide it.
+                // A 4xx is the service disagreeing with the harness about the protocol — an older
+                // service that predates a mode, or a request it cannot parse. Treating that as the
+                // action failing is what turned one framing bug into a fleet-wide outage of every
+                // structured browser action. Report it, stop asking that service for that mode for a
+                // while, and let the caller take the exec route, which runs the same helper.
                 if ((int)response.StatusCode is >= 400 and < 500)
-                    return (false, "", $"The container browser service rejected mode '{mode}' ({(int)response.StatusCode}).");
+                {
+                    string detail = "";
+                    try { detail = (await response.Content.ReadAsStringAsync(timeout.Token)).Trim(); } catch { }
+                    Rejected[rejectionKey] = DateTime.UtcNow + RejectionBackoff;
+                    try
+                    {
+                        Diagnostics?.Invoke($"Container browser service {Endpoint} rejected mode '{mode}' "
+                            + $"({(int)response.StatusCode} {(detail.Length > 200 ? detail[..200] : detail)}); "
+                            + $"using docker exec for that mode for {RejectionBackoff.TotalMinutes:0} minutes.");
+                    }
+                    catch { }
+                    return null;
+                }
                 if (!response.IsSuccessStatusCode) return null;
 
                 var body = await response.Content.ReadFromJsonAsync<RunBody>(cancellationToken: timeout.Token);

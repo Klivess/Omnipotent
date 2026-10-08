@@ -2533,7 +2533,7 @@ namespace Omnipotent.Services.Projects
                 {
                     Succeeded = result.Success,
                     AuditText = result.Success && toolName is
-                        "computer_browser_inspect" or "computer_browser_action" or
+                        "computer_browser_inspect" or "computer_browser_action" or "computer_cdp" or
                         "computer_clipboard_get" or "computer_read_screen" or "computer_window_state"
                         ? $"{toolName} succeeded; live contents were omitted from durable history because they may contain form values, verification codes, or credentials."
                         : null,
@@ -3802,6 +3802,9 @@ namespace Omnipotent.Services.Projects
                 ServiceLog($"Projects: remote-control session on container {shortID} ended ({applied} input event(s) applied).");
                 if (applied > 0)
                 {
+                    // Klives drove the desktop — typically to tick the CAPTCHA the agent could not.
+                    // The one-attempt rule on that widget starts again from what he left behind.
+                    Containers.ContainerToolAdapter.NoteHumanControl(record.ContainerID);
                     if (ExternalDesktopOwners.IsExternal(record.ProjectID))
                     {
                         // No project agent owns this desktop; its owner (KliveAgent) listens instead.

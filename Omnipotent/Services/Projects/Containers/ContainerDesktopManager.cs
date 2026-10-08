@@ -64,6 +64,9 @@ namespace Omnipotent.Services.Projects.Containers
             registry = new ContainerRegistry(log);
             orchestrator = new ContainerOrchestrator(registry, log, imageForProject, dockerUri);
             bootstrapper = new ContainerDependencyBootstrapper(this.log);
+            // A browser-service rejection now degrades to docker exec instead of failing the action;
+            // this is where the harness/service disagreement still gets reported.
+            BrowserServiceClient.Diagnostics = this.log;
         }
 
         /// <summary>Boot reconciliation — reattach to surviving containers (§9 restart/redeploy).</summary>
@@ -644,6 +647,7 @@ namespace Omnipotent.Services.Projects.Containers
             CancellationToken ct = default)
         {
             var record = await EnsureDesktopAsync(project, agentID, requireVisualReady, ct);
+            await EnsureHelpersCurrentAsync(record, ct);
             var transport = GetTransport(record);
             bool shared = project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock;
             return new ContainerToolAdapter(
@@ -662,6 +666,56 @@ namespace Omnipotent.Services.Projects.Containers
                 // back to docker exec, so an old desktop keeps working without being recreated.
                 browserServiceHostPort: record.BrowserServiceHostPort,
                 browserServiceHost: vncHost);
+        }
+
+        // Desktops whose in-container helpers are known to match this build (container → fingerprint
+        // of the shipped helpers), and when a failed refresh may be retried.
+        private static readonly ConcurrentDictionary<string, string> HelpersCurrent = new(StringComparer.Ordinal);
+        private static readonly ConcurrentDictionary<string, DateTime> HelperRefreshRetryAfter = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> helperRefreshGates = new(StringComparer.Ordinal);
+        private static string? shippedHelperFingerprint;
+
+        private static string? ShippedHelperFingerprint()
+        {
+            if (shippedHelperFingerprint != null) return shippedHelperFingerprint;
+            try
+            {
+                var hashes = ContainerOrchestrator.ShippedHelperHashes(ResolveBuildContextDirectory());
+                return shippedHelperFingerprint = string.Join(",", hashes.OrderBy(p => p.Key, StringComparer.Ordinal).Select(p => p.Value));
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Makes sure this desktop runs the helpers this build ships (see
+        /// <see cref="ContainerOrchestrator.SyncDesktopHelpersAsync"/>): one cheap check per desktop per
+        /// process, a refresh in place when they differ. Never fails the caller — a desktop with old
+        /// helpers still works, it just lacks the newer verification and DevTools modes.
+        /// </summary>
+        private async Task EnsureHelpersCurrentAsync(DesktopContainerRecord record, CancellationToken ct)
+        {
+            string? fingerprint = ShippedHelperFingerprint();
+            if (fingerprint == null) return;
+            if (HelpersCurrent.TryGetValue(record.ContainerID, out var known) && known == fingerprint) return;
+            if (HelperRefreshRetryAfter.TryGetValue(record.ContainerID, out var retryAfter) && DateTime.UtcNow < retryAfter) return;
+            var gate = helperRefreshGates.GetOrAdd(record.ContainerID, _ => new SemaphoreSlim(1, 1));
+            if (!await gate.WaitAsync(TimeSpan.FromSeconds(45), ct)) return;
+            string id12 = record.ContainerID[..Math.Min(12, record.ContainerID.Length)];
+            try
+            {
+                if (HelpersCurrent.TryGetValue(record.ContainerID, out known) && known == fingerprint) return;
+                string? refreshed = await orchestrator.SyncDesktopHelpersAsync(record.ContainerID, ResolveBuildContextDirectory(), ct);
+                HelpersCurrent[record.ContainerID] = fingerprint;
+                HelperRefreshRetryAfter.TryRemove(record.ContainerID, out _);
+                if (refreshed != null) log($"Desktop {id12}: {refreshed} in place so it runs this build's browser helpers.");
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                HelperRefreshRetryAfter[record.ContainerID] = DateTime.UtcNow.AddMinutes(5);
+                log($"Desktop {id12}: browser helper refresh failed ({ex.GetType().Name}: {ex.Message}); it keeps its current helpers and is retried later.");
+            }
+            finally { gate.Release(); }
         }
 
         /// <summary>

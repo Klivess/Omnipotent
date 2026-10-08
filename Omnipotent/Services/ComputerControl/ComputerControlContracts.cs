@@ -102,7 +102,9 @@ namespace Omnipotent.Services.ComputerControl
             "text", "value", "password", "secret", "token", "authorization", "cookie", "clipboard",
             // Terminal input can contain inline credentials. Its exact body belongs neither in
             // the event log nor the audit summary (vault placeholders are not resolved here).
-            "command", "script", "javascript"
+            "command", "script", "javascript",
+            // computer_cdp bodies: page JavaScript and raw protocol parameters can carry form values.
+            "expression", "params", "promptText"
         };
 
         public static string Describe(string toolName, string? argumentsJson, int max = 220)
@@ -532,7 +534,7 @@ namespace Omnipotent.Services.ComputerControl
             };
             if (capabilities.SupportsTerminalExecution && capabilities.Supports("computer_terminal"))
                 all.Add(Tool("computer_terminal",
-                    "Run a Bash command INSIDE your isolated Linux desktop container, as its agent user - never on the Omnipotent host. Prefer this over typing commands into XFCE Terminal: it is reliable even when screenshots are temporarily unavailable, returns bounded stdout/stderr, and can install container software with sudo. The default working directory is persistent /project. Vault/account placeholders are intentionally NOT available because arbitrary command output could reveal them; use computer_type for secret entry.",
+                    "Run a Bash command INSIDE your isolated Linux desktop container, as its agent user - never on the Omnipotent host. Prefer this over typing commands into XFCE Terminal: it is reliable even when screenshots are temporarily unavailable, returns bounded stdout/stderr, and can install container software with sudo (apt; system pip is blocked by Debian, use a venv under $KLIVE_AGENT_RUNTIME). The default working directory is persistent /project. Vault/account placeholders are intentionally NOT available because arbitrary command output could reveal them; use computer_type for secret entry. For the browser's DevTools protocol use the computer_cdp tool rather than a hand-written script; if a script really needs it, `klive-cdp` (eval/send/targets/click/upload/dialog) and python3's preinstalled websocket module talk to 127.0.0.1:9222.",
                     Obj(new
                     {
                         command = Str("Bash command to run inside the desktop container."),

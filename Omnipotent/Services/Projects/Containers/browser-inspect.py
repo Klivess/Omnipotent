@@ -21,13 +21,14 @@ import urllib.request
 
 import websocket
 
-CDP_ROOT = "http://127.0.0.1:9222"
+CDP_ROOT = os.environ.get("KLIVE_CDP_ROOT", "http://127.0.0.1:9222")
 # The tab the harness last drove. Chromium exposes no "active tab" flag over HTTP, so the live
 # visibilityState probe is primary and this file is the fallback when every tab reports hidden
 # (window minimised/unmapped) — which is exactly when defaulting to index 0 picked a stale page.
-ACTIVE_TAB_FILE = "/tmp/klive-active-tab"
+ACTIVE_TAB_FILE = os.environ.get("KLIVE_ACTIVE_TAB_FILE", "/tmp/klive-active-tab")
 BLANK_URLS = ("", "about:blank", "about:newtab", "chrome://newtab/", "chrome://new-tab-page/")
-ACTION_MODES = ("navigate", "closetabs", "upload", "dialog", "control", "action")
+ACTION_MODES = ("navigate", "closetabs", "upload", "dialog", "control", "action",
+                "preflight", "receipt", "cdp")
 
 
 def http_json(path, method="GET", timeout=5):
@@ -53,6 +54,30 @@ class Session(object):
         self.ws = websocket.create_connection(ws_url, timeout=timeout, suppress_origin=True)
         self.next_id = 1
         self.events = []
+        # Called with every protocol event as it arrives, including while a command is waiting
+        # for its response. A navigation that raises "Leave site?" only completes once that dialog
+        # is answered, and only the session that saw it open can answer it.
+        self.on_event = None
+
+    def _keep(self, message):
+        # Retain a bounded event tail. Structured control uses this to report JavaScript dialogs
+        # and lifecycle changes that would otherwise be silently discarded while waiting for a
+        # command response. Existing one-shot callers keep the same contract.
+        self.events.append(message)
+        if len(self.events) > 200:
+            del self.events[:-200]
+        if self.on_event is not None:
+            try:
+                self.on_event(self, message)
+            except Exception:
+                pass
+
+    def send(self, method, params=None):
+        """Fire a command without waiting for its response (it is discarded when it arrives)."""
+        request_id = self.next_id
+        self.next_id += 1
+        self.ws.send(json.dumps({"id": request_id, "method": method, "params": params or {}}))
+        return request_id
 
     def call(self, method, params=None, timeout=15):
         self.ws.settimeout(timeout)
@@ -63,18 +88,31 @@ class Session(object):
         while time.time() < deadline:
             message = json.loads(self.ws.recv())
             if message.get("id") != request_id:
-                # Retain a bounded event tail. Structured control uses this to report JavaScript
-                # dialogs and lifecycle changes that would otherwise be silently discarded while
-                # waiting for a command response. Existing one-shot callers keep the same contract.
                 if message.get("method"):
-                    self.events.append(message)
-                    if len(self.events) > 200:
-                        del self.events[:-200]
+                    self._keep(message)
                 continue
             if "error" in message:
                 raise RuntimeError(message["error"].get("message", "CDP error"))
             return message.get("result", {})
         raise RuntimeError("Timed out waiting for the CDP response to " + method)
+
+    def wait_event(self, predicate, timeout):
+        """The first already-received or arriving event the predicate accepts, else None."""
+        for event in self.events:
+            if predicate(event):
+                return event
+        deadline = time.time() + max(0.0, timeout)
+        while time.time() < deadline:
+            self.ws.settimeout(max(0.05, deadline - time.time()))
+            try:
+                message = json.loads(self.ws.recv())
+            except Exception:
+                break
+            if message.get("method"):
+                self._keep(message)
+                if predicate(message):
+                    return message
+        return None
 
     def evaluate(self, expression, timeout=15):
         result = self.call("Runtime.evaluate",
@@ -268,6 +306,13 @@ def do_dialog(payload):
 
 
 # ── navigation and tab hygiene ───────────────────────────────────────────────────────────────
+def accept_beforeunload(session, event):
+    if event.get("method") != "Page.javascriptDialogOpening":
+        return
+    if (event.get("params") or {}).get("type") == "beforeunload":
+        session.send("Page.handleJavaScriptDialog", {"accept": True})
+
+
 def wait_ready(session, budget_seconds=15):
     deadline = time.time() + budget_seconds
     state = "unknown"
@@ -339,6 +384,11 @@ def do_navigate(payload):
         session = session_for(tabs[index])
         try:
             session.call("Page.enable")
+            # Leaving a page with a half-filled form raises "Leave site?" (beforeunload). Navigating
+            # away is exactly what was asked for, so confirm it. Left unanswered, the navigation
+            # hangs, and because no later session can see a dialog opened before it attached,
+            # every subsequent action on the tab stalls behind it.
+            session.on_event = accept_beforeunload
             result = session.call("Page.navigate", {"url": url}, timeout=30)
             if result.get("errorText"):
                 raise RuntimeError("Navigation failed: %s" % result["errorText"])
@@ -379,16 +429,20 @@ def do_closetabs(payload):
 
 
 # ── file-input upload ────────────────────────────────────────────────────────────────────────
-def collect_file_inputs(session):
+def collect_file_inputs(session, roots=None):
     """Every <input type=file> in the tab, including ones inside iframes, shadow roots and the
     display:none inputs that styled upload buttons actually drive. The pierced DOM tree is walked
-    in Python because DOM.querySelectorAll does not cross those boundaries."""
+    in Python because DOM.querySelectorAll does not cross those boundaries. When `roots` is a list,
+    every document and shadow root met on the way is appended so a CSS selector can be applied
+    inside each of them."""
     document = session.call("DOM.getDocument", {"depth": -1, "pierce": True}, timeout=30)
     found = []
 
     def walk(node, depth=0):
         if depth > 64 or not isinstance(node, dict):
             return
+        if roots is not None and node.get("nodeName") in ("#document", "#document-fragment") and node.get("nodeId"):
+            roots.append(node["nodeId"])
         if node.get("nodeName") == "INPUT":
             attributes = node.get("attributes") or []
             pairs = dict(zip(attributes[0::2], attributes[1::2]))
@@ -439,17 +493,32 @@ def do_upload(payload):
             raise RuntimeError("File not found inside the desktop container: %s" % ", ".join(missing))
     tabs = list_tabs()
     index = resolve_index(tabs, payload.get("tabIndex"))
+    if not verify_only and isinstance(payload.get("trigger"), dict) and payload["trigger"]:
+        return intercept_upload(tabs, index, paths, payload)
     session = session_for(tabs[index])
     try:
         session.call("DOM.enable")
         session.call("Runtime.enable")
-        inputs = collect_file_inputs(session)
+        roots = []
+        inputs = collect_file_inputs(session, roots)
+        css = str(payload.get("css") or "").strip()
+        if css and inputs and not verify_only:
+            matched = set()
+            for root in roots[:200]:
+                try:
+                    matched.update(session.call("DOM.querySelectorAll", {"nodeId": root, "selector": css},
+                                                timeout=8).get("nodeIds") or [])
+                except Exception:
+                    continue
+            inputs = [item for item in inputs if item["nodeId"] in matched]
+            if not inputs:
+                raise RuntimeError("No <input type=file> matches the selector %s." % bounded_text(css, 200))
         if not inputs:
             raise RuntimeError(
-                "This page exposes no <input type=file> element. The site is using a native picker "
-                "(File System Access API) or a drag-and-drop-only uploader, so the visible GTK dialog "
-                "is the only route: click the page's upload control, then call computer_upload_file "
-                "again while the dialog is open.")
+                "This page has no <input type=file> in its document — its upload button builds one on "
+                "the fly (or uses a native picker). Call computer_upload_file again with 'trigger' set to "
+                "that upload button (ref/name/text/css): the tool clicks it itself and catches the file "
+                "request before any native dialog opens.")
         if verify_only:
             states = []
             for candidate in inputs[:12]:
@@ -2155,6 +2224,10 @@ def do_control(payload):
         session.call("Page.enable")
         session.call("Runtime.enable")
         session.call("DOM.enable")
+        if op in ("back", "forward", "reload"):
+            # Leaving the page is the request, so "Leave site?" is answered rather than left
+            # blocking the tab (see accept_beforeunload).
+            session.on_event = accept_beforeunload
         # Every target-bearing action activates its tab first. This is essential for op=locate:
         # the returned geometry is intended for a later physical VNC click and must describe what
         # is actually in front, never a background tab at the same coordinates.
@@ -2631,203 +2704,1373 @@ def do_control(payload):
     finally:
         close_owned_worlds(worlds)
         session.close()
-# ── entry point ──────────────────────────────────────────────────────────────────────────────
-mode = (sys.argv[1] if len(sys.argv) > 1 else "dom").lower()
-if mode in ACTION_MODES:
-    action_payload = decode_payload(sys.argv[2]) if len(sys.argv) > 2 else {}
-    action = {
-        "navigate": do_navigate, "closetabs": do_closetabs, "upload": do_upload,
-        "dialog": do_dialog, "control": do_control, "action": do_control,
-    }[mode]
-    action_output = action(action_payload)
-    print(json.dumps(action_output, indent=2, ensure_ascii=False))
-    # Existing action helpers signal operational failures by throwing/non-zero exit. Structured
-    # action returns an error envelope so callers and humans get a useful reason; mirror the old
-    # process contract as well so ContainerToolAdapter does not report {"ok":false} as success.
-    if mode in ("control", "action") and isinstance(action_output, dict) \
-            and action_output.get("ok") is False:
-        raise SystemExit(2)
-    raise SystemExit(0)
 
-limit = max(1, min(200, int(sys.argv[2]) if len(sys.argv) > 2 else 80))
-# -1 (or omitted) means "the tab the human would be looking at". Defaulting to index 0 made every
-# inspection after a few navigations report a stale page while the agent acted on the live one.
-tab_index = max(-1, min(200, int(sys.argv[3]) if len(sys.argv) > 3 else -1))
-query = {}
-if mode == "locate":
-    if len(sys.argv) < 5:
-        raise RuntimeError("locate mode requires a base64url JSON query")
-    query = decode_payload(sys.argv[4])
-tabs = list_tabs()
-if mode == "tabs":
-    active = active_index(tabs) if tabs else 0
-    print(json.dumps([{"index": i, "id": t.get("id"), "title": t.get("title"), "url": t.get("url"),
-                       "active": i == active, "blank": is_blank(t.get("url"))}
-                      for i, t in enumerate(tabs[:limit])], indent=2))
-    raise SystemExit(0)
-if not tabs:
-    raise RuntimeError("No inspectable browser tab is open.")
 
-tab_index = resolve_index(tabs, tab_index)
-tab = tabs[tab_index]
-ws_url = tab["webSocketDebuggerUrl"]
-if mode == "controls":
-    output = inspect_controls(tab, tab_index, tabs, limit)
-elif mode == "accessibility":
-    result = cdp(ws_url, "Accessibility.getFullAXTree")
-    nodes = []
-    for node in result.get("nodes", [])[:limit]:
-        nodes.append({
-            "role": (node.get("role") or {}).get("value"),
-            "name": (node.get("name") or {}).get("value"),
-            "description": (node.get("description") or {}).get("value"),
-            "ignored": node.get("ignored", False),
-        })
-    output = {"title": tab.get("title"), "url": tab.get("url"), "nodes": nodes}
-elif mode == "locate":
-    expression = r"""
-    (() => {
-      const query = %s;
-      const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
-      const roleOf = x => {
-        const explicit = x.getAttribute('role');
-        if (explicit) return explicit.toLowerCase();
-        const tag = x.tagName.toLowerCase();
-        const type = (x.getAttribute('type') || '').toLowerCase();
-        if (tag === 'button' || (tag === 'input' && ['button','submit','reset','image'].includes(type))) return 'button';
-        if (tag === 'a' && x.hasAttribute('href')) return 'link';
-        if (tag === 'select') return 'combobox';
-        if (tag === 'textarea' || (tag === 'input' && !['checkbox','radio','range','file','color','hidden'].includes(type))) return 'textbox';
-        if (tag === 'input' && type === 'checkbox') return 'checkbox';
-        if (tag === 'input' && type === 'radio') return 'radio';
-        return '';
-      };
-      const nameOf = x => {
-        const labelledBy = (x.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
-          .map(id => document.getElementById(id)?.innerText || '').join(' ');
-        const labels = x.labels ? [...x.labels].map(label => label.innerText || '').join(' ') : '';
-        const type = (x.getAttribute('type') || '').toLowerCase();
-        const safeButtonValue = ['button','submit','reset'].includes(type) ? x.getAttribute('value') : '';
-        return (x.getAttribute('aria-label') || labelledBy || labels || x.innerText ||
-          x.getAttribute('placeholder') || x.getAttribute('title') || safeButtonValue || x.getAttribute('name') || '').trim();
-      };
-      const controls = [...document.querySelectorAll('button,input,select,textarea,a[href],[role],[contenteditable="true"]')]
-        .map((x, index) => {
-          const rect = x.getBoundingClientRect();
-          const style = getComputedStyle(x);
-          const visible = rect.width > 2 && rect.height > 2 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
-          const cx = rect.left + rect.width / 2;
-          const cy = rect.top + rect.height / 2;
-          const hit = visible ? document.elementFromPoint(cx, cy) : null;
-          const intercepted = !!hit && hit !== x && !x.contains(hit);
-          const borderX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-          const browserTop = Math.max(0, window.outerHeight - window.innerHeight - borderX);
-          return {element:x, index, name:nameOf(x), role:roleOf(x), tag:x.tagName.toLowerCase(), visible,
-            disabled:!!x.disabled || x.getAttribute('aria-disabled') === 'true', intercepted,
-            interceptedBy:intercepted ? {name:nameOf(hit), role:roleOf(hit), tag:hit.tagName.toLowerCase()} : null,
-            x:Math.round(window.screenX + borderX + cx), y:Math.round(window.screenY + browserTop + cy),
-            bounds:{x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(rect.width),height:Math.round(rect.height)}};
-        }).filter(item => item.visible);
-      const wantedName = norm(query.name || query.text);
-      const wantedRole = norm(query.role);
-      const wantedTag = norm(query.tag);
-      const exact = query.exact === true;
-      const matched = controls.filter(item => {
-        const itemName = norm(item.name);
-        return (!wantedName || (exact ? itemName === wantedName : itemName.includes(wantedName))) &&
-          (!wantedRole || norm(item.role) === wantedRole) && (!wantedTag || norm(item.tag) === wantedTag);
-      });
-      const occurrence = Math.max(0, Number(query.occurrence || 0));
-      const selected = matched[occurrence];
-      const clean = item => item ? {index:item.index,name:item.name,role:item.role,tag:item.tag,
-        disabled:item.disabled,intercepted:item.intercepted,interceptedBy:item.interceptedBy,
-        x:item.x,y:item.y,bounds:item.bounds} : null;
-      return {title:document.title,url:location.href,match:clean(selected),matchCount:matched.length,
-        candidates:controls.slice(0,20).map(clean)};
-    })()
-    """ % json.dumps(query, ensure_ascii=False)
-    result = cdp(ws_url, "Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
-    if result.get("exceptionDetails"):
-        details = result["exceptionDetails"]
-        raise RuntimeError(details.get("text") or ((details.get("exception") or {}).get("description")) or "Runtime.evaluate failed")
-    output = ((result.get("result") or {}).get("value"))
-else:
-    expression = """
-    (() => {
-      const maxItems = %d;
-      if (%s) {
-        return {title: document.title, url: location.href,
-          resources: performance.getEntriesByType('resource').slice(-maxItems).map(x => ({name:x.name, initiatorType:x.initiatorType, duration:Math.round(x.duration), transferSize:x.transferSize}))};
-      }
-      return {title: document.title, url: location.href,
-        text: (document.body?.innerText || '').slice(0, 16000),
-        links: [...document.querySelectorAll('a[href]')].slice(0,maxItems).map(x => ({text:(x.innerText||x.getAttribute('aria-label')||'').trim().slice(0,200), href:x.href})),
-        forms: [...document.forms].slice(0,maxItems).map(f => ({action:f.action, method:f.method, fields:[...f.elements].slice(0,40).map(x => ({name:x.name, type:x.type, ariaLabel:x.getAttribute('aria-label'), required:x.required}))})),
-        fileInputs: [...document.querySelectorAll('input[type=file]')].map(x => ({name:x.name||x.id||'', accept:x.accept||'', multiple:!!x.multiple, attached:x.files?x.files.length:0})),
-        controls: [...document.querySelectorAll('button,input,select,textarea,[role],[contenteditable="true"]')].slice(0,maxItems).map(x => ({
-          tag:x.tagName,
-          role:x.getAttribute('role')||undefined,
-          type:x.type||undefined,
-          text:(x.innerText||x.getAttribute('aria-label')||x.getAttribute('placeholder')||'').trim().slice(0,200),
-          name:x.getAttribute('name')||undefined,
-          ariaLabel:x.getAttribute('aria-label')||undefined,
-          expanded:x.getAttribute('aria-expanded')||undefined,
-          selected:x.getAttribute('aria-selected')||undefined,
-          checked:typeof x.checked==='boolean'?x.checked:undefined,
-          required:!!x.required,
-          disabled:!!x.disabled,
-          bounds:(() => { const r=x.getBoundingClientRect(); return {x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)}; })()
-        }))};
-    })()
-    """ % (limit, "true" if mode == "network" else "false")
-    result = cdp(ws_url, "Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
-    if result.get("exceptionDetails"):
-        details = result["exceptionDetails"]
-        raise RuntimeError(details.get("text") or ((details.get("exception") or {}).get("description")) or "Runtime.evaluate failed")
-    output = ((result.get("result") or {}).get("value"))
-    if output is None:
-        raise RuntimeError("Runtime.evaluate returned no inspectable value for the selected visible tab.")
+# ── input verification: what pointer/keyboard input will hit, and whether it arrived ─────────
+# A coordinate click is the agent's estimate of where a control is. On modern pages that estimate
+# misses — the text centre of a styled div, the backdrop beside a modal's button, a browser bubble
+# on top — and the harness used to answer "Clicked (x,y)." either way, so a miss surfaced turns
+# later as "nothing happened". preflight says what the input will hit before it is sent and arms a
+# receipt; receipt says whether the input actually reached the page.
+#
+# Both run in a private isolated world ("klive-input") that page scripts cannot see. It is created
+# once per document and found again by its stored context id, so no DevTools domain is enabled on
+# the page for this: these probes run around every click, and Runtime.enable in particular is a
+# well-known bot-detection signal.
 
-# Detect human-verification gates on every inspectable mode, before an agent burns retries trying
-# controls that automation cannot complete. DOM selectors catch reCAPTCHA/hCaptcha/Turnstile;
-# bounded visible-text signals cover provider-hosted interstitials.
-if isinstance(output, dict):
-    challenge_expression = r"""
-    (() => {
-      const signals = [];
-      const visible = x => {
-        const r = x.getBoundingClientRect(); const s = getComputedStyle(x);
-        return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
-      };
-      const selectors = ['.g-recaptcha','.h-captcha','[data-sitekey]','[name="cf-turnstile-response"]',
-        'iframe[src*="recaptcha"]','iframe[src*="hcaptcha"]','iframe[src*="challenges.cloudflare.com"]'];
-      for (const selector of selectors) {
-        if ([...document.querySelectorAll(selector)].some(visible)) signals.push('visible selector: ' + selector);
+INPUT_WORLD = "klive-input"
+INPUT_STATE_FILE = os.environ.get("KLIVE_INPUT_STATE_FILE", "/tmp/klive-input-worlds.json")
+INPUT_ACTION = "Input."
+
+INPUT_JS_HELPERS = r"""
+  const __clip = (value, max) => {
+    value = String(value == null ? '' : value).replace(/\s+/g, ' ').trim();
+    return value.length <= max ? value : value.slice(0, max) + '…';
+  };
+  const __ACTION_ROLES = new Set(['button','link','checkbox','radio','switch','tab','menuitem',
+    'menuitemcheckbox','menuitemradio','option','combobox','textbox','searchbox','slider','spinbutton',
+    'treeitem','listbox']);
+  const __roleOf = el => {
+    const explicit = (el.getAttribute('role') || '').trim().split(/\s+/)[0];
+    if (explicit) return explicit.toLowerCase();
+    const tag = el.tagName.toLowerCase(), type = (el.getAttribute('type') || '').toLowerCase();
+    if (tag === 'button' || (tag === 'input' && ['button','submit','reset','image'].includes(type))) return 'button';
+    if (tag === 'a' && el.hasAttribute('href')) return 'link';
+    if (tag === 'select') return 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    if (tag === 'input') return ['checkbox','radio'].includes(type) ? type : type === 'file' ? 'file' : 'textbox';
+    return '';
+  };
+  const __nameOf = el => __clip(el.getAttribute('aria-label') || el.getAttribute('title') ||
+    el.getAttribute('alt') || (el.childElementCount < 16 ? (el.innerText || el.textContent) : '') ||
+    el.getAttribute('placeholder') || (el.tagName.toLowerCase() === 'input' &&
+    ['button','submit','reset'].includes((el.getAttribute('type') || '').toLowerCase()) ? el.value : '') || '', 100);
+  const __semantic = el => {
+    if (!el || el.nodeType !== 1) return false;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'a') return el.hasAttribute('href') || el.hasAttribute('onclick') || el.hasAttribute('role');
+    if (['button','select','textarea','summary','label','option'].includes(tag)) return true;
+    if (tag === 'input') return (el.getAttribute('type') || '').toLowerCase() !== 'hidden';
+    if (__ACTION_ROLES.has((el.getAttribute('role') || '').toLowerCase())) return true;
+    if (el.isContentEditable || el.hasAttribute('onclick')) return true;
+    return el.hasAttribute('tabindex') && el.tabIndex >= 0;
+  };
+  const __pointer = el => { try { return getComputedStyle(el).cursor === 'pointer'; } catch (_) { return false; } };
+  const __up = el => { const root = el.getRootNode && el.getRootNode(); return el.parentElement || (root && root.host) || null; };
+  // The control that handles a click on el: the nearest element with real semantics (a button,
+  // a link, a role, a handler attribute). Failing that, the outermost element of the unbroken
+  // cursor:pointer run above el — cursor is inherited, so the innermost pointer element is
+  // usually just a label inside the real clickable card.
+  const __control = el => {
+    let pointer = null, chain = true;
+    for (let x = el, depth = 0; x && depth < 14; x = __up(x), depth++) {
+      if (__semantic(x)) return x;
+      if (chain && __pointer(x)) pointer = x; else chain = false;
+    }
+    return pointer;
+  };
+  const __editable = el => {
+    const tag = el.tagName.toLowerCase(), type = (el.getAttribute('type') || '').toLowerCase();
+    return el.isContentEditable || tag === 'textarea' || (tag === 'input' && !['button','submit','reset',
+      'image','checkbox','radio','range','file','hidden','color'].includes(type));
+  };
+  const __describe = el => {
+    if (!el) return null;
+    const r = el.getBoundingClientRect();
+    const tag = el.tagName.toLowerCase(), type = (el.getAttribute('type') || '').toLowerCase();
+    return {tag, role: __roleOf(el), name: __nameOf(el), id: __clip(el.id, 80),
+      cls: __clip(typeof el.className === 'string' ? el.className.split(/\s+/).filter(Boolean).slice(0, 2).join('.') : '', 80),
+      type, disabled: !!el.disabled || el.getAttribute('aria-disabled') === 'true', editable: __editable(el),
+      fileInput: tag === 'input' && type === 'file',
+      rect: {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)}};
+  };
+"""
+
+# Installed once per document. Listens in the capture phase on window, so it sees what reaches the
+# page before any page handler can stop it, and keeps only counts and short target labels — never
+# key values, so a typed password is not recorded anywhere.
+INPUT_WORLD_JS = r"""
+(() => {
+  const KEY = __KEY__;
+  if (globalThis.__kliveInput && globalThis.__kliveInput.key === KEY) return {installed: false};
+""" + INPUT_JS_HELPERS + r"""
+  const MOVES = new Set(['pointermove', 'mousemove']);
+  const KEYS = new Set(['keydown', 'keyup', 'beforeinput', 'input']);
+  const label = el => el && el.nodeType === 1 ? {tag: el.tagName.toLowerCase(), id: __clip(el.id, 60),
+    role: __roleOf(el), name: __clip(el.getAttribute('aria-label') || el.getAttribute('title') ||
+    (el.childElementCount < 16 ? el.textContent : '') || '', 80)} : null;
+  const docMarker = () => String(performance.timeOrigin) + '|' + location.href;
+  const state = {key: KEY, nonce: '', armedAt: 0, events: [], moves: 0, lastMove: null, keys: 0,
+    inputs: 0, doc: docMarker(), focus: null, focusFrame: null, before: '', sel: [null, null]};
+  const record = event => {
+    if (!state.nonce) return;
+    const type = event.type;
+    if (MOVES.has(type)) {
+      state.moves++;
+      state.lastMove = {x: Math.round(event.clientX), y: Math.round(event.clientY), trusted: event.isTrusted};
+      return;
+    }
+    if (KEYS.has(type)) {
+      if (type === 'keydown' || type === 'beforeinput') state.keys++;
+      if (type === 'input') state.inputs++;
+      if (state.events.length < 60) state.events.push({type, trusted: event.isTrusted,
+        at: Math.round(performance.now() - state.armedAt), target: label(event.target)});
+      return;
+    }
+    if (state.events.length >= 200) state.events.shift();
+    const target = event.target && event.target.nodeType === 1 ? event.target
+      : (event.target && event.target.parentElement) || null;
+    state.events.push({type, trusted: event.isTrusted, x: Math.round(event.clientX || 0),
+      y: Math.round(event.clientY || 0), at: Math.round(performance.now() - state.armedAt), target: label(target)});
+  };
+  for (const type of ['pointermove', 'mousemove', 'pointerdown', 'mousedown', 'pointerup', 'mouseup',
+                      'click', 'dblclick', 'contextmenu', 'keydown', 'keyup', 'beforeinput', 'input', 'focusin'])
+    window.addEventListener(type, record, {capture: true, passive: true});
+  state.arm = nonce => {
+    state.nonce = nonce; state.armedAt = performance.now(); state.events = []; state.moves = 0;
+    state.lastMove = null; state.keys = 0; state.inputs = 0; state.doc = docMarker();
+    return true;
+  };
+  state.docMarker = docMarker;
+  globalThis.__kliveInput = state;
+  return {installed: true};
+})()
+"""
+
+DESCRIBE_HIT_JS = "function(px, py) {" + INPUT_JS_HELPERS + r"""
+  const el = this && this.nodeType === 1 ? this : (this && this.parentElement) || null;
+  if (!el) return {missing: true};
+  const target = __control(el);
+  const control = target || el, tag = control.tagName.toLowerCase();
+  const opensFileChooser = (tag === 'input' && (control.getAttribute('type') || '').toLowerCase() === 'file')
+    || (tag === 'label' && !!control.control && control.control.type === 'file');
+  let cursor = '';
+  try { cursor = getComputedStyle(el).cursor; } catch (_) {}
+  return {hit: __describe(el), actionable: __describe(target), opensFileChooser, cursor,
+          frameUrl: location.href, local: {x: Math.round(px), y: Math.round(py)}};
+}"""
+
+NEARBY_JS = "((px, py) => {" + INPUT_JS_HELPERS + r"""
+  const seen = new Set(), found = [];
+  for (const radius of [6, 14, 26, 42, 64, 90]) {
+    for (let k = 0; k < 8; k++) {
+      const angle = k * Math.PI / 4;
+      const x = px + Math.cos(angle) * radius, y = py + Math.sin(angle) * radius;
+      if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
+      for (const candidate of document.elementsFromPoint(x, y).slice(0, 6)) {
+        const target = __control(candidate);
+        if (!target || seen.has(target)) continue;
+        seen.add(target);
+        const r = target.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) continue;
+        const dx = Math.max(r.left - px, 0, px - r.right), dy = Math.max(r.top - py, 0, py - r.bottom);
+        const item = __describe(target);
+        item.distance = Math.round(Math.hypot(dx, dy));
+        item.centre = {x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2)};
+        found.push(item);
       }
-      const text = (document.body?.innerText || '').slice(0, 6000).toLowerCase();
-      for (const marker of ['verify you are human','complete the security check','checking your browser',
-        'security verification','captcha']) {
-        if (text.includes(marker)) signals.push('visible text: ' + marker);
-      }
-      return {detected: signals.length > 0, signals: [...new Set(signals)].slice(0,8)};
-    })()
-    """
+    }
+  }
+  found.sort((a, b) => a.distance - b.distance);
+  return found.slice(0, 5);
+})"""
+
+FOCUS_JS = "(() => {" + INPUT_JS_HELPERS + r"""
+  const s = globalThis.__kliveInput;
+  let el = document.activeElement;
+  for (let i = 0; el && el.shadowRoot && el.shadowRoot.activeElement && i < 10; i++) el = el.shadowRoot.activeElement;
+  s.focus = null; s.focusFrame = null; s.before = ''; s.sel = [null, null];
+  if (!el || el === document.body || el === document.documentElement) return {kind: 'none', hasFocus: document.hasFocus()};
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'iframe' || tag === 'frame') { s.focusFrame = el; return {kind: 'frame'}; }
+  const type = (el.getAttribute('type') || '').toLowerCase();
+  const value = el.isContentEditable ? (el.textContent || '') : (typeof el.value === 'string' ? el.value : '');
+  let start = null, end = null;
+  try { if (typeof el.selectionStart === 'number') { start = el.selectionStart; end = el.selectionEnd; } } catch (_) {}
+  s.focus = el; s.before = value; s.sel = [start, end];
+  const d = __describe(el);
+  return {kind: __editable(el) ? 'editable' : 'other', tag, type, password: type === 'password',
+    name: d.name, id: d.id, role: d.role, readOnly: !!el.readOnly, disabled: !!el.disabled,
+    valueLength: value.length, value: type === 'password' ? null : value.slice(0, 200),
+    selStart: start, selEnd: end, hasFocus: document.hasFocus()};
+})()"""
+
+RECEIPT_JS = r"""
+(() => {
+  const s = globalThis.__kliveInput;
+  if (!s) return {missing: true};
+  const count = types => s.events.filter(e => types.includes(e.type)).length;
+  const firstOf = types => s.events.find(e => types.includes(e.type)) || null;
+  const downs = s.events.filter(e => e.type === 'pointerdown' || e.type === 'mousedown');
+  const el = s.focus;
+  const value = el ? (el.isContentEditable ? (el.textContent || '') : (typeof el.value === 'string' ? el.value : '')) : null;
+  return {key: s.key, nonce: s.nonce, docChanged: s.docMarker() !== s.doc, moves: s.moves, lastMove: s.lastMove,
+    downs: downs.length, trustedDowns: downs.filter(e => e.trusted).length,
+    clicks: count(['click', 'dblclick', 'contextmenu']), firstDown: downs[0] || null,
+    firstClick: firstOf(['click', 'dblclick', 'contextmenu']), keys: s.keys, inputs: s.inputs,
+    keyTarget: (firstOf(['keydown', 'beforeinput']) || {}).target || null,
+    focus: el ? {connected: el.isConnected, stillFocused: (el.getRootNode && el.getRootNode().activeElement === el)
+      || document.activeElement === el, before: s.before, after: value, sel: s.sel} : null};
+})()
+"""
+
+METRICS_JS = ("(() => ({screenX:window.screenX||0,screenY:window.screenY||0,"
+              "outerWidth:window.outerWidth||window.innerWidth,outerHeight:window.outerHeight||window.innerHeight,"
+              "innerWidth:window.innerWidth,innerHeight:window.innerHeight,devicePixelRatio:window.devicePixelRatio||1}))()")
+
+# Provider frames a "not a robot" / humanity checkbox lives in. Clicks inside them are scored for
+# automation and silently rejected; the harness counts them so an agent gets exactly one try.
+CHALLENGE_FRAME = re.compile(
+    r"(recaptcha/(api2|enterprise)/(anchor|bframe))|hcaptcha\.com/captcha|challenges\.cloudflare\.com|"
+    r"challenges\.fed\.cloudflare\.com|arkoselabs\.com|funcaptcha\.com", re.I)
+
+
+def challenge_provider(url):
+    url = url or ""
+    if not CHALLENGE_FRAME.search(url):
+        return None
+    if "recaptcha" in url.lower():
+        return "recaptcha"
+    if "hcaptcha" in url.lower():
+        return "hcaptcha"
+    if "cloudflare" in url.lower():
+        return "turnstile"
+    return "arkose"
+
+
+def load_input_worlds():
     try:
-        challenge_result = cdp(ws_url, "Runtime.evaluate", {
-            "expression": challenge_expression, "returnByValue": True, "awaitPromise": True
+        with open(INPUT_STATE_FILE, "r") as handle:
+            state = json.load(handle)
+        return state if isinstance(state, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_input_worlds(state):
+    try:
+        live = {item.get("id") for item in list_targets()}
+        state = {key: value for key, value in state.items() if key.split("|", 1)[0] in live}
+        while len(state) > 64:
+            state.pop(next(iter(state)))
+        temporary = INPUT_STATE_FILE + ".tmp"
+        with open(temporary, "w") as handle:
+            json.dump(state, handle)
+        os.replace(temporary, INPUT_STATE_FILE)
+    except Exception:
+        pass
+
+
+def world_eval(session, context_id, expression, timeout=6):
+    result = session.call("Runtime.evaluate", {
+        "expression": expression, "contextId": context_id, "returnByValue": True,
+        "awaitPromise": False}, timeout=timeout)
+    if result.get("exceptionDetails"):
+        details = result["exceptionDetails"]
+        raise RuntimeError(details.get("text") or ((details.get("exception") or {}).get("description"))
+                           or "evaluation failed")
+    return (result.get("result") or {}).get("value")
+
+
+def input_world(session, target_id, frame_id, worlds):
+    """The document's private input world, reused when its stored context still answers with
+    our key. Context ids can be reissued in a renderer that replaced the old one, which is why the
+    key is checked rather than trusted."""
+    key_name = (target_id or "") + "|" + (frame_id or "")
+    entry = worlds.get(key_name)
+    if isinstance(entry, dict) and entry.get("ctx"):
+        try:
+            if world_eval(session, entry["ctx"],
+                          "(globalThis.__kliveInput && globalThis.__kliveInput.key) || ''", 3) == entry.get("key"):
+                worlds.pop(key_name, None)
+                worlds[key_name] = entry
+                return entry["ctx"]
+        except Exception:
+            pass
+    made = session.call("Page.createIsolatedWorld", {
+        "frameId": frame_id, "worldName": INPUT_WORLD, "grantUniveralAccess": False}, timeout=6)
+    context_id = made.get("executionContextId")
+    if not context_id:
+        raise RuntimeError("could not create the input-verification world")
+    key = hashlib.sha256(os.urandom(16)).hexdigest()[:24]
+    world_eval(session, context_id, INPUT_WORLD_JS.replace("__KEY__", json.dumps(key)), 6)
+    worlds.pop(key_name, None)
+    worlds[key_name] = {"ctx": context_id, "key": key}
+    return context_id
+
+
+def page_responsive(session, timeout=1.5):
+    """A renderer behind a JavaScript alert/confirm/'Leave site?' dialog stops answering scripts,
+    and a session that attached after the dialog opened can neither see nor answer it over CDP."""
+    try:
+        result = session.call("Runtime.evaluate", {"expression": "1", "returnByValue": True}, timeout=timeout)
+        return (result.get("result") or {}).get("value") == 1
+    except Exception:
+        return False
+
+
+def window_metrics(session):
+    value = session.call("Runtime.evaluate", {"expression": METRICS_JS, "returnByValue": True},
+                         timeout=4).get("result", {}).get("value") or {}
+    border_x = max(0.0, (float(value.get("outerWidth") or 0) - float(value.get("innerWidth") or 0)) / 2.0)
+    browser_top = max(0.0, float(value.get("outerHeight") or 0) - float(value.get("innerHeight") or 0) - border_x)
+    return {
+        "screenX": float(value.get("screenX") or 0), "screenY": float(value.get("screenY") or 0),
+        "outerWidth": float(value.get("outerWidth") or 0), "outerHeight": float(value.get("outerHeight") or 0),
+        "innerWidth": float(value.get("innerWidth") or 0), "innerHeight": float(value.get("innerHeight") or 0),
+        "scale": max(0.25, min(8.0, float(value.get("devicePixelRatio") or 1.0))),
+        "borderX": border_x, "browserTop": browser_top,
+    }
+
+
+def screen_to_viewport(metrics, screen_x, screen_y):
+    """Inverse of selected_geometry's mapping: desktop pixels to the active tab's viewport."""
+    scale = metrics["scale"]
+    vx = screen_x / scale - metrics["screenX"] - metrics["borderX"]
+    vy = screen_y / scale - metrics["screenY"] - metrics["browserTop"]
+    if 0 <= vx < metrics["innerWidth"] and 0 <= vy < metrics["innerHeight"]:
+        region = "page"
+    elif (metrics["screenX"] <= screen_x / scale < metrics["screenX"] + metrics["outerWidth"]
+          and metrics["screenY"] <= screen_y / scale < metrics["screenY"] + metrics["outerHeight"]):
+        region = "browser-ui"
+    else:
+        region = "outside"
+    return vx, vy, region
+
+
+def viewport_to_screen(metrics, vx, vy):
+    scale = metrics["scale"]
+    return (int(round((metrics["screenX"] + metrics["borderX"] + vx) * scale)),
+            int(round((metrics["screenY"] + metrics["browserTop"] + vy) * scale)))
+
+
+def target_for_frame(frame_id):
+    return next((item for item in list_targets()
+                 if item.get("id") == frame_id and item.get("type") == "iframe"
+                 and item.get("webSocketDebuggerUrl")), None)
+
+
+def hit_test_point(session, target_id, vx, vy, worlds, sessions, offset=(0.0, 0.0), depth=0):
+    """What a click at viewport (vx, vy) lands on, descending into out-of-process frames through
+    their own targets (same-process frames are hit-tested through directly). Returns the frame
+    chain needed to arm a receipt where the click will actually be delivered."""
+    location = session.call("DOM.getNodeForLocation", {
+        "x": int(round(vx)), "y": int(round(vy)), "ignorePointerEventsNone": True,
+        "includeUserAgentShadowDOM": False}, timeout=5)
+    backend = location.get("backendNodeId")
+    frame_id = location.get("frameId")
+    node = session.call("DOM.describeNode", {"backendNodeId": backend}, timeout=5).get("node") or {}
+    if (node.get("nodeName") or "").upper() in ("IFRAME", "FRAME") and node.get("frameId") and depth < 4:
+        child = target_for_frame(node["frameId"])
+        if child:
+            quad = (session.call("DOM.getBoxModel", {"backendNodeId": backend}, timeout=5)
+                    .get("model") or {}).get("content") or []
+            ox, oy = (min(quad[0::2]), min(quad[1::2])) if len(quad) >= 8 else (0.0, 0.0)
+            child_session = Session(child["webSocketDebuggerUrl"], timeout=8)
+            sessions.append(child_session)
+            return hit_test_point(child_session, child.get("id"), vx - ox, vy - oy, worlds, sessions,
+                                  (offset[0] + ox, offset[1] + oy), depth + 1)
+    context_id = input_world(session, target_id, frame_id, worlds)
+    resolved = session.call("DOM.resolveNode", {"backendNodeId": backend, "executionContextId": context_id},
+                            timeout=5)
+    object_id = (resolved.get("object") or {}).get("objectId")
+    described = {}
+    if object_id:
+        described = (session.call("Runtime.callFunctionOn", {
+            "objectId": object_id, "functionDeclaration": DESCRIBE_HIT_JS,
+            "arguments": [{"value": vx}, {"value": vy}], "returnByValue": True}, timeout=6)
+            .get("result") or {}).get("value") or {}
+    return {"session": session, "targetId": target_id, "frameId": frame_id, "contextId": context_id,
+            "offset": offset, "local": (vx, vy), "describe": described, "depth": depth}
+
+
+def focus_snapshot(session, target_id, frame_id, worlds, sessions, depth=0):
+    """The element that will receive typing, through same- and cross-process frames, and the
+    session/world it lives in. Its value before typing is kept in the private world so the
+    receipt can compare like with like."""
+    context_id = input_world(session, target_id, frame_id, worlds)
+    info = world_eval(session, context_id, FOCUS_JS, 6) or {}
+    if info.get("kind") == "frame" and depth < 4:
+        remote = session.call("Runtime.evaluate", {
+            "expression": "globalThis.__kliveInput.focusFrame", "contextId": context_id,
+            "returnByValue": False}, timeout=4).get("result") or {}
+        node = session.call("DOM.describeNode", {"objectId": remote.get("objectId")}, timeout=4).get("node") or {}
+        child_frame = node.get("frameId")
+        if child_frame:
+            child = target_for_frame(child_frame)
+            if child:
+                child_session = Session(child["webSocketDebuggerUrl"], timeout=8)
+                sessions.append(child_session)
+                return focus_snapshot(child_session, child.get("id"), child_frame, worlds, sessions, depth + 1)
+            return focus_snapshot(session, target_id, child_frame, worlds, sessions, depth + 1)
+    info["targetId"] = target_id
+    info["frameId"] = frame_id
+    return info, session, context_id
+
+
+def top_frame_id(session):
+    return ((session.call("Page.getFrameTree", timeout=5).get("frameTree") or {}).get("frame") or {}).get("id")
+
+
+def fast_active_index(tabs):
+    """The foreground tab, asking the remembered one first: a full visibility scan opens a
+    connection per tab, which is too slow to run around every click."""
+    if len(tabs) <= 1:
+        return 0
+    remembered = remembered_active_id()
+    for index, tab in enumerate(tabs):
+        if tab.get("id") == remembered and is_visible(tab):
+            return index
+    return active_index(tabs)
+
+
+WINDOW_TYPE = re.compile(r"_NET_WM_WINDOW_TYPE_([A-Z_]+)")
+
+
+def x11_window(window_id):
+    geometry = {}
+    for line in run_x11(["xdotool", "getwindowgeometry", "--shell", window_id]).splitlines():
+        if "=" in line:
+            name, value = line.split("=", 1)
+            geometry[name.strip()] = value.strip()
+    try:
+        x, y = int(geometry["X"]), int(geometry["Y"])
+        width, height = int(geometry["WIDTH"]), int(geometry["HEIGHT"])
+    except (KeyError, ValueError):
+        return None
+    properties = run_x11(["xprop", "-id", window_id, "_NET_WM_WINDOW_TYPE", "WM_WINDOW_ROLE"])
+    role = re.search(r'WM_WINDOW_ROLE\(STRING\) = "([^"]*)"', properties)
+    return {"id": int(window_id), "title": run_x11(["xdotool", "getwindowname", window_id])[:200],
+            "x": x, "y": y, "width": width, "height": height,
+            "types": [kind.lower() for kind in WINDOW_TYPE.findall(properties)],
+            "role": role.group(1) if role else ""}
+
+
+def desktop_windows():
+    """Every visible Chromium-owned window. Bubbles ("Restore pages?", save-password, permission
+    prompts), open <select> menus and native dialogs are separate X windows that sit above the
+    page and take its input, while the page itself reports nothing unusual."""
+    ids = []
+    for token in run_x11(["xdotool", "search", "--onlyvisible", "--class", "chromium"]).split():
+        if token.isdigit() and token not in ids:
+            ids.append(token)
+    windows = [window for window in (x11_window(identifier) for identifier in ids[:16])
+               if window and window["width"] > 2 and window["height"] > 2]
+    active = run_x11(["xdotool", "getactivewindow"]).strip()
+    focus = run_x11(["xdotool", "getwindowfocus", "-f"]).strip()
+    browsers = [window for window in windows if window["role"] == "browser"] or \
+        [window for window in windows if BROWSER_WINDOW_TITLE.search(window["title"] or "")]
+    main = max(browsers or windows, key=lambda w: w["width"] * w["height"]) if windows else None
+    overlays = []
+    for window in windows:
+        if main and window["id"] == main["id"]:
+            continue
+        types = window["types"]
+        if "tooltip" in types:
+            continue
+        if any(kind in types for kind in ("menu", "dropdown_menu", "popup_menu", "combo")):
+            kind = "menu"
+        elif FILE_CHOOSER_TITLE.search(window["title"] or ""):
+            kind = "file-chooser"
+        elif "dialog" in types or (window["title"] and not BROWSER_WINDOW_TITLE.search(window["title"])
+                                   and window["width"] * window["height"] > 160000):
+            kind = "dialog"
+        elif main and window["width"] * window["height"] >= 0.6 * main["width"] * main["height"]:
+            continue  # a second browser window, not an overlay
+        else:
+            kind = "bubble"
+        window["kind"] = kind
+        overlays.append(window)
+    return {
+        "available": bool(windows),
+        "activeId": int(active) if active.isdigit() else None,
+        "focusId": int(focus) if focus.isdigit() else None,
+        "browser": main, "overlays": overlays,
+    }
+
+
+def window_contains(window, x, y):
+    return window["x"] <= x < window["x"] + window["width"] and window["y"] <= y < window["y"] + window["height"]
+
+
+def dismiss_stray_overlays(windows, x=None, y=None):
+    """Close a browser bubble or menu that holds the keyboard (or grabs the pointer) when the
+    action is not aimed at it. Escape is what a person would press; it is sent only when the
+    overlay itself has focus, so it can never close a dialog inside the page by accident."""
+    dismissed = []
+    for overlay in windows.get("overlays") or []:
+        if overlay.get("kind") not in ("bubble", "menu"):
+            continue
+        if x is not None and y is not None and window_contains(overlay, x, y):
+            continue
+        focused = overlay["id"] in (windows.get("focusId"), windows.get("activeId"))
+        if overlay["kind"] == "menu" or focused:
+            run_x11(["xdotool", "key", "--clearmodifiers", "Escape"], timeout=3)
+            dismissed.append({"kind": overlay["kind"], "title": overlay.get("title") or "",
+                              "bounds": {k: overlay[k] for k in ("x", "y", "width", "height")}})
+            break
+    if dismissed:
+        time.sleep(0.25)
+        windows = desktop_windows()
+    return dismissed, windows
+
+
+def summarize_windows(windows, x=None, y=None):
+    active_id = windows.get("activeId")
+    browser = windows.get("browser")
+    overlays = []
+    for overlay in windows.get("overlays") or []:
+        overlays.append({
+            "kind": overlay.get("kind"), "title": overlay.get("title") or "",
+            "bounds": {k: overlay[k] for k in ("x", "y", "width", "height")},
+            "coversPoint": x is not None and y is not None and window_contains(overlay, x, y),
+            "focused": overlay["id"] in (windows.get("focusId"), active_id),
         })
-        output["humanChallenge"] = ((challenge_result.get("result") or {}).get("value")) or {
-            "detected": False, "signals": []}
-    except Exception as challenge_error:
-        # A JavaScript/native modal can make Runtime.evaluate unavailable. Keep the primary
-        # inspection result and report that the optional challenge probe was inconclusive.
-        output["humanChallenge"] = {
-            "detected": False, "signals": [],
-            "inspectionError": bounded_text(challenge_error, 300),
-        }
-    # A modal GTK chooser blocks the page but is invisible to the DOM. Reporting it here is what
-    # stops an agent looping on a control that cannot receive input until the dialog is dealt with.
-    output["nativeDialog"] = detect_native_dialog()
-    output["tabIndex"] = tab_index
-    output["tabCount"] = len(tabs)
-print(json.dumps(output, indent=2, ensure_ascii=False))
+    active_title = None
+    if active_id is not None:
+        active_title = run_x11(["xdotool", "getwindowname", str(active_id)])[:200] or None
+    return {"available": windows.get("available", False),
+            "browserActive": bool(browser and active_id == browser["id"]),
+            "browserBounds": {k: browser[k] for k in ("x", "y", "width", "height")} if browser else None,
+            "activeTitle": active_title,
+            "overlays": overlays[:8]}
+
+
+def arm_world(session, context_id, nonce):
+    return world_eval(session, context_id, "globalThis.__kliveInput.arm(%s)" % json.dumps(nonce), 4)
+
+
+def do_preflight(payload):
+    """What the coming input will hit, plus an armed receipt. Never raises: an inconclusive probe
+    must not stop the action, so failures come back as ok:false with whatever was learned."""
+    started = time.time()
+    intent = str(payload.get("intent") or "click").strip().lower()
+    nonce = str(payload.get("nonce") or "")[:64]
+    x, y = payload.get("x"), payload.get("y")
+    has_point = isinstance(x, (int, float)) and isinstance(y, (int, float))
+    result = {"ok": True, "intent": intent, "nonce": nonce}
+    sessions = []
+    try:
+        windows = desktop_windows()
+        if payload.get("dismissStray", True) and windows.get("overlays"):
+            dismissed, windows = dismiss_stray_overlays(windows, x if has_point else None, y if has_point else None)
+            if dismissed:
+                result["dismissed"] = dismissed
+        result["windows"] = summarize_windows(windows, x if has_point else None, y if has_point else None)
+        result["nativeDialog"] = detect_native_dialog()
+        tabs = list_tabs()
+        if not tabs:
+            result["page"] = {"available": False}
+            return result
+        index = fast_active_index(tabs) if payload.get("tabIndex") in (None, -1) else resolve_index(tabs, payload.get("tabIndex"))
+        tab = tabs[index]
+        session = session_for(tab)
+        sessions.append(session)
+        responsive = page_responsive(session)
+        result["page"] = {"available": True, "tabId": tab.get("id"), "tabIndex": index,
+                          "url": safe_url(tab.get("url") or ""), "title": bounded_text(tab.get("title") or "", 200),
+                          "responsive": responsive}
+        if not responsive:
+            result["page"]["blocked"] = ("The page stopped answering scripts: a JavaScript alert/confirm/"
+                                         "'Leave site?' dialog is most likely open, or the page is frozen.")
+            return result
+        metrics = window_metrics(session)
+        worlds = load_input_worlds()
+        top_frame = top_frame_id(session)
+        armed = []
+
+        def arm(owner, target_id, frame_id, context_id, point=None):
+            if not payload.get("arm") or not nonce:
+                return
+            if any(item["targetId"] == target_id and item["frameId"] == frame_id for item in armed):
+                return
+            arm_world(owner, context_id, nonce)
+            entry = {"targetId": target_id, "frameId": frame_id}
+            if point is not None:
+                # Where, in this frame's own coordinates, the pointer is meant to end up. The
+                # receipt measures how close the last move the page saw came to it.
+                entry["x"], entry["y"] = int(round(point[0])), int(round(point[1]))
+            armed.append(entry)
+
+        if has_point:
+            vx, vy, region = screen_to_viewport(metrics, float(x), float(y))
+            result["point"] = {"region": region, "viewport": {"x": int(round(vx)), "y": int(round(vy))}}
+            if region == "page":
+                top_context = input_world(session, tab.get("id"), top_frame, worlds)
+                arm(session, tab.get("id"), top_frame, top_context, (vx, vy))
+                hit = hit_test_point(session, tab.get("id"), vx, vy, worlds, sessions)
+                described = hit["describe"] or {}
+                provider = challenge_provider(described.get("frameUrl"))
+                result["hit"] = {
+                    "frameId": hit["frameId"], "frameUrl": safe_url(described.get("frameUrl") or ""),
+                    "crossOrigin": hit["depth"] > 0, "element": described.get("hit"),
+                    "actionable": described.get("actionable"), "cursor": described.get("cursor"),
+                    "opensFileChooser": bool(described.get("opensFileChooser")), "challenge": provider,
+                }
+                arm(hit["session"], hit["targetId"], hit["frameId"], hit["contextId"], hit["local"])
+                actionable = described.get("actionable")
+                if actionable and actionable.get("rect"):
+                    rect = actionable["rect"]
+                    centre = viewport_to_screen(metrics, hit["offset"][0] + rect["x"] + rect["w"] / 2.0,
+                                                hit["offset"][1] + rect["y"] + rect["h"] / 2.0)
+                    result["hit"]["actionableScreen"] = {"x": centre[0], "y": centre[1]}
+                elif not provider and payload.get("nearby", True):
+                    try:
+                        near = world_eval(hit["session"], hit["contextId"],
+                                          NEARBY_JS + "(%f, %f)" % (hit["local"][0], hit["local"][1]), 6) or []
+                    except Exception:
+                        near = []
+                    for item in near:
+                        centre = item.get("centre") or {}
+                        sx, sy = viewport_to_screen(metrics, hit["offset"][0] + float(centre.get("x") or 0),
+                                                    hit["offset"][1] + float(centre.get("y") or 0))
+                        item["screen"] = {"x": sx, "y": sy}
+                        item.pop("centre", None)
+                    result["nearby"] = near
+        if intent == "type":
+            focus, owner, context_id = focus_snapshot(session, tab.get("id"), top_frame, worlds, sessions)
+            arm(owner, focus.get("targetId"), focus.get("frameId"), context_id)
+            result["focus"] = focus
+        save_input_worlds(worlds)
+        result["armed"] = armed
+        remember_active(tab.get("id"))
+        return result
+    except Exception as ex:
+        result["ok"] = False
+        result["error"] = bounded_text(ex, 400)
+        return result
+    finally:
+        for owned in sessions:
+            owned.close()
+        result["elapsedMs"] = int((time.time() - started) * 1000)
+
+
+def typed_landed(before, after, selection, expected=None, expected_hash=None, expected_length=None):
+    """Whether typed text is now in the field. Exact (inserted at the caret, replacing any
+    selection), contained, or contained once the page's own formatting is stripped (card numbers,
+    phone masks). A secret is compared by hash, so its value never leaves the container."""
+    before, after = before or "", after or ""
+    start, end = (list(selection if isinstance(selection, list) else []) + [None, None])[:2]
+    if expected is not None:
+        candidates = [before + expected]
+        if isinstance(start, int) and isinstance(end, int) and 0 <= start <= end <= len(before):
+            candidates.insert(0, before[:start] + expected + before[end:])
+        exact = after in candidates
+        contained = bool(expected) and expected in after
+        strip = lambda value: re.sub(r"[\s\-().]", "", value)
+        reformatted = not (exact or contained) and bool(strip(expected)) and strip(expected) in strip(after)
+        return {"landed": exact or contained or reformatted, "exact": exact, "reformatted": reformatted}
+    length = int(expected_length or 0)
+    if not expected_hash or length <= 0:
+        return {"landed": False, "exact": False, "reformatted": False}
+    found = any(hashlib.sha256(after[i:i + length].encode("utf-8")).hexdigest() == expected_hash
+                for i in range(0, max(0, len(after) - length) + 1))
+    return {"landed": found, "exact": found and len(after) == len(before) + length, "reformatted": False}
+
+
+def do_receipt(payload):
+    """Did the input armed by preflight reach the page? Reports per frame and in summary."""
+    intent = str(payload.get("intent") or "click").strip().lower()
+    nonce = str(payload.get("nonce") or "")
+    worlds = load_input_worlds()
+    result = {"ok": True, "intent": intent, "frames": []}
+    try:
+        targets = {item.get("id"): item for item in list_targets()}
+    except Exception as ex:
+        return {"ok": False, "error": bounded_text(ex, 300)}
+    summary = {"received": False, "navigated": False, "moves": 0, "downs": 0, "clicks": 0, "keys": 0,
+               "inputs": 0, "firstTarget": None, "lastMove": None, "nearestMoveDistance": None}
+    for entry in (payload.get("armed") or [])[:6]:
+        target_id, frame_id = entry.get("targetId"), entry.get("frameId")
+        frame = {"targetId": target_id, "frameId": frame_id}
+        target = targets.get(target_id)
+        world = worlds.get((target_id or "") + "|" + (frame_id or ""))
+        if not target or not target.get("webSocketDebuggerUrl") or not world:
+            frame["gone"] = True
+            summary["navigated"] = True
+            result["frames"].append(frame)
+            continue
+        session = None
+        try:
+            session = Session(target["webSocketDebuggerUrl"], timeout=8)
+            value = world_eval(session, world["ctx"], RECEIPT_JS, 6) or {}
+        except Exception as ex:
+            # "Cannot find context": the document was replaced, which is itself a reaction.
+            frame["gone"] = True
+            frame["error"] = bounded_text(ex, 200)
+            summary["navigated"] = True
+            result["frames"].append(frame)
+            continue
+        finally:
+            if session is not None:
+                session.close()
+        if value.get("missing") or value.get("key") != world.get("key") or value.get("nonce") != nonce:
+            frame["gone"] = True
+            summary["navigated"] = True
+            result["frames"].append(frame)
+            continue
+        focus = value.pop("focus", None)
+        frame.update({key: value.get(key) for key in (
+            "docChanged", "moves", "lastMove", "downs", "trustedDowns", "clicks", "firstDown",
+            "firstClick", "keys", "inputs", "keyTarget")})
+        summary["navigated"] = summary["navigated"] or bool(value.get("docChanged"))
+        summary["moves"] += int(value.get("moves") or 0)
+        summary["downs"] += int(value.get("downs") or 0)
+        summary["clicks"] += int(value.get("clicks") or 0)
+        summary["keys"] += int(value.get("keys") or 0)
+        summary["inputs"] += int(value.get("inputs") or 0)
+        if value.get("lastMove"):
+            summary["lastMove"] = dict(value["lastMove"], frameId=frame_id)
+            if isinstance(entry.get("x"), (int, float)) and isinstance(entry.get("y"), (int, float)):
+                distance = int(round(math.hypot(float(value["lastMove"].get("x") or 0) - entry["x"],
+                                                float(value["lastMove"].get("y") or 0) - entry["y"])))
+                frame["lastMoveDistance"] = distance
+                if summary["nearestMoveDistance"] is None or distance < summary["nearestMoveDistance"]:
+                    summary["nearestMoveDistance"] = distance
+        if not summary["firstTarget"]:
+            first = value.get("firstClick") or value.get("firstDown")
+            if first:
+                summary["firstTarget"] = first.get("target")
+        if int(value.get("trustedDowns") or 0) > 0 or int(value.get("clicks") or 0) > 0:
+            summary["received"] = True
+        if focus is not None and intent == "type":
+            secret = bool(payload.get("secret"))
+            verdict = typed_landed(focus.get("before"), focus.get("after"), focus.get("sel"),
+                                   payload.get("expected") if not secret else None,
+                                   payload.get("expectedHash"), payload.get("expectedLength"))
+            typed = {"connected": focus.get("connected"), "stillFocused": focus.get("stillFocused"),
+                     "beforeLength": len(focus.get("before") or ""), "afterLength": len(focus.get("after") or "")}
+            typed.update(verdict)
+            if not secret and not payload.get("password"):
+                typed["after"] = bounded_text(focus.get("after") or "", 200)
+            result["typed"] = typed
+        result["frames"].append(frame)
+    result["summary"] = summary
+    return result
+
+
+# ── computer_cdp: the DevTools protocol as a first-class tool ────────────────────────────────
+# Agents kept rebuilding a websocket client against 127.0.0.1:9222 from the terminal every session
+# because nothing exposed the protocol directly — and it was what cleared every dead end the
+# structured tools could not. This is that escape hatch, bounded and with the persistent sign-ins
+# protected: mass cookie/storage wipes and browser shutdown are refused, and cookie values are
+# redacted from every result.
+
+CDP_ACTIONS = ("evaluate", "send", "click", "type", "key", "set_files", "dialog", "targets", "screenshot")
+CDP_METHOD = re.compile(r"^[A-Z][A-Za-z]+\.[a-z][A-Za-z]+$")
+CDP_REFUSED = {
+    "Browser.close": "it would shut the browser down",
+    "Browser.crash": "it would crash the browser",
+    "Browser.crashGpuProcess": "it would crash the GPU process",
+    "Network.clearBrowserCookies": "it would sign the persistent profile out of every site",
+    "Storage.clearCookies": "it would sign the persistent profile out of every site",
+    "Storage.clearDataForOrigin": "it would wipe a site's sign-in and storage",
+    "Storage.clearDataForStorageKey": "it would wipe a site's sign-in and storage",
+}
+COOKIE_METHODS = ("Network.getCookies", "Network.getAllCookies", "Storage.getCookies")
+
+
+def redact_cookies(value):
+    if isinstance(value, dict):
+        cleaned = {}
+        for key, item in value.items():
+            if key == "value" and isinstance(item, str) and "name" in value and "domain" in value:
+                cleaned[key] = "<redacted:%d chars>" % len(item)
+            else:
+                cleaned[key] = redact_cookies(item)
+        return cleaned
+    if isinstance(value, list):
+        return [redact_cookies(item) for item in value]
+    return value
+
+
+def bounded_json(value, limit=20000):
+    text = json.dumps(value, ensure_ascii=False)
+    if len(text) <= limit:
+        return value
+    return {"truncated": True, "length": len(text), "preview": text[:limit]}
+
+
+def cdp_session_for(payload, tabs):
+    """(session, tab, index): the active tab by default, a named target, or the browser itself."""
+    target = str(payload.get("target") or "page").strip()
+    if target == "browser":
+        version = http_json("/json/version")
+        url = version.get("webSocketDebuggerUrl")
+        if not url:
+            raise RuntimeError("The browser target exposes no debugger endpoint.")
+        return Session(url, timeout=15), None, None
+    if target not in ("", "page"):
+        for item in list_targets():
+            if item.get("id") == target or (target.startswith("frame:") and item.get("type") == "iframe"
+                                            and target[6:].lower() in (item.get("url") or "").lower()):
+                if not item.get("webSocketDebuggerUrl"):
+                    raise RuntimeError("That target exposes no debugger endpoint.")
+                return Session(item["webSocketDebuggerUrl"], timeout=15), item, None
+        raise RuntimeError("No target matches '%s'; call action=targets for the list." % bounded_text(target, 120))
+    if not tabs:
+        raise RuntimeError("No inspectable browser tab is open.")
+    index = resolve_index(tabs, payload.get("tabIndex"))
+    return session_for(tabs[index]), tabs[index], index
+
+
+def cdp_click_point(session, payload, tab):
+    """Viewport point for a cdp click: explicit viewport x/y, desktop screenX/screenY, or a
+    structured locator (css/ref/name/...) resolved through every frame."""
+    if isinstance(payload.get("x"), (int, float)) and isinstance(payload.get("y"), (int, float)):
+        return float(payload["x"]), float(payload["y"]), None
+    if isinstance(payload.get("screenX"), (int, float)) and isinstance(payload.get("screenY"), (int, float)):
+        vx, vy, region = screen_to_viewport(window_metrics(session), float(payload["screenX"]), float(payload["screenY"]))
+        if region != "page":
+            raise RuntimeError("Screen point (%d,%d) is not inside the page viewport (it is on %s)."
+                               % (payload["screenX"], payload["screenY"], region))
+        return vx, vy, None
+    locator = dict(payload)
+    if locator.get("selector") and not locator.get("css"):
+        locator["css"] = locator["selector"]
+    worlds = []
+    try:
+        worlds, _ = isolated_worlds(session, tab)
+        decoded = decode_ref(locator["ref"]) if locator.get("ref") else None
+        world, item, error = select_control(tab, worlds, locator, decoded)
+        if error:
+            raise RuntimeError((error.get("error") or {}).get("message") or "target not found")
+        geometry = selected_geometry(session, world)
+        if not geometry:
+            raise RuntimeError("The matched control has no on-screen geometry.")
+        return float(geometry["viewport"]["x"]), float(geometry["viewport"]["y"]), item
+    finally:
+        close_owned_worlds(worlds)
+
+
+def dispatch_click(session, vx, vy, button="left", clicks=1):
+    method = INPUT_ACTION + "dispatchMouseEvent"
+    session.call(method, {"type": "mouseMoved", "x": vx, "y": vy}, timeout=10)
+    session.call(method, {"type": "mousePressed", "x": vx, "y": vy, "button": button, "clickCount": clicks}, timeout=10)
+    session.call(method, {"type": "mouseReleased", "x": vx, "y": vy, "button": button, "clickCount": clicks}, timeout=10)
+
+
+def describe_point(session, tab, vx, vy):
+    try:
+        worlds = load_input_worlds()
+        sessions = []
+        try:
+            hit = hit_test_point(session, tab.get("id"), vx, vy, worlds, sessions)
+            save_input_worlds(worlds)
+            described = hit["describe"] or {}
+            return {"element": described.get("hit"), "actionable": described.get("actionable"),
+                    "frameUrl": safe_url(described.get("frameUrl") or ""),
+                    "challenge": challenge_provider(described.get("frameUrl"))}
+        finally:
+            for owned in sessions:
+                if owned is not session:
+                    owned.close()
+    except Exception as ex:
+        return {"error": bounded_text(ex, 200)}
+
+
+def recorded_focus(payload):
+    """The element preflight recorded as focused, for re-entering typing that never arrived."""
+    focus = payload.get("recordedFocus") or {}
+    target_id, frame_id = focus.get("targetId"), focus.get("frameId")
+    world = load_input_worlds().get((target_id or "") + "|" + (frame_id or ""))
+    target = next((item for item in list_targets() if item.get("id") == target_id), None)
+    if not world or not target or not target.get("webSocketDebuggerUrl"):
+        return None, None, None
+    return Session(target["webSocketDebuggerUrl"], timeout=10), world, target
+
+
+def cdp_dialog(payload, tabs):
+    accept = payload.get("accept") is not False
+    prompt_text = payload.get("promptText")
+    index = resolve_index(tabs, payload.get("tabIndex"))
+    session = session_for(tabs[index])
+    try:
+        try:
+            params = {"accept": accept}
+            if isinstance(prompt_text, str):
+                params["promptText"] = prompt_text
+            session.call("Page.handleJavaScriptDialog", params, timeout=5)
+            return {"ok": True, "handled": "cdp", "accepted": accept, "responsive": page_responsive(session)}
+        except Exception:
+            pass
+        if page_responsive(session):
+            return error_result("no-dialog", "No JavaScript dialog is blocking this tab; the page answers scripts normally.")
+        # The dialog opened before this session attached, so only real keyboard input can answer it.
+        windows = desktop_windows()
+        browser = windows.get("browser")
+        if browser:
+            run_x11(["xdotool", "windowactivate", "--sync", str(browser["id"])], timeout=3)
+        if isinstance(prompt_text, str) and prompt_text and accept:
+            run_x11(["xdotool", "type", "--delay", "40", "--", prompt_text], timeout=10)
+        run_x11(["xdotool", "key", "--clearmodifiers", "Return" if accept else "Escape"], timeout=3)
+        time.sleep(0.4)
+        responsive = page_responsive(session, timeout=2.5)
+        if not responsive:
+            return error_result("dialog-still-open",
+                                "Pressed %s but the page still does not answer. Take a screenshot: the blocker may "
+                                "be a frozen page rather than a dialog." % ("Enter" if accept else "Escape"))
+        return {"ok": True, "handled": "keyboard", "accepted": accept, "responsive": True}
+    finally:
+        session.close()
+
+
+def do_cdp(payload):
+    action = str(payload.get("action") or "").strip().lower()
+    if action not in CDP_ACTIONS:
+        return error_result("invalid-action", "action must be one of: " + ", ".join(CDP_ACTIONS) + ".")
+    if action == "targets":
+        tabs = list_tabs()
+        active = fast_active_index(tabs) if tabs else -1
+        return {"ok": True, "action": action, "activeTabIndex": active, "targets": [
+            {"id": item.get("id"), "type": item.get("type"), "title": bounded_text(item.get("title") or "", 160),
+             "url": safe_url(item.get("url") or ""), "parentId": item.get("parentId")}
+            for item in list_targets()[:60]]}
+    if action == "set_files":
+        upload_payload = dict(payload)
+        upload_payload["paths"] = payload.get("paths") or ([payload["path"]] if payload.get("path") else [])
+        if payload.get("selector") and not payload.get("trigger"):
+            upload_payload["css"] = payload.get("selector")
+        result = do_upload(upload_payload)
+        result.setdefault("ok", True)
+        result["action"] = action
+        return result
+    tabs = list_tabs()
+    if action == "dialog":
+        if not tabs:
+            return error_result("no-tab", "No inspectable browser tab is open.")
+        result = cdp_dialog(payload, tabs)
+        result["action"] = action
+        return result
+    if action == "send":
+        method = str(payload.get("method") or "").strip()
+        if not CDP_METHOD.match(method):
+            return error_result("invalid-method", "method must look like Domain.command, e.g. Page.navigate.")
+        if method in CDP_REFUSED:
+            return error_result("refused", "%s is refused: %s, and this browser's sign-ins are a persistent asset."
+                                % (method, CDP_REFUSED[method]))
+    session = None
+    owned = []
+    try:
+        if action == "type" and payload.get("recordedFocus"):
+            session, world, target = recorded_focus(payload)
+            if session is None:
+                return error_result("focus-gone", "The field recorded before typing no longer exists.")
+            owned.append(session)
+            text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+            selection = world_eval(session, world["ctx"], r"""
+              (() => { const s = globalThis.__kliveInput, el = s && s.focus;
+                if (!el || !el.isConnected) return {missing: true};
+                el.focus({preventScroll: true});
+                const [start, end] = s.sel || [null, null];
+                try { if (typeof start === 'number' && typeof el.setSelectionRange === 'function') el.setSelectionRange(start, end); } catch (_) {}
+                return {focused: document.activeElement === el || (el.getRootNode && el.getRootNode().activeElement === el)}; })()""", 5) or {}
+            if selection.get("missing"):
+                return error_result("focus-gone", "The field recorded before typing is no longer in the page.")
+            tab = next((item for item in tabs if item.get("id") == payload.get("tabId")), None) or (tabs[0] if tabs else None)
+            input_session = session_for(tab) if tab and target.get("type") == "iframe" else session
+            if input_session is not session:
+                owned.append(input_session)
+            input_session.call(INPUT_ACTION + "insertText", {"text": text}, timeout=30)
+            time.sleep(0.08)
+            value = world_eval(session, world["ctx"], RECEIPT_JS, 6) or {}
+            focus = value.get("focus") or {}
+            verdict = typed_landed(focus.get("before"), focus.get("after"), focus.get("sel"),
+                                   None if payload.get("secret") else text,
+                                   payload.get("expectedHash"), payload.get("expectedLength"))
+            result = {"ok": bool(verdict["landed"]), "action": action, "mechanism": "insert-text",
+                      "typed": dict(verdict, afterLength=len(focus.get("after") or ""))}
+            if not verdict["landed"]:
+                result["error"] = {"code": "not-applied", "message": "Re-entered the text through CDP but the field still does not hold it: the page rejects or rewrites this input."}
+            return result
+
+        session, tab, index = cdp_session_for(payload, tabs)
+        owned.append(session)
+        if action == "evaluate":
+            expression = payload.get("expression") if isinstance(payload.get("expression"), str) else ""
+            if not expression.strip():
+                return error_result("missing-expression", "evaluate requires 'expression'.")
+            if len(expression) > 16000:
+                return error_result("expression-too-large", "expression is limited to 16,000 characters.")
+            timeout = max(1, min(60, int(math.ceil(int(payload.get("timeoutMs") or 15000) / 1000.0))))
+            # replMode is the DevTools console's own evaluation mode: top-level await works and
+            # re-running a snippet that declares a const does not throw.
+            params = {"expression": expression, "returnByValue": True, "replMode": True,
+                      "awaitPromise": payload.get("awaitPromise") is not False, "userGesture": True}
+            frame = str(payload.get("frameId") or "").strip()
+            if payload.get("world") == "isolated" or frame:
+                frame = frame or top_frame_id(session)
+                if payload.get("world") == "isolated":
+                    params["contextId"] = session.call("Page.createIsolatedWorld", {
+                        "frameId": frame, "worldName": "klive-cdp"}, timeout=6).get("executionContextId")
+                else:
+                    session.call("Runtime.enable", timeout=6)
+                    context = next((event["params"]["context"]["id"] for event in session.events
+                                    if event.get("method") == "Runtime.executionContextCreated"
+                                    and ((event["params"]["context"].get("auxData") or {}).get("frameId") == frame)
+                                    and (event["params"]["context"].get("auxData") or {}).get("isDefault")), None)
+                    if context is None:
+                        return error_result("frame-not-found", "No page context for frame %s; call action=targets." % frame)
+                    params["contextId"] = context
+            outcome = session.call("Runtime.evaluate", params, timeout=timeout)
+            if outcome.get("exceptionDetails"):
+                details = outcome["exceptionDetails"]
+                return error_result("script-error", bounded_text(
+                    ((details.get("exception") or {}).get("description")) or details.get("text") or "evaluation failed", 1500))
+            remote = outcome.get("result") or {}
+            value = remote.get("value") if "value" in remote else remote.get("description") or remote.get("type")
+            return {"ok": True, "action": action, "type": remote.get("type"), "value": bounded_json(value)}
+        if action == "send":
+            params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+            timeout = max(1, min(120, int(math.ceil(int(payload.get("timeoutMs") or 15000) / 1000.0))))
+            raw = session.call(method, params, timeout=timeout)
+            if method in COOKIE_METHODS:
+                raw = redact_cookies(raw)
+            result = {"ok": True, "action": action, "method": method, "result": bounded_json(raw)}
+            wait_for = str(payload.get("waitEvent") or "").strip()
+            if wait_for:
+                wait_ms = max(0, min(60000, int(payload.get("waitMs") or 5000)))
+                event = session.wait_event(lambda e: e.get("method") == wait_for, wait_ms / 1000.0)
+                result["event"] = bounded_json(event.get("params") if event else None, 8000)
+                result["eventSeen"] = bool(event)
+            return result
+        if action == "screenshot":
+            shot = session.call("Page.captureScreenshot", {"format": "jpeg", "quality": 70}, timeout=20)
+            metrics = window_metrics(session)
+            return {"ok": True, "action": action, "jpegBase64": shot.get("data") or "",
+                    "width": int(metrics["innerWidth"]), "height": int(metrics["innerHeight"])}
+        if not page_responsive(session):
+            return error_result("page-blocked", "The page stopped answering scripts — most likely a JavaScript "
+                                "dialog is open. Use action=dialog with accept true/false first.")
+        if action == "click":
+            vx, vy, item = cdp_click_point(session, payload, tab)
+            button = str(payload.get("button") or "left").lower()
+            button = button if button in ("left", "middle", "right") else "left"
+            clicks = max(1, min(2, int(payload.get("clicks") or 1)))
+            described = describe_point(session, tab, vx, vy)
+            if payload.get("refuseChallenges") and described.get("challenge"):
+                return error_result("human-gate", "That point is inside a %s human-verification frame whose one "
+                                    "automated attempt is already used." % described["challenge"], hit=described)
+            dispatch_click(session, vx, vy, button, clicks)
+            remember_active(tab.get("id") if tab else "")
+            return {"ok": True, "action": action, "viewport": {"x": int(round(vx)), "y": int(round(vy))},
+                    "hit": described, "control": item, "url": safe_url((tab or {}).get("url") or "")}
+        if action == "key":
+            chord = str(payload.get("key") or "")
+            dispatch_key(session, chord, max(1, min(50, int(payload.get("repeats") or 1))))
+            return {"ok": True, "action": action, "key": bounded_text(chord, 40)}
+        if action == "type":
+            text = payload.get("text") if isinstance(payload.get("text"), str) else ""
+            if not text:
+                return error_result("missing-text", "type requires 'text'.")
+            if payload.get("selector") or payload.get("ref") or payload.get("name") or payload.get("label"):
+                worlds = []
+                try:
+                    worlds, _ = isolated_worlds(session, tab)
+                    decoded = decode_ref(payload["ref"]) if payload.get("ref") else None
+                    locator = dict(payload)
+                    if payload.get("selector"):
+                        locator["css"] = payload["selector"]
+                    world, item, error = select_control(tab, worlds, locator, decoded)
+                    if error:
+                        return error
+                    data = type_and_verify(session, world, text, payload)
+                    data["ok"] = not data.get("error")
+                    data["action"] = action
+                    return data
+                finally:
+                    close_owned_worlds(worlds)
+            session.call(INPUT_ACTION + "insertText", {"text": text}, timeout=30)
+            return {"ok": True, "action": action, "mechanism": "insert-text", "length": len(text)}
+        return error_result("invalid-action", "Unsupported action.")
+    except Exception as ex:
+        return error_result(action + "-failed", bounded_text(ex, 1200))
+    finally:
+        for item in owned:
+            item.close()
+
+
+# ── uploads by chooser interception ──────────────────────────────────────────────────────────
+# A site whose upload button builds an <input type=file> on the fly and clicks it without ever
+# adding it to the page offers nothing for DOM.setFileInputFiles to find, and leaves a native GTK
+# dialog as the only route — the Tumblr-avatar dead end. With interception on, the browser hands
+# the request to us instead of opening the dialog, detached input and all.
+
+def intercept_upload(tabs, index, paths, payload):
+    tab = tabs[index]
+    session = session_for(tab)
+    sessions = [session]
+    try:
+        if not page_responsive(session):
+            return error_result("page-blocked", "The page is not answering scripts (a JavaScript dialog is "
+                                "probably open). Clear it before uploading.")
+        session.call("Page.enable", timeout=8)
+        session.call("Page.setInterceptFileChooserDialog", {"enabled": True}, timeout=8)
+        # An input inside an out-of-process frame raises its chooser on that frame's own target.
+        for target in list_targets()[:24]:
+            if target.get("type") == "iframe" and target.get("webSocketDebuggerUrl"):
+                try:
+                    child = Session(target["webSocketDebuggerUrl"], timeout=8)
+                    sessions.append(child)
+                    child.call("Page.enable", timeout=5)
+                    child.call("Page.setInterceptFileChooserDialog", {"enabled": True}, timeout=5)
+                except Exception:
+                    pass
+        trigger = payload.get("trigger") if isinstance(payload.get("trigger"), dict) else {}
+        point = dict(trigger)
+        vx, vy, item = cdp_click_point(session, point, tab)
+        # A file chooser opens only from a user gesture; CDP input is trusted, a script click is not.
+        dispatch_click(session, vx, vy)
+        event, owner = None, None
+        deadline = time.time() + max(1.0, min(15.0, float(payload.get("chooserWaitSeconds") or 6)))
+        while time.time() < deadline and event is None:
+            for candidate in sessions:
+                found = candidate.wait_event(lambda e: e.get("method") == "Page.fileChooserOpened", 0.15)
+                if found:
+                    event, owner = found, candidate
+                    break
+        if not event:
+            return error_result(
+                "no-file-chooser",
+                "Clicked the trigger but the page did not ask for a file. It may have opened a menu first "
+                "(inspect the page and pass that menu item as the trigger), or it accepts drag-and-drop only.",
+                clicked={"viewport": {"x": int(round(vx)), "y": int(round(vy))}, "control": item})
+        params = event.get("params") or {}
+        mode = params.get("mode") or "selectSingle"
+        note = None
+        if len(paths) > 1 and mode == "selectSingle":
+            paths, note = paths[:1], "The page asked for a single file, so only the first path was attached."
+        owner.call("DOM.setFileInputFiles", {"files": paths, "backendNodeId": params.get("backendNodeId")}, timeout=90)
+        state = {}
+        try:
+            remote = owner.call("DOM.resolveNode", {"backendNodeId": params.get("backendNodeId")}, timeout=8)
+            state = (owner.call("Runtime.callFunctionOn", {
+                "objectId": (remote.get("object") or {}).get("objectId"), "returnByValue": True,
+                "functionDeclaration": "function(){return {count:this.files?this.files.length:0,"
+                                       "names:this.files?Array.prototype.map.call(this.files,function(f){return f.name;}):[],"
+                                       "connected:this.isConnected};}"}, timeout=8).get("result") or {}).get("value") or {}
+        except Exception:
+            pass
+        result = {"attached": int(state.get("count") or 0), "files": state.get("names") or [],
+                  "via": "chooser-interception", "chooserMode": mode,
+                  "detachedInput": state.get("connected") is False, "tabIndex": index,
+                  "url": safe_url(tab.get("url") or ""), "title": bounded_text(tab.get("title") or "", 200)}
+        if note:
+            result["note"] = note
+        return result
+    finally:
+        for owned in sessions:
+            try:
+                owned.call("Page.setInterceptFileChooserDialog", {"enabled": False}, timeout=3)
+            except Exception:
+                pass
+            owned.close()
+
+
+# ── entry point ──────────────────────────────────────────────────────────────────────────────
+def main():
+    mode = (sys.argv[1] if len(sys.argv) > 1 else "dom").lower()
+    if mode in ACTION_MODES:
+        action_payload = decode_payload(sys.argv[2]) if len(sys.argv) > 2 else {}
+        action = {
+            "navigate": do_navigate, "closetabs": do_closetabs, "upload": do_upload,
+            "dialog": do_dialog, "control": do_control, "action": do_control,
+            "preflight": do_preflight, "receipt": do_receipt, "cdp": do_cdp,
+        }[mode]
+        action_output = action(action_payload)
+        print(json.dumps(action_output, indent=2, ensure_ascii=False))
+        # Existing action helpers signal operational failures by throwing/non-zero exit. Structured
+        # action returns an error envelope so callers and humans get a useful reason; mirror the old
+        # process contract as well so ContainerToolAdapter does not report {"ok":false} as success.
+        # preflight/receipt always exit 0: an inconclusive probe must never block the input itself.
+        if mode in ("control", "action", "cdp") and isinstance(action_output, dict) \
+                and action_output.get("ok") is False:
+            raise SystemExit(2)
+        raise SystemExit(0)
+
+    limit = max(1, min(200, int(sys.argv[2]) if len(sys.argv) > 2 else 80))
+    # -1 (or omitted) means "the tab the human would be looking at". Defaulting to index 0 made every
+    # inspection after a few navigations report a stale page while the agent acted on the live one.
+    tab_index = max(-1, min(200, int(sys.argv[3]) if len(sys.argv) > 3 else -1))
+    query = {}
+    if mode == "locate":
+        if len(sys.argv) < 5:
+            raise RuntimeError("locate mode requires a base64url JSON query")
+        query = decode_payload(sys.argv[4])
+    tabs = list_tabs()
+    if mode == "tabs":
+        active = active_index(tabs) if tabs else 0
+        print(json.dumps([{"index": i, "id": t.get("id"), "title": t.get("title"), "url": t.get("url"),
+                           "active": i == active, "blank": is_blank(t.get("url"))}
+                          for i, t in enumerate(tabs[:limit])], indent=2))
+        raise SystemExit(0)
+    if not tabs:
+        raise RuntimeError("No inspectable browser tab is open.")
+
+    tab_index = resolve_index(tabs, tab_index)
+    tab = tabs[tab_index]
+    ws_url = tab["webSocketDebuggerUrl"]
+    if mode == "controls":
+        output = inspect_controls(tab, tab_index, tabs, limit)
+    elif mode == "accessibility":
+        result = cdp(ws_url, "Accessibility.getFullAXTree")
+        nodes = []
+        for node in result.get("nodes", [])[:limit]:
+            nodes.append({
+                "role": (node.get("role") or {}).get("value"),
+                "name": (node.get("name") or {}).get("value"),
+                "description": (node.get("description") or {}).get("value"),
+                "ignored": node.get("ignored", False),
+            })
+        output = {"title": tab.get("title"), "url": tab.get("url"), "nodes": nodes}
+    elif mode == "locate":
+        expression = r"""
+        (() => {
+          const query = %s;
+          const norm = value => String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+          const roleOf = x => {
+            const explicit = x.getAttribute('role');
+            if (explicit) return explicit.toLowerCase();
+            const tag = x.tagName.toLowerCase();
+            const type = (x.getAttribute('type') || '').toLowerCase();
+            if (tag === 'button' || (tag === 'input' && ['button','submit','reset','image'].includes(type))) return 'button';
+            if (tag === 'a' && x.hasAttribute('href')) return 'link';
+            if (tag === 'select') return 'combobox';
+            if (tag === 'textarea' || (tag === 'input' && !['checkbox','radio','range','file','color','hidden'].includes(type))) return 'textbox';
+            if (tag === 'input' && type === 'checkbox') return 'checkbox';
+            if (tag === 'input' && type === 'radio') return 'radio';
+            return '';
+          };
+          const nameOf = x => {
+            const labelledBy = (x.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+              .map(id => document.getElementById(id)?.innerText || '').join(' ');
+            const labels = x.labels ? [...x.labels].map(label => label.innerText || '').join(' ') : '';
+            const type = (x.getAttribute('type') || '').toLowerCase();
+            const safeButtonValue = ['button','submit','reset'].includes(type) ? x.getAttribute('value') : '';
+            return (x.getAttribute('aria-label') || labelledBy || labels || x.innerText ||
+              x.getAttribute('placeholder') || x.getAttribute('title') || safeButtonValue || x.getAttribute('name') || '').trim();
+          };
+          const controls = [...document.querySelectorAll('button,input,select,textarea,a[href],[role],[contenteditable="true"]')]
+            .map((x, index) => {
+              const rect = x.getBoundingClientRect();
+              const style = getComputedStyle(x);
+              const visible = rect.width > 2 && rect.height > 2 && style.display !== 'none' && style.visibility !== 'hidden' && Number(style.opacity || 1) > 0;
+              const cx = rect.left + rect.width / 2;
+              const cy = rect.top + rect.height / 2;
+              const hit = visible ? document.elementFromPoint(cx, cy) : null;
+              const intercepted = !!hit && hit !== x && !x.contains(hit);
+              const borderX = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+              const browserTop = Math.max(0, window.outerHeight - window.innerHeight - borderX);
+              return {element:x, index, name:nameOf(x), role:roleOf(x), tag:x.tagName.toLowerCase(), visible,
+                disabled:!!x.disabled || x.getAttribute('aria-disabled') === 'true', intercepted,
+                interceptedBy:intercepted ? {name:nameOf(hit), role:roleOf(hit), tag:hit.tagName.toLowerCase()} : null,
+                x:Math.round(window.screenX + borderX + cx), y:Math.round(window.screenY + browserTop + cy),
+                bounds:{x:Math.round(rect.left),y:Math.round(rect.top),width:Math.round(rect.width),height:Math.round(rect.height)}};
+            }).filter(item => item.visible);
+          const wantedName = norm(query.name || query.text);
+          const wantedRole = norm(query.role);
+          const wantedTag = norm(query.tag);
+          const exact = query.exact === true;
+          const matched = controls.filter(item => {
+            const itemName = norm(item.name);
+            return (!wantedName || (exact ? itemName === wantedName : itemName.includes(wantedName))) &&
+              (!wantedRole || norm(item.role) === wantedRole) && (!wantedTag || norm(item.tag) === wantedTag);
+          });
+          const occurrence = Math.max(0, Number(query.occurrence || 0));
+          const selected = matched[occurrence];
+          const clean = item => item ? {index:item.index,name:item.name,role:item.role,tag:item.tag,
+            disabled:item.disabled,intercepted:item.intercepted,interceptedBy:item.interceptedBy,
+            x:item.x,y:item.y,bounds:item.bounds} : null;
+          return {title:document.title,url:location.href,match:clean(selected),matchCount:matched.length,
+            candidates:controls.slice(0,20).map(clean)};
+        })()
+        """ % json.dumps(query, ensure_ascii=False)
+        result = cdp(ws_url, "Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
+        if result.get("exceptionDetails"):
+            details = result["exceptionDetails"]
+            raise RuntimeError(details.get("text") or ((details.get("exception") or {}).get("description")) or "Runtime.evaluate failed")
+        output = ((result.get("result") or {}).get("value"))
+    else:
+        expression = """
+        (() => {
+          const maxItems = %d;
+          if (%s) {
+            return {title: document.title, url: location.href,
+              resources: performance.getEntriesByType('resource').slice(-maxItems).map(x => ({name:x.name, initiatorType:x.initiatorType, duration:Math.round(x.duration), transferSize:x.transferSize}))};
+          }
+          return {title: document.title, url: location.href,
+            text: (document.body?.innerText || '').slice(0, 16000),
+            links: [...document.querySelectorAll('a[href]')].slice(0,maxItems).map(x => ({text:(x.innerText||x.getAttribute('aria-label')||'').trim().slice(0,200), href:x.href})),
+            forms: [...document.forms].slice(0,maxItems).map(f => ({action:f.action, method:f.method, fields:[...f.elements].slice(0,40).map(x => ({name:x.name, type:x.type, ariaLabel:x.getAttribute('aria-label'), required:x.required}))})),
+            fileInputs: [...document.querySelectorAll('input[type=file]')].map(x => ({name:x.name||x.id||'', accept:x.accept||'', multiple:!!x.multiple, attached:x.files?x.files.length:0})),
+            controls: [...document.querySelectorAll('button,input,select,textarea,[role],[contenteditable="true"]')].slice(0,maxItems).map(x => ({
+              tag:x.tagName,
+              role:x.getAttribute('role')||undefined,
+              type:x.type||undefined,
+              text:(x.innerText||x.getAttribute('aria-label')||x.getAttribute('placeholder')||'').trim().slice(0,200),
+              name:x.getAttribute('name')||undefined,
+              ariaLabel:x.getAttribute('aria-label')||undefined,
+              expanded:x.getAttribute('aria-expanded')||undefined,
+              selected:x.getAttribute('aria-selected')||undefined,
+              checked:typeof x.checked==='boolean'?x.checked:undefined,
+              required:!!x.required,
+              disabled:!!x.disabled,
+              bounds:(() => { const r=x.getBoundingClientRect(); return {x:Math.round(r.x),y:Math.round(r.y),width:Math.round(r.width),height:Math.round(r.height)}; })()
+            }))};
+        })()
+        """ % (limit, "true" if mode == "network" else "false")
+        result = cdp(ws_url, "Runtime.evaluate", {"expression": expression, "returnByValue": True, "awaitPromise": True})
+        if result.get("exceptionDetails"):
+            details = result["exceptionDetails"]
+            raise RuntimeError(details.get("text") or ((details.get("exception") or {}).get("description")) or "Runtime.evaluate failed")
+        output = ((result.get("result") or {}).get("value"))
+        if output is None:
+            raise RuntimeError("Runtime.evaluate returned no inspectable value for the selected visible tab.")
+
+    # Detect human-verification gates on every inspectable mode, before an agent burns retries trying
+    # controls that automation cannot complete. DOM selectors catch reCAPTCHA/hCaptcha/Turnstile;
+    # bounded visible-text signals cover provider-hosted interstitials.
+    if isinstance(output, dict):
+        challenge_expression = r"""
+        (() => {
+          const signals = [];
+          const visible = x => {
+            const r = x.getBoundingClientRect(); const s = getComputedStyle(x);
+            return r.width > 2 && r.height > 2 && s.display !== 'none' && s.visibility !== 'hidden';
+          };
+          const selectors = ['.g-recaptcha','.h-captcha','[data-sitekey]','[name="cf-turnstile-response"]',
+            'iframe[src*="recaptcha"]','iframe[src*="hcaptcha"]','iframe[src*="challenges.cloudflare.com"]'];
+          for (const selector of selectors) {
+            if ([...document.querySelectorAll(selector)].some(visible)) signals.push('visible selector: ' + selector);
+          }
+          const text = (document.body?.innerText || '').slice(0, 6000).toLowerCase();
+          for (const marker of ['verify you are human','complete the security check','checking your browser',
+            'security verification','captcha']) {
+            if (text.includes(marker)) signals.push('visible text: ' + marker);
+          }
+          return {detected: signals.length > 0, signals: [...new Set(signals)].slice(0,8)};
+        })()
+        """
+        try:
+            challenge_result = cdp(ws_url, "Runtime.evaluate", {
+                "expression": challenge_expression, "returnByValue": True, "awaitPromise": True
+            })
+            output["humanChallenge"] = ((challenge_result.get("result") or {}).get("value")) or {
+                "detected": False, "signals": []}
+        except Exception as challenge_error:
+            # A JavaScript/native modal can make Runtime.evaluate unavailable. Keep the primary
+            # inspection result and report that the optional challenge probe was inconclusive.
+            output["humanChallenge"] = {
+                "detected": False, "signals": [],
+                "inspectionError": bounded_text(challenge_error, 300),
+            }
+        # A modal GTK chooser blocks the page but is invisible to the DOM. Reporting it here is what
+        # stops an agent looping on a control that cannot receive input until the dialog is dealt with.
+        output["nativeDialog"] = detect_native_dialog()
+        output["tabIndex"] = tab_index
+        output["tabCount"] = len(tabs)
+    print(json.dumps(output, indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

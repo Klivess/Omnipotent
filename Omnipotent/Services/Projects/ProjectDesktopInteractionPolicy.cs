@@ -73,6 +73,9 @@ public static class ProjectDesktopInteractionPolicy
             return null;
         }
 
+        if (toolName == "computer_cdp")
+            return FindCdpViolation(argumentsJson);
+
         if (!ScriptTools.Contains(toolName)) return null;
 
         string script = extracted;
@@ -107,6 +110,50 @@ public static class ProjectDesktopInteractionPolicy
         return ViolationText(hiddenNetworkMutation
             ? "hidden mutation of a public website over HTTP"
             : "hidden browser automation");
+    }
+
+    /// <summary>
+    /// computer_cdp drives the same visible, persistent browser through the audited tool path, so
+    /// its input, dialog, file, target and screenshot actions are first-party browser operations like
+    /// any other. Only its two raw escape hatches can hide work, and under the browser-first contract
+    /// they are held to what op=script already allows: no page-script network calls, and raw
+    /// commands limited to reading state and driving the visible page.
+    /// </summary>
+    private static readonly string[] HiddenPageScriptMarkers =
+    {
+        "fetch(", "xmlhttprequest", "sendbeacon", "new websocket", "websocket(", "eventsource",
+        "importscripts", "serviceworker.register", ".requestsubmit(",
+    };
+
+    private static readonly Regex VisibleCdpMethod = new(
+        @"^(?:(?:DOM|CSS|Accessibility|DOMSnapshot|Overlay|Log|Performance|Memory|Animation|LayerTree|Input)\.\w+" +
+        @"|Page\.(?:get\w+|navigate|reload|bringToFront|captureScreenshot|handleJavaScriptDialog|stopLoading|navigateToHistoryEntry|setInterceptFileChooserDialog|enable|disable)" +
+        @"|Runtime\.(?:getProperties|releaseObject|releaseObjectGroup|enable|disable|getHeapUsage)" +
+        @"|(?:Network|Storage|Target|Browser|SystemInfo|Emulation)\.get\w+" +
+        @"|Target\.activateTarget|Browser\.getVersion|Browser\.getWindowForTarget)$",
+        RegexOptions.Compiled);
+
+    private static string? FindCdpViolation(string? argumentsJson)
+    {
+        JObject args;
+        try { args = JObject.Parse(string.IsNullOrWhiteSpace(argumentsJson) ? "{}" : argumentsJson); }
+        catch { return null; }
+        string action = ((string?)args["action"] ?? "").Trim().ToLowerInvariant();
+        if (action == "evaluate")
+        {
+            string expression = ((string?)args["expression"] ?? "").ToLowerInvariant();
+            return HiddenPageScriptMarkers.Any(expression.Contains)
+                ? ViolationText("a page script that makes its own network requests (computer_cdp evaluate)")
+                : null;
+        }
+        if (action == "send")
+        {
+            string method = ((string?)args["method"] ?? "").Trim();
+            return VisibleCdpMethod.IsMatch(method)
+                ? null
+                : ViolationText($"the raw DevTools command {method} (computer_cdp send; only reads and visible-page driving are allowed here)");
+        }
+        return null;
     }
 
     private static string ViolationText(string reason) =>

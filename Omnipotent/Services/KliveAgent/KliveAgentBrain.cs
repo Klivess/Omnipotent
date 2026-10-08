@@ -437,7 +437,7 @@ namespace Omnipotent.Services.KliveAgent
             // KliveAgent's own desktop (container target) adds structured browser control and a
             // container-local terminal on top of the shared visual vocabulary.
             "computer_browser_inspect", "computer_browser_action", "computer_click_browser_control",
-            "computer_upload_file", "computer_terminal"
+            "computer_upload_file", "computer_terminal", "computer_cdp"
         };
 
         private static bool IsComputerTool(string name) => ComputerUseToolNames.Contains(name);

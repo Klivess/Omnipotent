@@ -97,6 +97,7 @@
 		<None Update="Services\Projects\Containers\browser-service.py" CopyToOutputDirectory="PreserveNewest" />
 		<None Update="Services\Projects\Containers\klive-fp-manifest.json" CopyToOutputDirectory="PreserveNewest" />
 		<None Update="Services\Projects\Containers\klive-fp-patch.js" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Projects\Containers\klive-cdp" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 </Project>

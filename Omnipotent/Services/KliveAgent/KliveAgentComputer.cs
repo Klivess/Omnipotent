@@ -134,7 +134,7 @@ public sealed class KliveAgentComputer
     /// <summary>Tools that only exist on KliveAgent's container desktop.</summary>
     internal static readonly IReadOnlySet<string> ContainerOnlyTools = new HashSet<string>(StringComparer.Ordinal)
     {
-        "computer_browser_action", "computer_click_browser_control", "computer_upload_file", "computer_terminal",
+        "computer_browser_action", "computer_click_browser_control", "computer_upload_file", "computer_terminal", "computer_cdp",
     };
 
     /// <summary>
@@ -165,7 +165,7 @@ public sealed class KliveAgentComputer
             "GATE + perform an irreversible click (place an order, final Pay, publish publicly, send to a real person). Shows Klives the current desktop and blocks until he approves, then clicks (x,y). Ordinary signup/login/settings clicks are NOT irreversible — use normal tools for those.",
             Obj(new { x = integer, y = integer, summary = str, button = str }, "x", "y", "summary")));
         tools.Add(Tool("request_human",
-            "Hand your desktop to Klives for something only a human can do: an SMS/phone code, an identity check, a CAPTCHA that computer_browser_action op=solve_challenge could not clear, or a genuinely ambiguous judgement. He sees your live desktop in the chat (and gets a Discord ping), takes control, and you AUTO-RESUME when he is done — so do NOT end your turn or abandon the task. Never use it for ordinary clicks, file dialogs, email verification (use klivemail_wait_for_email) or work that is merely tedious.",
+            "Hand your desktop to Klives for something only a human can do: an SMS/phone code, an identity check, a CAPTCHA after its one automated attempt (op=solve_challenge or a rejected click — a HUMAN_GATE result is handed over for you), or a genuinely ambiguous judgement. He sees your live desktop in the chat (and gets a Discord ping), takes control, and you AUTO-RESUME when he is done — so do NOT end your turn or abandon the task. Never use it for ordinary clicks, file dialogs (computer_upload_file handles those), email verification (use klivemail_wait_for_email) or work that is merely tedious.",
             Obj(new { reason = str, maxMinutes = integer }, "reason")));
         tools.Add(Tool("save_encrypted_memory",
             "Securely store a credential/secret under a name. The value is encrypted and NEVER shown back to you — type it later as {Name} in computer_type or computer_browser_action fill. For accounts on external services prefer the shared account registry ({account:service/field}).",
@@ -213,7 +213,11 @@ public sealed class KliveAgentComputer
                         : await host.ExecuteToolAsync(toolName, argsJson, ct, onProgress);
                 }
             }
-            return await RunOnDesktopAsync(toolName, argsJson, ct, onProgress);
+            var (result, kind) = await RunOnDesktopDetailedAsync(toolName, argsJson, ct, onProgress);
+            if (kind == ContainerToolAdapter.ContainerToolFailureKind.HumanRequired
+                && await agent.GetBoolOmniSetting("KliveAgent_AutoHandOffHumanGates", true))
+                return await HandOffHumanGateAsync(toolName, result, conversationId, ct, onProgress);
+            return result;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
         {
@@ -226,14 +230,41 @@ public sealed class KliveAgentComputer
         }
     }
 
+    /// <summary>
+    /// A CAPTCHA that has rejected its one automated attempt goes to Klives at once, in this same
+    /// run. The report's lesson was "after one failure, escalate immediately": every retry burns
+    /// trust with the site, and a solved token lives about two minutes, so the round trip of the
+    /// model deciding to ask is time the token does not have.
+    /// </summary>
+    private async Task<ComputerToolResult> HandOffHumanGateAsync(string toolName, ComputerToolResult gated, string? conversationId,
+        CancellationToken ct, Action<HostControlProgress> onProgress)
+    {
+        string gate = gated.Text ?? "";
+        int start = gate.IndexOf("HUMAN_GATE: ", StringComparison.Ordinal);
+        string detail = start >= 0 ? gate[(start + "HUMAN_GATE: ".Length)..] : gate;
+        int sentence = detail.IndexOf(" — ", StringComparison.Ordinal);
+        string what = Trim(sentence > 0 ? detail[..sentence] : detail, 160);
+        string reason = $"Please clear the human check on my desktop ({what}). Tick or solve it, then hand back — " +
+                        "I submit straight away, because the token expires about two minutes after you solve it.";
+        var takeover = await RequestHumanAsync(JsonSerializer.Serialize(new { reason }), conversationId, ct, onProgress);
+        takeover.Text = $"{toolName}: {gate}\n\nThe desktop was handed to Klives automatically. {takeover.Text}";
+        return takeover;
+    }
+
     [SupportedOSPlatform("windows")]
     private async Task<ComputerToolResult> RunOnDesktopAsync(string toolName, string? argsJson, CancellationToken ct,
-        Action<HostControlProgress> onProgress)
+        Action<HostControlProgress> onProgress) =>
+        (await RunOnDesktopDetailedAsync(toolName, argsJson, ct, onProgress)).Result;
+
+    [SupportedOSPlatform("windows")]
+    private async Task<(ComputerToolResult Result, ContainerToolAdapter.ContainerToolFailureKind Kind)> RunOnDesktopDetailedAsync(
+        string toolName, string? argsJson, CancellationToken ct, Action<HostControlProgress> onProgress)
     {
+        const ContainerToolAdapter.ContainerToolFailureKind failed = ContainerToolAdapter.ContainerToolFailureKind.Infrastructure;
         var projects = ResolveProjects();
         var desktops = projects?.Desktops;
         if (projects == null || desktops == null)
-            return ComputerToolResult.Fail("KliveAgent's desktop is unavailable: the Projects desktop subsystem is not running on this host.");
+            return (ComputerToolResult.Fail("KliveAgent's desktop is unavailable: the Projects desktop subsystem is not running on this host."), failed);
         EnsureSubscribed(projects);
 
         var settings = projects.Settings?.Get(OwnerID) ?? new ProjectSettings { ProjectID = OwnerID };
@@ -244,12 +275,12 @@ public sealed class KliveAgentComputer
             // they only need Docker and the image.
             string? bootstrap = await desktops.TryBootstrapAsync(settings.DesktopImage, ct);
             if (bootstrap != null)
-                return ComputerToolResult.Fail("KliveAgent's desktop runtime is not ready: " + bootstrap);
+                return (ComputerToolResult.Fail("KliveAgent's desktop runtime is not ready: " + bootstrap), failed);
         }
         else
         {
             string? problem = await EnsureReadyAsync(desktops, settings.DesktopImage, ct, onProgress);
-            if (problem != null) return ComputerToolResult.Fail(problem);
+            if (problem != null) return (ComputerToolResult.Fail(problem), failed);
         }
 
         var adapter = await desktops.GetAdapterForAgentAsync(OwnerProject, AgentID,
@@ -267,7 +298,7 @@ public sealed class KliveAgentComputer
 
         if (result.Jpeg is { Length: > 0 } frame)
             lock (frameLock) lastFrameJpeg = frame;
-        return Map(result);
+        return (Map(result), result.FailureKind);
     }
 
     /// <summary>Self-heals Docker/the image, provisions or resumes the desktop and probes it, at most
@@ -391,6 +422,9 @@ public sealed class KliveAgentComputer
         string reason = Str(args, "reason") ?? Str(args, "what") ?? "I need you to take over my desktop for a moment.";
         int maxMinutes = Math.Clamp(Int(args, "maxMinutes", await agent.GetIntOmniSetting("KliveAgent_HumanHandoffMaxMinutes", 20)), 1, 240);
         int idleResumeSeconds = Math.Max(10, await agent.GetIntOmniSetting("KliveAgent_TakeoverIdleResumeSeconds", 45));
+        // One nudge if nobody has touched the desktop by then. The website card stays live the whole
+        // time; this is for when Klives is away from it and the Discord ping scrolled past.
+        int reminderMinutes = Math.Max(0, await agent.GetIntOmniSetting("KliveAgent_TakeoverReminderMinutes", 4));
 
         // The takeover is of THIS desktop: make sure it is up and capture what Klives will land on.
         var before = await RunOnDesktopAsync("computer_screenshot", "{}", ct, onProgress);
@@ -432,6 +466,7 @@ public sealed class KliveAgentComputer
         var deadline = DateTime.UtcNow.AddMinutes(maxMinutes);
         var waited = System.Diagnostics.Stopwatch.StartNew();
         long lastHeartbeat = 0;
+        bool reminded = reminderMinutes == 0 || reminderMinutes >= maxMinutes;
         string outcome = "timeout";
         var desktops = ResolveProjects()?.Desktops;
         try
@@ -440,6 +475,17 @@ public sealed class KliveAgentComputer
             {
                 if (ct.IsCancellationRequested) { handoff.Completion.TrySetResult("cancelled"); break; }
                 if (DateTime.UtcNow >= deadline) { handoff.Completion.TrySetResult("timeout"); break; }
+                if (!reminded && waited.Elapsed >= TimeSpan.FromMinutes(reminderMinutes) && Volatile.Read(ref handoff.Interacted) == 0)
+                {
+                    reminded = true;
+                    try
+                    {
+                        await agent.ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                            $"⏳ **Still waiting on you** ({KliveAgentBrain.FormatElapsed(waited.Elapsed)}): {Trim(reason, 240)}\n" +
+                            $"My run is paused on it, not stuck. Take over here: {link}");
+                    }
+                    catch { /* best effort; the card is still live */ }
+                }
                 // A desktop awaiting Klives counts as in use: idle suspension would stop the container
                 // under him and lose the very page (and any solved CAPTCHA) he was asked to work on.
                 desktops?.MarkViewed(containerID);
@@ -478,10 +524,15 @@ public sealed class KliveAgentComputer
         }
 
         if (outcome == "cancelled") return ComputerToolResult.Fail("Takeover cancelled (run stopped).");
+        // Whatever he did may have cleared a human check, so its one-attempt rule starts afresh.
+        if (outcome == "done" || Volatile.Read(ref handoff.Interacted) == 1)
+            ContainerToolAdapter.NoteHumanControl(containerID);
         var after = await RunOnDesktopAsync("computer_screenshot", "{}", ct, onProgress);
         after.Text = outcome switch
         {
-            "done" => "Klives took over your desktop and handed it back. Re-read the screen (inspect the page) to see what he did, then CONTINUE the task from here. " + after.Text,
+            "done" => "Klives took over your desktop and handed it back. If he cleared a CAPTCHA or verification, submit the form NOW — " +
+                      "a solved token expires about two minutes after he solved it, so do that before any long inspection. " +
+                      "Otherwise re-read the screen (inspect the page) to see what he did, then CONTINUE the task from here. " + after.Text,
             "cancelled-by-klives" => "Klives declined the takeover — he could not or would not do it. Find another route, or report what is blocking you. " + after.Text,
             _ => $"Nobody took over within {maxMinutes} min; the obstacle may still be there. Decide whether to try another route, ask again with request_human, or report the blocker. " + after.Text,
         };

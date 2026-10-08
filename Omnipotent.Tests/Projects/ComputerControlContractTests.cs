@@ -195,7 +195,13 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("xfdesktop", entrypoint);
             Assert.Contains("xfce4-panel", entrypoint);
             Assert.Contains("thunar mousepad ristretto", dockerfile);
-            Assert.Contains("\"imageVersion\":\"12\"", dockerfile);
+            Assert.Contains("\"imageVersion\":\"13\"", dockerfile);
+            // v13: verified physical input, the DevTools tool, chooser interception and the baked
+            // klive-cdp client.
+            Assert.Contains("\"input-receipts\"", dockerfile);
+            Assert.Contains("\"cdp-tool\"", dockerfile);
+            Assert.Contains("\"file-chooser-intercept\"", dockerfile);
+            Assert.Contains("COPY klive-cdp /usr/local/bin/klive-cdp", dockerfile);
             Assert.Contains("\"desktop-shell\"", dockerfile);
             Assert.Contains("\"structured-browser-actions\"", dockerfile);
             // The helper is served over a published loopback port so an ordinary browser action

@@ -70,8 +70,33 @@ namespace Omnipotent.Services.Projects.Containers
             "computer_open_browser", "computer_navigate", "computer_browser_inspect", "computer_browser_action", "computer_click_browser_control", "computer_focus_window", "computer_launch_app",
             "computer_upload_file",
             "computer_terminal",
+            "computer_cdp",
             "computer_clipboard_get", "computer_clipboard_set",
         };
+
+        /// <summary>Where the last physical click on each desktop landed. When that click opened a
+        /// native file chooser, the upload tool closes the chooser and re-presses the same control
+        /// with the browser's file request intercepted, so no GTK dialog has to be operated.</summary>
+        private sealed record PointerMemory(int X, int Y, DateTime AtUtc, bool OpensFileChooser);
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, PointerMemory> LastPointer = new(StringComparer.Ordinal);
+        private static readonly TimeSpan PointerMemoryLifetime = TimeSpan.FromMinutes(3);
+
+        /// <summary>Helper modes a desktop's (older) image does not have, so they are not retried on
+        /// every action before the container is rebuilt.</summary>
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> UnsupportedHelperModes = new(StringComparer.Ordinal);
+
+        private static readonly Regex PlaceholderPattern = new(@"\{[^{}\r\n]{1,200}\}", RegexOptions.Compiled);
+
+        /// <summary>
+        /// A human just drove this desktop (remote control or a KliveAgent takeover). Whatever was
+        /// blocking the agent — a CAPTCHA above all — may now be cleared, so the one-attempt rule on
+        /// human-verification widgets starts again from a clean slate.
+        /// </summary>
+        internal static void NoteHumanControl(string containerID)
+        {
+            if (string.IsNullOrWhiteSpace(containerID)) return;
+            HumanGateRegistry.Reset(containerID);
+        }
 
         internal static IReadOnlySet<string> SupportedToolNames => Tools;
 
@@ -98,7 +123,12 @@ namespace Omnipotent.Services.Projects.Containers
             SupportedTools = Tools,
         };
 
-        public enum ContainerToolFailureKind { None, Validation, Semantic, Contention, BrowserInspection, Infrastructure, Cancelled }
+        /// <summary>
+        /// HumanRequired: the action hit a human-verification gate that automated input cannot pass
+        /// (a CAPTCHA that already rejected its one synthetic attempt). The text says what to hand
+        /// over; KliveAgent opens the takeover automatically when it sees this kind.
+        /// </summary>
+        public enum ContainerToolFailureKind { None, Validation, Semantic, Contention, BrowserInspection, Infrastructure, Cancelled, HumanRequired }
 
         /// <summary>Result kept for the existing Project runner. Jpeg is always the final gridded frame.</summary>
         public sealed record ContainerToolResult(bool Success, string Text, byte[]? Jpeg = null)
@@ -292,6 +322,8 @@ namespace Omnipotent.Services.Projects.Containers
                     return await MutateAsync("Desktop application launched.", () => desktop.LaunchAsync(Str(a, "shellName") ?? Str(a, "path"), Str(a, "args"), ct), ct);
                 case "computer_terminal":
                     return await TerminalAsync(a, ct);
+                case "computer_cdp":
+                    return await CdpAsync(a, ct);
                 case "computer_clipboard_get":
                     return ContainerToolResult.Ok(transport.GetClipboardText() is { } clip ? $"Clipboard: {clip}" : "Clipboard is unavailable until the desktop publishes a selection.");
                 case "computer_clipboard_set":
@@ -416,7 +448,7 @@ namespace Omnipotent.Services.Projects.Containers
                     stdout = served.Value.Stdout.Trim();
                     lastError = served.Value.Error;
                     if (served.Value.Ok && stdout.Length > 0 && stdout is not "null" and not "[]")
-                        return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000));
+                        return ContainerToolResult.Ok(Scrub(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000)));
                 }
                 else
                 {
@@ -425,7 +457,7 @@ namespace Omnipotent.Services.Projects.Containers
                     lastError = string.Join(" ", new[] { last.Stderr, last.Stdout }
                         .Where(x => !string.IsNullOrWhiteSpace(x))).Trim();
                     if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
-                        return ContainerToolResult.Ok(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000));
+                        return ContainerToolResult.Ok(Scrub(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000)));
                 }
                 if (attempt == 1)
                 {
@@ -462,14 +494,42 @@ namespace Omnipotent.Services.Projects.Containers
                     && challenge.TryGetProperty("detected", out var detected)
                     && detected.ValueKind is JsonValueKind.True)
                     banner += "CHALLENGE_DETECTED: a CAPTCHA or human-verification widget is on this page. " +
-                        "Do not retry the signup controls underneath it. Call computer_browser_action op=solve_challenge, " +
+                        "Do not retry the signup controls underneath it. Call computer_browser_action op=solve_challenge once, " +
                         "which waits for the free browser solver. A response token already present means submit/verify " +
-                        "the form, not buy another token. If solving fails, follow its recovery diagnosis.\n";
+                        "the form, not buy another token. If solving fails, call request_human straight away: automated " +
+                        "clicks on the checkbox are scored as a bot and silently rejected, so you get one attempt, not several.\n";
                 if (root.ValueKind == JsonValueKind.Object && NativeDialogBanner(root) is { } dialog) banner += dialog;
+                if (root.ValueKind == JsonValueKind.Object) banner += HostileSurfaceAdvisories(root);
                 return banner + inspectionJson;
             }
             catch (JsonException) { }
             return inspectionJson;
+        }
+
+        private static readonly Regex PaymentFrame = new(
+            @"js\.stripe\.com|checkoutshopper|adyen|braintreegateway|paypal\.com/(sdk|smart)|checkout\.com|squareup\.com|klarna",
+            RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+        /// <summary>
+        /// Surfaces that are known to defeat a particular approach, named the moment inspection sees
+        /// them, so an agent does not rediscover each dead end by trial (the report's "do-not-fight"
+        /// list). The native-dialog and CAPTCHA cases have their own banners above.
+        /// </summary>
+        internal static string HostileSurfaceAdvisories(JsonElement root)
+        {
+            var advice = new StringBuilder();
+            if (root.TryGetProperty("javascriptDialog", out var jsDialog) && jsDialog.ValueKind == JsonValueKind.Object
+                && jsDialog.TryGetProperty("open", out var open) && open.ValueKind == JsonValueKind.True)
+                advice.Append("JS_DIALOG_OPEN: a JavaScript alert/confirm/prompt is blocking this tab, and nothing in the page will respond until it is answered. " +
+                              "Answer it with computer_cdp action=dialog (accept true to confirm, false to dismiss).\n");
+            if (root.TryGetProperty("frames", out var frames) && frames.ValueKind == JsonValueKind.Array
+                && frames.EnumerateArray().Any(frame => frame.ValueKind == JsonValueKind.Object
+                    && frame.TryGetProperty("url", out var url) && url.ValueKind == JsonValueKind.String
+                    && PaymentFrame.IsMatch(url.GetString() ?? "")))
+                advice.Append("PAYMENT_FRAME: card fields here live in a cross-origin payment frame. Reach them with computer_browser_action " +
+                              "(refs from inspect mode=controls are frame-aware), never by pixel-typing into the frame, and complete any payment only " +
+                              "through computer_confirm_action / computer_confirm_and_click.\n");
+            return advice.ToString();
         }
 
         /// <summary>
@@ -616,15 +676,32 @@ namespace Omnipotent.Services.Projects.Containers
             bool carriesSecret = false;
             if (resolveSecretsAsync != null && op is "fill" or "type" or "select")
             {
-                string resolvedValue = await resolveSecretsAsync(value);
-                carriesSecret = !string.Equals(resolvedValue, value, StringComparison.Ordinal);
-                value = resolvedValue;
+                var resolvedValue = await ResolveSecretsTrackedAsync(value);
+                carriesSecret = resolvedValue.Secrets.Count > 0;
+                value = resolvedValue.Text;
                 for (int i = 0; i < values.Count; i++)
                 {
-                    string resolvedItem = await resolveSecretsAsync(values[i]);
-                    carriesSecret |= !string.Equals(resolvedItem, values[i], StringComparison.Ordinal);
-                    values[i] = resolvedItem;
+                    var resolvedItem = await ResolveSecretsTrackedAsync(values[i]);
+                    carriesSecret |= resolvedItem.Secrets.Count > 0;
+                    values[i] = resolvedItem.Text;
                 }
+            }
+
+            // A human-verification widget whose one automated attempt is used up is not clicked again
+            // by any route. Locating first is cheap and only happens while such a gate is shut.
+            if (op == "click" && HumanGateRegistry.AnyExhausted(containerID))
+            {
+                var locate = await RunBrowserHelperAsync("action", new
+                {
+                    op = "locate", @ref = Str(a, "ref") ?? "", name = Str(a, "name") ?? "", text = Str(a, "text") ?? "",
+                    role = Str(a, "role") ?? "", tag = Str(a, "tag") ?? "", css = Str(a, "css") ?? "",
+                    label = Str(a, "label") ?? "", placeholder = Str(a, "placeholder") ?? "", testId = Str(a, "testId") ?? "",
+                    exact = Bool(a, "exact"), occurrence = Math.Clamp(Int(a, "occurrence", 0), 0, 1000), tabIndex = RequestedTabIndex(a),
+                }, 45, ct);
+                var gate = ChallengeOfControl(locate.Stdout);
+                if (gate.Provider != null && HumanGateRegistry.IsExhausted(containerID, gate.Host, gate.Provider))
+                    return ContainerToolResult.Fail(HumanGateRegistry.Directive(gate.Provider, gate.Host),
+                        ContainerToolFailureKind.HumanRequired);
             }
 
             int timeoutMs = Math.Clamp(Int(a, "timeoutMs", 15_000), 100, 120_000);
@@ -670,13 +747,56 @@ namespace Omnipotent.Services.Projects.Containers
             string? helperError = BrowserHelperReportedError(action.Stdout);
             if (!action.Ok || helperError != null)
                 return ContainerToolResult.Fail(
-                    $"Structured browser op={op} failed: {ComputerAudit.Truncate(helperError ?? action.Error, 1800)} " +
-                    "Re-inspect mode=controls/tabs before retrying; do not repeat a stale ref.",
+                    Scrub($"Structured browser op={op} failed: {ComputerAudit.Truncate(helperError ?? action.Error, 1800)} " +
+                    "Re-inspect mode=controls/tabs before retrying; do not repeat a stale ref."),
                     ContainerToolFailureKind.Semantic);
 
-            string resultText = ComputerAudit.Truncate(AnnotateInspection(action.Stdout), 24000);
+            string resultText = Scrub(ComputerAudit.Truncate(AnnotateInspection(action.Stdout), 24000));
+            if (op == "click" && ChallengeOfControl(action.Stdout) is { Provider: { } provider } clicked)
+            {
+                // That was this site's one automated attempt at its human check.
+                var outcome = await ChallengeOutcomeAsync(clicked.Host, provider, ct);
+                if (outcome != null)
+                    return await ObserveFailureAsync($"Structured browser op=click completed. {outcome}", before,
+                        ContainerToolFailureKind.HumanRequired, ct);
+                resultText += " The challenge accepted the click and a response token is present: submit the form now — the token expires about two minutes after it is issued.";
+            }
             return await ObserveAfterMutationAsync(
                 $"Structured browser op={op} completed. {resultText}", before, ct);
+        }
+
+        /// <summary>The human-verification frame (if any) a structured control lives in.</summary>
+        private static (string? Provider, string? Host) ChallengeOfControl(string json)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object) return (null, null);
+                string? frameUrl = root.TryGetProperty("control", out var control) && control.ValueKind == JsonValueKind.Object
+                    && control.TryGetProperty("frame", out var frame) && frame.ValueKind == JsonValueKind.Object
+                    && frame.TryGetProperty("url", out var url) && url.ValueKind == JsonValueKind.String
+                    ? url.GetString() : null;
+                string? pageUrl = root.TryGetProperty("url", out var page) && page.ValueKind == JsonValueKind.String ? page.GetString() : null;
+                string? provider = HumanGateRegistry.ProviderForFrameUrl(frameUrl);
+                return (provider, Uri.TryCreate(pageUrl, UriKind.Absolute, out var uri) ? uri.Host.ToLowerInvariant() : null);
+            }
+            catch (JsonException) { return (null, null); }
+        }
+
+        /// <summary>
+        /// After the one automated attempt at a human check: wait briefly for the widget to answer,
+        /// then record the outcome. Returns null when a response token appeared (or the check is
+        /// gone), or the hand-over directive when it did not.
+        /// </summary>
+        private async Task<string?> ChallengeOutcomeAsync(string? host, string provider, CancellationToken ct)
+        {
+            await Task.Delay(2500, ct);
+            var probeRun = await RunBrowserHelperAsync("action", new { op = "challenge_probe", tabIndex = -1 }, 30, ct);
+            var probe = BrowserChallengeSolver.ParseProbe(probeRun.Stdout);
+            bool passed = probe.Error == null && (!probe.Detected || probe.Widgets.Any(w => w.ResponsePresent));
+            HumanGateRegistry.Record(containerID, host, provider, failed: !passed);
+            return passed ? null : HumanGateRegistry.Directive(provider, host);
         }
 
         private static readonly HttpClient SolverHttp = new() { Timeout = TimeSpan.FromSeconds(30) };
@@ -712,9 +832,23 @@ namespace Omnipotent.Services.Projects.Containers
 
             // Free mode is the default for every agent. Existing stored paid credentials alone
             // cannot authorize spending; the host operator must explicitly enable that fallback.
+            string? challengeHost = Uri.TryCreate(probe.Url, UriKind.Absolute, out var challengeUri) ? challengeUri.Host.ToLowerInvariant() : null;
+            string challengeProvider = NormalizeChallengeProvider(probe.Primary?.Provider ?? probe.Widgets.FirstOrDefault()?.Provider);
             var free = await WaitForFreeChallengeAsync(a, probe, ct);
-            if (free.Success || !PaidChallengeFallbackEnabled())
+            if (free.Success)
+            {
+                HumanGateRegistry.Record(containerID, challengeHost, challengeProvider, failed: false);
                 return free;
+            }
+            if (!PaidChallengeFallbackEnabled())
+            {
+                // The solver had its go; the policy is one automated attempt, then a human. Saying so
+                // in the result (and in the failure kind) is what stops the retry loop that wasted the
+                // two-minute token window in the Tumblr OAuth arc.
+                HumanGateRegistry.Record(containerID, challengeHost, challengeProvider, failed: true);
+                return ContainerToolResult.Fail(free.Text + " " + HumanGateRegistry.Directive(challengeProvider, challengeHost),
+                    ContainerToolFailureKind.HumanRequired);
+            }
 
             // The free attempt may have navigated or replaced the widget. Never pay for the old probe.
             probeRun = await RunBrowserHelperAsync("action", new
@@ -786,6 +920,15 @@ namespace Omnipotent.Services.Projects.Containers
 
         internal static bool PaidChallengeFallbackEnabled() =>
             string.Equals(Environment.GetEnvironmentVariable("PROJECTS_CAPTCHA_ALLOW_PAID"), "1", StringComparison.Ordinal);
+
+        /// <summary>The probe names reCAPTCHA variants (recaptcha_v2/_enterprise); the gate keys
+        /// them as one widget so a click attempt and a solver attempt count against each other.</summary>
+        internal static string NormalizeChallengeProvider(string? provider) => (provider ?? "").ToLowerInvariant() switch
+        {
+            var p when p.StartsWith("recaptcha", StringComparison.Ordinal) => "recaptcha",
+            "" => "challenge",
+            var p => p,
+        };
 
         private async Task<ContainerToolResult> WaitForFreeChallengeAsync(
             JsonElement a, BrowserChallengeSolver.ChallengeProbe probe, CancellationToken ct)
@@ -1022,7 +1165,43 @@ namespace Omnipotent.Services.Projects.Containers
 
             var notes = new List<string>();
             bool dialogOpen = probe.Ok && IsNativeDialogOpen(probe.Stdout);
-            if (dialogOpen && paths.Count == 1)
+            var trigger = await UploadTriggerAsync(a, ct);
+
+            // Preferred route: press the page's own upload control with the browser's file request
+            // intercepted. No native dialog ever opens, and it works for inputs the page builds on
+            // the fly and never attaches — the case no DOM search can reach. When a chooser is
+            // already open, it is closed first and the control that opened it is pressed again.
+            var retrigger = trigger ?? (dialogOpen ? RememberedChooserTrigger() : null);
+            if (retrigger != null)
+            {
+                if (dialogOpen)
+                {
+                    await DismissNativeDialogAsync(ct);
+                    dialogOpen = false;
+                    notes.Add(trigger == null
+                        ? "Closed the native file chooser and pressed the control that opened it again, this time catching the file request."
+                        : "Closed the native file chooser first.");
+                }
+                var intercepted = await RunBrowserHelperAsync("upload", new
+                {
+                    paths, trigger = retrigger, tabIndex = RequestedTabIndex(a),
+                }, 150, ct);
+                string? interceptError = BrowserHelperReportedError(intercepted.Stdout);
+                int caught = AttachedFileCount(intercepted.Stdout);
+                if (intercepted.Ok && interceptError == null && caught > 0)
+                {
+                    notes.Add($"Attached {caught} file(s) ({ComputerAudit.Truncate(string.Join(", ", paths), 300)}) through the page's own file request" +
+                              (UploadUsedDetachedInput(intercepted.Stdout) ? " — the page builds its file input on the fly, which is why no input was visible in the DOM" : "") +
+                              ". The page received the same change event as a manual selection. Verify the visible upload state and continue with the site's submit/publish step.");
+                    return await ObserveAfterMutationAsync(string.Join(" ", notes), RecentFrameJpeg(), ct);
+                }
+                string reason = ComputerAudit.Truncate(interceptError ?? intercepted.Error, 600);
+                if (trigger != null)
+                    return ContainerToolResult.Fail(string.Join(" ", notes.Append(
+                        $"Pressing the trigger did not produce a file request: {reason}")), ContainerToolFailureKind.Semantic);
+                notes.Add($"Re-pressing the remembered control did not produce a file request ({reason}); falling back to the page's file inputs.");
+            }
+            else if (dialogOpen && paths.Count == 1)
             {
                 var driven = await DriveFileChooserAsync(paths[0], ct);
                 notes.Add(driven.Note);
@@ -1043,23 +1222,13 @@ namespace Omnipotent.Services.Projects.Containers
                 notes.Add("A native file chooser was open; it only accepts one path at a time, so it was dismissed in favour of a direct multi-file attach.");
             }
             if (dialogOpen)
-            {
-                // A chooser left open keeps the renderer modal and would overwrite whatever the CDP
-                // route attaches when it finally returns.
-                await transport.KeyChordAsync("escape", ct: ct);
-                await Task.Delay(400, ct);
-                var after = await RunBrowserHelperAsync("dialog", new { }, 20, ct);
-                if (after.Ok && IsNativeDialogOpen(after.Stdout))
-                {
-                    await transport.KeyChordAsync("escape", ct: ct);
-                    await Task.Delay(400, ct);
-                }
-            }
+                await DismissNativeDialogAsync(ct);
 
             var attach = await RunBrowserHelperAsync("upload", new
             {
                 paths,
                 name = Str(a, "name") ?? Str(a, "inputName") ?? "",
+                css = Str(a, "css") ?? "",
                 occurrence = Math.Clamp(Int(a, "occurrence", 0), 0, 50),
                 tabIndex = RequestedTabIndex(a),
             }, 180, ct);
@@ -1072,8 +1241,8 @@ namespace Omnipotent.Services.Projects.Containers
             if (attached == 0)
                 return ContainerToolResult.Fail(
                     string.Join(" ", notes.Append(
-                        "The file input reported no attached file afterwards. Inspect the page (mode='dom' lists fileInputs) and " +
-                        "pass 'name' to target the right input, or click the site's upload control first and call this tool again while the dialog is open.")),
+                        "The file input reported no attached file afterwards. Pass 'trigger' (the site's upload button as ref/name/text/css) " +
+                        "so this tool presses it itself and catches the file request, or pass 'name'/'css' to target a specific input.")),
                     ContainerToolFailureKind.Semantic);
 
             notes.Add($"Attached {attached} file(s) to the page's file input ({ComputerAudit.Truncate(string.Join(", ", paths), 300)}); " +
@@ -1082,10 +1251,74 @@ namespace Omnipotent.Services.Projects.Containers
         }
 
         /// <summary>
-        /// Drive Chromium's GTK file chooser from the keyboard. ctrl+l opens its location bar, which
-        /// takes an absolute path — deterministic, unlike hunting the Open button with OCR at a
-        /// coordinate that moves with the dialog. Delete clears GTK's inline completion first, which
-        /// would otherwise submit a neighbouring filename.
+        /// The control that opens the site's file request, as the helper wants it: a structured
+        /// locator (ref/name/text/role/css/…) or a screenshot point. A bare string is taken as the
+        /// control's accessible name.
+        /// </summary>
+        private async Task<Dictionary<string, object?>?> UploadTriggerAsync(JsonElement a, CancellationToken ct)
+        {
+            if (a.ValueKind != JsonValueKind.Object || !a.TryGetProperty("trigger", out var trigger)) return null;
+            if (trigger.ValueKind == JsonValueKind.String)
+                return string.IsNullOrWhiteSpace(trigger.GetString()) ? null
+                    : new Dictionary<string, object?> { ["name"] = trigger.GetString()!.Trim() };
+            if (trigger.ValueKind != JsonValueKind.Object) return null;
+            var locator = new Dictionary<string, object?>();
+            foreach (string field in new[] { "ref", "name", "text", "role", "tag", "css", "label", "placeholder", "testId" })
+                if (Str(trigger, field) is { Length: > 0 and <= 4096 } value) locator[field] = value;
+            if (Bool(trigger, "exact")) locator["exact"] = true;
+            if (HasInt(trigger, "occurrence")) locator["occurrence"] = Math.Clamp(Int(trigger, "occurrence", 0), 0, 1000);
+            if (HasInt(trigger, "x") && HasInt(trigger, "y"))
+            {
+                var point = await ResolvePointAsync(RequiredInt(trigger, "x"), RequiredInt(trigger, "y"), ct);
+                locator["screenX"] = point.X;
+                locator["screenY"] = point.Y;
+            }
+            return locator.Count == 0 ? null : locator;
+        }
+
+        /// <summary>The last physical click on this desktop, if it was recent enough to be the one
+        /// that opened the native chooser now on screen.</summary>
+        private Dictionary<string, object?>? RememberedChooserTrigger()
+        {
+            if (!LastPointer.TryGetValue(containerID, out var last) || DateTime.UtcNow - last.AtUtc > PointerMemoryLifetime)
+                return null;
+            return new Dictionary<string, object?> { ["screenX"] = last.X, ["screenY"] = last.Y };
+        }
+
+        private void RememberPointer(int x, int y, InputPreflight? pre) =>
+            LastPointer[containerID] = new PointerMemory(x, y, DateTime.UtcNow, pre?.Hit?.OpensFileChooser == true);
+
+        private static bool UploadUsedDetachedInput(string json)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                return document.RootElement.TryGetProperty("detachedInput", out var detached) && detached.ValueKind == JsonValueKind.True;
+            }
+            catch (JsonException) { return false; }
+        }
+
+        /// <summary>A chooser left open keeps the renderer modal and would overwrite whatever the CDP
+        /// route attaches when it finally returns, so it is closed and the close is checked.</summary>
+        private async Task DismissNativeDialogAsync(CancellationToken ct)
+        {
+            await transport.KeyChordAsync("escape", ct: ct);
+            await Task.Delay(400, ct);
+            var after = await RunBrowserHelperAsync("dialog", new { }, 20, ct);
+            if (after.Ok && IsNativeDialogOpen(after.Stdout))
+            {
+                await RunBrowserHelperAsync("dialog", new { activate = true }, 20, ct);
+                await transport.KeyChordAsync("escape", ct: ct);
+                await Task.Delay(400, ct);
+            }
+        }
+
+        /// <summary>
+        /// Drive Chromium's GTK file chooser from the keyboard — the last resort, used only when the
+        /// control that opened it is unknown. ctrl+l opens its location bar, which takes an absolute
+        /// path — deterministic, unlike hunting the Open button with OCR at a coordinate that moves
+        /// with the dialog. Delete clears GTK's inline completion first, which would otherwise submit
+        /// a neighbouring filename; a second Enter covers the completion popup swallowing the first.
         /// </summary>
         private async Task<(bool Closed, string Note)> DriveFileChooserAsync(string path, CancellationToken ct)
         {
@@ -1105,6 +1338,8 @@ namespace Omnipotent.Services.Projects.Containers
                 var state = await RunBrowserHelperAsync("dialog", new { }, 20, ct);
                 if (state.Ok && !IsNativeDialogOpen(state.Stdout))
                     return (true, "Typed the path into the visible file chooser's location bar and confirmed it; the dialog closed.");
+                if (attempt == 2)
+                    await transport.KeyChordAsync("enter", ct: ct);
             }
             return (false, "The visible file chooser did not close after the path was entered.");
         }
@@ -1245,16 +1480,9 @@ namespace Omnipotent.Services.Projects.Containers
                     if (box.TryGetProperty("height", out var bh) && bh.TryGetInt32(out var h)) boundsH = h;
                 }
                 (x, y) = human.HumanizeClickPoint(x, y, boundsW, boundsH);
-                byte[]? before = RecentFrameJpeg();
-                return await WithModifiersAsync(a, async () =>
-                {
-                    var point = await ResolvePointAsync(x, y, ct);
-                    await human.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), clicks, ct);
-                    await Task.Delay(actionSettleMs, ct);
-                    return await ObserveAfterMutationAsync(
-                        $"Physically clicked visible browser control '{ComputerAudit.Truncate(matchedName, 120)}' ({matchedRole}) at ({x},{y}). Re-inspect to verify the resulting state.",
-                        before, ct);
-                }, ct);
+                return await VerifiedClickAsync(x, y, a, clicks,
+                    $"Physically clicked visible browser control '{ComputerAudit.Truncate(matchedName, 120)}' ({matchedRole}) at ({x},{y}).",
+                    RecentFrameJpeg(), ct);
             }
             catch (JsonException ex)
             {
@@ -1286,14 +1514,32 @@ namespace Omnipotent.Services.Projects.Containers
             var match = matches[occurrence];
             string text = $"OCR match {occurrence}: '{ComputerAudit.Truncate(match.Text, 120)}' centre=({match.CentreX},{match.CentreY}) confidence={match.Confidence:0}.";
             if (!click) return shot with { Text = text + " " + shot.Text };
-            var point = await ResolvePointAsync(match.CentreX, match.CentreY, ct);
-            return await WithModifiersAsync(a, async () =>
-            {
-                await human.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), Math.Clamp(Int(a, "clicks", 1), 1, 2), ct);
-                await Task.Delay(350, ct);
-                return await ObserveAfterMutationAsync(text + " Clicked OCR match.", raw.jpeg, ct);
-            }, ct);
+            return await VerifiedClickAsync(match.CentreX, match.CentreY, a, Math.Clamp(Int(a, "clicks", 1), 1, 2),
+                text + " Clicked OCR match.", raw.jpeg, ct, pre => OcrRetarget(pre, needle));
         }
+
+        /// <summary>
+        /// OCR finds where text is drawn, not what handles a click on it: on a page whose label sits
+        /// beside or inside a styled element, the text centre is often on no control at all (the
+        /// report's "returned coordinate is the text centre, not the hit-test target"). When that
+        /// happens and a control carrying the same text is within reach, click that control instead.
+        /// </summary>
+        internal static (int X, int Y, string Note)? OcrRetarget(InputPreflight pre, string needle)
+        {
+            if (pre.Hit == null || pre.Hit.Actionable != null || pre.Hit.Challenge != null) return null;
+            string wanted = CompactForMatch(needle);
+            if (wanted.Length == 0) return null;
+            var control = pre.Nearby
+                .Where(n => n.Distance <= 48 && CompactForMatch(n.Control.Name).Contains(wanted, StringComparison.Ordinal))
+                .OrderBy(n => n.Distance)
+                .FirstOrDefault();
+            return control == null ? null
+                : (control.ScreenX, control.ScreenY,
+                   $"The text itself is not clickable; clicked the {ComputerInputGuard.DescribeElement(control.Control)} it labels at ({control.ScreenX},{control.ScreenY}) instead.");
+        }
+
+        private static string CompactForMatch(string? text) =>
+            new string((text ?? "").Where(char.IsLetterOrDigit).Select(char.ToLowerInvariant).ToArray());
 
         private async Task<ContainerToolResult> MoveAsync(JsonElement a, CancellationToken ct)
         {
@@ -1318,11 +1564,210 @@ namespace Omnipotent.Services.Projects.Containers
         {
             int x = RequiredInt(a, "x"), y = RequiredInt(a, "y");
             int clicks = Math.Clamp(Int(a, "clicks", 1), 1, 2);
-            return await WithModifiersAsync(a, () => MutateAsync($"Clicked ({x},{y}).", async () =>
+            return await VerifiedClickAsync(x, y, a, clicks, $"Clicked ({x},{y}).", RecentFrameJpeg(), ct);
+        }
+
+        // ── verified physical input ──────────────────────────────────────────────────────────
+
+        private const int InputProbeTimeoutSeconds = 12;
+
+        private static string NewNonce() => Guid.NewGuid().ToString("N")[..16];
+
+        private string Scrub(string? text) => SecretEchoScrubber.Scrub(containerID, text);
+
+        private bool HelperModeUnsupported(string mode) =>
+            UnsupportedHelperModes.TryGetValue(containerID + "|" + mode, out var until) && DateTime.UtcNow < until;
+
+        private void NoteHelperModeUnsupported(string mode) =>
+            UnsupportedHelperModes[containerID + "|" + mode] = DateTime.UtcNow.AddMinutes(10);
+
+        private static bool HasModifiers(JsonElement a) =>
+            a.ValueKind == JsonValueKind.Object && a.TryGetProperty("modifiers", out var modifiers)
+            && modifiers.ValueKind == JsonValueKind.Array && modifiers.GetArrayLength() > 0;
+
+        private static string ButtonName(int button) => button switch { 2 => "middle", 3 => "right", _ => "left" };
+
+        /// <summary>
+        /// What the coming input will hit, with a receipt armed in the page. Best effort by design:
+        /// a desktop whose image predates the probe, a slow helper or a dead browser all answer null,
+        /// and the input then goes ahead exactly as it always did.
+        /// </summary>
+        private async Task<InputPreflight?> PreflightAsync(string intent, int? x, int? y, string nonce, CancellationToken ct)
+        {
+            if (terminalAsync == null || !ComputerInputGuard.Enabled() || HelperModeUnsupported("preflight")) return null;
+            try
             {
-                var point = await ResolvePointAsync(x, y, ct);
-                await human.ClickAsync(point.X, point.Y, ParseButton(Str(a, "button")), clicks, ct);
-            }, ct), ct);
+                var run = await RunBrowserHelperAsync("preflight",
+                    new { intent, x, y, nonce, arm = true, dismissStray = true, nearby = true }, InputProbeTimeoutSeconds, ct);
+                var pre = ComputerInputGuard.ParsePreflight(run.Stdout);
+                if (pre == null)
+                {
+                    NoteHelperModeUnsupported("preflight");
+                    return null;
+                }
+                return pre.Ok ? pre : null;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return null; }
+        }
+
+        private async Task<InputReceipt?> ReceiptAsync(string intent, string nonce, InputPreflight pre,
+            Dictionary<string, object?>? extra, CancellationToken ct)
+        {
+            try
+            {
+                var payload = new Dictionary<string, object?> { ["intent"] = intent, ["nonce"] = nonce, ["armed"] = pre.Armed };
+                if (extra != null)
+                    foreach (var pair in extra) payload[pair.Key] = pair.Value;
+                var run = await RunBrowserHelperAsync("receipt", payload, InputProbeTimeoutSeconds, ct);
+                return ComputerInputGuard.ParseReceipt(run.Stdout);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return null; }
+        }
+
+        private static string FileChooserBlockingText() =>
+            "NATIVE_FILE_DIALOG_OPEN: the browser's own file chooser is on screen and holds the browser's input, so this click would be lost. " +
+            "Call computer_upload_file with the container path of the file: it closes the dialog and attaches the file through the page itself. " +
+            "Do not operate the dialog with clicks or OCR, and never ask Klives to click it.";
+
+        /// <summary>
+        /// A physical click that is checked rather than assumed. The browser helper first says what
+        /// the point will hit and arms an invisible receipt in the page; the humanised VNC click is
+        /// sent; then the receipt says whether it arrived. A click that provably never reached the
+        /// page — no press, and the pointer's final approach unseen, i.e. a browser bubble, menu or
+        /// unfocused window took it (the "Restore pages?" stall) — is re-delivered once through the
+        /// browser itself. A click the page received but that hit nothing clickable is reported with
+        /// the exact coordinates of the nearest controls. Human-verification widgets get exactly one
+        /// automated attempt. <paramref name="retarget"/> may move the point after the first probe.
+        /// </summary>
+        private async Task<ContainerToolResult> VerifiedClickAsync(int shownX, int shownY, JsonElement a, int clicks,
+            string label, byte[]? before, CancellationToken ct,
+            Func<InputPreflight, (int X, int Y, string Note)?>? retarget = null)
+        {
+            var point = await ResolvePointAsync(shownX, shownY, ct);
+            string nonce = NewNonce();
+            var pre = await PreflightAsync("click", point.X, point.Y, nonce, ct);
+            if (pre != null && retarget?.Invoke(pre) is { } moved)
+            {
+                (shownX, shownY) = (moved.X, moved.Y);
+                label = (label + " " + moved.Note).Trim();
+                point = await ResolvePointAsync(shownX, shownY, ct);
+                nonce = NewNonce();
+                pre = await PreflightAsync("click", point.X, point.Y, nonce, ct);
+            }
+
+            if (pre is { NativeFileChooser: true } && !pre.Overlays.Any(o => o.Kind == "file-chooser" && o.CoversPoint))
+                return ContainerToolResult.Fail(FileChooserBlockingText(), ContainerToolFailureKind.Semantic);
+            string? provider = pre?.Hit?.Challenge;
+            string? host = pre?.PageHost;
+            if (provider != null && HumanGateRegistry.IsExhausted(containerID, host, provider))
+                return ContainerToolResult.Fail(HumanGateRegistry.Directive(provider, host), ContainerToolFailureKind.HumanRequired);
+
+            var notes = new List<string>();
+            string landing = ComputerInputGuard.DescribeLanding(pre, shownX, shownY);
+            if (landing.Length > 0) notes.Add(landing);
+            string overlays = ComputerInputGuard.DescribeOverlays(pre);
+            if (overlays.Length > 0) notes.Add(overlays);
+            if (pre is { PageAvailable: true, PageResponsive: false })
+                notes.Add("The page was not answering scripts before this click: a JavaScript alert/confirm/'Leave site?' dialog is probably open. " +
+                          "If this click was not on that dialog's own button, answer it with computer_cdp action=dialog.");
+
+            int button = ParseButton(Str(a, "button"));
+            await WithModifiersAsync(a, async () =>
+            {
+                await human.ClickAsync(point.X, point.Y, button, clicks, ct);
+                return ContainerToolResult.Ok("");
+            }, ct);
+            await Task.Delay(actionSettleMs, ct);
+            RememberPointer(point.X, point.Y, pre);
+
+            if (pre != null && pre.Armed.Count > 0)
+            {
+                var receipt = await ReceiptAsync("click", nonce, pre, null, ct);
+                switch (ComputerInputGuard.AssessClick(pre, receipt))
+                {
+                    case ClickDelivery.Received:
+                        notes.Add(receipt?.FirstTarget != null
+                            ? $"The page received the click (on {ComputerInputGuard.DescribeElement(receipt.FirstTarget)})."
+                            : "The page received the click.");
+                        break;
+                    case ClickDelivery.PageChanged:
+                        notes.Add("The page reacted: it navigated or replaced its document.");
+                        break;
+                    case ClickDelivery.PointerOnly:
+                        notes.Add("The page saw the pointer arrive but no press reached it — something inside the page swallowed the click. Re-inspect before repeating it.");
+                        break;
+                    case ClickDelivery.NotDelivered when provider == null && !HasModifiers(a):
+                        notes.Add(await RedeliverClickAsync(point.X, point.Y, button, clicks, nonce, pre, ct));
+                        break;
+                    case ClickDelivery.NotDelivered:
+                        notes.Add("No part of the click reached the page.");
+                        break;
+                }
+            }
+
+            if (provider != null)
+            {
+                string? refused = await ChallengeOutcomeAsync(host, provider, ct);
+                if (refused != null)
+                    return await ObserveFailureAsync((label + " " + string.Join(" ", notes) + " " + refused).Trim(), before,
+                        ContainerToolFailureKind.HumanRequired, ct);
+                notes.Add("The challenge accepted the click and a response token is present: submit the form now — the token expires about two minutes after it is issued.");
+            }
+            if (pre?.Hit?.OpensFileChooser == true)
+                notes.Add("That control opens a file chooser. To upload, call computer_upload_file with the path and this control as trigger — " +
+                          "it presses the control itself and catches the file request, so no native dialog is involved.");
+            return await ObserveAfterMutationAsync((label + " " + string.Join(" ", notes)).Trim(), before, ct);
+        }
+
+        private async Task<string> RedeliverClickAsync(int x, int y, int button, int clicks, string nonce, InputPreflight pre,
+            CancellationToken ct)
+        {
+            string cause = pre.Overlays.FirstOrDefault(o => o.CoversPoint) is { } over
+                ? $"a browser {over.Kind} window over the point"
+                : !pre.BrowserActive && pre.WindowsKnown ? "the browser window not having focus" : "a browser-owned window taking the input";
+            var cdp = await RunBrowserHelperAsync("cdp", new
+            {
+                action = "click", screenX = x, screenY = y, button = ButtonName(button), clicks, refuseChallenges = true,
+            }, 30, ct);
+            string? error = BrowserHelperReportedError(cdp.Stdout);
+            if (!cdp.Ok || error != null)
+                return $"The physical click never reached the page ({cause}), and re-delivering it through the browser failed: " +
+                       ComputerAudit.Truncate(error ?? cdp.Error, 300);
+            var again = await ReceiptAsync("click", nonce, pre, null, ct);
+            return ComputerInputGuard.AssessClick(pre, again) is ClickDelivery.Received or ClickDelivery.PageChanged
+                ? $"The physical click never reached the page (most likely {cause}); it was re-delivered through the browser and the page received it" +
+                  (again?.FirstTarget != null ? $" (on {ComputerInputGuard.DescribeElement(again.FirstTarget)})." : ".")
+                : "Neither the physical click nor a re-delivery through the browser reached the page — take a screenshot; something is covering it.";
+        }
+
+        private async Task<ContainerToolResult> ObserveFailureAsync(string text, byte[]? before, ContainerToolFailureKind kind,
+            CancellationToken ct)
+        {
+            var observed = await ObserveAfterMutationAsync(text, before, ct);
+            return observed with { Success = false, FailureKind = kind };
+        }
+
+        /// <summary>
+        /// Vault/registry placeholders resolved for typing, plus the individual secret values they
+        /// stood for. Those values are remembered for this desktop so any tool output that echoes
+        /// one later is masked before the model sees it.
+        /// </summary>
+        private async Task<(string Text, List<string> Secrets)> ResolveSecretsTrackedAsync(string text)
+        {
+            var secrets = new List<string>();
+            if (resolveSecretsAsync == null || string.IsNullOrEmpty(text) || !text.Contains('{'))
+                return (text ?? string.Empty, secrets);
+            foreach (string token in PlaceholderPattern.Matches(text).Select(m => m.Value).Distinct(StringComparer.Ordinal))
+            {
+                string value = await resolveSecretsAsync(token);
+                if (value.Length > 0 && !string.Equals(value, token, StringComparison.Ordinal)) secrets.Add(value);
+            }
+            string resolved = await resolveSecretsAsync(text);
+            if (secrets.Count == 0 && !string.Equals(resolved, text, StringComparison.Ordinal)) secrets.Add(resolved);
+            SecretEchoScrubber.Remember(containerID, secrets);
+            return (resolved, secrets);
         }
 
         private async Task<ContainerToolResult> DragAsync(JsonElement a, CancellationToken ct)
@@ -1376,13 +1821,266 @@ namespace Omnipotent.Services.Projects.Containers
                 () => human.ScrollAsync(point.X, point.Y, dy, dx, ct), ct);
         }
 
+        /// <summary>
+        /// Typing that is checked rather than assumed. Before any keystroke the helper confirms a text
+        /// field has focus — typing into nothing loses the text or fires page shortcuts — and records
+        /// the field's value; afterwards it reads the value back. Keystrokes that never reached the
+        /// field (focus taken by a browser bubble or another window) are re-entered once through the
+        /// browser into that same field; keystrokes the page received but refused are reported, never
+        /// retried. Secrets are compared by hash only. Neither the literal nor the substituted text is
+        /// ever placed in a result or event.
+        /// </summary>
         private async Task<ContainerToolResult> TypeAsync(JsonElement a, CancellationToken ct)
         {
-            string text = Str(a, "text") ?? string.Empty;
-            if (resolveSecretsAsync != null) text = await resolveSecretsAsync(text);
-            // Do not place either literal or substituted text in results/events.
-            return await MutateAsync("Typed text.",
-                () => human.Enabled ? human.TypeTextAsync(text, ct) : transport.TypeTextAsync(text, typingDelayMs, ct), ct);
+            var resolved = await ResolveSecretsTrackedAsync(Str(a, "text") ?? string.Empty);
+            string text = resolved.Text;
+            bool secret = resolved.Secrets.Count > 0;
+            byte[]? before = RecentFrameJpeg();
+            string nonce = NewNonce();
+            var pre = text.Length == 0 ? null : await PreflightAsync("type", null, null, nonce, ct);
+            if (ComputerInputGuard.FocusProblem(pre, text.Length, Bool(a, "force")) is { } problem)
+                return ContainerToolResult.Fail(problem, ContainerToolFailureKind.Semantic);
+
+            var notes = new List<string>();
+            string overlays = ComputerInputGuard.DescribeOverlays(pre);
+            if (overlays.Length > 0) notes.Add(overlays);
+            await (human.Enabled ? human.TypeTextAsync(text, ct) : transport.TypeTextAsync(text, typingDelayMs, ct));
+            await Task.Delay(actionSettleMs, ct);
+
+            if (pre?.Focus is { Kind: "editable" } focus && pre.Armed.Count > 0)
+            {
+                bool hidden = secret || focus.Password;
+                var expectation = hidden
+                    ? new Dictionary<string, object?>
+                    {
+                        ["secret"] = true, ["password"] = focus.Password,
+                        ["expectedHash"] = ComputerInputGuard.Sha256Hex(text), ["expectedLength"] = text.Length,
+                    }
+                    : new Dictionary<string, object?> { ["expected"] = text };
+                var receipt = await ReceiptAsync("type", nonce, pre, expectation, ct);
+                switch (ComputerInputGuard.AssessType(pre, receipt))
+                {
+                    case TypeDelivery.Landed:
+                        notes.Add("Verified: the field now holds the typed text.");
+                        break;
+                    case TypeDelivery.LandedReformatted:
+                        notes.Add("Verified: the field holds the typed text (the page reformatted it).");
+                        break;
+                    case TypeDelivery.FieldGone:
+                        notes.Add("The field was replaced after typing (the form may have submitted or re-rendered) — check the page before continuing.");
+                        break;
+                    case TypeDelivery.NotDelivered:
+                        string? retypeFailure = await RetypeThroughBrowserAsync(text, hidden, pre, ct);
+                        if (retypeFailure != null)
+                            return await ObserveFailureAsync(retypeFailure, before, ContainerToolFailureKind.Semantic, ct);
+                        notes.Add("The keystrokes never reached the field" +
+                                  (pre.Overlays.Any(o => o.Focused) ? " (a browser pop-up had the keyboard)" : !pre.BrowserActive && pre.WindowsKnown ? " (the browser window did not have focus)" : "") +
+                                  "; the text was re-entered through the browser into the same field and verified.");
+                        break;
+                    case TypeDelivery.Misdirected:
+                        return await ObserveFailureAsync(
+                            $"The keystrokes went to {ComputerInputGuard.DescribeElement(receipt?.KeyTarget)} instead of the field that had focus — focus moved while typing. " +
+                            "Clear any stray text there, click the intended field and type again (or use computer_browser_action op=fill).",
+                            before, ContainerToolFailureKind.Semantic, ct);
+                    case TypeDelivery.Rejected:
+                        return await ObserveFailureAsync(
+                            $"The page received the keystrokes, but the field does not hold the text ({text.Length} characters were typed; the field went from " +
+                            $"{receipt?.Typed?.BeforeLength} to {receipt?.Typed?.AfterLength}). It rewrites or rejects typed input — an input mask, a maxlength, " +
+                            "or a widget that wants clicks. Use computer_browser_action op=fill, or the widget's own picker. Do NOT submit as if it were filled.",
+                            before, ContainerToolFailureKind.Semantic, ct);
+                }
+            }
+            return await ObserveAfterMutationAsync(("Typed text. " + string.Join(" ", notes)).Trim(), before, ct);
+        }
+
+        /// <summary>Re-enters text that never arrived into the field recorded before typing. Null on
+        /// verified success, otherwise what went wrong.</summary>
+        private async Task<string?> RetypeThroughBrowserAsync(string text, bool hidden, InputPreflight pre, CancellationToken ct)
+        {
+            var payload = new Dictionary<string, object?>
+            {
+                ["action"] = "type", ["text"] = text, ["secret"] = hidden, ["tabId"] = pre.TabId,
+                ["recordedFocus"] = new Dictionary<string, object?> { ["targetId"] = pre.Focus?.TargetId, ["frameId"] = pre.Focus?.FrameId },
+            };
+            if (hidden)
+            {
+                payload["expectedHash"] = ComputerInputGuard.Sha256Hex(text);
+                payload["expectedLength"] = text.Length;
+            }
+            var run = await RunBrowserHelperAsync("cdp", payload, 40, ct);
+            string? error = BrowserHelperReportedError(run.Stdout);
+            if (run.Ok && error == null) return null;
+            return "The keystrokes never reached the field, and re-entering the text through the browser did not land either: " +
+                   ComputerAudit.Truncate(error ?? run.Error, 400) +
+                   " Re-inspect the field (it may be read-only or rebuilt) and use computer_browser_action op=fill.";
+        }
+
+        internal static readonly string[] CdpActions =
+            { "evaluate", "send", "click", "type", "key", "set_files", "dialog", "targets", "screenshot" };
+
+        private static readonly Regex ReadOnlyCdpMethod = new(
+            @"\.(get|describe|query|search|resolve|request|capture|take)[A-Z]", RegexOptions.Compiled);
+
+        /// <summary>
+        /// The browser's DevTools protocol as a first-class tool. In the Tumblr arc every dead end the
+        /// structured tools could not clear — the bubble eating clicks, the native upload dialog, the
+        /// helper service rejecting requests — was cleared over 127.0.0.1:9222, but only after the
+        /// agent rebuilt a websocket client in the terminal from memory notes, every session. This
+        /// exposes the same power as one call: evaluate (top-level await, any frame), raw commands,
+        /// trusted click/type/key, file attach, JavaScript dialogs, targets and a page screenshot.
+        /// Wiping the profile's sign-ins is refused, cookie values are redacted, and any substituted
+        /// secret echoed back is masked.
+        /// </summary>
+        private async Task<ContainerToolResult> CdpAsync(JsonElement a, CancellationToken ct)
+        {
+            if (terminalAsync == null)
+                return ContainerToolResult.Fail("computer_cdp needs this desktop's browser helper, which is unavailable.",
+                    ContainerToolFailureKind.Infrastructure);
+            string action = (Str(a, "action") ?? "").Trim().ToLowerInvariant();
+            if (!CdpActions.Contains(action, StringComparer.Ordinal))
+                return ContainerToolResult.Fail("action must be one of: " + string.Join(", ", CdpActions) + ".",
+                    ContainerToolFailureKind.Validation);
+
+            var payload = new Dictionary<string, object?> { ["action"] = action };
+            foreach (string field in new[]
+                     {
+                         "expression", "world", "frameId", "method", "target", "waitEvent", "selector", "ref", "name",
+                         "role", "tag", "css", "label", "placeholder", "testId", "button", "key", "promptText",
+                     })
+                if (Str(a, field) is { } value) payload[field] = value;
+            foreach (string field in new[] { "timeoutMs", "waitMs", "clicks", "repeats", "tabIndex", "occurrence" })
+                if (HasInt(a, field)) payload[field] = Int(a, field, 0);
+            if (a.ValueKind == JsonValueKind.Object && a.TryGetProperty("awaitPromise", out var awaitPromise)
+                && awaitPromise.ValueKind == JsonValueKind.False)
+                payload["awaitPromise"] = false;
+            if (a.ValueKind == JsonValueKind.Object && a.TryGetProperty("accept", out var accept)
+                && accept.ValueKind is JsonValueKind.True or JsonValueKind.False)
+                payload["accept"] = accept.GetBoolean();
+            if (a.ValueKind == JsonValueKind.Object && a.TryGetProperty("params", out var parameters)
+                && parameters.ValueKind is not (JsonValueKind.Null or JsonValueKind.Undefined))
+            {
+                // Models often send the params object as a JSON string; accept either.
+                JsonElement parsed = parameters;
+                if (parameters.ValueKind == JsonValueKind.String)
+                {
+                    try { parsed = JsonDocument.Parse(parameters.GetString() ?? "{}").RootElement.Clone(); }
+                    catch (JsonException) { return ContainerToolResult.Fail("params must be a JSON object.", ContainerToolFailureKind.Validation); }
+                }
+                if (parsed.ValueKind != JsonValueKind.Object)
+                    return ContainerToolResult.Fail("params must be a JSON object.", ContainerToolFailureKind.Validation);
+                payload["params"] = parsed.Clone();
+            }
+            if ((Str(a, "expression") ?? "").Length > 16_000)
+                return ContainerToolResult.Fail("expression is limited to 16,000 characters.", ContainerToolFailureKind.Validation);
+
+            // x/y are screenshot pixels like every other computer tool; viewportX/viewportY are the
+            // page's own CSS pixels for anyone working from DOM rectangles.
+            if (HasInt(a, "x") && HasInt(a, "y"))
+            {
+                var point = await ResolvePointAsync(RequiredInt(a, "x"), RequiredInt(a, "y"), ct);
+                payload["screenX"] = point.X;
+                payload["screenY"] = point.Y;
+            }
+            if (HasInt(a, "viewportX") && HasInt(a, "viewportY"))
+            {
+                payload["x"] = Int(a, "viewportX", 0);
+                payload["y"] = Int(a, "viewportY", 0);
+            }
+            if (action == "type")
+            {
+                var resolved = await ResolveSecretsTrackedAsync(Str(a, "text") ?? "");
+                payload["text"] = resolved.Text;
+                payload["secret"] = resolved.Secrets.Count > 0;
+            }
+            if (action == "set_files")
+            {
+                var paths = new List<string>();
+                if (Str(a, "path") is { Length: > 0 } single) paths.Add(single.Trim());
+                if (a.TryGetProperty("paths", out var list) && list.ValueKind == JsonValueKind.Array)
+                    paths.AddRange(list.EnumerateArray().Where(p => p.ValueKind == JsonValueKind.String)
+                        .Select(p => p.GetString()!.Trim()).Where(p => p.Length > 0));
+                if (paths.Count == 0 || paths.Any(p => !p.StartsWith('/') || p.Length > 1024 || p.Any(char.IsControl)))
+                    return ContainerToolResult.Fail("set_files needs absolute container paths (path or paths), e.g. /project/avatar.png.",
+                        ContainerToolFailureKind.Validation);
+                payload["paths"] = paths.Distinct(StringComparer.Ordinal).Take(8).ToList();
+                if (await UploadTriggerAsync(a, ct) is { } trigger) payload["trigger"] = trigger;
+            }
+            if (action == "click" && HumanGateRegistry.AnyExhausted(containerID)) payload["refuseChallenges"] = true;
+
+            string method = Str(a, "method") ?? "";
+            bool mutating = action is "click" or "type" or "key" or "dialog" or "set_files"
+                || (action == "send" && !ReadOnlyCdpMethod.IsMatch(method));
+            byte[]? before = mutating ? RecentFrameJpeg() : null;
+            int timeoutMs = Math.Clamp(Int(a, "timeoutMs", 15_000), 100, 120_000);
+            if (action != "dialog") await EnsureBrowserAsync(ct);
+            var run = await RunBrowserHelperAsync("cdp", payload, Math.Clamp(timeoutMs / 1000 + 20, 25, 150), ct);
+            string? error = BrowserHelperReportedError(run.Stdout);
+            if (error != null)
+            {
+                bool gate = error.StartsWith("human-gate", StringComparison.Ordinal);
+                return ContainerToolResult.Fail(Scrub($"computer_cdp action={action} failed: {error}") +
+                    (gate ? " " + HumanGateRegistry.Directive(null, null) : ""),
+                    gate ? ContainerToolFailureKind.HumanRequired : ContainerToolFailureKind.Semantic);
+            }
+            if (!run.Ok || string.IsNullOrWhiteSpace(run.Stdout))
+                return ContainerToolResult.Fail("computer_cdp could not run: " + ComputerAudit.Truncate(run.Error, 1200),
+                    ContainerToolFailureKind.BrowserInspection);
+
+            if (action == "screenshot") return CdpScreenshotResult(run.Stdout);
+
+            string text = Scrub(ComputerAudit.Truncate(run.Stdout, 24_000));
+            if (action == "click" && CdpClickChallenge(run.Stdout) is { Provider: { } provider } challenge)
+            {
+                string? refused = await ChallengeOutcomeAsync(challenge.Host, provider, ct);
+                if (refused != null)
+                    return await ObserveFailureAsync($"computer_cdp action=click completed. {refused}", before,
+                        ContainerToolFailureKind.HumanRequired, ct);
+            }
+            return mutating
+                ? await ObserveAfterMutationAsync($"computer_cdp action={action} completed. {text}", before, ct)
+                : ContainerToolResult.Ok($"computer_cdp action={action}: {text}");
+        }
+
+        private static ContainerToolResult CdpScreenshotResult(string json)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                byte[] jpeg = Convert.FromBase64String(root.GetProperty("jpegBase64").GetString() ?? "");
+                int width = root.TryGetProperty("width", out var w) && w.TryGetInt32(out int wv) ? wv : 0;
+                int height = root.TryGetProperty("height", out var h) && h.TryGetInt32(out int hv) ? hv : 0;
+                return new ContainerToolResult(true,
+                    $"Captured the active tab's page viewport through the browser ({width}x{height} CSS px). It shows the page itself — " +
+                    "no browser UI, no native dialogs, nothing covering it — so compare it with a desktop screenshot to see what an overlay hides. " +
+                    "Its pixels are page coordinates, not desktop coordinates: click from computer_screenshot, or pass viewportX/viewportY to computer_cdp action=click.",
+                    jpeg)
+                {
+                    Frames = new List<ComputerFrame> { new() { Jpeg = jpeg, OffsetMs = 0, IsSettled = true, HasCoordinateGrid = false } },
+                    Width = width,
+                    Height = height,
+                };
+            }
+            catch (Exception ex) when (ex is JsonException or FormatException or KeyNotFoundException or InvalidOperationException)
+            {
+                return ContainerToolResult.Fail("The browser screenshot could not be decoded: " + ex.Message,
+                    ContainerToolFailureKind.BrowserInspection);
+            }
+        }
+
+        private static (string? Provider, string? Host) CdpClickChallenge(string json)
+        {
+            try
+            {
+                using var document = JsonDocument.Parse(json);
+                var root = document.RootElement;
+                string? provider = root.TryGetProperty("hit", out var hit) && hit.ValueKind == JsonValueKind.Object
+                    && hit.TryGetProperty("challenge", out var challenge) && challenge.ValueKind == JsonValueKind.String
+                    ? challenge.GetString() : null;
+                string? url = root.TryGetProperty("url", out var page) && page.ValueKind == JsonValueKind.String ? page.GetString() : null;
+                return (provider, Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.Host.ToLowerInvariant() : null);
+            }
+            catch (JsonException) { return (null, null); }
         }
 
         private async Task<ContainerToolResult> TerminalAsync(JsonElement a, CancellationToken ct)
@@ -1401,8 +2099,9 @@ namespace Omnipotent.Services.Projects.Containers
             var result = await terminalAsync(command, Str(a, "workingDirectory"), timeoutSeconds, ct);
             // Never repeat the command in the result. Vault/account placeholders are deliberately
             // NOT resolved here: arbitrary shell stdout could echo them back to the model. Secrets
-            // remain confined to computer_type's one-way keystroke substitution path.
-            return new ContainerToolResult(result.Success, result.Format())
+            // remain confined to computer_type's one-way keystroke substitution path, and any value
+            // typed through it that a page or file later echoes into this output is masked.
+            return new ContainerToolResult(result.Success, Scrub(result.Format()))
             {
                 // A user command's non-zero exit is not evidence that the desktop, VNC, or image
                 // is broken. Timeouts/transport exceptions are surfaced by the outer adapter.

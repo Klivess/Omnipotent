@@ -10,6 +10,8 @@
 *.sh text eol=lf
 Dockerfile text eol=lf
 *.Dockerfile text eol=lf
+# Extensionless container executable (shebang script).
+klive-cdp text eol=lf
 
 ###############################################################################
 # Set default behavior for command prompt diff.
