@@ -131,6 +131,8 @@ namespace Omnipotent.Data_Handling
             public static string OmniTumblrAnalyticsDirectory = $"{OmniTumblrDirectory}/Analytics";
             public static string OmniTumblrLogsDirectory = $"{OmniTumblrDirectory}/Logs";
             public static string OmniTumblrEventsDirectory = $"{OmniTumblrLogsDirectory}/Events";
+            /// <summary>OmniTumblr v2 data root (the v1 folders above are read once for migration).</summary>
+            public static string OmniTumblrV2Directory = $"{OmniTumblrDirectory}/v2";
 
             //KliveMultiTool
             public static string KliveMultiToolDirectory = $"{SavedDataDirectory}/KliveMultiTool";

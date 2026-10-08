@@ -86,7 +86,7 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new AutoGoat());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTube());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniGram());
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTumblr());
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTumblr(kliveApi));
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveChat.KliveChatService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveTechHub());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniTrader());
