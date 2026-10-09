@@ -149,6 +149,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private TimeSpan NextPublishWait()
         {
             var next = publisher.NextDueUtc();
+            var confirm = publisher.NextConfirmUtc();
+            if (confirm != null && (next == null || confirm < next)) next = confirm;
             if (next == null) return PublishPoll;
             var wait = next.Value - clock();
             return wait < PublishPoll ? wait : PublishPoll;
@@ -157,8 +159,10 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private async Task<string?> PublishTickAsync(CancellationToken token)
         {
             int published = await publisher.PublishDueAsync(token);
-            if (published > 0) WakeSync();
-            return published > 0 ? $"published {published} post(s)" : null;
+            int confirmed = await publisher.ConfirmProvisionalIdsAsync(token);
+            if (published > 0 || confirmed > 0) WakeSync();
+            if (published == 0 && confirmed == 0) return null;
+            return confirmed == 0 ? $"published {published} post(s)" : $"published {published}, confirmed {confirmed} video(s) live";
         }
 
         private async Task<string?> PlanTickAsync(CancellationToken token)

@@ -1167,17 +1167,31 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
         private async Task PostsDeleteRemote(UserRequest req)
         {
             string postId = Required(Body(req), "postId");
+            // A video's id is a placeholder until Tumblr finishes processing it; deleting that id hits nothing.
+            if (Store.Read(s => s.FindPost(postId)?.TumblrIdProvisional == true) && service.Publisher != null)
+                await service.Publisher.ConfirmProvisionalIdsAsync(CancellationToken.None, postId, force: true);
             var target = Store.Read(s =>
             {
                 var post = s.FindPost(postId) ?? throw NotFound("No such post.");
                 if (post.Status != PostStatus.Published || post.TumblrPostId == null) throw Conflict("Only a published post can be deleted from Tumblr.");
+                if (post.TumblrIdProvisional) throw Conflict("Tumblr is still processing this video, so it has no live post to delete yet. Try again in a minute.");
                 var blog = s.Blog(post.BlogId) ?? throw NotFound("The post's blog is gone.");
                 return (Identifier: blog.Uuid ?? blog.Name, blog.ConnectionId, TumblrId: post.TumblrPostId, BlogName: blog.Name);
             });
             try
             {
                 var creds = await service.Auth!.GetCredentialsAsync(target.ConnectionId, CancellationToken.None);
-                await service.TumblrApi!.DeletePostAsync(creds, target.Identifier, target.TumblrId, CancellationToken.None);
+                try
+                {
+                    await service.TumblrApi!.DeletePostAsync(creds, target.Identifier, target.TumblrId, CancellationToken.None);
+                }
+                catch (TumblrApiException ex) when (ex.Kind is TumblrErrorKind.NotFound or TumblrErrorKind.EdgeBlocked && service.Publisher != null)
+                {
+                    // Our id may be a stale placeholder (a video's pre-transcode id): find the live post by slug.
+                    string? liveId = await service.Publisher.RelinkBySlugAsync(postId, CancellationToken.None);
+                    if (liveId == null || liveId == target.TumblrId) throw;
+                    await service.TumblrApi!.DeletePostAsync(creds, target.Identifier, liveId, CancellationToken.None);
+                }
             }
             catch (ConnectionUnavailableException ex) { throw Conflict(ex.Message); }
             catch (TumblrApiException ex) when (ex.Kind != TumblrErrorKind.NotFound) { throw Bad($"Tumblr refused ({ex.Code}): {ex.Message}"); }

@@ -88,6 +88,8 @@ namespace Omnipotent.Services.OmniTumblr.Api
     public sealed class TumblrCreatedPost
     {
         public string Id { get; set; } = "";
+        /// <summary>"transcoding" for a video Tumblr is still processing (its <see cref="Id"/> is then provisional).</summary>
+        public string? State { get; set; }
     }
 
     public sealed class TumblrOAuth2Token

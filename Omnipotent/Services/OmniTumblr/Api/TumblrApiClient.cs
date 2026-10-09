@@ -226,7 +226,7 @@ namespace Omnipotent.Services.OmniTumblr.Api
             string? id = Str(response["id_string"]) ?? Str(response["id"]);
             if (string.IsNullOrWhiteSpace(id))
                 throw new TumblrApiException(TumblrErrorKind.Unknown, 201, null, "Tumblr accepted the post but returned no id.") { Ambiguous = true };
-            return new TumblrCreatedPost { Id = id };
+            return new TumblrCreatedPost { Id = id, State = Str(response["state"]) };
         }
 
         public async Task DeletePostAsync(TumblrCredentials creds, string blog, string postId, CancellationToken ct)

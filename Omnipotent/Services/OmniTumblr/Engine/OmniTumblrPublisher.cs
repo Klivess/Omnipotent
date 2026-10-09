@@ -333,7 +333,9 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             try
             {
                 var created = await api.CreatePostAsync(creds, c.BlogIdentifier, request, ct);
-                ApplySuccess(c, created.Id, null, sw.ElapsedMilliseconds, reconciled: false);
+                bool provisional = request.Uploads.Any(u => u.MimeType.StartsWith("video/", StringComparison.OrdinalIgnoreCase))
+                    || string.Equals(created.State, "transcoding", StringComparison.OrdinalIgnoreCase);
+                ApplySuccess(c, created.Id, null, sw.ElapsedMilliseconds, reconciled: false, provisional);
                 return true;
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -392,7 +394,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 && (captionHead.Length == 0 || (p.Summary ?? "").Contains(captionHead, StringComparison.OrdinalIgnoreCase)));
         }
 
-        private void ApplySuccess(Claimed c, string tumblrId, string? url, long durationMs, bool reconciled)
+        private void ApplySuccess(Claimed c, string tumblrId, string? url, long durationMs, bool reconciled, bool provisional = false)
         {
             DateTime now = clock();
             store.Mutate(s =>
@@ -402,6 +404,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 var blog = s.Blog(post.BlogId);
                 post.Status = PostStatus.Published;
                 post.TumblrPostId = tumblrId;
+                post.TumblrIdProvisional = provisional;
                 post.PublishedUtc = now;
                 post.TumblrUrl = url ?? TumblrApiClient.BuildPostUrl(blog?.Name ?? c.BlogName, tumblrId);
                 post.NeedsReconcile = false;
@@ -428,7 +431,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                         s.MarkConnections();
                     }
 
-                    OmniTumblrInsights.MergeIndex(s.InsightsOf(blog.BlogId), new[]
+                    // A provisional id never appears on Tumblr; the live one is indexed once it is found.
+                    if (!provisional) OmniTumblrInsights.MergeIndex(s.InsightsOf(blog.BlogId), new[]
                     {
                         new TumblrPostSummary
                         {
@@ -438,7 +442,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     }, _ => post.PostId);
                     s.MarkInsights(blog.BlogId);
                     s.AddEvent(EventLevel.Success, "publish.ok",
-                        $"@{blog.Name}: published {post.Kind.ToString().ToLowerInvariant()}{(reconciled ? " (confirmed after an uncertain response)" : "")} — {post.TumblrUrl}",
+                        $"@{blog.Name}: published {post.Kind.ToString().ToLowerInvariant()}{(reconciled ? " (confirmed after an uncertain response)" : "")}{(provisional ? " — Tumblr is processing the video" : " — " + post.TumblrUrl)}",
                         blog.BlogId, post.PostId, now);
                 }
             });
@@ -589,6 +593,137 @@ namespace Omnipotent.Services.OmniTumblr.Engine
 
             if (alertMessage != null && alertKey != null) await AlertOnceAsync(alertKey, alertMessage);
             if (contentFailure) await NotifyContentFailureAsync(c.PostId);
+        }
+
+        // ─────────────────────────────── Provisional ids ───────────────────────────────
+
+        public static readonly TimeSpan ConfirmFirstAfter = TimeSpan.FromSeconds(30);
+        public static readonly TimeSpan ConfirmEvery = TimeSpan.FromMinutes(1);
+        public static readonly TimeSpan ConfirmGiveUpAfter = TimeSpan.FromHours(6);
+        private readonly ConcurrentDictionary<string, DateTime> lastConfirmCheckUtc = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Video posts are answered with a placeholder id while Tumblr transcodes; the post then goes live under
+        /// a new id. Finds the live post by its unique slug and re-keys ours, so links, metrics and deletes
+        /// point at the real post. <paramref name="force"/> skips the pacing (a user is waiting on it).
+        /// Returns how many were confirmed.
+        /// </summary>
+        public async Task<int> ConfirmProvisionalIdsAsync(CancellationToken ct, string? onlyPostId = null, bool force = false)
+        {
+            DateTime now = clock();
+            var pending = store.Read(s => s.AllPosts()
+                .Where(p => p.Status == PostStatus.Published && p.TumblrIdProvisional && p.PublishedUtc.HasValue
+                    && (onlyPostId == null || p.PostId == onlyPostId))
+                .Select(p => (p.PostId, p.BlogId, p.Slug, Published: p.PublishedUtc!.Value))
+                .ToList());
+            int confirmed = 0;
+            foreach (var group in pending.GroupBy(p => p.BlogId))
+            {
+                var due = group.Where(p => force || (now - p.Published >= ConfirmFirstAfter
+                    && (!lastConfirmCheckUtc.TryGetValue(p.PostId, out var last) || now - last >= ConfirmEvery))).ToList();
+                if (due.Count == 0) continue;
+                var target = store.Read(s => s.Blog(group.Key) is { } b
+                    ? (Identifier: string.IsNullOrEmpty(b.Uuid) ? b.Name : b.Uuid, b.ConnectionId)
+                    : (Identifier: (string?)null, ConnectionId: ""));
+                if (target.Identifier == null) continue;
+                foreach (var p in due) lastConfirmCheckUtc[p.PostId] = now;
+
+                TumblrPostsPage page;
+                try
+                {
+                    var creds = await auth.GetCredentialsAsync(target.ConnectionId, ct);
+                    page = await api.GetPostsAsync(creds, target.Identifier, 0, 20, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                catch { continue; } // checked again next pass
+
+                foreach (var p in due)
+                {
+                    var live = string.IsNullOrEmpty(p.Slug) ? null
+                        : page.Posts.FirstOrDefault(x => x.Slug != null && x.Slug.StartsWith(p.Slug, StringComparison.OrdinalIgnoreCase));
+                    if (live != null)
+                    {
+                        if (ApplyConfirmedId(p.PostId, live)) confirmed++;
+                        lastConfirmCheckUtc.TryRemove(p.PostId, out _);
+                    }
+                    else if (now - p.Published > ConfirmGiveUpAfter)
+                    {
+                        store.Mutate(s =>
+                        {
+                            var post = s.FindPost(p.PostId);
+                            if (post == null || !post.TumblrIdProvisional) return;
+                            post.TumblrIdProvisional = false;
+                            s.Touch(post, now);
+                            s.AddEvent(EventLevel.Warning, "publish.unconfirmed",
+                                $"Tumblr accepted a video post but it had not appeared on the blog after {Describe(ConfirmGiveUpAfter)}; its processing may have failed.",
+                                post.BlogId, post.PostId, now);
+                        });
+                        lastConfirmCheckUtc.TryRemove(p.PostId, out _);
+                    }
+                }
+            }
+            return confirmed;
+        }
+
+        /// <summary>When the next provisional id is worth checking (for the engine's sleep), or null.</summary>
+        public DateTime? NextConfirmUtc() => store.Read(s =>
+        {
+            DateTime? next = null;
+            foreach (var p in s.AllPosts())
+            {
+                if (p.Status != PostStatus.Published || !p.TumblrIdProvisional || p.PublishedUtc is not DateTime published) continue;
+                DateTime at = published + ConfirmFirstAfter;
+                if (lastConfirmCheckUtc.TryGetValue(p.PostId, out var last) && last + ConfirmEvery > at) at = last + ConfirmEvery;
+                if (next == null || at < next) next = at;
+            }
+            return next;
+        });
+
+        /// <summary>
+        /// Looks a published post up on Tumblr by slug and, if it lives under a different id than ours (a
+        /// placeholder recorded before provisional ids were tracked), re-keys it. Returns the live id, or null.
+        /// </summary>
+        public async Task<string?> RelinkBySlugAsync(string postId, CancellationToken ct)
+        {
+            var target = store.Read(s =>
+            {
+                var post = s.FindPost(postId);
+                var blog = post == null ? null : s.Blog(post.BlogId);
+                if (post == null || blog == null || string.IsNullOrEmpty(post.Slug)) return null;
+                return new { post.Slug, post.TumblrPostId, Identifier = string.IsNullOrEmpty(blog.Uuid) ? blog.Name : blog.Uuid, blog.ConnectionId };
+            });
+            if (target == null) return null;
+            var creds = await auth.GetCredentialsAsync(target.ConnectionId, ct);
+            var page = await api.GetPostsAsync(creds, target.Identifier, 0, 20, ct);
+            var live = page.Posts.FirstOrDefault(x => x.Slug != null && x.Slug.StartsWith(target.Slug, StringComparison.OrdinalIgnoreCase));
+            if (live == null) return null;
+            if (live.Id != target.TumblrPostId) ApplyConfirmedId(postId, live, requireProvisional: false);
+            return live.Id;
+        }
+
+        private bool ApplyConfirmedId(string postId, TumblrPostSummary live, bool requireProvisional = true)
+        {
+            DateTime now = clock();
+            return store.Mutate(s =>
+            {
+                var post = s.FindPost(postId);
+                if (post == null || (requireProvisional && !post.TumblrIdProvisional)) return false;
+                var blog = s.Blog(post.BlogId);
+                string? oldId = post.TumblrPostId;
+                post.TumblrPostId = live.Id;
+                post.TumblrIdProvisional = false;
+                post.TumblrUrl = !string.IsNullOrEmpty(live.PostUrl) ? live.PostUrl : TumblrApiClient.BuildPostUrl(blog?.Name ?? live.BlogName ?? "", live.Id);
+                s.Touch(post, now);
+                if (blog != null)
+                {
+                    var insights = s.InsightsOf(blog.BlogId);
+                    if (oldId != null && oldId != live.Id) insights.Index.RemoveAll(e => e.Id == oldId);
+                    OmniTumblrInsights.MergeIndex(insights, new[] { live }, _ => post.PostId);
+                    s.MarkInsights(blog.BlogId);
+                    s.AddEvent(EventLevel.Success, "publish.live", $"@{blog.Name}: the post is live — {post.TumblrUrl}", blog.BlogId, post.PostId, now);
+                }
+                return true;
+            });
         }
 
         /// <summary>Returns a claimed post to Ready without counting the attempt (nothing was sent).</summary>

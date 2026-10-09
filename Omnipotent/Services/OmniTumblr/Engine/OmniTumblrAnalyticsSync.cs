@@ -377,7 +377,14 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 {
                     var post = Match(summary);
                     if (post == null) continue;
-                    if (post.TumblrPostId != summary.Id) post.TumblrPostId = summary.Id;
+                    if (post.TumblrPostId != summary.Id)
+                    {
+                        // Found by slug under a new id (a video's placeholder id was replaced): drop the stale entry.
+                        string? oldId = post.TumblrPostId;
+                        if (oldId != null) s.InsightsOf(blogId).Index.RemoveAll(e => e.Id == oldId);
+                        post.TumblrPostId = summary.Id;
+                    }
+                    post.TumblrIdProvisional = false;
                     if (!string.IsNullOrEmpty(summary.PostUrl)) post.TumblrUrl = summary.PostUrl;
                     UpdateMetrics(post, summary.NoteCount, null, null, now);
                     s.Touch(post, now);

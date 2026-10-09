@@ -38,8 +38,13 @@ namespace Omnipotent.Tests.OmniTumblr
             Assert.Equal("t:memeblog", blog); // published by uuid, so a renamed blog still works
             Assert.Equal(post.Slug, request.Slug);
             Assert.Equal(Start, h.Blog(blogId).Stats.LastPublishedUtc);
-            Assert.Contains(h.Store.Read(s => s.InsightsOf(blogId).Index.ToList()), p => p.OmniPostId == postId);
             Assert.Contains(h.Store.Read(s => s.Events.ToList()), e => e.Kind == "publish.ok" && e.PostId == postId);
+            // A video's id is provisional until it is seen live; only then is it indexed.
+            Assert.True(post.TumblrIdProvisional);
+            Assert.DoesNotContain(h.Store.Read(s => s.InsightsOf(blogId).Index.ToList()), p => p.OmniPostId == postId);
+            h.Clock.Advance(OmniTumblrPublisher.ConfirmFirstAfter);
+            Assert.Equal(1, await h.Publisher.ConfirmProvisionalIdsAsync(CancellationToken.None));
+            Assert.Contains(h.Store.Read(s => s.InsightsOf(blogId).Index.ToList()), p => p.OmniPostId == postId);
 
             // Nothing left to do.
             Assert.Equal(0, await h.Publisher.PublishDueAsync(CancellationToken.None));
@@ -251,6 +256,60 @@ namespace Omnipotent.Tests.OmniTumblr
             await h.Publisher.PublishDueAsync(CancellationToken.None);
             Assert.Equal(PostStatus.Published, h.Post(postId).Status);
             Assert.Equal("888", h.Post(postId).TumblrPostId);
+        }
+
+        [Fact]
+        public async Task AVideosPlaceholderId_IsReplacedByTheLiveId_OnceTumblrFinishesProcessing()
+        {
+            var (h, _, blogId) = Setup();
+            using var _h = h;
+            // Tumblr answers a video create with a placeholder id; the post goes live later under another id.
+            h.Api.OnCreate = (_, _) => Task.FromResult(new TumblrCreatedPost { Id = "111", State = "transcoding" });
+            string postId = h.AddReadyPost(blogId);
+
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            var post = h.Post(postId);
+            Assert.Equal(PostStatus.Published, post.Status);
+            Assert.True(post.TumblrIdProvisional);
+            Assert.Equal(Start.Add(OmniTumblrPublisher.ConfirmFirstAfter), h.Publisher.NextConfirmUtc());
+
+            // Still transcoding: nothing to find yet.
+            h.Clock.Advance(OmniTumblrPublisher.ConfirmFirstAfter);
+            Assert.Equal(0, await h.Publisher.ConfirmProvisionalIdsAsync(CancellationToken.None));
+            Assert.True(h.Post(postId).TumblrIdProvisional);
+
+            lock (h.Api.PublishedPosts)
+                h.Api.PublishedPosts.Add(new TumblrPostSummary { Id = "222", Slug = post.Slug, PublishedUtc = h.Clock.Now, PostUrl = "https://www.tumblr.com/memeblog/222/" + post.Slug });
+            h.Clock.Advance(OmniTumblrPublisher.ConfirmEvery);
+            Assert.Equal(1, await h.Publisher.ConfirmProvisionalIdsAsync(CancellationToken.None));
+
+            post = h.Post(postId);
+            Assert.False(post.TumblrIdProvisional);
+            Assert.Equal("222", post.TumblrPostId);
+            Assert.Equal("https://www.tumblr.com/memeblog/222/" + post.Slug, post.TumblrUrl);
+            var index = h.Store.Read(s => s.InsightsOf(blogId).Index.Select(e => e.Id).ToList());
+            Assert.Contains("222", index);
+            Assert.DoesNotContain("111", index);
+            Assert.Null(h.Publisher.NextConfirmUtc());
+        }
+
+        [Fact]
+        public async Task RelinkBySlug_RepairsAPlaceholderIdRecordedBeforeTracking()
+        {
+            var (h, _, blogId) = Setup();
+            using var _h = h;
+            string postId = h.AddReadyPost(blogId, p =>
+            {
+                p.Status = PostStatus.Published;
+                p.PublishedUtc = Start;
+                p.Slug = "peak-mcu-b7281aec";
+                p.TumblrPostId = "111";
+            });
+            lock (h.Api.PublishedPosts)
+                h.Api.PublishedPosts.Add(new TumblrPostSummary { Id = "222", Slug = "peak-mcu-b7281aec", PublishedUtc = Start });
+
+            Assert.Equal("222", await h.Publisher.RelinkBySlugAsync(postId, CancellationToken.None));
+            Assert.Equal("222", h.Post(postId).TumblrPostId);
         }
 
         [Fact]

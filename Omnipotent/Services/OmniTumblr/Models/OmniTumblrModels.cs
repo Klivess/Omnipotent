@@ -335,6 +335,9 @@ namespace Omnipotent.Services.OmniTumblr.Models
         /// Tumblr by slug before uploading again.</summary>
         public bool NeedsReconcile { get; set; }
         public string? TumblrPostId { get; set; }
+        /// <summary>Video posts: the id Tumblr answered the create with is a placeholder while it transcodes;
+        /// the post goes live under a new id. Until that id is found (by slug), this is true.</summary>
+        public bool TumblrIdProvisional { get; set; }
         public string? TumblrUrl { get; set; }
         public DateTime? PublishedUtc { get; set; }
 

@@ -41,6 +41,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public int Attempts { get; set; }
         public string? TumblrUrl { get; set; }
         public string? TumblrPostId { get; set; }
+        /// <summary>Tumblr is still transcoding the video; the link/id are placeholders until it goes live.</summary>
+        public bool TumblrIdPending { get; set; }
         public long Notes { get; set; }
         public long? Likes { get; set; }
         public long? Reblogs { get; set; }
@@ -260,6 +262,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 Attempts = p.Attempts,
                 TumblrUrl = p.TumblrUrl,
                 TumblrPostId = p.TumblrPostId,
+                TumblrIdPending = p.TumblrIdProvisional,
                 Notes = p.Metrics.Notes,
                 Likes = p.Metrics.Likes,
                 Reblogs = p.Metrics.Reblogs,
