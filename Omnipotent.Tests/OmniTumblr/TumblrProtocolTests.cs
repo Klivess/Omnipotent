@@ -256,6 +256,35 @@ namespace Omnipotent.Tests.OmniTumblr
         }
 
         [Fact]
+        public async Task ABare403FromTheEdge_IsTransient_AndReportedWithoutItsHtml()
+        {
+            const string nginx = "<html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+            using var dir = new TempDir();
+            string file = dir.File("clip.mp4", 1024);
+            var stub = new StubHandler { Respond = _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent(nginx, Encoding.UTF8, "text/html") }) };
+            var client = new TumblrApiClient(new HttpClient(stub));
+            var request = TumblrNpf.Build(new NpfBuildInput { Kind = PostKind.Video, Media = new[] { new PostMedia { Path = file, MimeType = "video/mp4" } }, Caption = "cap" });
+
+            var ex = await Assert.ThrowsAsync<TumblrApiException>(() => client.CreatePostAsync(OAuth1, "t:abc", request, CancellationToken.None));
+
+            Assert.Equal(TumblrErrorKind.EdgeBlocked, ex.Kind);
+            Assert.True(ex.IsTransient);
+            Assert.Equal("403", ex.Code);
+            Assert.DoesNotContain("<", ex.Message);
+            Assert.Contains("403 Forbidden", ex.Message);
+            Assert.Contains("nginx", ex.Message);
+        }
+
+        [Fact]
+        public async Task A403WithTheApiEnvelope_IsStillForbidden()
+        {
+            var stub = new StubHandler { Respond = _ => Task.FromResult(Json(HttpStatusCode.Forbidden, "{\"meta\":{\"status\":403,\"msg\":\"Forbidden\"},\"errors\":[{\"title\":\"Forbidden\",\"code\":0}],\"response\":[]}")) };
+            var client = new TumblrApiClient(new HttpClient(stub));
+            var ex = await Assert.ThrowsAsync<TumblrApiException>(() => client.GetUserInfoAsync(OAuth1, CancellationToken.None));
+            Assert.Equal(TumblrErrorKind.Forbidden, ex.Kind);
+        }
+
+        [Fact]
         public async Task CreatePost_SendsMultipartWithJsonAndMedia_AndReturnsTheId()
         {
             using var dir = new TempDir();

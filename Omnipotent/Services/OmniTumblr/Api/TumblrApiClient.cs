@@ -386,8 +386,12 @@ namespace Omnipotent.Services.OmniTumblr.Api
             int effective = status is >= 200 and < 300 ? metaStatus : status;
             int? subcode = (int?)Long(root?["errors"]?.FirstOrDefault()?["code"]);
             if (subcode == 0) subcode = null;
-            string message = ErrorMessage(root) ?? Str(root?["meta"]?["msg"]) ?? Clip(body, 300);
-            var kind = TumblrApiException.Classify(effective, subcode, message);
+            string message = ErrorMessage(root) ?? Str(root?["meta"]?["msg"]) ?? DescribeNonApiBody(body);
+            // Tumblr's API always answers with a JSON envelope; a 403 without one is its edge proxy (nginx)
+            // turning the request away before the API saw it — not a verdict on the account or the post.
+            var kind = root == null && effective == 403
+                ? TumblrErrorKind.EdgeBlocked
+                : TumblrApiException.Classify(effective, subcode, message);
             DateTime? retryAfter = null;
             if (headers?.RetryAfter?.Delta is TimeSpan delta) retryAfter = DateTime.UtcNow + delta;
             else if (headers?.RetryAfter?.Date is DateTimeOffset date) retryAfter = date.UtcDateTime;
@@ -529,6 +533,18 @@ namespace Omnipotent.Services.OmniTumblr.Api
             if (t.Type == JTokenType.Boolean) return t.Value<bool>();
             string s = t.ToString().Trim().ToLowerInvariant();
             return s is "true" or "1" or "yes" or "y" ? true : s is "false" or "0" or "no" or "n" ? false : null;
+        }
+
+        /// <summary>A non-JSON error body as one readable line: an HTML page becomes its title, not its markup.</summary>
+        internal static string DescribeNonApiBody(string? body)
+        {
+            if (string.IsNullOrWhiteSpace(body)) return "(empty response)";
+            if (!body.TrimStart().StartsWith('<')) return Clip(body.Trim(), 300);
+            var title = System.Text.RegularExpressions.Regex.Match(body, @"<title[^>]*>\s*(.*?)\s*</title>",
+                System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.Singleline);
+            string head = title.Success && title.Groups[1].Value.Length > 0 ? title.Groups[1].Value : "HTML error page";
+            bool nginx = body.Contains("nginx", StringComparison.OrdinalIgnoreCase);
+            return $"{Clip(head, 120)} (HTML page from Tumblr's {(nginx ? "nginx " : "")}edge, not an API response)";
         }
 
         private static string Clip(string? s, int max) => string.IsNullOrEmpty(s) ? "(empty response)" : s.Length <= max ? s : s[..max] + "…";

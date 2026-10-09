@@ -10,6 +10,11 @@ namespace Omnipotent.Services.OmniTumblr.Api
         /// <summary>401: the token was revoked or expired. The connection needs re-authorizing.</summary>
         Unauthorized,
         Forbidden,
+        /// <summary>
+        /// A 403 from Tumblr's edge (a bare nginx HTML page, no API envelope): the request never reached
+        /// the API, so it says nothing about the account or the post. Transient — retry with backoff.
+        /// </summary>
+        EdgeBlocked,
         NotFound,
         BadRequest,
         /// <summary>400.8005: Tumblr cannot accept this media. Retrying the same file will never work.</summary>
@@ -62,7 +67,7 @@ namespace Omnipotent.Services.OmniTumblr.Api
 
         public bool IsTransient => Kind is TumblrErrorKind.Network or TumblrErrorKind.Timeout
             or TumblrErrorKind.ServerError or TumblrErrorKind.ServiceUnavailable or TumblrErrorKind.RateLimited
-            or TumblrErrorKind.Unknown;
+            or TumblrErrorKind.Unknown or TumblrErrorKind.EdgeBlocked;
 
         public bool IsDailyLimit => Kind is TumblrErrorKind.DailyPostLimit or TumblrErrorKind.DailyMediaLimit
             or TumblrErrorKind.DailyVideoLimit;

@@ -229,6 +229,31 @@ namespace Omnipotent.Tests.OmniTumblr
         }
 
         [Fact]
+        public async Task AnEdgeBlock_IsRetried_NotFailedOrAlerted()
+        {
+            var (h, _, blogId) = Setup();
+            using var _h = h;
+            int calls = 0;
+            h.Api.OnCreate = (_, _) =>
+            {
+                if (++calls == 1) throw new TumblrApiException(TumblrErrorKind.EdgeBlocked, 403, null, "403 Forbidden (HTML page from Tumblr's nginx edge, not an API response)");
+                return Task.FromResult(new TumblrCreatedPost { Id = "888" });
+            };
+            string postId = h.AddReadyPost(blogId, p => { p.Origin = PostOrigin.Autopilot; p.SlotUtc = p.ScheduledUtc; });
+
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            var post = h.Post(postId);
+            Assert.Equal(PostStatus.Ready, post.Status);
+            Assert.Equal(Start.AddMinutes(2), post.NextAttemptUtc);
+            Assert.Empty(h.Alerts);
+
+            h.Clock.Advance(TimeSpan.FromMinutes(3));
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            Assert.Equal(PostStatus.Published, h.Post(postId).Status);
+            Assert.Equal("888", h.Post(postId).TumblrPostId);
+        }
+
+        [Fact]
         public async Task AnAutopilotPostThatMissedItsSlotByTooMuch_IsSkipped()
         {
             var (h, _, blogId) = Setup(b => b.Strategy.MissedSlotGraceHours = 6);
