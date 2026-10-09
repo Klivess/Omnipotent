@@ -11,6 +11,7 @@ using System.Text;
 using System.Collections.Concurrent;
 using System.Management.Automation;
 using System.Management.Automation.Runspaces;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Service_Manager
 {
@@ -202,7 +203,7 @@ namespace Omnipotent.Service_Manager
 
         private async Task SetupUptimeApiRoutesAsync()
         {
-            await CreateAPIRoute("/System/UptimeStatistics", HandleUptimeStatisticsRequest, HttpMethod.Get, KMProfileManager.KMPermissions.Admin);
+            await CreateAPIRoute("/System/UptimeStatistics", HandleUptimeStatisticsRequest, HttpMethod.Get, SystemPerms.UptimeView);
             await SetupTerminalApiRoutesAsync();
         }
 
@@ -345,14 +346,14 @@ namespace Omnipotent.Service_Manager
 
         private async Task SetupTerminalApiRoutesAsync()
         {
-            await CreateAPIRoute("/admin/terminal/session/open", HandleTerminalSessionOpen, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/terminal/session/execute", HandleTerminalSessionExecute, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/terminal/session/reset", HandleTerminalSessionReset, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/terminal/session/close", HandleTerminalSessionClose, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/terminal/execute", HandleTerminalExecute, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/terminal/status", HandleTerminalStatus, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/terminal/history", HandleTerminalHistory, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/terminal/clear", HandleTerminalClear, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            await CreateAPIRoute("/admin/terminal/session/open", HandleTerminalSessionOpen, HttpMethod.Post, SystemPerms.TerminalUse);
+            await CreateAPIRoute("/admin/terminal/session/execute", HandleTerminalSessionExecute, HttpMethod.Post, SystemPerms.TerminalUse);
+            await CreateAPIRoute("/admin/terminal/session/reset", HandleTerminalSessionReset, HttpMethod.Post, SystemPerms.TerminalUse);
+            await CreateAPIRoute("/admin/terminal/session/close", HandleTerminalSessionClose, HttpMethod.Post, SystemPerms.TerminalUse);
+            await CreateAPIRoute("/admin/terminal/execute", HandleTerminalExecute, HttpMethod.Post, SystemPerms.TerminalUse);
+            await CreateAPIRoute("/admin/terminal/status", HandleTerminalStatus, HttpMethod.Get, SystemPerms.TerminalUse);
+            await CreateAPIRoute("/admin/terminal/history", HandleTerminalHistory, HttpMethod.Get, SystemPerms.TerminalUse);
+            await CreateAPIRoute("/admin/terminal/clear", HandleTerminalClear, HttpMethod.Post, SystemPerms.TerminalUse);
         }
 
         private static TerminalSessionRequest ParseTerminalSessionRequest(string requestBody)

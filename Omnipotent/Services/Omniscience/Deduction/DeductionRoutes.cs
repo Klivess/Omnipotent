@@ -7,6 +7,7 @@ using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Omniscience.Deduction
 {
@@ -44,7 +45,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await OmniscienceRoutes.GatedRead(req, () => BuildFactsPayload(personId));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/persons/relationships", async req =>
             {
@@ -55,7 +56,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await OmniscienceRoutes.GatedRead(req, () => BuildRelationshipsPayload(personId));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/persons/aliases", async req =>
             {
@@ -78,7 +79,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     });
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/persons/open-questions", async req =>
             {
@@ -89,7 +90,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await OmniscienceRoutes.GatedRead(req, () => BuildOpenQuestionsPayload(personId));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/persons/changelog", async req =>
             {
@@ -113,7 +114,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     });
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/persons/bigfive-series", async req =>
             {
@@ -145,13 +146,13 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     });
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/review/queue", async req =>
             {
                 try { await OmniscienceRoutes.CachedRead(req, "review/queue", TimeSpan.FromSeconds(30), BuildReviewQueuePayload); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/review/resolve", async req =>
             {
@@ -167,13 +168,13 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
 
             await service.CreateAPIRoute("/omniscience/targets/suggestions", async req =>
             {
                 try { await OmniscienceRoutes.CachedRead(req, "targets/suggestions", TimeSpan.FromSeconds(60), BuildTargetSuggestionsPayload); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/targets/dismiss", async req =>
             {
@@ -196,7 +197,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
 
             await service.CreateAPIRoute("/omniscience/persons/tier-set", async req =>
             {
@@ -216,7 +217,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
 
             await service.CreateAPIRoute("/omniscience/persons/profile-era", async req =>
             {
@@ -239,7 +240,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true,\"message\":\"era profile queued\"}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
 
             await service.CreateAPIRoute("/omniscience/persons/era-profiles", async req =>
             {
@@ -270,7 +271,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     });
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/radar/alerts", async req =>
             {
@@ -279,7 +280,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await OmniscienceRoutes.CachedRead(req, "radar/alerts", TimeSpan.FromSeconds(30), BuildRadarAlertsPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/identity-links", async req =>
             {
@@ -288,7 +289,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await OmniscienceRoutes.CachedRead(req, "identity-links", TimeSpan.FromSeconds(30), BuildIdentityLinksPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/identity-links/resolve", async req =>
             {
@@ -305,7 +306,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
 
             await service.CreateAPIRoute("/omniscience/persons/observe", async req =>
             {
@@ -335,7 +336,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
 
             await service.CreateAPIRoute("/omniscience/watchlists", async req =>
             {
@@ -360,7 +361,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse(new JObject(new JProperty("watchlists", arr)).ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/watchlists/add", async req =>
             {
@@ -391,7 +392,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
 
             await service.CreateAPIRoute("/omniscience/watchlists/remove", async req =>
             {
@@ -414,7 +415,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
 
             // This payload is ~10 COUNT(*) aggregates, several over tables that grow
             // with the full message corpus (qa_pairs, name_usages, stimulus_reply_pairs).
@@ -424,7 +425,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
             {
                 try { await OmniscienceRoutes.CachedRead(req, "deduction/status", TimeSpan.FromSeconds(60), BuildDeductionStatusPayload); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.OverviewView);
 
             await service.CreateAPIRoute("/omniscience/deduction/run", async req =>
             {
@@ -445,7 +446,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
                     await req.ReturnResponse("{\"ok\":true,\"message\":\"deduction pass queued\"}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.AnalysisRun);
         }
 
         private static async Task Err(KliveAPI.KliveAPI.UserRequest req, Exception ex)

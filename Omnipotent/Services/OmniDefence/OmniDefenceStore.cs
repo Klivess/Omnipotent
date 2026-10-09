@@ -243,6 +243,8 @@ namespace Omnipotent.Services.OmniDefence
             await EnsureColumnAsync("requests", "body_text", "TEXT");
             await EnsureColumnAsync("requests", "body_truncated", "INTEGER");
             await EnsureColumnAsync("requests", "headers_json", "TEXT");
+            // The permission key that gated the request (replaces the retired numeric perm_required).
+            await EnsureColumnAsync("requests", "perm_key", "TEXT");
             await EnsureColumnAsync("ip_records", "latitude", "REAL");
             await EnsureColumnAsync("ip_records", "longitude", "REAL");
             await EnsureColumnAsync("ip_records", "city", "TEXT");
@@ -522,8 +524,8 @@ namespace Omnipotent.Services.OmniDefence
         });
 
         private const string RequestInsertSql = @"INSERT INTO requests
-                (utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, request_origin, client_page, body_text, body_truncated, headers_json)
-                VALUES ($ts,$ip,$method,$route,$query,$status,$dur,$pid,$pname,$prank,$perm,$matched,$bh,$blen,$ua,$deny,$origin,$page,$btext,$btrunc,$hdrs)";
+                (utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, perm_key, matched_route, body_hash, body_length, user_agent, deny_reason, request_origin, client_page, body_text, body_truncated, headers_json)
+                VALUES ($ts,$ip,$method,$route,$query,$status,$dur,$pid,$pname,$prank,$perm,$pkey,$matched,$bh,$blen,$ua,$deny,$origin,$page,$btext,$btrunc,$hdrs)";
 
         private static void BindRequestParameters(SqliteCommand cmd, RequestRow row)
         {
@@ -539,6 +541,7 @@ namespace Omnipotent.Services.OmniDefence
             cmd.Parameters.AddWithValue("$pname", (object?)row.ProfileName ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$prank", (object?)row.ProfileRank ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$perm", row.PermRequired);
+            cmd.Parameters.AddWithValue("$pkey", (object?)row.PermKey ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$matched", row.MatchedRoute ? 1 : 0);
             cmd.Parameters.AddWithValue("$bh", (object?)row.BodyHash ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$blen", row.BodyLength);
@@ -565,6 +568,7 @@ namespace Omnipotent.Services.OmniDefence
             cmd.Parameters["$pname"].Value = (object?)row.ProfileName ?? DBNull.Value;
             cmd.Parameters["$prank"].Value = (object?)row.ProfileRank ?? DBNull.Value;
             cmd.Parameters["$perm"].Value = row.PermRequired;
+            cmd.Parameters["$pkey"].Value = (object?)row.PermKey ?? DBNull.Value;
             cmd.Parameters["$matched"].Value = row.MatchedRoute ? 1 : 0;
             cmd.Parameters["$bh"].Value = (object?)row.BodyHash ?? DBNull.Value;
             cmd.Parameters["$blen"].Value = row.BodyLength;
@@ -595,6 +599,7 @@ namespace Omnipotent.Services.OmniDefence
             cmd.Parameters.AddWithValue("$pname", (object?)row.ProfileName ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$prank", (object?)row.ProfileRank ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$perm", row.PermRequired);
+            cmd.Parameters.AddWithValue("$pkey", (object?)row.PermKey ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$matched", row.MatchedRoute ? 1 : 0);
             cmd.Parameters.AddWithValue("$bh", (object?)row.BodyHash ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$blen", row.BodyLength);
@@ -1240,7 +1245,10 @@ namespace Omnipotent.Services.OmniDefence
         public string? ProfileId;
         public string? ProfileName;
         public int? ProfileRank;
+        /// <summary>Retired numeric rank requirement; written as 0 since permissions replaced ranks.</summary>
         public int PermRequired;
+        /// <summary>The permission key that gated the request (e.g. <c>omnitrader.orders.read</c>).</summary>
+        public string? PermKey;
         public bool MatchedRoute;
         public string? BodyHash;
         public long BodyLength;

@@ -4,6 +4,7 @@ using Omnipotent.Profiles;
 using System.Collections.Specialized;
 using System.Globalization;
 using System.Net;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveTechHub
 {
@@ -22,79 +23,79 @@ namespace Omnipotent.Services.KliveTechHub
                 "/klivetech/GetAllGadgets",
                 GetAllGadgets,
                 HttpMethod.Get,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.GadgetsRead);
 
             await parent.CreateAPIRoute(
                 "/klivetech/executegadgetaction",
                 ExecuteGadgetAction,
                 HttpMethod.Post,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.GadgetsAct);
 
             await parent.CreateAPIRoute(
                 "/klivetech/GetGadgetByID",
                 GetGadgetById,
                 HttpMethod.Get,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.GadgetsRead);
 
             await parent.CreateAPIRoute(
                 "/klivetech/firmware/config",
                 GetFirmwareConfiguration,
                 HttpMethod.Get,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.FirmwareRead);
 
             await parent.CreateAPIRoute(
                 "/klivetech/firmware/projects",
                 GetFirmwareProjects,
                 HttpMethod.Get,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.FirmwareRead);
 
             await parent.CreateAPIRoute(
                 "/klivetech/firmware/compile",
                 CompileFirmware,
                 HttpMethod.Post,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.FirmwareDeploy);
 
             await parent.CreateAPIRoute(
                 "/klivetech/firmware/update",
                 UpdateFirmware,
                 HttpMethod.Post,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.FirmwareDeploy);
 
             await parent.CreateAPIRoute(
                 "/klivetech/firmware/jobs",
                 GetFirmwareJobs,
                 HttpMethod.Get,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.FirmwareRead);
 
             await parent.CreateAPIRoute(
                 "/klivetech/firmware/jobs/cancel",
                 CancelFirmwareJob,
                 HttpMethod.Post,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.FirmwareDeploy);
 
             await parent.CreateAPIRoute(
                 "/klivetech/streamables",
                 GetStreamables,
                 HttpMethod.Get,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.StreamablesRead);
 
             await parent.CreateAPIRoute(
                 "/klivetech/streamables/history",
                 GetStreamableHistory,
                 HttpMethod.Get,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.StreamablesRead);
 
             await parent.CreateAPIRoute(
                 "/klivetech/streamables/latest",
                 GetLatestStreamableBinary,
                 HttpMethod.Get,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.StreamablesRead);
 
             await parent.CreateAPIRoute(
                 "/klivetech/streamables/control",
                 ConfigureStreamable,
                 HttpMethod.Post,
-                KMProfileManager.KMPermissions.Klives);
+                KliveTechPerms.StreamablesControl);
 
             await parent.RegisterRelayRouteAsync();
             await parent.RegisterStreamableLiveRouteAsync();

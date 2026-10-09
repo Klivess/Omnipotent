@@ -16,6 +16,7 @@ using System.IO;
 using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Omniscience
 {
@@ -171,7 +172,7 @@ namespace Omnipotent.Services.Omniscience
                 {
                     await req.ReturnResponse("{\"error\":\"" + ex.Message.Replace("\"", "'") + "\"}", code: System.Net.HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.AnalysisRun);
 
             await CreateAPIRoute("/omniscience/briefing/run", async req =>
             {
@@ -186,7 +187,7 @@ namespace Omnipotent.Services.Omniscience
                 {
                     await req.ReturnResponse("{\"error\":\"" + ex.Message.Replace("\"", "'") + "\"}", code: System.Net.HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.AnalysisRun);
             await ServiceLog("[Omniscience] API routes registered.");
 
             // Start Discord ingest (will start gateways for every saved source).

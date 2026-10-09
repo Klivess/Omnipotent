@@ -1,5 +1,6 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Profiles;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.SeleniumManager
 {
@@ -19,7 +20,7 @@ namespace Omnipotent.Services.SeleniumManager
                 string json = JsonConvert.SerializeObject(parent.GetCurrentActiveSeleniumInstances());
 
                 await req.ReturnResponse(json, "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, SystemPerms.ResourcesRead);
         }
     }
 }

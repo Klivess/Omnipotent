@@ -14,7 +14,7 @@ namespace Omnipotent.Services.KliveMultiTool.Tools
             Description = "Demo tool showcasing all KliveMultiTool features.";
         }
 
-        public override KMPermissions RequiredPermission => KMPermissions.Admin;
+        public override Omnipotent.Profiles.ProfileRank LegacyRank => Omnipotent.Profiles.ProfileRank.Admin;
 
         // ── Observable state — streamed to the UI on demand ──
 

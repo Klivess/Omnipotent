@@ -35,6 +35,7 @@ using Omnipotent.Services.OmniDefence;
 using Omnipotent.Services.OmniDefence.Fingerprint;
 using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.KliveAPI.Telemetry;
+using Omnipotent.Profiles.Permissions;
 
 
 namespace Omnipotent.Services.KliveAPI
@@ -118,7 +119,8 @@ namespace Omnipotent.Services.KliveAPI
         public struct RouteInfo
         {
             public Func<UserRequest, Task> action;
-            public KMProfileManager.KMPermissions authenticationLevelRequired;
+            /// <summary>The permission that gates this route (Public / SignedIn pseudo-keys included).</summary>
+            public PermissionDef permission;
             public HttpMethod method;
             public string normalizedMethod;
             public RequestBodyMode requestBodyMode;
@@ -127,7 +129,21 @@ namespace Omnipotent.Services.KliveAPI
         public struct WebSocketRouteInfo
         {
             public Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler;
-            public KMProfileManager.KMPermissions authenticationLevelRequired;
+            public PermissionDef permission;
+        }
+
+        /// <summary>A registered route as the permission catalog shows it.</summary>
+        public sealed record RouteDescriptor(string Path, string Method, string Kind, PermissionDef Permission);
+
+        /// <summary>Every registered HTTP and WebSocket route with the permission that gates it.</summary>
+        public IReadOnlyList<RouteDescriptor> DescribeRoutes()
+        {
+            var list = new List<RouteDescriptor>();
+            foreach (var (path, info) in ControllerLookup)
+                list.Add(new RouteDescriptor(path, info.normalizedMethod, info.requestBodyMode == RequestBodyMode.Streaming ? "streaming" : "route", info.permission));
+            foreach (var (path, info) in WebSocketRouteLookup)
+                list.Add(new RouteDescriptor(path, "WS", "websocket", info.permission));
+            return list.OrderBy(r => r.Path, StringComparer.OrdinalIgnoreCase).ToList();
         }
 
         /// <summary>
@@ -223,7 +239,24 @@ namespace Omnipotent.Services.KliveAPI
             public HttpListenerRequest req;
             public NameValueCollection userParameters;
             public KMProfileManager.KMProfile? user;
+            /// <summary>The signed-in session behind <see cref="user"/> (null for password/API credentials).</summary>
+            [JsonIgnore]
+            public Omnipotent.Profiles.Sessions.KMSession? session;
+            /// <summary>The permission that gated this route.</summary>
+            [JsonIgnore]
+            public PermissionDef? permission;
             public string userMessageContent;
+
+            /// <summary>
+            /// In-handler permission refinement ("may this caller also see X?"). Registers the caller's
+            /// access as a cache dependency, so a response that depended on it is never replayed after
+            /// their access changes.
+            /// </summary>
+            public bool Can(PermissionDef permission)
+            {
+                if (user != null) CacheDeps.NoteRead(KMProfileManager.AccessDependencyKey(user.UserID));
+                return AccessEvaluator.Can(user, permission);
+            }
             public byte[] userMessageBytes;
 
             // NOTE: UserRequest is a struct that gets copied around — any state that
@@ -760,7 +793,7 @@ namespace Omnipotent.Services.KliveAPI
                 string url = req.userParameters.Get("redirectURL");
                 string code = $"<script>window.location.replace('{url}');</script>";
                 await req.ReturnResponse(code, "text/html");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+            }, HttpMethod.Get, Perms.Public);
             await CreateRoute("/ping", async (req) =>
             {
                 // Counts pings the handler actually served — the watchdog compares this
@@ -773,21 +806,28 @@ namespace Omnipotent.Services.KliveAPI
                 CacheDeps.MarkUncacheable("liveness probe");
                 Interlocked.Increment(ref _pingsServed);
                 await req.ReturnResponse("Pong", "text/html");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+            }, HttpMethod.Get, Perms.Public);
             await CreateRoute("/", async (req) =>
             {
                 await req.ReturnResponse(RootLandingText, "text/plain");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+            }, HttpMethod.Get, Perms.Public);
             await CreateRoute("/allRoutes", async (req) =>
             {
-                var copy = ControllerLookup.ToDictionary();
-                string resp = JsonConvert.SerializeObject(copy);
-                await req.ReturnResponse(resp, "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Associate);
+                // A projection: the raw route table holds delegates and internals.
+                var routes = DescribeRoutes().Select(r => new
+                {
+                    path = r.Path,
+                    method = r.Method,
+                    kind = r.Kind,
+                    permission = r.Permission.Key,
+                    permissionTitle = r.Permission.Title,
+                });
+                await req.ReturnResponse(JsonConvert.SerializeObject(routes), "application/json");
+            }, HttpMethod.Get, SystemPerms.ApiRoutesRead);
             // One round-trip for what used to be N parallel dashboard GETs.
             // Guest (not Anybody) so a stale-cookie call fails once at pipeline
             // level (smart-tarpit fast-fail) instead of N per-item 401s.
-            await CreateBufferedRoute("/batch", HandleBatchRequest, HttpMethod.Post, KMProfileManager.KMPermissions.Guest, 64 * 1024);
+            await CreateBufferedRoute("/batch", HandleBatchRequest, HttpMethod.Post, Perms.SignedIn, 64 * 1024);
             await CreateRoute("/KliveAPI/Statistics", async (req) =>
             {
                 await req.ReturnResponse(JsonConvert.SerializeObject(apiStatistics?.GetSummary() ?? new
@@ -815,7 +855,7 @@ namespace Omnipotent.Services.KliveAPI
                     topRoutes = Array.Empty<object>(),
                     slowestRoutes = Array.Empty<object>()
                 }), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, SystemPerms.StatusView);
 
             // Response-cache observability + manual controls (Klives-only). The stats
             // route reads no tracked store, so it is never itself cached.
@@ -827,13 +867,13 @@ namespace Omnipotent.Services.KliveAPI
                     denylistPrefixes = cacheDenylistPrefixes,
                     cache = responseCache.GetStatsSnapshot()
                 }), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, SystemPerms.ApiCacheManage);
 
             await CreateRoute("/KliveAPI/cache/clear", async (req) =>
             {
                 responseCache.Clear();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { cleared = true }), "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, SystemPerms.ApiCacheManage);
 
             await TelemetryRoutes.RegisterAsync(this, () => telemetry, () => telemetryDb, () => telemetryTraceViews,
                 route => ControllerLookup.TryGetValue(route, out RouteInfo info) ? info.normalizedMethod : null);
@@ -998,11 +1038,18 @@ namespace Omnipotent.Services.KliveAPI
                 if (routeInfo.normalizedMethod != "GET")
                     return BatchError(result, 405, "Only GET routes may be batched.");
 
-                // Permission — mirror the pipeline's checks exactly (auth-bypass guard).
-                var required = routeInfo.authenticationLevelRequired;
-                bool allowed = required == KMProfileManager.KMPermissions.Anybody
-                    || (batchReq.user != null && batchReq.user.CanLogin && batchReq.user.KlivesManagementRank >= required);
-                if (!allowed) return BatchError(result, 401, "Insufficient permission.");
+                // Permission — the same evaluator as direct requests (auth-bypass guard).
+                var access = AccessEvaluator.Evaluate(batchReq.user, routeInfo.permission);
+                if (!access.Allowed)
+                {
+                    int deniedStatus = access.IsAuthenticationFailure ? 401 : 403;
+                    RecordBatchActivity(batchReq, normalized, routeInfo.permission, deniedStatus, 0, access.Reason.ToString());
+                    result["status"] = deniedStatus;
+                    result["ok"] = false;
+                    result["contentType"] = "application/json";
+                    result["body"] = BuildDenialBody(access, normalized, batchReq.user);
+                    return result;
+                }
                 TryGetDefence()?.NoteBatchRoute(OmniDefenceService.ExtractClientIp(batchReq.req), normalized);
 
                 NameValueCollection subParams = string.IsNullOrEmpty(queryPart)
@@ -1029,8 +1076,10 @@ namespace Omnipotent.Services.KliveAPI
                     itemTrace.InFlightAtStart = Volatile.Read(ref _inFlightRequests);
                     RequestTrace.Current = itemTrace;
                 }
+                var itemClock = Stopwatch.StartNew();
                 void RecordItem(int status)
                 {
+                    RecordBatchActivity(batchReq, normalized, routeInfo.permission, status, itemClock.Elapsed.TotalMilliseconds, null);
                     if (itemTrace == null) return;
                     itemTrace.StatusCode = status;
                     itemTrace.Enter(TelemetryStage.Teardown);
@@ -1067,6 +1116,7 @@ namespace Omnipotent.Services.KliveAPI
                 sub.userMessageBytes = Array.Empty<byte>();
                 sub.userMessageContent = string.Empty;
                 sub.capture = new CapturedResponse();
+                sub.permission = routeInfo.permission;
                 sub.trace = itemTrace;
                 itemTrace?.Enter(TelemetryStage.Handler);
 
@@ -1127,6 +1177,20 @@ namespace Omnipotent.Services.KliveAPI
                 result["body"] = text;
             }
             return result;
+        }
+
+        /// <summary>One activity row per /batch item, so the profile console sees what a dashboard actually loaded.</summary>
+        private void RecordBatchActivity(UserRequest batchReq, string route, PermissionDef permission, int status, double durationMs, string? denyReason)
+        {
+            var manager = profileManager;
+            if (manager == null || batchReq.user == null) return;
+            try
+            {
+                string? page = batchReq.req?.Headers["X-Klive-Page"] ?? batchReq.req?.Headers["Referer"];
+                manager.RecordRequest(batchReq.user, batchReq.session, "GET", route, permission, status, durationMs,
+                    OmniDefenceService.ExtractClientIp(batchReq.req), page, denyReason, viaBatch: true);
+            }
+            catch { /* activity must never affect the batch */ }
         }
 
         private static JObject BatchError(JObject result, int status, string message)
@@ -1362,38 +1426,40 @@ namespace Omnipotent.Services.KliveAPI
         //      await request.ReturnResponse("BLAHAHHH" + RandomGeneration.GenerateRandomLengthOfNumbers(10));
         //  };
         //await serviceManager.GetKliveAPIService().CreateRoute("/omniscience/getmessagecount", getMessageCount);
-        public Task CreateRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired)
+        public Task CreateRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, PermissionDef permission)
         {
-            return CreateRouteCore(route, handler, method, authenticationLevelRequired, RequestBodyMode.Buffered, null);
+            return CreateRouteCore(route, handler, method, permission, RequestBodyMode.Buffered, null);
         }
 
         /// <summary>
         /// Creates a conventional buffered route with an enforced request-body limit.
         /// Existing CreateRoute callers remain unlimited for backwards compatibility.
         /// </summary>
-        public Task CreateBufferedRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired, long maxBodyBytes)
+        public Task CreateBufferedRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, PermissionDef permission, long maxBodyBytes)
         {
-            return CreateRouteCore(route, handler, method, authenticationLevelRequired, RequestBodyMode.Buffered, ValidateBodyLimit(maxBodyBytes));
+            return CreateRouteCore(route, handler, method, permission, RequestBodyMode.Buffered, ValidateBodyLimit(maxBodyBytes));
         }
 
         /// <summary>
         /// Creates a route whose handler consumes UserRequest.RequestBodyStream
         /// directly, without populating userMessageBytes or userMessageContent.
         /// </summary>
-        public Task CreateStreamingRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired, long maxBodyBytes)
+        public Task CreateStreamingRoute(string route, Func<UserRequest, Task> handler, HttpMethod method, PermissionDef permission, long maxBodyBytes)
         {
-            return CreateRouteCore(route, handler, method, authenticationLevelRequired, RequestBodyMode.Streaming, ValidateBodyLimit(maxBodyBytes));
+            return CreateRouteCore(route, handler, method, permission, RequestBodyMode.Streaming, ValidateBodyLimit(maxBodyBytes));
         }
 
-        private Task CreateRouteCore(string route, Func<UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions authenticationLevelRequired, RequestBodyMode requestBodyMode, long? maxBodyBytes)
+        private Task CreateRouteCore(string route, Func<UserRequest, Task> handler, HttpMethod method, PermissionDef permission, RequestBodyMode requestBodyMode, long? maxBodyBytes)
         {
             ArgumentNullException.ThrowIfNull(handler);
             ArgumentNullException.ThrowIfNull(method);
+            // Every route names the permission that gates it; there is no implicit default.
+            ArgumentNullException.ThrowIfNull(permission);
             route = NormalizeRoute(route);
             RouteInfo routeInfo = new()
             {
                 action = handler,
-                authenticationLevelRequired = authenticationLevelRequired,
+                permission = permission,
                 method = method,
                 normalizedMethod = NormalizeMethod(method.Method),
                 requestBodyMode = requestBodyMode,
@@ -1417,13 +1483,14 @@ namespace Omnipotent.Services.KliveAPI
             return maxBodyBytes;
         }
 
-        public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, KMProfileManager.KMPermissions authenticationLevelRequired)
+        public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, PermissionDef permission)
         {
+            ArgumentNullException.ThrowIfNull(permission);
             route = NormalizeRoute(route);
             var info = new WebSocketRouteInfo
             {
                 handler = handler,
-                authenticationLevelRequired = authenticationLevelRequired
+                permission = permission
             };
             if (WebSocketRouteLookup.TryAdd(route, info))
             {
@@ -1530,10 +1597,6 @@ namespace Omnipotent.Services.KliveAPI
                 || (normalizedRequestMethod == "HEAD" && normalizedRouteMethod == "GET");
         }
 
-        private static bool ShouldResolveUser(HttpListenerRequest req, KMPermissions requiredPermission)
-        {
-            return requiredPermission != KMPermissions.Anybody || !string.IsNullOrWhiteSpace(req.Headers["Authorization"]);
-        }
 
         private static bool IsWebsiteClientRequest(HttpListenerRequest req)
         {
@@ -1549,15 +1612,15 @@ namespace Omnipotent.Services.KliveAPI
                 || referer.Contains(domainName, StringComparison.OrdinalIgnoreCase);
         }
 
-        private async Task<KMProfileManager.KMProfile?> ResolveRequestUserAsync(HttpListenerRequest req)
+        /// <summary>
+        /// Resolves a session token or password to its profile (and session). In memory and O(1);
+        /// never waits on I/O. Before the profile manager has loaded, every credential is invalid.
+        /// </summary>
+        private KMProfileManager.AuthResult ResolveCredential(string credential, string? ip)
         {
-            string password = req.Headers["Authorization"];
-            if (string.IsNullOrWhiteSpace(password) || profileManager == null)
-            {
-                return null;
-            }
-
-            return await profileManager.GetProfileByPassword(password);
+            var manager = profileManager;
+            if (manager == null) return new KMProfileManager.AuthResult(null, null, AccessDenyReason.InvalidCredential, null);
+            return manager.Authenticate(credential, ip);
         }
 
         private static readonly HashSet<string> SensitiveHeaderNames = new(StringComparer.OrdinalIgnoreCase)
@@ -2032,9 +2095,7 @@ namespace Omnipotent.Services.KliveAPI
             string? userId = request.user?.UserID;
             string key = ResponseCache.BuildKey(route, request.userParameters, userId, request.req.Headers["Range"]);
 
-            bool forceBypass = request.user != null
-                && request.user.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives
-                && ClientRequestedNoCache(request.req);
+            bool forceBypass = request.user?.IsOwner == true && ClientRequestedNoCache(request.req);
 
             if (!forceBypass)
             {
@@ -2097,7 +2158,11 @@ namespace Omnipotent.Services.KliveAPI
             string? defenceQueryString = null;
             string? defenceBodyHash = null;
             long defenceBodyLength = 0;
-            int defencePermRequired = 0;
+            string? defencePermKey = null;
+            // Per-profile activity (profile console); captured into the finally block.
+            KMProfileManager.KMProfile? activityProfile = null;
+            Omnipotent.Profiles.Sessions.KMSession? activitySession = null;
+            PermissionDef? activityPermission = null;
             string? defenceProfileId = null;
             string? defenceProfileName = null;
             int? defenceProfileRank = null;
@@ -2176,25 +2241,40 @@ namespace Omnipotent.Services.KliveAPI
                     return;
                 }
 
+                // Credentials are resolved once, up front. Browsers cannot set headers on a
+                // WebSocket, so an upgrade may carry the token as ?authorization= instead.
                 KMProfileManager.KMProfile? preResolvedUser = null;
-                if (!string.IsNullOrWhiteSpace(defenceAuthHeader))
+                Omnipotent.Profiles.Sessions.KMSession? preResolvedSession = null;
+                AccessDenyReason credentialFailure = AccessDenyReason.NoCredential;
+                string? credential = string.IsNullOrWhiteSpace(defenceAuthHeader) ? null : defenceAuthHeader;
+                if (credential == null && req.IsWebSocketRequest) credential = nameValueCollection["authorization"];
+                if (!string.IsNullOrWhiteSpace(credential))
                 {
                     trace?.Enter(TelemetryStage.Auth);
-                    preResolvedUser = await ResolveRequestUserAsync(req);
+                    var auth = ResolveCredential(credential, defenceIp);
                     trace?.Enter(TelemetryStage.Prologue);
+                    preResolvedUser = auth.Profile;
+                    preResolvedSession = auth.Session;
+                    credentialFailure = auth.Failure;
                     if (preResolvedUser != null)
                     {
                         defenceProfileId = preResolvedUser.UserID;
                         defenceProfileName = preResolvedUser.Name;
-                        defenceProfileRank = (int)preResolvedUser.KlivesManagementRank;
+                        defenceProfileRank = (int)preResolvedUser.Rank;
                         defenceRequestOrigin = defenceFromWebsite ? "WebsiteProfile" : "DirectApiProfile";
+                        activityProfile = preResolvedUser;
+                        activitySession = preResolvedSession;
                     }
                 }
-                bool skipDefenceGateForKlives = preResolvedUser != null && preResolvedUser.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives;
+                bool skipDefenceGateForOwner = preResolvedUser?.IsOwner == true;
+                // Profiles load a moment after the listener starts (longer on the first boot that
+                // migrates passwords). Until then a credential can't be checked: say "try again",
+                // never "signed out", so a restart doesn't log the website out.
+                bool authNotReady = credential != null && preResolvedUser == null && profileManager?.IsLoaded != true;
 
                 // ---- OmniDefence pre-dispatch gate ----
                 var defence = TryGetDefence();
-                if (defence != null && !string.IsNullOrEmpty(defenceIp) && !skipDefenceGateForKlives)
+                if (defence != null && !string.IsNullOrEmpty(defenceIp) && !skipDefenceGateForOwner)
                 {
                     trace?.Enter(TelemetryStage.DefenceGate);
                     var decision = defence.EvaluateRequestGate(defenceIp, route);
@@ -2233,23 +2313,25 @@ namespace Omnipotent.Services.KliveAPI
                 {
                     shouldRecordStatistics = false;
                     defenceSkipRecord = true;
+                    activityProfile = null; // a socket is one long connection, not a request
                     trace = null; // long-lived sockets would only distort request latency
                     request.trace = null;
                     RequestTrace.Current = null;
-                    if (ShouldResolveUser(req, wsRouteData.authenticationLevelRequired))
-                    {
-                        request.user = preResolvedUser ?? await ResolveRequestUserAsync(req);
-                    }
+                    request.user = preResolvedUser;
+                    request.session = preResolvedSession;
+                    request.permission = wsRouteData.permission;
 
-                    if (wsRouteData.authenticationLevelRequired == KMPermissions.Anybody
-                        || (request.user != null && request.user.KlivesManagementRank >= wsRouteData.authenticationLevelRequired))
+                    // Same decision as HTTP routes — including CanLogin, suspension and read-only,
+                    // which the old rank gate never checked for sockets.
+                    var wsDecision = AccessEvaluator.Evaluate(preResolvedUser, wsRouteData.permission, credentialFailure);
+                    if (wsDecision.Allowed)
                     {
                         var wsContext = await context.AcceptWebSocketAsync(subProtocol: null);
-                        await wsRouteData.handler(context, wsContext.WebSocket, nameValueCollection, request.user);
+                        await wsRouteData.handler(context, wsContext.WebSocket, nameValueCollection, preResolvedUser);
                     }
                     else
                     {
-                        context.Response.StatusCode = 401;
+                        context.Response.StatusCode = authNotReady ? 503 : wsDecision.IsAuthenticationFailure ? 401 : 403;
                         context.Response.Close();
                     }
                     return;
@@ -2260,12 +2342,13 @@ namespace Omnipotent.Services.KliveAPI
                     if (sensitiveSettingsRequest)
                         routeData.maxBodyBytes = Math.Min(routeData.maxBodyBytes ?? 1024 * 1024, 1024 * 1024);
                     matchedRoute = true;
-                    defencePermRequired = (int)routeData.authenticationLevelRequired;
+                    defencePermKey = routeData.permission.Key;
+                    activityPermission = routeData.permission;
                     if (!IsRequestMethodAllowed(req.HttpMethod, routeData.normalizedMethod))
                     {
                         defenceOutcome = RequestOutcome.IncorrectMethod;
                         defenceDenyReason = "IncorrectHTTPMethod";
-                        await DenyRequest(request, DeniedRequestReason.IncorrectHTTPMethod);
+                        await DenyMethodAsync(request, routeData.normalizedMethod);
                         return;
                     }
 
@@ -2285,27 +2368,17 @@ namespace Omnipotent.Services.KliveAPI
                         defenceBodyLength = 0;
                     }
 
-                    if (ShouldResolveUser(req, routeData.authenticationLevelRequired))
-                    {
-                        if (preResolvedUser != null)
-                        {
-                            request.user = preResolvedUser;
-                        }
-                        else
-                        {
-                            trace?.Enter(TelemetryStage.Auth);
-                            request.user = await ResolveRequestUserAsync(req);
-                            trace?.Enter(TelemetryStage.Prologue);
-                        }
-                    }
+                    request.user = preResolvedUser;
+                    request.session = preResolvedSession;
+                    request.permission = routeData.permission;
 
                     if (defenceFromWebsite)
                     {
                         defenceRequestOrigin = request.user != null
                             ? "WebsiteProfile"
-                            : routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody
+                            : routeData.permission.Kind == PermissionKind.Public
                                 ? "WebsitePublicNoProfile"
-                                : string.IsNullOrWhiteSpace(req.Headers["Authorization"])
+                                : string.IsNullOrWhiteSpace(credential)
                                     ? "WebsiteNoProfile"
                                     : "WebsiteInvalidProfile";
                     }
@@ -2341,109 +2414,90 @@ namespace Omnipotent.Services.KliveAPI
                         }
                     }
 
-                    bool isUserNull = request.user == null;
-                    if (isUserNull != true)
+                    var access = AccessEvaluator.Evaluate(request.user, routeData.permission, credentialFailure);
+                    if (access.Allowed)
                     {
-                        defenceProfileId = request.user.UserID;
-                        defenceProfileName = request.user.Name;
-                        defenceProfileRank = (int)request.user.KlivesManagementRank;
+                        await PrepareBodyForDispatchAsync();
+                        await DispatchRouteAsync(routeData, request, route);
+                        return;
+                    }
 
-                        if (request.user.CanLogin == false && routeData.authenticationLevelRequired != KMProfileManager.KMPermissions.Anybody)
-                        {
-                            defenceOutcome = RequestOutcome.InsufficientClearance;
-                            defenceDenyReason = "ProfileDisabled";
-                            await DenyRequest(request, DeniedRequestReason.ProfileDisabled);
-                            return;
-                        }
-
-                        if (routeData.authenticationLevelRequired == KMProfileManager.KMPermissions.Anybody)
-                        {
-                            await PrepareBodyForDispatchAsync();
-                            await DispatchRouteAsync(routeData, request, route);
-                            return;
-                        }
-
-                        if (request.user.KlivesManagementRank >= routeData.authenticationLevelRequired)
-                        {
-                            await PrepareBodyForDispatchAsync();
-                            await DispatchRouteAsync(routeData, request, route);
-                            return;
-                        }
-
-                        _ = ServiceLog($"{request.user.Name} requested route {route} without sufficient permission.");
+                    defenceDenyReason = access.Reason.ToString();
+                    if (authNotReady)
+                    {
+                        defenceOutcome = RequestOutcome.ClientError;
+                        defenceDenyReason = "AuthNotReady";
+                        var retryHeaders = new NameValueCollection { { "Retry-After", "2" }, { "Cache-Control", "no-store" } };
+                        await request.ReturnResponse(JsonConvert.SerializeObject(new { error = "Starting", message = "Klives Management is starting up. Try again in a moment." }),
+                            "application/json", retryHeaders, HttpStatusCode.ServiceUnavailable);
+                        return;
+                    }
+                    if (request.user != null)
+                    {
+                        // Signed in but not allowed (missing permission, suspended, read-only or
+                        // login turned off). Answered with the JSON contract, never a redirect.
                         defenceOutcome = RequestOutcome.InsufficientClearance;
-                        defenceDenyReason = "TooLowClearance";
                         if (defence != null)
                         {
                             _ = defence.RecordAuthEventAsync(new AuthEventRow
                             {
                                 UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
                                 Ip = defenceIp,
-                                Type = "InsufficientClearance",
+                                Type = access.Reason == AccessDenyReason.MissingPermission ? "InsufficientClearance" : access.Reason.ToString(),
                                 ProfileId = request.user.UserID,
                                 ProfileName = request.user.Name,
                                 Route = route,
                                 UserAgent = defenceUserAgent,
-                                Detail = "Required " + routeData.authenticationLevelRequired
+                                Detail = "Requires " + routeData.permission.Key
                             });
                         }
-                        await DenyRequest(request, DeniedRequestReason.TooLowClearance);
+                        await DenyAccessAsync(request, access, route);
+                        return;
                     }
-                    else if (routeData.authenticationLevelRequired == KMPermissions.Anybody)
+
+                    _ = ServiceLog($"Route {route} was requested without valid credentials.", false);
+                    bool isWebsiteNoProfile = defenceFromWebsite;
+                    defenceOutcome = isWebsiteNoProfile ? RequestOutcome.WebsiteNoProfile : RequestOutcome.UnauthRoute;
+                    defenceDenyReason = isWebsiteNoProfile
+                        ? (string.IsNullOrWhiteSpace(credential) ? "WebsiteNoProfile" : "WebsiteInvalidProfile")
+                        : "NoProfile";
+                    if (defence != null)
                     {
-                        await PrepareBodyForDispatchAsync();
-                        await DispatchRouteAsync(routeData, request, route);
+                        _ = defence.RecordAuthEventAsync(new AuthEventRow
+                        {
+                            UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                            Ip = defenceIp,
+                            Type = isWebsiteNoProfile
+                                ? defenceDenyReason
+                                : string.IsNullOrWhiteSpace(credential) ? "UnauthRoute" : "InvalidPassword",
+                            Route = route,
+                            UserAgent = defenceUserAgent,
+                            Detail = "Requires " + routeData.permission.Key + (access.Reason is AccessDenyReason.SessionRevoked or AccessDenyReason.SessionExpired ? "; " + access.Reason : "")
+                                + (string.IsNullOrWhiteSpace(defenceClientPage) ? "" : "; Page " + defenceClientPage)
+                        });
+                        if (!isWebsiteNoProfile && !string.IsNullOrWhiteSpace(credential))
+                        {
+                            defenceOutcome = RequestOutcome.InvalidPassword;
+                            defenceDenyReason = "InvalidPassword";
+                        }
                     }
-                    else
+                    if (isWebsiteNoProfile)
                     {
-                        _ = ServiceLog($"Authenticated route {route} was requested without valid credentials.");
-                        bool isWebsiteNoProfile = defenceFromWebsite;
-                        string authHeader = req.Headers["Authorization"] ?? string.Empty;
-                        defenceOutcome = isWebsiteNoProfile ? RequestOutcome.WebsiteNoProfile : RequestOutcome.UnauthRoute;
-                        defenceDenyReason = isWebsiteNoProfile
-                            ? (string.IsNullOrWhiteSpace(authHeader) ? "WebsiteNoProfile" : "WebsiteInvalidProfile")
-                            : "NoProfile";
-                        if (defence != null)
+                        // Smart tarpit: the first few failures per IP fail fast so a
+                        // legitimate user with a stale cookie gets an instant logout
+                        // redirect instead of 6-9s hangs; repeat offenders (scanners)
+                        // still get the escalating delay. If OmniDefence is down we
+                        // fail fast rather than slow.
+                        const int FastFailAuthFailures = 3;
+                        int recentFailures = defence?.RegisterAuthFailure(defenceIp) ?? 0;
+                        if (recentFailures > FastFailAuthFailures)
                         {
-                            _ = defence.RecordAuthEventAsync(new AuthEventRow
-                            {
-                                UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
-                                Ip = defenceIp,
-                                Type = isWebsiteNoProfile
-                                    ? defenceDenyReason
-                                    : string.IsNullOrWhiteSpace(authHeader) ? "UnauthRoute" : "InvalidPassword",
-                                Route = route,
-                                UserAgent = defenceUserAgent,
-                                Detail = "Required " + routeData.authenticationLevelRequired + (string.IsNullOrWhiteSpace(defenceClientPage) ? "" : "; Page " + defenceClientPage)
-                            });
-                            if (!isWebsiteNoProfile && !string.IsNullOrWhiteSpace(authHeader))
-                            {
-                                defenceOutcome = RequestOutcome.InvalidPassword;
-                                defenceDenyReason = "InvalidPassword";
-                            }
-                        }
-                        if (isWebsiteNoProfile)
-                        {
-                            // Smart tarpit: the first few failures per IP fail fast so a
-                            // legitimate user with a stale cookie gets an instant logout
-                            // redirect instead of 6-9s hangs; repeat offenders (scanners)
-                            // still get the escalating delay. If OmniDefence is down we
-                            // fail fast rather than slow.
-                            const int FastFailAuthFailures = 3;
-                            int recentFailures = defence?.RegisterAuthFailure(defenceIp) ?? 0;
-                            if (recentFailures > FastFailAuthFailures)
-                            {
-                                trace?.Enter(TelemetryStage.DefenceDelay);
-                                try { await Task.Delay(TimeSpan.FromSeconds(6) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 3000)), cancellationToken.Token); } catch { }
-                                trace?.Enter(TelemetryStage.Prologue);
-                            }
-                            await DenyRequest(request, DeniedRequestReason.NoProfile, HttpStatusCode.Forbidden);
-                        }
-                        else
-                        {
-                            await DenyRequest(request, DeniedRequestReason.NoProfile);
+                            trace?.Enter(TelemetryStage.DefenceDelay);
+                            try { await Task.Delay(TimeSpan.FromSeconds(6) + TimeSpan.FromMilliseconds(Random.Shared.Next(0, 3000)), cancellationToken.Token); } catch { }
+                            trace?.Enter(TelemetryStage.Prologue);
                         }
                     }
+                    await DenyAccessAsync(request, access, route);
                 }
                 else
                 {
@@ -2577,7 +2631,7 @@ namespace Omnipotent.Services.KliveAPI
                                 ProfileId = defenceProfileId,
                                 ProfileName = defenceProfileName,
                                 ProfileRank = defenceProfileRank,
-                                PermRequired = defencePermRequired,
+                                PermKey = defencePermKey,
                                 MatchedRoute = matchedRoute,
                                 BodyHash = defenceBodyHash,
                                 BodyLength = defenceBodyLength,
@@ -2613,6 +2667,20 @@ namespace Omnipotent.Services.KliveAPI
                     }
                 }
 
+                // Per-profile activity for the profile console. Batch items are recorded one by
+                // one by ExecuteBatchItem, so the /batch envelope itself is skipped.
+                if (activityProfile != null && profileManager != null
+                    && !string.Equals(statsRoute, "/batch", StringComparison.OrdinalIgnoreCase))
+                {
+                    try
+                    {
+                        int statusCode = context?.Response?.StatusCode > 0 ? context.Response.StatusCode : (int)HttpStatusCode.InternalServerError;
+                        profileManager.RecordRequest(activityProfile, activitySession, statsMethod, statsRoute, activityPermission,
+                            statusCode, requestStopwatch.Elapsed.TotalMilliseconds, defenceIp, defenceClientPage, defenceDenyReason, viaBatch: false);
+                    }
+                    catch { /* activity must never affect the request */ }
+                }
+
                 if (trace != null)
                 {
                     try
@@ -2634,13 +2702,116 @@ namespace Omnipotent.Services.KliveAPI
                 }
             }
         }
-        private enum DeniedRequestReason
+        /// <summary>
+        /// The <c>RequestDeniedCode</c> header value. Numbers are stable: the website signs out on
+        /// 0, 1, 4, 5 and 6 (authentication failures, status 401) and shows everything else in place.
+        /// </summary>
+        internal enum DeniedRequestReason
         {
             NoProfile = 0,
             InvalidPassword = 1,
+            /// <summary>Signed in but missing the route's permission.</summary>
             TooLowClearance = 2,
             IncorrectHTTPMethod = 3,
-            ProfileDisabled = 4
+            ProfileDisabled = 4,
+            SessionRevoked = 5,
+            SessionExpired = 6,
+            Suspended = 7,
+            ReadOnly = 8,
+        }
+
+        internal static DeniedRequestReason DeniedCodeFor(AccessDenyReason reason) => reason switch
+        {
+            AccessDenyReason.NoCredential => DeniedRequestReason.NoProfile,
+            AccessDenyReason.InvalidCredential => DeniedRequestReason.InvalidPassword,
+            AccessDenyReason.ProfileDisabled => DeniedRequestReason.ProfileDisabled,
+            AccessDenyReason.SessionRevoked => DeniedRequestReason.SessionRevoked,
+            AccessDenyReason.SessionExpired => DeniedRequestReason.SessionExpired,
+            AccessDenyReason.Suspended => DeniedRequestReason.Suspended,
+            AccessDenyReason.ReadOnly => DeniedRequestReason.ReadOnly,
+            _ => DeniedRequestReason.TooLowClearance,
+        };
+
+        /// <summary>
+        /// The JSON every refusal carries, for direct requests and /batch items alike. It names
+        /// what was missing so the website can explain it in place instead of redirecting.
+        /// </summary>
+        internal static JObject BuildDenialBody(AccessDecision decision, string route, KMProfileManager.KMProfile? profile)
+        {
+            var body = new JObject
+            {
+                ["error"] = decision.IsAuthenticationFailure ? "Unauthorized" : "AccessDenied",
+                ["reason"] = decision.Reason.ToString(),
+                ["code"] = (int)DeniedCodeFor(decision.Reason),
+                ["route"] = route,
+            };
+            var p = decision.Permission;
+            switch (decision.Reason)
+            {
+                case AccessDenyReason.MissingPermission:
+                case AccessDenyReason.ReadOnly:
+                    body["permission"] = new JObject
+                    {
+                        ["key"] = p.Key,
+                        ["title"] = p.Title,
+                        ["description"] = p.Description,
+                        ["service"] = p.Service,
+                        ["area"] = p.Area,
+                        ["tier"] = p.Tier.ToString(),
+                        ["tierValue"] = (int)p.Tier,
+                    };
+                    body["message"] = decision.Reason == AccessDenyReason.ReadOnly
+                        ? "Your profile is read-only right now, so you can look but not change anything."
+                        : "You need the \u201c" + p.Title + "\u201d permission (" + p.Service + ").";
+                    break;
+                case AccessDenyReason.Suspended:
+                    body["suspendedUntil"] = profile?.SuspendedUntilUtc;
+                    body["suspensionReason"] = profile?.SuspensionReason;
+                    body["message"] = "Your access is suspended.";
+                    break;
+                case AccessDenyReason.ProfileDisabled:
+                    body["message"] = "Sign-in is turned off for your profile.";
+                    break;
+                case AccessDenyReason.SessionRevoked:
+                    body["message"] = "This session was signed out.";
+                    break;
+                case AccessDenyReason.SessionExpired:
+                    body["message"] = "Your session expired. Sign in again.";
+                    break;
+                case AccessDenyReason.InvalidCredential:
+                    body["message"] = "Your sign-in is no longer valid.";
+                    break;
+                default:
+                    body["message"] = "Sign in to continue.";
+                    break;
+            }
+            return body;
+        }
+
+        /// <summary>401 for "not signed in (any more)", 403 for "signed in but not allowed".</summary>
+        private static async Task DenyAccessAsync(UserRequest request, AccessDecision decision, string route)
+        {
+            var code = DeniedCodeFor(decision.Reason);
+            var headers = new NameValueCollection
+            {
+                { "RequestDeniedReason", code.ToString() },
+                { "RequestDeniedCode", ((int)code).ToString() },
+                { "Cache-Control", "no-store" },
+            };
+            var status = decision.IsAuthenticationFailure ? HttpStatusCode.Unauthorized : HttpStatusCode.Forbidden;
+            await request.ReturnResponse(BuildDenialBody(decision, route, request.user).ToString(Formatting.None), "application/json", headers, status);
+        }
+
+        private static async Task DenyMethodAsync(UserRequest request, string allowedMethod)
+        {
+            var headers = new NameValueCollection
+            {
+                { "RequestDeniedReason", DeniedRequestReason.IncorrectHTTPMethod.ToString() },
+                { "RequestDeniedCode", ((int)DeniedRequestReason.IncorrectHTTPMethod).ToString() },
+                { "Allow", allowedMethod },
+            };
+            await request.ReturnResponse(JsonConvert.SerializeObject(new { error = "MethodNotAllowed", allowed = allowedMethod }),
+                "application/json", headers, HttpStatusCode.MethodNotAllowed);
         }
 
         private static async Task ReturnPayloadTooLargeAsync(HttpListenerContext context, long maxBodyBytes)
@@ -2671,12 +2842,5 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
-        private async Task DenyRequest(UserRequest request, DeniedRequestReason reason, HttpStatusCode code = HttpStatusCode.Unauthorized)
-        {
-            NameValueCollection headers = new();
-            headers.Add("RequestDeniedReason", reason.ToString());
-            headers.Add("RequestDeniedCode", ((int)reason).ToString());
-            await request.ReturnResponse("Access Denied: " + reason, "text/plain", headers, code);
-        }
     }
 }

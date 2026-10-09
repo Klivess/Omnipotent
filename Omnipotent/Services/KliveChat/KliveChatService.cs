@@ -12,6 +12,7 @@ using System.Threading.Tasks;
 using System;
 using Omnipotent.Profiles;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveChat
 {
@@ -49,7 +50,7 @@ namespace Omnipotent.Services.KliveChat
                     var rooms = ListRoomSummaries();
                     await req.ReturnResponse(JsonConvert.SerializeObject(rooms), "application/json");
                 }
-            }, HttpMethod.Get, KMPermissions.Anybody);
+            }, HttpMethod.Get, Perms.Public);
 
             // GET /klivechat/me returns the current user's profile details
             await CreateAPIRoute("/klivechat/me", async (req) =>
@@ -59,9 +60,10 @@ namespace Omnipotent.Services.KliveChat
                     var response = new
                     {
                         name = req.user.Name,
-                        rank = (int)req.user.KlivesManagementRank,
+                        rank = (int)req.user.Rank,
                         userId = req.user.UserID,
-                        canModerate = req.user.KlivesManagementRank >= KMPermissions.Associate
+                        canModerate = AccessEvaluator.Can(req.user, KliveChatPerms.RoomsModerate),
+                        canDeleteAnyRoom = AccessEvaluator.Can(req.user, KliveChatPerms.RoomsDeleteAny)
                     };
                     await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
                 }
@@ -69,14 +71,14 @@ namespace Omnipotent.Services.KliveChat
                 {
                     await req.ReturnResponse("{}", "application/json", null!, System.Net.HttpStatusCode.Unauthorized);
                 }
-            }, HttpMethod.Get, KMPermissions.Anybody);
+            }, HttpMethod.Get, Perms.Public);
 
             // POST /klivechat/create requires Guest or above as per prompt
             await CreateAPIRoute("/klivechat/create", async (req) =>
             {
                 var response = CreateRoom(req.userParameters["name"], req.user?.Name);
                 await req.ReturnResponse(JsonConvert.SerializeObject(response.Room), "application/json");
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, KliveChatPerms.RoomsManage);
 
             // POST /klivechat/delete requires Guest or above
             await CreateAPIRoute("/klivechat/delete", async (req) =>
@@ -91,7 +93,7 @@ namespace Omnipotent.Services.KliveChat
                 var result = await DeleteRoomAsync(
                     roomId,
                     req.user?.Name,
-                    (req.user?.KlivesManagementRank ?? KMPermissions.Anybody) >= KMPermissions.Admin);
+                    req.Can(KliveChatPerms.RoomsDeleteAny));
 
                 if (result.Success)
                 {
@@ -104,7 +106,7 @@ namespace Omnipotent.Services.KliveChat
                         : System.Net.HttpStatusCode.NotFound;
                     await req.ReturnResponse(result.Message, "text/plain", null!, statusCode);
                 }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, KliveChatPerms.RoomsManage);
 
             // WebSocket route for connections
             await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateWebSocketRoute", "/klivechat/ws", (Func<System.Net.HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfile?, Task>)(async (context, socket, queryParams, user) =>
@@ -126,14 +128,15 @@ namespace Omnipotent.Services.KliveChat
                     Name = userName,
                     Socket = socket,
                     UserId = resolvedUser?.UserID,
-                    Rank = resolvedUser?.KlivesManagementRank ?? KMPermissions.Anybody,
+                    Rank = resolvedUser?.Rank ?? Omnipotent.Profiles.ProfileRank.None,
+                    CanModerateRooms = resolvedUser != null && AccessEvaluator.Can(resolvedUser, KliveChatPerms.RoomsModerate),
                     GuestIdentity = string.IsNullOrWhiteSpace(queryParams["guestIdentity"])
                         ? $"{context.Request.RemoteEndPoint?.Address}|{context.Request.UserAgent}"
                         : queryParams["guestIdentity"]
                 };
 
                 await room.AddClient(client, this);
-            }), KMPermissions.Anybody);
+            }), Perms.Public);
 
             _ = ServiceLog("KliveChatService started. Listening on /klivechat/ endpoints.");
         }

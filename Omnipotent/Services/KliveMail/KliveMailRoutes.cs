@@ -4,6 +4,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveMail.Persistence;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveMail
 {
@@ -17,17 +18,17 @@ namespace Omnipotent.Services.KliveMail
 
         public async Task RegisterRoutes()
         {
-            await service.CreateAPIRoute("/klivemail/stats", HandleStats, HttpMethod.Get, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/mailboxes", HandleListMailboxes, HttpMethod.Get, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/mailboxes/create", HandleCreateMailbox, HttpMethod.Post, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/mailboxes/delete", HandleDeleteMailbox, HttpMethod.Post, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/messages", HandleListMessages, HttpMethod.Get, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/messages/detail", HandleMessageDetail, HttpMethod.Get, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/search", HandleSearch, HttpMethod.Get, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/messages/mark-read", HandleMarkRead, HttpMethod.Post, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/messages/mark-unread", HandleMarkUnread, HttpMethod.Post, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/messages/delete", HandleDelete, HttpMethod.Post, KMPermissions.Klives);
-            await service.CreateAPIRoute("/klivemail/attachments/download", HandleAttachmentDownload, HttpMethod.Get, KMPermissions.Klives);
+            await service.CreateAPIRoute("/klivemail/stats", HandleStats, HttpMethod.Get, KliveMailPerms.OverviewView);
+            await service.CreateAPIRoute("/klivemail/mailboxes", HandleListMailboxes, HttpMethod.Get, KliveMailPerms.MailboxesRead);
+            await service.CreateAPIRoute("/klivemail/mailboxes/create", HandleCreateMailbox, HttpMethod.Post, KliveMailPerms.MailboxesManage);
+            await service.CreateAPIRoute("/klivemail/mailboxes/delete", HandleDeleteMailbox, HttpMethod.Post, KliveMailPerms.MailboxesManage);
+            await service.CreateAPIRoute("/klivemail/messages", HandleListMessages, HttpMethod.Get, KliveMailPerms.MessagesRead);
+            await service.CreateAPIRoute("/klivemail/messages/detail", HandleMessageDetail, HttpMethod.Get, KliveMailPerms.MessagesRead);
+            await service.CreateAPIRoute("/klivemail/search", HandleSearch, HttpMethod.Get, KliveMailPerms.MessagesRead);
+            await service.CreateAPIRoute("/klivemail/messages/mark-read", HandleMarkRead, HttpMethod.Post, KliveMailPerms.MessagesAct);
+            await service.CreateAPIRoute("/klivemail/messages/mark-unread", HandleMarkUnread, HttpMethod.Post, KliveMailPerms.MessagesAct);
+            await service.CreateAPIRoute("/klivemail/messages/delete", HandleDelete, HttpMethod.Post, KliveMailPerms.MessagesDelete);
+            await service.CreateAPIRoute("/klivemail/attachments/download", HandleAttachmentDownload, HttpMethod.Get, KliveMailPerms.MessagesRead);
         }
 
         private async Task HandleStats(UserRequest req)

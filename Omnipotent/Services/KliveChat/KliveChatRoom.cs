@@ -167,9 +167,9 @@ namespace Omnipotent.Services.KliveChat
 
         private async Task HandleModerationMessage(KliveChatClient actor, object payload, KliveChatService service)
         {
-            if (actor.Rank < KMPermissions.Associate)
+            if (!actor.CanModerate)
             {
-                await SendRoomError(actor, "Associate or above is required to moderate a call.");
+                await SendRoomError(actor, "You need the \u201cModerate rooms\u201d permission to moderate a call.");
                 return;
             }
 

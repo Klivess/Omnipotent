@@ -14,6 +14,7 @@ using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
 using Omnipotent.Services.Notifications;
 using Omnipotent.Threading;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.HostControl
 {
@@ -166,10 +167,9 @@ namespace Omnipotent.Services.HostControl
                     "/kliveagent/screen/stream",
                     (Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
                     {
-                        // Browsers can't set an Authorization header on a WebSocket, so this is registered as
-                        // Anybody and authorized here: a Klives ?authorization= password, OR a pending handoff
-                        // ?token= (scoped capability for a captcha-solve session).
-                        var (auth, handoff) = await AuthorizeRemoteAsync(queryParams, user);
+                        // Public at the pipeline because a captcha-solve page connects with a scoped handoff
+                        // ?token= and no profile. A profile (from ?authorization=) needs system.hostcontrol.view.
+                        var (auth, handoff) = await AuthorizeRemoteAsync(queryParams, user, SystemPerms.HostControlView);
                         if (auth == RemoteAuthKind.Denied)
                         {
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
@@ -181,7 +181,7 @@ namespace Omnipotent.Services.HostControl
                         int? quality = TryQueryInt(queryParams, "quality");
                         await StreamScreenAsync(socket, fps, quality, handoff);
                     }),
-                    KMProfileManager.KMPermissions.Anybody);
+                    Perms.Public);
                 await ServiceLog("[HostControl] Screen-stream WebSocket route registered (/kliveagent/screen/stream).");
             }
             catch (Exception ex) { await ServiceLogError(ex, "[HostControl] Failed to register screen-stream route (non-fatal)."); }
@@ -227,18 +227,19 @@ namespace Omnipotent.Services.HostControl
         // remote-desktop (password auth) and the captcha-solve page (token auth) — one route, two callers.
         private enum RemoteAuthKind { Denied, Password, Token }
 
-        /// <summary>Authorize a remote stream/input WebSocket: a Klives ?authorization= password, OR a pending
-        /// handoff ?token= (scoped capability). Returns the matched handoff for a token session.</summary>
-        private async Task<(RemoteAuthKind kind, PendingHandoff? handoff)> AuthorizeRemoteAsync(NameValueCollection q, KMProfileManager.KMProfile? user)
+        /// <summary>Authorize a remote stream/input WebSocket: a signed-in profile holding <paramref name="needed"/>
+        /// (resolved by KliveAPI from ?authorization=), OR a pending handoff ?token= (scoped capability).
+        /// Returns the matched handoff for a token session.</summary>
+        private async Task<(RemoteAuthKind kind, PendingHandoff? handoff)> AuthorizeRemoteAsync(NameValueCollection q, KMProfileManager.KMProfile? user, PermissionDef needed)
         {
             var resolved = user;
             if (resolved == null)
             {
-                var pw = q["authorization"];
-                if (!string.IsNullOrEmpty(pw))
-                    resolved = await ExecuteServiceMethod<KMProfileManager>("GetProfileByPassword", pw) as KMProfileManager.KMProfile;
+                var credential = q["authorization"];
+                if (!string.IsNullOrEmpty(credential))
+                    resolved = await ExecuteServiceMethod<KMProfileManager>("GetProfileByPassword", credential) as KMProfileManager.KMProfile;
             }
-            if (resolved != null && resolved.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives)
+            if (resolved != null && AccessEvaluator.Can(resolved, needed))
                 return (RemoteAuthKind.Password, null);
 
             var token = q["token"];
@@ -259,7 +260,7 @@ namespace Omnipotent.Services.HostControl
                     "/kliveagent/remote/input",
                     (Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
                     {
-                        var (auth, handoff) = await AuthorizeRemoteAsync(queryParams, user);
+                        var (auth, handoff) = await AuthorizeRemoteAsync(queryParams, user, SystemPerms.HostControlUse);
                         if (auth == RemoteAuthKind.Denied)
                         {
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
@@ -267,7 +268,7 @@ namespace Omnipotent.Services.HostControl
                         }
                         await HandleRemoteInputAsync(socket, handoff);
                     }),
-                    KMProfileManager.KMPermissions.Anybody);
+                    Perms.Public);
                 await ServiceLog("[HostControl] Remote-input WebSocket route registered (/kliveagent/remote/input).");
             }
             catch (Exception ex) { await ServiceLogError(ex, "[HostControl] Failed to register remote-input route (non-fatal)."); }

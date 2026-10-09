@@ -6,6 +6,7 @@ using Newtonsoft.Json.Serialization;
 using Omnipotent.Services.KliveBot_Discord;
 using Omnipotent.Services.KliveAPI.Caching;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Tripwires
 {
@@ -23,7 +24,7 @@ namespace Omnipotent.Services.Tripwires
 
         public async Task RegisterRoutes()
         {
-            await service.CreateAPIRoute("/t", service.HandlePublicTripAsync, HttpMethod.Get, KMPermissions.Anybody);
+            await service.CreateAPIRoute("/t", service.HandlePublicTripAsync, HttpMethod.Get, Perms.Public);
 
             await service.CreateAPIRoute("/tripwires/list", async req =>
             {
@@ -34,7 +35,7 @@ namespace Omnipotent.Services.Tripwires
                     await req.ReturnResponse(Json(items.Select(Present)));
                 }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, TripwirePerms.WiresRead);
 
             await service.CreateAPIRoute("/tripwires/get", async req =>
             {
@@ -45,7 +46,7 @@ namespace Omnipotent.Services.Tripwires
                     if (item != null) await req.ReturnResponse(Json(Present(item)));
                 }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, TripwirePerms.WiresRead);
 
             await service.CreateBufferedAPIRoute("/tripwires/create", async req =>
             {
@@ -63,7 +64,7 @@ namespace Omnipotent.Services.Tripwires
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (JsonException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives, MaxBodyBytes);
+            }, HttpMethod.Post, TripwirePerms.WiresManage, MaxBodyBytes);
 
             await service.CreateBufferedAPIRoute("/tripwires/update", async req =>
             {
@@ -82,7 +83,7 @@ namespace Omnipotent.Services.Tripwires
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (JsonException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives, MaxBodyBytes);
+            }, HttpMethod.Post, TripwirePerms.WiresManage, MaxBodyBytes);
 
             await service.CreateBufferedAPIRoute("/tripwires/delete", async req =>
             {
@@ -94,7 +95,7 @@ namespace Omnipotent.Services.Tripwires
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives, MaxBodyBytes);
+            }, HttpMethod.Post, TripwirePerms.WiresManage, MaxBodyBytes);
 
             await service.CreateAPIRoute("/tripwires/events", async req =>
             {
@@ -110,7 +111,7 @@ namespace Omnipotent.Services.Tripwires
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, TripwirePerms.WiresRead);
 
             await service.CreateAPIRoute("/tripwires/summary", async req =>
             {
@@ -130,7 +131,7 @@ namespace Omnipotent.Services.Tripwires
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, TripwirePerms.WiresRead);
 
             await service.CreateBufferedAPIRoute("/tripwires/events/clear", async req =>
             {
@@ -143,7 +144,7 @@ namespace Omnipotent.Services.Tripwires
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives, MaxBodyBytes);
+            }, HttpMethod.Post, TripwirePerms.WiresManage, MaxBodyBytes);
 
             await service.CreateBufferedAPIRoute("/tripwires/notification/test", async req =>
             {
@@ -165,7 +166,7 @@ namespace Omnipotent.Services.Tripwires
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Error(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives, MaxBodyBytes);
+            }, HttpMethod.Post, TripwirePerms.AlertsTest, MaxBodyBytes);
         }
 
         private async Task<TripwireRecord?> RequireTripwire(Services.KliveAPI.KliveAPI.UserRequest req)

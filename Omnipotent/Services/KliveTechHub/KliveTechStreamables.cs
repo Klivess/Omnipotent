@@ -8,6 +8,7 @@ using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Channels;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveTechHub
 {
@@ -1053,23 +1054,11 @@ namespace Omnipotent.Services.KliveTechHub
         /// This mirrors Projects.AuthorizeWsAsKlivesAsync, where the same mismatch was the
         /// reason its live view never connected.
         /// </summary>
-        private async Task<bool> AuthorizeStreamViewerAsync(
+        private static Task<bool> AuthorizeStreamViewerAsync(
             NameValueCollection query,
             KMProfileManager.KMProfile? user)
         {
-            KMProfileManager.KMProfile? resolved = user;
-            if (resolved == null)
-            {
-                string? password = query["authorization"];
-                if (!string.IsNullOrEmpty(password))
-                {
-                    resolved = await ExecuteServiceMethod<KMProfileManager>(
-                        "GetProfileByPassword",
-                        password) as KMProfileManager.KMProfile;
-                }
-            }
-            return resolved != null &&
-                resolved.KlivesManagementRank >= KMProfileManager.KMPermissions.Klives;
+            return Task.FromResult(user != null && AccessEvaluator.Can(user, KliveTechPerms.StreamablesRead));
         }
 
         internal async Task RegisterStreamableLiveRouteAsync()
@@ -1106,7 +1095,7 @@ namespace Omnipotent.Services.KliveTechHub
                     }
                     await HandleStreamLiveConnectionAsync(socket, query);
                 },
-                KMProfileManager.KMPermissions.Anybody);
+                KliveTechPerms.StreamablesRead);
         }
 
         private async Task HandleStreamLiveConnectionAsync(WebSocket socket, NameValueCollection query)

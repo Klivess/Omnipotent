@@ -3,6 +3,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Services.OmniGram.Models;
 using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.OmniGram
 {
@@ -43,7 +44,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.OverviewView);
         }
 
         // ── Accounts ──
@@ -83,7 +84,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.AccountsRead);
 
             await service.CreateAPIRoute("/omnigram/accounts/detail", async (req) =>
             {
@@ -131,7 +132,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.AccountsRead);
 
             await service.CreateAPIRoute("/omnigram/accounts/add", async (req) =>
             {
@@ -165,7 +166,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsManage);
 
             await service.CreateAPIRoute("/omnigram/accounts/remove", async (req) =>
             {
@@ -190,7 +191,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsManage);
 
             await service.CreateAPIRoute("/omnigram/accounts/pause", async (req) =>
             {
@@ -213,7 +214,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsAct);
 
             await service.CreateAPIRoute("/omnigram/accounts/resume", async (req) =>
             {
@@ -236,7 +237,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsAct);
 
             await service.CreateAPIRoute("/omnigram/accounts/update-notes", async (req) =>
             {
@@ -266,7 +267,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsAct);
 
             // Force re-login (clears session and retries full login + challenge flow)
             await service.CreateAPIRoute("/omnigram/accounts/relogin", async (req) =>
@@ -325,7 +326,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsAct);
         }
 
         private async Task RegisterProfileRoutes()
@@ -416,7 +417,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.AccountsRead);
 
             // Edit profile (bio, name, username, url)
             await service.CreateAPIRoute("/omnigram/accounts/profile/edit", async (req) =>
@@ -478,7 +479,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsManage);
 
             // Upload profile picture (raw bytes in body, accountId in query)
             await service.CreateAPIRoute("/omnigram/accounts/profile/picture", async (req) =>
@@ -548,7 +549,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsManage);
         }
 
         // ── Content Configuration ──
@@ -574,7 +575,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.AccountsRead);
 
             await service.CreateAPIRoute("/omnigram/accounts/config/update", async (req) =>
             {
@@ -610,7 +611,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.AccountsManage);
 
             await service.CreateAPIRoute("/omnigram/content-folder/list", async (req) =>
             {
@@ -634,7 +635,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.ContentRead);
 
             await service.CreateAPIRoute("/omnigram/content-folder/reset-used", async (req) =>
             {
@@ -658,7 +659,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.ContentPublish);
         }
 
         // ── Posts ──
@@ -702,7 +703,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.ContentRead);
 
             await service.CreateAPIRoute("/omnigram/queue", async (req) =>
             {
@@ -726,7 +727,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.ContentRead);
 
             await service.CreateAPIRoute("/omnigram/posts/schedule", async (req) =>
             {
@@ -782,7 +783,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.ContentPublish);
 
             await service.CreateAPIRoute("/omnigram/posts/publish-now", async (req) =>
             {
@@ -831,7 +832,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.ContentPublish);
 
             await service.CreateAPIRoute("/omnigram/posts/cancel", async (req) =>
             {
@@ -853,7 +854,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.ContentPublish);
 
             await service.CreateAPIRoute("/omnigram/posts/trigger-pull", async (req) =>
             {
@@ -868,7 +869,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.ContentPublish);
             // Draft post to multiple accounts at once
             await service.CreateAPIRoute("/omnigram/posts/draft", async (req) =>
             {
@@ -947,7 +948,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.ContentPublish);
 
             // Upload media file for manual posts (raw bytes in body, filename in query)
             await service.CreateAPIRoute("/omnigram/media/upload", async (req) =>
@@ -996,7 +997,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.ContentPublish);
         }
 
         // ── Analytics ──
@@ -1026,7 +1027,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.ContentRead);
 
             await service.CreateAPIRoute("/omnigram/analytics/snapshots", async (req) =>
             {
@@ -1050,7 +1051,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.ContentRead);
 
             await service.CreateAPIRoute("/omnigram/analytics/trigger-snapshot", async (req) =>
             {
@@ -1064,7 +1065,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, OmniGramPerms.ContentPublish);
         }
 
         // ── Events ──
@@ -1087,7 +1088,7 @@ namespace Omnipotent.Services.OmniGram
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, OmniGramPerms.ContentRead);
         }
     }
 #pragma warning restore CS4014

@@ -1,6 +1,9 @@
 using FFMpegCore;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
+using Omnipotent.Profiles;
+using Omnipotent.Profiles.Permissions;
+using Omnipotent.Profiles.Permissions.Legacy;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Concurrent;
@@ -10,14 +13,29 @@ using static Omnipotent.Services.KliveCloud.CloudItem;
 
 namespace Omnipotent.Services.KliveCloud
 {
+    /// <summary>
+    /// Personal cloud storage. What a profile may do here is decided twice for every action: the
+    /// route's <c>klivecloud.*</c> permission (may they upload / delete / share at all?) and the
+    /// item's access list (are they a Viewer or Editor of <i>this</i> item?).
+    ///
+    /// <see cref="CloudItems"/> and <see cref="ShareLinks"/> are copy-on-write: every change builds
+    /// a new list under <see cref="metadataLock"/>, so request handlers can enumerate them without
+    /// locking and never see a half-applied change.
+    /// </summary>
     public class KliveCloud : OmniService
     {
-        public List<CloudItem> CloudItems;
-        public List<ShareLink> ShareLinks;
+        public List<CloudItem> CloudItems = new();
+        public List<ShareLink> ShareLinks = new();
+        private Dictionary<string, CloudItem> itemsById = new(StringComparer.OrdinalIgnoreCase);
+        private readonly SemaphoreSlim metadataLock = new(1, 1);
         private KliveCloudRoutes routes;
         private string metadataFilePath;
         private string shareLinksFilePath;
         private readonly ConcurrentDictionary<string, SemaphoreSlim> videoEmbedTranscodeLocks = new();
+        private KMProfileManager? profileManager;
+
+        /// <summary>Virtual folder id listing items shared with the caller whose folder they can't see.</summary>
+        public const string SharedWithMeFolderID = "shared-with-me";
 
         public KliveCloud()
         {
@@ -45,6 +63,7 @@ namespace Omnipotent.Services.KliveCloud
 
             await LoadMetadata();
             await LoadShareLinks();
+            await MigrateLegacyAccessAsync();
 
             routes = new KliveCloudRoutes(this);
             routes.CreateRoutes();
@@ -54,20 +73,22 @@ namespace Omnipotent.Services.KliveCloud
 
         private async Task LoadMetadata()
         {
-            CloudItems = new List<CloudItem>();
+            var items = new List<CloudItem>();
             if (File.Exists(metadataFilePath))
             {
                 try
                 {
                     string data = await GetDataHandler().ReadDataFromFile(metadataFilePath);
-                    CloudItems = JsonConvert.DeserializeObject<List<CloudItem>>(data) ?? new List<CloudItem>();
+                    items = JsonConvert.DeserializeObject<List<CloudItem>>(data) ?? new List<CloudItem>();
                 }
                 catch (Exception ex)
                 {
                     ServiceLogError(ex, "Failed to load KliveCloud metadata.");
-                    CloudItems = new List<CloudItem>();
+                    items = new List<CloudItem>();
                 }
             }
+            foreach (var item in items) item.Access ??= new CloudAccess();
+            PublishItems(items);
         }
 
         // Response-cache dataset keys. CloudItems and ShareLinks are held in memory and
@@ -77,6 +98,18 @@ namespace Omnipotent.Services.KliveCloud
         // These keys make the in-memory reads visible to the dependency tracker.
         internal const string ItemsCacheKey = "klivecloud:items";
         internal const string ShareLinksCacheKey = "klivecloud:sharelinks";
+
+        /// <summary>Swaps in a new item list and rebuilds the id index (call under the metadata lock).</summary>
+        private void PublishItems(List<CloudItem> items)
+        {
+            var index = new Dictionary<string, CloudItem>(StringComparer.OrdinalIgnoreCase);
+            foreach (var item in items)
+            {
+                if (!string.IsNullOrEmpty(item.ItemID)) index[item.ItemID] = item;
+            }
+            CloudItems = items;
+            itemsById = index;
+        }
 
         public async Task SaveMetadata()
         {
@@ -140,45 +173,304 @@ namespace Omnipotent.Services.KliveCloud
             CacheDeps.Bump(ShareLinksCacheKey); // revocations/permission changes invalidate cached share responses
         }
 
-        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly, bool reuseExisting = true)
+        // ───────────────────────────── profiles ─────────────────────────────
+
+        /// <summary>Test seam: resolve profiles from this manager instead of the running services.</summary>
+        internal void UseProfileManager(KMProfileManager manager) => profileManager = manager;
+
+        /// <summary>Test seam: replaces the item list (as loading does).</summary>
+        internal void SetItemsForTests(List<CloudItem> items) => PublishItems(items);
+
+        private KMProfileManager? Profiles()
         {
-            if (reuseExisting)
+            if (profileManager != null) return profileManager;
+            try { profileManager = GetActiveServices().ToArray().OfType<KMProfileManager>().FirstOrDefault(); }
+            catch (InvalidOperationException) { }
+            return profileManager;
+        }
+
+        public KMProfile? GetProfile(string? userId) => string.IsNullOrEmpty(userId) ? null : Profiles()?.GetProfileByIDFast(userId);
+
+        public IReadOnlyList<KMProfile> AllProfiles() => Profiles()?.Profiles ?? Array.Empty<KMProfile>();
+
+        // ───────────────────────────── access ─────────────────────────────
+
+        /// <summary>
+        /// The caller's level on an item: their own entries and "everyone" on the item and, while
+        /// <see cref="CloudAccess.Inherit"/> holds, on each folder above it. The owner, and anyone
+        /// holding <c>klivecloud.files.all</c> (<paramref name="allFiles"/>), is an Editor everywhere.
+        /// </summary>
+        public CloudAccessLevel EffectiveLevel(CloudItem item, KMProfile? profile, bool allFiles = false)
+        {
+            if (item == null || profile == null) return CloudAccessLevel.None;
+            if (profile.IsOwner || allFiles) return CloudAccessLevel.Editor;
+            var best = CloudAccessLevel.None;
+            var node = item;
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            while (node != null && visited.Add(node.ItemID))
             {
-                var existingLink = await GetReusableShareLink(itemID);
-                if (existingLink != null)
+                var access = node.Access ?? new CloudAccess();
+                if (access.Everyone is CloudAccessLevel everyone && everyone > best) best = everyone;
+                foreach (var entry in access.Entries)
                 {
-                    existingLink.ExpirationDate = expirationDate;
-                    existingLink.PermissionMode = permissionMode;
-                    await SaveShareLinks();
-                    return existingLink;
+                    if (entry.ProfileId == profile.UserID && entry.Level > best) best = entry.Level;
                 }
+                if (best == CloudAccessLevel.Editor || !access.Inherit || string.IsNullOrEmpty(node.ParentFolderID)) break;
+                node = GetItemByID(node.ParentFolderID);
+            }
+            return best;
+        }
+
+        public bool CanView(CloudItem item, KMProfile? profile, bool allFiles = false)
+            => EffectiveLevel(item, profile, allFiles) >= CloudAccessLevel.Viewer;
+
+        public bool CanEdit(CloudItem item, KMProfile? profile, bool allFiles = false)
+            => EffectiveLevel(item, profile, allFiles) >= CloudAccessLevel.Editor;
+
+        public List<CloudItem> GetDescendants(string folderID)
+        {
+            CacheDeps.NoteRead(ItemsCacheKey);
+            return CloudItems.Where(item => IsDescendantOfFolder(folderID, item)).ToList();
+        }
+
+        /// <summary>
+        /// Deleting or sharing a folder acts on everything inside it, so the caller must be an
+        /// Editor of every descendant. Returns the first item they aren't an editor of.
+        /// </summary>
+        public CloudItem? FirstNonEditableDescendant(CloudItem folder, KMProfile? profile, bool allFiles)
+        {
+            if (folder.ItemType != CloudItemType.Folder || profile?.IsOwner == true || allFiles) return null;
+            return GetDescendants(folder.ItemID).FirstOrDefault(d => !CanEdit(d, profile, allFiles));
+        }
+
+        /// <summary>Items in a folder (or at the root) the caller can see, each with their level.</summary>
+        public List<(CloudItem Item, CloudAccessLevel Level)> GetVisibleChildren(string? folderID, KMProfile? profile, bool allFiles)
+        {
+            CacheDeps.NoteRead(ItemsCacheKey);
+            string parent = folderID ?? "";
+            return CloudItems
+                .Where(k => string.Equals(k.ParentFolderID ?? "", parent, StringComparison.OrdinalIgnoreCase))
+                .Select(k => (k, EffectiveLevel(k, profile, allFiles)))
+                .Where(t => t.Item2 >= CloudAccessLevel.Viewer)
+                .ToList();
+        }
+
+        /// <summary>
+        /// Items shared with the caller that they can't reach by browsing, because they can't see
+        /// the folder above them. Shown in the "Shared with me" virtual folder.
+        /// </summary>
+        public List<(CloudItem Item, CloudAccessLevel Level)> GetSharedWithMe(KMProfile? profile, bool allFiles)
+        {
+            CacheDeps.NoteRead(ItemsCacheKey);
+            if (profile == null || profile.IsOwner || allFiles) return new();
+            var result = new List<(CloudItem, CloudAccessLevel)>();
+            foreach (var item in CloudItems)
+            {
+                if (string.IsNullOrEmpty(item.ParentFolderID)) continue;
+                var level = EffectiveLevel(item, profile, allFiles);
+                if (level < CloudAccessLevel.Viewer) continue;
+                var parent = GetItemByID(item.ParentFolderID);
+                if (parent != null && CanView(parent, profile, allFiles)) continue;
+                result.Add((item, level));
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Path segments from the highest folder the caller can see down to the item, so a shared
+        /// item never reveals the names of folders above it that the caller can't open.
+        /// </summary>
+        public List<CloudItem> VisibleAncestry(CloudItem item, KMProfile? profile, bool allFiles)
+        {
+            var chain = new List<CloudItem> { item };
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { item.ItemID };
+            var node = item;
+            while (!string.IsNullOrEmpty(node.ParentFolderID))
+            {
+                var parent = GetItemByID(node.ParentFolderID);
+                if (parent == null || !visited.Add(parent.ItemID) || !CanView(parent, profile, allFiles)) break;
+                chain.Insert(0, parent);
+                node = parent;
+            }
+            return chain;
+        }
+
+        public async Task<CloudItem?> SetAccess(string itemID, CloudAccess access)
+        {
+            await metadataLock.WaitAsync();
+            try
+            {
+                var item = GetItemByID(itemID);
+                if (item == null) return null;
+                item.Access = access;
+                item.ModifiedDate = DateTime.Now;
+                await SaveMetadata();
+                return item;
+            }
+            finally { metadataLock.Release(); }
+        }
+
+        /// <summary>
+        /// One-time conversion of rank floors into access lists, preserving exactly who could see
+        /// each item: an item visible to every signed-in profile (Guest floor or lower) becomes
+        /// "everyone: Editor"; otherwise the profiles whose rank reached the item's effective floor
+        /// become Editors. A child only gets its own list when that set differs from its parent's.
+        /// Editor matches the old behaviour, where anyone who could see an item could change it.
+        /// </summary>
+        private async Task MigrateLegacyAccessAsync()
+        {
+            if (!CloudItems.Any(i => i.LegacyMinimumPermissionLevel != null)) return;
+
+            var manager = Profiles();
+            var deadline = DateTime.UtcNow.AddMinutes(2);
+            while ((manager == null || !manager.IsLoaded) && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(250);
+                manager = Profiles();
+            }
+            if (manager == null || !manager.IsLoaded)
+            {
+                await ServiceLogError("KliveCloud: profiles were not available, so item access was not converted. " +
+                    "Until it is, only the owner can see KliveCloud items. It will be retried on the next start.");
+                return;
             }
 
-            var link = new ShareLink
+            await metadataLock.WaitAsync();
+            try
             {
-                ShareCode = Guid.NewGuid().ToString("N"),
-                ItemID = itemID,
-                CreatedByUserID = createdByUserID,
-                CreatedDate = DateTime.Now,
-                ExpirationDate = expirationDate,
-                PermissionMode = permissionMode
-            };
-            ShareLinks.Add(link);
-            await SaveShareLinks();
-            ServiceLog($"Share link created for item {itemID} by user {createdByUserID}.");
-            return link;
+                try
+                {
+                    string backup = metadataFilePath + ".v1.bak";
+                    if (File.Exists(metadataFilePath) && !File.Exists(backup)) File.Copy(metadataFilePath, backup);
+                }
+                catch { }
+
+                int own = ApplyLegacyAccessMigration(CloudItems, manager.Profiles, GetItemByID, DateTime.UtcNow);
+                await SaveMetadata();
+                ServiceLog($"KliveCloud: converted {CloudItems.Count} items from rank floors to access lists ({own} with their own list).");
+            }
+            finally { metadataLock.Release(); }
+        }
+
+        /// <summary>
+        /// The pure part of the rank-floor migration (tested directly). Returns how many items got
+        /// their own list rather than inheriting.
+        /// </summary>
+        internal static int ApplyLegacyAccessMigration(IReadOnlyList<CloudItem> items, IEnumerable<KMProfile> allProfiles,
+            Func<string, CloudItem?> lookup, DateTime now)
+        {
+            var profiles = allProfiles.Where(p => !p.IsOwner).ToList();
+            var effective = new Dictionary<string, LegacyRank>(StringComparer.OrdinalIgnoreCase);
+            var visiting = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            LegacyRank Effective(CloudItem item)
+            {
+                if (effective.TryGetValue(item.ItemID, out var known)) return known;
+                var rank = item.LegacyMinimumPermissionLevel ?? LegacyRank.Guest;
+                var parent = string.IsNullOrEmpty(item.ParentFolderID) ? null : lookup(item.ParentFolderID);
+                if (parent != null && visiting.Add(item.ItemID))
+                {
+                    var parentRank = Effective(parent);
+                    if (parentRank > rank) rank = parentRank;
+                }
+                effective[item.ItemID] = rank;
+                return rank;
+            }
+
+            // Before access lists, every KliveCloud route needed at least Guest, so an
+            // Anybody/Guest floor meant "every signed-in profile".
+            string Signature(LegacyRank floor) => floor <= LegacyRank.Guest
+                ? "*"
+                : string.Join(",", profiles.Where(p => (int)p.Rank >= (int)floor).Select(p => p.UserID).OrderBy(x => x, StringComparer.Ordinal));
+
+            int own = 0;
+            foreach (var item in items)
+            {
+                var floor = Effective(item);
+                var parent = string.IsNullOrEmpty(item.ParentFolderID) ? null : lookup(item.ParentFolderID);
+                bool sameAsParent = parent != null && Signature(Effective(parent)) == Signature(floor);
+                var access = new CloudAccess { Inherit = true };
+                if (!sameAsParent)
+                {
+                    access.Inherit = parent == null;
+                    if (floor <= LegacyRank.Guest)
+                    {
+                        access.Everyone = CloudAccessLevel.Editor;
+                    }
+                    else
+                    {
+                        access.Entries = profiles.Where(p => (int)p.Rank >= (int)floor).Select(p => new CloudAccessEntry
+                        {
+                            ProfileId = p.UserID,
+                            Level = CloudAccessLevel.Editor,
+                            AddedById = "migration",
+                            AddedUtc = now,
+                        }).ToList();
+                    }
+                    own++;
+                }
+                item.Access = access;
+            }
+            foreach (var item in items) item.LegacyMinimumPermissionLevel = null;
+            return own;
+        }
+
+        // ───────────────────────────── share links ─────────────────────────────
+
+        /// <summary>
+        /// Creates a link owned by its creator. A creator's own link for the same item and mode is
+        /// reused (with the new expiry); someone else's link is never touched.
+        /// </summary>
+        public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly, bool reuseExisting = true)
+        {
+            await metadataLock.WaitAsync();
+            try
+            {
+                DateTime now = DateTime.Now;
+                var live = ShareLinks.Where(k => !(k.ExpirationDate.HasValue && k.ExpirationDate.Value < now)).ToList();
+                if (reuseExisting)
+                {
+                    var mine = live.FirstOrDefault(k => k.ItemID == itemID && k.CreatedByUserID == createdByUserID && k.PermissionMode == permissionMode);
+                    if (mine != null)
+                    {
+                        mine.ExpirationDate = expirationDate;
+                        ShareLinks = live;
+                        await SaveShareLinks();
+                        return mine;
+                    }
+                }
+
+                var link = new ShareLink
+                {
+                    ShareCode = Guid.NewGuid().ToString("N"),
+                    ItemID = itemID,
+                    CreatedByUserID = createdByUserID,
+                    CreatedDate = now,
+                    ExpirationDate = expirationDate,
+                    PermissionMode = permissionMode
+                };
+                ShareLinks = live.Append(link).ToList();
+                await SaveShareLinks();
+                ServiceLog($"Share link created for item {itemID} by user {createdByUserID}.");
+                return link;
+            }
+            finally { metadataLock.Release(); }
         }
 
         public async Task<bool> UpdateShareLinkPermission(string shareCode, SharePermissionMode permissionMode)
         {
-            var link = GetShareLinkByCode(shareCode);
-            if (link == null) return false;
+            await metadataLock.WaitAsync();
+            try
+            {
+                var link = GetShareLinkByCode(shareCode);
+                if (link == null) return false;
 
-            link.PermissionMode = permissionMode;
-            link.LegacySharePermissionMode = null;
-            await SaveShareLinks();
-            ServiceLog($"Share link {shareCode} permission updated to {permissionMode}.");
-            return true;
+                link.PermissionMode = permissionMode;
+                link.LegacySharePermissionMode = null;
+                await SaveShareLinks();
+                ServiceLog($"Share link {shareCode} permission updated to {permissionMode}.");
+                return true;
+            }
+            finally { metadataLock.Release(); }
         }
 
         public bool CanWriteThroughShareLink(ShareLink link)
@@ -202,39 +494,42 @@ namespace Omnipotent.Services.KliveCloud
             return sharedRoot != null && sharedRoot.ItemType == CloudItemType.Folder && IsDescendantOfFolder(sharedRoot.ItemID, item);
         }
 
+        /// <summary>
+        /// A share link never serves more than its creator can still see: an item inside a shared
+        /// folder that the creator has no access to (or lost access to) is invisible through the link.
+        /// Links written through share links ("shared:…") act for the link that created them.
+        /// </summary>
+        public bool LinkCanServe(ShareLink link, CloudItem item)
+        {
+            if (!IsItemWithinSharedScope(link, item)) return false;
+            if (link.CreatedByUserID != null && link.CreatedByUserID.StartsWith("shared:", StringComparison.Ordinal)) return true;
+            var creator = GetProfile(link.CreatedByUserID);
+            if (creator == null) return false;
+            bool allFiles = AccessEvaluator.Can(creator, KliveCloudPerms.FilesAll);
+            return CanView(item, creator, allFiles);
+        }
+
         public ShareLink GetShareLinkByCode(string shareCode)
         {
             CacheDeps.NoteRead(ShareLinksCacheKey);
             return ShareLinks.FirstOrDefault(k => k.ShareCode == shareCode);
         }
 
-        public async Task<ShareLink?> GetReusableShareLink(string itemID)
-        {
-            bool removedExpiredLinks = false;
-            foreach (var expiredLink in ShareLinks
-                .Where(k => k.ItemID == itemID && k.ExpirationDate.HasValue && k.ExpirationDate.Value < DateTime.Now)
-                .ToList())
-            {
-                ShareLinks.Remove(expiredLink);
-                removedExpiredLinks = true;
-            }
-
-            if (removedExpiredLinks)
-            {
-                await SaveShareLinks();
-            }
-
-            return ShareLinks.FirstOrDefault(k => k.ItemID == itemID);
-        }
-
         public async Task<bool> DeleteShareLink(string shareCode)
         {
-            var link = GetShareLinkByCode(shareCode);
-            if (link == null) return false;
-            ShareLinks.Remove(link);
-            await SaveShareLinks();
-            return true;
+            await metadataLock.WaitAsync();
+            try
+            {
+                var link = GetShareLinkByCode(shareCode);
+                if (link == null) return false;
+                ShareLinks = ShareLinks.Where(k => k.ShareCode != shareCode).ToList();
+                await SaveShareLinks();
+                return true;
+            }
+            finally { metadataLock.Release(); }
         }
+
+        // ───────────────────────────── storage ─────────────────────────────
 
         private static readonly char[] InvalidNameChars = Path.GetInvalidFileNameChars();
 
@@ -265,83 +560,10 @@ namespace Omnipotent.Services.KliveCloud
         public CloudItem GetItemByID(string itemID)
         {
             CacheDeps.NoteRead(ItemsCacheKey);
+            if (string.IsNullOrEmpty(itemID)) return null;
+            if (itemsById.TryGetValue(itemID, out var hit)) return hit;
+            // Callers that populate CloudItems directly (tests) bypass the index.
             return CloudItems.FirstOrDefault(k => k.ItemID == itemID);
-        }
-
-        public List<CloudItem> GetItemsInFolder(string folderID, KMPermissions userPermission)
-        {
-            CacheDeps.NoteRead(ItemsCacheKey);
-            return CloudItems
-                .Where(k => k.ParentFolderID == folderID && CanAccessItem(k, userPermission))
-                .Select(CloneWithEffectivePermission)
-                .ToList();
-        }
-
-        public List<CloudItem> GetRootItems(KMPermissions userPermission)
-        {
-            return CloudItems
-                .Where(k => string.IsNullOrEmpty(k.ParentFolderID) && CanAccessItem(k, userPermission))
-                .Select(CloneWithEffectivePermission)
-                .ToList();
-        }
-
-        public bool CanAccessItem(CloudItem item, KMPermissions userPermission)
-        {
-            return GetEffectiveMinimumPermission(item) <= userPermission;
-        }
-
-        public CloudItem CloneWithEffectivePermission(CloudItem item)
-        {
-            return new CloudItem
-            {
-                ItemID = item.ItemID,
-                Name = item.Name,
-                RelativePath = item.RelativePath,
-                ParentFolderID = item.ParentFolderID,
-                CreatedDate = item.CreatedDate,
-                ModifiedDate = item.ModifiedDate,
-                CreatedByUserID = item.CreatedByUserID,
-                ItemType = item.ItemType,
-                MinimumPermissionLevel = GetEffectiveMinimumPermission(item),
-                FileSizeBytes = item.FileSizeBytes
-            };
-        }
-
-        public KMPermissions GetEffectiveMinimumPermission(CloudItem item)
-        {
-            KMPermissions effectivePermission = item.MinimumPermissionLevel;
-            string parentFolderID = item.ParentFolderID;
-            HashSet<string> visitedFolderIds = new(StringComparer.OrdinalIgnoreCase);
-
-            while (!string.IsNullOrWhiteSpace(parentFolderID) && visitedFolderIds.Add(parentFolderID))
-            {
-                var parentFolder = GetItemByID(parentFolderID);
-                if (parentFolder == null)
-                {
-                    break;
-                }
-
-                effectivePermission = (KMPermissions)Math.Max((int)effectivePermission, (int)parentFolder.MinimumPermissionLevel);
-                parentFolderID = parentFolder.ParentFolderID;
-            }
-
-            return effectivePermission;
-        }
-
-        public KMPermissions ApplyParentPermissionFloor(string parentFolderID, KMPermissions requestedPermission)
-        {
-            if (string.IsNullOrWhiteSpace(parentFolderID))
-            {
-                return requestedPermission;
-            }
-
-            var parentFolder = GetItemByID(parentFolderID);
-            if (parentFolder == null)
-            {
-                throw new Exception("Parent folder not found.");
-            }
-
-            return (KMPermissions)Math.Max((int)requestedPermission, (int)GetEffectiveMinimumPermission(parentFolder));
         }
 
         public bool IsDescendantOfFolder(string folderID, CloudItem item)
@@ -368,57 +590,103 @@ namespace Omnipotent.Services.KliveCloud
             return false;
         }
 
-        public List<CloudItem> GetFolderDescendantsForShare(string folderID)
+        /// <summary>
+        /// A name no sibling (in metadata or on disk) already uses: "report.pdf" becomes
+        /// "report (1).pdf". Two items must never share a disk path, or deleting one destroys the other.
+        /// </summary>
+        private string UniqueSiblingName(string desired, string? parentFolderID, CloudItemType type, string parentRelativePath)
         {
-            return CloudItems
-                .Where(item => IsDescendantOfFolder(folderID, item))
-                .Select(CloneWithEffectivePermission)
-                .OrderBy(item => item.RelativePath, StringComparer.OrdinalIgnoreCase)
-                .ToList();
+            string parent = parentFolderID ?? "";
+            var taken = new HashSet<string>(CloudItems
+                .Where(k => string.Equals(k.ParentFolderID ?? "", parent, StringComparison.OrdinalIgnoreCase))
+                .Select(k => k.Name), StringComparer.OrdinalIgnoreCase);
+            string basePath = GetStorageBasePath();
+            bool ExistsOnDisk(string candidate)
+            {
+                string full = Path.GetFullPath(Path.Combine(basePath, parentRelativePath, candidate));
+                return File.Exists(full) || Directory.Exists(full);
+            }
+            if (!taken.Contains(desired) && !ExistsOnDisk(desired)) return desired;
+
+            string stem = type == CloudItemType.File ? Path.GetFileNameWithoutExtension(desired) : desired;
+            string ext = type == CloudItemType.File ? Path.GetExtension(desired) : "";
+            for (int i = 1; i < 10_000; i++)
+            {
+                string candidate = $"{stem} ({i}){ext}";
+                if (!taken.Contains(candidate) && !ExistsOnDisk(candidate)) return candidate;
+            }
+            throw new IOException("Could not find a free name for this item.");
         }
 
-        public async Task<CloudItem> CreateFolder(string name, string parentFolderID, string createdByUserID, KMPermissions minimumPermission)
+        private string ParentRelativePath(string? parentFolderID)
+        {
+            if (string.IsNullOrEmpty(parentFolderID)) return "";
+            var parentFolder = GetItemByID(parentFolderID);
+            if (parentFolder == null || parentFolder.ItemType != CloudItemType.Folder)
+                throw new Exception("Parent folder not found.");
+            return parentFolder.RelativePath;
+        }
+
+        /// <summary>New items inherit their folder's access; the creator also becomes an Editor.</summary>
+        private static CloudAccess NewItemAccess(string createdByUserID)
+        {
+            var access = new CloudAccess { Inherit = true };
+            if (!string.IsNullOrEmpty(createdByUserID) && !createdByUserID.StartsWith("shared:", StringComparison.Ordinal))
+            {
+                access.Entries.Add(new CloudAccessEntry
+                {
+                    ProfileId = createdByUserID,
+                    Level = CloudAccessLevel.Editor,
+                    AddedById = createdByUserID,
+                    AddedUtc = DateTime.UtcNow,
+                });
+            }
+            return access;
+        }
+
+        public async Task<CloudItem> CreateFolder(string name, string parentFolderID, string createdByUserID)
         {
             ValidateItemName(name);
-            minimumPermission = ApplyParentPermissionFloor(parentFolderID, minimumPermission);
-
-            string relativePath;
-            if (string.IsNullOrEmpty(parentFolderID))
+            await metadataLock.WaitAsync();
+            try
             {
-                relativePath = name;
+                string parentPath = ParentRelativePath(parentFolderID);
+                name = UniqueSiblingName(name, parentFolderID, CloudItemType.Folder, parentPath);
+                string relativePath = string.IsNullOrEmpty(parentPath) ? name : Path.Combine(parentPath, name);
+
+                string basePath = GetStorageBasePath();
+                string fullPath = Path.GetFullPath(Path.Combine(basePath, relativePath));
+                if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar))
+                    throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
+                Directory.CreateDirectory(fullPath);
+
+                CloudItem folder = new CloudItem
+                {
+                    ItemID = NewItemId(),
+                    Name = name,
+                    RelativePath = relativePath,
+                    ParentFolderID = parentFolderID ?? "",
+                    CreatedDate = DateTime.Now,
+                    ModifiedDate = DateTime.Now,
+                    CreatedByUserID = createdByUserID,
+                    ItemType = CloudItemType.Folder,
+                    Access = NewItemAccess(createdByUserID),
+                    FileSizeBytes = 0
+                };
+
+                PublishItems(CloudItems.Append(folder).ToList());
+                await SaveMetadata();
+                ServiceLog($"Folder '{name}' created by user {createdByUserID}.");
+                return folder;
             }
-            else
-            {
-                var parentFolder = GetItemByID(parentFolderID);
-                if (parentFolder == null || parentFolder.ItemType != CloudItemType.Folder)
-                    throw new Exception("Parent folder not found.");
-                relativePath = Path.Combine(parentFolder.RelativePath, name);
-            }
+            finally { metadataLock.Release(); }
+        }
 
-            string basePath = GetStorageBasePath();
-            string fullPath = Path.GetFullPath(Path.Combine(basePath, relativePath));
-            if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar))
-                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
-            Directory.CreateDirectory(fullPath);
-
-            CloudItem folder = new CloudItem
-            {
-                ItemID = RandomGeneration.GenerateRandomLengthOfNumbers(12),
-                Name = name,
-                RelativePath = relativePath,
-                ParentFolderID = parentFolderID ?? "",
-                CreatedDate = DateTime.Now,
-                ModifiedDate = DateTime.Now,
-                CreatedByUserID = createdByUserID,
-                ItemType = CloudItemType.Folder,
-                MinimumPermissionLevel = minimumPermission,
-                FileSizeBytes = 0
-            };
-
-            CloudItems.Add(folder);
-            await SaveMetadata();
-            ServiceLog($"Folder '{name}' created by user {createdByUserID}.");
-            return folder;
+        private string NewItemId()
+        {
+            string id;
+            do { id = RandomGeneration.GenerateRandomLengthOfNumbers(12); } while (itemsById.ContainsKey(id));
+            return id;
         }
 
         /// <summary>
@@ -436,104 +704,73 @@ namespace Omnipotent.Services.KliveCloud
         public const long MaxUploadBytes = 64L * 1024 * 1024 * 1024;
 
         /// <summary>
-        /// Resolves and validates where an uploaded file will land, creating the parent
-        /// directory. Shared by the buffered and streaming upload paths so both enforce
-        /// exactly the same name, permission and path-traversal rules.
-        /// </summary>
-        private (string RelativePath, string FullPath, KMPermissions Permission) ResolveUploadTarget(
-            string fileName, string parentFolderID, KMPermissions minimumPermission)
-        {
-            ValidateItemName(fileName);
-            minimumPermission = ApplyParentPermissionFloor(parentFolderID, minimumPermission);
-
-            string relativePath;
-            if (string.IsNullOrEmpty(parentFolderID))
-            {
-                relativePath = fileName;
-            }
-            else
-            {
-                var parentFolder = GetItemByID(parentFolderID);
-                if (parentFolder == null || parentFolder.ItemType != CloudItemType.Folder)
-                    throw new Exception("Parent folder not found.");
-                relativePath = Path.Combine(parentFolder.RelativePath, fileName);
-            }
-
-            string basePath = GetStorageBasePath();
-            string fullPath = Path.GetFullPath(Path.Combine(basePath, relativePath));
-            if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar))
-                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
-            string directory = Path.GetDirectoryName(fullPath);
-            if (!Directory.Exists(directory))
-                Directory.CreateDirectory(directory);
-
-            return (relativePath, fullPath, minimumPermission);
-        }
-
-        private async Task<CloudItem> RegisterUploadedFile(
-            string fileName, string relativePath, string parentFolderID, string createdByUserID,
-            KMPermissions minimumPermission, long fileSizeBytes)
-        {
-            CloudItem file = new CloudItem
-            {
-                ItemID = RandomGeneration.GenerateRandomLengthOfNumbers(12),
-                Name = fileName,
-                RelativePath = relativePath,
-                ParentFolderID = parentFolderID ?? "",
-                CreatedDate = DateTime.Now,
-                ModifiedDate = DateTime.Now,
-                CreatedByUserID = createdByUserID,
-                ItemType = CloudItemType.File,
-                MinimumPermissionLevel = minimumPermission,
-                FileSizeBytes = fileSizeBytes
-            };
-
-            CloudItems.Add(file);
-            await SaveMetadata();
-            ServiceLog($"File '{fileName}' ({fileSizeBytes} bytes) uploaded by user {createdByUserID}.");
-            return file;
-        }
-
-        public async Task<CloudItem> UploadFile(string fileName, byte[] fileData, string parentFolderID, string createdByUserID, KMPermissions minimumPermission)
-        {
-            var target = ResolveUploadTarget(fileName, parentFolderID, minimumPermission);
-
-            await GetDataHandler().WriteBytesToFile(target.FullPath, fileData);
-
-            return await RegisterUploadedFile(
-                fileName, target.RelativePath, parentFolderID, createdByUserID,
-                target.Permission, fileData.Length);
-        }
-
-        /// <summary>
         /// Copies an upload straight from the request socket to disk, one buffer at a
-        /// time, and only then records it.
-        ///
-        /// The buffered <see cref="UploadFile(string, byte[], string, string, KMPermissions)"/>
-        /// above needs the whole payload resident as a byte[] before it can write a single
-        /// byte, which costs a full copy of the file in memory, stalls the write until the
-        /// last network byte arrives, and cannot represent a file over 2GB at all. This
-        /// path holds one buffer regardless of file size and overlaps network with disk.
-        ///
-        /// Writes land on a sibling temp file that is moved into place at the end, so an
-        /// aborted or failed upload never leaves a half-written file visible under the
-        /// item's name.
+        /// time, and only then records it. Holds one buffer regardless of file size and
+        /// overlaps network with disk. Writes land on a sibling temp file that is moved
+        /// into place at the end, so an aborted or failed upload never leaves a
+        /// half-written file visible under the item's name. A name already used in the
+        /// folder gets a " (1)" suffix rather than overwriting the other item's bytes.
         /// </summary>
         public async Task<CloudItem> UploadFileFromStream(
             string fileName, Stream source, long declaredLength, string parentFolderID,
-            string createdByUserID, KMPermissions minimumPermission,
-            CancellationToken cancellationToken = default)
+            string createdByUserID, CancellationToken cancellationToken = default)
         {
             ArgumentNullException.ThrowIfNull(source);
-            var target = ResolveUploadTarget(fileName, parentFolderID, minimumPermission);
+            ValidateItemName(fileName);
 
-            long written = await StreamToFileAtomically(
-                target.FullPath, source, declaredLength, cancellationToken);
-            DataUtil.NoteExternalFileWrite(target.FullPath);
+            // Reserve the name under the lock, write outside it (uploads can take minutes),
+            // then register under the lock again.
+            string relativePath, fullPath;
+            await metadataLock.WaitAsync(cancellationToken);
+            try
+            {
+                string parentPath = ParentRelativePath(parentFolderID);
+                fileName = UniqueSiblingName(fileName, parentFolderID, CloudItemType.File, parentPath);
+                relativePath = string.IsNullOrEmpty(parentPath) ? fileName : Path.Combine(parentPath, fileName);
+                string basePath = GetStorageBasePath();
+                fullPath = Path.GetFullPath(Path.Combine(basePath, relativePath));
+                if (!fullPath.StartsWith(basePath + Path.DirectorySeparatorChar))
+                    throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
+                Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+                // Placeholder so a concurrent upload of the same name picks a different one.
+                using (File.Create(fullPath)) { }
+            }
+            finally { metadataLock.Release(); }
 
-            return await RegisterUploadedFile(
-                fileName, target.RelativePath, parentFolderID, createdByUserID,
-                target.Permission, written);
+            long written;
+            try
+            {
+                written = await StreamToFileAtomically(fullPath, source, declaredLength, cancellationToken);
+            }
+            catch
+            {
+                try { if (File.Exists(fullPath) && new FileInfo(fullPath).Length == 0) File.Delete(fullPath); } catch { }
+                throw;
+            }
+            DataUtil.NoteExternalFileWrite(fullPath);
+
+            await metadataLock.WaitAsync(CancellationToken.None);
+            try
+            {
+                CloudItem file = new CloudItem
+                {
+                    ItemID = NewItemId(),
+                    Name = fileName,
+                    RelativePath = relativePath,
+                    ParentFolderID = parentFolderID ?? "",
+                    CreatedDate = DateTime.Now,
+                    ModifiedDate = DateTime.Now,
+                    CreatedByUserID = createdByUserID,
+                    ItemType = CloudItemType.File,
+                    Access = NewItemAccess(createdByUserID),
+                    FileSizeBytes = written
+                };
+                PublishItems(CloudItems.Append(file).ToList());
+                await SaveMetadata();
+                ServiceLog($"File '{fileName}' ({written} bytes) uploaded by user {createdByUserID}.");
+                return file;
+            }
+            finally { metadataLock.Release(); }
         }
 
         /// <summary>
@@ -616,130 +853,166 @@ namespace Omnipotent.Services.KliveCloud
             return await DeleteItemInternal(itemID, deletedByLabel);
         }
 
+        /// <summary>
+        /// Deletes an item and everything under it, together with its thumbnails, video embeds
+        /// and share links. Callers check the caller may edit every descendant first.
+        /// </summary>
         private async Task<bool> DeleteItemInternal(string itemID, string deletedByLabel)
         {
-            var item = GetItemByID(itemID);
-            if (item == null) return false;
-
-            if (item.ItemType == CloudItemType.Folder)
+            await metadataLock.WaitAsync();
+            CloudItem? item;
+            List<CloudItem> removed;
+            try
             {
-                var children = CloudItems.Where(k => k.ParentFolderID == itemID).ToList();
-                foreach (var child in children)
+                item = GetItemByID(itemID);
+                if (item == null) return false;
+
+                removed = new List<CloudItem> { item };
+                if (item.ItemType == CloudItemType.Folder) removed.AddRange(CloudItems.Where(k => IsDescendantOfFolder(itemID, k)));
+
+                string fullPath = GetFullItemPath(item);
+                if (item.ItemType == CloudItemType.Folder)
                 {
-                    await DeleteItemInternal(child.ItemID, deletedByLabel);
+                    if (Directory.Exists(fullPath)) Directory.Delete(fullPath, true);
+                    DataUtil.NoteExternalFileWrite(fullPath);
+                }
+                else if (File.Exists(fullPath))
+                {
+                    await GetDataHandler().DeleteFile(fullPath);
                 }
 
-                string fullPath = GetFullItemPath(item);
-                if (Directory.Exists(fullPath))
-                    Directory.Delete(fullPath, true);
-            }
-            else
-            {
-                string fullPath = GetFullItemPath(item);
-                if (File.Exists(fullPath))
-                    await GetDataHandler().DeleteFile(fullPath);
-            }
+                var removedIds = new HashSet<string>(removed.Select(r => r.ItemID), StringComparer.OrdinalIgnoreCase);
+                PublishItems(CloudItems.Where(k => !removedIds.Contains(k.ItemID)).ToList());
+                await SaveMetadata();
 
-            CloudItems.Remove(item);
-            await SaveMetadata();
-            ServiceLog($"Item '{item.Name}' deleted by {deletedByLabel}.");
+                if (ShareLinks.Any(l => removedIds.Contains(l.ItemID)))
+                {
+                    ShareLinks = ShareLinks.Where(l => !removedIds.Contains(l.ItemID)).ToList();
+                    await SaveShareLinks();
+                }
+            }
+            finally { metadataLock.Release(); }
+
+            foreach (var gone in removed) DeleteDerivedFiles(gone.ItemID);
+            ServiceLog($"Item '{item.Name}' deleted by {deletedByLabel} ({removed.Count} item(s)).");
             return true;
         }
 
-        public async Task<CloudItem> UpdateItemPermission(string itemID, KMPermissions newPermission)
+        /// <summary>Thumbnails and Discord embeds are derived from an item and go with it.</summary>
+        private void DeleteDerivedFiles(string itemID)
         {
-            var item = GetItemByID(itemID);
-            if (item == null) return null;
-            item.MinimumPermissionLevel = ApplyParentPermissionFloor(item.ParentFolderID, newPermission);
-            item.ModifiedDate = DateTime.Now;
-            await SaveMetadata();
-            return CloneWithEffectivePermission(item);
+            try
+            {
+                string thumbnailsDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudThumbnailsDirectory);
+                if (Directory.Exists(thumbnailsDir))
+                {
+                    foreach (var thumb in Directory.EnumerateFiles(thumbnailsDir, itemID + "_*.jpg")) File.Delete(thumb);
+                }
+                string embed = GetVideoEmbedCachePath(itemID);
+                if (File.Exists(embed)) File.Delete(embed);
+            }
+            catch (Exception ex)
+            {
+                ServiceLogError(ex, $"Could not clean up previews for deleted item {itemID}.");
+            }
         }
 
         public async Task<bool> MoveItem(string itemID, string newParentFolderID, string userID)
         {
-            var item = GetItemByID(itemID);
-            if (item == null) return false;
-
-            newParentFolderID = newParentFolderID ?? "";
-
-            // Cannot move an item into itself
-            if (string.Equals(itemID, newParentFolderID, StringComparison.OrdinalIgnoreCase))
-                throw new ArgumentException("Cannot move a folder into itself.");
-
-            // Cannot move a folder into one of its descendants
-            if (item.ItemType == CloudItemType.Folder && !string.IsNullOrEmpty(newParentFolderID))
+            await metadataLock.WaitAsync();
+            try
             {
-                var targetFolder = GetItemByID(newParentFolderID);
-                if (targetFolder != null && IsDescendantOfFolder(itemID, targetFolder))
+                var item = GetItemByID(itemID);
+                if (item == null) return false;
+
+                newParentFolderID = newParentFolderID ?? "";
+
+                // Cannot move an item into itself
+                if (string.Equals(itemID, newParentFolderID, StringComparison.OrdinalIgnoreCase))
+                    throw new ArgumentException("Cannot move a folder into itself.");
+
+                // Cannot move a folder into one of its descendants
+                if (item.ItemType == CloudItemType.Folder && !string.IsNullOrEmpty(newParentFolderID))
                 {
-                    throw new ArgumentException("Cannot move a folder into one of its descendants.");
+                    var targetFolder = GetItemByID(newParentFolderID);
+                    if (targetFolder != null && IsDescendantOfFolder(itemID, targetFolder))
+                    {
+                        throw new ArgumentException("Cannot move a folder into one of its descendants.");
+                    }
                 }
-            }
 
-            string oldRelativePath = item.RelativePath;
-            string newRelativePath;
-            if (string.IsNullOrEmpty(newParentFolderID))
-            {
-                newRelativePath = item.Name;
-            }
-            else
-            {
-                var newParent = GetItemByID(newParentFolderID);
-                if (newParent == null || newParent.ItemType != CloudItemType.Folder)
-                    throw new Exception("New parent folder not found.");
-                newRelativePath = Path.Combine(newParent.RelativePath, item.Name);
-            }
-
-            string basePath = GetStorageBasePath();
-            string oldFullPath = Path.GetFullPath(Path.Combine(basePath, oldRelativePath));
-            string newFullPath = Path.GetFullPath(Path.Combine(basePath, newRelativePath));
-
-            if (!oldFullPath.StartsWith(basePath + Path.DirectorySeparatorChar) && oldFullPath != basePath)
-                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
-            if (!newFullPath.StartsWith(basePath + Path.DirectorySeparatorChar) && newFullPath != basePath)
-                throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
-
-            // Check if the destination path already exists
-            if (item.ItemType == CloudItemType.Folder)
-            {
-                if (Directory.Exists(newFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
-                    throw new IOException("A folder with this name already exists in the destination.");
-            }
-            else
-            {
-                if (File.Exists(newFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
-                    throw new IOException("A file with this name already exists in the destination.");
-            }
-
-            // Perform physical move on disk
-            if (item.ItemType == CloudItemType.Folder)
-            {
-                if (Directory.Exists(oldFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                if (CloudItems.Any(k => k.ItemID != itemID
+                    && string.Equals(k.ParentFolderID ?? "", newParentFolderID, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(k.Name, item.Name, StringComparison.OrdinalIgnoreCase)))
                 {
-                    Directory.Move(oldFullPath, newFullPath);
+                    throw new IOException($"An item called '{item.Name}' already exists in the destination.");
                 }
-            }
-            else
-            {
-                if (File.Exists(oldFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+
+                string oldRelativePath = item.RelativePath;
+                string newRelativePath;
+                if (string.IsNullOrEmpty(newParentFolderID))
                 {
-                    string destDir = Path.GetDirectoryName(newFullPath);
-                    if (!Directory.Exists(destDir))
-                        Directory.CreateDirectory(destDir);
-                    File.Move(oldFullPath, newFullPath);
+                    newRelativePath = item.Name;
                 }
-            }
+                else
+                {
+                    var newParent = GetItemByID(newParentFolderID);
+                    if (newParent == null || newParent.ItemType != CloudItemType.Folder)
+                        throw new Exception("New parent folder not found.");
+                    newRelativePath = Path.Combine(newParent.RelativePath, item.Name);
+                }
 
-            // Update item metadata
-            item.ParentFolderID = newParentFolderID;
-            item.RelativePath = newRelativePath;
-            item.ModifiedDate = DateTime.Now;
+                string basePath = GetStorageBasePath();
+                string oldFullPath = Path.GetFullPath(Path.Combine(basePath, oldRelativePath));
+                string newFullPath = Path.GetFullPath(Path.Combine(basePath, newRelativePath));
 
-            // If it is a folder, update all descendant relative paths
-            if (item.ItemType == CloudItemType.Folder)
-            {
-                var descendants = CloudItems.Where(k => IsDescendantOfFolder(itemID, k)).ToList();
+                if (!oldFullPath.StartsWith(basePath + Path.DirectorySeparatorChar) && oldFullPath != basePath)
+                    throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
+                if (!newFullPath.StartsWith(basePath + Path.DirectorySeparatorChar) && newFullPath != basePath)
+                    throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
+
+                // Check if the destination path already exists
+                if (item.ItemType == CloudItemType.Folder)
+                {
+                    if (Directory.Exists(newFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("A folder with this name already exists in the destination.");
+                }
+                else
+                {
+                    if (File.Exists(newFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("A file with this name already exists in the destination.");
+                }
+
+                // Perform physical move on disk
+                if (item.ItemType == CloudItemType.Folder)
+                {
+                    if (Directory.Exists(oldFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        Directory.Move(oldFullPath, newFullPath);
+                    }
+                }
+                else
+                {
+                    if (File.Exists(oldFullPath) && !string.Equals(oldFullPath, newFullPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        string destDir = Path.GetDirectoryName(newFullPath);
+                        if (!Directory.Exists(destDir))
+                            Directory.CreateDirectory(destDir);
+                        File.Move(oldFullPath, newFullPath);
+                    }
+                }
+
+                // Descendants are collected before the item's own parent changes.
+                var descendants = item.ItemType == CloudItemType.Folder
+                    ? CloudItems.Where(k => IsDescendantOfFolder(itemID, k)).ToList()
+                    : new List<CloudItem>();
+
+                // Update item metadata
+                item.ParentFolderID = newParentFolderID;
+                item.RelativePath = newRelativePath;
+                item.ModifiedDate = DateTime.Now;
+
+                // If it is a folder, update all descendant relative paths
                 foreach (var descendant in descendants)
                 {
                     // Find the subpath from the old folder root
@@ -750,50 +1023,24 @@ namespace Omnipotent.Services.KliveCloud
                     }
                     descendant.RelativePath = Path.Combine(newRelativePath, relativeSubPath);
                 }
+
+                PublishItems(CloudItems.ToList());
+                await SaveMetadata();
+                ServiceLog($"Item '{item.Name}' moved to parent '{newParentFolderID}' by user {userID}.");
+                return true;
             }
-
-            await SaveMetadata();
-            ServiceLog($"Item '{item.Name}' moved to parent '{newParentFolderID}' by user {userID}.");
-            return true;
-        }
-
-        /// <summary>
-        /// Reads a whole file into memory. Nothing calls this any more: every download
-        /// route streams via <see cref="TryGetReadableFilePath"/> instead, because
-        /// buffering meant the client waited for the entire disk read before its first
-        /// byte, the server held a full copy (and the response-cache tee a second), and
-        /// a file over 2GB could not be returned at all.
-        /// </summary>
-        [Obsolete("Stream the file with TryGetReadableFilePath instead of buffering it in memory.")]
-        public async Task<byte[]> DownloadFile(string itemID)
-        {
-            var item = GetItemByID(itemID);
-            if (item == null || item.ItemType != CloudItemType.File) return null;
-            string fullPath = GetFullItemPath(item);
-            if (!File.Exists(fullPath)) return null;
-            return await GetDataHandler().ReadBytesFromFile(fullPath, true);
+            finally { metadataLock.Release(); }
         }
 
         /// <summary>
         /// Resolves a file item to a path on disk without reading it. Download routes
-        /// stream from this path rather than calling
-        /// <see cref="DownloadFile(string)"/>, which has to hold the entire file in
-        /// memory before the client receives its first byte.
+        /// stream from this path; nothing ever buffers a whole file in memory.
         /// </summary>
         public string TryGetReadableFilePath(CloudItem item)
         {
             if (item == null || item.ItemType != CloudItemType.File) return null;
             string fullPath = GetFullItemPath(item);
             return File.Exists(fullPath) ? fullPath : null;
-        }
-
-        public CloudItem GetFolderTree(string folderID, KMPermissions userPermission)
-        {
-            CacheDeps.NoteRead(ItemsCacheKey);
-            var folder = GetItemByID(folderID);
-            if (folder == null || folder.ItemType != CloudItemType.Folder) return null;
-            if (folder.MinimumPermissionLevel > userPermission) return null;
-            return folder;
         }
 
         private static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase)

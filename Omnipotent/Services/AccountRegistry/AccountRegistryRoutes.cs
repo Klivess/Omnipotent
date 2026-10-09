@@ -3,6 +3,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json.Serialization;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.AccountRegistry
 {
@@ -58,7 +59,7 @@ namespace Omnipotent.Services.AccountRegistry
                     await req.ReturnResponse(Json(list));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, AccountsPerms.RegistryRead);
 
             await parent.CreateAPIRoute("/accounts/update", async req =>
             {
@@ -85,7 +86,7 @@ namespace Omnipotent.Services.AccountRegistry
                     await req.ReturnResponse(Json(new { updated = true }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, AccountsPerms.RegistryManage);
 
             await parent.CreateAPIRoute("/accounts/delete", async req =>
             {
@@ -98,7 +99,7 @@ namespace Omnipotent.Services.AccountRegistry
                     await req.ReturnResponse(Json(new { deleted }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, AccountsPerms.RegistryManage);
         }
 
         private static async Task Err(Services.KliveAPI.KliveAPI.UserRequest req, Exception ex)

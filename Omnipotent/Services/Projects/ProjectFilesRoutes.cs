@@ -8,6 +8,7 @@ using Newtonsoft.Json.Serialization;
 using Omnipotent.Profiles;
 using ApiService = Omnipotent.Services.KliveAPI.KliveAPI;
 using ApiUserRequest = Omnipotent.Services.KliveAPI.KliveAPI.UserRequest;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Projects;
 
@@ -29,35 +30,35 @@ public sealed class ProjectFilesRoutes
     public async Task RegisterRoutes()
     {
         await parent.RegisterBufferedHttpRouteAsync("/projects/files/uploads/start", StartUpload,
-            HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
+            HttpMethod.Post, ProjectsPerms.FilesWrite, ControlBodyLimit);
         await parent.RegisterHttpRouteAsync("/projects/files/uploads/get", GetUpload,
-            HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            HttpMethod.Get, ProjectsPerms.FilesRead);
         await parent.RegisterStreamingHttpRouteAsync("/projects/files/uploads/chunk", UploadChunk,
-            HttpMethod.Put, KMProfileManager.KMPermissions.Klives, parent.Files.Options.MaxChunkBytes);
+            HttpMethod.Put, ProjectsPerms.FilesWrite, parent.Files.Options.MaxChunkBytes);
         await parent.RegisterBufferedHttpRouteAsync("/projects/files/uploads/commit", CommitUpload,
-            HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
+            HttpMethod.Post, ProjectsPerms.FilesWrite, ControlBodyLimit);
         await parent.RegisterBufferedHttpRouteAsync("/projects/files/uploads/cancel", CancelUpload,
-            HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
+            HttpMethod.Post, ProjectsPerms.FilesWrite, ControlBodyLimit);
 
         await parent.RegisterHttpRouteAsync("/projects/files/list", ListFiles,
-            HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            HttpMethod.Get, ProjectsPerms.FilesRead);
         await parent.RegisterHttpRouteAsync("/projects/files/stat", StatFile,
-            HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            HttpMethod.Get, ProjectsPerms.FilesRead);
         await parent.RegisterHttpRouteAsync("/projects/files/download", DownloadFile,
-            HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            HttpMethod.Get, ProjectsPerms.FilesRead);
         await parent.RegisterHttpRouteAsync("/projects/files/audit", AuditFiles,
-            HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            HttpMethod.Get, ProjectsPerms.FilesRead);
 
         await parent.RegisterBufferedHttpRouteAsync("/projects/files/directory", CreateDirectory,
-            HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
+            HttpMethod.Post, ProjectsPerms.FilesWrite, ControlBodyLimit);
         await parent.RegisterBufferedHttpRouteAsync("/projects/files/move", MoveFile,
-            HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
+            HttpMethod.Post, ProjectsPerms.FilesWrite, ControlBodyLimit);
         await parent.RegisterBufferedHttpRouteAsync("/projects/files/copy", CopyFile,
-            HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
+            HttpMethod.Post, ProjectsPerms.FilesWrite, ControlBodyLimit);
         await parent.RegisterBufferedHttpRouteAsync("/projects/files/delete", DeleteFile,
-            HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
+            HttpMethod.Post, ProjectsPerms.FilesDelete, ControlBodyLimit);
         await parent.RegisterBufferedHttpRouteAsync("/projects/files/metadata", SetMetadata,
-            HttpMethod.Post, KMProfileManager.KMPermissions.Klives, ControlBodyLimit);
+            HttpMethod.Post, ProjectsPerms.FilesWrite, ControlBodyLimit);
     }
 
     private async Task StartUpload(ApiUserRequest req)

@@ -5,6 +5,7 @@ using System.Net;
 using System.Net.Http;
 using System.Threading.Tasks;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveRAG
 {
@@ -48,7 +49,7 @@ namespace Omnipotent.Services.KliveRAG
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveRagPerms.SearchUse);
 
             await service.CreateAPIRoute("/kliverag/doc", async (req) =>
             {
@@ -73,19 +74,19 @@ namespace Omnipotent.Services.KliveRAG
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveRagPerms.SearchUse);
 
             await service.CreateAPIRoute("/kliverag/stats", async (req) =>
             {
                 try { await req.ReturnResponse(JsonConvert.SerializeObject(service.GetStats()), "application/json"); }
                 catch (Exception ex) { await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveRagPerms.IndexView);
 
             await service.CreateAPIRoute("/kliverag/sources", async (req) =>
             {
                 try { await req.ReturnResponse(JsonConvert.SerializeObject(service.GetSourceCursors()), "application/json"); }
                 catch (Exception ex) { await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveRagPerms.IndexView);
 
             await service.CreateAPIRoute("/kliverag/websearch", async (req) =>
             {
@@ -107,7 +108,7 @@ namespace Omnipotent.Services.KliveRAG
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveRagPerms.SearchUse);
 
             await service.CreateAPIRoute("/kliverag/reindex", async (req) =>
             {
@@ -126,7 +127,7 @@ namespace Omnipotent.Services.KliveRAG
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveRagPerms.IndexRebuild);
         }
 
         private static int ParseInt(string? s, int fallback) => int.TryParse(s, out int v) ? v : fallback;

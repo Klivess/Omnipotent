@@ -10,6 +10,7 @@ using System.Net;
 using System.Security.Cryptography;
 using System.Text;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Projects
 {
@@ -64,7 +65,7 @@ namespace Omnipotent.Services.Projects
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.OverviewView);
 
             await parent.RegisterHttpRouteAsync("/projects/result-pin", async req =>
             {
@@ -84,7 +85,7 @@ namespace Omnipotent.Services.Projects
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.PlanEdit);
 
             // ── Projects ──
             await parent.RegisterHttpRouteAsync("/projects/list", async req =>
@@ -97,7 +98,7 @@ namespace Omnipotent.Services.Projects
                         code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.OverviewView);
 
             await parent.RegisterHttpRouteAsync("/projects/create", async req =>
             {
@@ -149,7 +150,7 @@ namespace Omnipotent.Services.Projects
                 catch (ProjectFileConflictException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.Conflict); }
                 catch (ProjectFileException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             await parent.RegisterHttpRouteAsync("/projects/get", async req =>
             {
@@ -159,7 +160,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/state", async req =>
             {
@@ -175,7 +176,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/pause", async req =>
             {
@@ -205,7 +206,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             // ── Archive / unarchive (shelving, item 2) ──
             await parent.RegisterHttpRouteAsync("/projects/archive", async req =>
@@ -234,7 +235,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             await parent.RegisterHttpRouteAsync("/projects/unarchive", async req =>
             {
@@ -262,7 +263,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             // ── Rename (agents learn of it via the log + wake seed, item 4) ──
             await parent.RegisterHttpRouteAsync("/projects/rename", async req =>
@@ -298,7 +299,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             // Klives-side budget editing (the Commander's own path stays request_budget_increase).
             // POST { projectID, tokenBudgetUsd?, moneyBudgetUsd?, moneyAutonomousThresholdUsd?, subAgentCap? }
@@ -402,7 +403,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             // Klives removes specific agents by hand. Same instant, work-preserving path as a cap
             // reduction: wake cancelled, work snapshotted to a handover, milestones released,
@@ -458,7 +459,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             // The unfinished work of retired agents. ?open=true is what the UI badges.
             await parent.RegisterHttpRouteAsync("/projects/agents/handovers", async req =>
@@ -470,7 +471,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(parent.Handovers.List(project!.ProjectID, openOnly)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/resume", async req =>
             {
@@ -543,7 +544,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(project));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             // ── Fleet-wide controls (broadcast + global halt) ──
 
@@ -581,7 +582,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.AgentsMessage);
 
             // Durable broadcast reconciliation. A caller can refresh this after a page reload to
             // answer “did every Project actually finish its report?” without retaining receipts client-side.
@@ -614,7 +615,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.OverviewView);
 
             // Halt every project that isn't already halted (or terminal), remembering each project's
             // pre-halt status so unhalt-all restores it exactly. POST (no body).
@@ -628,7 +629,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { ok = true, halted = halted.Count, projectIDs = halted }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.FleetControl);
 
             // Prompt-cache kill switch: the live trailing-window measurement plus the latch state.
             // Answers both "is the fleet stopped, and why" and — via the verdict's summary — "why
@@ -662,7 +663,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.OverviewView);
 
             // Release the prompt-cache halt. Body: {"unhalt": true} also restores every project to
             // the status it held before the halt; without it the latch opens but nothing resumes on
@@ -683,7 +684,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.FleetControl);
 
             // Restore every globally-halted project to the exact status it held before the halt.
             // POST (no body).
@@ -710,7 +711,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.FleetControl);
 
             // ── Timeline ──
             // Read for the website's timeline/conversation panels:
@@ -742,7 +743,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Lossless CSV export of the whole event log over a timeframe — the website's
             // "Download history" button. Every stored field is a column, so nothing is lost
@@ -796,7 +797,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnBinaryResponse(payload, "text/csv; charset=utf-8", headers: headers);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/digest", async req =>
             {
@@ -806,7 +807,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(parent.Digests.GetDigest(project!.ProjectID)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/ledger", async req =>
             {
@@ -816,7 +817,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(parent.Budget.GetLedger(project!.ProjectID)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Server-side analytics keep the browser from paging/scanning every project's raw log.
             // Lifetime ledger totals remain authoritative; the response also describes the coverage
@@ -840,7 +841,7 @@ namespace Omnipotent.Services.Projects
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/analytics/all", async req =>
             {
@@ -854,7 +855,7 @@ namespace Omnipotent.Services.Projects
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Cost simulator: recorded token counts, bucketed the way providers bill them, per
             // project and per agent. No prices here on purpose — the website multiplies, so Klives
@@ -886,7 +887,7 @@ namespace Omnipotent.Services.Projects
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Agent roster (org chart) for the workspace's Agents panel.
             await parent.RegisterHttpRouteAsync("/projects/agents", async req =>
@@ -927,7 +928,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(agents));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Who is mid-turn right now. The event stream pushes this live; this route only exists so
             // a panel can paint the indicator before its socket is up (or if the socket is down).
@@ -939,7 +940,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(parent.Activity.ListForProject(project!.ProjectID)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Observables (the agents' live dashboard for this project). History is trimmed to the
             // last N samples server-side so the 1s-debounced refresh stays cheap; ?history=0 = values only.
@@ -973,7 +974,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(list));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Manual cleanup of an agent-created observable (agents own the values; Klives can only prune).
             await parent.RegisterHttpRouteAsync("/projects/observables/delete", async req =>
@@ -999,7 +1000,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { deleted }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.PlanEdit);
 
             // ── Step ledger (the project's linear path) ──
             // Reads go through RuntimeState.Get, so these responses participate in that store's existing
@@ -1034,7 +1035,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Klives can add steps to the path himself — the point of the panel is that the linear path is
             // steerable, not just observable.
@@ -1066,7 +1067,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { added = created.Select(s => s.StepID).ToList() }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.PlanEdit);
 
             await parent.RegisterHttpRouteAsync("/projects/steps/reorder", async req =>
             {
@@ -1079,7 +1080,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { applied = result.Applied, reason = result.Reason }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.PlanEdit);
 
             await parent.RegisterHttpRouteAsync("/projects/steps/activate", async req =>
             {
@@ -1099,7 +1100,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { applied = result.Applied, reason = result.Reason }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.PlanEdit);
 
             // Klives closing a step is a steer, so it needs no evidence gate for 'abandoned'/'blocked'; a
             // 'done' still does, since the evidence rule protects the record rather than the agent.
@@ -1136,7 +1137,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { applied = result.Applied, reason = result.Reason }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.PlanEdit);
 
             // ── Councils (adversarial deliberation transcripts) ──
             await parent.RegisterHttpRouteAsync("/projects/councils", async req =>
@@ -1164,7 +1165,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(list));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/councils/get", async req =>
             {
@@ -1177,7 +1178,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(council));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // ── Grand Plan (the approved strategic north star + version history) ──
             await parent.RegisterHttpRouteAsync("/projects/grandplan", async req =>
@@ -1206,7 +1207,7 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/computers/health", async req =>
             {
@@ -1218,7 +1219,7 @@ namespace Omnipotent.Services.Projects
                         : await parent.Desktops.GetHostHealthAsync()));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.OverviewView);
 
             await parent.RegisterHttpRouteAsync("/projects/computers/resume", async req =>
             {
@@ -1238,7 +1239,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { resumed = true, record.ContainerID }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             // A project's desktop containers, so the live-view can offer them (and map agent → desktop).
             await parent.RegisterHttpRouteAsync("/projects/containers", async req =>
@@ -1256,7 +1257,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(containers));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // ── Per-project settings (Projects' own setting system, not OmniSettings) ──
             await parent.RegisterHttpRouteAsync("/projects/settings", async req =>
@@ -1267,7 +1268,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(parent.Settings.Get(project!.ProjectID)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Patch one or more settings. Route values are ordered JSON arrays; scalar settings
             // retain their natural JSON type.
@@ -1312,7 +1313,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { applied, unknown, settings, desktopAllocation = project.DesktopAllocation }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
 
             // Which request parameters the models on a route can actually be given, resolved LIVE from
             // OpenRouter's per-model `supported_parameters`. GET ?models=a,b,c (a route's ordered list).
@@ -1401,14 +1402,14 @@ namespace Omnipotent.Services.Projects
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // ── System default settings (what NEW projects inherit) — Projects' own config, not OmniSettings ──
             await parent.RegisterHttpRouteAsync("/projects/system/settings", async req =>
             {
                 try { await req.ReturnResponse(Json(parent.Settings.GetSystemDefaults())); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.FleetControl);
 
             await parent.RegisterHttpRouteAsync("/projects/system/settings/update", async req =>
             {
@@ -1427,7 +1428,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { applied, unknown, settings = defaults }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.FleetControl);
 
             // ── Durable project memory + steering ──
 
@@ -1442,7 +1443,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(parent.Directives.List(project!.ProjectID, includeResolved)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // POST { projectID, text, key?, priority? }. Rules are all-agent, durable and are
             // immediately injected into the Commander; every future worker receives them too.
@@ -1465,7 +1466,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { ok = receipt.Accepted, receipt }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.PlanEdit);
 
             await parent.RegisterHttpRouteAsync("/projects/memory/revoke", async req =>
             {
@@ -1494,7 +1495,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { ok = true, directive = revoked }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.PlanEdit);
 
             // Klives → one live sub-agent. It has the same durable receipt/lifecycle as Commander
             // steering instead of relying on the internal-only inter-agent bus.
@@ -1518,7 +1519,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { ok = receipt.Accepted, receipt }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.AgentsMessage);
 
             // Klives → Commander message. A message is now a durable steering record first,
             // then a low-latency live injection; returning {ok:true} never again implies a wake
@@ -1547,7 +1548,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { ok = receipt.Accepted, receipt }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.AgentsMessage);
 
             // ── Approvals ──
             await parent.RegisterHttpRouteAsync("/projects/gates", async req =>
@@ -1558,7 +1559,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(parent.Gates.ListPending(project!.ProjectID)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/gates/resolve", async req =>
             {
@@ -1599,7 +1600,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { ok }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.GatesResolve);
 
             // ── Stimulus hooks (Klives-side CRUD; the Commander does the same via tools in a later build) ──
             await parent.RegisterHttpRouteAsync("/projects/hooks", async req =>
@@ -1631,7 +1632,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(enriched));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             await parent.RegisterHttpRouteAsync("/projects/hooks/create", async req =>
             {
@@ -1650,7 +1651,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(created));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.HooksManage);
 
             await parent.RegisterHttpRouteAsync("/projects/hooks/delete", async req =>
             {
@@ -1663,7 +1664,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { ok }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.HooksManage);
 
             await parent.RegisterHttpRouteAsync("/projects/hooks/token/rotate", async req =>
             {
@@ -1681,7 +1682,7 @@ namespace Omnipotent.Services.Projects
                 }
                 catch (InvalidOperationException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.NotFound); }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, ProjectsPerms.HooksManage);
 
             // ── Artifacts (screenshots/clips referenced by timeline events) ──
             await parent.RegisterHttpRouteAsync("/projects/artifacts/get", async req =>
@@ -1711,7 +1712,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnBinaryResponse(bytes, record.ContentType);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // Webhook ingest: POST /projects/hooks/webhook?projectID=..&hookID=.. with a raw body.
             // Guest-level so external services can call it; the hook's criterion + triage gate it.
@@ -1749,7 +1750,7 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new { accepted = true }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, Perms.Public);
         }
 
         private bool AllowWebhookRequest(string key)

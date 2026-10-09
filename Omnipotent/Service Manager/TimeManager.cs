@@ -10,6 +10,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading.Tasks;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Service_Manager
 {
@@ -294,7 +295,7 @@ namespace Omnipotent.Service_Manager
             await CreateAPIRoute("/timemanager/getalltasks", async (request) =>
             {
                 await request.ReturnResponse(JsonConvert.SerializeObject(tasks), code: HttpStatusCode.OK);
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, SystemPerms.SchedulerRead);
             await CreateAPIRoute("/timemanager/prefiretask", async (request) =>
             {
                 try
@@ -307,7 +308,7 @@ namespace Omnipotent.Service_Manager
                     ServiceLogError(ex, $"Error in {request.route} while prefiring task.");
                     await request.ReturnResponse($"Error: {ex.Message}", code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Associate);
+            }, HttpMethod.Get, SystemPerms.SchedulerRun);
         }
     }
 }

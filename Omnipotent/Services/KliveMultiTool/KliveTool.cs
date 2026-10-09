@@ -8,7 +8,14 @@ namespace Omnipotent.Services.KliveMultiTool
     {
         public string Name { get; set; } = string.Empty;
         public string Description { get; set; } = string.Empty;
-        public virtual KMPermissions RequiredPermission => KMPermissions.Admin;
+        /// <summary>
+        /// The lowest retired rank that could run this tool. Only used to seed the tool's
+        /// <c>klivetools.tool.&lt;name&gt;.run</c> permission for profiles converted from ranks.
+        /// </summary>
+        public virtual Omnipotent.Profiles.ProfileRank LegacyRank => Omnipotent.Profiles.ProfileRank.Admin;
+
+        /// <summary>The permission that gates every function of this tool (set when the tool loads).</summary>
+        public Omnipotent.Profiles.Permissions.PermissionDef? Permission { get; internal set; }
 
         internal KliveMultiTool Parent { get; private set; } = null!;
         internal List<KliveToolFunctionDescriptor> Functions { get; set; } = new();

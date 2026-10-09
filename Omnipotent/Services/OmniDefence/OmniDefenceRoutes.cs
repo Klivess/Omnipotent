@@ -5,17 +5,18 @@ using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Specialized;
 using System.Net;
 using System.Text;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.OmniDefence
 {
     /// <summary>
     /// All <c>/omnidefence/*</c> HTTP routes. Every route requires
-    /// <see cref="KMProfileManager.KMPermissions.Klives"/>.
+    /// an <c>omnidefence.*</c> permission (see <see cref="Omnipotent.Profiles.Permissions.OmniDefencePerms"/>).
     /// </summary>
     internal static partial class OmniDefenceRoutes
     {
         private const string DerivedRequestOriginSql = "COALESCE(NULLIF(request_origin, ''), CASE WHEN client_page IS NOT NULL AND client_page <> '' THEN CASE WHEN profile_id IS NOT NULL AND profile_id <> '' THEN 'WebsiteProfile' ELSE 'WebsiteNoProfile' END WHEN profile_id IS NOT NULL AND profile_id <> '' THEN 'DirectApiProfile' ELSE 'DirectApi' END)";
-        private const string RequestSelectSql = "SELECT id, utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, matched_route, body_hash, body_length, user_agent, deny_reason, " + DerivedRequestOriginSql + " AS request_origin, client_page FROM requests";
+        private const string RequestSelectSql = "SELECT id, utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, perm_key, matched_route, body_hash, body_length, user_agent, deny_reason, " + DerivedRequestOriginSql + " AS request_origin, client_page FROM requests";
 
         public static async Task RegisterAsync(OmniDefence parent)
         {
@@ -30,7 +31,7 @@ namespace Omnipotent.Services.OmniDefence
                     return;
                 }
                 await req.ReturnResponse(json, "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.OverviewView);
 
             // Requests filtered query
             await parent.CreateAPIRoute("/omnidefence/requests", async req =>
@@ -47,7 +48,7 @@ namespace Omnipotent.Services.OmniDefence
                 ReadSnapshotReply reply = parent.ReadSnapshots.GetOrQueue(key, false,
                     async ct => JsonConvert.SerializeObject(await parent.Store.QueryBoundedAsync(sql, parameters, ct)));
                 await SendReadSnapshot(req, reply);
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.TrafficRead);
 
             // Single request detail (full body, headers, query, etc.)
             await parent.CreateAPIRoute("/omnidefence/request", async req =>
@@ -76,7 +77,7 @@ namespace Omnipotent.Services.OmniDefence
                     ["headers"] = headers
                 };
                 await req.ReturnResponse(JsonConvert.SerializeObject(resp), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.TrafficRead);
 
             // Auth events
             await parent.CreateAPIRoute("/omnidefence/auth-events", async req =>
@@ -84,7 +85,7 @@ namespace Omnipotent.Services.OmniDefence
                 var (sql, parameters) = BuildAuthEventsQuery(req);
                 var rows = await parent.Store.QueryAsync(sql, parameters);
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.AuthRead);
 
             // Profile actions
             await parent.CreateAPIRoute("/omnidefence/profile-actions", async req =>
@@ -92,7 +93,7 @@ namespace Omnipotent.Services.OmniDefence
                 var (sql, parameters) = BuildProfileActionsQuery(req);
                 var rows = await parent.Store.QueryAsync(sql, parameters);
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.AuthRead);
 
             // IPs list
             await parent.CreateAPIRoute("/omnidefence/ips", async req =>
@@ -105,7 +106,7 @@ namespace Omnipotent.Services.OmniDefence
 
                 var rows = FilterIpRecords(parent.Tracker.All(), status, minScore, query, limit, offset);
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.TrafficRead);
 
             // Tactical map data
             await parent.CreateAPIRoute("/omnidefence/ip-map", async req =>
@@ -114,7 +115,7 @@ namespace Omnipotent.Services.OmniDefence
                     .OrderByDescending(r => r.LastSeen)
                     .ToList();
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.OverviewView);
 
             // IP detail
             await parent.CreateAPIRoute("/omnidefence/ip", async req =>
@@ -139,7 +140,7 @@ namespace Omnipotent.Services.OmniDefence
                     });
                 });
                 await SendReadSnapshot(req, reply);
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.TrafficRead);
 
             // Block
             await parent.CreateAPIRoute("/omnidefence/ip/block", async req =>
@@ -164,19 +165,19 @@ namespace Omnipotent.Services.OmniDefence
                 parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
                 _ = parent.SendBlockNotificationAsync(rec, req.user?.Name ?? "Unknown");
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.IpBlock);
 
             // Unblock
             await parent.CreateAPIRoute("/omnidefence/ip/unblock", async req =>
             {
                 await ResetIpToNormalAsync(parent, req, "Unblock");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.IpBlock);
 
             // Untrap / release hostile statuses (Blocked / Tarpit / Honeypot)
             await parent.CreateAPIRoute("/omnidefence/ip/untrap", async req =>
             {
                 await ResetIpToNormalAsync(parent, req, "Untrap");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.IpBlock);
 
             // Set status (Watch / Tarpit / Honeypot / Normal / Blocked)
             await parent.CreateAPIRoute("/omnidefence/ip/status", async req =>
@@ -212,7 +213,7 @@ namespace Omnipotent.Services.OmniDefence
                 });
                 parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.IpBlock);
 
             // Note
             await parent.CreateAPIRoute("/omnidefence/ip/note", async req =>
@@ -226,7 +227,7 @@ namespace Omnipotent.Services.OmniDefence
                 await parent.Tracker.PersistAsync(rec);
                 parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.IpAct);
 
             // Active port scan
             await parent.CreateAPIRoute("/omnidefence/ip/scan", async req =>
@@ -254,7 +255,7 @@ namespace Omnipotent.Services.OmniDefence
                 });
                 parent.ReadSnapshots.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", ip));
                 await req.ReturnResponse(JsonConvert.SerializeObject(result), "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.IpAct);
 
             // Blocked regions list
             await parent.CreateAPIRoute("/omnidefence/regions", async req =>
@@ -271,7 +272,7 @@ namespace Omnipotent.Services.OmniDefence
                     createdUtc = r.CreatedUtc,
                     createdBy = r.CreatedBy
                 })), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.RegionsManage);
 
             // Add a blocked region
             await parent.CreateAPIRoute("/omnidefence/regions/add", async req =>
@@ -302,7 +303,7 @@ namespace Omnipotent.Services.OmniDefence
                 parent.RegisterBlockedRegion(row);
                 int blockedCount = await parent.ApplyBlockedRegionToKnownIpsAsync(row, req.user?.UserID, req.user?.Name);
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, id, blockedCount }), "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.RegionsManage);
 
             // Remove a blocked region
             await parent.CreateAPIRoute("/omnidefence/regions/remove", async req =>
@@ -318,7 +319,7 @@ namespace Omnipotent.Services.OmniDefence
                     ? await parent.UnblockIpsInRegionAsync(region, req.user?.UserID, req.user?.Name)
                     : 0;
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, unblockedCount }), "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.RegionsManage);
 
             // Honeypot routes management
             await parent.CreateAPIRoute("/omnidefence/honeypot-routes", async req =>
@@ -344,7 +345,7 @@ namespace Omnipotent.Services.OmniDefence
                     });
                 }
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.HoneypotsManage);
 
             await parent.CreateAPIRoute("/omnidefence/honeypot-routes/add", async req =>
             {
@@ -355,7 +356,7 @@ namespace Omnipotent.Services.OmniDefence
                 if (!route.StartsWith('/')) route = "/" + route;
                 await parent.RegisterHoneypotRouteAsync(route, note);
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.HoneypotsManage);
 
             await parent.CreateAPIRoute("/omnidefence/honeypot-routes/remove", async req =>
             {
@@ -364,7 +365,7 @@ namespace Omnipotent.Services.OmniDefence
                 if (string.IsNullOrEmpty(route)) { await req.ReturnResponse("Missing route", "text/plain", null, HttpStatusCode.BadRequest); return; }
                 await parent.RemoveHoneypotRouteAsync(route);
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.HoneypotsManage);
 
             // Profiles overview
             await parent.CreateAPIRoute("/omnidefence/profiles", async req =>
@@ -380,7 +381,7 @@ namespace Omnipotent.Services.OmniDefence
                       ORDER BY total_requests DESC",
                     new());
                 await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.AuthRead);
 
             // Profile detail
             await parent.CreateAPIRoute("/omnidefence/profile", async req =>
@@ -397,7 +398,7 @@ namespace Omnipotent.Services.OmniDefence
                     "SELECT * FROM auth_events WHERE profile_id=$id ORDER BY utc_ts DESC LIMIT 200",
                     new() { ["$id"] = id });
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { recentRequests = recent, actions, authEvents = auth }), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.AuthRead);
 
             // Settings (thresholds)
             await parent.CreateAPIRoute("/omnidefence/settings", async req =>
@@ -411,7 +412,7 @@ namespace Omnipotent.Services.OmniDefence
                     escalation3 = st.Escalation3,
                     fingerprint = await FingerprintSettingsView(parent, st)
                 }), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.SettingsManage);
 
             await parent.CreateAPIRoute("/omnidefence/settings/update", async req =>
             {
@@ -424,7 +425,7 @@ namespace Omnipotent.Services.OmniDefence
                 ApplyFingerprintSettings(next, body);
                 await parent.SaveSettingsAsync(next);
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.SettingsManage);
 
             // Export
             await parent.CreateAPIRoute("/omnidefence/export", async req =>
@@ -445,7 +446,7 @@ namespace Omnipotent.Services.OmniDefence
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(rows), "application/json");
                 }
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.DataExport);
 
             await RegisterFingerprintRoutesAsync(parent);
         }

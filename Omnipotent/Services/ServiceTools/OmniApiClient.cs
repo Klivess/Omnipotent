@@ -171,9 +171,9 @@ public sealed class OmniApiClient
         return sb.ToString();
     }
 
-    /// <summary>Reads the Klives-rank profile's password out of the live profile manager. The agent
-    /// already runs with Klives' authority, so this stores no new secret and grants no new access —
-    /// it just presents the credential the pipeline expects.</summary>
+    /// <summary>Gets an in-process owner session token from the live profile manager. The agent
+    /// already runs with Klives' authority, so this grants no new access — it just presents the
+    /// credential the pipeline expects, without ever touching the owner's password.</summary>
     private (string? password, string? error) ResolveKlivesCredential()
     {
         KMProfileManager? profiles;
@@ -189,13 +189,11 @@ public sealed class OmniApiClient
         if (profiles?.Profiles == null)
             return (null, "The profile manager has not loaded yet, so omni_api cannot authenticate. Try again shortly.");
 
-        var klives = profiles.Profiles.FirstOrDefault(p =>
-            p != null && p.KlivesManagementRank == KMProfileManager.KMPermissions.Klives
-            && !string.IsNullOrEmpty(p.Password));
-
-        return klives == null
-            ? (null, "No Klives-rank profile with a password is loaded, so omni_api cannot authenticate.")
-            : (klives.Password, null);
+        // An in-process owner session: the owner's password is no longer stored in plaintext.
+        string? token = profiles.IssueInternalToken();
+        return token == null
+            ? (null, "No owner profile is loaded yet, so omni_api cannot authenticate.")
+            : (token, null);
     }
 
     private string Render(HttpStatusCode status, string body, HttpResponseMessage response)

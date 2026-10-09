@@ -11,6 +11,7 @@ using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Omniscience
 {
@@ -329,7 +330,7 @@ namespace Omnipotent.Services.Omniscience
                     await CachedRead(req, "sources", TimeSpan.FromSeconds(15), BuildSourcesPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.SourcesView);
 
             await service.CreateAPIRoute("/omniscience/sources/add", async req =>
             {
@@ -360,7 +361,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, self_id = selfId, self_username = selfName }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.SourcesManage);
 
             await service.CreateAPIRoute("/omniscience/sources/remove", async req =>
             {
@@ -378,7 +379,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.SourcesManage);
 
             await service.CreateAPIRoute("/omniscience/sources/backfill", async req =>
             {
@@ -394,7 +395,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.SourcesManage);
         }
 
         // ── Persons ──
@@ -417,7 +418,7 @@ namespace Omnipotent.Services.Omniscience
                         () => BuildPersonsPayload(search, platform, relatedTo, limit, offset));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/persons/get", async req =>
             {
@@ -441,7 +442,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(dossier.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/persons/messages", async req =>
             {
@@ -483,7 +484,7 @@ namespace Omnipotent.Services.Omniscience
                     });
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.MessagesRead);
 
             await service.CreateAPIRoute("/omniscience/persons/recompute", async req =>
             {
@@ -504,7 +505,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, accepted = true, run_id = started.RunId, message = started.Message }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.AnalysisRun);
 
             await service.CreateAPIRoute("/omniscience/persons/profile-targets", async req =>
             {
@@ -513,7 +514,7 @@ namespace Omnipotent.Services.Omniscience
                     await CachedRead(req, "profile-targets", TimeSpan.FromSeconds(30), BuildProfileTargetsPayload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/persons/profile-targets/set", async req =>
             {
@@ -533,7 +534,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true, person_id = personId, enabled }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.SourcesManage);
 
             await service.CreateAPIRoute("/omniscience/persons/merge", async req =>
             {
@@ -584,7 +585,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.SourcesManage);
         }
 
         // ── Conversations ──
@@ -604,7 +605,7 @@ namespace Omnipotent.Services.Omniscience
                         () => BuildConversationsPayload(platform, kind, limit));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.MessagesRead);
 
             await service.CreateAPIRoute("/omniscience/conversations/messages", async req =>
             {
@@ -651,7 +652,7 @@ namespace Omnipotent.Services.Omniscience
                     });
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.MessagesRead);
         }
 
         // ── Stats ──
@@ -667,7 +668,7 @@ namespace Omnipotent.Services.Omniscience
                     else await req.ReturnResponse(payload);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.OverviewView);
         }
 
         // ── Schedule control ──
@@ -680,7 +681,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(service.Scheduler.BuildStatusJson().ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.OverviewView);
 
             await service.CreateAPIRoute("/omniscience/schedule/run-now", async req =>
             {
@@ -691,7 +692,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse("{\"ok\":true}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.AnalysisRun);
         }
 
         // ── cached payload builders ──

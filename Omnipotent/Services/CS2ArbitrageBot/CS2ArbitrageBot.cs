@@ -13,6 +13,7 @@ using System.Diagnostics;
 using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
 using static Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs.Scanalytics;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.CS2ArbitrageBot
 {
@@ -1002,7 +1003,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         private Omnipotent.Services.KliveAPI.KliveAPI? routeApi;
 
-        private async Task RegisterRouteAsync(string path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, KMPermissions permission)
+        private async Task RegisterRouteAsync(string path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, PermissionDef permission)
         {
             routeApi ??= injectedApi;
             if (routeApi == null)
@@ -1026,29 +1027,29 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         private async Task CreateRoutesAsync()
         {
-            var routes = new (string Path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> Handler, HttpMethod Method, KMPermissions Permission, bool NeedsData)[]
+            var routes = new (string Path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> Handler, HttpMethod Method, PermissionDef Permission, bool NeedsData)[]
             {
-                ("/cs2arbitragebot/status", StatusRoute, HttpMethod.Get, KMPermissions.Guest, false),
-                ("/cs2arbitragebot/getscanalytics", AnalyticsRoute, HttpMethod.Get, KMPermissions.Guest, true),
+                ("/cs2arbitragebot/status", StatusRoute, HttpMethod.Get, Cs2Perms.StatusView, false),
+                ("/cs2arbitragebot/getscanalytics", AnalyticsRoute, HttpMethod.Get, Cs2Perms.ScansRead, true),
                 ("/cs2arbitragebot/scanresults", async request =>
                 {
                     CacheDeps.MarkUncacheable("cs2 live scan cycles");
                     await request.ReturnResponse(JsonConvert.SerializeObject(scanalytics.RecentCycles(200)), code: HttpStatusCode.OK);
-                }, HttpMethod.Get, KMPermissions.Guest, true),
+                }, HttpMethod.Get, Cs2Perms.ScansRead, true),
                 ("/cs2arbitragebot/opportunities", async request =>
                 {
                     CacheDeps.MarkUncacheable("cs2 live opportunities");
                     int max = int.TryParse(request.userParameters["limit"], out int l) ? Math.Clamp(l, 1, 300) : 100;
                     await request.ReturnResponse(JsonConvert.SerializeObject(scanalytics.RecentNotable(max)), code: HttpStatusCode.OK);
-                }, HttpMethod.Get, KMPermissions.Guest, true),
+                }, HttpMethod.Get, Cs2Perms.ScansRead, true),
                 ("/cs2arbitragebot/latestliquidityplan", async request =>
                 {
                     CacheDeps.MarkUncacheable("cs2 liquidity plan");
                     string? json = Volatile.Read(ref liquidityPlanSnapshot)?.Json;
                     await request.ReturnResponse(json ?? "{\"error\":\"The conversion plan has not been computed yet.\"}",
                         code: json == null ? HttpStatusCode.ServiceUnavailable : HttpStatusCode.OK);
-                }, HttpMethod.Get, KMPermissions.Guest, true),
-                ("/cs2arbitragebot/balanceHistory", BalanceHistoryRoute, HttpMethod.Get, KMPermissions.Guest, true),
+                }, HttpMethod.Get, Cs2Perms.ScansRead, true),
+                ("/cs2arbitragebot/balanceHistory", BalanceHistoryRoute, HttpMethod.Get, Cs2Perms.ScansRead, true),
                 ("/cs2arbitragebot/scanNow", async request =>
                 {
                     CacheDeps.MarkUncacheable("cs2 action");
@@ -1059,7 +1060,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     }
                     Engine.RequestScanNow();
                     await request.ReturnResponse(JsonConvert.SerializeObject(new { queued = true }), code: HttpStatusCode.Accepted);
-                }, HttpMethod.Post, KMPermissions.Manager, true),
+                }, HttpMethod.Post, Cs2Perms.ScansRun, true),
             };
 
             int registered = 0;

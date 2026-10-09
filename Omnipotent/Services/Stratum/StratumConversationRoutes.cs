@@ -1,6 +1,7 @@
 using Newtonsoft.Json;
 using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Stratum
 {
@@ -55,7 +56,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { turnID = run.RunID }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             // Long-poll the timeline. Query: projectID, since.
             await parent.CreateAPIRoute("/stratum/conversation/events", async req =>
@@ -103,7 +104,7 @@ namespace Omnipotent.Services.Stratum
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             // Resolve the current gate. Body: { gateID, decision: "Approve"|"Reject", comment }.
             await parent.CreateAPIRoute("/stratum/conversation/approve", async req =>
@@ -148,7 +149,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             // Cancel the active turn.
             await parent.CreateAPIRoute("/stratum/conversation/cancel-turn", async req =>
@@ -166,7 +167,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
         }
 
         // ── helpers (same contract as StratumRoutes) ──

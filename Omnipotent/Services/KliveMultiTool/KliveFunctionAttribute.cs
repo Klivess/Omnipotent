@@ -7,7 +7,6 @@ namespace Omnipotent.Services.KliveMultiTool
     {
         public string DisplayName { get; }
         public string Description { get; }
-        public KMPermissions? PermissionOverride { get; set; }
 
         public KliveFunctionAttribute(string displayName, string description = "")
         {

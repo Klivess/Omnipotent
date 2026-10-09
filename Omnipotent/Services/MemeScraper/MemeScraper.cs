@@ -7,6 +7,7 @@ using Omnipotent.Services.MemeScraper.Scraping;
 using System.Collections.Concurrent;
 using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 
 namespace Omnipotent.Services.MemeScraper
@@ -483,7 +484,7 @@ namespace Omnipotent.Services.MemeScraper
         /// Registers against the typed KliveAPI (bounded wait, failures named in the log) instead of the
         /// reflection-based CreateAPIRoute, which can fail silently and leave a partial route table.
         /// </summary>
-        private async Task RegisterRouteAsync(string path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, KMPermissions permission)
+        private async Task RegisterRouteAsync(string path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, PermissionDef permission)
         {
             if (routeApi == null)
             {
@@ -511,24 +512,24 @@ namespace Omnipotent.Services.MemeScraper
 
         private async Task CreateRoutes()
         {
-            var routes = new (string Path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> Handler, HttpMethod Method, KMPermissions Permission)[]
+            var routes = new (string Path, Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> Handler, HttpMethod Method, PermissionDef Permission)[]
             {
-                ("/memescraper/addInstagramSource", AddInstagramSourceRoute, HttpMethod.Post, KMPermissions.Manager),
+                ("/memescraper/addInstagramSource", AddInstagramSourceRoute, HttpMethod.Post, MemeScraperPerms.SourcesManage),
                 ("/memescraper/getAllInstagramSources", async request =>
                 {
                     CacheDeps.MarkUncacheable("memescraper live source health");
                     await request.ReturnResponse(JsonConvert.SerializeObject(SourceManager.InstagramSources), code: HttpStatusCode.OK);
-                }, HttpMethod.Get, KMPermissions.Guest),
+                }, HttpMethod.Get, MemeScraperPerms.SourcesRead),
                 ("/memescraper/getAllSavedNiches", async request =>
                 {
                     await request.ReturnResponse(JsonConvert.SerializeObject(SourceManager.AllNiches), code: HttpStatusCode.OK);
-                }, HttpMethod.Get, KMPermissions.Guest),
+                }, HttpMethod.Get, MemeScraperPerms.SourcesRead),
                 ("/memescraper/memeScraperAnalytics", async request =>
                 {
                     CacheDeps.MarkUncacheable("memescraper live analytics");
                     var analytics = new MemeScraperLabs.MemeScraperAnalytics(SourceManager.InstagramSources, mediaManager.allScrapedReels);
                     await request.ReturnResponse(JsonConvert.SerializeObject(analytics), code: HttpStatusCode.OK);
-                }, HttpMethod.Get, KMPermissions.Guest),
+                }, HttpMethod.Get, MemeScraperPerms.HealthView),
                 ("/memescraper/deleteInstagramSource", async request =>
                 {
                     string id = request.userParameters["sourceAccountID"] ?? "";
@@ -541,14 +542,14 @@ namespace Omnipotent.Services.MemeScraper
                     }
                     await SourceManager.DeleteInstagramSource(source, deleteAssociatedMemes);
                     await request.ReturnResponse("OK");
-                }, HttpMethod.Get, KMPermissions.Manager),
+                }, HttpMethod.Get, MemeScraperPerms.SourcesManage),
                 ("/memescraper/scraperHealth", async request =>
                 {
                     CacheDeps.MarkUncacheable("memescraper live health");
                     await request.ReturnResponse(JsonConvert.SerializeObject(BuildHealthSnapshot()), code: HttpStatusCode.OK);
-                }, HttpMethod.Get, KMPermissions.Guest),
-                ("/memescraper/scrapeNow", ScrapeNowRoute, HttpMethod.Post, KMPermissions.Manager),
-                ("/memescraper/diagnoseProviders", DiagnoseProvidersRoute, HttpMethod.Post, KMPermissions.Manager),
+                }, HttpMethod.Get, MemeScraperPerms.HealthView),
+                ("/memescraper/scrapeNow", ScrapeNowRoute, HttpMethod.Post, MemeScraperPerms.ScrapeRun),
+                ("/memescraper/diagnoseProviders", DiagnoseProvidersRoute, HttpMethod.Post, MemeScraperPerms.ScrapeRun),
             };
 
             int registered = 0;

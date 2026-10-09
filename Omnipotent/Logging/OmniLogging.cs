@@ -15,6 +15,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using static Omnipotent.Logging.OmniLogging;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Logging
 {
@@ -214,8 +215,8 @@ Data:
                 await req.ReturnResponse(JsonConvert.SerializeObject(summary, Formatting.None), "application/json");
             };
 
-            await CreateAPIRoute("api/logs", getLogs, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Admin);
-            await CreateAPIRoute("api/logs/summary", getLogSummary, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Admin);
+            await CreateAPIRoute("api/logs", getLogs, HttpMethod.Get, SystemPerms.LogsRead);
+            await CreateAPIRoute("api/logs/summary", getLogSummary, HttpMethod.Get, SystemPerms.LogsRead);
         }
 
         /// <summary>

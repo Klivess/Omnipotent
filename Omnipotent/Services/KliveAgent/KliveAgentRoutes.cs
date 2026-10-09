@@ -6,6 +6,7 @@ using System.Net;
 using System.Text;
 using static Omnipotent.Profiles.KMProfileManager;
 using Omnipotent.Services.ServiceTools;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveAgent
 {
@@ -36,7 +37,7 @@ namespace Omnipotent.Services.KliveAgent
             await RegisterServiceToolRoutes();
         }
 
-        private async Task CreateRoute(string path, Func<global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, KMPermissions permission)
+        private async Task CreateRoute(string path, Func<global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, PermissionDef permission)
         {
             await service.CreateBufferedAPIRoute(path, async (req) =>
             {
@@ -58,7 +59,7 @@ namespace Omnipotent.Services.KliveAgent
             string path,
             Func<global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler,
             HttpMethod method,
-            KMPermissions permission)
+            PermissionDef permission)
         {
             await service.CreateBufferedAPIRoute(path, async req =>
             {
@@ -84,7 +85,7 @@ namespace Omnipotent.Services.KliveAgent
                 var (ready, state, progress, message) = service.GetInitializationStatus();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { ready, state, progress, message,
                     codebase = service.GetCodebaseInitializationStatus() }));
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.StatusView);
         }
 
         // ── Chat ──
@@ -139,7 +140,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.ChatUse);
 
             await CreateDurableRoute("/kliveagent/chat/pending", async (req) =>
             {
@@ -180,7 +181,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             // Reconciliation endpoint: the browser can always rediscover work after a reload, across
             // tabs, or after losing the original POST response. No localStorage request ID is required.
@@ -210,7 +211,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             await CreateRoute("/kliveagent/chat/steer", async (req) =>
             {
@@ -247,7 +248,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.ChatUse);
 
             // Manual Stop: cancel a running message. The run unwinds (LLM call, agent loop, any running
             // script) and resolves to a truthful partial answer.
@@ -274,7 +275,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.ChatUse);
 
             // Approve/deny a pending computer-use action (the website's inline Approve/Deny buttons).
             // Unblocks the waiting action via HostControlManager's ApprovalBroker.
@@ -302,7 +303,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.ChatUse);
 
             // Hand KliveAgent's desktop back after a takeover (the "Done — continue" button), or decline
             // it. The waiting request_human call resumes immediately either way.
@@ -331,7 +332,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.ChatUse);
 
             // Which computer KliveAgent uses and, for its own desktop, the container to stream — so the
             // page can show it live even before (or between) runs.
@@ -354,7 +355,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.StatusView);
         }
 
         private async Task RegisterAttachmentRoutes()
@@ -387,7 +388,7 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Put, KMPermissions.Klives, KliveAgentAttachments.MaxFileBytes);
+            }, HttpMethod.Put, KliveAgentPerms.ChatUse, KliveAgentAttachments.MaxFileBytes);
 
             await CreateDurableRoute("/kliveagent/attachments/download", async req =>
             {
@@ -412,7 +413,7 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.BadRequest);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
         }
 
         private async Task RegisterCapabilityRoutes()
@@ -431,7 +432,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             await CreateRoute("/kliveagent/capabilities/execute", async (req) =>
             {
@@ -452,7 +453,7 @@ namespace Omnipotent.Services.KliveAgent
                         SenderName = req.user?.Name ?? "API",
                         SourceChannel = AgentSourceChannel.API,
                         Confirmed = body.Confirmed,
-                        HasElevatedPermissions = (req.user?.KlivesManagementRank ?? KMPermissions.Anybody) >= KMPermissions.Admin
+                        HasElevatedPermissions = AccessEvaluator.Can(req.user, KliveAgentPerms.CapabilitiesElevated)
                     };
 
                     var result = await service.ExecuteCapabilityAsync(body, context);
@@ -470,7 +471,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.CapabilitiesExecute);
         }
 
         // ── Conversations ──
@@ -490,7 +491,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             await CreateDurableRoute("/kliveagent/conversations/get", async (req) =>
             {
@@ -525,7 +526,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
         }
 
         // ── Background Tasks ──
@@ -545,7 +546,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             await CreateRoute("/kliveagent/tasks/cancel", async (req) =>
             {
@@ -570,7 +571,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.JobsManage);
         }
 
         // ── Memories ──
@@ -584,7 +585,7 @@ namespace Omnipotent.Services.KliveAgent
                 int? limit = ParseOptionalLimit(req.userParameters["limit"]);
                 await req.ReturnResponse(JsonConvert.SerializeObject(
                     service.GetLongTermJobs(activeOnly, limit)));
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             await CreateDurableRoute("/kliveagent/jobs/get", async req =>
             {
@@ -593,7 +594,7 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(job ?? (object)new { error = "Job not found." }),
                     code: job == null ? HttpStatusCode.NotFound : HttpStatusCode.OK);
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             await CreateDurableRoute("/kliveagent/jobs/create", async req =>
             {
@@ -630,7 +631,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.JobsManage);
 
             await CreateDurableRoute("/kliveagent/jobs/steer", async req =>
             {
@@ -648,7 +649,7 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(receipt),
                     code: receipt.Accepted ? HttpStatusCode.Accepted : HttpStatusCode.Conflict);
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.JobsManage);
 
             await CreateDurableRoute("/kliveagent/jobs/stop", async req =>
             {
@@ -658,7 +659,7 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { success = stopped }),
                     code: stopped ? HttpStatusCode.OK : HttpStatusCode.Conflict);
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.JobsManage);
 
             await CreateDurableRoute("/kliveagent/jobs/resume", async req =>
             {
@@ -668,7 +669,7 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { success = resumed }),
                     code: resumed ? HttpStatusCode.OK : HttpStatusCode.Conflict);
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.JobsManage);
         }
 
         private async Task RegisterNotificationRoutes()
@@ -680,7 +681,7 @@ namespace Omnipotent.Services.KliveAgent
                 int? limit = ParseOptionalLimit(req.userParameters["limit"]);
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(service.GetNotifications(unreadOnly, limit)));
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             await CreateDurableRoute("/kliveagent/notifications/read", async req =>
             {
@@ -690,13 +691,13 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { success = marked }),
                     code: marked ? HttpStatusCode.OK : HttpStatusCode.NotFound);
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.ChatUse);
 
             await CreateDurableRoute("/kliveagent/notifications/read-all", async req =>
             {
                 int marked = await service.MarkAllNotificationsReadAsync();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, marked }));
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.ChatUse);
         }
 
         private async Task RegisterMemoryRoutes()
@@ -717,7 +718,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.MemoriesRead);
 
             await CreateRoute("/kliveagent/memories/add", async (req) =>
             {
@@ -746,7 +747,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.MemoriesManage);
 
             await CreateRoute("/kliveagent/memories/delete", async (req) =>
             {
@@ -771,7 +772,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.MemoriesManage);
 
             await CreateRoute("/kliveagent/shortcuts", async (req) =>
             {
@@ -786,7 +787,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
         }
 
         // ── Stats ──
@@ -839,7 +840,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
 
             await CreateDurableRoute("/kliveagent/servicetools/audit", async (req) =>
             {
@@ -866,7 +867,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
         }
 
         private async Task RegisterStatsRoutes()
@@ -883,7 +884,7 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.StatusView);
 
             await CreateRoute("/kliveagent/stats/summary", async (req) =>
             {
@@ -897,7 +898,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.StatusView);
 
             await CreateRoute("/kliveagent/stats", async (req) =>
             {
@@ -912,7 +913,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
         }
 
         /// <summary>Responses that may carry revealed credentials or live run state are never cached.</summary>
@@ -959,7 +960,7 @@ namespace Omnipotent.Services.KliveAgent
                         JsonConvert.SerializeObject(new ErrorInformation(ex)),
                         code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveAgentPerms.IndexRebuild);
         }
     }
 }

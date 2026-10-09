@@ -13,6 +13,7 @@ using System.Runtime.Versioning;
 using System.Text;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Projects
 {
@@ -3379,23 +3380,12 @@ namespace Omnipotent.Services.Projects
         }
 
         /// <summary>
-        /// Authorizes a Projects WebSocket connection as Klives. Browsers cannot set an Authorization
-        /// HEADER on a WebSocket, so KliveAPI's header-based gate can never pass for a browser client —
-        /// WS routes must register as Anybody and check the ?authorization= password here (the exact
-        /// pattern HostControl's /kliveagent/screen/stream uses). This was the root cause of the live
-        /// desktop never connecting: the route was registered Klives-gated, so every browser got 401.
+        /// Second check on a Projects WebSocket. KliveAPI already resolved the ?authorization= token
+        /// (browsers cannot set an Authorization header on a WebSocket) and enforced the route's key
+        /// before upgrading; this re-checks it against the profile it handed over.
         /// </summary>
-        private async Task<bool> AuthorizeWsAsKlivesAsync(NameValueCollection query, Profiles.KMProfileManager.KMProfile? user)
-        {
-            var resolved = user;
-            if (resolved == null)
-            {
-                string? pw = query["authorization"];
-                if (!string.IsNullOrEmpty(pw))
-                    resolved = await ExecuteServiceMethod<Profiles.KMProfileManager>("GetProfileByPassword", pw) as Profiles.KMProfileManager.KMProfile;
-            }
-            return resolved != null && resolved.KlivesManagementRank >= Profiles.KMProfileManager.KMPermissions.Klives;
-        }
+        private static Task<bool> AuthorizeWsAsync(Profiles.KMProfileManager.KMProfile? user, PermissionDef needed)
+            => Task.FromResult(user != null && AccessEvaluator.Can(user, needed));
 
         // Resolved once, then reused by all 65 HTTP route registrations. See RegisterHttpRouteAsync.
         private Omnipotent.Services.KliveAPI.KliveAPI? routeApi;
@@ -3463,7 +3453,7 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         internal async Task RegisterHttpRouteAsync(string path,
             Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler,
-            HttpMethod method, Profiles.KMProfileManager.KMPermissions permission)
+            HttpMethod method, PermissionDef permission)
         {
             var api = await ResolveRouteApiAsync();
             try { await api.CreateRoute(path, GuardUntilReady(handler), method, permission); }
@@ -3477,7 +3467,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Body-capped variant of <see cref="RegisterHttpRouteAsync"/>.</summary>
         internal async Task RegisterBufferedHttpRouteAsync(string path,
             Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler,
-            HttpMethod method, Profiles.KMProfileManager.KMPermissions permission, long maxBodyBytes)
+            HttpMethod method, PermissionDef permission, long maxBodyBytes)
         {
             var api = await ResolveRouteApiAsync();
             try { await api.CreateBufferedRoute(path, GuardUntilReady(handler), method, permission, maxBodyBytes); }
@@ -3491,7 +3481,7 @@ namespace Omnipotent.Services.Projects
         /// <summary>Unbuffered variant of <see cref="RegisterHttpRouteAsync"/> (large uploads).</summary>
         internal async Task RegisterStreamingHttpRouteAsync(string path,
             Func<Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler,
-            HttpMethod method, Profiles.KMProfileManager.KMPermissions permission, long maxBodyBytes)
+            HttpMethod method, PermissionDef permission, long maxBodyBytes)
         {
             var api = await ResolveRouteApiAsync();
             try { await api.CreateStreamingRoute(path, GuardUntilReady(handler), method, permission, maxBodyBytes); }
@@ -3564,9 +3554,9 @@ namespace Omnipotent.Services.Projects
                 await api.CreateWebSocketRoute("/projects/events/stream",
                     async (context, socket, query, user) =>
                     {
-                        if (!await AuthorizeWsAsKlivesAsync(query, user))
+                        if (!await AuthorizeWsAsync(user, ProjectsPerms.EventsStream))
                         {
-                            ServiceLog("Projects: rejected unauthorized container screen-stream connection.");
+                            ServiceLog("Projects: rejected unauthorized event-stream connection.");
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
                             return;
                         }
@@ -3575,13 +3565,13 @@ namespace Omnipotent.Services.Projects
                         await EventBroadcaster.HandleAsync(socket, projectID, since,
                             (pid, sinceExclusive) => EventLog.ReadSince(pid, sinceExclusive));
                     },
-                    Profiles.KMProfileManager.KMPermissions.Anybody);
+                    ProjectsPerms.EventsStream);
                 ServiceLog("Projects: event-stream route registered (/projects/events/stream).");
 
                 await api.CreateWebSocketRoute("/projects/containers/screen/stream",
                     async (context, socket, query, user) =>
                     {
-                        if (!await AuthorizeWsAsKlivesAsync(query, user))
+                        if (!await AuthorizeWsAsync(user, ProjectsPerms.ScreensView))
                         {
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
                             return;
@@ -3593,7 +3583,7 @@ namespace Omnipotent.Services.Projects
                         }
                         await StreamContainerScreenAsync(socket, query);
                     },
-                    Profiles.KMProfileManager.KMPermissions.Anybody);
+                    ProjectsPerms.ScreensView);
                 ServiceLog("Projects: container screen-stream route registered (/projects/containers/screen/stream).");
 
                 // Remote control (two-way input): the control half of the live view. Klives'
@@ -3603,7 +3593,7 @@ namespace Omnipotent.Services.Projects
                 await api.CreateWebSocketRoute("/projects/containers/remote/input",
                     async (context, socket, query, user) =>
                     {
-                        if (!await AuthorizeWsAsKlivesAsync(query, user))
+                        if (!await AuthorizeWsAsync(user, ProjectsPerms.ScreensControl))
                         {
                             try { await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None); } catch { }
                             return;
@@ -3615,7 +3605,7 @@ namespace Omnipotent.Services.Projects
                         }
                         await HandleContainerRemoteInputAsync(socket, query);
                     },
-                    Profiles.KMProfileManager.KMPermissions.Anybody);
+                    ProjectsPerms.ScreensControl);
                 ServiceLog("Projects: container remote-input route registered (/projects/containers/remote/input).");
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to register WebSocket routes (non-fatal)"); }

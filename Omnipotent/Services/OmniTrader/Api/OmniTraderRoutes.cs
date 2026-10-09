@@ -4,6 +4,7 @@ using Omnipotent.Services.OmniTrader.Contracts;
 using Omnipotent.Services.OmniTrader.Strategy.Strategies;
 using System.Globalization;
 using System.Net;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.OmniTrader.Api
 {
@@ -30,7 +31,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     KrakenConfigured = parent.IsKrakenConfigured
                 };
                 await req.ReturnResponse(JsonConvert.SerializeObject(payload));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.StatusView);
 
             await parent.CreateAPIRoute("/api/omnitrader/strategies", async req =>
             {
@@ -39,7 +40,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     .OrderBy(x => x.Name)
                     .ToList();
                 await req.ReturnResponse(JsonConvert.SerializeObject(items));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.StrategiesRead);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployments", async req =>
             {
@@ -51,7 +52,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     return;
                 }
                 await req.ReturnResponse(body, "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment", async req =>
             {
@@ -80,7 +81,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Orders = orders,
                     Fills = fills
                 }));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/equity", async req =>
             {
@@ -90,7 +91,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 DateTime? to = ParseUtc(req.userParameters.Get("to"));
                 var series = await parent.EquityRepo.GetSeriesAsync(id, from, to);
                 await req.ReturnResponse(JsonConvert.SerializeObject(series));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
             // Total account value over time = the summed equity of all deployments of a given mode
             // (default Live = the Kraken account), forward-filled so each deployment contributes its
@@ -115,7 +116,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Deployments = serieses.Count,
                     Series = total.Select(p => new { Ts = p.Ts, Equity = p.Equity })
                 }));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.PortfolioRead);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/chart", async req =>
             {
@@ -171,7 +172,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Candles = candles.Select(c => new { c.Timestamp, c.Open, c.High, c.Low, c.Close }),
                     Markers = markers
                 }));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/ticks", async req =>
             {
@@ -210,7 +211,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Price = price, Forming = forming }));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/create", async req =>
             {
@@ -228,7 +229,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     await parent.ServiceLogError(ex, "create-deployment failed");
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { Error = ex.Message }), code: HttpStatusCode.BadRequest);
                 }
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.DeploymentsManage);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/arm-live", async req =>
             {
@@ -242,7 +243,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 bool ok = await parent.SessionManager.ArmLiveAsync(id);
                 if (ok) NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Armed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.DeploymentsGoLive);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/pause", async req =>
             {
@@ -251,7 +252,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 bool ok = await parent.SessionManager.PauseAsync(id);
                 if (ok) NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Paused = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.DeploymentsControl);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/resume", async req =>
             {
@@ -260,7 +261,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 bool ok = await parent.SessionManager.ResumeAsync(id);
                 if (ok) NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Resumed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.DeploymentsControl);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/kill", async req =>
             {
@@ -269,7 +270,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 bool ok = await parent.SessionManager.KillAsync(id);
                 if (ok) NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Killed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.DeploymentsManage);
 
             await parent.CreateAPIRoute("/api/omnitrader/deployment/delete", async req =>
             {
@@ -278,7 +279,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await parent.SessionManager.DeleteAsync(id);
                 NotifyDeploymentMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Deleted = true }));
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.DeploymentsManage);
 
             await parent.CreateAPIRoute("/api/omnitrader/backtests", async req =>
             {
@@ -290,7 +291,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     return;
                 }
                 await req.ReturnResponse(body, "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.BacktestsRead);
 
             await parent.CreateAPIRoute("/api/omnitrader/backtest", async req =>
             {
@@ -314,7 +315,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     job.Error,
                     Result = job.Result
                 }));
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, OmniTraderPerms.BacktestsRead);
 
             await parent.CreateAPIRoute("/api/omnitrader/backtest/create", async req =>
             {
@@ -331,7 +332,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     await parent.ServiceLogError(ex, "backtest enqueue failed");
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { Error = ex.Message }), code: HttpStatusCode.BadRequest);
                 }
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.BacktestsRun);
 
             await parent.CreateAPIRoute("/api/omnitrader/backtest/cancel", async req =>
             {
@@ -340,7 +341,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await parent.BacktestJobRepo.RequestCancelAsync(id);
                 NotifyBacktestMutation();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Requested = true }));
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.BacktestsRun);
 
             await parent.CreateAPIRoute("/api/omnitrader/signals/flowsignal", async req =>
             {
@@ -366,7 +367,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     await parent.ServiceLogError(ex, "flowsignal webhook failed");
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { Error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniTraderPerms.SignalsSubmit);
         }
 
         // Forward-fill merge of several equity series into a single total-value series. At each

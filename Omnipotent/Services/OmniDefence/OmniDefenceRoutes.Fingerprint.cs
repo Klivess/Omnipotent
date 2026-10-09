@@ -4,6 +4,7 @@ using Omnipotent.Profiles;
 using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.OmniDefence.Fingerprint;
 using System.Net;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.OmniDefence
 {
@@ -16,7 +17,7 @@ namespace Omnipotent.Services.OmniDefence
             // failed silently before, and the public beacon routes must exist for the site.
             var apis = await parent.GetServicesByType<KliveAPI.KliveAPI>();
             var api = apis != null && apis.Length > 0 ? (KliveAPI.KliveAPI)apis[0] : null;
-            Task Route(string path, Func<KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions perm, long? maxBody = null)
+            Task Route(string path, Func<KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, PermissionDef perm, long? maxBody = null)
             {
                 if (api == null) return parent.CreateAPIRoute(path, handler, method, perm);
                 return maxBody.HasValue ? api.CreateBufferedRoute(path, handler, method, perm, maxBody.Value) : api.CreateRoute(path, handler, method, perm);
@@ -27,7 +28,7 @@ namespace Omnipotent.Services.OmniDefence
             await Route("/robots.txt", async req =>
             {
                 await req.ReturnResponse(parent.BuildRobotsTxt(), "text/plain");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+            }, HttpMethod.Get, Perms.Public);
 
             await Route("/omnidefence/fp/nonce", async req =>
             {
@@ -36,7 +37,7 @@ namespace Omnipotent.Services.OmniDefence
                 string ip = OmniDefence.ExtractClientIp(req.req);
                 bool enabled = parent.Settings.BeaconEnabled && parent.Settings.FingerprintEnabled;
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { enabled, nonce = enabled ? parent.IssueBeaconNonce(ip) : null }), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Anybody);
+            }, HttpMethod.Get, Perms.Public);
 
             await Route("/omnidefence/fp", async req =>
             {
@@ -55,7 +56,7 @@ namespace Omnipotent.Services.OmniDefence
                 }
                 bool ok = parent.IngestBeacon(ip, req.req.UserAgent, payload);
                 await req.ReturnResponse(ok ? "{\"ok\":true}" : "{\"ok\":false}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Anybody, OmniDefence.BeaconMaxBytes);
+            }, HttpMethod.Post, Perms.Public, OmniDefence.BeaconMaxBytes);
 
             // ── Klives ──
 
@@ -69,7 +70,7 @@ namespace Omnipotent.Services.OmniDefence
                     malicious = i.Malicious,
                     description = i.Description
                 })), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.OverviewView);
 
             await Route("/omnidefence/ip/fingerprint", async req =>
             {
@@ -105,7 +106,7 @@ namespace Omnipotent.Services.OmniDefence
                     devices,
                     linkedIps = linked
                 }), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.TrafficRead);
 
             await Route("/omnidefence/ip/reclassify", async req =>
             {
@@ -120,7 +121,7 @@ namespace Omnipotent.Services.OmniDefence
                     engine.Reclassify(ip);
                 }
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.IpAct);
 
             await Route("/omnidefence/ip/class", async req =>
             {
@@ -145,7 +146,7 @@ namespace Omnipotent.Services.OmniDefence
                     Detail = clear ? "Returned to automatic classification" : $"Manually labelled {parsed}"
                 });
                 await req.ReturnResponse("{\"ok\":true}", "application/json");
-            }, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, OmniDefencePerms.IpAct);
 
             await Route("/omnidefence/fingerprint/status", async req =>
             {
@@ -172,7 +173,7 @@ namespace Omnipotent.Services.OmniDefence
                     },
                     settings = await FingerprintSettingsView(parent, parent.Settings)
                 }), "application/json");
-            }, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, OmniDefencePerms.OverviewView);
         }
 
         // ── helpers ──

@@ -41,7 +41,10 @@ namespace Omnipotent.Services.KliveChat
         public string Id { get; set; } = Guid.NewGuid().ToString("N");
         public string Name { get; set; } = "Guest";
         public string? UserId { get; set; }
-        public KMPermissions Rank { get; set; } = KMPermissions.Anybody;
+        /// <summary>Hierarchy rank (who is above whom); used to decide who may moderate whom.</summary>
+        public Omnipotent.Profiles.ProfileRank Rank { get; set; } = Omnipotent.Profiles.ProfileRank.None;
+        /// <summary>Holds klivechat.rooms.moderate (resolved when the client connects).</summary>
+        public bool CanModerateRooms { get; set; }
         public bool IsMuted { get; set; }
         public bool HasVideo { get; set; }
         public bool IsScreenSharing { get; set; }
@@ -56,7 +59,7 @@ namespace Omnipotent.Services.KliveChat
             ? $"profile:{UserId}"
             : $"guest:{(string.IsNullOrWhiteSpace(GuestIdentity) ? (Name ?? "Guest").Trim().ToLowerInvariant() : GuestIdentity.Trim().ToLowerInvariant())}";
         [JsonIgnore]
-        public bool CanModerate => Rank >= KMPermissions.Associate;
+        public bool CanModerate => CanModerateRooms;
     }
 
     public class KliveChatParticipantSummary

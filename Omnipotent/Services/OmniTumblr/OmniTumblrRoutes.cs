@@ -9,6 +9,7 @@ using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
 using KliveApi = Omnipotent.Services.KliveAPI.KliveAPI;
 using UserRequest = Omnipotent.Services.KliveAPI.KliveAPI.UserRequest;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.OmniTumblr
 {
@@ -53,43 +54,43 @@ namespace Omnipotent.Services.OmniTumblr
         {
             var get = HttpMethod.Get;
             var post = HttpMethod.Post;
-            var routes = new List<(string Path, Func<UserRequest, Task> Handler, HttpMethod Method, KMPermissions Permission)>
+            var routes = new List<(string Path, Func<UserRequest, Task> Handler, HttpMethod Method, PermissionDef Permission)>
             {
-                ("/omnitumblr/overview", Overview, get, KMPermissions.Guest),
-                ("/omnitumblr/dashboard-stats", DashboardStats, get, KMPermissions.Guest),
-                ("/omnitumblr/blog", BlogDetail, get, KMPermissions.Guest),
-                ("/omnitumblr/analytics", Analytics, get, KMPermissions.Guest),
-                ("/omnitumblr/posts", Posts, get, KMPermissions.Guest),
-                ("/omnitumblr/post", PostDetail, get, KMPermissions.Guest),
-                ("/omnitumblr/media", Media, get, KMPermissions.Guest),
-                ("/omnitumblr/content/thumb", ContentThumb, get, KMPermissions.Guest),
-                ("/omnitumblr/library", Library, get, KMPermissions.Guest),
-                ("/omnitumblr/memescraper/options", MemeScraperOptions, get, KMPermissions.Guest),
-                ("/omnitumblr/events", Events, get, KMPermissions.Guest),
-                ("/omnitumblr/settings", Settings, get, KMPermissions.Admin),
-                ("/omnitumblr/connect/status", ConnectStatus, get, KMPermissions.Admin),
+                ("/omnitumblr/overview", Overview, get, OmniTumblrPerms.OverviewView),
+                ("/omnitumblr/dashboard-stats", DashboardStats, get, OmniTumblrPerms.OverviewView),
+                ("/omnitumblr/blog", BlogDetail, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/analytics", Analytics, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/posts", Posts, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/post", PostDetail, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/media", Media, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/content/thumb", ContentThumb, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/library", Library, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/memescraper/options", MemeScraperOptions, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/events", Events, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/settings", Settings, get, OmniTumblrPerms.SettingsView),
+                ("/omnitumblr/connect/status", ConnectStatus, get, OmniTumblrPerms.SettingsView),
 
-                ("/omnitumblr/settings/app", SaveApp, post, KMPermissions.Admin),
-                ("/omnitumblr/connect/begin", ConnectBegin, post, KMPermissions.Admin),
-                ("/omnitumblr/connections/refresh", ConnectionRefresh, post, KMPermissions.Admin),
-                ("/omnitumblr/connections/remove", ConnectionRemove, post, KMPermissions.Admin),
-                ("/omnitumblr/blogs/add", BlogsAdd, post, KMPermissions.Admin),
-                ("/omnitumblr/blogs/update", BlogsUpdate, post, KMPermissions.Admin),
-                ("/omnitumblr/blogs/remove", BlogsRemove, post, KMPermissions.Admin),
-                ("/omnitumblr/blogs/refresh", BlogsRefresh, post, KMPermissions.Admin),
-                ("/omnitumblr/blogs/plan-now", BlogsPlanNow, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/create", PostsCreate, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/update", PostsUpdate, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/approve", PostsApprove, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/publish-now", PostsPublishNow, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/regenerate-caption", PostsRegenerateCaption, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/swap-content", PostsSwapContent, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/skip", PostsSkip, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/cancel", PostsCancel, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/retry", PostsRetry, post, KMPermissions.Admin),
-                ("/omnitumblr/posts/delete-remote", PostsDeleteRemote, post, KMPermissions.Admin),
-                ("/omnitumblr/library/delete", LibraryDelete, post, KMPermissions.Admin),
-                ("/omnitumblr/captions/preview", CaptionPreview, post, KMPermissions.Admin),
+                ("/omnitumblr/settings/app", SaveApp, post, OmniTumblrPerms.SettingsManage),
+                ("/omnitumblr/connect/begin", ConnectBegin, post, OmniTumblrPerms.SettingsManage),
+                ("/omnitumblr/connections/refresh", ConnectionRefresh, post, OmniTumblrPerms.SettingsManage),
+                ("/omnitumblr/connections/remove", ConnectionRemove, post, OmniTumblrPerms.SettingsManage),
+                ("/omnitumblr/blogs/add", BlogsAdd, post, OmniTumblrPerms.BlogsManage),
+                ("/omnitumblr/blogs/update", BlogsUpdate, post, OmniTumblrPerms.BlogsManage),
+                ("/omnitumblr/blogs/remove", BlogsRemove, post, OmniTumblrPerms.BlogsManage),
+                ("/omnitumblr/blogs/refresh", BlogsRefresh, post, OmniTumblrPerms.BlogsManage),
+                ("/omnitumblr/blogs/plan-now", BlogsPlanNow, post, OmniTumblrPerms.BlogsManage),
+                ("/omnitumblr/posts/create", PostsCreate, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/posts/update", PostsUpdate, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/posts/approve", PostsApprove, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/posts/publish-now", PostsPublishNow, post, OmniTumblrPerms.PostsPublish),
+                ("/omnitumblr/posts/regenerate-caption", PostsRegenerateCaption, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/posts/swap-content", PostsSwapContent, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/posts/skip", PostsSkip, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/posts/cancel", PostsCancel, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/posts/retry", PostsRetry, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/posts/delete-remote", PostsDeleteRemote, post, OmniTumblrPerms.PostsPublish),
+                ("/omnitumblr/library/delete", LibraryDelete, post, OmniTumblrPerms.LibraryManage),
+                ("/omnitumblr/captions/preview", CaptionPreview, post, OmniTumblrPerms.PostsAct),
             };
 
             int registered = 0;
@@ -112,8 +113,8 @@ namespace Omnipotent.Services.OmniTumblr
                 var target = await ResolveApiAsync();
                 // Tumblr redirects the browser here; no KM login is involved, so it is open to anybody and
                 // only completes flows this server started.
-                await target.CreateRoute("/omnitumblr/oauth/callback", Guard("/omnitumblr/oauth/callback", OAuthCallback, true), HttpMethod.Get, KMPermissions.Anybody);
-                await target.CreateStreamingRoute("/omnitumblr/media/upload", Guard("/omnitumblr/media/upload", MediaUpload, false), HttpMethod.Post, KMPermissions.Admin, MaxUploadBytes);
+                await target.CreateRoute("/omnitumblr/oauth/callback", Guard("/omnitumblr/oauth/callback", OAuthCallback, true), HttpMethod.Get, Perms.Public);
+                await target.CreateStreamingRoute("/omnitumblr/media/upload", Guard("/omnitumblr/media/upload", MediaUpload, false), HttpMethod.Post, OmniTumblrPerms.PostsAct, MaxUploadBytes);
                 registered += 2;
             }
             catch (Exception ex)

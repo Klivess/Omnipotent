@@ -13,7 +13,7 @@ namespace Omnipotent.Services.KliveMultiTool.Tools
             Description = "Opens parallel headless Chrome instances to watch a YouTube video (muted) for 2 minutes each.";
         }
 
-        public override KMPermissions RequiredPermission => KMPermissions.Klives;
+        public override Omnipotent.Profiles.ProfileRank LegacyRank => Omnipotent.Profiles.ProfileRank.Klives;
 
         [KliveObservable("Active Instances")]
         public int ActiveInstances { get; private set; }

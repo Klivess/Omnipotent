@@ -4,6 +4,7 @@ using System.Collections.Concurrent;
 using System.Net;
 using System.Reflection;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveMultiTool
 {
@@ -46,6 +47,7 @@ namespace Omnipotent.Services.KliveMultiTool
                 {
                     var tool = (KliveTool)Activator.CreateInstance(type)!;
                     tool.SetParent(this);
+                    tool.Permission = KliveToolsPerms.ForTool(tool.Name, tool.Description, tool.LegacyRank);
                     tool.Functions = BuildFunctionDescriptors(tool);
                     loadedTools[tool.Name] = tool;
                     await ServiceLog($"Loaded '{tool.Name}' with {tool.Functions.Count} function(s).");
@@ -75,7 +77,8 @@ namespace Omnipotent.Services.KliveMultiTool
                 {
                     Name = funcAttr.DisplayName,
                     Description = funcAttr.Description,
-                    RequiredPermission = funcAttr.PermissionOverride ?? tool.RequiredPermission,
+                    RequiredPermission = tool.Permission?.Key ?? string.Empty,
+                    RequiredPermissionTitle = tool.Permission?.Title ?? string.Empty,
                     Parameters = parameters,
                     MethodInfo = method,
                     OwnerTool = tool,
@@ -122,7 +125,7 @@ namespace Omnipotent.Services.KliveMultiTool
             {
                 var result = loadedTools.Values.Select(SerialiseToolMeta);
                 await req.ReturnResponse(JsonConvert.SerializeObject(result), code: HttpStatusCode.OK);
-            }, HttpMethod.Get, KMPermissions.Admin);
+            }, HttpMethod.Get, KliveToolsPerms.CatalogView);
 
             // Single tool details
             await CreateAPIRoute("/KliveMultiTool/tool", async (req) =>
@@ -134,7 +137,7 @@ namespace Omnipotent.Services.KliveMultiTool
                     return;
                 }
                 await req.ReturnResponse(JsonConvert.SerializeObject(SerialiseToolMeta(tool)), code: HttpStatusCode.OK);
-            }, HttpMethod.Get, KMPermissions.Admin);
+            }, HttpMethod.Get, KliveToolsPerms.CatalogView);
 
             // Execute function (sync or async)
             // Note: route requires Guest at the route level; per-function permission is enforced inside.
@@ -160,9 +163,17 @@ namespace Omnipotent.Services.KliveMultiTool
                         return;
                     }
 
-                    if (req.user != null && req.user.KlivesManagementRank < descriptor.RequiredPermission)
+                    // The route is open to any signed-in profile; each tool has its own permission.
+                    var toolPermission = descriptor.OwnerTool.Permission;
+                    if (toolPermission == null || !req.Can(toolPermission))
                     {
-                        await req.ReturnResponse("Insufficient permissions.", code: HttpStatusCode.Unauthorized);
+                        await req.ReturnResponse(JsonConvert.SerializeObject(new
+                        {
+                            error = "AccessDenied",
+                            reason = "MissingPermission",
+                            permission = new { key = toolPermission?.Key, title = toolPermission?.Title, service = "KliveTools" },
+                            message = $"You need the \u201c{toolPermission?.Title ?? toolName}\u201d permission.",
+                        }), code: HttpStatusCode.Forbidden);
                         return;
                     }
 
@@ -209,7 +220,7 @@ namespace Omnipotent.Services.KliveMultiTool
                     await ServiceLogError(ex, "Error in /KliveMultiTool/execute");
                     await req.ReturnResponse(JsonConvert.SerializeObject(KliveToolResult.Fail(ex.Message)), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, Perms.SignedIn);
 
             // Observable state of a single tool
             await CreateAPIRoute("/KliveMultiTool/tool/observables", async (req) =>
@@ -222,7 +233,7 @@ namespace Omnipotent.Services.KliveMultiTool
                 }
                 var observables = GetToolObservables(tool);
                 await req.ReturnResponse(JsonConvert.SerializeObject(observables), code: HttpStatusCode.OK);
-            }, HttpMethod.Get, KMPermissions.Admin);
+            }, HttpMethod.Get, KliveToolsPerms.CatalogView);
 
             // Cancel a running job
             await CreateAPIRoute("/KliveMultiTool/job/cancel", async (req) =>
@@ -240,7 +251,7 @@ namespace Omnipotent.Services.KliveMultiTool
                 }
                 job.Cancel();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { cancelled = true, jobId }), code: HttpStatusCode.OK);
-            }, HttpMethod.Post, KMPermissions.Admin);
+            }, HttpMethod.Post, KliveToolsPerms.JobsCancel);
 
             // Single job
             await CreateAPIRoute("/KliveMultiTool/job", async (req) =>
@@ -252,14 +263,14 @@ namespace Omnipotent.Services.KliveMultiTool
                     return;
                 }
                 await req.ReturnResponse(JsonConvert.SerializeObject(job), code: HttpStatusCode.OK);
-            }, HttpMethod.Get, KMPermissions.Admin);
+            }, HttpMethod.Get, KliveToolsPerms.CatalogView);
 
             // All jobs
             await CreateAPIRoute("/KliveMultiTool/jobs", async (req) =>
             {
                 var jobs = activeJobs.Values.OrderByDescending(j => j.StartTime);
                 await req.ReturnResponse(JsonConvert.SerializeObject(jobs), code: HttpStatusCode.OK);
-            }, HttpMethod.Get, KMPermissions.Admin);
+            }, HttpMethod.Get, KliveToolsPerms.CatalogView);
         }
 
         // ── Invocation ──
@@ -391,14 +402,15 @@ namespace Omnipotent.Services.KliveMultiTool
         {
             name = t.Name,
             description = t.Description,
-            requiredPermission = (int)t.RequiredPermission,
-            requiredPermissionName = t.RequiredPermission.ToString(),
+            // The tool's permission key, and its title for display.
+            requiredPermission = t.Permission?.Key,
+            requiredPermissionName = t.Permission?.Title,
             functions = t.Functions.Select(f => new
             {
                 name = f.Name,
                 description = f.Description,
-                requiredPermission = (int)f.RequiredPermission,
-                requiredPermissionName = f.RequiredPermission.ToString(),
+                requiredPermission = f.RequiredPermission,
+                requiredPermissionName = f.RequiredPermissionTitle,
                 parameters = f.Parameters.Select(p => new
                 {
                     name = p.Name,

@@ -8,6 +8,7 @@ using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveGames.Models;
 using static Omnipotent.Profiles.KMProfileManager;
 using KGRequest = global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveGames
 {
@@ -28,50 +29,50 @@ namespace Omnipotent.Services.KliveGames
 
         public async Task RegisterRoutes()
         {
-            await Route("/klivegames/games", HandleGames, HttpMethod.Get);
-            await Route("/klivegames/versions", HandleVersions, HttpMethod.Get);
+            await Route("/klivegames/games", HandleGames, HttpMethod.Get, KliveGamesPerms.ServersRead);
+            await Route("/klivegames/versions", HandleVersions, HttpMethod.Get, KliveGamesPerms.ServersRead);
 
-            await Route("/klivegames/servers", HandleListServers, HttpMethod.Get);
-            await Route("/klivegames/servers/get", HandleGetServer, HttpMethod.Get);
-            await Route("/klivegames/servers/create", HandleCreate, HttpMethod.Post);
-            await Route("/klivegames/servers/start", req => HandleLifecycle(req, "start"), HttpMethod.Post);
-            await Route("/klivegames/servers/stop", req => HandleLifecycle(req, "stop"), HttpMethod.Post);
-            await Route("/klivegames/servers/restart", req => HandleLifecycle(req, "restart"), HttpMethod.Post);
-            await Route("/klivegames/servers/kill", req => HandleLifecycle(req, "kill"), HttpMethod.Post);
-            await Route("/klivegames/servers/delete", req => HandleLifecycle(req, "delete"), HttpMethod.Post);
-            await Route("/klivegames/servers/command", HandleCommand, HttpMethod.Post);
+            await Route("/klivegames/servers", HandleListServers, HttpMethod.Get, KliveGamesPerms.ServersRead);
+            await Route("/klivegames/servers/get", HandleGetServer, HttpMethod.Get, KliveGamesPerms.ServersRead);
+            await Route("/klivegames/servers/create", HandleCreate, HttpMethod.Post, KliveGamesPerms.ServersManage);
+            await Route("/klivegames/servers/start", req => HandleLifecycle(req, "start"), HttpMethod.Post, KliveGamesPerms.ServersOperate);
+            await Route("/klivegames/servers/stop", req => HandleLifecycle(req, "stop"), HttpMethod.Post, KliveGamesPerms.ServersOperate);
+            await Route("/klivegames/servers/restart", req => HandleLifecycle(req, "restart"), HttpMethod.Post, KliveGamesPerms.ServersOperate);
+            await Route("/klivegames/servers/kill", req => HandleLifecycle(req, "kill"), HttpMethod.Post, KliveGamesPerms.ServersManage);
+            await Route("/klivegames/servers/delete", req => HandleLifecycle(req, "delete"), HttpMethod.Post, KliveGamesPerms.ServersManage);
+            await Route("/klivegames/servers/command", HandleCommand, HttpMethod.Post, KliveGamesPerms.ConsoleUse);
 
-            await Route("/klivegames/config/get", HandleConfigGet, HttpMethod.Get);
-            await Route("/klivegames/config/set", HandleConfigSet, HttpMethod.Post);
+            await Route("/klivegames/config/get", HandleConfigGet, HttpMethod.Get, KliveGamesPerms.ServersRead);
+            await Route("/klivegames/config/set", HandleConfigSet, HttpMethod.Post, KliveGamesPerms.ServersManage);
 
-            await Route("/klivegames/files/list", HandleFilesList, HttpMethod.Get);
-            await Route("/klivegames/files/download", HandleFilesDownload, HttpMethod.Get);
-            await Route("/klivegames/files/upload", HandleFilesUpload, HttpMethod.Post);
-            await Route("/klivegames/files/edit", HandleFilesEdit, HttpMethod.Post);
-            await Route("/klivegames/files/delete", HandleFilesDelete, HttpMethod.Post);
+            await Route("/klivegames/files/list", HandleFilesList, HttpMethod.Get, KliveGamesPerms.ServersRead);
+            await Route("/klivegames/files/download", HandleFilesDownload, HttpMethod.Get, KliveGamesPerms.FilesRead);
+            await Route("/klivegames/files/upload", HandleFilesUpload, HttpMethod.Post, KliveGamesPerms.FilesWrite);
+            await Route("/klivegames/files/edit", HandleFilesEdit, HttpMethod.Post, KliveGamesPerms.FilesWrite);
+            await Route("/klivegames/files/delete", HandleFilesDelete, HttpMethod.Post, KliveGamesPerms.FilesWrite);
 
-            await Route("/klivegames/players/list", HandlePlayersList, HttpMethod.Get);
-            await Route("/klivegames/players/action", HandlePlayersAction, HttpMethod.Post);
+            await Route("/klivegames/players/list", HandlePlayersList, HttpMethod.Get, KliveGamesPerms.ServersRead);
+            await Route("/klivegames/players/action", HandlePlayersAction, HttpMethod.Post, KliveGamesPerms.ServersOperate);
 
-            await Route("/klivegames/backups/create", HandleBackupCreate, HttpMethod.Post);
-            await Route("/klivegames/backups/list", HandleBackupList, HttpMethod.Get);
-            await Route("/klivegames/backups/restore", HandleBackupRestore, HttpMethod.Post);
-            await Route("/klivegames/backups/download", HandleBackupDownload, HttpMethod.Get);
+            await Route("/klivegames/backups/create", HandleBackupCreate, HttpMethod.Post, KliveGamesPerms.ServersManage);
+            await Route("/klivegames/backups/list", HandleBackupList, HttpMethod.Get, KliveGamesPerms.ServersRead);
+            await Route("/klivegames/backups/restore", HandleBackupRestore, HttpMethod.Post, KliveGamesPerms.ServersManage);
+            await Route("/klivegames/backups/download", HandleBackupDownload, HttpMethod.Get, KliveGamesPerms.FilesRead);
 
-            await Route("/klivegames/network/setpublic", HandleSetPublic, HttpMethod.Post);
+            await Route("/klivegames/network/setpublic", HandleSetPublic, HttpMethod.Post, KliveGamesPerms.ServersManage);
 
             await RegisterConsoleWebSocket();
         }
 
         // ----------------------------------------------------------------- helpers
 
-        private async Task Route(string path, Func<KGRequest, Task> handler, HttpMethod method)
+        private async Task Route(string path, Func<KGRequest, Task> handler, HttpMethod method, PermissionDef permission)
         {
             await parent.CreateAPIRoute(path, async (req) =>
             {
                 try { await handler(req); }
                 catch (Exception ex) { await Err(req, ex.Message, HttpStatusCode.InternalServerError); }
-            }, method, KMPermissions.Klives);
+            }, method, permission);
         }
 
         private static Task Ok(KGRequest req, object payload) =>
@@ -374,16 +375,10 @@ namespace Omnipotent.Services.KliveGames
             await parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute", "/klivegames/servers/console",
                 (Func<HttpListenerContext, WebSocket, NameValueCollection, Omnipotent.Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
                 {
-                    // Browsers can't set an Authorization header on a WebSocket, so this route is registered
-                    // as Anybody and authorized here from the ?authorization= query param (Klives only).
+                    // KliveAPI resolved ?authorization= (browsers can't set WS headers) and enforced
+                    // klivegames.console.use before upgrading; re-check the profile it handed over.
                     var resolved = user;
-                    if (resolved == null)
-                    {
-                        var pw = queryParams["authorization"];
-                        if (!string.IsNullOrEmpty(pw))
-                            resolved = await parent.ExecuteServiceMethod<Omnipotent.Profiles.KMProfileManager>("GetProfileByPassword", pw) as KMProfile;
-                    }
-                    if (resolved == null || resolved.KlivesManagementRank < KMPermissions.Klives)
+                    if (resolved == null || !AccessEvaluator.Can(resolved, KliveGamesPerms.ConsoleUse))
                     {
                         await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Unauthorized", CancellationToken.None);
                         return;
@@ -428,7 +423,7 @@ namespace Omnipotent.Services.KliveGames
                         hub.RemoveSubscriber(subId);
                         try { if (socket.State == WebSocketState.Open) await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "bye", CancellationToken.None); } catch { }
                     }
-                }), KMPermissions.Anybody);
+                }), KliveGamesPerms.ConsoleUse);
         }
     }
 }

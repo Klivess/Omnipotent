@@ -8,6 +8,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Omniscience.Search
 {
@@ -45,7 +46,7 @@ namespace Omnipotent.Services.Omniscience.Search
                         new JProperty("results", detailed)).ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.MessagesRead);
 
             await service.CreateAPIRoute("/omniscience/persons/ask", async req =>
             {
@@ -63,7 +64,7 @@ namespace Omnipotent.Services.Omniscience.Search
                     await req.ReturnResponse(answer.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.PersonsAsk);
         }
 
         private static async Task Err(KliveAPI.KliveAPI.UserRequest req, Exception ex)

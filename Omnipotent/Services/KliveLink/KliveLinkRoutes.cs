@@ -3,12 +3,13 @@ using Omnipotent.Data_Handling;
 using System.Net;
 using System.Net.WebSockets;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveLink
 {
     /// <summary>
     /// HTTP API routes for the KliveLink remote administration service.
-    /// ALL routes require KMPermissions.Klives — only the highest-rank user can control agents.
+    /// Every route names a <c>klivelink.*</c> permission; controlling agents needs the Critical keys.
     /// </summary>
     public class KliveLinkRoutes
     {
@@ -40,7 +41,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveLinkPerms.AgentsView);
 
             // --- Get system info from an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/systeminfo", async (req) =>
@@ -65,7 +66,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveLinkPerms.AgentsInspect);
 
             // --- Run a process on an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/runprocess", async (req) =>
@@ -92,7 +93,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
             // --- Run a terminal command on an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/terminal", async (req) =>
@@ -119,7 +120,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
             // --- List processes on an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/processes", async (req) =>
@@ -144,7 +145,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveLinkPerms.AgentsInspect);
 
             // --- Kill a process on an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/killprocess", async (req) =>
@@ -171,7 +172,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
             // --- Start screen capture on an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/screencapture/start", async (req) =>
@@ -198,7 +199,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
             // --- Stop screen capture on an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/screencapture/stop", async (req) =>
@@ -223,7 +224,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
             // --- List directory on an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/listdir", async (req) =>
@@ -250,7 +251,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveLinkPerms.AgentsInspect);
 
             // --- Download a file from an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/downloadfile", async (req) =>
@@ -277,7 +278,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveLinkPerms.AgentsFiles);
 
             // --- Upload a file to an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/uploadfile", async (req) =>
@@ -304,7 +305,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveLinkPerms.AgentsFiles);
 
             // --- Get agent status ---
             await _parent.CreateAPIRoute("/klivelink/agent/status", async (req) =>
@@ -329,7 +330,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, KliveLinkPerms.AgentsView);
 
             // --- Disconnect an agent ---
             await _parent.CreateAPIRoute("/klivelink/agent/disconnect", async (req) =>
@@ -354,7 +355,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
             // --- Self-destruct an agent (removes all traces from the client machine) ---
             await _parent.CreateAPIRoute("/klivelink/agent/selfdestruct", async (req) =>
@@ -379,7 +380,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, KliveLinkPerms.AgentsDestroy);
 
             // --- Download the KliveLink agent executable ---
             await _parent.CreateAPIRoute("/klivelink/download", async (req) =>
@@ -404,7 +405,7 @@ namespace Omnipotent.Services.KliveLink
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, KMPermissions.Anybody);
+            }, HttpMethod.Get, Perms.Public);
 
             // --- WebSocket: live screen capture stream for frontend viewers ---
             await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute", "/klivelink/agent/screencapture/stream", (Func<System.Net.HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, Omnipotent.Profiles.KMProfileManager.KMProfile?, Task>)(async (context, socket, queryParams, user) =>
@@ -445,7 +446,7 @@ namespace Omnipotent.Services.KliveLink
                         catch { }
                     }
                 }
-            }), KMPermissions.Klives);
+            }), KliveLinkPerms.AgentsControl);
 
             _parent.ServiceLog("KliveLink routes created (all Klives-rank restricted).");
         }

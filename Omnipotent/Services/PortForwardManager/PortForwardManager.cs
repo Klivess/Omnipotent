@@ -9,6 +9,7 @@ using Omnipotent.Profiles;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Service_Manager;
 using Open.Nat;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.PortForwardManager
 {
@@ -35,10 +36,10 @@ namespace Omnipotent.Services.PortForwardManager
 
         private async Task SetupRoutes()
         {
-            await CreateAPIRoute("/admin/portforwarding/list", HandleListRequest, HttpMethod.Get, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/portforwarding/add", HandleAddRequest, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/portforwarding/delete", HandleDeleteRequest, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
-            await CreateAPIRoute("/admin/portforwarding/edit", HandleEditRequest, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+            await CreateAPIRoute("/admin/portforwarding/list", HandleListRequest, HttpMethod.Get, SystemPerms.PortForwardingRead);
+            await CreateAPIRoute("/admin/portforwarding/add", HandleAddRequest, HttpMethod.Post, SystemPerms.PortForwardingManage);
+            await CreateAPIRoute("/admin/portforwarding/delete", HandleDeleteRequest, HttpMethod.Post, SystemPerms.PortForwardingManage);
+            await CreateAPIRoute("/admin/portforwarding/edit", HandleEditRequest, HttpMethod.Post, SystemPerms.PortForwardingManage);
         }
 
         // Returns true if a UPnP-enabled gateway device is present on the network.

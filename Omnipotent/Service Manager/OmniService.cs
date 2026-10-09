@@ -16,6 +16,7 @@ using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.SeleniumManager;
 using Org.BouncyCastle.Asn1.X509.Qualified;
 using static Omnipotent.Threading.WindowsInvokes;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Service_Manager
 {
@@ -181,7 +182,7 @@ namespace Omnipotent.Service_Manager
         }
 
         // Common cross-service helper for API route creation (wraps ExecuteServiceMethod)
-        public async Task CreateAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions permission)
+        public async Task CreateAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, PermissionDef permission)
         {
             await ExecuteServiceMethod<KliveAPI>("CreateRoute", path, handler, method, permission);
         }
@@ -190,7 +191,7 @@ namespace Omnipotent.Service_Manager
         /// Creates an API route that consumes the unread request body through
         /// UserRequest.RequestBodyStream instead of buffering it in memory.
         /// </summary>
-        public async Task CreateStreamingAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions permission, long maxBodyBytes)
+        public async Task CreateStreamingAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, PermissionDef permission, long maxBodyBytes)
         {
             await ExecuteServiceMethod<KliveAPI>("CreateStreamingRoute", path, handler, method, permission, maxBodyBytes);
         }
@@ -198,7 +199,7 @@ namespace Omnipotent.Service_Manager
         /// <summary>
         /// Creates a buffered API route with a pipeline-enforced body limit.
         /// </summary>
-        public async Task CreateBufferedAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, KMProfileManager.KMPermissions permission, long maxBodyBytes)
+        public async Task CreateBufferedAPIRoute(string path, Func<KliveAPI.UserRequest, Task> handler, HttpMethod method, PermissionDef permission, long maxBodyBytes)
         {
             await ExecuteServiceMethod<KliveAPI>("CreateBufferedRoute", path, handler, method, permission, maxBodyBytes);
         }

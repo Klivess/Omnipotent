@@ -16,6 +16,7 @@ using System.Net;
 // `KliveAPI` alone binds to the namespace here, not the class, so the nested request type needs the
 // full path. Aliasing it keeps the handler signatures readable.
 using UserRequest = Omnipotent.Services.KliveAPI.KliveAPI.UserRequest;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.OmniTrader.Api
 {
@@ -23,9 +24,10 @@ namespace Omnipotent.Services.OmniTrader.Api
     /// HTTP surface for the firm layer, organised by operating function rather than by broker:
     /// command centre, markets, portfolio, risk, execution, research, performance, journal, systems.
     ///
-    /// Reads are <c>Guest</c>. Anything that changes exposure, authority or emergency state is
-    /// <c>Klives</c>, and the genuinely dangerous actions additionally require a typed confirmation
-    /// token so a mis-click cannot arm live trading or unwind a book.
+    /// Every route names its <see cref="Omnipotent.Profiles.Permissions.OmniTraderPerms"/> key: reads
+    /// are Read-tier keys, and anything that changes exposure, authority or emergency state needs a
+    /// Manage or Critical key. The genuinely dangerous actions additionally require a typed
+    /// confirmation token so a mis-click cannot arm live trading or unwind a book.
     /// </summary>
     public sealed partial class FirmRoutes
     {
@@ -95,7 +97,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterCommandCentreAsync()
         {
-            await Get("/api/omnitrader/firm/overview", async req =>
+            await Get("/api/omnitrader/firm/overview", OmniTraderPerms.StatusView, async req =>
             {
                 int trendDays = ParseInt(req.userParameters.Get("trendDays"), 30, 1, 365);
                 string? body = GetOverviewSnapshot(trendDays);
@@ -108,7 +110,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(body, "application/json");
             });
 
-            await Get("/api/omnitrader/firm/environments", async req =>
+            await Get("/api/omnitrader/firm/environments", OmniTraderPerms.StatusView, async req =>
             {
                 var accounts = await Firm.Accounts.ListAsync();
                 await Json(req, new
@@ -149,13 +151,13 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterMarketsAsync()
         {
-            await Get("/api/omnitrader/firm/markets/watchlists", async req =>
+            await Get("/api/omnitrader/firm/markets/watchlists", OmniTraderPerms.MarketsRead, async req =>
             {
                 var lists = await Firm.Watchlists.ListAsync();
                 await Json(req, lists);
             });
 
-            await Get("/api/omnitrader/firm/markets", async req =>
+            await Get("/api/omnitrader/firm/markets", OmniTraderPerms.MarketsRead, async req =>
             {
                 string? watchlistId = req.userParameters.Get("watchlist");
                 string? symbols = req.userParameters.Get("instruments");
@@ -182,7 +184,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Get("/api/omnitrader/firm/instruments", async req =>
+            await Get("/api/omnitrader/firm/instruments", OmniTraderPerms.MarketsRead, async req =>
             {
                 string? search = req.userParameters.Get("q");
                 var results = Firm.Instruments.Search(search ?? "", 200);
@@ -210,14 +212,14 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }));
             });
 
-            await Post("/api/omnitrader/firm/instruments/refresh", async req =>
+            await Post("/api/omnitrader/firm/instruments/refresh", OmniTraderPerms.MarketsManage, async req =>
             {
                 int added = await Firm.Instruments.RefreshFromVenuesAsync();
                 await Firm.Audit.AppendAsync(Actor(req), "instruments.refreshed", "instrument-master", $"{added} new");
                 await Json(req, new { Added = added, Total = Firm.Instruments.Count, Firm.Instruments.LastRefreshUtc });
             });
 
-            await Post("/api/omnitrader/firm/markets/watchlist/save", async req =>
+            await Post("/api/omnitrader/firm/markets/watchlist/save", OmniTraderPerms.MarketsManage, async req =>
             {
                 var dto = Body<WatchlistDto>(req);
                 if (dto == null || string.IsNullOrWhiteSpace(dto.Name)) { await Bad(req, "name required"); return; }
@@ -231,7 +233,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, watchlist);
             });
 
-            await Post("/api/omnitrader/firm/markets/watchlist/delete", async req =>
+            await Post("/api/omnitrader/firm/markets/watchlist/delete", OmniTraderPerms.MarketsManage, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await Bad(req, "id required"); return; }
@@ -242,7 +244,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             // Add or remove a single instrument. Saving the whole list to add one row makes two
             // browser tabs overwrite each other, and it forces the UI into an edit-then-commit
             // ceremony for what should be one gesture.
-            await Post("/api/omnitrader/firm/markets/watchlist/instrument", async req =>
+            await Post("/api/omnitrader/firm/markets/watchlist/instrument", OmniTraderPerms.MarketsManage, async req =>
             {
                 var dto = Body<WatchlistInstrumentDto>(req);
                 if (dto == null || string.IsNullOrWhiteSpace(dto.InstrumentId))
@@ -258,7 +260,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             // These take a *symbol* rather than an instrument id, so anything listed can be charted
             // and quoted whether or not the firm has ever traded it.
 
-            await Get("/api/omnitrader/firm/candles", async req =>
+            await Get("/api/omnitrader/firm/candles", OmniTraderPerms.MarketsRead, async req =>
             {
                 string? symbol = req.userParameters.Get("symbol") ?? req.userParameters.Get("instrument");
                 if (string.IsNullOrWhiteSpace(symbol)) { await Bad(req, "symbol required"); return; }
@@ -286,7 +288,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Get("/api/omnitrader/firm/quote", async req =>
+            await Get("/api/omnitrader/firm/quote", OmniTraderPerms.MarketsRead, async req =>
             {
                 string? symbol = req.userParameters.Get("symbol") ?? req.userParameters.Get("instrument");
                 if (string.IsNullOrWhiteSpace(symbol)) { await Bad(req, "symbol required"); return; }
@@ -337,7 +339,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Get("/api/omnitrader/firm/search", async req =>
+            await Get("/api/omnitrader/firm/search", OmniTraderPerms.MarketsRead, async req =>
             {
                 string query = req.userParameters.Get("q") ?? "";
                 if (string.IsNullOrWhiteSpace(query)) { await Json(req, Array.Empty<object>()); return; }
@@ -359,7 +361,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             // whether to watch something is a judgement about its price action, and a ticker alone
             // cannot support it — so each match comes back as a full market row, ready to render as
             // the same card the watchlist shows.
-            await Get("/api/omnitrader/firm/markets/search", async req =>
+            await Get("/api/omnitrader/firm/markets/search", OmniTraderPerms.MarketsRead, async req =>
             {
                 string query = req.userParameters.Get("q") ?? "";
                 if (string.IsNullOrWhiteSpace(query)) { await Json(req, Array.Empty<object>()); return; }
@@ -494,7 +496,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterPortfolioAsync()
         {
-            await Get("/api/omnitrader/firm/portfolio", async req =>
+            await Get("/api/omnitrader/firm/portfolio", OmniTraderPerms.PortfolioRead, async req =>
             {
                 var view = await Firm.Portfolio.BuildAsync();
                 await Json(req, view);
@@ -503,7 +505,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             // Firm value history and what it is made of. Every figure is real money in the reporting
             // currency: the composition adds up to the total, so a mark moving in owned inventory can
             // be told apart from cash arriving.
-            await Get("/api/omnitrader/firm/portfolio/value-series", async req =>
+            await Get("/api/omnitrader/firm/portfolio/value-series", OmniTraderPerms.PortfolioRead, async req =>
             {
                 // An explicit `from` is a fixed window and needs no clock anchor; the
                 // default one slides, so it takes the bucket (see FirmNowUtc).
@@ -529,7 +531,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             // Per-account broker balances, in each account's own currency and labelled with it.
             // Deliberately separate from value history: these are not addable to each other, and the
             // simulated ones are not money at all.
-            await Get("/api/omnitrader/firm/portfolio/account-balances", async req =>
+            await Get("/api/omnitrader/firm/portfolio/account-balances", OmniTraderPerms.PortfolioRead, async req =>
             {
                 var from = ParseUtc(req.userParameters.Get("from")) ?? FirmNowUtc().AddDays(-30);
                 var series = await Firm.Accounts.SnapshotSeriesAsync(from);
@@ -547,7 +549,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     }));
             });
 
-            await Get("/api/omnitrader/firm/ledger", async req =>
+            await Get("/api/omnitrader/firm/ledger", OmniTraderPerms.PortfolioRead, async req =>
             {
                 var from = ParseUtc(req.userParameters.Get("from"));
                 string? account = req.userParameters.Get("account");
@@ -556,7 +558,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, entries);
             });
 
-            await Get("/api/omnitrader/firm/reconciliation", async req =>
+            await Get("/api/omnitrader/firm/reconciliation", OmniTraderPerms.RiskRead, async req =>
             {
                 var breaks = await Firm.Reconciliation.ListOpenBreaksAsync();
                 var runs = await Firm.Reconciliation.ListRunsAsync(25);
@@ -594,7 +596,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Post("/api/omnitrader/firm/reconciliation/run", async req =>
+            await Post("/api/omnitrader/firm/reconciliation/run", OmniTraderPerms.ReconciliationRun, async req =>
             {
                 var runs = await Firm.Reconciliation.ReconcileAllAsync("manual");
                 await Firm.Audit.AppendAsync(Actor(req), "reconciliation.manual_run", "firm",
@@ -607,7 +609,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Post("/api/omnitrader/firm/reconciliation/resolve", async req =>
+            await Post("/api/omnitrader/firm/reconciliation/resolve", OmniTraderPerms.ReconciliationRun, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 string? resolution = req.userParameters.Get("resolution");
@@ -622,7 +624,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterRiskAsync()
         {
-            await Get("/api/omnitrader/firm/risk", async req =>
+            await Get("/api/omnitrader/firm/risk", OmniTraderPerms.RiskRead, async req =>
             {
                 string? body = GetRiskSnapshot();
                 if (body == null)
@@ -634,7 +636,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(body, "application/json");
             });
 
-            await Post("/api/omnitrader/firm/risk/limits", async req =>
+            await Post("/api/omnitrader/firm/risk/limits", OmniTraderPerms.RiskManage, async req =>
             {
                 var dto = Body<RiskLimits>(req);
                 if (dto == null) { await Bad(req, "invalid limits body"); return; }
@@ -644,7 +646,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, Firm.Limits);
             });
 
-            await Post("/api/omnitrader/firm/risk/safe-mode", async req =>
+            await Post("/api/omnitrader/firm/risk/safe-mode", OmniTraderPerms.RiskManage, async req =>
             {
                 bool enable = string.Equals(req.userParameters.Get("enable"), "true", StringComparison.OrdinalIgnoreCase);
                 string reason = req.userParameters.Get("reason") ?? "manual";
@@ -655,7 +657,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, new { Firm.Emergency.SafeModeActive, Firm.Emergency.SafeModeReason });
             });
 
-            await Post("/api/omnitrader/firm/risk/killswitch", async req =>
+            await Post("/api/omnitrader/firm/risk/killswitch", OmniTraderPerms.RiskManage, async req =>
             {
                 var dto = Body<KillSwitchDto>(req);
                 if (dto == null) { await Bad(req, "invalid body"); return; }
@@ -684,7 +686,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
             // Reducing exposure is deliberately separate from disabling automation, and previews what
             // it will do before it does it.
-            await Post("/api/omnitrader/firm/risk/reduce/preview", async req =>
+            await Post("/api/omnitrader/firm/risk/reduce/preview", OmniTraderPerms.RiskManage, async req =>
             {
                 var view = await Firm.Portfolio.BuildAsync();
                 string? venueFilter = req.userParameters.Get("venue");
@@ -715,7 +717,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Post("/api/omnitrader/firm/risk/reduce/execute", async req =>
+            await Post("/api/omnitrader/firm/risk/reduce/execute", OmniTraderPerms.RiskManage, async req =>
             {
                 var view = await Firm.Portfolio.BuildAsync();
                 string? venueFilter = req.userParameters.Get("venue");
@@ -773,7 +775,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterExecutionAsync()
         {
-            await Get("/api/omnitrader/firm/orders", async req =>
+            await Get("/api/omnitrader/firm/orders", OmniTraderPerms.OrdersRead, async req =>
             {
                 string? state = req.userParameters.Get("state");
                 string? search = req.userParameters.Get("q");
@@ -825,7 +827,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Get("/api/omnitrader/firm/order", async req =>
+            await Get("/api/omnitrader/firm/order", OmniTraderPerms.OrdersRead, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await Bad(req, "id required"); return; }
@@ -850,7 +852,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Get("/api/omnitrader/firm/ticket", async req =>
+            await Get("/api/omnitrader/firm/ticket", OmniTraderPerms.OrdersRead, async req =>
             {
                 // The order ticket is capability-driven: the UI renders exactly what the venue can do
                 // and shows a reason next to everything it cannot.
@@ -896,14 +898,14 @@ namespace Omnipotent.Services.OmniTrader.Api
 
             // Spending power on its own, for when the ticket only needs to re-price the account
             // rather than re-derive every dealing rule.
-            await Get("/api/omnitrader/firm/ticket/accounts", async req =>
+            await Get("/api/omnitrader/firm/ticket/accounts", OmniTraderPerms.OrdersRead, async req =>
             {
                 string? venueRaw = req.userParameters.Get("venue");
                 if (!Enum.TryParse<VenueId>(venueRaw, true, out var venue)) { await Bad(req, "venue required"); return; }
                 await Json(req, await SpendingPowerAsync(venue));
             });
 
-            await Post("/api/omnitrader/firm/order/propose", async req =>
+            await Post("/api/omnitrader/firm/order/propose", OmniTraderPerms.OrdersPlace, async req =>
             {
                 var dto = Body<ProposeOrderDto>(req);
                 if (dto == null) { await Bad(req, "invalid body"); return; }
@@ -943,7 +945,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }
             });
 
-            await Post("/api/omnitrader/firm/order/approve", async req =>
+            await Post("/api/omnitrader/firm/order/approve", OmniTraderPerms.OrdersPlace, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await Bad(req, "id required"); return; }
@@ -952,7 +954,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, OrderDto(order));
             });
 
-            await Post("/api/omnitrader/firm/order/reject", async req =>
+            await Post("/api/omnitrader/firm/order/reject", OmniTraderPerms.OrdersPlace, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 string reason = req.userParameters.Get("reason") ?? "rejected by operator";
@@ -962,7 +964,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, OrderDto(order));
             });
 
-            await Post("/api/omnitrader/firm/order/cancel", async req =>
+            await Post("/api/omnitrader/firm/order/cancel", OmniTraderPerms.OrdersPlace, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await Bad(req, "id required"); return; }
@@ -970,7 +972,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, new { Cancelled = ok });
             });
 
-            await Post("/api/omnitrader/firm/orders/reconcile", async req =>
+            await Post("/api/omnitrader/firm/orders/reconcile", OmniTraderPerms.ReconciliationRun, async req =>
             {
                 int count = await Firm.Orders.ReconcileOutstandingAsync();
                 await Firm.Audit.AppendAsync(Actor(req), "orders.reconciled", "firm", $"{count} order(s)");
@@ -983,13 +985,13 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterResearchAsync()
         {
-            await Get("/api/omnitrader/firm/experiments", async req =>
+            await Get("/api/omnitrader/firm/experiments", OmniTraderPerms.ExperimentsRead, async req =>
             {
                 var experiments = await Firm.Research.ListAsync();
                 await Json(req, experiments);
             });
 
-            await Post("/api/omnitrader/firm/experiment/create", async req =>
+            await Post("/api/omnitrader/firm/experiment/create", OmniTraderPerms.ExperimentsManage, async req =>
             {
                 var dto = Body<ExperimentDto>(req);
                 if (dto == null || string.IsNullOrWhiteSpace(dto.Name) || string.IsNullOrWhiteSpace(dto.StrategyClass))
@@ -998,7 +1000,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, experiment);
             });
 
-            await Post("/api/omnitrader/firm/experiment/attach", async req =>
+            await Post("/api/omnitrader/firm/experiment/attach", OmniTraderPerms.ExperimentsManage, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 string? jobId = req.userParameters.Get("job");
@@ -1008,7 +1010,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, experiment);
             });
 
-            await Post("/api/omnitrader/firm/experiment/update", async req =>
+            await Post("/api/omnitrader/firm/experiment/update", OmniTraderPerms.ExperimentsManage, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 var dto = Body<ExperimentDto>(req);
@@ -1019,7 +1021,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, experiment);
             });
 
-            await Get("/api/omnitrader/firm/strategy-versions", async req =>
+            await Get("/api/omnitrader/firm/strategy-versions", OmniTraderPerms.StrategiesRead, async req =>
             {
                 string? strategyClass = req.userParameters.Get("strategy");
                 var versions = await Firm.Research.ListVersionsAsync(strategyClass);
@@ -1038,7 +1040,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }));
             });
 
-            await Post("/api/omnitrader/firm/strategy-version/create", async req =>
+            await Post("/api/omnitrader/firm/strategy-version/create", OmniTraderPerms.ExperimentsManage, async req =>
             {
                 var dto = Body<StrategyVersionDto>(req);
                 if (dto == null || string.IsNullOrWhiteSpace(dto.StrategyClass)) { await Bad(req, "strategyClass required"); return; }
@@ -1047,7 +1049,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, record);
             });
 
-            await Get("/api/omnitrader/firm/promotion/assess", async req =>
+            await Get("/api/omnitrader/firm/promotion/assess", OmniTraderPerms.ExperimentsRead, async req =>
             {
                 string? strategyClass = req.userParameters.Get("strategy");
                 int version = ParseInt(req.userParameters.Get("version"), 1, 1, 10_000);
@@ -1067,7 +1069,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Post("/api/omnitrader/firm/promotion/promote", async req =>
+            await Post("/api/omnitrader/firm/promotion/promote", OmniTraderPerms.DeploymentsGoLive, async req =>
             {
                 string? strategyClass = req.userParameters.Get("strategy");
                 int version = ParseInt(req.userParameters.Get("version"), 1, 1, 10_000);
@@ -1094,7 +1096,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterPerformanceAsync()
         {
-            await Get("/api/omnitrader/firm/performance", async req =>
+            await Get("/api/omnitrader/firm/performance", OmniTraderPerms.PortfolioRead, async req =>
             {
                 var from = ParseUtc(req.userParameters.Get("from")) ?? DateTime.UtcNow.AddDays(-30);
                 var report = await Firm.PerformanceService.BuildAsync(from);
@@ -1106,7 +1108,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterJournalAsync()
         {
-            await Get("/api/omnitrader/firm/journal", async req =>
+            await Get("/api/omnitrader/firm/journal", OmniTraderPerms.JournalRead, async req =>
             {
                 string? reviewState = req.userParameters.Get("review");
                 string? strategy = req.userParameters.Get("strategy");
@@ -1155,7 +1157,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Get("/api/omnitrader/firm/journal/record", async req =>
+            await Get("/api/omnitrader/firm/journal/record", OmniTraderPerms.JournalRead, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await Bad(req, "id required"); return; }
@@ -1164,7 +1166,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, record);
             });
 
-            await Post("/api/omnitrader/firm/journal/annotate", async req =>
+            await Post("/api/omnitrader/firm/journal/annotate", OmniTraderPerms.JournalWrite, async req =>
             {
                 var dto = Body<AnnotateDto>(req);
                 if (dto == null || string.IsNullOrWhiteSpace(dto.Id)) { await Bad(req, "id required"); return; }
@@ -1175,7 +1177,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, record);
             });
 
-            await Post("/api/omnitrader/firm/journal/intervention", async req =>
+            await Post("/api/omnitrader/firm/journal/intervention", OmniTraderPerms.JournalWrite, async req =>
             {
                 var dto = Body<InterventionDto>(req);
                 if (dto == null || string.IsNullOrWhiteSpace(dto.Id)) { await Bad(req, "id required"); return; }
@@ -1190,7 +1192,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task RegisterSystemsAsync()
         {
-            await Get("/api/omnitrader/firm/systems", async req =>
+            await Get("/api/omnitrader/firm/systems", OmniTraderPerms.StatusView, async req =>
             {
                 var health = await Firm.Health.EvaluateAsync();
                 var audit = await Firm.Audit.ListAsync(100);
@@ -1254,14 +1256,14 @@ namespace Omnipotent.Services.OmniTrader.Api
                 });
             });
 
-            await Get("/api/omnitrader/firm/alerts", async req =>
+            await Get("/api/omnitrader/firm/alerts", OmniTraderPerms.RiskRead, async req =>
             {
                 bool openOnly = !string.Equals(req.userParameters.Get("all"), "true", StringComparison.OrdinalIgnoreCase);
                 var alerts = await Firm.Alerts.ListAsync(openOnly, 200);
                 await Json(req, alerts.Select(AlertDto));
             });
 
-            await Post("/api/omnitrader/firm/alert/acknowledge", async req =>
+            await Post("/api/omnitrader/firm/alert/acknowledge", OmniTraderPerms.AlertsAct, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await Bad(req, "id required"); return; }
@@ -1270,7 +1272,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, new { Acknowledged = ok });
             });
 
-            await Post("/api/omnitrader/firm/alert/resolve", async req =>
+            await Post("/api/omnitrader/firm/alert/resolve", OmniTraderPerms.AlertsAct, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await Bad(req, "id required"); return; }
@@ -1279,7 +1281,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, new { Resolved = ok });
             });
 
-            await Post("/api/omnitrader/firm/venues/connect", async req =>
+            await Post("/api/omnitrader/firm/venues/connect", OmniTraderPerms.VenuesManage, async req =>
             {
                 var failures = await Firm.Venues.ConnectAllAsync();
                 await Firm.Audit.AppendAsync(Actor(req), "venues.reconnected", "firm",
@@ -1290,7 +1292,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await Json(req, new { Failures = failures, Health = Firm.Venues.HealthSnapshots });
             });
 
-            await Post("/api/omnitrader/firm/account/authority", async req =>
+            await Post("/api/omnitrader/firm/account/authority", OmniTraderPerms.VenuesManage, async req =>
             {
                 string? id = req.userParameters.Get("id");
                 string? authorityRaw = req.userParameters.Get("authority");
@@ -1323,11 +1325,11 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         // ── helpers ───────────────────────────────────────────────────────────────
 
-        private Task Get(string path, Func<UserRequest, Task> handler)
-            => parent.CreateAPIRoute(path, handler, HttpMethod.Get, KMProfileManager.KMPermissions.Guest);
+        private Task Get(string path, PermissionDef permission, Func<UserRequest, Task> handler)
+            => parent.CreateAPIRoute(path, handler, HttpMethod.Get, permission);
 
-        private Task Post(string path, Func<UserRequest, Task> handler)
-            => parent.CreateAPIRoute(path, handler, HttpMethod.Post, KMProfileManager.KMPermissions.Klives);
+        private Task Post(string path, PermissionDef permission, Func<UserRequest, Task> handler)
+            => parent.CreateAPIRoute(path, handler, HttpMethod.Post, permission);
 
         private static Task Json(UserRequest req, object payload)
             => req.ReturnResponse(JsonConvert.SerializeObject(payload, JsonSettings));

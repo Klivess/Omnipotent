@@ -4,6 +4,7 @@ using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Concurrent;
 using System.Net;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Service_Manager
 {
@@ -943,7 +944,7 @@ namespace Omnipotent.Service_Manager
             {
                 CacheDeps.MarkUncacheable("protected-settings");
                 await req.ReturnResponse(JsonConvert.SerializeObject(settings.Values.Select(ApiView)), "application/json");
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, SystemPerms.SettingsRead);
 
             await CreateAPIRoute("/OmniGlobalSettings/Get", async req =>
             {
@@ -959,7 +960,7 @@ namespace Omnipotent.Service_Manager
                 }
                 catch (ArgumentException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
                 catch { await req.ReturnResponse("SettingsUnavailable", code: HttpStatusCode.InternalServerError); }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Get, SystemPerms.SettingsRead);
 
             await CreateBufferedAPIRoute("/OmniGlobalSettings/Set", async req =>
             {
@@ -989,7 +990,7 @@ namespace Omnipotent.Service_Manager
                 catch (ArgumentException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
                 catch (JsonException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
                 catch { await req.ReturnResponse("SettingsUnavailable", code: HttpStatusCode.InternalServerError); }
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives, MaxRequestBodyBytes);
+            }, HttpMethod.Post, SystemPerms.SettingsWrite, MaxRequestBodyBytes);
 
             await CreateBufferedAPIRoute("/OmniGlobalSettings/Delete", async req =>
             {
@@ -1006,7 +1007,7 @@ namespace Omnipotent.Service_Manager
                 catch (ArgumentException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
                 catch (JsonException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }
                 catch { await req.ReturnResponse("SettingsUnavailable", code: HttpStatusCode.InternalServerError); }
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives, MaxRequestBodyBytes);
+            }, HttpMethod.Post, SystemPerms.SettingsWrite, MaxRequestBodyBytes);
         }
     }
 }

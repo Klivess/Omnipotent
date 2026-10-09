@@ -4,6 +4,7 @@ using Omnipotent.Services.Omniscience.Replica;
 using System.Net;
 using System.Net.Http;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Omniscience
 {
@@ -13,7 +14,7 @@ namespace Omnipotent.Services.Omniscience
     /// <see cref="OmniscienceRoutes"/> so the dossier-replica feature has a clear
     /// surface and can evolve independently.
     ///
-    /// Endpoints (all under KMPermissions.Klives):
+    /// Endpoints (gated by the omniscience.replica.* permissions):
     ///   GET  /omniscience/replica/status?personId=...
     ///   POST /omniscience/replica/train          { personId }
     ///   GET  /omniscience/replica/job?jobId=...
@@ -43,7 +44,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.ReplicaRead);
 
             await service.CreateAPIRoute("/omniscience/replica/train", async req =>
             {
@@ -69,7 +70,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(new JObject { ["ok"] = true, ["job_id"] = jobId }.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReplicaTrain);
 
             await service.CreateAPIRoute("/omniscience/replica/job", async req =>
             {
@@ -82,7 +83,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.ReplicaRead);
 
             // ── chats ──
 
@@ -96,7 +97,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.ReplicaRead);
 
             await service.CreateAPIRoute("/omniscience/replica/chats/new", async req =>
             {
@@ -110,7 +111,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(new JObject { ["ok"] = true, ["chat_id"] = chatId }.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReplicaChat);
 
             await service.CreateAPIRoute("/omniscience/replica/chats/rename", async req =>
             {
@@ -124,7 +125,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(new JObject { ["ok"] = true }.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReplicaChat);
 
             await service.CreateAPIRoute("/omniscience/replica/chats/delete", async req =>
             {
@@ -137,7 +138,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(new JObject { ["ok"] = true }.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReplicaChat);
 
             await service.CreateAPIRoute("/omniscience/replica/chats/messages", async req =>
             {
@@ -149,7 +150,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.ReplicaRead);
 
             await service.CreateAPIRoute("/omniscience/replica/chats/send", async req =>
             {
@@ -180,7 +181,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReplicaChat);
 
             // ── notifications ──
 
@@ -192,7 +193,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.PersonsRead);
 
             await service.CreateAPIRoute("/omniscience/notifications/dismiss", async req =>
             {
@@ -205,7 +206,7 @@ namespace Omnipotent.Services.Omniscience
                     await req.ReturnResponse(new JObject { ["ok"] = true }.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReviewAct);
         }
 
         // ── payload builders ──

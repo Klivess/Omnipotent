@@ -1,27 +1,61 @@
-﻿using DSharpPlus;
-using LangChain.Providers;
-using Microsoft.CodeAnalysis.CSharp.Syntax;
+using System.Collections.Concurrent;
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
-using Omnipotent.Klives_Management;
+using Omnipotent.Profiles.Activity;
+using Omnipotent.Profiles.Credentials;
+using Omnipotent.Profiles.Permissions;
+using Omnipotent.Profiles.Sessions;
 using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveAPI.Caching;
 using Omnipotent.Services.KliveBot_Discord;
-using System.Net;
-using System.Net.WebSockets;
-using System.Text;
-using System.Threading;
-using System.Xml.Linq;
-using static System.Runtime.InteropServices.JavaScript.JSType;
 
 namespace Omnipotent.Profiles
 {
-    public class KMProfileManager : OmniService
+    /// <summary>
+    /// Klives Management profiles: who can sign in, what each profile may do (permissions), their
+    /// sessions, what they are doing (activity + presence) and the live controls over all of it.
+    ///
+    /// Profiles are copy-on-write: every change clones the profile, applies the change, persists it
+    /// and swaps the new instance in. A request holding a profile therefore always sees one
+    /// consistent version, and readers never take a lock.
+    /// </summary>
+    public partial class KMProfileManager : OmniService
     {
         private const string profileFileExtension = ".kmp";
-        public List<KMProfile> Profiles;
-        private readonly object profileIndexLock = new();
-        private Dictionary<string, KMProfile> profilesByPassword = new(StringComparer.Ordinal);
+        public const int CurrentSchemaVersion = 2;
+
+        private volatile IReadOnlyList<KMProfile> profiles = Array.Empty<KMProfile>();
+        private readonly object indexLock = new();
         private Dictionary<string, KMProfile> profilesById = new(StringComparer.Ordinal);
+        private Dictionary<string, KMProfile> profilesByLookup = new(StringComparer.OrdinalIgnoreCase);
+        private readonly SemaphoreSlim mutationLock = new(1, 1);
+
+        private ProfileCredentials? credentials;
+        private readonly LoginThrottle loginThrottle = new();
+        private volatile bool acceptPasswordAsBearer = true;
+        private volatile bool loaded;
+
+        /// <summary>Profiles migrated from ranks during this process run, with the rank they had.</summary>
+        private readonly ConcurrentDictionary<string, ProfileRank> migratedThisRun = new(StringComparer.Ordinal);
+
+        private string? internalOwnerToken;
+        private readonly object internalTokenGate = new();
+
+        public SessionStore Sessions { get; private set; } = null!;
+        public ProfileActivityStore? Activity { get; private set; }
+        public PresenceTracker Presence { get; } = new();
+
+        /// <summary>Every profile (immutable snapshot).</summary>
+        public IReadOnlyList<KMProfile> Profiles => profiles;
+        public bool IsLoaded => loaded;
+
+        /// <summary>
+        /// Website requests may still send the profile password as the bearer credential until the
+        /// new session-based site is live. Controlled by the OmniSetting
+        /// <c>KMProfiles_AcceptPasswordAsBearer</c>; when it is off only profiles with
+        /// <see cref="KMProfile.AllowPasswordApiAccess"/> may authenticate with a password.
+        /// </summary>
+        public bool AcceptPasswordAsBearer => acceptPasswordAsBearer;
 
         public KMProfileManager()
         {
@@ -29,647 +63,772 @@ namespace Omnipotent.Profiles
             threadAnteriority = ThreadAnteriority.Standard;
         }
 
-        // Lightweight audit hook into OmniDefence. Errors are swallowed so a missing
-        // OmniDefence service never breaks profile operations.
-        private async Task AuditAction(KMProfile? actor, string category, string action, object? detail = null)
-        {
-            try
-            {
-                await ExecuteServiceMethod<Omnipotent.Services.OmniDefence.OmniDefence>(
-                    "RecordProfileAction", actor, category, action, detail, (string?)null);
-            }
-            catch { }
-        }
+        private static string Dir => OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesManagementInfoDirectory);
 
-        // Fire-and-forget Discord "so-and-so logged in" notification that swallows its own
-        // errors, so a slow/booting Discord bot can never delay the login response.
-        private async Task SafeNotifyLogin(string profileName)
-        {
-            try
-            {
-                await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{profileName} has logged into Klives Management.");
-            }
-            catch { }
-        }
         protected override async void ServiceMain()
         {
-            await LoadAllProfiles();
-            if (!Profiles.Any())
+            try
             {
-                RequestProfileFromKlives();
+                PermissionCatalog.EnsureLoaded();
+                PermissionCatalog.Registered += OnPermissionRegistered;
+
+                Directory.CreateDirectory(OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesManagementProfilesDirectory));
+                await LoadAllProfiles();
+
+                credentials = new ProfileCredentials(Path.Combine(Dir, "credential-lookup.key"),
+                    () => profiles.Any(p => !string.IsNullOrEmpty(p.PasswordLookup)),
+                    msg => _ = ServiceLog(msg));
+                credentials.VerifyKeyCheck(Path.Combine(Dir, "credential-lookup.check"));
+
+                Sessions = new SessionStore(Path.Combine(Dir, "sessions.json"), msg => _ = ServiceLog(msg));
+                Sessions.Load();
+                Sessions.Revoked += OnSessionRevoked;
+
+                await MigrateProfilesAsync();
+                RebuildIndexes();
+                loaded = true;
+
+                Activity = new ProfileActivityStore(Path.Combine(Dir, "profile_activity.db"), msg => _ = ServiceLog(msg));
+                Activity.Start();
+                Presence.PageLeft += OnPageLeft;
+
+                if (!profiles.Any())
+                {
+                    _ = RequestProfileFromKlives();
+                }
+
+                CreateRoutes();
+                _ = MaintenanceLoop();
             }
-            CreateRoutes();
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Klives Management Profile Manager failed to start.");
+            }
         }
 
-        public async Task RequestProfileFromKlives()
-        {
-            var password = (string)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord", "No profiles detected in Klives Management", "As I am making your profile, please provide me with a password.", TimeSpan.FromDays(3), "Password here! Turn off screenshare!", "Password");
-            await CreateNewProfile("Klives", KMPermissions.Klives, password);
-        }
+        // ───────────────────────────── profile model ─────────────────────────────
 
-        public bool CheckIfProfileExists(string password)
-        {
-            return GetProfileByPasswordFast(password) != null;
-        }
         public class KMProfile
         {
-            public string UserID;
-            public string Name;
+            public string UserID = "";
+            public string Name = "";
             public DateTime CreationDate;
-            public KMPermissions KlivesManagementRank;
-            public string Password;
-            public string DiscordID;
+
+            /// <summary>Hierarchy label only — see <see cref="ProfileRank"/>. Never grants access.</summary>
+            [JsonProperty("KlivesManagementRank")]
+            public ProfileRank Rank;
+
+            /// <summary>Plaintext from before schema 2. Cleared by migration; never written again.</summary>
+            [JsonProperty("Password", NullValueHandling = NullValueHandling.Ignore)]
+            public string? LegacyPassword;
+
+            /// <summary>HMAC of the password under the local lookup key (see <see cref="ProfileCredentials"/>).</summary>
+            public string? PasswordLookup;
+            /// <summary>Salted PBKDF2 hash of the password.</summary>
+            public string? PasswordHash;
+            public DateTime? PasswordChangedUtc;
+
+            public string? DiscordID;
             public bool CanLogin { get; set; }
+
+            /// <summary>May the password itself be used as an API credential (scripts, devices)?</summary>
+            public bool AllowPasswordApiAccess;
+
+            public string? CreatedById;
+            public DateTime? LastLoginUtc;
+
+            // ── Permission model (replaces rank-based access; see Permissions/) ──
+            /// <summary>The owner (Klives): holds every current and future permission.</summary>
+            public bool IsOwner;
+            public List<PermissionGrant> Grants = new();
+            public DateTime? SuspendedUntilUtc;
+            public string? SuspensionReason;
+            public string? SuspendedById;
+            /// <summary>Read-only lockdown: every permission of tier Act or above is refused.</summary>
+            public bool ReadOnly;
+            /// <summary>Bumped on every access change; the website refreshes when it moves.</summary>
+            public long AccessVersion;
+            public int SchemaVersion;
+
+            [JsonIgnore]
+            private ProfileAccessSnapshot? accessSnapshot;
+
+            public bool IsSuspended(DateTime nowUtc) => SuspendedUntilUtc is DateTime until && until > nowUtc;
+
+            /// <summary>
+            /// Whether an active grant (or a key implied by one) covers <paramref name="key"/>. The
+            /// effective set is rebuilt only when grants change or a temporary grant lapses.
+            /// </summary>
+            public bool HoldsPermission(string key, DateTime nowUtc)
+            {
+                if (IsOwner) return true;
+                return EffectiveKeys(nowUtc).Contains(key);
+            }
+
+            /// <summary>Every key this profile holds right now (owner: every catalog key).</summary>
+            public IReadOnlySet<string> EffectiveKeys(DateTime nowUtc)
+            {
+                if (IsOwner) return PermissionCatalog.All.Select(d => d.Key).ToHashSet(StringComparer.Ordinal);
+                var snapshot = accessSnapshot;
+                if (snapshot == null || (snapshot.RebuildAfterUtc is DateTime rebuild && nowUtc >= rebuild))
+                {
+                    snapshot = ProfileAccessSnapshot.Build(Grants ?? new(), nowUtc);
+                    accessSnapshot = snapshot;
+                }
+                return snapshot.Effective;
+            }
+
+            /// <summary>Drops the cached effective set after <see cref="Grants"/> changes.</summary>
+            public void InvalidateAccessSnapshot() => accessSnapshot = null;
 
             public string CreateProfilePath()
             {
                 return Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesManagementProfilesDirectory), $"{UserID}profile{profileFileExtension}");
             }
-        }
 
-        public async Task<KMProfile> CreateNewProfile(string name, KMPermissions rank, string password)
-        {
-            KMProfile profile = new();
-            profile.UserID = RandomGeneration.GenerateRandomLengthOfNumbers(8);
-            profile.Name = name;
-            profile.CreationDate = DateTime.Now;
-            profile.KlivesManagementRank = rank;
-            profile.Password = password;
-            profile.CanLogin = true;
-            await SaveProfileAsync(profile);
-            Profiles.Add(profile);
-            AddOrUpdateProfileIndex(profile);
-            ServiceLog($"Created new KM Profile '{profile.Name}, with permissions {rank.ToString()}.'");
-            return profile;
-        }
-
-        public async Task SaveProfileAsync(KMProfile profile)
-        {
-            string json = JsonConvert.SerializeObject(profile);
-            await GetDataHandler().WriteToFile(profile.CreateProfilePath(), json);
-        }
-
-        public async void UpdateProfileWithID(string userID, KMProfile profile)
-        {
-            var oldProfile = Profiles.FirstOrDefault(k => k.UserID == userID);
-            if (oldProfile != null)
+            internal KMProfile Clone()
             {
-                Profiles.Remove(oldProfile);
-                Profiles.Add(profile);
-                await SaveProfileAsync(profile);
-            }
-            Profiles = Profiles.OrderBy(k => k.UserID).ToList();
-            RebuildProfileIndexes();
-        }
-
-        private void RebuildProfileIndexes()
-        {
-            lock (profileIndexLock)
-            {
-                profilesByPassword = new Dictionary<string, KMProfile>(StringComparer.Ordinal);
-                profilesById = new Dictionary<string, KMProfile>(StringComparer.Ordinal);
-                foreach (var profile in Profiles ?? new List<KMProfile>())
-                {
-                    if (profile == null) continue;
-                    if (!string.IsNullOrWhiteSpace(profile.Password)) profilesByPassword[profile.Password] = profile;
-                    if (!string.IsNullOrWhiteSpace(profile.UserID)) profilesById[profile.UserID] = profile;
-                }
+                var copy = JsonConvert.DeserializeObject<KMProfile>(JsonConvert.SerializeObject(this))!;
+                copy.Grants = (Grants ?? new()).Select(g => g.Clone()).ToList();
+                return copy;
             }
         }
 
-        private void AddOrUpdateProfileIndex(KMProfile profile)
-        {
-            if (profile == null) return;
-            lock (profileIndexLock)
-            {
-                if (!string.IsNullOrWhiteSpace(profile.Password)) profilesByPassword[profile.Password] = profile;
-                if (!string.IsNullOrWhiteSpace(profile.UserID)) profilesById[profile.UserID] = profile;
-            }
-        }
-
-        private void RemoveProfileFromIndex(KMProfile profile)
-        {
-            if (profile == null) return;
-            lock (profileIndexLock)
-            {
-                if (!string.IsNullOrWhiteSpace(profile.Password)) profilesByPassword.Remove(profile.Password);
-                if (!string.IsNullOrWhiteSpace(profile.UserID)) profilesById.Remove(profile.UserID);
-            }
-        }
-
-        public KMProfile GetProfileByPasswordFast(string password)
-        {
-            if (string.IsNullOrWhiteSpace(password)) return null;
-            lock (profileIndexLock)
-            {
-                return profilesByPassword.TryGetValue(password, out var profile) ? profile : null;
-            }
-        }
-
-        public KMProfile GetProfileByIDFast(string id)
-        {
-            if (string.IsNullOrWhiteSpace(id)) return null;
-            lock (profileIndexLock)
-            {
-                return profilesById.TryGetValue(id, out var profile) ? profile : null;
-            }
-        }
+        // ───────────────────────────── loading & indexes ─────────────────────────────
 
         private async Task LoadAllProfiles()
         {
-            Profiles = new();
-            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesManagementProfilesDirectory)).Where(k => Path.GetExtension(k) == profileFileExtension);
+            var loadedProfiles = new List<KMProfile>();
+            var files = Directory.GetFiles(OmniPaths.GetPath(OmniPaths.GlobalPaths.KlivesManagementProfilesDirectory))
+                .Where(k => Path.GetExtension(k) == profileFileExtension);
             foreach (var file in files)
             {
                 try
                 {
                     string data = await GetDataHandler().ReadDataFromFile(file);
                     var profile = JsonConvert.DeserializeObject<KMProfile>(data);
-                    if (profile != null) Profiles.Add(profile);
+                    if (profile != null && !string.IsNullOrWhiteSpace(profile.UserID))
+                    {
+                        profile.Grants ??= new();
+                        loadedProfiles.Add(profile);
+                    }
                 }
-                catch (Exception ex) { }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, $"Could not read profile file {Path.GetFileName(file)}; it was skipped.");
+                }
             }
-            RebuildProfileIndexes();
-            ServiceLog($"Loaded {Profiles.Count} Klives Management Profiles into memory.");
+            profiles = loadedProfiles.OrderBy(p => p.UserID, StringComparer.Ordinal).ToList();
+            RebuildIndexes();
+            ServiceLog($"Loaded {profiles.Count} Klives Management Profiles into memory.");
         }
 
-        public Task<KMProfile> GetProfileByPassword(string password)
+        private void RebuildIndexes()
         {
-            return Task.FromResult(GetProfileByPasswordFast(password));
-        }
-
-        public Task<KMProfile> GetProfileByID(string id)
-        {
-            return Task.FromResult(GetProfileByIDFast(id));
-        }
-
-        private static KMProfile CreateProfileResponseCopy(KMProfile profile, bool includePassword)
-        {
-            return new KMProfile
+            lock (indexLock)
             {
-                UserID = profile.UserID,
-                Name = profile.Name,
-                CreationDate = profile.CreationDate,
-                KlivesManagementRank = profile.KlivesManagementRank,
-                Password = includePassword ? profile.Password : "***",
-                DiscordID = profile.DiscordID,
-                CanLogin = profile.CanLogin
-            };
+                var byId = new Dictionary<string, KMProfile>(StringComparer.Ordinal);
+                var byLookup = new Dictionary<string, KMProfile>(StringComparer.OrdinalIgnoreCase);
+                foreach (var profile in profiles.OrderBy(p => p.CreationDate))
+                {
+                    byId[profile.UserID] = profile;
+                    if (!string.IsNullOrWhiteSpace(profile.PasswordLookup) && !byLookup.ContainsKey(profile.PasswordLookup))
+                        byLookup[profile.PasswordLookup] = profile;
+                }
+                profilesById = byId;
+                profilesByLookup = byLookup;
+            }
         }
 
-        private static async Task SendSessionWatchStateAsync(WebSocket socket, string state)
+        public KMProfile? GetProfileByIDFast(string? id)
         {
-            if (socket == null || socket.State != WebSocketState.Open)
+            if (string.IsNullOrWhiteSpace(id)) return null;
+            CacheDeps.NoteRead("kmprofiles");
+            lock (indexLock)
             {
-                return;
+                return profilesById.TryGetValue(id, out var profile) ? profile : null;
+            }
+        }
+
+        public Task<KMProfile?> GetProfileByID(string id) => Task.FromResult(GetProfileByIDFast(id));
+
+        /// <summary>
+        /// Resolves a credential (session token or password) to its profile. Kept under its old name
+        /// for callers that still invoke it by reflection.
+        /// </summary>
+        public Task<KMProfile?> GetProfileByPassword(string credential) => Task.FromResult(Authenticate(credential).Profile);
+
+        public KMProfile? GetOwner() => profiles.FirstOrDefault(p => p.IsOwner);
+
+        // ───────────────────────────── authentication ─────────────────────────────
+
+        public readonly record struct AuthResult(KMProfile? Profile, KMSession? Session, AccessDenyReason Failure, string? Method);
+
+        /// <summary>
+        /// Resolves an Authorization value: a session token (<c>kms_…</c>, optionally "Bearer "-prefixed)
+        /// or a password. Never throws, never waits.
+        /// </summary>
+        public AuthResult Authenticate(string? rawCredential, string? ip = null, bool touch = true)
+        {
+            string? credential = ProfileCredentials.NormalizeCredential(rawCredential);
+            if (credential == null) return new AuthResult(null, null, AccessDenyReason.NoCredential, null);
+            if (!loaded) return new AuthResult(null, null, AccessDenyReason.InvalidCredential, null);
+            DateTime now = DateTime.UtcNow;
+
+            if (ProfileCredentials.IsSessionToken(credential))
+            {
+                var validation = Sessions.Validate(credential, now);
+                if (validation.Session == null) return new AuthResult(null, null, validation.Failure, "session");
+                var profile = GetProfileByIDFast(validation.Session.ProfileId);
+                if (profile == null)
+                {
+                    Sessions.Revoke(validation.Session.SessionId, null, "Profile deleted");
+                    return new AuthResult(null, null, AccessDenyReason.InvalidCredential, "session");
+                }
+                if (touch) Sessions.Touch(validation.Session, now, ip);
+                return new AuthResult(profile, validation.Session, AccessDenyReason.None, "session");
             }
 
-            string payload = JsonConvert.SerializeObject(new
+            var byPassword = FindByPassword(credential);
+            if (byPassword == null) return new AuthResult(null, null, AccessDenyReason.InvalidCredential, "password");
+            if (!byPassword.AllowPasswordApiAccess && !acceptPasswordAsBearer)
+                return new AuthResult(null, null, AccessDenyReason.InvalidCredential, "password");
+            return new AuthResult(byPassword, null, AccessDenyReason.None, "password");
+        }
+
+        /// <summary>O(1): HMAC lookup. Falls back to plaintext only for a profile whose migration failed.</summary>
+        private KMProfile? FindByPassword(string password)
+        {
+            if (string.IsNullOrEmpty(password)) return null;
+            if (credentials != null)
+            {
+                string lookup = credentials.ComputeLookup(password);
+                lock (indexLock)
+                {
+                    if (profilesByLookup.TryGetValue(lookup, out var hit)) return hit;
+                }
+            }
+            foreach (var p in profiles)
+            {
+                if (p.PasswordHash == null && p.LegacyPassword != null
+                    && System.Security.Cryptography.CryptographicOperations.FixedTimeEquals(
+                        System.Text.Encoding.UTF8.GetBytes(p.LegacyPassword), System.Text.Encoding.UTF8.GetBytes(password)))
+                    return p;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Full login check (lookup + PBKDF2). When the lookup key was regenerated, verifies hashes
+        /// directly and repairs the profile's lookup.
+        /// </summary>
+        private async Task<KMProfile?> VerifyLoginPasswordAsync(string password)
+        {
+            var candidate = FindByPassword(password);
+            if (candidate != null)
+            {
+                if (candidate.PasswordHash == null) return candidate; // legacy plaintext matched exactly
+                if (ProfileCredentials.VerifyPassword(password, candidate.PasswordHash)) return candidate;
+            }
+            if (credentials?.LookupsStale == true)
+            {
+                foreach (var p in profiles)
+                {
+                    if (!ProfileCredentials.VerifyPassword(password, p.PasswordHash)) continue;
+                    string lookup = credentials.ComputeLookup(password);
+                    await MutateProfileAsync(p.UserID, clone => clone.PasswordLookup = lookup, accessChanged: false);
+                    return GetProfileByIDFast(p.UserID);
+                }
+            }
+            return null;
+        }
+
+        /// <summary>True when no other profile already uses this password (passwords identify profiles).</summary>
+        private bool IsPasswordAvailable(string password, string? exceptProfileId)
+        {
+            var existing = FindByPassword(password);
+            return existing == null || existing.UserID == exceptProfileId;
+        }
+
+        private void ApplyPassword(KMProfile clone, string password)
+        {
+            clone.PasswordHash = ProfileCredentials.HashPassword(password);
+            clone.PasswordLookup = credentials?.ComputeLookup(password);
+            clone.LegacyPassword = null;
+            clone.PasswordChangedUtc = DateTime.UtcNow;
+        }
+
+        /// <summary>
+        /// An owner credential for Omnipotent's own loopback API calls (KliveAgent's omni_api tool),
+        /// so they no longer need the owner's password. In-memory only, valid for this process run.
+        /// </summary>
+        public string? IssueInternalToken()
+        {
+            if (internalOwnerToken != null) return internalOwnerToken;
+            lock (internalTokenGate)
+            {
+                if (internalOwnerToken != null) return internalOwnerToken;
+                var owner = GetOwner();
+                if (owner == null || Sessions == null) return null;
+                var (token, _) = Sessions.Issue(owner.UserID, "127.0.0.1", "Omnipotent internal", SessionKind.Internal);
+                internalOwnerToken = token;
+                return token;
+            }
+        }
+
+        // ───────────────────────────── mutation ─────────────────────────────
+
+        /// <summary>
+        /// Clones the profile, applies <paramref name="mutate"/>, persists it and swaps it in. When
+        /// <paramref name="accessChanged"/> is true the access version moves, cached responses that
+        /// depended on the profile's access are invalidated and its open tabs are told to refresh.
+        /// </summary>
+        public async Task<KMProfile?> MutateProfileAsync(string userId, Action<KMProfile> mutate, bool accessChanged = true)
+        {
+            await mutationLock.WaitAsync();
+            KMProfile updated;
+            try
+            {
+                var current = GetProfileByIDFast(userId);
+                if (current == null) return null;
+                updated = current.Clone();
+                mutate(updated);
+                updated.InvalidateAccessSnapshot();
+                if (accessChanged) updated.AccessVersion++;
+                await SaveProfileAsync(updated);
+                profiles = profiles.Select(p => p.UserID == userId ? updated : p).ToList();
+                RebuildIndexes();
+            }
+            finally
+            {
+                mutationLock.Release();
+            }
+            CacheDeps.Bump("kmprofiles");
+            if (accessChanged)
+            {
+                CacheDeps.Bump(AccessDependencyKey(userId));
+                PushToProfile(userId, new { type = "access-changed", version = updated.AccessVersion });
+            }
+            return updated;
+        }
+
+        /// <summary>The cache dependency every in-handler access check notes (see UserRequest.Can).</summary>
+        public static string AccessDependencyKey(string userId) => $"kmprofile:{userId}:access";
+
+        public async Task SaveProfileAsync(KMProfile profile)
+        {
+            string json = JsonConvert.SerializeObject(profile, Formatting.Indented);
+            await GetDataHandler().WriteToFile(profile.CreateProfilePath(), json);
+        }
+
+        private async Task<KMProfile> CreateProfileCoreAsync(string name, ProfileRank rank, string password, bool isOwner,
+            string? createdById, string? discordId, IEnumerable<PermissionGrant>? grants, bool allowPasswordApiAccess)
+        {
+            await mutationLock.WaitAsync();
+            KMProfile profile;
+            try
+            {
+                string id;
+                do { id = RandomGeneration.GenerateRandomLengthOfNumbers(8); } while (GetProfileByIDFast(id) != null);
+                profile = new KMProfile
+                {
+                    UserID = id,
+                    Name = name,
+                    CreationDate = DateTime.Now,
+                    Rank = isOwner ? ProfileRank.Klives : rank,
+                    IsOwner = isOwner,
+                    CanLogin = true,
+                    DiscordID = discordId,
+                    CreatedById = createdById,
+                    AllowPasswordApiAccess = isOwner || allowPasswordApiAccess,
+                    Grants = grants?.ToList() ?? new List<PermissionGrant>(),
+                    SchemaVersion = CurrentSchemaVersion,
+                    AccessVersion = 1,
+                };
+                ApplyPassword(profile, password);
+                await SaveProfileAsync(profile);
+                profiles = profiles.Append(profile).ToList();
+                RebuildIndexes();
+            }
+            finally
+            {
+                mutationLock.Release();
+            }
+            CacheDeps.Bump("kmprofiles");
+            ServiceLog($"Created KM profile '{profile.Name}' ({profile.Rank}, {(profile.IsOwner ? "owner" : profile.Grants.Count + " permissions")}).");
+            return profile;
+        }
+
+        private async Task<bool> DeleteProfileCoreAsync(string userId)
+        {
+            await mutationLock.WaitAsync();
+            KMProfile? profile;
+            try
+            {
+                profile = GetProfileByIDFast(userId);
+                if (profile == null) return false;
+                profiles = profiles.Where(p => p.UserID != userId).ToList();
+                RebuildIndexes();
+                await GetDataHandler().DeleteFile(profile.CreateProfilePath());
+            }
+            finally
+            {
+                mutationLock.Release();
+            }
+            CacheDeps.Bump("kmprofiles");
+            CacheDeps.Bump(AccessDependencyKey(userId));
+            PushToProfile(userId, new { type = "session-state", state = "ProfileNotFound" });
+            Sessions.RevokeAll(userId, null, "Profile deleted");
+            return true;
+        }
+
+        public async Task RequestProfileFromKlives()
+        {
+            try
+            {
+                var password = (string?)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscord",
+                    "No profiles detected in Klives Management", "As I am making your profile, please provide me with a password.",
+                    TimeSpan.FromDays(3), "Password here! Turn off screenshare!", "Password");
+                if (string.IsNullOrWhiteSpace(password)) return;
+                await CreateProfileCoreAsync("Klives", ProfileRank.Klives, password, isOwner: true, createdById: null,
+                    discordId: null, grants: null, allowPasswordApiAccess: true);
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Could not create the owner profile from Discord.");
+            }
+        }
+
+        // ───────────────────────────── migration ─────────────────────────────
+
+        /// <summary>
+        /// Schema 1 → 2: ranks become permissions (exactly the keys the rank could use, via each key's
+        /// LegacyRank), Klives becomes the owner, and plaintext passwords become a lookup + hash.
+        /// Each file is backed up as <c>*.kmp.v1.bak</c> first.
+        /// </summary>
+        private async Task MigrateProfilesAsync()
+        {
+            var notes = new List<string>();
+            var all = PermissionCatalog.All;
+            foreach (var original in profiles.ToList())
+            {
+                if (original.SchemaVersion < CurrentSchemaVersion) BackupProfileFile(original);
+                var (p, changed, note, legacy) = MigrateProfile(original, all, credentials, DateTime.UtcNow);
+                if (note != null) notes.Add(note);
+                if (legacy != null) migratedThisRun[p.UserID] = legacy.Value;
+                if (!changed) continue;
+                try
+                {
+                    await SaveProfileAsync(p);
+                    profiles = profiles.Select(x => x.UserID == p.UserID ? p : x).ToList();
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, $"Could not migrate profile {p.Name}; it keeps its old format for now.");
+                }
+            }
+
+            if (notes.Count > 0)
+            {
+                string summary = "Profiles converted from ranks to permissions:\n" + string.Join("\n", notes.Select(n => "• " + n));
+                ServiceLog(summary);
+                _ = SafeDiscord(summary);
+            }
+        }
+
+        /// <summary>
+        /// The pure part of migration (tested directly): ranks become exactly the keys whose
+        /// LegacyRank the rank reached, Klives becomes the owner, plaintext passwords become a
+        /// lookup + hash. Returns the migrated copy and, for non-owners, the rank they had.
+        /// </summary>
+        internal static (KMProfile Profile, bool Changed, string? Note, ProfileRank? LegacyRank) MigrateProfile(
+            KMProfile original, IReadOnlyList<PermissionDef> catalog, ProfileCredentials? credentials, DateTime now)
+        {
+            var p = original.Clone();
+            bool changed = false;
+            string? note = null;
+            ProfileRank? legacyRank = null;
+
+            if (p.SchemaVersion < CurrentSchemaVersion)
+            {
+                ProfileRank legacy = p.Rank;
+                if (legacy >= ProfileRank.Klives)
+                {
+                    p.IsOwner = true;
+                    p.Rank = ProfileRank.Klives;
+                    p.AllowPasswordApiAccess = true;
+                    p.Grants = new List<PermissionGrant>();
+                }
+                else
+                {
+                    if (p.Rank < ProfileRank.Guest) p.Rank = ProfileRank.Guest;
+                    p.Grants = catalog.Where(d => d.IsStandard && d.LegacyRank != ProfileRank.Klives && d.LegacyRank <= legacy)
+                        .Select(d => new PermissionGrant
+                        {
+                            Key = d.Key,
+                            GrantedUtc = now,
+                            GrantedById = "migration",
+                            Note = $"Converted from rank {legacy}",
+                        }).ToList();
+                    legacyRank = legacy;
+                }
+                p.SchemaVersion = CurrentSchemaVersion;
+                p.AccessVersion++;
+                note = p.IsOwner ? $"{p.Name}: owner" : $"{p.Name}: {p.Grants.Count} permissions (was {legacy})";
+                changed = true;
+            }
+
+            if (p.LegacyPassword != null && credentials != null)
+            {
+                if (p.PasswordHash == null) p.PasswordHash = ProfileCredentials.HashPassword(p.LegacyPassword);
+                p.PasswordLookup = credentials.ComputeLookup(p.LegacyPassword);
+                p.PasswordChangedUtc ??= now;
+                p.LegacyPassword = null;
+                changed = true;
+            }
+            p.InvalidateAccessSnapshot();
+            return (p, changed, note, legacyRank);
+        }
+
+        /// <summary>
+        /// Test seam: loads profiles and wires credentials and sessions under
+        /// <paramref name="dataDirectory"/> without starting the service.
+        /// </summary>
+        internal void InitializeForTests(IEnumerable<KMProfile> initialProfiles, string dataDirectory)
+        {
+            PermissionCatalog.EnsureLoaded();
+            Directory.CreateDirectory(dataDirectory);
+            profiles = initialProfiles.ToList();
+            credentials = new ProfileCredentials(Path.Combine(dataDirectory, "credential-lookup.key"),
+                () => profiles.Any(p => !string.IsNullOrEmpty(p.PasswordLookup)), _ => { });
+            Sessions = new SessionStore(Path.Combine(dataDirectory, "sessions.json"), _ => { });
+            Sessions.Load();
+            Sessions.Revoked += OnSessionRevoked;
+            profiles = profiles.Select(p => MigrateProfile(p, PermissionCatalog.All, credentials, DateTime.UtcNow).Profile).ToList();
+            RebuildIndexes();
+            loaded = true;
+        }
+
+        /// <summary>Test seam: the in-process credential helper.</summary>
+        internal ProfileCredentials? Credentials => credentials;
+
+        private static void BackupProfileFile(KMProfile profile)
+        {
+            try
+            {
+                string path = profile.CreateProfilePath();
+                string backup = path + ".v1.bak";
+                if (File.Exists(path) && !File.Exists(backup)) File.Copy(path, backup);
+            }
+            catch { /* the migration itself is still safe; the backup is a courtesy */ }
+        }
+
+        /// <summary>
+        /// A key registered at runtime (one per KliveTools tool) is granted to profiles migrated during
+        /// this run whose old rank could use it — so a tool that loads after migration isn't lost.
+        /// Keys registered in later runs are new features and start owner-only.
+        /// </summary>
+        private void OnPermissionRegistered(PermissionDef def)
+        {
+            if (!def.IsStandard || def.LegacyRank == ProfileRank.Klives || migratedThisRun.IsEmpty) return;
+            foreach (var (userId, legacy) in migratedThisRun)
+            {
+                if (legacy < def.LegacyRank) continue;
+                _ = MutateProfileAsync(userId, p =>
+                {
+                    if (p.Grants.Any(g => g.Key == def.Key)) return;
+                    p.Grants.Add(new PermissionGrant { Key = def.Key, GrantedUtc = DateTime.UtcNow, GrantedById = "migration", Note = $"Converted from rank {legacy}" });
+                });
+            }
+        }
+
+        // ───────────────────────────── upkeep ─────────────────────────────
+
+        private async Task MaintenanceLoop()
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    acceptPasswordAsBearer = await GetBoolOmniSetting("KMProfiles_AcceptPasswordAsBearer", defaultValue: true);
+                }
+                catch { /* settings not ready yet: keep the last value */ }
+                try { Sessions?.FlushIfDirty(); } catch { }
+                try { ExpireSuspensions(); } catch { }
+                try { await Task.Delay(TimeSpan.FromSeconds(30), cancellationToken.Token); }
+                catch (OperationCanceledException) { break; }
+            }
+            try { Sessions?.FlushIfDirty(); } catch { }
+        }
+
+        /// <summary>Lifts suspensions whose time has passed so the profile's tabs refresh.</summary>
+        private void ExpireSuspensions()
+        {
+            DateTime now = DateTime.UtcNow;
+            foreach (var p in profiles.Where(p => p.SuspendedUntilUtc != null && p.SuspendedUntilUtc <= now).ToList())
+            {
+                _ = MutateProfileAsync(p.UserID, clone =>
+                {
+                    clone.SuspendedUntilUtc = null;
+                    clone.SuspensionReason = null;
+                    clone.SuspendedById = null;
+                });
+                RecordEvent(p.UserID, "access.unsuspended", null, new { automatic = true });
+            }
+        }
+
+        private void OnSessionRevoked(KMSession session)
+        {
+            Presence.SendToSession(session.SessionId, JsonConvert.SerializeObject(new
             {
                 type = "session-state",
-                state
+                state = "SessionRevoked",
+                reason = session.RevokeReason,
+            }));
+        }
+
+        private void OnPageLeft(PresenceConnection conn, string path, DateTime sinceUtc, long dwellMs)
+        {
+            Activity?.EnqueuePageView(new ActivityPageView
+            {
+                ProfileId = conn.ProfileId,
+                SessionId = conn.SessionId,
+                TsMs = new DateTimeOffset(sinceUtc).ToUnixTimeMilliseconds(),
+                Path = path,
+                Title = conn.Title,
+                DwellMs = dwellMs,
             });
-
-            byte[] buffer = Encoding.UTF8.GetBytes(payload);
-            await socket.SendAsync(new ArraySegment<byte>(buffer), WebSocketMessageType.Text, true, CancellationToken.None);
         }
 
-        public enum KMPermissions
+        // ───────────────────────────── activity & notifications ─────────────────────────────
+
+        /// <summary>Called by KliveAPI for every request a profile makes (batch items individually).</summary>
+        public void RecordRequest(KMProfile profile, KMSession? session, string method, string route, PermissionDef? permission,
+            int status, double durationMs, string? ip, string? page, string? denyReason, bool viaBatch)
         {
-            Anybody = 0,
-            Guest = 1,
-            Manager = 2,
-            Associate = 3,
-            Admin = 4,
-            Klives = 5
+            var store = Activity;
+            if (store == null || profile == null) return;
+            if (session?.Kind == SessionKind.Internal) return;
+            if (route.Equals("/KliveAPI/telemetry/rum", StringComparison.OrdinalIgnoreCase)) return;
+            store.EnqueueRequest(new ActivityRequest
+            {
+                ProfileId = profile.UserID,
+                TsMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                SessionId = session?.SessionId,
+                Method = method,
+                Route = route,
+                PermKey = permission?.IsStandard == true ? permission.Key : permission?.Key,
+                Service = permission?.IsStandard == true ? permission.Service : "Account",
+                Status = status,
+                DurationMs = durationMs,
+                Ip = ip,
+                Page = page,
+                DenyReason = denyReason,
+                ViaBatch = viaBatch,
+            });
         }
 
-        private async void CreateRoutes()
+        public void RecordEvent(string profileId, string kind, KMProfile? actor, object? detail = null, string? ip = null)
         {
+            Activity?.EnqueueEvent(new ActivityEvent
+            {
+                ProfileId = profileId,
+                TsMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Kind = kind,
+                ActorId = actor?.UserID,
+                ActorName = actor?.Name,
+                Ip = ip,
+                DetailJson = detail == null ? null : JsonConvert.SerializeObject(detail),
+            });
+        }
 
-            await CreateAPIRoute("/KMProfiles/LoginStatus", async (req) =>
+        public int PushToProfile(string profileId, object message)
+            => Presence.SendToProfile(profileId, JsonConvert.SerializeObject(message));
+
+        /// <summary>Audit into OmniDefence. Fire-and-forget: OmniDefence's write lock must never delay a request.</summary>
+        private void Audit(KMProfile? actor, string category, string action, object? detail = null, string? ip = null)
+        {
+            _ = Task.Run(async () =>
             {
                 try
                 {
-                    // An authorization decision must never be replayed from cache: this
-                    // answers "may this credential log in right now?", and a stale
-                    // "Allowed" would outlive a disabled profile. The in-memory profile
-                    // index makes it O(1) anyway, so there is nothing to gain by caching.
-                    Omnipotent.Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("live authorization decision");
-
-                    if (req.user == null)
-                    {
-                        await req.ReturnResponse("ProfileNotFound", code: HttpStatusCode.Unauthorized);
-                        return;
-                    }
-                    var canLogin = req.user.CanLogin;
-                    if (canLogin)
-                    {
-                        await req.ReturnResponse("Allowed", code: HttpStatusCode.OK);
-                    }
-                    else
-                    {
-                        await req.ReturnResponse("ProfileDisabled", code: HttpStatusCode.Unauthorized);
-                    }
+                    await ExecuteServiceMethod<Omnipotent.Services.OmniDefence.OmniDefence>(
+                        "RecordProfileAction", actor, category, action, detail, ip);
                 }
-                catch (Exception ex)
+                catch { }
+            });
+        }
+
+        private void AuthEvent(string type, string? ip, KMProfile? profile, string? userAgent, string? detail)
+        {
+            _ = Task.Run(async () =>
+            {
+                try
                 {
-                    ServiceLogError(ex);
-                    await req.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMPermissions.Anybody);
-
-            await ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>(
-                "CreateWebSocketRoute",
-                "/KMProfiles/SessionWatch",
-                (Func<System.Net.HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfile?, Task>)(async (context, socket, queryParams, user) =>
-                {
-                    KMProfile resolvedProfile = user;
-                    string? authorization = queryParams["authorization"];
-
-                    if (resolvedProfile == null && !string.IsNullOrWhiteSpace(authorization))
-                    {
-                        resolvedProfile = await GetProfileByPassword(authorization);
-                    }
-
-                    if (resolvedProfile == null)
-                    {
-                        await SendSessionWatchStateAsync(socket, "ProfileNotFound");
-                        await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Profile not found", CancellationToken.None);
-                        return;
-                    }
-
-                    string watchedUserId = resolvedProfile.UserID;
-                    string watchedPassword = resolvedProfile.Password;
-                    await SendSessionWatchStateAsync(socket, "SessionActive");
-
-                    try
-                    {
-                        while (socket.State == WebSocketState.Open)
+                    await ExecuteServiceMethod<Omnipotent.Services.OmniDefence.OmniDefence>("RecordAuthEventAsync",
+                        new Omnipotent.Services.OmniDefence.AuthEventRow
                         {
-                            var liveProfile = Profiles.FirstOrDefault(profile => profile.UserID == watchedUserId);
-                            string? invalidationReason = null;
-                            string closeReason = "Session invalidated";
-
-                            if (liveProfile == null)
-                            {
-                                invalidationReason = "ProfileNotFound";
-                                closeReason = "Profile not found";
-                            }
-                            else if (!liveProfile.CanLogin)
-                            {
-                                invalidationReason = "ProfileDisabled";
-                                closeReason = "Profile disabled";
-                            }
-                            else if (!string.Equals(liveProfile.Password, watchedPassword, StringComparison.Ordinal))
-                            {
-                                invalidationReason = "PasswordChanged";
-                                closeReason = "Password changed";
-                            }
-
-                            if (invalidationReason != null)
-                            {
-                                await SendSessionWatchStateAsync(socket, invalidationReason);
-                                if (socket.State == WebSocketState.Open || socket.State == WebSocketState.CloseReceived)
-                                {
-                                    await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, closeReason, CancellationToken.None);
-                                }
-                                return;
-                            }
-
-                            await Task.Delay(1000);
-                        }
-                    }
-                    catch (WebSocketException)
-                    {
-                    }
-                }),
-                KMPermissions.Anybody);
-
-            await CreateAPIRoute("/KMProfiles/CreateProfile", async (request) =>
-            {
-                try
-                {
-                    var name = request.userParameters.Get("name");
-                    var rank = (KMPermissions)Convert.ToInt32(request.userParameters.Get("rank"));
-                    if (rank > (request.user.KlivesManagementRank + 1))
-                    {
-                        await request.ReturnResponse("RankTooHigh", code: HttpStatusCode.Forbidden);
-                        return;
-                    }
-                    var password = request.userParameters.Get("password");
-                    var profile = await CreateNewProfile(name, rank, password);
-                    string serialized = JsonConvert.SerializeObject(profile);
-                    await request.ReturnResponse(serialized, "application/json");
-                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"A new profile has been created with the name {name} and the rank {rank} by {request.user.Name}.");
-                    await AuditAction(request.user, "Profile", "CreateProfile", new { profile.UserID, profile.Name, rank = rank.ToString() });
+                            UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                            Ip = ip,
+                            Type = type,
+                            ProfileId = profile?.UserID,
+                            ProfileName = profile?.Name,
+                            Route = "/KMProfiles/Login",
+                            UserAgent = userAgent,
+                            Detail = detail,
+                        });
                 }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Associate);
-            await CreateAPIRoute("/KMProfiles/AttemptLogin", async (request) =>
+                catch { }
+            });
+        }
+
+        /// <summary>Discord message to Klives that can never delay the caller.</summary>
+        private Task SafeDiscord(string message)
+        {
+            return Task.Run(async () =>
             {
-                try
-                {
-                    var password = JsonConvert.DeserializeObject<string>(request.userMessageContent);
-                    if (CheckIfProfileExists(password) == false)
+                try { await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", message); }
+                catch { }
+            });
+        }
+
+        /// <summary>
+        /// Per-IP login throttle: the first few failures in ten minutes fail fast, after that each
+        /// attempt must wait an escalating delay (capped at five minutes).
+        /// </summary>
+        internal sealed class LoginThrottle
+        {
+            private const int FreeFailures = 3;
+            private static readonly TimeSpan Window = TimeSpan.FromMinutes(10);
+            private static readonly TimeSpan MaxDelay = TimeSpan.FromMinutes(5);
+            private readonly ConcurrentDictionary<string, (int Failures, DateTime WindowStart, DateTime BlockedUntil)> state = new();
+
+            public TimeSpan? RetryAfter(string ip, DateTime nowUtc)
+            {
+                if (!state.TryGetValue(ip, out var s)) return null;
+                if (nowUtc - s.WindowStart > Window) { state.TryRemove(ip, out _); return null; }
+                return s.BlockedUntil > nowUtc ? s.BlockedUntil - nowUtc : null;
+            }
+
+            public void Failed(string ip, DateTime nowUtc)
+            {
+                state.AddOrUpdate(ip,
+                    _ => (1, nowUtc, nowUtc),
+                    (_, s) =>
                     {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    else
-                    {
-                        var profile = await GetProfileByPassword(password);
-                        if (profile.CanLogin == true)
+                        if (nowUtc - s.WindowStart > Window) return (1, nowUtc, nowUtc);
+                        int failures = s.Failures + 1;
+                        DateTime blocked = nowUtc;
+                        if (failures > FreeFailures)
                         {
-                            // Login notification and audit logging are side effects — never make the
-                            // user wait on them. Both hit other services (Discord, OmniDefence's shared
-                            // SQLite lock) that can be busy right after startup; awaiting them here is
-                            // what used to hang AttemptLogin for many minutes. Fire-and-forget instead.
-                            if (profile.KlivesManagementRank != KMPermissions.Klives)
-                            {
-                                _ = SafeNotifyLogin(profile.Name);
-                            }
-                            _ = AuditAction(profile, "Auth", "Login");
-                            await request.ReturnResponse("true", "application/json");
+                            double seconds = Math.Min(MaxDelay.TotalSeconds, Math.Pow(2, failures - FreeFailures));
+                            blocked = nowUtc + TimeSpan.FromSeconds(seconds);
                         }
-                        else
-                        {
-                            await request.ReturnResponse("LoginDisabled", code: HttpStatusCode.Unauthorized);
-                            return;
-                        }
-                    }
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Anybody);
-            await CreateAPIRoute("/KMProfiles/GetProfileByID", async (request) =>
-            {
-                try
-                {
-                    var id = request.userParameters.Get("id");
-                    var profile = Profiles.FirstOrDefault(k => k.UserID == id);
-                    if (profile == null)
-                    {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    await request.ReturnResponse(JsonConvert.SerializeObject(CreateProfileResponseCopy(profile, request.user.KlivesManagementRank == KMPermissions.Klives)), "application/json");
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMPermissions.Associate);
-            await CreateAPIRoute("/KMProfiles/GetAllProfiles", async (request) =>
-            {
-                try
-                {
-                    bool includePassword = request.user.KlivesManagementRank == KMPermissions.Klives;
-                    List<KMProfile> kMProfiles = Profiles.Select(profile => CreateProfileResponseCopy(profile, includePassword)).ToList();
-                    string serialized = JsonConvert.SerializeObject(kMProfiles);
-                    await request.ReturnResponse(serialized, "application/json");
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMPermissions.Associate);
-            await CreateAPIRoute("/KMProfiles/GetCurrentProfile", async (request) =>
-            {
-                try
-                {
-                    if (request.user == null)
-                    {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.Unauthorized);
-                        return;
-                    }
+                        return (failures, s.WindowStart, blocked);
+                    });
+            }
 
-                    await request.ReturnResponse(JsonConvert.SerializeObject(new
-                    {
-                        request.user.UserID,
-                        request.user.Name,
-                        request.user.CreationDate,
-                        request.user.KlivesManagementRank,
-                        request.user.DiscordID,
-                        request.user.CanLogin
-                    }), "application/json");
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Get, KMPermissions.Guest);
-            await CreateAPIRoute("/KMProfiles/ChangeCanLogin", async (request) =>
-            {
-                try
-                {
-                    var id = request.userParameters.Get("id");
-                    var on = request.userParameters.Get("enabled").Trim();
-                    var profile = await GetProfileByID(id);
-                    if (on == "true" && profile.CanLogin == true)
-                    {
-                        await request.ReturnResponse("OK: Unchanged", code: HttpStatusCode.OK);
-                        return;
-                    }
-                    if (profile == null)
-                    {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    if (profile.KlivesManagementRank < request.user.KlivesManagementRank)
-                    {
-                        profile.CanLogin = (on == "true");
-                        UpdateProfileWithID(id, profile);
-                        await request.ReturnResponse("OK", code: HttpStatusCode.OK);
-                    }
-                    else
-                    {
-                        await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
-                    }
-                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just disabled {profile.Name}'s KMProfile.");
-                    await AuditAction(request.user, "Profile", "ChangeCanLogin", new { profile.UserID, profile.Name, canLogin = profile.CanLogin });
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Admin);
-            await CreateAPIRoute("/KMProfiles/ChangeProfileName", async (request) =>
-            {
-                try
-                {
-                    var id = request.userParameters.Get("id");
-                    var name = request.userParameters.Get("name");
-                    var profile = Profiles.FirstOrDefault(k => k.UserID == id);
-                    string originalName = profile.Name;
-                    if (profile.Name == name)
-                    {
-                        await request.ReturnResponse("ProfileNameUnchanged", code: HttpStatusCode.OK);
-                        return;
-                    }
-                    if (profile == null)
-                    {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    if (profile.KlivesManagementRank < request.user.KlivesManagementRank)
-                    {
-                        profile.Name = name;
-                        UpdateProfileWithID(id, profile);
-                        await request.ReturnResponse("ProfileNameChanged", code: HttpStatusCode.OK);
-                    }
-                    else
-                    {
-                        await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
-                    }
-                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {originalName}'s KMProfile username to {profile.Name}.");
-                    await AuditAction(request.user, "Profile", "ChangeProfileName", new { profile.UserID, oldName = originalName, newName = profile.Name });
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Admin);
-            await CreateAPIRoute("/KMProfiles/ChangeProfilePassword", async (request) =>
-            {
-                try
-                {
-                    var id = request.userParameters.Get("id");
-                    var password = request.userMessageContent;
-                    var profile = Profiles.FirstOrDefault(k => k.UserID == id);
-                    if (profile.Password == password)
-                    {
-                        await request.ReturnResponse("ProfilePasswordUnchanged", code: HttpStatusCode.OK);
-                        return;
-                    }
-                    if (profile == null)
-                    {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    if (profile.KlivesManagementRank < request.user.KlivesManagementRank)
-                    {
-                        profile.Password = password;
-                        UpdateProfileWithID(id, profile);
-                        await request.ReturnResponse("ProfilePasswordChanged", code: HttpStatusCode.OK);
-                    }
-                    else
-                    {
-                        await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
-                    }
-                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {profile.Name}'s KMProfile password.");
-                    await AuditAction(request.user, "Permission", "ChangeProfilePassword", new { profile.UserID, profile.Name });
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Klives);
-            await CreateAPIRoute("/KMProfiles/ChangeProfileRank", async (request) =>
-            {
-                try
-                {
-                    var id = request.userParameters.Get("id");
-                    var rank = (KMPermissions)Convert.ToInt32(request.userParameters.Get("rank"));
-                    var profile = Profiles.FirstOrDefault(k => k.UserID == id);
-                    if (profile.KlivesManagementRank == rank)
-                    {
-                        await request.ReturnResponse("ProfileRankUnchanged", code: HttpStatusCode.OK);
-                        return;
-                    }
-                    var originalRank = profile.KlivesManagementRank;
-                    if (profile == null)
-                    {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    if (profile.KlivesManagementRank < request.user.KlivesManagementRank)
-                    {
-                        profile.KlivesManagementRank = rank;
-                        UpdateProfileWithID(id, profile);
-                        await request.ReturnResponse("ProfileRankChanged", code: HttpStatusCode.OK);
-                    }
-                    else
-                    {
-                        await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
-                    }
-                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {profile.Name}'s KMProfile rank from {originalRank.ToString()} to {rank.ToString()}. Ominous!!");
-                    await AuditAction(request.user, "Permission", "ChangeProfileRank", new { profile.UserID, profile.Name, oldRank = originalRank.ToString(), newRank = rank.ToString() });
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Admin);
-            await CreateAPIRoute("/KMProfiles/DeleteProfile", async (request) =>
-            {
-                try
-                {
-                    var id = request.userParameters.Get("id");
-                    var profile = Profiles.FirstOrDefault(k => k.UserID == id);
-                    if (profile == null)
-                    {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    if (request.user.KlivesManagementRank == KMPermissions.Klives)
-                    {
-                        Profiles.Remove(profile);
-                        RemoveProfileFromIndex(profile);
-                        GetDataHandler().DeleteFile(profile.CreateProfilePath());
-                        await request.ReturnResponse("ProfileDeleted", code: HttpStatusCode.OK);
-                    }
-                    else
-                    {
-                        await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
-                    }
-                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just deleted {profile.Name}'s KMProfile.");
-                    await AuditAction(request.user, "Profile", "DeleteProfile", new { profile.UserID, profile.Name });
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Klives);
-            await CreateAPIRoute("/KMProfiles/ChangeProfileDiscordID", async (request) =>
-            {
-                try
-                {
-                    var id = request.userParameters.Get("id");
-                    var discID = request.userParameters.Get("DiscordID");
-                    var profile = Profiles.FirstOrDefault(k => k.UserID == id);
-                    if (profile.DiscordID == discID)
-                    {
-                        await request.ReturnResponse("ProfileDiscordIDUnchanged", code: HttpStatusCode.OK);
-                        return;
-                    }
-                    if (profile == null)
-                    {
-                        await request.ReturnResponse("ProfileNotFound", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    if (profile.KlivesManagementRank < request.user.KlivesManagementRank)
-                    {
-                        profile.DiscordID = discID;
-                        UpdateProfileWithID(id, profile);
-                        await request.ReturnResponse("ProfileNameChanged", code: HttpStatusCode.OK);
-                    }
-                    else
-                    {
-                        await request.ReturnResponse("ProfileRankTooHigh", code: HttpStatusCode.Forbidden);
-                    }
-                    await ExecuteServiceMethod<KliveBotDiscord>("SendMessageToKlives", $"{request.user.Name} just changed {profile.Name}'s KMProfile discordID to {profile.DiscordID}.");
-                }
-                catch (Exception ex)
-                {
-                    await request.ReturnResponse((new ErrorInformation(ex)).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
-                }
-            }, HttpMethod.Post, KMPermissions.Admin);
+            public void Succeeded(string ip) => state.TryRemove(ip, out _);
         }
     }
 }

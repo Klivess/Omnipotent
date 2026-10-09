@@ -8,6 +8,7 @@ using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Omniscience.Replica
 {
@@ -209,7 +210,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                     await req.ReturnResponse(new JObject(new JProperty("runs", arr)).ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Klives);
+            }, HttpMethod.Get, OmnisciencePerms.ReplicaRead);
 
             await service.CreateAPIRoute("/omniscience/replica/fidelity/run", async req =>
             {
@@ -227,7 +228,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                     await req.ReturnResponse("{\"ok\":true,\"message\":\"benchmark queued; poll /omniscience/replica/fidelity\"}");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Klives);
+            }, HttpMethod.Post, OmnisciencePerms.ReplicaTrain);
         }
 
         private static async Task Err(KliveAPI.KliveAPI.UserRequest req, Exception ex)

@@ -2,6 +2,7 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using Omnipotent.Profiles;
 using ApiService = Omnipotent.Services.KliveAPI.KliveAPI;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Tests.KliveAPI;
 
@@ -126,8 +127,8 @@ public sealed class KliveAPIStreamingTests
     {
         var api = new ApiService();
 
-        await api.CreateRoute("/legacy", _ => Task.CompletedTask, HttpMethod.Post, KMProfileManager.KMPermissions.Guest);
-        await api.CreateStreamingRoute("/stream", _ => Task.CompletedTask, HttpMethod.Put, KMProfileManager.KMPermissions.Klives, 1234);
+        await api.CreateRoute("/legacy", _ => Task.CompletedTask, HttpMethod.Post, Perms.SignedIn);
+        await api.CreateStreamingRoute("/stream", _ => Task.CompletedTask, HttpMethod.Put, KliveCloudPerms.FilesUpload, 1234);
 
         Assert.Equal(ApiService.RequestBodyMode.Buffered, api.ControllerLookup["/legacy"].requestBodyMode);
         Assert.Null(api.ControllerLookup["/legacy"].maxBodyBytes);

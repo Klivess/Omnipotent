@@ -4,6 +4,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveBot_Discord;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KlivesWorkoutManager
 {
@@ -222,7 +223,7 @@ namespace Omnipotent.Services.KlivesWorkoutManager
                 {
                     await ServiceLogError(e, "Failed to process workout notification.");
                 }
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Anybody);
+            }, HttpMethod.Post, Perms.Public);
         }
     }
 }

@@ -2,6 +2,7 @@ using Newtonsoft.Json;
 using Omnipotent.Services.KliveAPI;
 using System.Net;
 using static Omnipotent.Profiles.KMProfileManager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.Stratum
 {
@@ -30,7 +31,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(list));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             await parent.CreateAPIRoute("/stratum/projects/create", async req =>
             {
@@ -49,7 +50,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(ToProjectDetail(p)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.ProjectsManage);
 
             await parent.CreateAPIRoute("/stratum/projects/get", async req =>
             {
@@ -59,7 +60,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(ToProjectDetail(project)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             await parent.CreateAPIRoute("/stratum/projects/rename", async req =>
             {
@@ -73,7 +74,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(ToProjectDetail(parent.Storage.GetProject(project.ProjectID)!)));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.ProjectsManage);
 
             await parent.CreateAPIRoute("/stratum/projects/delete", async req =>
             {
@@ -84,7 +85,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.ProjectsManage);
 
             // ── Revisions ──
             await parent.CreateAPIRoute("/stratum/revisions/create", async req =>
@@ -99,7 +100,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(rev));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             // ── Artifacts ──
             // Upload binary as raw body. Query params: projectID, revisionID, kind, fileName, contentType.
@@ -130,7 +131,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(art));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             await parent.CreateAPIRoute("/stratum/artifacts/download", async req =>
             {
@@ -154,7 +155,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnBinaryResponse(bytes, art.ContentType);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             // Bulk download: zip every artifact in the project according to the requested scope.
             // Query: projectID, include=current|all|printables (default current).
@@ -174,7 +175,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnBinaryResponse(zip, "application/zip");
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             // ── Attachments ──
             await parent.CreateAPIRoute("/stratum/attachments/upload", async req =>
@@ -202,7 +203,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(att));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             await parent.CreateAPIRoute("/stratum/attachments/download", async req =>
             {
@@ -226,7 +227,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnBinaryResponse(bytes, att.ContentType);
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             await parent.CreateAPIRoute("/stratum/attachments/delete", async req =>
             {
@@ -238,7 +239,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             // ── Agent Runs ──
             // Legacy per-agent run starts — replaced by the unified Stratum Engineer conversation.
@@ -248,7 +249,7 @@ namespace Omnipotent.Services.Stratum
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { error = "Per-agent runs have been replaced by the unified Stratum Engineer. Use POST /stratum/conversation/send." }),
                     code: HttpStatusCode.Gone);
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             await parent.CreateAPIRoute("/stratum/runs/list", async req =>
             {
@@ -277,7 +278,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(runs));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             await parent.CreateAPIRoute("/stratum/runs/get", async req =>
             {
@@ -297,7 +298,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { run, currentGate = gate }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             await parent.CreateAPIRoute("/stratum/runs/events", async req =>
             {
@@ -331,7 +332,7 @@ namespace Omnipotent.Services.Stratum
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             await parent.CreateAPIRoute("/stratum/runs/cancel", async req =>
             {
@@ -349,7 +350,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             await parent.CreateAPIRoute("/stratum/gates/resolve", async req =>
             {
@@ -395,7 +396,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { ok = true }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             // ── Python runtime status (informational; bootstrap is triggered lazily by the Mechanical agent) ──
             await parent.CreateAPIRoute("/stratum/python/status", async req =>
@@ -414,7 +415,7 @@ namespace Omnipotent.Services.Stratum
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             // ── Native tool status (gmsh, ccx) ──
             await parent.CreateAPIRoute("/stratum/tools/status", async req =>
@@ -426,7 +427,7 @@ namespace Omnipotent.Services.Stratum
                     await req.ReturnResponse(JsonConvert.SerializeObject(s));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             // ── Electronics catalog status ──
             await parent.CreateAPIRoute("/stratum/catalog/status", async req =>
@@ -443,7 +444,7 @@ namespace Omnipotent.Services.Stratum
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             // ── Mechanical Engineer chat ──
             // List recent messages since a given sequence. Defaults to since=0 (full history).
@@ -465,7 +466,7 @@ namespace Omnipotent.Services.Stratum
                     }));
                 }
                 catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, KMPermissions.Guest);
+            }, HttpMethod.Get, StratumPerms.ProjectsRead);
 
             // Legacy chat write endpoints — replaced by the unified Engineer conversation.
             await parent.CreateAPIRoute("/stratum/chat/send", async req =>
@@ -473,14 +474,14 @@ namespace Omnipotent.Services.Stratum
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { error = "The per-agent chat has been replaced by the unified Stratum Engineer conversation. Use POST /stratum/conversation/send." }),
                     code: HttpStatusCode.Gone);
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
 
             await parent.CreateAPIRoute("/stratum/chat/approve-proposal", async req =>
             {
                 await req.ReturnResponse(
                     JsonConvert.SerializeObject(new { error = "Proposal approval moved to the unified conversation. Use POST /stratum/conversation/approve." }),
                     code: HttpStatusCode.Gone);
-            }, HttpMethod.Post, KMPermissions.Guest);
+            }, HttpMethod.Post, StratumPerms.DesignRun);
         }
 
         // ── Helpers ──

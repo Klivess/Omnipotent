@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using Omnipotent.Profiles;
 using Omnipotent.Services.KliveAPI.Caching;
 using static Omnipotent.Services.KliveAPI.KliveAPI;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveAPI.Telemetry
 {
@@ -36,7 +37,7 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
         public static async Task RegisterAsync(KliveAPI api, Func<ApiTelemetry?> engine,
             Func<TelemetryDb?> database, Func<TelemetryTraceViews?> traceViews, Func<string, string?> routeMethod)
         {
-            var klives = KMProfileManager.KMPermissions.Klives;
+            var klives = SystemPerms.ApiTelemetryRead;
 
             Func<UserRequest, Task> With(Func<UserRequest, ApiTelemetry, Task> handler) => async req =>
             {
@@ -62,7 +63,7 @@ namespace Omnipotent.Services.KliveAPI.Telemetry
             await api.CreateRoute("/KliveAPI/telemetry/trace", req => ServeTrace(req, database(), traceViews()), HttpMethod.Get, klives);
             // Any signed-in website user reports their own client timings.
             await api.CreateBufferedRoute("/KliveAPI/telemetry/rum", With((req, tel) => IngestRum(req, tel, routeMethod)), HttpMethod.Post,
-                KMProfileManager.KMPermissions.Guest, 32 * 1024);
+                Perms.SignedIn, 32 * 1024);
         }
 
         // ─── aggregates ───

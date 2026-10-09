@@ -6,6 +6,7 @@ using System.Net;
 using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Text;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Services.KliveTechHub
 {
@@ -112,7 +113,8 @@ namespace Omnipotent.Services.KliveTechHub
                 KliveTechRelayProtocol.WebSocketRoute,
                 (Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task>)
                     (async (_, socket, _, _) => await HandleRelayHubConnectionAsync(socket)),
-                KMProfileManager.KMPermissions.Anybody);
+                // Hubs authenticate with the relay token inside the socket, not with a profile.
+                Perms.Public);
         }
 
         private async Task HandleRelayHubConnectionAsync(WebSocket socket)

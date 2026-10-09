@@ -1,5 +1,6 @@
 ﻿using Newtonsoft.Json;
 using Omnipotent.Service_Manager;
+using Omnipotent.Profiles.Permissions;
 
 namespace Omnipotent.Klives_Management.General_Analytics
 {
@@ -132,7 +133,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, SystemPerms.StatusView);
 
             // Lightweight hardware-only summary (CPU, RAM, disks, network)
             await g.CreateAPIRoute("/GeneralBotStatistics/GetHardwareStats", async (req) =>
@@ -159,7 +160,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, SystemPerms.ResourcesRead);
 
             // Services overview
             await g.CreateAPIRoute("/GeneralBotStatistics/GetServicesStats", async (req) =>
@@ -179,17 +180,17 @@ namespace Omnipotent.Klives_Management.General_Analytics
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, SystemPerms.ResourcesRead);
 
             await g.CreateAPIRoute("/GeneralBotStatistics/RestartService", async (req) =>
             {
                 await HandleServiceAction(req, "restart", service => service.RestartService());
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, SystemPerms.ServicesControl);
 
             await g.CreateAPIRoute("/GeneralBotStatistics/QuitService", async (req) =>
             {
                 await HandleServiceAction(req, "quit", service => service.TerminateService());
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, SystemPerms.ServicesControl);
 
             // Process / GC diagnostics
             await g.CreateAPIRoute("/GeneralBotStatistics/GetProcessStats", async (req) =>
@@ -212,7 +213,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Get, Profiles.KMProfileManager.KMPermissions.Guest);
+            }, HttpMethod.Get, SystemPerms.ResourcesRead);
 
             // Trigger bot update – launches SyncAndStartOmnipotent.bat which kills the process, pulls, rebuilds and restarts
             await g.CreateAPIRoute("/GeneralBotStatistics/UpdateBot", async (req) =>
@@ -240,7 +241,7 @@ namespace Omnipotent.Klives_Management.General_Analytics
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
                 }
-            }, HttpMethod.Post, Profiles.KMProfileManager.KMPermissions.Klives);
+            }, HttpMethod.Post, SystemPerms.UpdateDeploy);
         }
     }
 }
