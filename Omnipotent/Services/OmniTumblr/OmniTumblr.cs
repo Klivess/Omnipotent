@@ -32,6 +32,7 @@ namespace Omnipotent.Services.OmniTumblr
         internal OmniTumblrMediaTools? MediaTools { get; private set; }
         internal OmniTumblrApiBudget? ApiBudget { get; private set; }
         internal TumblrApiClient? TumblrApi { get; private set; }
+        internal TumblrEdgeGate? EdgeGate { get; private set; }
 
         internal Task Ready => ready.Task;
         internal bool Enabled { get; private set; } = true;
@@ -67,14 +68,15 @@ namespace Omnipotent.Services.OmniTumblr
 
                 Func<DateTime> clock = () => DateTime.UtcNow;
                 ApiBudget = new OmniTumblrApiBudget(clock);
-                TumblrApi = new TumblrApiClient(onCall: ApiBudget.Count, onRateHeaders: ApiBudget.Observe);
+                EdgeGate = new TumblrEdgeGate(clock) { Changed = OnEdgeChanged };
+                TumblrApi = new TumblrApiClient(onCall: ApiBudget.Count, onRateHeaders: ApiBudget.Observe, edgeGate: EdgeGate);
                 MediaTools = new OmniTumblrMediaTools(OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory));
                 ContentSources = new OmniTumblrContentSources(new MemeScraperReelCatalog(FindService<MemeScraper.MemeScraper>), MediaTools, store.LibraryDirectory);
                 Captioner = new OmniTumblrCaptioner(new KliveLlmCaptionModel(FindService<KliveLLM.KliveLLM>));
                 Auth = new OmniTumblrAuth(store, TumblrApi, clock);
                 Planner = new OmniTumblrPlanner(store, ContentSources, Captioner, MediaTools, clock);
-                Publisher = new OmniTumblrPublisher(store, TumblrApi, Auth, clock, AlertAsync) { PublishingEnabled = () => PublishingEnabled };
-                Sync = new OmniTumblrAnalyticsSync(store, TumblrApi, Auth, ApiBudget, clock, message => _ = ServiceLog(message, false));
+                Publisher = new OmniTumblrPublisher(store, TumblrApi, Auth, clock, AlertAsync, EdgeGate) { PublishingEnabled = () => PublishingEnabled };
+                Sync = new OmniTumblrAnalyticsSync(store, TumblrApi, Auth, ApiBudget, clock, message => _ = ServiceLog(message, false), EdgeGate);
                 Engine = new OmniTumblrEngine(store, Planner, Publisher, Sync, clock, (ex, message) => _ = ServiceLogError(ex, message));
                 var planner = Planner;
                 var engine = Engine;
@@ -122,6 +124,39 @@ namespace Omnipotent.Services.OmniTumblr
         {
             Enabled = await GetBoolOmniSetting("OmniTumblr_Enabled", defaultValue: true);
             PublishingEnabled = await GetBoolOmniSetting("OmniTumblrV2_PublishingEnabled", defaultValue: true);
+
+            string proxy = (await GetStringOmniSetting("OmniTumblr_Proxy", "") ?? "").Trim();
+            if (TumblrApi != null && proxy != TumblrApi.Proxy)
+            {
+                if (TumblrApi.TrySetProxy(proxy, out string? error))
+                {
+                    rejectedProxy = null;
+                    EdgeGate?.ProbeNow(); // a new route may well get through: try it at once
+                    await ServiceLog(proxy.Length == 0 ? "[OmniTumblr] Tumblr traffic now goes direct." : "[OmniTumblr] Tumblr traffic now goes through the proxy set in OmniTumblr_Proxy.");
+                }
+                else if (proxy != rejectedProxy)
+                {
+                    rejectedProxy = proxy; // said once, not every minute
+                    await ServiceLog($"[OmniTumblr] Ignoring OmniTumblr_Proxy: {error}");
+                }
+            }
+        }
+
+        private string? rejectedProxy;
+
+        /// <summary>Tumblr's edge started refusing this server, or answered again: one event and log line per change.</summary>
+        private void OnEdgeChanged(TumblrEdgeGateStatus status)
+        {
+            string message = status.Blocked
+                ? $"Tumblr's edge is refusing this server's requests (an HTML 403 from nginx, before the API) — the server's network, not the accounts or posts. Posts and sync wait; next check {status.NextCheckUtc:HH:mm} UTC."
+                : $"Tumblr is answering this server again after {OmniTumblrPublisher.Describe(TimeSpan.FromMinutes(status.LastBlockMinutes ?? 0))}; waiting posts are going out.";
+            try { Store?.Mutate(s => s.AddEvent(status.Blocked ? EventLevel.Warning : EventLevel.Success, status.Blocked ? "tumblr.edge-blocked" : "tumblr.edge-cleared", message)); } catch { }
+            _ = ServiceLog("[OmniTumblr] " + message, false);
+            if (!status.Blocked)
+            {
+                Engine?.WakePublisher();
+                Engine?.WakeSync();
+            }
         }
 
         /// <summary>Picks up OmniSettings changes (kill switches) without a restart.</summary>

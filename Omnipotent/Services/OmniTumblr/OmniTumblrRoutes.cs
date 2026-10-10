@@ -274,6 +274,8 @@ namespace Omnipotent.Services.OmniTumblr
                 AiAvailable = aiAvailable,
                 Migration = s.Engine.MigrationSummary,
                 SyncErrors = service.Sync?.LastErrors.Select(kv => new { Job = kv.Key, Error = kv.Value }).ToList(),
+                EdgeGate = service.EdgeGate?.Snapshot(),
+                ProxyConfigured = !string.IsNullOrEmpty(service.TumblrApi?.Proxy),
             };
         }
 
@@ -315,7 +317,7 @@ namespace Omnipotent.Services.OmniTumblr
                 Upcoming = s.AllPosts().Where(p => p.IsPending).OrderBy(p => p.ScheduledUtc).Take(16).Select(p => OmniTumblrViews.Summary(p, s.Blog(p.BlogId))).ToList(),
                 RecentlyPublished = s.AllPosts().Where(p => p.Status == PostStatus.Published).OrderByDescending(p => p.PublishedUtc).Take(12)
                     .Select(p => OmniTumblrViews.Summary(p, s.Blog(p.BlogId))).ToList(),
-                Attention = OmniTumblrViews.Attention(s, now, service.PublishingEnabled, ai, reels),
+                Attention = OmniTumblrViews.Attention(s, now, service.PublishingEnabled, ai, reels, service.EdgeGate?.Snapshot()),
                 Events = s.Events.AsEnumerable().Reverse().Take(40).Select(e => EventDto(s, e)).ToList(),
             });
             await Respond(req, dto);
@@ -344,7 +346,7 @@ namespace Omnipotent.Services.OmniTumblr
                     AvgNotes30d = k.AvgNotes30d,
                     NextPostUtc = k.NextPostUtc,
                     NextPostBlog = k.NextPostBlog,
-                    AttentionCount = OmniTumblrViews.Attention(s, now, service.PublishingEnabled, true, true).Count(a => a.Level != "info"),
+                    AttentionCount = OmniTumblrViews.Attention(s, now, service.PublishingEnabled, true, true, service.EdgeGate?.Snapshot()).Count(a => a.Level != "info"),
                 };
             });
             await Respond(req, dto);
@@ -589,6 +591,10 @@ namespace Omnipotent.Services.OmniTumblr
             catch (InvalidOperationException ex)
             {
                 throw Bad(ex.Message);
+            }
+            catch (TumblrApiException ex) when (ex.Kind == TumblrErrorKind.EdgeBlocked)
+            {
+                throw Bad($"Tumblr's edge is refusing this server's requests right now ({ex.Message}). That is the server's network, not the app keys; try again later or set the OmniSetting OmniTumblr_Proxy.");
             }
             catch (TumblrApiException ex)
             {
@@ -1071,6 +1077,7 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
                 s.AddEvent(EventLevel.Info, "post.publish-now", $"@{s.Blog(post.BlogId)?.Name}: publishing now on request.", post.BlogId, post.PostId, now);
                 return OmniTumblrViews.Summary(post, s.Blog(post.BlogId));
             });
+            service.EdgeGate?.ProbeNow(); // asked for now: try even while Tumblr's edge is refusing background work
             service.Engine?.WakePlanner();
             service.Engine?.WakePublisher();
             await Respond(req, summary);
@@ -1161,6 +1168,7 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
                 s.AddEvent(EventLevel.Info, "post.retry", $"@{s.Blog(post.BlogId)?.Name}: retrying a failed post.", post.BlogId, post.PostId, now);
                 return OmniTumblrViews.Summary(post, s.Blog(post.BlogId));
             });
+            service.EdgeGate?.ProbeNow();
             service.Engine?.WakePublisher();
             await Respond(req, summary);
         }

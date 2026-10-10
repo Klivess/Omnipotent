@@ -91,6 +91,43 @@ namespace Omnipotent.Tests.OmniTumblr
         }
 
         [Fact]
+        public async Task WhileTheEdgeRefuses_SyncSendsOneProbePerWindow_NotEveryJob()
+        {
+            using var h = new Harness(Start);
+            string conn = h.Connect();
+            h.AddBlog(conn);
+            var answer = h.Api.UserInfo;
+            bool refusing = true;
+            h.Api.UserInfo = creds =>
+            {
+                if (refusing) throw h.EdgeRefusal("user/info");
+                h.Gate.RecordAnswered();
+                return answer(creds);
+            };
+            Assert.Equal(0, await h.Sync.RunDueAsync(CancellationToken.None)); // schedules the jobs, staggered
+            h.Clock.Advance(TimeSpan.FromMinutes(5)); // now every job is due
+
+            Assert.Equal(1, await h.Sync.RunDueAsync(CancellationToken.None));
+            Assert.Equal(new[] { "user/info" }, h.Api.Calls.ToArray()); // the probe; the other jobs wait
+            Assert.True(h.Gate.IsBlocked);
+
+            // Each later window costs one call, however many jobs are waiting (housekeeping, which is local, still runs).
+            for (int i = 0; i < 3; i++)
+            {
+                h.Clock.Now = h.Gate.RetryAtUtc!.Value + TimeSpan.FromMinutes(3);
+                await h.Sync.RunDueAsync(CancellationToken.None);
+                Assert.Equal(2 + i, h.Api.Calls.Count);
+            }
+
+            refusing = false;
+            h.Clock.Now = h.Gate.RetryAtUtc!.Value + TimeSpan.FromMinutes(3);
+            int ran = await h.Sync.RunDueAsync(CancellationToken.None);
+            Assert.False(h.Gate.IsBlocked);
+            Assert.True(ran >= 6, $"expected every job to run once Tumblr answered, ran {ran}");
+            Assert.Contains("user/limits", h.Api.Calls);
+        }
+
+        [Fact]
         public async Task DueJobs_RunOnTheirCadence_AndAnUnauthorizedJobParksTheConnection()
         {
             using var h = new Harness(Start);

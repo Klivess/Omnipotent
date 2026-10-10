@@ -275,6 +275,74 @@ namespace Omnipotent.Tests.OmniTumblr
             Assert.Contains("nginx", ex.Message);
         }
 
+        private const string NginxForbidden = "<html>\r\n<head><title>403 Forbidden</title></head>\r\n<body>\r\n<center><h1>403 Forbidden</h1></center>\r\n<hr><center>nginx</center>\r\n</body>\r\n</html>\r\n";
+
+        [Fact]
+        public async Task EveryResponse_TellsTheEdgeGate_WhetherTumblrsEdgeLetItThrough()
+        {
+            var changes = new List<TumblrEdgeGateStatus>();
+            var gate = new TumblrEdgeGate { Changed = changes.Add };
+            bool refuse = true;
+            var stub = new StubHandler
+            {
+                Respond = _ => Task.FromResult(refuse
+                    ? new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent(NginxForbidden, Encoding.UTF8, "text/html") }
+                    : Json(HttpStatusCode.Unauthorized, "{\"meta\":{\"status\":401,\"msg\":\"Unauthorized\"},\"errors\":[],\"response\":[]}")),
+            };
+            var client = new TumblrApiClient(new HttpClient(stub), edgeGate: gate);
+
+            var refused = await Assert.ThrowsAsync<TumblrApiException>(() => client.GetUserLimitsAsync(OAuth1, CancellationToken.None));
+            Assert.Equal(TumblrErrorKind.EdgeBlocked, refused.Kind);
+            Assert.True(gate.IsBlocked);
+            Assert.True(Assert.Single(changes).Blocked);
+
+            // Any API answer — even an error — means the edge let the request through.
+            refuse = false;
+            await Assert.ThrowsAsync<TumblrApiException>(() => client.GetUserLimitsAsync(OAuth1, CancellationToken.None));
+            Assert.False(gate.IsBlocked);
+            Assert.False(changes[1].Blocked);
+            Assert.NotNull(changes[1].LastBlockMinutes);
+        }
+
+        [Fact]
+        public async Task AnEdgeRefusalDuringTheOAuthHandshake_IsNotBlamedOnTheAppKeys()
+        {
+            var gate = new TumblrEdgeGate();
+            var stub = new StubHandler { Respond = _ => Task.FromResult(new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent(NginxForbidden, Encoding.UTF8, "text/html") }) };
+            var client = new TumblrApiClient(new HttpClient(stub), edgeGate: gate);
+
+            var ex = await Assert.ThrowsAsync<TumblrApiException>(() => client.GetOAuth1RequestTokenAsync("ck", "cs", "https://klive.dev/omnitumblr/oauth/callback", CancellationToken.None));
+
+            Assert.Equal(TumblrErrorKind.EdgeBlocked, ex.Kind);
+            Assert.DoesNotContain("<", ex.Message);
+            Assert.True(gate.IsBlocked);
+        }
+
+        [Theory]
+        [InlineData("http://proxy.example:8080", "http://proxy.example:8080/", null)]
+        [InlineData("proxy.example:3128", "http://proxy.example:3128/", null)]
+        [InlineData("socks5://user:p%40ss@10.0.0.2:1080", "socks5://10.0.0.2:1080/", "user")]
+        public void ProxySettings_AreParsed_WithCredentialsKeptOutOfTheAddress(string value, string address, string? user)
+        {
+            Assert.True(TumblrApiClient.TryParseProxy(value, out var proxy, out var error), error);
+            Assert.Equal(address, proxy!.Address!.ToString());
+            var credentials = proxy.Credentials as NetworkCredential;
+            Assert.Equal(user, credentials?.UserName);
+            if (user != null) Assert.Equal("p@ss", credentials!.Password);
+        }
+
+        [Fact]
+        public void AnUnusableProxy_IsRejected_AndTheCurrentRouteKept()
+        {
+            var client = new TumblrApiClient();
+            Assert.True(client.TrySetProxy("http://good.example:8080", out _));
+            Assert.False(client.TrySetProxy("ftp://nope.example", out var error));
+            Assert.NotNull(error);
+            Assert.Equal("http://good.example:8080", client.Proxy);
+            Assert.True(client.TrySetProxy("", out _));
+            Assert.Equal("", client.Proxy);
+        }
+
         [Fact]
         public async Task A403WithTheApiEnvelope_IsStillForbidden()
         {
@@ -415,5 +483,84 @@ namespace Omnipotent.Tests.OmniTumblr
         [InlineData("t:0aY0xL2Fi1OFJg4YxpmegQ", "t:0aY0xL2Fi1OFJg4YxpmegQ")]
         public void BlogIdentifiers_AreNormalized(string input, string expected) =>
             Assert.Equal(expected, TumblrApiClient.NormalizeBlogIdentifier(input));
+    }
+
+    public class TumblrEdgeGateTests
+    {
+        private static readonly DateTime Start = new(2026, 10, 10, 7, 0, 0, DateTimeKind.Utc);
+
+        [Fact]
+        public void WhileRefused_OneCallerPerWindowIsTheProbe_AndTheWaitBacksOff()
+        {
+            var clock = new TestClock(Start);
+            var gate = new TumblrEdgeGate(clock.Func);
+            Assert.True(gate.TryEnter(out _));
+
+            gate.RecordRefused("user/info");
+            Assert.False(gate.TryEnter(out var retryAt));
+            Assert.Equal(Start.AddMinutes(5), retryAt);
+
+            var waits = new List<double>();
+            for (int i = 0; i < 5; i++)
+            {
+                DateTime previous = clock.Now;
+                clock.Now = gate.RetryAtUtc!.Value;
+                waits.Add((clock.Now - previous).TotalMinutes);
+                Assert.True(gate.TryEnter(out _));   // the probe
+                Assert.False(gate.TryEnter(out _));  // everyone else waits for its outcome
+                gate.RecordRefused("user/info");
+            }
+            Assert.Equal(new double[] { 5, 10, 20, 30, 30 }, waits);
+            Assert.Equal(6, gate.Snapshot().FailedChecks);
+        }
+
+        [Fact]
+        public void ARefusalFromACallAlreadyInFlight_DoesNotLengthenTheWait()
+        {
+            var clock = new TestClock(Start);
+            var gate = new TumblrEdgeGate(clock.Func);
+            gate.RecordRefused("blog/posts");
+            clock.Advance(TimeSpan.FromSeconds(20));
+            gate.RecordRefused("user/limits"); // started before the block was noticed
+            Assert.Equal(Start.AddMinutes(5), gate.RetryAtUtc);
+            Assert.Equal(1, gate.Snapshot().FailedChecks);
+        }
+
+        [Fact]
+        public void AProbeThatNeverReports_ReleasesTheNextOneAfterItsLease()
+        {
+            var clock = new TestClock(Start);
+            var gate = new TumblrEdgeGate(clock.Func);
+            gate.RecordRefused("user/info");
+            clock.Now = gate.RetryAtUtc!.Value;
+            Assert.True(gate.TryEnter(out _)); // e.g. a timeout: no response, so nothing is recorded
+            Assert.False(gate.TryEnter(out var retryAt));
+            clock.Now = retryAt;
+            Assert.True(gate.TryEnter(out _));
+        }
+
+        [Fact]
+        public void AnAnswer_ReopensTheGate_AndProbeNowSkipsTheWait()
+        {
+            var clock = new TestClock(Start);
+            var changes = new List<TumblrEdgeGateStatus>();
+            var gate = new TumblrEdgeGate(clock.Func) { Changed = changes.Add };
+            gate.RecordAnswered();
+            Assert.Empty(changes); // nothing changed
+
+            gate.RecordRefused("blog/posts:create");
+            gate.ProbeNow();
+            Assert.True(gate.TryEnter(out _));
+
+            clock.Advance(TimeSpan.FromMinutes(42));
+            gate.RecordAnswered();
+            Assert.False(gate.IsBlocked);
+            Assert.Null(gate.RetryAtUtc);
+            Assert.True(gate.TryEnter(out _));
+            Assert.Equal(new[] { true, false }, changes.Select(c => c.Blocked));
+            Assert.Equal(42, changes[1].LastBlockMinutes);
+            Assert.Equal(Start, changes[0].BlockedSinceUtc);
+            Assert.Equal(Start.AddMinutes(5), changes[0].NextCheckUtc);
+        }
     }
 }

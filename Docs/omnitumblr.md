@@ -74,9 +74,23 @@ Each post gets a unique slug before upload. If an attempt fails ambiguously (a t
 | 400.8005 (media rejected) or other 400 | Failed. Rejected content is never picked again. Autopilot refills the slot |
 | 404, blog not found | Retried hourly. Discord alert (blog renamed or deleted?) |
 | 403.8022 (queue full) or other 403 | Failed. Discord alert |
+| 403 as a bare nginx HTML page (no JSON) | Tumblr's edge refused the request before the API saw it. See below. Never fails the post |
 | 5xx, timeout or unknown | Retried after 2, 5, 15, 30 and 60 minutes. Fails after 5 attempts with a Discord alert |
 
 Discord alerts go through KliveBot, at most one per problem every 6 hours.
+
+### When Tumblr's edge refuses the server
+
+Tumblr's edge proxy sometimes rejects every request from the server's IP for hours, including read-only calls and the OAuth handshake. It answers with nginx's stock "403 Forbidden" HTML page, never with the API's JSON. From Oct 8 to Oct 10 2026, every call from the server got this page in on/off windows, while the same requests with the same app key from another network got normal answers. v2's first policy treated it as a normal failure, so each post gave up after five tries (about 52 minutes) and roughly 30 sync jobs kept retrying into the block.
+
+The edge gate (`TumblrEdgeGate`) now handles it:
+
+- The client reports every response to the gate. An HTML 403 closes the gate, and any JSON answer, even an error, opens it again.
+- While the gate is closed, posts wait without using an attempt, and sync jobs are postponed. Every 5, 10, 20, then 30 minutes, one call goes out to test whether Tumblr is answering again. **Publish now** and **Retry** try at once.
+- When the gate opens, the waiting posts go out and sync catches up, spread over three minutes. An autopilot post still follows the missed-slot policy, so after the grace period it is skipped rather than posted many hours late.
+- The overview shows "Tumblr is refusing this server's requests". The event log records when the block starts and when it lifts. If it lasts over 2 hours, a Discord alert is sent.
+
+If the blocks keep coming back, the cause is the server's IP or network, not OmniTumblr. Send Tumblr traffic another way with `OmniTumblr_Proxy`.
 
 ### Analytics
 
@@ -103,6 +117,8 @@ Both are OmniSettings and take effect without a restart:
 | `OmniTumblrV2_PublishingEnabled` | true | Nothing is posted. Planning, captions and analytics carry on |
 
 The second has a v2 name on purpose: OmniSettings writes a default on first read, so a renamed setting is the only way to ship a new default.
+
+`OmniTumblr_Proxy` (default empty, which means direct) sends every Tumblr call through a proxy: `http://host:port`, `https://…` or `socks5://host:port`, optionally with `user:pass@`. It takes effect within a minute. A value that cannot be parsed is ignored and logged once.
 
 ## Data
 

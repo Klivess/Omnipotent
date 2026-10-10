@@ -94,7 +94,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 verified = true;
                 message = "Tumblr accepted the app credentials.";
             }
-            catch (TumblrApiException ex) when (ex.Status is 400 or 401 or 403)
+            catch (TumblrApiException ex) when (ex.Status is 400 or 401 or 403 && ex.Kind != TumblrErrorKind.EdgeBlocked)
             {
                 return new AppSaveResult { Message = $"Tumblr rejected these credentials ({ex.Code}): {ex.Message}. Check the OAuth consumer key and secret key at tumblr.com/oauth/apps, and that the default callback URL there is exactly {callback}." };
             }

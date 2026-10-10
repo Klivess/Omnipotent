@@ -696,7 +696,24 @@ namespace Omnipotent.Services.KliveLLM
                     return caps;
             }
 
+            if (provider == LLMProvider.AIRouter)
+                return AIRouterModelCapabilities(modelId);
+
             return StaticModelCapabilities(modelId);
+        }
+
+        /// <summary>AIRouter's /models lists ids only (no modality data), so its capabilities come from
+        /// its published model table. Both chat models accept images: Qwen3.8 natively, DeepSeek-V4-Flash
+        /// through AIRouter's vision augmentation (the router hands the image to Qwen3.8 and answers as
+        /// DeepSeek). Any other chat id is redirected to the configured model before it is sent (see
+        /// ResolveAIRouterModelAsync), so it lands on one of those two. The family table knows neither
+        /// name and called them text-only, which refused every KliveAgent image attachment and silently
+        /// switched off Projects screenshots and OmniTumblr vision captions.</summary>
+        internal static ModelCapabilities AIRouterModelCapabilities(string? modelId)
+        {
+            string id = (modelId ?? string.Empty).ToLowerInvariant();
+            bool chatModel = !(id.Contains("embedding") || id.Contains("whisper") || id.Contains("kokoro"));
+            return StaticModelCapabilities(modelId) with { ImageInput = chatModel };
         }
 
         /// <summary>Conservative capability guess from the model id's family, used for HuggingFace and when the

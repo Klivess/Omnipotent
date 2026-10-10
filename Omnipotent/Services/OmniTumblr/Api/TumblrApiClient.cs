@@ -19,29 +19,85 @@ namespace Omnipotent.Services.OmniTumblr.Api
         public const string UserAgent = "OmniTumblr/2.0 (+https://klive.dev)";
         public const string OAuth2Scopes = "basic write offline_access";
 
-        private static readonly Lazy<HttpClient> SharedClient = new(() => new HttpClient(new SocketsHttpHandler
-        {
-            PooledConnectionLifetime = TimeSpan.FromMinutes(5),
-            AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
-            AllowAutoRedirect = false,
-            ConnectTimeout = TimeSpan.FromSeconds(20),
-        })
-        { Timeout = Timeout.InfiniteTimeSpan });
+        /// <summary>One pooled client per egress route ("" = direct), so changing the proxy never disturbs calls in flight.</summary>
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, HttpClient> SharedClients = new(StringComparer.Ordinal);
 
-        private readonly HttpClient http;
+        private readonly HttpClient? injectedHttp;
         private readonly Action<string>? onCall;
         private readonly Action<TumblrRateLimitHeaders>? onRateHeaders;
+        private volatile string proxy = "";
 
         public TimeSpan RequestTimeout { get; set; } = TimeSpan.FromSeconds(40);
         public TimeSpan UploadTimeout { get; set; } = TimeSpan.FromMinutes(15);
 
+        /// <summary>Told about every response, so background work can wait out an edge block (see <see cref="TumblrEdgeGate"/>).</summary>
+        public TumblrEdgeGate? EdgeGate { get; }
+
+        /// <summary>
+        /// Optional egress proxy for every Tumblr call (OmniSetting OmniTumblr_Proxy) — the way round Tumblr's
+        /// edge refusing this server's IP. http://, https:// or socks5://, with user:pass@ if needed; empty is direct.
+        /// Set it through <see cref="TrySetProxy"/>, which rejects what cannot be parsed.
+        /// </summary>
+        public string Proxy => proxy;
+
         /// <param name="onCall">Invoked once per API request with a short endpoint label (budget accounting).</param>
         /// <param name="onRateHeaders">Invoked when a response carries Tumblr's rate-limit headers.</param>
-        public TumblrApiClient(HttpClient? http = null, Action<string>? onCall = null, Action<TumblrRateLimitHeaders>? onRateHeaders = null)
+        public TumblrApiClient(HttpClient? http = null, Action<string>? onCall = null, Action<TumblrRateLimitHeaders>? onRateHeaders = null,
+            TumblrEdgeGate? edgeGate = null)
         {
-            this.http = http ?? SharedClient.Value;
+            injectedHttp = http;
             this.onCall = onCall;
             this.onRateHeaders = onRateHeaders;
+            EdgeGate = edgeGate;
+        }
+
+        private HttpClient Http => injectedHttp ?? SharedClients.GetOrAdd(proxy, CreateHttpClient);
+
+        /// <summary>Switches the egress route. Returns false (and keeps the current one) when the value is not a usable proxy URL.</summary>
+        public bool TrySetProxy(string? value, out string? error)
+        {
+            string normalized = (value ?? string.Empty).Trim();
+            if (normalized.Length > 0 && !TryParseProxy(normalized, out _, out error)) return false;
+            error = null;
+            proxy = normalized;
+            return true;
+        }
+
+        internal static bool TryParseProxy(string value, out WebProxy? webProxy, out string? error)
+        {
+            webProxy = null;
+            error = null;
+            string text = value.Contains("://") ? value : "http://" + value;
+            if (!Uri.TryCreate(text, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host)
+                || uri.Scheme is not ("http" or "https" or "socks4" or "socks4a" or "socks5"))
+            {
+                error = "Expected http://host:port, https://host:port or socks5://host:port (optionally user:pass@host).";
+                return false;
+            }
+            webProxy = new WebProxy(new UriBuilder(uri.Scheme, uri.Host, uri.Port).Uri);
+            if (!string.IsNullOrEmpty(uri.UserInfo))
+            {
+                string[] parts = uri.UserInfo.Split(':', 2);
+                webProxy.Credentials = new NetworkCredential(Uri.UnescapeDataString(parts[0]), parts.Length > 1 ? Uri.UnescapeDataString(parts[1]) : "");
+            }
+            return true;
+        }
+
+        private static HttpClient CreateHttpClient(string proxy)
+        {
+            var handler = new SocketsHttpHandler
+            {
+                PooledConnectionLifetime = TimeSpan.FromMinutes(5),
+                AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
+                AllowAutoRedirect = false,
+                ConnectTimeout = TimeSpan.FromSeconds(20),
+            };
+            if (proxy.Length > 0 && TryParseProxy(proxy, out var webProxy, out _))
+            {
+                handler.Proxy = webProxy;
+                handler.UseProxy = true;
+            }
+            return new HttpClient(handler) { Timeout = Timeout.InfiniteTimeSpan };
         }
 
         // ─────────────────────────────── Users ───────────────────────────────
@@ -287,6 +343,8 @@ namespace Omnipotent.Services.OmniTumblr.Api
 
             var (status, body, _) = await SendRawAsync(req, label, RequestTimeout, ct);
             if (status is >= 200 and < 300) return body;
+            if (IsEdgeRefusal(status, body))
+                throw new TumblrApiException(TumblrErrorKind.EdgeBlocked, status, null, $"{label} failed ({status}): {DescribeNonApiBody(body)}", label);
             throw new TumblrApiException(TumblrApiException.Classify(status, null, body), status, null,
                 $"{label} failed ({status}): {Clip(body, 300)}", label);
         }
@@ -328,6 +386,8 @@ namespace Omnipotent.Services.OmniTumblr.Api
             var (status, body, _) = await SendRawAsync(req, label, RequestTimeout, ct);
 
             JToken? root = TryParseJson(body);
+            if (IsEdgeRefusal(status, body))
+                throw new TumblrApiException(TumblrErrorKind.EdgeBlocked, status, null, $"{label} failed ({status}): {DescribeNonApiBody(body)}", label);
             if (status is < 200 or >= 300)
             {
                 string message = Str(root?["error_description"]) ?? Str(root?["error"]) ?? ErrorMessage(root) ?? Clip(body, 300);
@@ -387,9 +447,17 @@ namespace Omnipotent.Services.OmniTumblr.Api
             int? subcode = (int?)Long(root?["errors"]?.FirstOrDefault()?["code"]);
             if (subcode == 0) subcode = null;
             string message = ErrorMessage(root) ?? Str(root?["meta"]?["msg"]) ?? DescribeNonApiBody(body);
+            if (root == null)
+            {
+                // An edge rejection carries no reason, so record what Tumblr's proxy did say plus what we sent —
+                // enough to tell a blocked upload, blog path or credential apart from the next failure's log.
+                string rid = headers == null ? "-" : Header(headers, "X-Rid") ?? "-";
+                string sent = $"{method} {path}, auth {(creds.HasUserToken ? creds.Mode.ToString() : "none")}, body {req.Content?.GetType().Name ?? "none"}, {(injectedHttp == null && proxy.Length > 0 ? "via proxy" : "direct")}";
+                message += $" [x-rid {rid}; {sent}; response: {Clip(System.Text.RegularExpressions.Regex.Replace(body ?? "", "<[^>]+>|\\s+", " ").Trim(), 200)}]";
+            }
             // Tumblr's API always answers with a JSON envelope; a 403 without one is its edge proxy (nginx)
             // turning the request away before the API saw it — not a verdict on the account or the post.
-            var kind = root == null && effective == 403
+            var kind = IsEdgeRefusal(status, body)
                 ? TumblrErrorKind.EdgeBlocked
                 : TumblrApiException.Classify(effective, subcode, message);
             DateTime? retryAfter = null;
@@ -408,10 +476,12 @@ namespace Omnipotent.Services.OmniTumblr.Api
             timeoutCts.CancelAfter(timeout);
             try
             {
-                using var response = await http.SendAsync(req, HttpCompletionOption.ResponseContentRead, timeoutCts.Token);
+                using var response = await Http.SendAsync(req, HttpCompletionOption.ResponseContentRead, timeoutCts.Token);
                 string body = await response.Content.ReadAsStringAsync(timeoutCts.Token);
+                int status = (int)response.StatusCode;
+                EdgeGate?.Observe(status, IsEdgeRefusal(status, body), $"{label} at {DateTime.UtcNow:HH:mm:ss} UTC (x-rid {Header(response.Headers, "X-Rid") ?? "-"})");
                 // Redirects are not followed (auth headers must never leave api.tumblr.com); report them.
-                return ((int)response.StatusCode, body, response.Headers);
+                return (status, body, response.Headers);
             }
             catch (OperationCanceledException ex) when (!ct.IsCancellationRequested)
             {
@@ -486,7 +556,13 @@ namespace Omnipotent.Services.OmniTumblr.Api
 
         public static string BuildAvatarUrl(string blog, int size = 128) => $"{ApiBase}/v2/blog/{BlogPath(blog)}/avatar/{size}";
 
-        private static JToken? TryParseJson(string body)
+        /// <summary>A 403 without Tumblr's JSON envelope: its edge proxy refused the request before the API saw it.</summary>
+        internal static bool IsEdgeRefusal(int status, string? body) => status == 403 && TryParseJson(body) == null;
+
+        private static string? Header(HttpResponseHeaders headers, string name) =>
+            headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;
+
+        private static JToken? TryParseJson(string? body)
         {
             if (string.IsNullOrWhiteSpace(body)) return null;
             string t = body.TrimStart();

@@ -62,7 +62,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
     /// Keeps analytics fresh with a small job scheduler persisted in engine.json: per connection
     /// (/user/info for follower counts, /user/limits), per blog (/info, the post index with note counts,
     /// note breakdowns at 1d/3d/7d/30d, and the activity feed). Jobs are staggered, budgeted and
-    /// independent — one failing blog or endpoint never stalls the rest.
+    /// independent — one failing blog or endpoint never stalls the rest. While Tumblr's edge refuses this
+    /// server (<see cref="TumblrEdgeGate"/>) the jobs wait, and the first one due is the gate's probe.
     /// </summary>
     internal sealed class OmniTumblrAnalyticsSync
     {
@@ -82,10 +83,12 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private readonly OmniTumblrApiBudget budget;
         private readonly Func<DateTime> clock;
         private readonly Action<string> log;
+        private readonly TumblrEdgeGate edgeGate;
         private readonly ConcurrentDictionary<string, string> lastErrors = new(StringComparer.Ordinal);
         private readonly SemaphoreSlim runLock = new(1, 1);
 
-        public OmniTumblrAnalyticsSync(OmniTumblrStore store, ITumblrApi api, OmniTumblrAuth auth, OmniTumblrApiBudget budget, Func<DateTime> clock, Action<string> log)
+        public OmniTumblrAnalyticsSync(OmniTumblrStore store, ITumblrApi api, OmniTumblrAuth auth, OmniTumblrApiBudget budget, Func<DateTime> clock, Action<string> log,
+            TumblrEdgeGate? edgeGate = null)
         {
             this.store = store;
             this.api = api;
@@ -93,6 +96,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             this.budget = budget;
             this.clock = clock;
             this.log = log;
+            this.edgeGate = edgeGate ?? new TumblrEdgeGate(clock);
         }
 
         public IReadOnlyDictionary<string, string> LastErrors => lastErrors;
@@ -116,6 +120,11 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     if (job.Priority > 1 && !budget.AllowBackground())
                     {
                         Reschedule(job.Key, clock().AddMinutes(20));
+                        continue;
+                    }
+                    if (job.Kind != JobKind.Housekeeping && !edgeGate.TryEnter(out var retryAt))
+                    {
+                        Reschedule(job.Key, retryAt + Stagger(job.Key));
                         continue;
                     }
                     await RunJobAsync(job, ct);
@@ -254,6 +263,13 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 next = ex.RetryAfterUtc is DateTime at && at > now ? at - now : TimeSpan.FromMinutes(30);
                 RecordError(job.Key, ex.Message);
             }
+            catch (TumblrApiException ex) when (ex.Kind == TumblrErrorKind.EdgeBlocked)
+            {
+                // The gate logs the block once; this job just waits for it to lift.
+                DateTime retry = edgeGate.RetryAtUtc ?? now.AddMinutes(5);
+                next = (retry > now ? retry - now : TimeSpan.Zero) + Stagger(job.Key);
+                lastErrors[job.Key] = ex.Message;
+            }
             catch (Exception ex)
             {
                 next = TimeSpan.FromMinutes(20);
@@ -261,6 +277,9 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             }
             Reschedule(job.Key, clock() + next);
         }
+
+        /// <summary>A fixed 0–3 min offset per job, so the backlog after an edge block doesn't go out in one burst.</summary>
+        private static TimeSpan Stagger(string key) => TimeSpan.FromSeconds(OmniTumblrScheduleMath.Fnv1a(key) % 180);
 
         private void RecordError(string key, string message)
         {

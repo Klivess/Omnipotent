@@ -208,6 +208,8 @@ namespace Omnipotent.Tests.OmniTumblr
         public OmniTumblrPublisher Publisher { get; }
         public OmniTumblrApiBudget Budget { get; }
         public OmniTumblrAnalyticsSync Sync { get; }
+        /// <summary>Shared by the publisher and sync, as in production. The fake API does not report to it; tests do, as the real client would.</summary>
+        public TumblrEdgeGate Gate { get; }
         public List<string> RefilledFor { get; } = new();
 
         public Harness(DateTime? startUtc = null)
@@ -220,13 +222,21 @@ namespace Omnipotent.Tests.OmniTumblr
             Captioner = new OmniTumblrCaptioner(Model);
             Auth = new OmniTumblrAuth(Store, Api, Clock.Func);
             Planner = new OmniTumblrPlanner(Store, Content, Captioner, Media, Clock.Func);
-            Publisher = new OmniTumblrPublisher(Store, Api, Auth, Clock.Func, message => { lock (Alerts) Alerts.Add(message); return Task.CompletedTask; })
+            Gate = new TumblrEdgeGate(Clock.Func);
+            Publisher = new OmniTumblrPublisher(Store, Api, Auth, Clock.Func, message => { lock (Alerts) Alerts.Add(message); return Task.CompletedTask; }, Gate)
             {
                 ReconcileDelay = TimeSpan.Zero,
                 OnContentFailure = postId => { lock (RefilledFor) RefilledFor.Add(postId); return Task.CompletedTask; },
             };
             Budget = new OmniTumblrApiBudget(Clock.Func);
-            Sync = new OmniTumblrAnalyticsSync(Store, Api, Auth, Budget, Clock.Func, _ => { });
+            Sync = new OmniTumblrAnalyticsSync(Store, Api, Auth, Budget, Clock.Func, _ => { }, Gate);
+        }
+
+        /// <summary>What the real client does on a bare nginx 403: tell the gate, then throw.</summary>
+        public TumblrApiException EdgeRefusal(string label = "blog/posts:create")
+        {
+            Gate.RecordRefused(label);
+            return new TumblrApiException(TumblrErrorKind.EdgeBlocked, 403, null, $"{label} failed (403): 403 Forbidden (HTML page from Tumblr's nginx edge, not an API response)", label);
         }
 
         /// <summary>Configures the app and a healthy OAuth1 connection; returns the connection id.</summary>

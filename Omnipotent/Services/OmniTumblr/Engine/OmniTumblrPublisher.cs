@@ -11,11 +11,16 @@ namespace Omnipotent.Services.OmniTumblr.Engine
     /// concurrently. Failures are handled by kind: limits and transcoding postpone without spending an
     /// attempt, a revoked token parks the connection for reauthorization, bad media fails the post and
     /// refills its slot, and anything ambiguous (timeout, 5xx) is reconciled by slug before retrying —
-    /// the post may already exist.
+    /// the post may already exist. While Tumblr's edge refuses this server (<see cref="TumblrEdgeGate"/>),
+    /// posts wait without spending attempts and go out when it answers again.
     /// </summary>
     internal sealed class OmniTumblrPublisher
     {
         public const int MaxAttempts = 5;
+        /// <summary>LastErrorCode of a post waiting out an edge block.</summary>
+        public const string EdgeWaitCode = "edge-403";
+        /// <summary>How long the edge may refuse before Klives is told on Discord.</summary>
+        public static readonly TimeSpan EdgeAlertAfter = TimeSpan.FromHours(2);
         private static readonly TimeSpan[] Backoff =
         {
             TimeSpan.FromMinutes(2), TimeSpan.FromMinutes(5), TimeSpan.FromMinutes(15), TimeSpan.FromMinutes(30), TimeSpan.FromHours(1),
@@ -26,6 +31,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private readonly OmniTumblrAuth auth;
         private readonly Func<DateTime> clock;
         private readonly Func<string, Task> alert;
+        private readonly TumblrEdgeGate edgeGate;
         private readonly SemaphoreSlim passLock = new(1, 1);
         private readonly ConcurrentDictionary<string, DateTime> lastAlertUtc = new(StringComparer.Ordinal);
 
@@ -35,13 +41,15 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public Func<string, Task>? OnContentFailure { get; set; }
         public TimeSpan ReconcileDelay { get; set; } = TimeSpan.FromSeconds(8);
 
-        public OmniTumblrPublisher(OmniTumblrStore store, ITumblrApi api, OmniTumblrAuth auth, Func<DateTime> clock, Func<string, Task> alert)
+        public OmniTumblrPublisher(OmniTumblrStore store, ITumblrApi api, OmniTumblrAuth auth, Func<DateTime> clock, Func<string, Task> alert,
+            TumblrEdgeGate? edgeGate = null)
         {
             this.store = store;
             this.api = api;
             this.auth = auth;
             this.clock = clock;
             this.alert = alert;
+            this.edgeGate = edgeGate ?? new TumblrEdgeGate(clock);
         }
 
         private sealed class Claimed
@@ -62,6 +70,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (!await passLock.WaitAsync(0, ct)) return 0; // a pass is already running and will see new posts
             try
             {
+                await AlertIfEdgeBlockedLongAsync();
                 int published = 0;
                 var tried = new HashSet<string>(StringComparer.Ordinal);
                 while (!ct.IsCancellationRequested)
@@ -159,7 +168,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                         continue;
                     }
 
-                    var (blocked, retryAt) = CheckGates(s, post, blog, now, publishingEnabled);
+                    var (blocked, retryAt, edgeWait) = CheckGates(s, post, blog, now, publishingEnabled);
                     if (blocked == null)
                     {
                         var missing = post.Media.FirstOrDefault(m => !File.Exists(m.Path));
@@ -180,7 +189,13 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     {
                         bool changed = false;
                         if (post.BlockedReason != blocked) { post.BlockedReason = blocked; changed = true; }
-                        if (retryAt.HasValue && post.NextAttemptUtc != retryAt) { post.NextAttemptUtc = retryAt; post.Deferrals++; changed = true; }
+                        if (retryAt.HasValue && post.NextAttemptUtc != retryAt)
+                        {
+                            post.NextAttemptUtc = retryAt;
+                            // Waiting out an edge block is downtime, not a deliberate deferral: the missed-slot policy still applies.
+                            if (!edgeWait) post.Deferrals++;
+                            changed = true;
+                        }
                         if (changed) s.Touch(post, now);
                         continue;
                     }
@@ -215,15 +230,15 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             return lateBy > grace && lateBy > TimeSpan.FromMinutes(10);
         }
 
-        private (string? Blocked, DateTime? RetryAt) CheckGates(OmniTumblrState s, OmniTumblrPost post, OmniTumblrBlog blog, DateTime now, bool publishingEnabled)
+        private (string? Blocked, DateTime? RetryAt, bool EdgeWait) CheckGates(OmniTumblrState s, OmniTumblrPost post, OmniTumblrBlog blog, DateTime now, bool publishingEnabled)
         {
-            if (!publishingEnabled) return ("Publishing is switched off (OmniSetting OmniTumblrV2_PublishingEnabled).", null);
-            if (!s.App.IsConfigured) return ("The Tumblr app credentials are not set.", null);
-            if (blog.Paused) return ("The blog is paused.", null);
-            if (!post.Approved && blog.RequireApproval && post.Origin == PostOrigin.Autopilot) return ("Waiting for approval.", null);
+            if (!publishingEnabled) return ("Publishing is switched off (OmniSetting OmniTumblrV2_PublishingEnabled).", null, false);
+            if (!s.App.IsConfigured) return ("The Tumblr app credentials are not set.", null, false);
+            if (blog.Paused) return ("The blog is paused.", null, false);
+            if (!post.Approved && blog.RequireApproval && post.Origin == PostOrigin.Autopilot) return ("Waiting for approval.", null, false);
             var conn = s.Connection(blog.ConnectionId);
-            if (conn == null) return ("The blog has no Tumblr connection; reconnect its account.", null);
-            if (conn.Health == ConnectionHealth.NeedsReauth) return ($"Reconnect @{conn.UserName}: {conn.HealthDetail ?? "authorization expired or was revoked."}", null);
+            if (conn == null) return ("The blog has no Tumblr connection; reconnect its account.", null, false);
+            if (conn.Health == ConnectionHealth.NeedsReauth) return ($"Reconnect @{conn.UserName}: {conn.HealthDetail ?? "authorization expired or was revoked."}", null, false);
 
             if (post.Origin == PostOrigin.Autopilot && !post.ManualOverride)
             {
@@ -234,19 +249,38 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 if (publishedToday >= cap)
                 {
                     var nextDay = OmniTumblrScheduleMath.LocalToUtc(OmniTumblrScheduleMath.UtcToLocal(now, tz).Date.AddDays(1), tz);
-                    return ($"Daily cap of {cap} post(s) reached; continues tomorrow.", nextDay.AddMinutes(5));
+                    return ($"Daily cap of {cap} post(s) reached; continues tomorrow.", nextDay.AddMinutes(5), false);
                 }
                 int gap = Math.Clamp(blog.Strategy.MinGapMinutes, 0, 24 * 60);
                 if (gap > 0 && blog.Stats.LastPublishedUtc is DateTime last && now - last < TimeSpan.FromMinutes(gap))
-                    return ($"Spacing posts at least {gap} min apart.", last.AddMinutes(gap));
+                    return ($"Spacing posts at least {gap} min apart.", last.AddMinutes(gap), false);
             }
 
             foreach (var (key, limit) in RelevantLimits(conn, post))
             {
                 if (limit.Remaining <= 0 && limit.ResetUtc is DateTime reset && reset > now)
-                    return ($"Tumblr's daily {Humanize(key)} limit is used up until {reset:HH:mm} UTC.", reset.AddMinutes(2));
+                    return ($"Tumblr's daily {Humanize(key)} limit is used up until {reset:HH:mm} UTC.", reset.AddMinutes(2), false);
             }
-            return (null, null);
+
+            // Last, so the probe slot is only taken by a post that will really be sent.
+            if (!edgeGate.TryEnter(out var probeAt)) return (EdgeWaitReason(probeAt), probeAt, true);
+            return (null, null, false);
+        }
+
+        private string EdgeWaitReason(DateTime retryAt)
+        {
+            var since = edgeGate.Snapshot().BlockedSinceUtc;
+            return $"Tumblr's edge has been refusing this server's requests{(since is DateTime t ? $" since {t:HH:mm} UTC" : "")} " +
+                $"(an HTML 403 before the API — the server's network, not this post or the account); waiting, next try {retryAt:HH:mm} UTC.";
+        }
+
+        private async Task AlertIfEdgeBlockedLongAsync()
+        {
+            var edge = edgeGate.Snapshot();
+            if (edge.BlockedSinceUtc is not DateTime since || clock() - since < EdgeAlertAfter) return;
+            await AlertOnceAsync("edge-blocked",
+                $"OmniTumblr: Tumblr's edge has refused every request from this server since {since:HH:mm} UTC (HTML 403 from nginx, not the API). " +
+                "Posts are waiting, not failing, and go out when it lifts. If it keeps happening, set the OmniSetting OmniTumblr_Proxy to route Tumblr traffic another way.");
         }
 
         /// <summary>The /user/limits entries that apply to this post (names vary, so match loosely).</summary>
@@ -462,6 +496,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 var blog = s.Blog(post.BlogId);
                 var conn = blog == null ? null : s.Connection(blog.ConnectionId);
                 string blogName = blog?.Name ?? c.BlogName;
+                string? previousCode = post.LastErrorCode;
                 AddAttempt(post, new PublishAttempt { Utc = now, Ok = false, Code = ex.Code, Message = ex.Message, DurationMs = durationMs });
                 post.LastError = ex.Message;
                 post.LastErrorCode = ex.Code;
@@ -509,6 +544,19 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                         countsAsFailure = false;
                         break;
                     }
+
+                    case TumblrErrorKind.EdgeBlocked:
+                        // The request never reached the API, so nothing was posted and nothing is wrong with the post:
+                        // wait for the edge to answer again (the gate paces the retries), however long that takes.
+                        post.Status = PostStatus.Ready;
+                        post.Attempts = Math.Max(0, post.Attempts - 1);
+                        post.NextAttemptUtc = edgeGate.RetryAtUtc ?? now.AddMinutes(5);
+                        post.BlockedReason = EdgeWaitReason(post.NextAttemptUtc.Value);
+                        post.LastErrorCode = EdgeWaitCode;
+                        if (previousCode != EdgeWaitCode)
+                            s.AddEvent(EventLevel.Warning, "publish.edge-wait", $"@{blogName}: Tumblr's edge refused the upload (an HTML 403 — this server's network is being blocked, not the post); it will go out when Tumblr answers again.", blog?.BlogId, post.PostId, now);
+                        countsAsFailure = false;
+                        break;
 
                     case TumblrErrorKind.RateLimited:
                         post.Status = PostStatus.Ready;
@@ -610,6 +658,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         /// </summary>
         public async Task<int> ConfirmProvisionalIdsAsync(CancellationToken ct, string? onlyPostId = null, bool force = false)
         {
+            if (!force && edgeGate.IsBlocked) return 0; // checked again once Tumblr answers; sync does the probing
             DateTime now = clock();
             var pending = store.Read(s => s.AllPosts()
                 .Where(p => p.Status == PostStatus.Published && p.TumblrIdProvisional && p.PublishedUtc.HasValue

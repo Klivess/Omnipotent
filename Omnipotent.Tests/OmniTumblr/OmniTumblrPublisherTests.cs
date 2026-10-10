@@ -234,14 +234,15 @@ namespace Omnipotent.Tests.OmniTumblr
         }
 
         [Fact]
-        public async Task AnEdgeBlock_IsRetried_NotFailedOrAlerted()
+        public async Task AnEdgeBlock_IsWaitedOut_NotCountedFailedOrAlerted()
         {
             var (h, _, blogId) = Setup();
             using var _h = h;
             int calls = 0;
             h.Api.OnCreate = (_, _) =>
             {
-                if (++calls == 1) throw new TumblrApiException(TumblrErrorKind.EdgeBlocked, 403, null, "403 Forbidden (HTML page from Tumblr's nginx edge, not an API response)");
+                if (++calls == 1) throw h.EdgeRefusal();
+                h.Gate.RecordAnswered();
                 return Task.FromResult(new TumblrCreatedPost { Id = "888" });
             };
             string postId = h.AddReadyPost(blogId, p => { p.Origin = PostOrigin.Autopilot; p.SlotUtc = p.ScheduledUtc; });
@@ -249,13 +250,104 @@ namespace Omnipotent.Tests.OmniTumblr
             await h.Publisher.PublishDueAsync(CancellationToken.None);
             var post = h.Post(postId);
             Assert.Equal(PostStatus.Ready, post.Status);
-            Assert.Equal(Start.AddMinutes(2), post.NextAttemptUtc);
+            Assert.Equal(Start + TumblrEdgeGate.ProbeBackoff[0], post.NextAttemptUtc);
+            Assert.Equal(0, post.Attempts);
+            Assert.Equal(0, post.Deferrals);
+            Assert.Equal(OmniTumblrPublisher.EdgeWaitCode, post.LastErrorCode);
+            Assert.Contains("edge", post.BlockedReason);
+            Assert.False(post.NeedsReconcile); // the request never reached the API, so nothing can have been posted
+            Assert.Equal(0, h.Blog(blogId).Health.ConsecutiveFailures);
             Assert.Empty(h.Alerts);
 
-            h.Clock.Advance(TimeSpan.FromMinutes(3));
+            h.Clock.Advance(TumblrEdgeGate.ProbeBackoff[0]);
             await h.Publisher.PublishDueAsync(CancellationToken.None);
             Assert.Equal(PostStatus.Published, h.Post(postId).Status);
             Assert.Equal("888", h.Post(postId).TumblrPostId);
+        }
+
+        [Fact]
+        public async Task WhileTheEdgeRefuses_PostsWaitBehindOneProbe_AndAllGoOutWhenItLifts()
+        {
+            var (h, _, blogId) = Setup();
+            using var _h = h;
+            bool refusing = true;
+            h.Api.OnCreate = (_, _) =>
+            {
+                if (refusing) throw h.EdgeRefusal();
+                h.Gate.RecordAnswered();
+                return Task.FromResult(new TumblrCreatedPost { Id = Guid.NewGuid().ToString("N") });
+            };
+            string first = h.AddReadyPost(blogId);
+            string second = h.AddReadyPost(blogId);
+
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            Assert.Equal(1, h.Api.CreateCalls); // the second post did not hit the block too
+            Assert.All(new[] { first, second }, id => Assert.Equal(Start + TumblrEdgeGate.ProbeBackoff[0], h.Post(id).NextAttemptUtc));
+
+            // Hours of refusals: one probe per window, on a growing backoff, and no post ever fails.
+            var waits = new List<double>();
+            for (int i = 0; i < 7; i++)
+            {
+                DateTime previous = h.Clock.Now;
+                h.Clock.Now = h.Gate.RetryAtUtc!.Value;
+                waits.Add((h.Clock.Now - previous).TotalMinutes);
+                await h.Publisher.PublishDueAsync(CancellationToken.None);
+                Assert.Equal(2 + i, h.Api.CreateCalls);
+            }
+            Assert.Equal(new double[] { 5, 10, 20, 30, 30, 30, 30 }, waits);
+            foreach (string id in new[] { first, second })
+            {
+                var post = h.Post(id);
+                Assert.Equal(PostStatus.Ready, post.Status);
+                Assert.Equal(0, post.Attempts);
+            }
+            Assert.Single(h.Store.Read(s => s.Events.Where(e => e.Kind == "publish.edge-wait").ToList()));
+            // Blocked for over two hours by now: Klives hears about it once.
+            Assert.Contains("OmniTumblr_Proxy", Assert.Single(h.Alerts));
+
+            refusing = false;
+            h.Clock.Now = h.Gate.RetryAtUtc!.Value;
+            Assert.Equal(2, await h.Publisher.PublishDueAsync(CancellationToken.None));
+            Assert.All(new[] { first, second }, id => Assert.Equal(PostStatus.Published, h.Post(id).Status));
+            Assert.False(h.Gate.IsBlocked);
+        }
+
+        [Fact]
+        public async Task AnAutopilotPost_WaitingOutAnEdgeBlock_IsStillSkippedOnceItsSlotIsStale()
+        {
+            var (h, _, blogId) = Setup();
+            using var _h = h;
+            h.Api.OnCreate = (_, _) => throw h.EdgeRefusal();
+            string postId = h.AddReadyPost(blogId, p => { p.Origin = PostOrigin.Autopilot; p.SlotUtc = p.ScheduledUtc; });
+            var grace = TimeSpan.FromHours(h.Blog(blogId).Strategy.MissedSlotGraceHours);
+
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            while (h.Post(postId).Status == PostStatus.Ready && h.Clock.Now - Start < grace + TimeSpan.FromHours(1))
+            {
+                h.Clock.Now = h.Gate.RetryAtUtc!.Value;
+                await h.Publisher.PublishDueAsync(CancellationToken.None);
+            }
+
+            // An outage is downtime: past the grace period the post is skipped (its content reusable), not posted hours late.
+            Assert.Equal(PostStatus.Skipped, h.Post(postId).Status);
+        }
+
+        [Fact]
+        public async Task PublishNow_IsTried_AtOnce_EvenWhileTheEdgeRefuses()
+        {
+            var (h, _, blogId) = Setup();
+            using var _h = h;
+            h.Api.OnCreate = (_, _) => throw h.EdgeRefusal();
+            string postId = h.AddReadyPost(blogId);
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            Assert.Equal(1, h.Api.CreateCalls);
+
+            // What the publish-now route does: let the next attempt through without waiting for the probe window.
+            h.Clock.Advance(TimeSpan.FromMinutes(1));
+            h.Store.Mutate(s => { var p = s.FindPost(postId)!; p.ScheduledUtc = h.Clock.Now; p.NextAttemptUtc = null; });
+            h.Gate.ProbeNow();
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            Assert.Equal(2, h.Api.CreateCalls);
         }
 
         [Fact]

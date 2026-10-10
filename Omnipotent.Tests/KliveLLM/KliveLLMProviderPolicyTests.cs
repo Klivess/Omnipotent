@@ -460,6 +460,25 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal(foreign, LlmService.LooksLikeForeignModelSlug(model));
         }
 
+        [Theory]
+        // Qwen3.8 sees images natively; DeepSeek-V4-Flash via AIRouter's vision augmentation.
+        [InlineData("Qwen3.8", true)]
+        [InlineData("DeepSeek-V4-Flash", true)]
+        // A foreign slug is redirected to the configured AIRouter chat model before sending.
+        [InlineData("openai/gpt-4.1-mini", true)]
+        [InlineData("", true)]
+        // Non-chat endpoints in AIRouter's catalogue.
+        [InlineData("Qwen3-Embedding", false)]
+        [InlineData("whisper-large-v3-turbo", false)]
+        [InlineData("kokoro", false)]
+        public void AIRouterChatModels_AcceptImageInput(string model, bool imageInput)
+        {
+            // The family table knows neither AIRouter name; relying on it refused every KliveAgent
+            // image attachment and turned off Projects screenshots under AIRouter.
+            Assert.Equal(imageInput, LlmService.AIRouterModelCapabilities(model).ImageInput);
+            Assert.False(LlmService.AIRouterModelCapabilities(model).AudioInput);
+        }
+
         [Fact]
         public void RequestTokenEstimate_CountsThePromptPlusTheWholeCompletionReserve()
         {

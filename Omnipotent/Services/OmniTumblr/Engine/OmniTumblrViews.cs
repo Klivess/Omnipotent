@@ -417,9 +417,23 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             return result;
         }
 
-        public static List<AttentionItemDto> Attention(OmniTumblrState s, DateTime now, bool publishingEnabled, bool aiAvailable, bool memeScraperReady)
+        public static List<AttentionItemDto> Attention(OmniTumblrState s, DateTime now, bool publishingEnabled, bool aiAvailable, bool memeScraperReady,
+            TumblrEdgeGateStatus? edge = null)
         {
             var items = new List<AttentionItemDto>();
+            if (edge is { Blocked: true, BlockedSinceUtc: DateTime since })
+            {
+                int waiting = s.AllPosts().Count(p => p.Status == PostStatus.Ready && p.ScheduledUtc <= now);
+                items.Add(new AttentionItemDto
+                {
+                    Level = "error",
+                    Title = "Tumblr is refusing this server's requests",
+                    Detail = $"Since {since:HH:mm} UTC every call gets an HTML 403 from Tumblr's edge (nginx) before it reaches the API — the server's network or IP, not the accounts or posts. " +
+                        $"{(waiting > 0 ? $"{waiting} due post(s) are waiting and" : "Posts")} will go out when it lifts; next check {edge.NextCheckUtc:HH:mm} UTC. " +
+                        "If it keeps happening, route Tumblr traffic through a proxy with the OmniSetting OmniTumblr_Proxy.",
+                    Action = "settings",
+                });
+            }
             if (!s.App.IsConfigured)
                 items.Add(new AttentionItemDto { Level = "error", Title = "Connect your Tumblr app", Detail = "Enter the OAuth consumer key and secret from tumblr.com/oauth/apps so OmniTumblr can authorize blogs.", Action = "settings" });
             else if (s.App.LastVerifyError != null)
