@@ -6,24 +6,37 @@ namespace Omnipotent.Profiles.Permissions
         private static readonly PermissionGroup G = new("omnigram", "OmniGram");
 
         public static readonly PermissionDef OverviewView = G.Define("overview.view", "Overview", PermissionTier.Glance,
-            "View OmniGram overview", "Dashboard statistics across all accounts.", ProfileRank.Guest);
+            "View OmniGram overview", "The autopilot overview and dashboard statistics.", ProfileRank.Guest);
 
         public static readonly PermissionDef AccountsRead = G.Define("accounts.read", "Accounts", PermissionTier.Read,
-            "View accounts", "Instagram accounts with their profiles and configuration.", ProfileRank.Guest);
+            "View accounts", "Instagram accounts with their profile, strategy, health and queue.", ProfileRank.Guest,
+            implies: new[] { "overview.view" });
 
         public static readonly PermissionDef AccountsAct = G.Define("accounts.act", "Accounts", PermissionTier.Act,
-            "Operate accounts", "Pause, resume and re-login accounts and edit their notes.", ProfileRank.Admin,
+            "Operate accounts", "Pause and resume accounts, refresh them from Instagram, plan now and edit their notes.", ProfileRank.Admin,
             implies: new[] { "accounts.read" });
 
         public static readonly PermissionDef AccountsManage = G.Define("accounts.manage", "Accounts", PermissionTier.Manage,
-            "Manage accounts", "Add and remove accounts, edit their Instagram profile and configuration.", ProfileRank.Admin,
+            "Manage accounts", "Switch autopilot, edit strategies, remove accounts and delete published posts from Instagram.", ProfileRank.Admin,
             implies: new[] { "accounts.act" }, sensitive: true);
 
         public static readonly PermissionDef ContentRead = G.Define("content.read", "Content", PermissionTier.Read,
-            "View content", "Content folders, posts, the publishing queue, analytics and events.", ProfileRank.Guest);
+            "View content", "Posts, media, the content library, analytics, comments and events.", ProfileRank.Guest,
+            implies: new[] { "accounts.read" });
 
         public static readonly PermissionDef ContentPublish = G.Define("content.publish", "Content", PermissionTier.Act,
-            "Publish content", "Schedule, publish, cancel and draft posts, upload media and take analytics snapshots.",
+            "Publish content", "Compose, schedule, edit, approve, publish, skip and cancel posts, regenerate captions and upload media.",
             ProfileRank.Admin, implies: new[] { "content.read" });
+
+        public static readonly PermissionDef CommentsAct = G.Define("comments.act", "Comments", PermissionTier.Act,
+            "Moderate comments", "Reply to, hide and delete comments on the accounts' posts.", ProfileRank.Admin,
+            implies: new[] { "content.read" });
+
+        public static readonly PermissionDef SettingsView = G.Define("settings.view", "Settings", PermissionTier.Manage,
+            "View settings and connections", "The Instagram app settings, account connections, tokens' expiry and engine status.", ProfileRank.Admin);
+
+        public static readonly PermissionDef SettingsManage = G.Define("settings.manage", "Settings", PermissionTier.Critical,
+            "Change settings and connections", "The Instagram app secret, connecting and reconnecting accounts, and removing v1 credentials.", ProfileRank.Admin,
+            implies: new[] { "settings.view" }, sensitive: true);
     }
 }

@@ -108,18 +108,9 @@ namespace Omnipotent.Data_Handling
             public static string OmniTubeDirectory = $"{SavedDataDirectory}/OmniTube";
             public static string OmniTubeBrandsDirectory = $"{OmniTubeDirectory}/OmniBrands";
 
-            //OmniGram
+            //OmniGram (the v1 folders under OmniGramDirectory are only read once, by the v2 import)
             public static string OmniGramDirectory = $"{SavedDataDirectory}/OmniGram";
-            public static string OmniGramAccountsDirectory = $"{OmniGramDirectory}/Accounts";
-            public static string OmniGramPostsDirectory = $"{OmniGramDirectory}/Posts";
-            public static string OmniGramCampaignsDirectory = $"{OmniGramDirectory}/Campaigns";
-            public static string OmniGramSessionsDirectory = $"{OmniGramDirectory}/Sessions";
-            public static string OmniGramUploadsDirectory = $"{OmniGramDirectory}/Uploads";
-            public static string OmniGramMediaDirectory = $"{OmniGramDirectory}/Media";
-            public static string OmniGramAnalyticsDirectory = $"{OmniGramDirectory}/Analytics";
-            public static string OmniGramLogsDirectory = $"{OmniGramDirectory}/Logs";
-            public static string OmniGramEventsDirectory = $"{OmniGramLogsDirectory}/Events";
-            public static string OmniGramUploadMetricsDirectory = $"{OmniGramLogsDirectory}/UploadMetrics";
+            public static string OmniGramV2Directory = $"{OmniGramDirectory}/v2";
 
             //OmniTumblr
             public static string OmniTumblrDirectory = $"{SavedDataDirectory}/OmniTumblr";
