@@ -453,5 +453,19 @@ namespace Omnipotent.Tests.OmniTumblr
             Assert.Contains(problems, e => e.Contains("time zone"));
             Assert.Contains(problems, e => e.Contains("pool"));
         }
+
+        [Fact]
+        public void SlotDays_TravelAsNumbers_EvenWithTheRoutesStringEnumConverter()
+        {
+            // The routes serialize with a global StringEnumConverter, which turned DayOfWeek into "Friday"; the
+            // website's schedule editor indexes day names by number (Sunday = 0), so it showed no slots at all.
+            var settings = new Newtonsoft.Json.JsonSerializerSettings { Converters = { new Newtonsoft.Json.Converters.StringEnumConverter() } };
+            string json = Newtonsoft.Json.JsonConvert.SerializeObject(OmniTumblrStrategy.CreateDefault(), settings);
+            Assert.Contains("\"Slots\":[{\"Day\":5,\"Minute\":1080}]", json);
+
+            // Strategies sent or saved with day names still load.
+            var parsed = Newtonsoft.Json.JsonConvert.DeserializeObject<OmniTumblrStrategy>("{\"Slots\":[{\"Day\":\"Friday\",\"Minute\":1080},{\"Day\":2,\"Minute\":60}]}", settings)!;
+            Assert.Equal(new[] { DayOfWeek.Friday, DayOfWeek.Tuesday }, parsed.Slots.Select(s => s.Day));
+        }
     }
 }

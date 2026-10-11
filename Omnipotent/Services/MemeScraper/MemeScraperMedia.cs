@@ -11,6 +11,7 @@ namespace Omnipotent.Services.MemeScraper
         private List<InstagramScrapeUtilities.InstagramReel> reels = new();
         private readonly HashSet<string> knownPostIds = new();
         private readonly HashSet<string> knownShortCodes = new();
+        private readonly Dictionary<string, InstagramScrapeUtilities.InstagramReel> byPostId = new(StringComparer.Ordinal);
 
         /// <summary>Cheap: call <see cref="LoadAllScrapedInstagramReels"/> to populate.</summary>
         public MemeScraperMedia(MemeScraper parent)
@@ -31,6 +32,12 @@ namespace Omnipotent.Services.MemeScraper
         public int Count
         {
             get { lock (gate) return reels.Count; }
+        }
+
+        public InstagramScrapeUtilities.InstagramReel? FindReel(string? postId)
+        {
+            if (string.IsNullOrEmpty(postId)) return null;
+            lock (gate) return byPostId.TryGetValue(postId, out var reel) ? reel : null;
         }
 
         public bool IsKnown(string? postId, string? shortCode)
@@ -72,7 +79,11 @@ namespace Omnipotent.Services.MemeScraper
 
         private void Index(InstagramScrapeUtilities.InstagramReel reel)
         {
-            if (!string.IsNullOrEmpty(reel.PostID)) knownPostIds.Add(reel.PostID);
+            if (!string.IsNullOrEmpty(reel.PostID))
+            {
+                knownPostIds.Add(reel.PostID);
+                byPostId.TryAdd(reel.PostID, reel);
+            }
             if (!string.IsNullOrEmpty(reel.ShortCode)) knownShortCodes.Add(reel.ShortCode);
         }
 
@@ -80,6 +91,7 @@ namespace Omnipotent.Services.MemeScraper
         {
             knownPostIds.Clear();
             knownShortCodes.Clear();
+            byPostId.Clear();
             foreach (var reel in reels) Index(reel);
         }
 

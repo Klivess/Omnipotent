@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
+using Omnipotent.Data_Handling;
 
 namespace Omnipotent.Services.OmniTumblr.Models
 {
@@ -183,6 +184,9 @@ namespace Omnipotent.Services.OmniTumblr.Models
 
     public sealed class WeeklySlot
     {
+        /// <summary>Always a number on the wire (Sunday = 0): the website indexes day names by it, and the routes'
+        /// global StringEnumConverter would otherwise send "Friday".</summary>
+        [JsonConverter(typeof(DayOfWeekNumberConverter))]
         public DayOfWeek Day { get; set; }
         /// <summary>Minutes after local midnight, 0–1439, in the strategy's time zone.</summary>
         public int Minute { get; set; }

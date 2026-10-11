@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
+using Omnipotent.Data_Handling;
 
 namespace Omnipotent.Services.OmniGram.Models
 {
@@ -225,24 +226,6 @@ namespace Omnipotent.Services.OmniGram.Models
 
         public WeeklySlot() { }
         public WeeklySlot(DayOfWeek day, int minute) { Day = day; Minute = minute; }
-    }
-
-    /// <summary>Writes a <see cref="DayOfWeek"/> as its number; reads a number, a numeric string or a day name.</summary>
-    public sealed class DayOfWeekNumberConverter : JsonConverter<DayOfWeek>
-    {
-        public override void WriteJson(JsonWriter writer, DayOfWeek value, JsonSerializer serializer) => writer.WriteValue((int)value);
-
-        public override DayOfWeek ReadJson(JsonReader reader, Type objectType, DayOfWeek existingValue, bool hasExistingValue, JsonSerializer serializer)
-        {
-            int? number = reader.TokenType switch
-            {
-                JsonToken.Integer => Convert.ToInt32(reader.Value),
-                JsonToken.String when int.TryParse((string?)reader.Value, out int n) => n,
-                JsonToken.String when Enum.TryParse((string?)reader.Value, true, out DayOfWeek named) => (int)named,
-                _ => null,
-            };
-            return number is >= 0 and <= 6 ? (DayOfWeek)number.Value : throw new JsonSerializationException($"'{reader.Value}' is not a day of the week.");
-        }
     }
 
     public sealed class MemeScraperContentFilter

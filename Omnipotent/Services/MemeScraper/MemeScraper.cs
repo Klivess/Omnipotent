@@ -27,7 +27,7 @@ namespace Omnipotent.Services.MemeScraper
     /// Discord, and <c>/memescraper/scraperHealth</c> shows it all, so the scraper can no longer die
     /// silently.
     /// </summary>
-    public class MemeScraper : OmniService
+    public partial class MemeScraper : OmniService
     {
         public MemeScraperSources SourceManager;
         public InstagramScrapeUtilities instagramScrapeUtilities;
@@ -38,7 +38,8 @@ namespace Omnipotent.Services.MemeScraper
         private readonly SemaphoreSlim scrapeLock = new(1, 1);
         private readonly SemaphoreSlim schedulerWake = new(0, int.MaxValue);
         private readonly ConcurrentDictionary<string, DateTime> lastAlertUtc = new();
-        private readonly ConcurrentQueue<ScrapeReport> recentReports = new();
+        // Every scrape's report, persisted so reliability can be charted across restarts.
+        private readonly MemeScraperScrapeLog scrapeLog = new(OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperScrapeHistoryFile));
         private volatile string? currentScrape;
         private volatile ProviderCheckRun? lastProviderCheck;
         private int queuedScrapes;
@@ -70,10 +71,14 @@ namespace Omnipotent.Services.MemeScraper
         public sealed class ScrapeReport
         {
             public string Username = "";
+            /// <summary>Ties the report to its source through a rename.</summary>
+            public string AccountID = "";
             public string Trigger = "";
             public DateTime StartedUtc;
             public DateTime? FinishedUtc;
             public string? ProviderSummary;
+            /// <summary>The provider whose answer was used (inflact or instagram); null when every provider failed.</summary>
+            public string? SucceededVia;
             public int ReelsFound;
             public int NewReels;
             public int Downloaded;
@@ -130,7 +135,7 @@ namespace Omnipotent.Services.MemeScraper
                 schedulerState = "loading data";
                 var sources = new MemeScraperSources(this);
                 var media = new MemeScraperMedia(this);
-                await Task.WhenAll(sources.LoadAllInstagramSources(), sources.LoadNiches(), media.LoadAllScrapedInstagramReels());
+                await Task.WhenAll(sources.LoadAllInstagramSources(), sources.LoadNiches(), media.LoadAllScrapedInstagramReels(), LoadScrapeLogAsync());
                 // Published only once loaded: OmniGram/OmniTumblr/OmniTube treat a non-null mediaManager as ready.
                 SourceManager = sources;
                 mediaManager = media;
@@ -146,6 +151,8 @@ namespace Omnipotent.Services.MemeScraper
             }
 
             GetTimeManagerService().TaskDue += TimeManager_TaskDue;
+            try { await RefreshSettingsAsync(); }
+            catch (Exception ex) { _ = ServiceLogError(ex, "MemeScraper couldn't read its settings; using the defaults until the next scheduler tick."); }
             _ = Task.Run(SchedulerLoopAsync);
             await ServiceLog($"MemeScraper data loaded in {startupClock.ElapsedMilliseconds} ms: {SourceManager.InstagramSources.Count} Instagram sources, {SourceManager.AllNiches.Count} niches, {mediaManager.Count} reels.");
         }
@@ -195,7 +202,7 @@ namespace Omnipotent.Services.MemeScraper
                 schedulerState = "idle (scheduled scrapes only run on the server; use /memescraper/scrapeNow to scrape here)";
                 return;
             }
-            if (!await GetBoolOmniSetting("ScrapeInstagramAccounts", true))
+            if ((await RefreshSettingsAsync()).Paused)
             {
                 schedulerState = "paused by the ScrapeInstagramAccounts setting";
                 return;
@@ -248,7 +255,7 @@ namespace Omnipotent.Services.MemeScraper
         /// </summary>
         public async Task<ScrapeReport> ScrapeSourceAsync(MemeScraperSources.InstagramSource source, string trigger, CancellationToken ct)
         {
-            var report = new ScrapeReport { Username = source.Username, Trigger = trigger };
+            var report = new ScrapeReport { Username = source.Username, AccountID = source.AccountID ?? "", Trigger = trigger };
             await scrapeLock.WaitAsync(ct);
             report.StartedUtc = DateTime.UtcNow;
             currentScrape = $"@{source.Username} ({trigger}) since {report.StartedUtc:u}";
@@ -263,6 +270,7 @@ namespace Omnipotent.Services.MemeScraper
                 var discovery = await instagramScrapeUtilities.DiscoverReelsAsync(
                     source.Username, r => mediaManager.IsKnown(r.PostID, r.ShortCode), maxPages, ct);
                 report.ProviderSummary = discovery.Summary;
+                report.SucceededVia = discovery.SucceededVia;
                 report.ReelsFound = discovery.Reels.Count;
 
                 var fresh = discovery.Reels.Where(r => !mediaManager.IsKnown(r.PostID, r.ShortCode)).ToList();
@@ -365,9 +373,9 @@ namespace Omnipotent.Services.MemeScraper
                 try
                 {
                     report.FinishedUtc = DateTime.UtcNow;
-                    recentReports.Enqueue(report);
-                    while (recentReports.Count > 50) recentReports.TryDequeue(out _);
                     currentScrape = null;
+                    try { await scrapeLog.AppendAsync(report); }
+                    catch (Exception ex) { _ = ServiceLogError(ex, "Couldn't record a scrape in the scrape history."); }
                     // A source deleted mid-scrape must stay deleted; saving it would resurrect its file.
                     if (SourceManager.IsRegistered(source)) await SourceManager.SaveInstagramSource(source);
                 }
@@ -550,6 +558,20 @@ namespace Omnipotent.Services.MemeScraper
                 }, HttpMethod.Get, MemeScraperPerms.HealthView),
                 ("/memescraper/scrapeNow", ScrapeNowRoute, HttpMethod.Post, MemeScraperPerms.ScrapeRun),
                 ("/memescraper/diagnoseProviders", DiagnoseProvidersRoute, HttpMethod.Post, MemeScraperPerms.ScrapeRun),
+
+                // Analytics website (pages/schemery/memescraper/*): MemeScraperDashboardRoutes.cs.
+                ("/memescraper/summary", SummaryRoute, HttpMethod.Get, MemeScraperPerms.HealthView),
+                ("/memescraper/dashboard", DashboardRoute, HttpMethod.Get, MemeScraperPerms.HealthView),
+                ("/memescraper/scrapeHistory", ScrapeHistoryRoute, HttpMethod.Get, MemeScraperPerms.HealthView),
+                ("/memescraper/settings", SettingsRoute, HttpMethod.Get, MemeScraperPerms.HealthView),
+                ("/memescraper/saveSettings", SaveSettingsRoute, HttpMethod.Post, MemeScraperPerms.ScrapeRun),
+                ("/memescraper/reels", ReelsRoute, HttpMethod.Get, MemeScraperPerms.SourcesRead),
+                ("/memescraper/reel", ReelRoute, HttpMethod.Get, MemeScraperPerms.SourcesRead),
+                ("/memescraper/reelThumb", ReelThumbRoute, HttpMethod.Get, MemeScraperPerms.SourcesRead),
+                ("/memescraper/reelVideo", ReelVideoRoute, HttpMethod.Get, MemeScraperPerms.SourcesRead),
+                ("/memescraper/updateInstagramSource", UpdateInstagramSourceRoute, HttpMethod.Post, MemeScraperPerms.SourcesManage),
+                ("/memescraper/removeInstagramSource", RemoveInstagramSourceRoute, HttpMethod.Post, MemeScraperPerms.SourcesManage),
+                ("/memescraper/refreshSourceProfile", RefreshSourceProfileRoute, HttpMethod.Post, MemeScraperPerms.SourcesManage),
             };
 
             int registered = 0;
@@ -841,10 +863,14 @@ namespace Omnipotent.Services.MemeScraper
                     s.LastScrapeDownloadFailures,
                     s.TotalReelsDownloaded,
                 }).ToList(),
-                RecentScrapes = recentReports.Reverse().ToList(),
+                RecentScrapes = scrapeLog.Latest(50),
+                ScrapeHistoryCount = scrapeLog.Count,
                 ProviderCheck = lastProviderCheck,
+                ProfileRefresh = lastProfileRefresh,
                 ScrapeIntervalHours = scrapeIntervalHoursCache,
+                Settings = settingsCache,
                 ScrapeQueued = Math.Max(0, queuedScrapes),
+                Disk = GetDiskUsage(),
             };
         }
     }
