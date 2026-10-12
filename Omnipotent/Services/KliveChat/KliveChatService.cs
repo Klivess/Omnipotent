@@ -1,25 +1,65 @@
 using Newtonsoft.Json;
-using Omnipotent.Service_Manager;
-using Omnipotent.Services.KliveAPI;
-using System.Collections.Concurrent;
-using System.Net.WebSockets;
-using System.Net;
-using System.Net.Http;
-using System.Collections.Generic;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using System;
+using Omnipotent.Data_Handling;
 using Omnipotent.Profiles;
-using static Omnipotent.Profiles.KMProfileManager;
 using Omnipotent.Profiles.Permissions;
+using Omnipotent.Service_Manager;
+using Omnipotent.Services.KliveAPI.Caching;
+using System.Collections.Concurrent;
+using System.Collections.Specialized;
+using System.Net;
+using System.Net.WebSockets;
+using System.Text;
+using static Omnipotent.Profiles.KMProfileManager;
 
 namespace Omnipotent.Services.KliveChat
 {
-    public class KliveChatService : OmniService
+    /// <summary>
+    /// Voice/video rooms. Rooms are stored on disk; calls are peer-to-peer WebRTC with this service as the
+    /// signalling relay (/klivechat/ws), and the lobby is pushed live over /klivechat/lobby.
+    /// </summary>
+    public class KliveChatService : OmniService, IKliveChatHost
     {
-        public ConcurrentDictionary<string, KliveChatRoom> ActiveRooms { get; } = new();
+        /// <summary>A room nobody has been in for this long is removed, unless it is kept (persistent).</summary>
+        public static readonly TimeSpan EmptyRoomLifetime = TimeSpan.FromHours(24);
+        private static readonly TimeSpan MaintenanceInterval = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan LobbySilenceLimit = TimeSpan.FromSeconds(75);
+        private static readonly TimeSpan IceSettingsTtl = TimeSpan.FromMinutes(1);
+
+        private static readonly JsonSerializerSettings WireSettings = new()
+        {
+            NullValueHandling = NullValueHandling.Ignore,
+            DateTimeZoneHandling = DateTimeZoneHandling.Utc,
+        };
+
+        public ConcurrentDictionary<string, KliveChatRoom> ActiveRooms { get; } = new(StringComparer.Ordinal);
+
+        private readonly ConcurrentDictionary<Guid, LobbySubscriber> lobbySubscribers = new();
+        private readonly SemaphoreSlim lobbySignal = new(0);
+        private readonly SemaphoreSlim iceSettingsLock = new(1, 1);
+        private int lobbyDirty;
+        private int saveRequested;
+        private KliveChatRoomStore? store;
         private KMProfileManager? profileManager;
+        private CancellationTokenSource? loops;
+        private IceSettings? iceSettings;
+
+        private sealed record IceSettings(DateTime ReadUtc, string? Urls, string? Secret, string? Username, string? Password);
+
+        private sealed class LobbySubscriber
+        {
+            public LobbySubscriber(KMProfile profile, KliveChatConnection connection)
+            {
+                Profile = profile;
+                Connection = connection;
+                LastSeenUtc = DateTime.UtcNow;
+            }
+
+            public Guid Id { get; } = Guid.NewGuid();
+            public KMProfile Profile { get; }
+            public KliveChatConnection Connection { get; }
+            public DateTime LastSeenUtc { get; set; }
+            public bool Pings { get; set; }
+        }
 
         public KliveChatService()
         {
@@ -27,232 +67,485 @@ namespace Omnipotent.Services.KliveChat
             threadAnteriority = ThreadAnteriority.Standard;
         }
 
+        DateTime IKliveChatHost.UtcNow => DateTime.UtcNow;
+
+        void IKliveChatHost.Log(string message) => TryLog(message);
+
+        void IKliveChatHost.LogError(Exception error, string context)
+        {
+            try { _ = ServiceLogError(error, context); } catch { }
+        }
+
+        void IKliveChatHost.RoomChanged(KliveChatRoom room, bool persist)
+        {
+            if (persist) Interlocked.Exchange(ref saveRequested, 1);
+            SignalLobby();
+        }
+
         protected override async void ServiceMain()
         {
-            // GET /klivechat/rooms to list basic details or get by id
-            await CreateAPIRoute("/klivechat/rooms", async (req) =>
+            loops?.Cancel();
+            loops = new CancellationTokenSource();
+
+            store = new KliveChatRoomStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveChatRoomsFile));
+            var saved = store.Load(out string? problem);
+            foreach (var record in saved)
             {
-                var id = req.userParameters["id"];
+                ActiveRooms.TryAdd(record.Id, new KliveChatRoom(record, this));
+            }
+            if (problem != null) TryLog($"KliveChat: the saved rooms could not be read: {problem}");
+
+            await RegisterRoutesAsync();
+
+            var token = loops.Token;
+            _ = Task.Run(() => MaintenanceLoopAsync(token));
+            _ = Task.Run(() => LobbyPushLoopAsync(token));
+            TryLog($"KliveChat ready with {ActiveRooms.Count} room(s).");
+        }
+
+        // ───────────────────────────── routes ─────────────────────────────
+
+        private async Task RegisterRoutesAsync()
+        {
+            await Route("/klivechat/rooms", HttpMethod.Get, Perms.Public, async req =>
+            {
+                // Live, in-memory state: never replay a cached copy (req.Can below would otherwise make it cacheable).
+                CacheDeps.MarkUncacheable("klivechat: live room state");
+                string? id = req.userParameters["id"];
                 if (!string.IsNullOrEmpty(id))
                 {
-                    if (ActiveRooms.TryGetValue(id, out var specificRoom))
-                    {
-                        var response = ToRoomSummary(specificRoom);
-                        await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
-                    }
+                    if (ActiveRooms.TryGetValue(id, out var room) && !room.IsClosed)
+                        await ReturnJsonAsync(req, room.ToSummary(CanManage(req.user, room)));
                     else
-                    {
-                        await req.ReturnResponse("Room not found", "text/plain", null!, System.Net.HttpStatusCode.NotFound);
-                    }
+                        await req.ReturnResponse("Room not found", "text/plain", null!, HttpStatusCode.NotFound);
+                    return;
                 }
-                else
-                {
-                    var rooms = ListRoomSummaries();
-                    await req.ReturnResponse(JsonConvert.SerializeObject(rooms), "application/json");
-                }
-            }, HttpMethod.Get, Perms.Public);
+                // The directory is for signed-in profiles; guests join by link.
+                await ReturnJsonAsync(req, req.user == null ? new List<KliveChatRoomSummary>() : ListRoomSummaries(req.user));
+            });
 
-            // GET /klivechat/me returns the current user's profile details
-            await CreateAPIRoute("/klivechat/me", async (req) =>
+            await Route("/klivechat/me", HttpMethod.Get, Perms.Public, async req =>
             {
-                if (req.user != null)
+                CacheDeps.MarkUncacheable("klivechat: caller identity");
+                if (req.user == null)
                 {
-                    var response = new
-                    {
-                        name = req.user.Name,
-                        rank = (int)req.user.Rank,
-                        userId = req.user.UserID,
-                        canModerate = AccessEvaluator.Can(req.user, KliveChatPerms.RoomsModerate),
-                        canDeleteAnyRoom = AccessEvaluator.Can(req.user, KliveChatPerms.RoomsDeleteAny)
-                    };
-                    await req.ReturnResponse(JsonConvert.SerializeObject(response), "application/json");
+                    await req.ReturnResponse("{}", "application/json", null!, HttpStatusCode.Unauthorized);
+                    return;
                 }
-                else
+                await ReturnJsonAsync(req, new
                 {
-                    await req.ReturnResponse("{}", "application/json", null!, System.Net.HttpStatusCode.Unauthorized);
-                }
-            }, HttpMethod.Get, Perms.Public);
+                    name = req.user.Name,
+                    rank = (int)req.user.Rank,
+                    userId = req.user.UserID,
+                    canCreate = AccessEvaluator.Can(req.user, KliveChatPerms.RoomsManage),
+                    canModerate = AccessEvaluator.Can(req.user, KliveChatPerms.RoomsModerate),
+                    canDeleteAnyRoom = AccessEvaluator.Can(req.user, KliveChatPerms.RoomsDeleteAny),
+                });
+            });
 
-            // POST /klivechat/create requires Guest or above as per prompt
-            await CreateAPIRoute("/klivechat/create", async (req) =>
+            await Route("/klivechat/create", HttpMethod.Post, KliveChatPerms.RoomsManage, async req =>
             {
-                var response = CreateRoom(req.userParameters["name"], req.user?.Name);
-                await req.ReturnResponse(JsonConvert.SerializeObject(response.Room), "application/json");
-            }, HttpMethod.Post, KliveChatPerms.RoomsManage);
+                var result = CreateRoom(req.userParameters["name"], req.user?.Name, req.user?.UserID, ParseBool(req.userParameters["persistent"]) ?? false);
+                await SaveRoomsAsync();
+                SignalLobby();
+                await ReturnJsonAsync(req, result.Room);
+            });
 
-            // POST /klivechat/delete requires Guest or above
-            await CreateAPIRoute("/klivechat/delete", async (req) =>
+            await Route("/klivechat/delete", HttpMethod.Post, KliveChatPerms.RoomsManage, async req =>
             {
                 string? roomId = req.userParameters["id"];
                 if (string.IsNullOrEmpty(roomId))
                 {
-                    await req.ReturnResponse("Missing room ID", "text/plain", null!, System.Net.HttpStatusCode.BadRequest);
+                    await req.ReturnResponse("Missing room ID", "text/plain", null!, HttpStatusCode.BadRequest);
                     return;
                 }
-
-                var result = await DeleteRoomAsync(
-                    roomId,
-                    req.user?.Name,
-                    req.Can(KliveChatPerms.RoomsDeleteAny));
-
+                var result = await DeleteRoomAsync(roomId, req.user);
                 if (result.Success)
                 {
-                    await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, roomId }), "application/json");
+                    await ReturnJsonAsync(req, new { success = true, roomId });
                 }
                 else
                 {
-                    var statusCode = result.Message.Contains("Unauthorized", StringComparison.OrdinalIgnoreCase)
-                        ? System.Net.HttpStatusCode.Unauthorized
-                        : System.Net.HttpStatusCode.NotFound;
-                    await req.ReturnResponse(result.Message, "text/plain", null!, statusCode);
+                    var status = result.Message.Contains("not found", StringComparison.OrdinalIgnoreCase) ? HttpStatusCode.NotFound : HttpStatusCode.Forbidden;
+                    await req.ReturnResponse(result.Message, "text/plain", null!, status);
                 }
-            }, HttpMethod.Post, KliveChatPerms.RoomsManage);
+            });
 
-            // WebSocket route for connections
-            await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateWebSocketRoute", "/klivechat/ws", (Func<System.Net.HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfile?, Task>)(async (context, socket, queryParams, user) =>
+            await Route("/klivechat/update", HttpMethod.Post, KliveChatPerms.RoomsManage, async req =>
             {
-                string? roomId = queryParams["roomId"];
-                if (string.IsNullOrEmpty(roomId) || !ActiveRooms.TryGetValue(roomId, out var room))
+                string? roomId = req.userParameters["id"];
+                if (string.IsNullOrEmpty(roomId) || !ActiveRooms.TryGetValue(roomId, out var room) || room.IsClosed)
                 {
-                    await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Invalid Room ID", CancellationToken.None);
+                    await req.ReturnResponse("Room not found", "text/plain", null!, HttpStatusCode.NotFound);
                     return;
                 }
-
-                KMProfile? resolvedUser = user ?? await ResolveSocketUserAsync(queryParams["authorization"]);
-                string userName = !string.IsNullOrWhiteSpace(resolvedUser?.Name)
-                    ? resolvedUser.Name
-                    : queryParams["name"] ?? "Guest_" + Guid.NewGuid().ToString().Substring(0, 4);
-
-                var client = new KliveChatClient
+                if (!CanManage(req.user, room))
                 {
-                    Name = userName,
-                    Socket = socket,
-                    UserId = resolvedUser?.UserID,
-                    Rank = resolvedUser?.Rank ?? Omnipotent.Profiles.ProfileRank.None,
-                    CanModerateRooms = resolvedUser != null && AccessEvaluator.Can(resolvedUser, KliveChatPerms.RoomsModerate),
-                    GuestIdentity = string.IsNullOrWhiteSpace(queryParams["guestIdentity"])
-                        ? $"{context.Request.RemoteEndPoint?.Address}|{context.Request.UserAgent}"
-                        : queryParams["guestIdentity"]
-                };
+                    await req.ReturnResponse("Only the room's creator can change it.", "text/plain", null!, HttpStatusCode.Forbidden);
+                    return;
+                }
+                string? rawName = req.userParameters["name"];
+                string? newName = rawName == null ? null : KliveChatText.CleanRoomName(rawName);
+                if (rawName != null && newName == null)
+                {
+                    await req.ReturnResponse("A room needs a name.", "text/plain", null!, HttpStatusCode.BadRequest);
+                    return;
+                }
+                if (room.UpdateSettings(newName, ParseBool(req.userParameters["locked"]), ParseBool(req.userParameters["persistent"]), req.user?.Name ?? "Someone"))
+                {
+                    await SaveRoomsAsync();
+                    SignalLobby();
+                }
+                await ReturnJsonAsync(req, room.ToSummary(true));
+            });
 
-                await room.AddClient(client, this);
-            }), Perms.Public);
+            await WebSocketRoute("/klivechat/ws", Perms.Public, async (context, socket, query, user) =>
+            {
+                string? roomId = query["roomId"];
+                if (string.IsNullOrEmpty(roomId) || !ActiveRooms.TryGetValue(roomId, out var room) || room.IsClosed)
+                {
+                    await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "Invalid Room ID");
+                    return;
+                }
+                KMProfile? profile = user ?? await ResolveSocketUserAsync(query["authorization"]);
+                var join = BuildJoinRequest(roomId, query, profile, context);
+                join.IceServers = await GetIceServersAsync(join.ParticipantId);
+                await room.RunConnectionAsync(join, socket);
+            });
 
-            _ = ServiceLog("KliveChatService started. Listening on /klivechat/ endpoints.");
+            await WebSocketRoute("/klivechat/lobby", Perms.SignedIn, async (context, socket, query, user) =>
+            {
+                KMProfile? profile = user ?? await ResolveSocketUserAsync(query["authorization"]);
+                if (profile == null)
+                {
+                    await CloseQuietlyAsync(socket, WebSocketCloseStatus.PolicyViolation, "Sign in to see rooms");
+                    return;
+                }
+                await RunLobbySubscriberAsync(profile, socket);
+            });
         }
 
-        public List<KliveChatRoomSummary> ListRoomSummaries()
+        private async Task Route(string path, HttpMethod method, PermissionDef permission, Func<KliveAPI.KliveAPI.UserRequest, Task> handler)
+        {
+            try
+            {
+                await CreateAPIRoute(path, handler, method, permission);
+            }
+            catch (Exception ex)
+            {
+                // Route registration fails quietly otherwise, leaving a route that just 404s.
+                try { _ = ServiceLogError(ex, $"KliveChat: could not register {path}"); } catch { }
+            }
+        }
+
+        private async Task WebSocketRoute(string path, PermissionDef permission, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfile?, Task> handler)
+        {
+            try
+            {
+                await ExecuteServiceMethod<KliveAPI.KliveAPI>("CreateWebSocketRoute", path, handler, permission);
+            }
+            catch (Exception ex)
+            {
+                try { _ = ServiceLogError(ex, $"KliveChat: could not register the {path} socket"); } catch { }
+            }
+        }
+
+        private static Task ReturnJsonAsync(KliveAPI.KliveAPI.UserRequest req, object? value) =>
+            req.ReturnResponse(JsonConvert.SerializeObject(value, WireSettings), "application/json");
+
+        private static bool? ParseBool(string? value) => bool.TryParse(value, out bool parsed) ? parsed : null;
+
+        // ───────────────────────────── rooms ─────────────────────────────
+
+        /// <summary>Rooms with people in them first (busiest first), then the rest by most recently used.</summary>
+        public List<KliveChatRoomSummary> ListRoomSummaries(KMProfile? viewer)
         {
             return ActiveRooms.Values
-                .OrderBy(room => room.Name, StringComparer.OrdinalIgnoreCase)
-                .Select(ToRoomSummary)
+                .Where(room => !room.IsClosed)
+                .Select(room => room.ToSummary(CanManage(viewer, room)))
+                .OrderByDescending(summary => summary.UserCount > 0)
+                .ThenByDescending(summary => summary.Persistent)
+                .ThenByDescending(summary => summary.LastActiveUtc)
+                .ThenBy(summary => summary.Name, StringComparer.OrdinalIgnoreCase)
                 .ToList();
         }
 
-        public KliveChatRoomMutationResult CreateRoom(string? requestedName, string? createdBy = null)
+        public KliveChatRoomMutationResult CreateRoom(string? requestedName, string? createdBy = null) =>
+            CreateRoom(requestedName, createdBy, null, persistent: false);
+
+        public KliveChatRoomMutationResult CreateRoom(string? requestedName, string? createdBy, string? createdByUserId, bool persistent)
         {
-            string roomId = Guid.NewGuid().ToString("N")[..8];
-            string roomName = string.IsNullOrWhiteSpace(requestedName) ? "KliveChat Room" : requestedName.Trim();
-            string creator = string.IsNullOrWhiteSpace(createdBy) ? "Guest" : createdBy.Trim();
+            string roomId;
+            do roomId = KliveChatText.NewRoomId(); while (ActiveRooms.ContainsKey(roomId));
 
-            var room = new KliveChatRoom(roomId, roomName, creator);
+            DateTime now = DateTime.UtcNow;
+            string creator = KliveChatText.CleanDisplayName(createdBy) ?? "Guest";
+            var record = new KliveChatRoomRecord
+            {
+                Id = roomId,
+                Name = KliveChatText.CleanRoomName(requestedName) ?? $"{creator}'s room",
+                CreatedBy = creator,
+                CreatedByUserId = string.IsNullOrWhiteSpace(createdByUserId) ? null : createdByUserId,
+                CreatedUtc = now,
+                LastActiveUtc = now,
+                Persistent = persistent,
+            };
+            var room = new KliveChatRoom(record, this);
             ActiveRooms[roomId] = room;
-
-            TryLog($"Created new room {roomId} by {creator}");
+            TryLog($"{creator} created room {roomId} ({record.Name}).");
 
             return new KliveChatRoomMutationResult
             {
                 Success = true,
                 Message = $"Created room {roomId}.",
-                Room = ToRoomSummary(room)
+                Room = room.ToSummary(canManage: true),
             };
         }
 
-        public async Task<KliveChatRoomMutationResult> DeleteRoomAsync(string roomId, string? requestedBy, bool hasElevatedPermissions = false)
+        public async Task<KliveChatRoomMutationResult> DeleteRoomAsync(string roomId, KMProfile? requestedBy)
         {
             if (!ActiveRooms.TryGetValue(roomId, out var room))
             {
-                return new KliveChatRoomMutationResult
-                {
-                    Success = false,
-                    Message = "Room not found"
-                };
+                return new KliveChatRoomMutationResult { Success = false, Message = "Room not found" };
             }
-
-            string actor = string.IsNullOrWhiteSpace(requestedBy) ? "Guest" : requestedBy.Trim();
-            if (!hasElevatedPermissions && !string.Equals(room.CreatedBy, actor, StringComparison.OrdinalIgnoreCase))
+            if (!CanManage(requestedBy, room))
             {
-                return new KliveChatRoomMutationResult
-                {
-                    Success = false,
-                    Message = "Unauthorized to delete this room"
-                };
+                return new KliveChatRoomMutationResult { Success = false, Message = "Only the room's creator can delete it." };
             }
 
+            var summary = room.ToSummary(canManage: true);
             ActiveRooms.TryRemove(roomId, out _);
-            TryLog($"Room {roomId} deleted by {actor}");
+            await room.CloseAsync("Room deleted");
+            await SaveRoomsAsync();
+            SignalLobby();
+            TryLog($"Room {roomId} ({summary.Name}) deleted by {requestedBy?.Name ?? "someone"}.");
+            return new KliveChatRoomMutationResult { Success = true, Message = $"Deleted room {roomId}.", Room = summary };
+        }
 
-            foreach (var client in room.Users.Values)
+        /// <summary>Its creator, or anyone holding klivechat.rooms.delete-any, may rename, keep or delete a room.</summary>
+        private static bool CanManage(KMProfile? profile, KliveChatRoom room) =>
+            profile != null && (AccessEvaluator.Can(profile, KliveChatPerms.RoomsDeleteAny) || room.IsCreator(profile.UserID, profile.Name));
+
+        private async Task SaveRoomsAsync()
+        {
+            if (store == null) return;
+            Interlocked.Exchange(ref saveRequested, 0);
+            try
             {
-                if (client.Socket != null && client.Socket.State == WebSocketState.Open)
+                var records = ActiveRooms.Values
+                    .Where(room => !room.IsClosed)
+                    .Select(room => room.SnapshotRecord())
+                    .OrderBy(record => record.CreatedUtc)
+                    .ToList();
+                await store.SaveAsync(records);
+            }
+            catch (Exception ex)
+            {
+                Interlocked.Exchange(ref saveRequested, 1);
+                try { _ = ServiceLogError(ex, "KliveChat: could not save rooms"); } catch { }
+            }
+        }
+
+        private async Task MaintenanceLoopAsync(CancellationToken token)
+        {
+            using var timer = new PeriodicTimer(MaintenanceInterval);
+            try
+            {
+                while (await timer.WaitForNextTickAsync(token))
                 {
-                    await client.Socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Room deleted", CancellationToken.None);
+                    try
+                    {
+                        DateTime now = DateTime.UtcNow;
+                        foreach (var room in ActiveRooms.Values) room.Sweep();
+                        foreach (var room in ActiveRooms.Values)
+                        {
+                            if (room.TryExpire(now, EmptyRoomLifetime) && ActiveRooms.TryRemove(room.Id, out _))
+                            {
+                                TryLog($"Room {room.Id} ({room.Name}) expired after {EmptyRoomLifetime.TotalHours:0} hours empty.");
+                                Interlocked.Exchange(ref saveRequested, 1);
+                                SignalLobby();
+                            }
+                        }
+                        SweepLobbySubscribers(now);
+                        if (Volatile.Read(ref saveRequested) == 1) await SaveRoomsAsync();
+                    }
+                    catch (Exception ex)
+                    {
+                        try { _ = ServiceLogError(ex, "KliveChat maintenance pass failed"); } catch { }
+                    }
                 }
             }
-
-            return new KliveChatRoomMutationResult
-            {
-                Success = true,
-                Message = $"Deleted room {roomId}.",
-                Room = ToRoomSummary(room)
-            };
+            catch (OperationCanceledException) { }
         }
 
-        private static KliveChatRoomSummary ToRoomSummary(KliveChatRoom room)
+        // ───────────────────────────── joining ─────────────────────────────
+
+        private static KliveChatJoinRequest BuildJoinRequest(string roomId, NameValueCollection query, KMProfile? profile, HttpListenerContext context)
         {
-            return new KliveChatRoomSummary
+            string? secret = query["secret"];
+            bool resumable = KliveChatText.IsValidSecret(secret);
+            string ip = context.Request.RemoteEndPoint?.Address?.ToString() ?? string.Empty;
+            string? guestIdentity = KliveChatText.CleanLine(query["guestIdentity"], 96);
+            return new KliveChatJoinRequest
             {
-                RoomId = room.Id,
-                Name = room.Name,
-                CreatedBy = room.CreatedBy,
-                UserCount = room.Users.Count,
-                RoomPath = $"/shared/klivechat/{room.Id}"
+                ParticipantId = resumable ? KliveChatText.ParticipantIdFromSecret(roomId, secret!) : KliveChatText.RandomParticipantId(),
+                Resumable = resumable,
+                Name = profile != null && !string.IsNullOrWhiteSpace(profile.Name)
+                    ? profile.Name.Trim()
+                    : KliveChatText.CleanDisplayName(query["name"]) ?? "Guest",
+                UserId = profile?.UserID,
+                Rank = profile?.Rank ?? ProfileRank.None,
+                HoldsModeratePermission = profile != null && AccessEvaluator.Can(profile, KliveChatPerms.RoomsModerate),
+                HoldsDeleteAnyPermission = profile != null && AccessEvaluator.Can(profile, KliveChatPerms.RoomsDeleteAny),
+                IdentityKey = profile != null
+                    ? $"profile:{profile.UserID}"
+                    : $"guest:{(guestIdentity ?? $"{ip}|{context.Request.UserAgent}").ToLowerInvariant()}",
+                IpAddress = string.IsNullOrEmpty(ip) ? null : ip,
+                Protocol = int.TryParse(query["protocol"], out int protocol) ? Math.Clamp(protocol, 1, KliveChatRoom.ProtocolVersion) : 1,
             };
         }
 
-        private void TryLog(string message)
+        private async Task<List<KliveChatIceServer>> GetIceServersAsync(string participantId)
+        {
+            var settings = iceSettings;
+            if (settings == null || DateTime.UtcNow - settings.ReadUtc > IceSettingsTtl)
+            {
+                await iceSettingsLock.WaitAsync();
+                try
+                {
+                    settings = iceSettings;
+                    if (settings == null || DateTime.UtcNow - settings.ReadUtc > IceSettingsTtl)
+                    {
+                        settings = await ReadIceSettingsAsync();
+                        iceSettings = settings;
+                    }
+                }
+                finally
+                {
+                    iceSettingsLock.Release();
+                }
+            }
+            return KliveChatIce.Build(settings.Urls, settings.Secret, settings.Username, settings.Password, participantId, DateTime.UtcNow);
+        }
+
+        private async Task<IceSettings> ReadIceSettingsAsync()
         {
             try
             {
-                _ = ServiceLog(message);
+                var read = Task.WhenAll(
+                    GetStringOmniSetting("KliveChat_TurnUrls", ""),
+                    GetStringOmniSetting("KliveChat_TurnSecret", "", sensitive: true),
+                    GetStringOmniSetting("KliveChat_TurnUsername", ""),
+                    GetStringOmniSetting("KliveChat_TurnPassword", "", sensitive: true));
+                // A slow settings service must never hold a join up; STUN-only still works for most networks.
+                string[] values = await read.WaitAsync(TimeSpan.FromSeconds(3));
+                return new IceSettings(DateTime.UtcNow, values[0], values[1], values[2], values[3]);
             }
-            catch
+            catch (Exception ex)
             {
+                try { _ = ServiceLogError(ex, "KliveChat: could not read the TURN settings; using STUN only"); } catch { }
+                return new IceSettings(DateTime.UtcNow, null, null, null, null);
             }
         }
 
         private async Task<KMProfile?> ResolveSocketUserAsync(string? authorization)
         {
-            if (string.IsNullOrWhiteSpace(authorization))
-            {
-                return null;
-            }
-
+            if (string.IsNullOrWhiteSpace(authorization)) return null;
             if (profileManager == null)
             {
                 var services = await GetServicesByType<KMProfileManager>();
-                if (services != null && services.Any())
+                if (services != null && services.Any()) profileManager = (KMProfileManager)services[0];
+            }
+            return profileManager == null ? null : await profileManager.GetProfileByPassword(authorization);
+        }
+
+        private static async Task CloseQuietlyAsync(WebSocket socket, WebSocketCloseStatus status, string reason)
+        {
+            try
+            {
+                using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+                await socket.CloseAsync(status, reason, cts.Token);
+            }
+            catch
+            {
+                try { socket.Abort(); } catch { }
+            }
+        }
+
+        // ───────────────────────────── lobby ─────────────────────────────
+
+        private void SignalLobby()
+        {
+            if (Interlocked.Exchange(ref lobbyDirty, 1) == 0) lobbySignal.Release();
+        }
+
+        private byte[] LobbySnapshot(KMProfile viewer) => Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(new
+        {
+            type = "rooms",
+            rooms = ListRoomSummaries(viewer),
+            serverTime = DateTime.UtcNow,
+        }, WireSettings));
+
+        private async Task RunLobbySubscriberAsync(KMProfile profile, WebSocket socket)
+        {
+            var connection = new KliveChatConnection(socket);
+            var subscriber = new LobbySubscriber(profile, connection);
+            lobbySubscribers[subscriber.Id] = subscriber;
+            connection.Start();
+            connection.TryEnqueue(LobbySnapshot(profile));
+            byte[] buffer = new byte[4096];
+            try
+            {
+                while (true)
                 {
-                    profileManager = (KMProfileManager)services[0];
+                    var result = await socket.ReceiveAsync(new ArraySegment<byte>(buffer), connection.Token);
+                    if (result.MessageType == WebSocketMessageType.Close) break;
+                    subscriber.LastSeenUtc = DateTime.UtcNow;
+                    if (result.EndOfMessage && result.Count < buffer.Length && Encoding.UTF8.GetString(buffer, 0, result.Count).Contains("\"ping\"", StringComparison.Ordinal))
+                    {
+                        subscriber.Pings = true;
+                        connection.TryEnqueue(Encoding.UTF8.GetBytes("{\"type\":\"pong\"}"));
+                    }
                 }
             }
-
-            if (profileManager == null)
+            catch (Exception ex) when (ex is OperationCanceledException or WebSocketException or ObjectDisposedException or InvalidOperationException) { }
+            finally
             {
-                return null;
+                lobbySubscribers.TryRemove(subscriber.Id, out _);
+                connection.Abort();
             }
+        }
 
-            return await profileManager.GetProfileByPassword(authorization);
+        private void SweepLobbySubscribers(DateTime now)
+        {
+            foreach (var subscriber in lobbySubscribers.Values)
+            {
+                if (subscriber.Pings && now - subscriber.LastSeenUtc > LobbySilenceLimit) subscriber.Connection.Abort();
+            }
+        }
+
+        private async Task LobbyPushLoopAsync(CancellationToken token)
+        {
+            try
+            {
+                while (true)
+                {
+                    await lobbySignal.WaitAsync(token);
+                    // A join changes several things at once; send one snapshot for the lot.
+                    await Task.Delay(250, token);
+                    Interlocked.Exchange(ref lobbyDirty, 0);
+                    foreach (var subscriber in lobbySubscribers.Values)
+                    {
+                        try { subscriber.Connection.TryEnqueue(LobbySnapshot(subscriber.Profile)); } catch { }
+                    }
+                }
+            }
+            catch (OperationCanceledException) { }
+        }
+
+        private void TryLog(string message)
+        {
+            try { _ = ServiceLog(message); } catch { }
         }
     }
 }

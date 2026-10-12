@@ -93,6 +93,10 @@ namespace Omnipotent.Data_Handling
             public static string MemeScraperThumbnailsDirectory = $"{MemeScraperInstagramDirectory}/Thumbnails";
             public static string MemeScraperScrapeHistoryFile = $"{MemeScraperDirectory}/ScrapeHistory.jsonl";
 
+            //KliveChat
+            public static string KliveChatDirectory = $"{SavedDataDirectory}/KliveChat";
+            public static string KliveChatRoomsFile = $"{KliveChatDirectory}/Rooms.json";
+
             //KliveCloud
             public static string KliveCloudDirectory = $"{SavedDataDirectory}/KliveCloud";
             public static string KliveCloudStorageDirectory = $"{KliveCloudDirectory}/Cloud";
