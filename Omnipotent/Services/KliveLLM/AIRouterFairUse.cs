@@ -93,6 +93,13 @@
         private readonly PrefixSurvivalMeter survival;
         private int coldInFlight;
         private int oneShotInFlight;
+
+        /// <summary>Live conversations (owner id → expiry) currently holding a slot back from the
+        /// fleet. Any number of owners hold the same one slot: it is "keep one free for Klives",
+        /// not "one per open tab".</summary>
+        private readonly Dictionary<string, DateTime> liveReserves = new(StringComparer.Ordinal);
+        /// <summary>Interactive + Audio requests in flight — the work the reserved slot exists for.</summary>
+        private int liveInFlight;
         private AIRouterSchedulerMode mode = AIRouterSchedulerMode.Fifo;
         private int lastReportedK = -1;
         private DateTime lastCapacityReportUtc = DateTime.MinValue;
@@ -151,7 +158,8 @@
             double EffectiveLifetimeSeconds = 0d,
             double WarmServiceSeconds = 0d,
             string LifetimeSource = "",
-            string Mode = "");
+            string Mode = "",
+            int ReservedSlots = 0);
 
         public Snapshot Describe()
         {
@@ -183,9 +191,55 @@
                     EffectiveLifetimeSeconds: curve.Lifetime.TotalSeconds,
                     WarmServiceSeconds: curve.WarmServiceTime.TotalSeconds,
                     LifetimeSource: curve.LifetimeSource,
-                    Mode: mode.ToString());
+                    Mode: mode.ToString(),
+                    ReservedSlots: ReservedSlotsLocked(now));
             }
         }
+
+        /// <summary>
+        /// Keep one slot free for a live spoken conversation until <paramref name="ttl"/> passes without a
+        /// renewal. Calling again with the same owner renews it.
+        ///
+        /// While held, background work (Agent, Burst, OneShot) may occupy at most
+        /// <c>maxParallel − 1</c> slots; Interactive and Audio requests may use all of them. Nothing in
+        /// flight is ever pre-empted: if the fleet already holds every slot when the reserve is taken,
+        /// the reserve becomes real the moment one of them finishes. The warm-cohort size and the fleet's
+        /// conversation budget are computed against the reduced slot count for as long as it is held, so
+        /// the scheduler keeps fewer conversations warm rather than parking them until their caches die.
+        /// </summary>
+        public void EngageInteractiveReserve(string ownerId, TimeSpan ttl)
+        {
+            if (string.IsNullOrWhiteSpace(ownerId) || ttl <= TimeSpan.Zero) return;
+            lock (sync)
+            {
+                liveReserves[ownerId] = nowUtc() + ttl;
+                PulseStateChanged();
+            }
+        }
+
+        /// <summary>Give back a reserve taken by <see cref="EngageInteractiveReserve"/>.</summary>
+        public void ReleaseInteractiveReserve(string ownerId)
+        {
+            if (string.IsNullOrWhiteSpace(ownerId)) return;
+            lock (sync)
+            {
+                if (liveReserves.Remove(ownerId)) PulseStateChanged();
+            }
+        }
+
+        /// <summary>Slots currently held back for live conversations (0 or 1). Never all of them.</summary>
+        private int ReservedSlotsLocked(DateTime now)
+        {
+            if (liveReserves.Count == 0) return 0;
+            List<string>? expired = null;
+            foreach (var kv in liveReserves)
+                if (kv.Value <= now) (expired ??= new List<string>()).Add(kv.Key);
+            if (expired != null) foreach (string key in expired) liveReserves.Remove(key);
+            return liveReserves.Count > 0 && maxParallel > 1 ? 1 : 0;
+        }
+
+        /// <summary>The slots background work may use right now.</summary>
+        private int BackgroundParallelLocked(DateTime now) => maxParallel - ReservedSlotsLocked(now);
 
         /// <summary>
         /// Is there work for this conversation family currently queued or in flight?
@@ -230,7 +284,9 @@
                 var curve = survival.Describe();
                 double service = Math.Max(1d, survival.ExpectedServiceTime().TotalSeconds);
                 double usable = Math.Clamp(1d - curve.NonResidentSlotShare, 0.1d, 1d);
-                double derived = residency.Alpha * usable * maxParallel * curve.Lifetime.TotalSeconds / service;
+                // Background work can only use the unreserved slots, so the fleet budget is costed on those.
+                double derived = residency.Alpha * usable * BackgroundParallelLocked(nowUtc())
+                    * curve.Lifetime.TotalSeconds / service;
                 return Math.Clamp((int)Math.Floor(derived), 1, 64);
             }
         }
@@ -323,9 +379,10 @@
                         Prune(now);
                         ExpireGraces(now);
                         // The waiting set is what tells residency which conversations are mid-wake, so
-                        // it never expires or evicts one whose next turn is already queued.
+                        // it never expires or evicts one whose next turn is already queued. The cohort
+                        // is sized on the slots background work can actually use.
                         residency.Maintain(now, survival.EffectiveLifetime(), survival.WarmServiceTime(),
-                            survival.NonResidentSlotShare(), maxParallel, WaitingPrefixKeys());
+                            survival.NonResidentSlotShare(), BackgroundParallelLocked(now), WaitingPrefixKeys());
                         recheck = stateChanged.Task;
                         lease = TryAdmitLocked(waiter, now, out wait);
                     }
@@ -404,8 +461,10 @@
             bool wasResident = residency.IsResident(self.Info.PrefixKey);
             TimeSpan? gap = residency.GapSinceLastDispatch(self.Info.PrefixKey, now);
             residency.OnDispatch(self.Info, now, pastDeadline);
-            if (!wasResident) coldInFlight++;
+            // A speech call has no prefill, so it must not hold the one cold-prefill permit.
+            if (!wasResident && self.Info.Class != AIRouterWorkClass.Audio) coldInFlight++;
             if (self.Info.Class == AIRouterWorkClass.OneShot) oneShotInFlight++;
+            if (AIRouterResidencyScheduler.IsLive(self.Info.Class)) liveInFlight++;
 
             ConsumeGraceLocked(self.Info.PrefixKey);
 
@@ -470,9 +529,10 @@
         private bool HasCapacityForLocked(Waiter self, DateTime now, bool pastDeadline)
         {
             int heldForOthers = 0;
+            bool live = AIRouterResidencyScheduler.IsLive(self.Info.Class);
             // A human waiting, or a request that has already waited out its park ceiling, takes a
             // reserved slot rather than idling behind it.
-            bool preempts = self.Info.Class == AIRouterWorkClass.Interactive || pastDeadline;
+            bool preempts = live || pastDeadline;
             // Checked here as well as at the point a grace is granted, so that switching the mode
             // under load takes effect on the very next decision instead of after the outstanding
             // reservations time out. Leaving them in the dictionary is deliberate: flipping back to
@@ -486,7 +546,13 @@
                     heldForOthers++;
                 }
             }
-            return inFlight + heldForOthers < maxParallel;
+            if (inFlight + heldForOthers >= maxParallel) return false;
+            if (live) return true;
+
+            // A live conversation holds one slot back: background work counts only against the rest,
+            // so it can fill them alongside a live request but never take the last free one.
+            int reserved = ReservedSlotsLocked(now);
+            return reserved == 0 || inFlight - liveInFlight + heldForOthers < maxParallel - reserved;
         }
 
         private void ExpireGraces(DateTime now)
@@ -525,7 +591,7 @@
             foreach (var kv in graces)
                 if (kv.Value.UntilUtc > now && !string.Equals(kv.Key, lease.Info.PrefixKey, StringComparison.Ordinal))
                     active++;
-            if (active >= maxParallel - 1) return;
+            if (active >= BackgroundParallelLocked(now) - 1) return;
 
             graces.TryGetValue(lease.Info.PrefixKey, out GraceState existing);
             DateTime startedAt = existing.StartedAt == default ? now : existing.StartedAt;
@@ -611,8 +677,9 @@
                 DateTime now = nowUtc();
                 inFlight--;
                 if (inFlight < 0) inFlight = 0;
-                if (!lease.WasResident && coldInFlight > 0) coldInFlight--;
+                if (!lease.WasResident && lease.Info.Class != AIRouterWorkClass.Audio && coldInFlight > 0) coldInFlight--;
                 if (lease.Info.Class == AIRouterWorkClass.OneShot && oneShotInFlight > 0) oneShotInFlight--;
+                if (AIRouterResidencyScheduler.IsLive(lease.Info.Class) && liveInFlight > 0) liveInFlight--;
                 residency.OnRelease(lease.Info.PrefixKey, now);
                 OfferGraceLocked(lease, now);
                 PulseStateChanged();

@@ -339,6 +339,12 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("reasoning", NullValueHandling = NullValueHandling.Ignore)]
             public object reasoning;
 
+            // AIRouter's reasoning control, in its own vocabulary: Qwen3.8 takes none/low/medium/xhigh and
+            // DeepSeek-V4-Flash only high/xhigh. Only callers that opted in send it (see
+            // KliveLLM.ApplyThinkingPreference); every other request serializes exactly as before.
+            [JsonProperty("reasoning_effort", NullValueHandling = NullValueHandling.Ignore)]
+            public string reasoning_effort;
+
             // OpenRouter request plugins. Projects opts into context-compression after doing its own
             // deterministic compaction so OpenRouter's exact tokenizer is the final overflow guard.
             [JsonProperty("plugins", NullValueHandling = NullValueHandling.Ignore)]

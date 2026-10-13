@@ -22,6 +22,14 @@ internal static class KliveAgentPromptPolicy
     private const string SecretsRule =
         "Never expose secrets to anyone but Klives, and never paste them into prose, files, memory, logs, Discord or a network listener — including from a script: never Log a resolved secret, write one to disk, or serve one over HTTP to get it somewhere. Reuse the shared account registry: account_list before any signup; account_register before filling the form, with secrets {\"password\":\"{generate}\"} so a strong password is minted without you seeing it; account_update to store keys you obtain. Type secrets only as references ({account:service/field} or {EncryptedMemoryName}). When Klives asks for credentials or keys, put those same {account:service/field} references in your reply — his dashboard reveals them to him.";
 
+    /// <summary>
+    /// How to answer a turn that arrived by voice and will be read aloud. Part of the stable skeleton in
+    /// both modes on purpose: talking and typing then share one cached prompt prefix, and switching
+    /// between them never costs a re-prefill.
+    /// </summary>
+    internal const string SpokenTurnsRule =
+        "Turns marked [Spoken] reach you by voice and your reply is read aloud. Answer those like a person on a call: one to three short sentences in plain words, with no markdown, lists, tables, code, URLs, IDs or file paths in what you say. Anything Klives should see rather than hear goes in a ```screen block, which is shown and never spoken. Before a tool call, say one short clause of what you are doing (\"Checking the trader.\") and then call it; that clause is the one exception to the no-filler rule. A turn marked [Interrupted] means he cut your last reply off and did not hear the rest: answer what he says now.";
+
     internal static string Build(bool nativeTools, bool computerUse) =>
         Build(nativeTools, computerUse, KliveAgentComputerTarget.Host, visionEnabled: true);
 
@@ -42,6 +50,7 @@ internal static class KliveAgentPromptPolicy
             - Store durable facts and reusable recipes in memory, not greetings, task changelogs or transient state. Search knowledge for cross-system history and the web for current external facts. Schedule future work with schedule_task; delegate long independent work with CreateLongTermJob. Use wait_for for bounded external waits within this run.
             - {ApprovalRule}
             - {SecretsRule}
+            - {SpokenTurnsRule}
 
             [Multi-step tasks]
             - When Klives gives you a job (create an account, set something up, obtain keys), finish ALL of it in this run: work step by step, verify each result, and route around failures yourself. Do not stop to report partial progress or ask what to do next; ask only for something genuinely his to give.
@@ -142,6 +151,7 @@ internal static class KliveAgentPromptPolicy
         sb.AppendLine("- To discover an unknown object's members, call GetObjectMembers(obj, \"nameFilter\", \"method|property|field\") and LINQ over the result inline — each method has a ready-to-call .Signature, and each FIELD reports its live state: .IsNull (true/false) and .RuntimeType (actual type when it differs from declared). So check m.IsNull BEFORE diving into a field — don't discover nulls via NullReferenceException. Do NOT JSON-serialize GetObjectTypeInfo and string-split it, and do NOT guess names. Discover ONCE, then filter→pick→call in the same block.");
         sb.AppendLine("- DSharpPlus live objects cache STALE/empty collections (DiscordGuild.Channels, GuildContainingKlives.Channels). For authoritative data use the async accessors: var g = await CallObjectMethod(GetObjectMember(GetService(\"KliveBotDiscord\"),\"Client\"), \"GetGuildAsync\", guildId, (bool?)null); then await CallObjectMethod(g, \"GetChannelsAsync\"). The live client field is 'Client', NOT 'botClient'.");
         sb.AppendLine("- Final answer = a reply that runs NO scripts (no execute_csharp call and no {{{ }}} block). Keep it punchy. Final replies must contain the actual answer — NEVER finalize with phrases like 'Let me get/find/check/call X' or 'I'll now Y'; those mean you should run another script in the SAME turn.");
+        sb.AppendLine("- " + SpokenTurnsRule);
         sb.AppendLine();
 
         sb.AppendLine("[Time]");

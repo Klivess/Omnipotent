@@ -7,7 +7,7 @@ tracked in the plan (persistence of actions, streaming, analytics, Discord gatin
 ## What KliveAgent is (and isn't)
 
 KliveAgent is **not** a code-rewriting coding agent for the Omnipotent source. It is Klives's
-personal, Jarvis-like assistant **embedded inside Omnipotent that operates and orchestrates the
+personal assistant, **embedded inside Omnipotent, that operates and orchestrates the
 platform's live services at runtime**. It does this by writing C# scripts (delimited by
 `{{{ ... }}}`) that are compiled and executed in-process via Roslyn against the live service
 graph — reading state, calling service methods, pulling logs/errors, spawning background tasks,
@@ -283,3 +283,67 @@ search (no API keys).
 - **Jobs:** background embed queue, live/periodic connector scans, and a nightly 04:15 sweep
   (`KliveRAGScheduler` — after Omniscience's 03:30) that reconciles connectors and evicts expired web
   docs. HTTP surface under `/kliverag/*` (`search`, `doc`, `stats`, `sources`, `reindex`, `websearch`).
+
+## Talk mode (spoken conversation)
+
+Talk mode is the spoken alternative to typing on the KliveAgent page. Klives speaks, KliveAgent answers out
+loud, and the conversation is the same one the typed chat uses. Speech-to-text is AIRouter's
+`whisper-large-v3-turbo` (`/v1/audio/transcriptions`); text-to-speech is AIRouter's `kokoro`
+(`/v1/audio/speech`, default voice `bm_george`).
+
+**Transport.** One WebSocket per conversation: `/kliveagent/talk?conversationId=…` (typed
+`KliveAPI.CreateWebSocketRoute`, `kliveagent.chat.use`, re-checked in the handler). JSON text frames carry
+control messages. Binary frames carry audio:
+- `0x02 [u16 utt] [PCM16 16 kHz]` from the browser.
+- `0x01 [u16 turn] [u16 seq] [segment]` and `0x03 [u16 index] [filler]` from the server.
+
+A second tab for the same conversation takes it over.
+
+**Where the latency goes, and what removes it:**
+
+| Stage | Mechanism |
+|---|---|
+| Detecting the end of speech | The browser runs Silero VAD (`@ricky0123/vad-web`, assets self-hosted under `/talk/`, loudness fallback) and its own endpointer (`scripts/talk/endpointer.ts`). The server's provisional transcript says whether the sentence sounded finished, so the commit comes after 450 ms of silence when it did, 1100 ms when it trails off, 750 ms otherwise. Hold-to-talk commits on release. |
+| Upload | Audio streams while Klives speaks; nothing is uploaded after he stops. |
+| Transcription | Starts at the first ~250 ms pause. On commit it is reused when no speech followed the pause (`talk.sttReused`). |
+| Prompt context | Memory and knowledge for the turn are fetched during that same pause (`PrepareTalkTurnContextAsync`). |
+| Prefill | A spoken conversation keeps ONE append-only tool session (`TalkEpoch`): the run does not `ResetSession` at the end, and the next turn appends `[Spoken] …` plus only new context lines. It rebuilds when the compatibility key (computer target, vision, model) changes, the session has been idle past the measured prefix lifetime, it exceeds `KliveAgent_TalkSessionMaxTokens`, or a tool exchange is unfinished. Opening talk mode seeds the session and sends it once with `max_tokens: 1` (`WarmToolSessionPrefixAsync`), so the first question pays only for its own words. |
+| Model slot | While talking, one of AIRouter's three slots is held back from background work (`EngageInteractiveReserve`, TTL `KliveAgent_TalkReserveIdleMinutes`). Live work (Interactive, and the new `Audio` class) may use all three; nothing in flight is pre-empted; the warm-cohort size is computed on the reduced count. |
+| Reasoning | Spoken turns are pinned to `KliveAgent_TalkThinking` (default low) on one model (`KliveAgent_TalkModel`). KliveLLM now sends AIRouter `reasoning_effort` for callers that opt in (`honourThinkingOnAIRouter`): Qwen off/low/medium/high → none/low/medium/xhigh; DeepSeek → high/xhigh. KliveAgent opts in for typing too, so its adaptive levels finally take effect there. |
+| First audio | `SpeechSegmenter` cuts the streamed reply into speakable segments. The first is cut at the first clause with at least 4 words (or 12 words); later ones are whole sentences. At most 2 are synthesised at once, and never far ahead of playback. |
+| Tools | The model says one short clause before a tool call (the `[Spoken turns]` rule in the stable prompt skeleton). That clause is spoken while the tool runs. A cached filler covers a tool that runs past 1.2 s with nothing said. |
+
+**What is never spoken.** Fenced blocks (including ```` ```screen ```` blocks, meant to be seen), `{{{ }}}`
+scripts, tables, URLs, long hex IDs and paths. Markdown is stripped, CamelCase names are split, and the
+`KliveAgent_TalkPronunciations` lexicon is applied (`Written=Spoken; …`).
+
+**Turn-taking extras:**
+- **Barge-in.** Speech while the reply plays fades it out in about 30 ms. The browser reports what was
+  heard; the rest of that run stays silent, and the next turn carries `[Interrupted] … he only heard: "…"`.
+  If Klives' words became steering, the run's next model call is a new spoken turn.
+- **Local commands.** "Stop" / "never mind" cancel the run with no model call. "Say that again" replays the
+  last reply from the speech cache.
+- **Whisper hygiene.** Phantom "Thank you." transcripts on short or quiet clips are dropped. The Whisper
+  prompt is `KliveAgent_TalkVocabulary` plus the last sentence spoken.
+
+**Code:**
+- Server:
+  - `Services/KliveAgent/Talk/` — session, segmenter, wire format, text rules, speech cache, hub/epoch, ports.
+  - `Services/KliveLLM/AIRouterAudio.cs` — the audio client. It learns which optional fields AIRouter
+    refuses; a 429 penalises the shared queue.
+  - `KliveLLM.Live.cs` — reserve, warm-up, session accessors.
+- Website:
+  - `composables/useTalkMode.ts`, `components/KliveAgent/TalkBar.vue`.
+  - `scripts/talk/` — endpointer, player, detector, prefs. `scripts/copy-talk-assets.mjs` runs on install.
+- Telemetry stages (Analytics → performance): `talk.endpoint`, `talk.stt`, `talk.sttReused`,
+  `talk.firstSegment`, `talk.tts`, `talk.firstAudio`, `talk.continued` / `talk.rebuilt`,
+  `talk.context(Prepared)`.
+
+**Unverified until the first live run.** Run `AIRouterAudioLiveProbe` with `OMNI_LIVE_AIROUTER=1
+AIROUTER_API_KEY=…` to confirm:
+- which formats and fields AIRouter accepts;
+- the real TTS/STT latencies;
+- whether `stream:true` streams.
+
+Whether audio counts toward the 3-parallel limit is unknown. `AIRouterAudioCountsTowardParallel` defaults
+to true (safe); measure only with the fleet paused.

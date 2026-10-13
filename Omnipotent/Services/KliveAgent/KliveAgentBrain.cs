@@ -1,6 +1,7 @@
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.HostControl;
 using Omnipotent.Services.KliveAgent.Models;
+using Omnipotent.Services.KliveAgent.Talk;
 using Omnipotent.Services.ComputerControl;
 using Omnipotent.Services.KliveLLM;
 using System.Globalization;
@@ -1376,6 +1377,16 @@ namespace Omnipotent.Services.KliveAgent
                 }
 
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
+
+                // Talk mode. A talk socket attached to this conversation when the run starts makes it a
+                // spoken run: one pinned model and thinking level, an append-only session the next turn
+                // extends instead of rebuilding, and the reply streamed to speech as it is written.
+                // Speech callbacks look the session up live, so a socket attached mid-run hears the rest.
+                var talkHub = agentService.Talk;
+                ITalkListener? talkAtStart = talkHub.GetListener(conversation.ConversationId);
+                ITalkListener? TalkNow() => talkHub.GetListener(conversation.ConversationId);
+                TalkNow()?.OnRunStarted();
+
                 var settingsTask = KliveAgentRunSettings.LoadAsync(agentService);
                 var nativeToolsTask = llm.SupportsNativeToolCallingAsync();
                 var flatFeeTask = llm.IsFlatFeeProviderAsync();
@@ -1397,9 +1408,13 @@ namespace Omnipotent.Services.KliveAgent
                 catch { flatFeeProvider = false; }
                 var settings = await settingsTask;
 
+                // A spoken run needs the structured tool session (that is what it keeps warm between turns).
+                bool talkProfile = talkAtStart != null && useToolCalling;
+
                 // Per-token streaming: when on (and we have a live progress channel), the model's output
-                // is surfaced token-by-token as it generates. Configurable so it can be turned off.
-                bool streamTokens = onProgress != null && settings.StreamTokens;
+                // is surfaced token-by-token as it generates. Configurable so it can be turned off — except
+                // for a spoken run, whose speech is made from those tokens.
+                bool streamTokens = onProgress != null && (settings.StreamTokens || talkProfile);
 
                 // Computer-use tools are ON by default (set KliveAgent_ComputerUseEnabled=false to disable)
                 // and only available on the structured tool-calling path. The computer itself is chosen
@@ -1421,13 +1436,30 @@ namespace Omnipotent.Services.KliveAgent
                 // model's context window and start hallucinating stale state).
                 int retainedScreenshots = settings.RetainedScreenshots;
 
-                var systemPromptTask = performance.MeasureAsync("systemPrompt", () =>
-                    BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled,
-                        computerTarget: computerTarget, visionEnabled: visionEnabled, performance: performance));
-                var toolDefinitions = useToolCalling
-                    ? BuildToolDefinitions(includeComputerUse: computerTarget == KliveAgentComputerTarget.Host)
-                    : null;
-                if (toolDefinitions != null && computerTarget == KliveAgentComputerTarget.Container)
+                // A spoken turn normally EXTENDS the conversation already sitting in the provider's cache
+                // (system prompt, tools and every earlier turn, byte for byte) instead of rebuilding it.
+                // Only the new turn is prefilled, which is most of the difference between answering in a
+                // few hundred milliseconds and a few seconds — and it keeps the cache-hit rate AIRouter
+                // monitors high. It rebuilds when the settings that shape the prompt changed, the prefix has
+                // probably expired, the session has grown past its budget, or a tool exchange is unfinished.
+                string? talkModel = talkProfile ? talkAtStart!.ModelOverride : null;
+                string talkKey = talkProfile ? TalkCompatibilityKey(computerTarget, visionEnabled, talkModel) : string.Empty;
+                TalkEpoch? talkEpoch = talkProfile ? talkHub.GetEpoch(conversation.ConversationId) : null;
+                bool continueTalk = talkProfile
+                    && CanContinueTalk(llm, llmSessionId, talkEpoch, talkKey, talkAtStart!.SessionMaxTokens);
+                if (talkProfile) performance.Add(continueTalk ? "talk.continued" : "talk.rebuilt", 0);
+
+                var systemPromptTask = continueTalk
+                    ? Task.FromResult(string.Empty)
+                    : performance.MeasureAsync("systemPrompt", () =>
+                        BuildSystemPrompt(userMessage, conversation, toolCallingMode: useToolCalling, computerUseEnabled: computerUseEnabled,
+                            computerTarget: computerTarget, visionEnabled: visionEnabled, performance: performance));
+                var toolDefinitions = continueTalk
+                    ? talkEpoch!.Tools
+                    : useToolCalling
+                        ? BuildToolDefinitions(includeComputerUse: computerTarget == KliveAgentComputerTarget.Host)
+                        : null;
+                if (!continueTalk && toolDefinitions != null && computerTarget == KliveAgentComputerTarget.Container)
                     toolDefinitions.AddRange(KliveAgentComputer.BuildContainerToolDefinitions(visionEnabled));
                 async Task<List<HFWrapper.HFTool>> PrepareServiceToolsAsync()
                 {
@@ -1442,20 +1474,22 @@ namespace Omnipotent.Services.KliveAgent
                         return new();
                     }
                 }
-                var serviceToolsTask = PrepareServiceToolsAsync();
+                var serviceToolsTask = continueTalk
+                    ? Task.FromResult(new List<HFWrapper.HFTool>())
+                    : PrepareServiceToolsAsync();
                 string systemPrompt = await systemPromptTask;
 
                 // The Service Surface: dedicated tools for the pinned services plus the two universals,
                 // so every OmniService is directly callable. Appended (never interleaved) and built from
                 // an immutable catalogue, so the offered array stays byte-stable between runs with the
                 // same settings — a churning tools array misses the provider's prefix cache on every
-                // request.
-                if (toolDefinitions != null && agentService.ServiceTools != null)
+                // request. (A continued spoken turn re-sends the list it was opened with, unchanged.)
+                if (!continueTalk && toolDefinitions != null && agentService.ServiceTools != null)
                 {
                     toolDefinitions.AddRange(await serviceToolsTask);
                 }
 
-                llm.ResetSession(llmSessionId);
+                if (!continueTalk) llm.ResetSession(llmSessionId);
 
                 var allScriptsExecuted = new List<AgentScriptResult>();
                 // Thread the per-run cancellation token into ScriptGlobals so a manual Stop or the stall
@@ -1491,9 +1525,13 @@ namespace Omnipotent.Services.KliveAgent
                 long billableTokens = 0;
                 var streamIdleLimit = TimeSpan.FromSeconds(settings.ModelStreamIdleSeconds);
 
+                // What Klives actually heard of the last reply, when he talked over it.
+                string? talkNote = talkProfile ? talkAtStart!.TakeTurnNote() : null;
                 string userPrompt;
                 using (performance.Measure("conversationPrompt"))
-                    userPrompt = BuildUserPrompt(conversation, userMessage, senderName);
+                    userPrompt = continueTalk
+                        ? await BuildTalkTurnAsync(userMessage, senderName, talkNote, talkEpoch!, talkAtStart!, performance)
+                        : BuildUserPrompt(conversation, userMessage, senderName, spoken: talkProfile, note: talkNote);
                 (string text, List<(byte[] data, string mimeType)> images) preparedAttachments;
                 try
                 {
@@ -1544,12 +1582,16 @@ namespace Omnipotent.Services.KliveAgent
                 // and feed observations back via currentPrompt.
                 if (useToolCalling)
                 {
-                    llm.StartToolSession(llmSessionId, systemPrompt);
+                    if (!continueTalk) llm.StartToolSession(llmSessionId, systemPrompt);
                     if (preparedAttachments.images.Count > 0)
                         llm.AppendUserContentToToolSession(llmSessionId, userPrompt, preparedAttachments.images,
                             keepRecentImages: retainedScreenshots, preservePromptPrefix: true);
                     else llm.AppendUserMessageToToolSession(llmSessionId, userPrompt);
                 }
+                // A rebuilt spoken conversation becomes the epoch later turns extend. Everything already
+                // in its system prompt counts as context the model has, so turns only add what is new.
+                if (talkProfile && !continueTalk && toolDefinitions != null)
+                    talkHub.SetEpoch(conversation.ConversationId, NewTalkEpoch(talkKey, toolDefinitions, systemPrompt));
                 var currentPrompt = userPrompt;
                 string? firstIterationSystemPrompt = systemPrompt;
                 bool stuckForceFinal = false;
@@ -1689,16 +1731,35 @@ namespace Omnipotent.Services.KliveAgent
                 // the ceiling stops an unexpectedly unbounded one from being kept alive forever.
                 async Task<T> WithToolPulse<T>(Task<T> work, string label, TimeSpan? ceiling = null)
                 {
-                    if (onProgress == null || work.IsCompleted) return await work;
-                    var limit = ceiling ?? ToolPulseCeiling;
-                    var running = System.Diagnostics.Stopwatch.StartNew();
-                    while (!work.IsCompleted)
+                    // A spoken conversation shows (and, if it runs long, covers with a short filler) what
+                    // the agent is doing while it is quiet.
+                    var talk = TalkNow();
+                    talk?.OnToolStarted(label);
+                    bool finished = false;
+                    try
                     {
-                        await Task.WhenAny(work, Task.Delay(ToolPulseInterval));
-                        if (!work.IsCompleted && running.Elapsed < limit && !cancellationToken.IsCancellationRequested)
-                            Pulse("running", $"{label} · {FormatElapsed(running.Elapsed)}");
+                        if (onProgress == null || work.IsCompleted)
+                        {
+                            var done = await work;
+                            finished = true;
+                            return done;
+                        }
+                        var limit = ceiling ?? ToolPulseCeiling;
+                        var running = System.Diagnostics.Stopwatch.StartNew();
+                        while (!work.IsCompleted)
+                        {
+                            await Task.WhenAny(work, Task.Delay(ToolPulseInterval));
+                            if (!work.IsCompleted && running.Elapsed < limit && !cancellationToken.IsCancellationRequested)
+                                Pulse("running", $"{label} · {FormatElapsed(running.Elapsed)}");
+                        }
+                        var result = await work;
+                        finished = true;
+                        return result;
                     }
-                    return await work;
+                    finally
+                    {
+                        talk?.OnToolFinished(label, finished);
+                    }
                 }
 
                 // Deliver a retry/guidance/observation prompt the right way for the active mode: a user-role
@@ -1745,6 +1806,9 @@ namespace Omnipotent.Services.KliveAgent
                 // ThinkingType, so it never exceeds what they allow and collapses to a no-op at a fixed level.
                 string DetermineThinkingLevel(int iter)
                 {
+                    // Spoken turns think at one fixed level: escalating mid-conversation would add seconds
+                    // of silent reasoning exactly when Klives is waiting to hear something.
+                    if (talkProfile) return talkAtStart!.ThinkingLevel;
                     if (stuckForceFinal || consecutiveErrorIters >= 2 || iter >= 12) return "high";
                     if (consecutiveErrorIters >= 1 || consecutiveNoOpResponses >= 1 || iter >= 6) return "medium";
                     return "low";
@@ -1755,6 +1819,8 @@ namespace Omnipotent.Services.KliveAgent
                 // model. Returns null (→ provider default) when the matching role isn't configured.
                 string? DetermineModelOverride(string thinkingLevel)
                 {
+                    // One model for a spoken conversation: a different model is a different cache.
+                    if (talkProfile) return talkModel;
                     bool heavy = !string.Equals(thinkingLevel, "low", StringComparison.OrdinalIgnoreCase);
                     string pick = heavy ? reasoningModel : fastModel;
                     return string.IsNullOrWhiteSpace(pick) ? null : pick;
@@ -1876,6 +1942,8 @@ namespace Omnipotent.Services.KliveAgent
                         speculativeTasks.GetOrAdd(tc.id, _ => RunNativeToolMeasuredAsync(name, tc.function?.arguments));
                     }
 
+                    TalkNow()?.OnModelTurnStarted();
+
                     // Brain-level retry: the transport backs off on transient HTTP errors, but an exception
                     // that surfaces here (e.g. a stream that died before the first token) otherwise aborts
                     // the whole run. Retry the turn a few times before giving up.
@@ -1891,6 +1959,7 @@ namespace Omnipotent.Services.KliveAgent
                                 if (!string.IsNullOrEmpty(token) && System.Threading.Interlocked.Exchange(ref firstTokenSeen, 1) == 0)
                                     performance.Add("firstToken", modelTimer.ElapsedMilliseconds);
                                 tokenSink?.Invoke(token);
+                                if (!string.IsNullOrEmpty(token)) TalkNow()?.OnSpeakable(token);
                             };
                             lastModelActivity = null;
                             using (performance.Measure("model"))
@@ -1902,14 +1971,15 @@ namespace Omnipotent.Services.KliveAgent
                                     // Klives is sitting there waiting on this one, so it is never parked
                                     // behind autonomous background work.
                                     llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: streamTokens ? measuredTokenSink : null, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete,
-                                        workClass: KliveLLM.AIRouterWorkClass.Interactive);
+                                        workClass: KliveLLM.AIRouterWorkClass.Interactive, honourThinkingOnAIRouter: true);
                                 }
                                 else
                                 {
                                     // Pass system prompt only on iteration 0 so it is set as the LLM session's
                                     // system role message once — not re-injected into every user turn.
                                     llmResponse = await llm.QueryLLM(currentPrompt, llmSessionId,
-                                        systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: streamTokens ? measuredTokenSink : null, thinkingOverride: thinkingForThisCall);
+                                        systemPrompt: firstIterationSystemPrompt, cancellationToken: cancellationToken, onToken: streamTokens ? measuredTokenSink : null, thinkingOverride: thinkingForThisCall,
+                                        honourThinkingOnAIRouter: true);
                                     firstIterationSystemPrompt = null; // don't resend
                                 }
                             }
@@ -1961,6 +2031,8 @@ namespace Omnipotent.Services.KliveAgent
                                 };
                             }
                             performance.Add("modelRetry", 0);
+                            // The retry starts its reply from the beginning; drop what was not yet said.
+                            TalkNow()?.OnModelTurnAborted();
                             var backoff = ModelRetryDelay(llmAttempt, llmEx);
                             string why = DescribeModelError(llmEx);
                             Pulse("retrying", $"{why} — retrying in {FormatElapsed(backoff)} (attempt {llmAttempt + 2} of {maxLlmRetries + 1})",
@@ -1982,6 +2054,10 @@ namespace Omnipotent.Services.KliveAgent
                             catch (OperationCanceledException) { return BuildStoppedResponse(); }
                         }
                     }
+
+                    // Whatever this call said is complete: a preface before its tool calls is spoken now,
+                    // while the tools run, rather than after them.
+                    TalkNow()?.OnModelTurnEnded(llmResponse?.ToolCalls is { Count: > 0 });
 
                     if (llmResponse == null || !llmResponse.Success)
                     {
@@ -2217,7 +2293,8 @@ namespace Omnipotent.Services.KliveAgent
                         }
                         if (finalRetryForSteering) continue;
 
-                        llm.ResetSession(llmSessionId);
+                        // A spoken conversation keeps its session: the next turn extends it in place.
+                        if (!talkProfile) llm.ResetSession(llmSessionId);
 
                         agentService.Stats.Record(totalPromptTokens, totalCompletionTokens, iterationsDone,
                             allScriptsExecuted.Count, allScriptsExecuted.Count(s => !s.Success),
@@ -2552,6 +2629,8 @@ namespace Omnipotent.Services.KliveAgent
             finally
             {
                 if (!preparationRecorded) performance.Add("preparation", preparationTimer.ElapsedMilliseconds);
+                try { agentService.Talk.GetListener(conversation.ConversationId)?.OnRunEnded(performance.Outcome == "completed"); }
+                catch { /* speech must never affect the run's outcome */ }
                 agentService.Stats.RecordPerformance(performance.Snapshot(iterationsDone, totalPromptTokens, totalCompletionTokens));
             }
         }
@@ -2563,10 +2642,17 @@ namespace Omnipotent.Services.KliveAgent
         /// The system prompt is no longer embedded here — it is passed separately to KliveLLM
         /// so it lands in the 'system' role of the chat, not the 'user' role.
         /// </summary>
+        /// <param name="spoken">The message came from talk mode (the spoken-turn rules apply to the reply).</param>
+        /// <param name="note">A one-off note for this turn, e.g. what Klives heard of the reply he cut off.</param>
+        /// <param name="seedOnly">Build only the history part, for a talk conversation opened before its
+        /// first spoken turn; that turn is appended to it later.</param>
         private string BuildUserPrompt(
             AgentConversation conversation,
             string userMessage,
-            string? senderName = null)
+            string? senderName = null,
+            bool spoken = false,
+            string? note = null,
+            bool seedOnly = false)
         {
             var sb = new StringBuilder();
 
@@ -2639,10 +2725,180 @@ namespace Omnipotent.Services.KliveAgent
                 }
             }
 
-            sb.AppendLine("[New Message]");
+            if (seedOnly)
+            {
+                sb.AppendLine("[Talk mode] Klives switched to talking. His next messages are spoken turns.");
+                return sb.ToString();
+            }
+
+            sb.AppendLine(spoken ? "[New Message] [Spoken]" : "[New Message]");
+            if (!string.IsNullOrWhiteSpace(note)) sb.AppendLine(note);
             sb.AppendLine(string.IsNullOrEmpty(senderName) ? $"User: {userMessage}" : $"{senderName}: {userMessage}");
 
             return sb.ToString();
+        }
+
+        // ── Talk mode: the warm, append-only spoken conversation ──
+
+        /// <summary>How long per-turn context may take when it was not prepared during the pause.</summary>
+        internal static readonly TimeSpan TalkTurnContextBudget = TimeSpan.FromMilliseconds(400);
+
+        /// <summary>The settings a warm spoken conversation was built with; a change means the next turn
+        /// must rebuild it, because the system prompt or the tools array would differ.</summary>
+        internal static string TalkCompatibilityKey(KliveAgentComputerTarget target, bool visionEnabled, string? model) =>
+            $"talk-v1|{target}|{visionEnabled}|{model ?? ""}";
+
+        /// <summary>
+        /// Whether a spoken turn can extend the existing session rather than rebuild it: same build
+        /// settings, the log ends where a user turn may follow, the provider has probably still got the
+        /// prefix cached, and the session is under its size budget.
+        /// </summary>
+        internal static bool CanContinueTalk(KliveLLM.KliveLLM llm, string sessionId, TalkEpoch? epoch, string key, int maxTokens)
+        {
+            if (epoch == null || !string.Equals(epoch.CompatibilityKey, key, StringComparison.Ordinal)) return false;
+            if (!llm.CanAppendUserTurn(sessionId)) return false;
+            if (llm.GetToolSessionLastUpdated(sessionId) is not { } last
+                || DateTime.UtcNow - last > KliveLLM.KliveLLM.EstimatedPrefixLifetime())
+                return false;
+            return llm.GetToolSessionContextTokens(sessionId) < maxTokens;
+        }
+
+        internal static TalkEpoch NewTalkEpoch(string key, List<HFWrapper.HFTool> tools, string systemPrompt)
+        {
+            var epoch = new TalkEpoch(key, tools);
+            foreach (string line in (systemPrompt ?? string.Empty).Split('\n'))
+            {
+                string trimmed = line.Trim();
+                if (trimmed.Length > 0) epoch.InjectedContext.Add(trimmed);
+            }
+            return epoch;
+        }
+
+        /// <summary>
+        /// One continued spoken turn: the words, an interruption note when there is one, and only the
+        /// memory/knowledge lines this conversation has not been given yet. Everything volatile goes at the
+        /// END of the conversation, which is what keeps every earlier byte cacheable.
+        /// </summary>
+        private async Task<string> BuildTalkTurnAsync(string userMessage, string? senderName, string? note,
+            TalkEpoch epoch, ITalkListener listener, KliveAgentPerformance performance)
+        {
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            string? raw = await listener.TakePreparedContextAsync(userMessage);
+            bool prepared = raw != null;
+            raw ??= await BuildTalkContextAsync(userMessage, TalkTurnContextBudget);
+            performance.Add(prepared ? "talk.contextPrepared" : "talk.context", timer.ElapsedMilliseconds);
+
+            string context;
+            lock (epoch.InjectedContext) context = DedupeTalkContext(raw ?? string.Empty, epoch.InjectedContext);
+
+            var sb = new StringBuilder();
+            sb.AppendLine($"[Spoken] {(string.IsNullOrEmpty(senderName) ? "User" : senderName)}: {userMessage}");
+            if (!string.IsNullOrWhiteSpace(note)) sb.AppendLine(note);
+            if (context.Length > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine("[New context for this message]");
+                sb.AppendLine(context);
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// The memories and knowledge relevant to <paramref name="text"/>, each section bounded by
+        /// <paramref name="budget"/>. Called during the pause before a spoken turn is committed, so the
+        /// turn itself rarely waits for it.
+        /// </summary>
+        public async Task<string> BuildTalkContextAsync(string text, TimeSpan budget)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return string.Empty;
+            var memoriesTask = BoundedSectionAsync(() => memory.FormatMemoriesForPrompt(
+                text, maxMemories: 4, maxShortcuts: 3, maxTokens: KliveAgentContextBudget.MemoryBudget), budget, string.Empty);
+            var knowledgeTask = BoundedSectionAsync(() => agentService.SearchKnowledgeForPromptAsync(
+                text, KliveAgentContextBudget.KnowledgeBudget), budget, string.Empty);
+            await Task.WhenAll(memoriesTask, knowledgeTask);
+            return string.Join("\n", new[] { await memoriesTask, await knowledgeTask }
+                .Where(section => !string.IsNullOrWhiteSpace(section)));
+        }
+
+        /// <summary>
+        /// Keeps only context lines the conversation has not seen, with their section headings. A line
+        /// that is already in the system prompt or an earlier turn is in the model's context — sending it
+        /// again only grows the prompt.
+        /// </summary>
+        internal static string DedupeTalkContext(string raw, HashSet<string> seen)
+        {
+            var sb = new StringBuilder();
+            string? heading = null;
+            foreach (string rawLine in (raw ?? string.Empty).Split('\n'))
+            {
+                string line = rawLine.TrimEnd('\r');
+                string key = line.Trim();
+                if (key.Length == 0) continue;
+                if (key.StartsWith('[') && key.EndsWith(']'))
+                {
+                    heading = line;
+                    continue;
+                }
+                if (!seen.Add(key)) continue;
+                if (heading != null)
+                {
+                    sb.AppendLine(heading);
+                    heading = null;
+                }
+                sb.AppendLine(line);
+            }
+            return sb.ToString().TrimEnd();
+        }
+
+        /// <summary>
+        /// Opens (or confirms) the warm spoken conversation before the first spoken turn needs it: system
+        /// prompt, tools and history are assembled and sent to the provider once with max_tokens 1, so the
+        /// first question pays only for its own words. A no-op while the conversation is still warm.
+        /// The caller holds the conversation's execution gate, so no run is using the session.
+        /// </summary>
+        internal async Task EnsureTalkSessionAsync(AgentConversation conversation, ITalkListener listener,
+            CancellationToken cancellationToken)
+        {
+            var llm = agentService.GetActiveServices().OfType<KliveLLM.KliveLLM>().FirstOrDefault();
+            if (llm == null) return;
+            bool useToolCalling;
+            try { useToolCalling = await llm.SupportsNativeToolCallingAsync(); }
+            catch { return; }
+            if (!useToolCalling) return;
+
+            var settings = await KliveAgentRunSettings.LoadAsync(agentService);
+            var target = settings.ComputerUseEnabled
+                ? agentService.Computer.ResolveTarget(settings.ComputerTarget)
+                : KliveAgentComputerTarget.None;
+            string? model = listener.ModelOverride;
+            string key = TalkCompatibilityKey(target, settings.VisionEnabled, model);
+            string sessionId = $"kliveagent-{conversation.ConversationId}";
+            if (CanContinueTalk(llm, sessionId, agentService.Talk.GetEpoch(conversation.ConversationId), key, listener.SessionMaxTokens))
+                return;
+
+            string seedText;
+            lock (conversation.SyncRoot)
+                seedText = conversation.Messages?.LastOrDefault(m => m.Role == AgentMessageRole.User)?.Content ?? string.Empty;
+
+            string systemPrompt = await BuildSystemPrompt(seedText, conversation, toolCallingMode: true,
+                computerUseEnabled: target != KliveAgentComputerTarget.None, computerTarget: target,
+                visionEnabled: settings.VisionEnabled);
+            var tools = BuildToolDefinitions(includeComputerUse: target == KliveAgentComputerTarget.Host);
+            if (target == KliveAgentComputerTarget.Container)
+                tools.AddRange(KliveAgentComputer.BuildContainerToolDefinitions(settings.VisionEnabled));
+            if (agentService.ServiceTools != null)
+            {
+                try { tools.AddRange(await agentService.ServiceTools.BuildToolDefinitionsAsync()); }
+                catch (Exception ex) { await agentService.ServiceLogError(ex, "Talk warm-up: service tools unavailable."); }
+            }
+            string seed = BuildUserPrompt(conversation, seedText, "Klives", seedOnly: true);
+            cancellationToken.ThrowIfCancellationRequested();
+
+            llm.ResetSession(sessionId);
+            llm.StartToolSession(sessionId, systemPrompt);
+            llm.AppendUserMessageToToolSession(sessionId, seed);
+            agentService.Talk.SetEpoch(conversation.ConversationId, NewTalkEpoch(key, tools, systemPrompt));
+            _ = llm.WarmToolSessionPrefixAsync(sessionId, tools, model, cancellationToken);
         }
 
         private static List<AgentMessage> SelectHistoryMessages(

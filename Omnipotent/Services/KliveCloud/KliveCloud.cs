@@ -7,6 +7,7 @@ using Omnipotent.Profiles.Permissions.Legacy;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Concurrent;
+using System.IO.Compression;
 using System.Runtime.Serialization;
 using static Omnipotent.Profiles.KMProfileManager;
 using static Omnipotent.Services.KliveCloud.CloudItem;
@@ -527,6 +528,119 @@ namespace Omnipotent.Services.KliveCloud
                 return true;
             }
             finally { metadataLock.Release(); }
+        }
+
+        // ───────────────────────────── ZIP downloads ─────────────────────────────
+
+        /// <summary>One entry of a ZIP built from a share: a file to copy, or a folder when <see cref="SourcePath"/> is null.</summary>
+        public sealed record ZipEntrySource(string EntryName, string? SourcePath, DateTime Modified, long Bytes);
+
+        /// <summary>
+        /// What a ZIP of part of a shared folder contains. Entry names are paths below
+        /// <paramref name="baseFolder"/> ("Day 1/IMG_0001.jpg"); with no selection, everything in it.
+        /// Items the link can't serve and files missing on disk are left out, and an item that sits
+        /// inside a selected folder comes with that folder rather than twice.
+        /// </summary>
+        public List<ZipEntrySource> PlanShareZip(ShareLink link, CloudItem baseFolder, IReadOnlyCollection<CloudItem>? selection = null)
+        {
+            CacheDeps.NoteRead(ItemsCacheKey);
+            var picked = (selection ?? CloudItems.Where(k => string.Equals(k.ParentFolderID ?? "", baseFolder.ItemID, StringComparison.OrdinalIgnoreCase)).ToList())
+                .Where(item => LinkCanServe(link, item))
+                .ToList();
+            var pickedFolders = picked.Where(i => i.ItemType == CloudItemType.Folder).Select(i => i.ItemID).ToList();
+            picked = picked
+                .Where(item => !pickedFolders.Any(folderID => !string.Equals(folderID, item.ItemID, StringComparison.OrdinalIgnoreCase) && IsDescendantOfFolder(folderID, item)))
+                .OrderBy(item => item.ItemType == CloudItemType.File)
+                .ThenBy(item => item.Name, StringComparer.OrdinalIgnoreCase)
+                .ToList();
+
+            var entries = new List<ZipEntrySource>();
+            var names = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            void Add(CloudItem item)
+            {
+                string? name = PathWithin(baseFolder, item);
+                if (string.IsNullOrEmpty(name)) return;
+                if (item.ItemType == CloudItemType.Folder)
+                {
+                    if (names.Add(name + "/")) entries.Add(new ZipEntrySource(name + "/", null, item.ModifiedDate, 0));
+                    return;
+                }
+                string? source = TryGetReadableFilePath(item);
+                if (source != null && names.Add(name)) entries.Add(new ZipEntrySource(name, source, item.ModifiedDate, item.FileSizeBytes));
+            }
+
+            foreach (var item in picked)
+            {
+                Add(item);
+                if (item.ItemType != CloudItemType.Folder) continue;
+                foreach (var descendant in GetDescendants(item.ItemID)
+                    .Where(d => LinkCanServe(link, d))
+                    .OrderBy(d => (d.RelativePath ?? "").Replace('\\', '/'), StringComparer.OrdinalIgnoreCase))
+                {
+                    Add(descendant);
+                }
+            }
+            return entries;
+        }
+
+        /// <summary>The item's path below <paramref name="baseFolder"/>, built from names; null when it isn't below it.</summary>
+        private string? PathWithin(CloudItem baseFolder, CloudItem item)
+        {
+            var parts = new List<string>();
+            var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var node = item;
+            while (node != null && visited.Add(node.ItemID))
+            {
+                if (string.Equals(node.ItemID, baseFolder.ItemID, StringComparison.OrdinalIgnoreCase))
+                {
+                    parts.Reverse();
+                    return string.Join("/", parts);
+                }
+                parts.Add(node.Name);
+                node = GetItemByID(node.ParentFolderID);
+            }
+            return null;
+        }
+
+        /// <summary>Already-compressed formats are stored as they are: deflating them costs CPU and saves nothing.</summary>
+        private static readonly HashSet<string> StoredInZip = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic", ".heif", ".avif",
+            ".mp4", ".mkv", ".mov", ".webm", ".m4v", ".avi", ".wmv", ".flv", ".3gp",
+            ".mp3", ".aac", ".m4a", ".ogg", ".opus", ".flac",
+            ".zip", ".rar", ".7z", ".gz", ".tgz", ".bz2", ".xz", ".zst",
+            ".docx", ".xlsx", ".pptx", ".apk", ".jar",
+        };
+
+        /// <summary>
+        /// Writes the planned entries to <paramref name="output"/> as a ZIP, one file at a time.
+        /// The output needn't be seekable (entries then carry data descriptors), so the archive
+        /// can go straight to the client without being assembled on disk or in memory first.
+        /// </summary>
+        public static async Task WriteZipAsync(Stream output, IEnumerable<ZipEntrySource> entries, CancellationToken cancellationToken = default)
+        {
+            using var archive = new ZipArchive(output, ZipArchiveMode.Create, leaveOpen: true);
+            foreach (var source in entries)
+            {
+                bool store = source.SourcePath == null || StoredInZip.Contains(Path.GetExtension(source.EntryName));
+                var entry = archive.CreateEntry(source.EntryName, store ? CompressionLevel.NoCompression : CompressionLevel.Fastest);
+                entry.LastWriteTime = ZipTimestamp(source.Modified);
+                await using var target = entry.Open();
+                if (source.SourcePath == null) continue;
+                await using var file = new FileStream(source.SourcePath, FileMode.Open, FileAccess.Read, FileShare.Read,
+                    TransferBufferBytes, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                await file.CopyToAsync(target, TransferBufferBytes, cancellationToken);
+            }
+        }
+
+        /// <summary>ZIP timestamps can only hold 1980–2107.</summary>
+        private static DateTimeOffset ZipTimestamp(DateTime value)
+        {
+            var min = new DateTime(1980, 1, 2);
+            var max = new DateTime(2107, 12, 30);
+            if (value < min) value = min;
+            if (value > max) value = max;
+            return new DateTimeOffset(DateTime.SpecifyKind(value, DateTimeKind.Unspecified), TimeSpan.Zero);
         }
 
         // ───────────────────────────── storage ─────────────────────────────
@@ -1194,33 +1308,47 @@ namespace Omnipotent.Services.KliveCloud
             }
         }
 
+        /// <summary>
+        /// A folder of photos opened in a grid asks for every thumbnail at once; each one not yet
+        /// cached is an ffmpeg process. Generation queues here instead of starting them all together.
+        /// </summary>
+        private static readonly SemaphoreSlim previewGenerationSlots = new(Math.Max(2, Environment.ProcessorCount / 2));
+
         public async Task<byte[]> GeneratePreview(CloudItem item, int maxWidth, int maxHeight)
         {
             string sourcePath = GetFullItemPath(item);
             if (!File.Exists(sourcePath)) return null;
 
             string cachePath = GetThumbnailCachePath(item.ItemID, maxWidth, maxHeight);
+            bool IsCached() => File.Exists(cachePath) && File.GetLastWriteTimeUtc(cachePath) >= File.GetLastWriteTimeUtc(sourcePath);
 
-            if (File.Exists(cachePath))
+            if (IsCached())
             {
-                var cacheWriteTime = File.GetLastWriteTimeUtc(cachePath);
-                var sourceWriteTime = File.GetLastWriteTimeUtc(sourcePath);
-                if (cacheWriteTime >= sourceWriteTime)
+                return await File.ReadAllBytesAsync(cachePath);
+            }
+
+            await previewGenerationSlots.WaitAsync();
+            try
+            {
+                // Whoever held the slot before may have just made this one.
+                if (IsCached())
                 {
                     return await File.ReadAllBytesAsync(cachePath);
                 }
+                if (IsImage(item))
+                {
+                    return await GenerateImageThumbnail(sourcePath, cachePath, maxWidth, maxHeight);
+                }
+                else if (IsVideo(item))
+                {
+                    return await GenerateVideoThumbnail(sourcePath, cachePath, maxWidth, maxHeight);
+                }
+                return null;
             }
-
-            if (IsImage(item))
+            finally
             {
-                return await GenerateImageThumbnail(sourcePath, cachePath, maxWidth, maxHeight);
+                previewGenerationSlots.Release();
             }
-            else if (IsVideo(item))
-            {
-                return await GenerateVideoThumbnail(sourcePath, cachePath, maxWidth, maxHeight);
-            }
-
-            return null;
         }
 
         private async Task<byte[]> GenerateImageThumbnail(string sourcePath, string cachePath, int maxWidth, int maxHeight)

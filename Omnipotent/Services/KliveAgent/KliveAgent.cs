@@ -2,8 +2,12 @@
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
+using Omnipotent.Services.KliveAgent.Talk;
 using System.Collections.Concurrent;
+using System.Collections.Specialized;
+using System.Globalization;
 using System.Net;
+using System.Net.WebSockets;
 using System.Threading;
 using System.Text.RegularExpressions;
 
@@ -31,6 +35,11 @@ namespace Omnipotent.Services.KliveAgent
         private KliveAgentComputer? computer;
         /// <summary>KliveAgent's computer: its own isolated desktop by default, or the host desktop.</summary>
         public KliveAgentComputer Computer => computer ??= new KliveAgentComputer(this);
+
+        /// <summary>Talk mode: which conversations have a live spoken session attached, and the warm
+        /// model session behind each.</summary>
+        public KliveAgentTalkHub Talk { get; } = new();
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> talkWarmGates = new(StringComparer.OrdinalIgnoreCase);
 
         // Codebase intelligence subsystems (spec Ch. 3, 4, 7)
         public KliveAgentCodebaseIndex CodebaseIndex { get; private set; }
@@ -137,6 +146,84 @@ namespace Omnipotent.Services.KliveAgent
                 return await rag.SearchForPromptAsync(userMessage, maxTokens, TimeSpan.FromMilliseconds(400));
             }
             catch { return string.Empty; }
+        }
+
+        // ── Talk mode ──
+
+        /// <summary>
+        /// Serves one talk-mode WebSocket for as long as it stays open. Authorization has already been
+        /// checked by the route; this validates the conversation and starts the session.
+        /// </summary>
+        internal async Task RunTalkSessionAsync(WebSocket socket, NameValueCollection query)
+        {
+            async Task Refuse(int code, string reason)
+            {
+                try { await socket.CloseAsync((WebSocketCloseStatus)code, reason, CancellationToken.None); } catch { }
+            }
+
+            string conversationId = query["conversationId"] ?? string.Empty;
+            if (!IsSafeIdentifier(conversationId)) { await Refuse(4400, "A valid conversationId is required."); return; }
+            if (!TryGetApiAvailability(out _, out var unavailable)) { await Refuse(4503, Clip(unavailable, 120)); return; }
+
+            var settings = await KliveAgentTalkSettings.LoadAsync(this);
+            if (!settings.Enabled) { await Refuse(4403, "Talk mode is turned off (KliveAgent_TalkEnabled)."); return; }
+            var llm = GetActiveServices().OfType<KliveLLM.KliveLLM>().FirstOrDefault();
+            if (llm == null) { await Refuse(4503, "KliveLLM is not running."); return; }
+
+            if (conversations.TryGetValue(conversationId, out var canonical)) conversationId = canonical.ConversationId;
+            double? speed = double.TryParse(query["speed"], NumberStyles.Float, CultureInfo.InvariantCulture, out double s) ? s : null;
+            var session = new KliveAgentTalkSession(new KliveAgentTalkBackend(this), new KliveLLMTalkAudio(llm), socket,
+                conversationId, settings, query["voice"], speed, query["format"]);
+            await session.RunAsync();
+
+            static string Clip(string text, int max) => text.Length <= max ? text : text[..max];
+        }
+
+        /// <summary>
+        /// Opens the warm spoken conversation ahead of the turn that needs it (talk start, and again when
+        /// Klives starts speaking after a long silence). Skipped while a run is active — the run owns the
+        /// session and leaves it warm — and when another warm-up for the same conversation is in flight.
+        /// </summary>
+        internal async Task EnsureTalkSessionAsync(string conversationId, ITalkListener listener, CancellationToken cancellationToken)
+        {
+            var currentBrain = brain;
+            if (currentBrain == null || !TryGetApiAvailability(out _, out _)) return;
+            var warmGate = talkWarmGates.GetOrAdd(conversationId, _ => new SemaphoreSlim(1, 1));
+            if (!await warmGate.WaitAsync(0, CancellationToken.None)) return;
+            try
+            {
+                if (activeRunByConversation.ContainsKey(conversationId)) return;
+                var executionGate = conversationExecutionGates.GetOrAdd(conversationId, _ => new SemaphoreSlim(1, 1));
+                if (!await executionGate.WaitAsync(0, CancellationToken.None)) return;
+                try
+                {
+                    // A brand-new conversation has no history yet; build against an empty one rather
+                    // than register a conversation nobody has written to.
+                    var conversation = conversations.TryGetValue(conversationId, out var existing)
+                        ? existing
+                        : new AgentConversation { ConversationId = conversationId, SourceChannel = AgentSourceChannel.API };
+                    await currentBrain.EnsureTalkSessionAsync(conversation, listener, cancellationToken);
+                }
+                finally { executionGate.Release(); }
+            }
+            catch (OperationCanceledException) { }
+            catch (Exception ex) { await ServiceLogError(ex, "[KliveAgent] Talk warm-up failed.", false); }
+            finally { warmGate.Release(); }
+        }
+
+        /// <summary>Memory/knowledge context for a provisional transcript, fetched during the pause before
+        /// the turn is committed. Null when there is nothing to fetch it with.</summary>
+        internal Task<string?> PrepareTalkTurnContextAsync(string text)
+        {
+            var currentBrain = brain;
+            if (currentBrain == null || string.IsNullOrWhiteSpace(text)) return Task.FromResult<string?>(null);
+            return Prepare();
+
+            async Task<string?> Prepare()
+            {
+                try { return await currentBrain.BuildTalkContextAsync(text, TimeSpan.FromMilliseconds(1200)); }
+                catch { return null; }
+            }
         }
 
         /// <summary>

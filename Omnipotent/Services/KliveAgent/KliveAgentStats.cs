@@ -305,6 +305,22 @@ namespace Omnipotent.Services.KliveAgent
             QueueSave();
         }
 
+        /// <summary>Adds one timing to the lifetime stage totals without counting a run: for latencies
+        /// measured outside a run, such as how long a spoken turn took to start answering out loud.</summary>
+        public void RecordStageSample(string stage, long durationMs)
+        {
+            if (string.IsNullOrWhiteSpace(stage)) return;
+            lock (_performanceLock)
+            {
+                if (!_performanceStages.TryGetValue(stage, out var total))
+                    _performanceStages[stage] = total = new PerformanceStage();
+                total.Count++;
+                total.TotalMs += Math.Max(0, durationMs);
+                total.MaxMs = Math.Max(total.MaxMs, durationMs);
+            }
+            QueueSave();
+        }
+
         public object GetPerformanceSummary()
         {
             lock (_performanceLock)

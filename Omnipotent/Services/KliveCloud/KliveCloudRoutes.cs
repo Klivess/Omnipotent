@@ -1215,6 +1215,75 @@ namespace Omnipotent.Services.KliveCloud
                 }
             }, HttpMethod.Get, Perms.Public);
 
+            // A shared folder (or a selection inside it) as one ZIP, built while it streams.
+            // folderID defaults to the shared folder; itemIDs (comma-separated) narrows it to a selection.
+            await parent.CreateAPIRoute("/KliveCloud/DownloadSharedZip", async (req) =>
+            {
+                bool streaming = false;
+                try
+                {
+                    var scope = await ResolveShareScope(req);
+                    if (scope == null) return;
+
+                    var (link, root) = scope.Value;
+                    if (root.ItemType != CloudItemType.Folder)
+                    {
+                        await req.ReturnResponse("SharedZipRequiresFolder", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+
+                    string? folderID = req.userParameters.Get("folderID");
+                    var folder = string.IsNullOrWhiteSpace(folderID) ? root : parent.GetItemByID(folderID);
+                    if (folder == null || folder.ItemType != CloudItemType.Folder || !parent.LinkCanServe(link, folder))
+                    {
+                        await req.ReturnResponse("SharedFolderNotFound", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+
+                    List<CloudItem>? selection = null;
+                    string? itemIDs = req.userParameters.Get("itemIDs");
+                    if (!string.IsNullOrWhiteSpace(itemIDs))
+                    {
+                        selection = new List<CloudItem>();
+                        foreach (string id in itemIDs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.OrdinalIgnoreCase))
+                        {
+                            var item = parent.GetItemByID(id);
+                            if (item == null || !parent.LinkCanServe(link, item) || !parent.IsDescendantOfFolder(folder.ItemID, item))
+                            {
+                                await req.ReturnResponse("SharedItemNotFound", code: HttpStatusCode.NotFound);
+                                return;
+                            }
+                            selection.Add(item);
+                        }
+                    }
+
+                    var plan = parent.PlanShareZip(link, folder, selection);
+                    string archiveName = selection is { Count: 1 } && selection[0].ItemType == CloudItemType.Folder ? selection[0].Name : folder.Name;
+                    var headers = new NameValueCollection
+                    {
+                        { "Content-Disposition", BuildAttachmentDisposition(archiveName + ".zip") },
+                        { "Cache-Control", "no-store" },
+                    };
+
+                    streaming = true;
+                    using Stream output = req.PrepareStreamResponse("application/zip", -1, HttpStatusCode.OK, headers);
+                    if (string.Equals(req.req.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase)) return;
+                    await KliveCloud.WriteZipAsync(output, plan);
+                }
+                catch (Exception ex) when (streaming)
+                {
+                    // Headers are gone; all that's left is to stop. Usually the client cancelled.
+                    if (ex is not (HttpListenerException or IOException or ObjectDisposedException))
+                    {
+                        await parent.ServiceLogError(ex, "Shared ZIP download failed partway");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, Perms.Public);
+
             // Get file info via share link (no authentication required)
             await parent.CreateAPIRoute("/KliveCloud/GetSharedItemInfo", async (req) =>
             {
@@ -1264,6 +1333,8 @@ namespace Omnipotent.Services.KliveCloud
                         SharePermissionMode = link.PermissionMode.ToString(),
                         CanWrite = parent.CanWriteThroughShareLink(link),
                         CanDelete = parent.CanDeleteThroughShareLink(link),
+                        // Tells the site this server has /DownloadSharedZip.
+                        CanDownloadZip = item.ItemType == CloudItemType.Folder,
                         ExpirationDate = link.ExpirationDate,
                         Children = descendants.Select(child => new
                         {

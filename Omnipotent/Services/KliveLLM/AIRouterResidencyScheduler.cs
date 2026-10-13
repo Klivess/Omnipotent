@@ -16,6 +16,10 @@
         /// <summary>A single discarded query — digest rebuild, triage, summary. Can never hit a cache,
         /// and its prefill EVICTS prefixes that could have.</summary>
         OneShot = 3,
+        /// <summary>A speech-to-text or text-to-speech call in a live conversation. Klives is waiting on
+        /// it like Interactive, it takes a fraction of a second, and it has no prompt prefix at all — so
+        /// it is never parked, never granted a residency, and never counted as a cold prefill.</summary>
+        Audio = 4,
     }
 
     /// <summary>How much of the scheduler is actually allowed to affect dispatch.</summary>
@@ -308,9 +312,15 @@
         internal static int Band(AIRouterWorkClass cls) => cls switch
         {
             AIRouterWorkClass.Interactive => 0,
+            AIRouterWorkClass.Audio => 0,
             AIRouterWorkClass.OneShot => 2,
             _ => 1,
         };
+
+        /// <summary>Work a human is actively waiting on: first in line, never parked, and allowed to
+        /// use the slot a live conversation keeps reserved.</summary>
+        internal static bool IsLive(AIRouterWorkClass cls)
+            => cls is AIRouterWorkClass.Interactive or AIRouterWorkClass.Audio;
 
         /// <summary>
         /// May this request be dispatched right now, given the cohort? Assumes the caller has already
@@ -324,7 +334,7 @@
             // A human is waiting and the volume is negligible. Its slot-seconds still show up in the
             // measured non-resident share, so the cohort shrinks to accommodate it rather than being
             // destabilised by it.
-            if (info.Class == AIRouterWorkClass.Interactive) return true;
+            if (IsLive(info.Class)) return true;
 
             // The invariant itself: a resident is always dispatched, which is what keeps its
             // consecutive turns inside the measured lifetime.
@@ -382,6 +392,10 @@
         /// renew residency.</summary>
         internal bool OnDispatch(in AIRouterWorkTicket info, DateTime now, bool pastDeadline)
         {
+            // Speech calls have no prompt prefix: nothing to track, nothing to keep warm, and nothing
+            // they could evict. Keeping them out of the tables keeps the cohort arithmetic honest.
+            if (info.Class == AIRouterWorkClass.Audio) return false;
+
             bool wasResident = residents.TryGetValue(info.PrefixKey, out Resident? r);
             if (!wasResident && !lastDispatch.ContainsKey(info.PrefixKey)) { /* first ever: a true cold start */ }
 

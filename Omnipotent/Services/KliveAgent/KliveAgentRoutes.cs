@@ -35,6 +35,50 @@ namespace Omnipotent.Services.KliveAgent
             await RegisterStatsRoutes();
             await RegisterIndexRoutes();
             await RegisterServiceToolRoutes();
+            // In the background: it waits for KliveAPI itself, which must never hold up the HTTP routes.
+            _ = RegisterTalkRouteAsync();
+        }
+
+        // ── Talk mode (spoken conversation) ──
+
+        /// <summary>
+        /// /kliveagent/talk — one WebSocket per spoken conversation. Registered on the typed KliveAPI rather
+        /// than through reflection (which fails silently and partially). KliveAPI resolves the
+        /// ?authorization= credential and enforces chat.use before upgrading; the handler checks it again
+        /// against the profile it was handed.
+        /// </summary>
+        private async Task RegisterTalkRouteAsync()
+        {
+            try
+            {
+                Omnipotent.Services.KliveAPI.KliveAPI? api = null;
+                DateTime deadline = DateTime.UtcNow.AddSeconds(60);
+                while (api == null)
+                {
+                    api = service.GetActiveServices().OfType<Omnipotent.Services.KliveAPI.KliveAPI>().FirstOrDefault();
+                    if (api != null) break;
+                    if (DateTime.UtcNow >= deadline)
+                    {
+                        await service.ServiceLog("[KliveAgent] KliveAPI did not start within 60s; talk mode is unavailable.");
+                        return;
+                    }
+                    await Task.Delay(250);
+                }
+
+                await api.CreateWebSocketRoute("/kliveagent/talk", async (context, socket, query, user) =>
+                {
+                    if (user == null || !AccessEvaluator.Can(user, KliveAgentPerms.ChatUse))
+                    {
+                        try { await socket.CloseAsync((System.Net.WebSockets.WebSocketCloseStatus)4003, "Unauthorized", CancellationToken.None); } catch { }
+                        return;
+                    }
+                    await service.RunTalkSessionAsync(socket, query);
+                }, KliveAgentPerms.ChatUse);
+            }
+            catch (Exception ex)
+            {
+                await service.ServiceLogError(ex, "[KliveAgent] Failed to register the talk route.");
+            }
         }
 
         private async Task CreateRoute(string path, Func<global::Omnipotent.Services.KliveAPI.KliveAPI.UserRequest, Task> handler, HttpMethod method, PermissionDef permission)

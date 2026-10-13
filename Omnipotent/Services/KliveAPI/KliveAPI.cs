@@ -586,7 +586,10 @@ namespace Omnipotent.Services.KliveAPI
                 HttpListenerResponse resp = context.Response;
                 resp.ContentType = contentType;
                 resp.StatusCode = (int)code;
-                resp.ContentLength64 = contentLength;
+                // A negative length means the body's size isn't known until it has been written
+                // (an archive built while it streams), so it goes out chunked.
+                if (contentLength >= 0) resp.ContentLength64 = contentLength;
+                else resp.SendChunked = true;
                 if (headers != null)
                 {
                     for (int i = 0; i < headers.Count; i++)

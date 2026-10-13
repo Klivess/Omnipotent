@@ -477,6 +477,10 @@ namespace Omnipotent.Services.KliveLLM
                 "AIRouterResidencyAlphaPercent",
                 ((int)(AIRouterResidencyScheduler.DefaultAlpha * 100)).ToString(), false, false);
             ApplySchedulerAlpha(configuredAlpha);
+
+            // Whether speech calls (transcription / synthesis) are admitted through the 3-slot queue.
+            // AIRouter does not say whether its parallel limit counts them, so the safe answer ships.
+            await GetBoolOmniSetting("AIRouterAudioCountsTowardParallel", true);
         }
 
         internal static readonly string[] SchedulerModeOptions =
@@ -613,7 +617,8 @@ namespace Omnipotent.Services.KliveLLM
             bool useFreeModel = false,
             CancellationToken cancellationToken = default,
             Action<string>? onToken = null,
-            string? thinkingOverride = null)
+            string? thinkingOverride = null,
+            bool honourThinkingOnAIRouter = false)
         {
             if (useFreeModel)
             {
@@ -625,7 +630,8 @@ namespace Omnipotent.Services.KliveLLM
                     forceFreeModel: true,
                     cancellationToken: cancellationToken,
                     onToken: onToken,
-                    thinkingOverride: thinkingOverride);
+                    thinkingOverride: thinkingOverride,
+                    honourThinkingOnAIRouter: honourThinkingOnAIRouter);
             }
 
             if (await GetActiveProviderAsync() != LLMProvider.Local)
@@ -637,7 +643,8 @@ namespace Omnipotent.Services.KliveLLM
                     systemPrompt,
                     cancellationToken: cancellationToken,
                     onToken: onToken,
-                    thinkingOverride: thinkingOverride);
+                    thinkingOverride: thinkingOverride,
+                    honourThinkingOnAIRouter: honourThinkingOnAIRouter);
 
                 return hfResponse;
             }
@@ -1451,7 +1458,12 @@ namespace Omnipotent.Services.KliveLLM
         /// whose intent a session id cannot express (a one-shot summary sitting in the same id-space as
         /// a real multi-turn session, for instance) state it explicitly.
         /// </param>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0, AIRouterWorkClass? workClass = null)
+        /// <param name="honourThinkingOnAIRouter">
+        /// Send the (ceiling-clamped) thinking level to AIRouter as its own <c>reasoning_effort</c>.
+        /// Off by default so every existing AIRouter caller keeps the provider's default reasoning;
+        /// KliveAgent opts in, which is what makes its adaptive low/medium/high real on AIRouter.
+        /// </param>
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0, AIRouterWorkClass? workClass = null, bool honourThinkingOnAIRouter = false)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -1573,7 +1585,8 @@ namespace Omnipotent.Services.KliveLLM
                 // Session id AND cache epoch: the epoch is what makes a compaction or brief rotation
                 // read as a genuinely new prefix rather than a continuation of one that no longer exists.
                 cachePrefixHint: $"{sessionId}#{cacheEpochID}",
-                workClass: workClass);
+                workClass: workClass,
+                honourThinkingOnAIRouter: honourThinkingOnAIRouter);
             var msg = response.choices[0].message;
             var rawContent = HFWrapper.ContentToText(msg?.content);
             var nativeToolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -1678,7 +1691,7 @@ namespace Omnipotent.Services.KliveLLM
                 .LastOrDefault(attempt => !string.IsNullOrWhiteSpace(attempt.provider))?.provider;
         }
 
-        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
+        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, bool honourThinkingOnAIRouter = false)
         {
             // ensure session
             if (string.IsNullOrEmpty(sessionId))
@@ -1711,7 +1724,7 @@ namespace Omnipotent.Services.KliveLLM
                 }
             }
             session.chatHistory.AddMessage(AuthorRole.User, StampIncoming(prompt));
-            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel, cancellationToken, onToken, thinkingOverride);
+            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel, cancellationToken, onToken, thinkingOverride, honourThinkingOnAIRouter);
             {
                 // Providers occasionally return an assistant turn with null content. Coalesce to an
                 // empty string so it neither crashes downstream parsing nor poisons the session
@@ -2113,7 +2126,7 @@ namespace Omnipotent.Services.KliveLLM
             return coolOff;
         }
 
-        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null)
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, bool honourThinkingOnAIRouter = false)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -2125,7 +2138,7 @@ namespace Omnipotent.Services.KliveLLM
             };
             ApplyServiceTier(ref payload, remoteProvider);
             ApplyUsageAccounting(ref payload, remoteProvider);
-            ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
+            ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride, honourThinkingOnAIRouter);
             payload.BuildMessagesFromChatHistory(messages);
             ApplyPromptCaching(ref payload, remoteProvider);
 
@@ -2158,7 +2171,8 @@ namespace Omnipotent.Services.KliveLLM
             bool enableOpenRouterContextCompression = false,
             ModelSamplingParameters? samplingParameters = null,
             string? cachePrefixHint = null,
-            AIRouterWorkClass? workClass = null)
+            AIRouterWorkClass? workClass = null,
+            bool honourThinkingOnAIRouter = false)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -2188,7 +2202,7 @@ namespace Omnipotent.Services.KliveLLM
             ApplyModelFallback(ref payload, remoteProvider, modelRoutes);
             ApplyServiceTier(ref payload, remoteProvider);
             ApplyUsageAccounting(ref payload, remoteProvider);
-            ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride);
+            ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride, honourThinkingOnAIRouter);
             ApplyContextCompression(ref payload, remoteProvider, enableOpenRouterContextCompression);
             ApplySamplingParameters(ref payload, remoteProvider, samplingParameters);
             ApplyTextualToolProtocolStops(ref payload, remoteProvider, structuredMessages);
@@ -2509,16 +2523,54 @@ namespace Omnipotent.Services.KliveLLM
             return ThinkingLevelOrder[effective];
         }
 
-        /// <summary>Maps the (clamped) thinking level to OpenRouter's native reasoning control. Other
-        /// providers rely on <see cref="ThinkingDirective"/> already present in the system prompt.
-        /// <paramref name="thinkingOverride"/> is the agent's per-call request (null = use the ceiling).</summary>
-        private void ApplyThinkingPreference(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider, string? thinkingOverride = null)
+        /// <summary>Maps the (clamped) thinking level to the provider's native reasoning control:
+        /// OpenRouter's <c>reasoning</c> object, or — for callers that opted in — AIRouter's
+        /// <c>reasoning_effort</c>. Other providers rely on <see cref="ThinkingDirective"/> already present
+        /// in the system prompt. <paramref name="thinkingOverride"/> is the agent's per-call request
+        /// (null = use the ceiling).
+        ///
+        /// AIRouter is opt-in because it never received a level before: every AIRouter call ran at the
+        /// model's own default ("medium" for Qwen3.8). Turning the mapping on for everyone at once would
+        /// silently change the reasoning of every fleet caller that happens to pass a level.</summary>
+        private void ApplyThinkingPreference(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider, string? thinkingOverride = null, bool honourThinkingOnAIRouter = false)
         {
+            if (remoteProvider.Provider == LLMProvider.AIRouter)
+            {
+                if (honourThinkingOnAIRouter)
+                    payload.reasoning_effort = AIRouterReasoningEffort(payload.model ?? remoteProvider.Model,
+                        ResolveThinkingLevel(thinkingOverride));
+                return;
+            }
             if (remoteProvider.Provider != LLMProvider.OpenRouter) return;
             string effective = ResolveThinkingLevel(thinkingOverride);
             payload.reasoning = string.Equals(effective, "off", StringComparison.OrdinalIgnoreCase)
                 ? new { enabled = false }
                 : new { effort = effective };
+        }
+
+        /// <summary>
+        /// Translates a canonical thinking level (off/low/medium/high) into the value AIRouter accepts
+        /// for <paramref name="model"/>. Qwen3.8 takes none/low/medium/xhigh and rejects "max" with a 400;
+        /// DeepSeek-V4-Flash only takes high/xhigh and has no non-thinking mode, so every lower level
+        /// becomes its floor. Null for a model whose vocabulary is unknown, so nothing is sent rather
+        /// than a value the router would reject.
+        /// </summary>
+        internal static string? AIRouterReasoningEffort(string? model, string? level)
+        {
+            string id = (model ?? string.Empty).Trim().ToLowerInvariant();
+            string canonical = (level ?? string.Empty).Trim().ToLowerInvariant();
+            if (id.StartsWith("qwen", StringComparison.Ordinal))
+                return canonical switch
+                {
+                    "off" => "none",
+                    "low" => "low",
+                    "medium" => "medium",
+                    "high" => "xhigh",
+                    _ => null,
+                };
+            if (id.StartsWith("deepseek", StringComparison.Ordinal))
+                return canonical == "high" ? "xhigh" : "high";
+            return null;
         }
 
         // Chooses the transport: when a token sink is supplied we stream (stream=true + SSE) so the UI
