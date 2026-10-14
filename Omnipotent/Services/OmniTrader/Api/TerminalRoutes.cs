@@ -465,7 +465,9 @@ namespace Omnipotent.Services.OmniTrader.Api
             {
                 if (Symbol(req) is not { } s) { await Bad(req, "symbol required"); return; }
                 Live();
-                await JsonOrNotFound(req, await Hub.GetOrderBookAsync(s, ParseInt(req.userParameters.Get("depth"), 50, 5, 500)));
+                int rows = ParseInt(req.userParameters.Get("rows") ?? req.userParameters.Get("depth"), 20, 5, 50);
+                decimal? group = decimal.TryParse(req.userParameters.Get("group"), NumberStyles.Float, CultureInfo.InvariantCulture, out var g) && g > 0 ? g : null;
+                await JsonOrNotFound(req, await Hub.GetOrderBookAsync(s, rows, group));
             });
         }
 

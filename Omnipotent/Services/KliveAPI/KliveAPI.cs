@@ -6,6 +6,7 @@ using Omnipotent.Service_Manager;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -141,6 +142,8 @@ namespace Omnipotent.Services.KliveAPI
             var list = new List<RouteDescriptor>();
             foreach (var (path, info) in ControllerLookup)
                 list.Add(new RouteDescriptor(path, info.normalizedMethod, info.requestBodyMode == RequestBodyMode.Streaming ? "streaming" : "route", info.permission));
+            foreach (var (key, info) in AdditionalMethodRoutes)
+                list.Add(new RouteDescriptor(PathOfMethodRouteKey(key), info.normalizedMethod, info.requestBodyMode == RequestBodyMode.Streaming ? "streaming" : "route", info.permission));
             foreach (var (path, info) in WebSocketRouteLookup)
                 list.Add(new RouteDescriptor(path, "WS", "websocket", info.permission));
             return list.OrderBy(r => r.Path, StringComparer.OrdinalIgnoreCase).ToList();
@@ -642,6 +645,13 @@ namespace Omnipotent.Services.KliveAPI
         //Key: Route (example: /omniscience/getmessagecount)
         //Value: EventHandler<route, routeInfo>
         public ConcurrentDictionary<string, RouteInfo> ControllerLookup;
+        /// <summary>
+        /// Handlers for further HTTP methods on a path ControllerLookup already holds, keyed
+        /// "METHOD /path". ControllerLookup keeps the first registration per path, which is what
+        /// the route catalog, telemetry and batch read; dispatch looks here when a request's method
+        /// is not the first one's, so GET /x and POST /x each reach their own handler.
+        /// </summary>
+        public ConcurrentDictionary<string, RouteInfo> AdditionalMethodRoutes;
         public ConcurrentDictionary<string, WebSocketRouteInfo> WebSocketRouteLookup;
 
         private KMProfileManager profileManager;
@@ -681,6 +691,7 @@ namespace Omnipotent.Services.KliveAPI
             name = "KliveAPI";
             threadAnteriority = ThreadAnteriority.Critical;
             ControllerLookup = new ConcurrentDictionary<string, RouteInfo>(StringComparer.OrdinalIgnoreCase);
+            AdditionalMethodRoutes = new ConcurrentDictionary<string, RouteInfo>(StringComparer.OrdinalIgnoreCase);
             WebSocketRouteLookup = new ConcurrentDictionary<string, WebSocketRouteInfo>(StringComparer.OrdinalIgnoreCase);
         }
         protected override async void ServiceMain()
@@ -1034,8 +1045,9 @@ namespace Omnipotent.Services.KliveAPI
                 if (string.Equals(normalized, "/batch", StringComparison.OrdinalIgnoreCase))
                     return BatchError(result, 400, "Nested /batch is not allowed.");
 
-                if (!ControllerLookup.TryGetValue(normalized, out RouteInfo routeInfo))
+                if (!ControllerLookup.TryGetValue(normalized, out RouteInfo firstRoute))
                     return BatchError(result, 404, "Route not found.");
+                RouteInfo routeInfo = ResolveMethodRoute(normalized, firstRoute, "GET");
                 if (routeInfo.requestBodyMode == RequestBodyMode.Streaming)
                     return BatchError(result, 400, "Streaming routes cannot run inside /batch.");
                 if (routeInfo.normalizedMethod != "GET")
@@ -1468,13 +1480,82 @@ namespace Omnipotent.Services.KliveAPI
                 requestBodyMode = requestBodyMode,
                 maxBodyBytes = maxBodyBytes
             };
+            string bodyMode = requestBodyMode == RequestBodyMode.Streaming ? "streaming" : "buffered";
+            string limit = maxBodyBytes.HasValue ? $", max body {maxBodyBytes.Value} bytes" : string.Empty;
             if (ControllerLookup.TryAdd(route, routeInfo))
             {
-                string bodyMode = requestBodyMode == RequestBodyMode.Streaming ? "streaming" : "buffered";
-                string limit = maxBodyBytes.HasValue ? $", max body {maxBodyBytes.Value} bytes" : string.Empty;
-                ServiceLog($"New {method.ToString().ToUpper()} route created: {route} ({bodyMode}{limit})");
+                ServiceLog($"New {routeInfo.normalizedMethod} route created: {route} ({bodyMode}{limit})");
+                return Task.CompletedTask;
+            }
+            if (!ControllerLookup.TryGetValue(route, out RouteInfo first)) return Task.CompletedTask;
+            if (first.normalizedMethod != routeInfo.normalizedMethod)
+            {
+                string key = MethodRouteKey(routeInfo.normalizedMethod, route);
+                if (AdditionalMethodRoutes.TryAdd(key, routeInfo))
+                {
+                    ServiceLog($"New {routeInfo.normalizedMethod} route created: {route} ({bodyMode}{limit}; shares its path with {first.normalizedMethod})");
+                    return Task.CompletedTask;
+                }
+                AdditionalMethodRoutes.TryGetValue(key, out first);
+            }
+            // The same path and method again. A restarting service re-registers the same handler,
+            // which is expected; a different handler is a collision, and the first one keeps
+            // answering. Say so, because otherwise the second handler simply never runs.
+            if (first.action != null && !SameHandler(first.action, handler))
+            {
+                string message = $"Route collision: {routeInfo.normalizedMethod} {route} is already registered by another handler, so this registration was ignored.";
+                routeCollisions.Enqueue(message);
+                ServiceLogError(message);
             }
             return Task.CompletedTask;
+        }
+
+        private readonly ConcurrentQueue<string> routeCollisions = new();
+        /// <summary>Registrations ignored because another handler already owned the path and method.</summary>
+        internal IReadOnlyCollection<string> RouteCollisions => routeCollisions;
+
+        /// <summary>
+        /// Whether two handlers are the same code, whatever closure instance carries them — so a service
+        /// registering its routes again is not mistaken for a collision. Wrappers (a try/catch guard, a
+        /// permission shim) share one method across every route, so the delegates they captured count too.
+        /// </summary>
+        private static bool SameHandler(Delegate a, Delegate b)
+        {
+            if (a.Method != b.Method) return false;
+            var inner = (Delegate d) => d.Target == null || !Attribute.IsDefined(d.Target.GetType(), typeof(System.Runtime.CompilerServices.CompilerGeneratedAttribute))
+                ? Array.Empty<MethodInfo>()
+                : d.Target.GetType().GetFields(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
+                    .Select(f => f.GetValue(d.Target) as Delegate).Where(x => x != null).Select(x => x!.Method).ToArray();
+            return inner(a).SequenceEqual(inner(b));
+        }
+
+        private static string MethodRouteKey(string method, string route)
+        {
+            string m = NormalizeMethod(method);
+            return (m == "HEAD" ? "GET" : m) + " " + route;
+        }
+
+        /// <summary>The handler for this request's method on a path: the path's first registration,
+        /// or the one registered for this method alongside it.</summary>
+        private RouteInfo ResolveMethodRoute(string route, RouteInfo first, string requestMethod)
+            => !IsRequestMethodAllowed(requestMethod, first.normalizedMethod)
+               && AdditionalMethodRoutes.TryGetValue(MethodRouteKey(requestMethod, route), out RouteInfo byMethod)
+                ? byMethod : first;
+
+        /// <summary>Every method a path answers, for the Allow header of a 405.</summary>
+        private string AllowedMethodsFor(string route, RouteInfo first)
+        {
+            var methods = new List<string> { first.normalizedMethod };
+            foreach (var (key, info) in AdditionalMethodRoutes)
+                if (string.Equals(PathOfMethodRouteKey(key), route, StringComparison.OrdinalIgnoreCase))
+                    methods.Add(info.normalizedMethod);
+            return string.Join(", ", methods.Distinct(StringComparer.OrdinalIgnoreCase));
+        }
+
+        private static string PathOfMethodRouteKey(string key)
+        {
+            int space = key.IndexOf(' ');
+            return space < 0 ? key : key[(space + 1)..];
         }
 
         private static long ValidateBodyLimit(long maxBodyBytes)
@@ -2340,8 +2421,9 @@ namespace Omnipotent.Services.KliveAPI
                     return;
                 }
 
-                if (ControllerLookup.TryGetValue(route, out RouteInfo routeData))
+                if (ControllerLookup.TryGetValue(route, out RouteInfo firstRoute))
                 {
+                    RouteInfo routeData = ResolveMethodRoute(route, firstRoute, req.HttpMethod);
                     if (sensitiveSettingsRequest)
                         routeData.maxBodyBytes = Math.Min(routeData.maxBodyBytes ?? 1024 * 1024, 1024 * 1024);
                     matchedRoute = true;
@@ -2351,7 +2433,7 @@ namespace Omnipotent.Services.KliveAPI
                     {
                         defenceOutcome = RequestOutcome.IncorrectMethod;
                         defenceDenyReason = "IncorrectHTTPMethod";
-                        await DenyMethodAsync(request, routeData.normalizedMethod);
+                        await DenyMethodAsync(request, AllowedMethodsFor(route, firstRoute));
                         return;
                     }
 

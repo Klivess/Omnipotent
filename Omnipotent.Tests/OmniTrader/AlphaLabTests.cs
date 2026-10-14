@@ -153,9 +153,9 @@ namespace Omnipotent.Tests.OmniTrader
 
             var tools = svc.Groups.ToDictionary(g => g.ToolName, g => g.Operations.Select(o => o.Op).ToHashSet());
             Assert.Equal(new[] { "omnitrader_data", "omnitrader_lab", "omnitrader_research", "omnitrader_studio" }, tools.Keys.OrderBy(k => k));
-            foreach (var op in new[] { "papers", "paper_get", "paper_verdict", "paper_add", "alpha_submit", "candidates", "candidate_get", "ingest_now" })
+            foreach (var op in new[] { "papers", "paper_get", "paper_verdict", "paper_add", "idea_add", "ideas", "alpha_submit", "candidates", "candidate_get", "ingest_now" })
                 Assert.Contains(op, tools["omnitrader_research"]);
-            foreach (var op in new[] { "reference", "templates", "list", "get", "create", "update", "validate", "formula_check" })
+            foreach (var op in new[] { "reference", "templates", "template_get", "list", "get", "create", "update", "validate", "formula_check" })
                 Assert.Contains(op, tools["omnitrader_studio"]);
             foreach (var op in new[] { "strategies", "quick_backtest", "backtest", "backtest_get", "sweep", "study_get" })
                 Assert.Contains(op, tools["omnitrader_lab"]);
@@ -166,8 +166,9 @@ namespace Omnipotent.Tests.OmniTrader
             var brief = typeof(AlphaLab).GetMethod("Brief", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
             Assert.NotNull(brief);
             foreach (var (tool, op) in new[] { ("omnitrader_research", "paper_get"), ("omnitrader_research", "paper_verdict"), ("omnitrader_research", "alpha_submit"),
+                         ("omnitrader_research", "idea_add"), ("omnitrader_research", "ideas"),
                          ("omnitrader_studio", "reference"), ("omnitrader_studio", "create"), ("omnitrader_studio", "validate"), ("omnitrader_studio", "update"),
-                         ("omnitrader_lab", "quick_backtest") })
+                         ("omnitrader_studio", "template_get"), ("omnitrader_lab", "quick_backtest") })
                 Assert.NotNull(registry.FindOnTool(tool, op));
         }
 
@@ -179,6 +180,69 @@ namespace Omnipotent.Tests.OmniTrader
                 Assert.Contains($"- {spec.Id}(", text);
             Assert.Contains("ScriptUniverseStrategy", text);
             Assert.Contains("crosses_above", text);
+            // C# leads, with complete worked scripts the agent can copy.
+            Assert.True(text.IndexOf("## Script (kind=script)", StringComparison.Ordinal) < text.IndexOf("## Blueprint (kind=blueprint)", StringComparison.Ordinal));
+            Assert.Contains("```csharp", text);
+            Assert.Contains("class KeltnerBreakout : ScriptStrategy", text);
+            Assert.Contains("class CrossSectionalMomentum : ScriptUniverseStrategy", text);
+            Assert.Contains("class TrendCrashFilterVolTarget", text);
+        }
+
+        [Fact]
+        public void Synthesis_Is_Compared_With_Its_Strongest_Part_On_Shared_Symbols()
+        {
+            static StudyRun Run(string symbol, double sharpe) => new() { Symbol = symbol, Metrics = new RunMetrics { Sharpe = sharpe } };
+            var synthesis = new AlphaCandidate { Id = "ac_syn", StrategyId = "st_syn", PaperIds = { "p1", "p2" }, TestSymbols = { "AAA", "BBB", "CCC" } };
+            var eval = new CandidateEvaluation
+            {
+                Primary = new RunMetrics { Sharpe = 1.1 },
+                PerSymbol = { Run("AAA", 1.2), Run("BBB", 0.9), Run("CCC", 1.0) },
+            };
+            var strong = new AlphaCandidate
+            {
+                Id = "ac_a", StrategyId = "st_a", StrategyName = "Momentum alone", PaperId = "p1", TestSymbols = { "AAA", "BBB", "DDD" },
+                Evaluation = new CandidateEvaluation { Primary = new RunMetrics { Sharpe = 0.8 }, PerSymbol = { Run("AAA", 0.8), Run("BBB", 0.6), Run("DDD", 2.0) } }
+            };
+            var weak = new AlphaCandidate
+            {
+                Id = "ac_b", StrategyId = "st_b", StrategyName = "Filter alone", PaperId = "p2", TestSymbols = { "ZZZ" },
+                Evaluation = new CandidateEvaluation { Primary = new RunMetrics { Sharpe = 0.2 } }
+            };
+            var otherInterval = new AlphaCandidate
+            {
+                Id = "ac_c", StrategyId = "st_c", PaperId = "p1", Interval = TimeInterval.OneHour,
+                Evaluation = new CandidateEvaluation { Primary = new RunMetrics { Sharpe = 3 } }
+            };
+
+            var parts = CandidateEvaluator.CompareConstituents(synthesis, eval, new[] { weak, strong, otherInterval });
+            Assert.Equal(new[] { "ac_a", "ac_b" }, parts.Select(p => p.CandidateId));
+            // Like for like: AAA and BBB only (DDD's 2.0 is not on the synthesis's basket).
+            Assert.Equal(2, parts[0].SharedSymbols);
+            Assert.Equal(0.7, parts[0].Sharpe, 3);
+            Assert.Equal(1.05, parts[0].SynthesisSharpe, 3);
+            Assert.Equal(0.35, parts[0].Delta, 3);
+            // No shared symbols: primary against primary.
+            Assert.Equal(0, parts[1].SharedSymbols);
+            Assert.Equal(0.9, parts[1].Delta, 3);
+
+            eval.Constituents = parts;
+            var scoreParts = (Dictionary<string, double>)typeof(CandidateEvaluator).GetMethod("ScoreParts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
+                .Invoke(null, new object[] { eval })!;
+            Assert.Equal(5, scoreParts["vs parts"]);
+            eval.Constituents[0].Delta = -0.3;
+            scoreParts = (Dictionary<string, double>)typeof(CandidateEvaluator).GetMethod("ScoreParts", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static)!
+                .Invoke(null, new object[] { eval })!;
+            Assert.Equal(-8, scoreParts["vs parts"]);
+        }
+
+        [Fact]
+        public void Old_Single_Paper_Candidates_Read_As_One_Source()
+        {
+            var json = """{"Id":"ac_old","PaperId":"arxiv:1","PaperTitle":"Old","StrategyId":"st_1","Status":"Weak"}""";
+            var c = Newtonsoft.Json.JsonConvert.DeserializeObject<AlphaCandidate>(json, DocumentStore<AlphaCandidate>.Json)!;
+            Assert.Equal(new[] { "arxiv:1" }, c.SourcePaperIds());
+            Assert.False(c.IsSynthesis());
+            Assert.Empty(c.IdeaIds);
         }
     }
 
@@ -314,6 +378,165 @@ namespace Omnipotent.Tests.OmniTrader
 
             for (int i = 0; i < 50 && (await lab.ListRunsAsync("analyse")).First().Status == "running"; i++) await Task.Delay(100);
             Assert.Equal("done", (await lab.ListRunsAsync("analyse")).First().Status);
+        }
+
+        private static async Task<AlphaCandidate> WaitEvaluatedAsync(AlphaLab lab, string id)
+        {
+            AlphaCandidate? c = null;
+            for (int i = 0; i < 2400; i++)
+            {
+                c = await lab.GetCandidateAsync(id);
+                if (c != null && c.Status is not (CandidateStatus.Proposed or CandidateStatus.Evaluating)) return c;
+                await Task.Delay(100);
+            }
+            throw new TimeoutException($"candidate {id} stayed {c?.Status}");
+        }
+
+        [Fact]
+        public async Task Reference_Synthesis_Example_Compiles_And_Trades()
+        {
+            var (check, result, error) = await studio.QuickTestAsync(
+                new StudioDraft { Kind = StudioKind.Script, Source = Omnipotent.Services.OmniTrader.Agent.StudioReference.SynthesisExample, Name = "synthesis example", DefaultSymbol = "AAAUSDT", DefaultInterval = TimeInterval.OneDay },
+                new StudioRunRequest { Symbol = "AAAUSDT", Interval = TimeInterval.OneDay, Bars = 900 });
+            Assert.True(check.Ok, string.Join("; ", check.Diagnostics.Select(d => d.Message)));
+            Assert.Null(error);
+            Assert.NotNull(result);
+            Assert.Equal(0, result!.StrategyErrors);
+            Assert.True(result.TotalTrades > 0, "the example never traded");
+            Assert.Contains(check.Parameters, p => p.Name == "TargetVol" && p.Min == 5 && p.Max == 80);
+        }
+
+        [Fact]
+        public async Task Synthesis_Connects_Ideas_From_Two_Papers_And_Is_Measured_Against_Its_Parts()
+        {
+            AlphaLab? lab = null;
+            string? synthesisBrief = null;
+            string? submittedId = null;
+            var ideaIds = new List<string>();
+            string p1 = "", p2 = "";
+            var evaluator = new CandidateEvaluator(studio, queue, jobs, runner, registry);
+            lab = new AlphaLab(db, studio, evaluator,
+                async (brief, conversation, ct) =>
+                {
+                    // The stand-in agent writes the reference's synthesis example in C# and cites both papers.
+                    synthesisBrief = brief;
+                    var s = await studio.CreateAsync(new StudioDraft
+                    {
+                        Kind = StudioKind.Script, Source = Omnipotent.Services.OmniTrader.Agent.StudioReference.SynthesisExample,
+                        Name = "Trend + crash filter + vol target", DefaultSymbol = "AAAUSDT", DefaultInterval = TimeInterval.OneDay
+                    }, "kliveagent");
+                    Assert.Equal(StudioStatus.Valid, s.Status);
+                    var c = await lab!.SubmitAsync(new CandidateSubmission
+                    {
+                        StrategyId = s.Id, Hypothesis = "Trend works when volatility is calm; vol-targeting evens the risk.",
+                        PaperIds = new[] { p1 }, IdeaIds = ideaIds, TestSymbols = new[] { "AAAUSDT", "BBBUSDT", "CCCUSDT" }, Interval = TimeInterval.OneDay
+                    });
+                    submittedId = c.Id;
+                    return "Submitted one synthesis.";
+                },
+                _ => Task.CompletedTask, _ => { }, (_, _) => { });
+            await lab.LoadAsync();
+            var settings = lab.Settings;
+            settings.EvaluationBars = 800;
+            settings.UseArxiv = settings.UseOpenAlex = false;
+            await lab.SaveSettingsAsync(settings);
+            lab.Start(cts.Token);
+
+            p1 = (await lab.AddPaperAsync("Time-series momentum in cryptocurrency markets", "Trailing twelve-month returns predict the next month's return in crypto.", "https://example.org/a", "klives")).Id;
+            p2 = (await lab.AddPaperAsync("Volatility-managed portfolios", "Scaling exposure by inverse realised volatility raises Sharpe ratios; momentum crashes cluster in high volatility.", "https://example.org/b", "klives")).Id;
+
+            // What analysis records as it reads the papers.
+            ideaIds.Add((await lab.AddIdeaAsync(new AlphaIdea { PaperId = p1, Role = "signal", Name = "12-month time-series momentum", Summary = "Long while the trailing 252-day return is positive.", Formula = "roc(close, 252) > 0" })).Id);
+            ideaIds.Add((await lab.AddIdeaAsync(new AlphaIdea { PaperId = p2, Role = "regime", Name = "High-volatility stand-aside", Summary = "Stay out when 20-day realised vol is in its top decile.", Formula = "percentrank(hv(20), 252) < 90" })).Id);
+            ideaIds.Add((await lab.AddIdeaAsync(new AlphaIdea { PaperId = p2, Role = "sizing", Name = "Volatility target", Summary = "Exposure = target vol / realised vol, capped at 100%." })).Id);
+            await Assert.ThrowsAsync<ArgumentException>(() => lab.AddIdeaAsync(new AlphaIdea { PaperId = p2, Role = "signal", Name = "Broken", Summary = "x", Formula = "close >" }));
+            await Assert.ThrowsAsync<ArgumentException>(() => lab.AddIdeaAsync(new AlphaIdea { PaperId = p2, Role = "astrology", Name = "Moon", Summary = "x" }));
+            // The same name again updates rather than duplicating.
+            var again = await lab.AddIdeaAsync(new AlphaIdea { PaperId = p2, Role = "sizing", Name = "volatility target", Summary = "Exposure = 25% / realised vol, at most 100%.", Parameters = "target 25%" });
+            Assert.Equal(ideaIds[2], again.Id);
+            Assert.Equal(3, (await lab.ListIdeasAsync(limit: 50)).Count);
+            Assert.Equal("filter", (await lab.GetIdeaAsync(ideaIds[1]))!.Role); // "regime" normalises to filter
+            Assert.Equal(2, (await lab.GetPaperAsync(p2))!.IdeaIds.Count);
+
+            // A single-paper replication of the signal exists first, so the synthesis has a part to beat.
+            var ema = await studio.CreateFromTemplateAsync("ema-cross", "kliveagent", "Momentum alone");
+            await studio.UpdateAsync(ema.Id, new StudioDraft { DefaultSymbol = "AAAUSDT" }, "kliveagent");
+            var part = await lab.SubmitAsync(new CandidateSubmission { StrategyId = ema.Id, Hypothesis = "Trend persists", PaperIds = new[] { p1 }, IdeaIds = new[] { ideaIds[0] }, TestSymbols = new[] { "AAAUSDT", "BBBUSDT", "CCCUSDT" } });
+            Assert.False(part.IsSynthesis());
+            part = await WaitEvaluatedAsync(lab, part.Id);
+            Assert.NotNull(part.Evaluation?.Primary);
+
+            // One paper's ideas are not enough to synthesise from.
+            Assert.Null(await lab.SynthesiseAsync("manual", default, new[] { p1 }));
+
+            var run = await lab.SynthesiseAsync("manual", default, new[] { p1, p2 }, null, "Keep it to three components.");
+            Assert.NotNull(run);
+            Assert.Equal("synthesise", run!.Kind);
+            for (int i = 0; i < 600 && submittedId == null; i++) await Task.Delay(100);
+            Assert.NotNull(submittedId);
+            Assert.NotNull(synthesisBrief);
+            Assert.Contains(p1, synthesisBrief);
+            Assert.Contains(p2, synthesisBrief);
+            Assert.Contains("kind=script", synthesisBrief);
+            Assert.Contains("alpha_submit paperIds=", synthesisBrief);
+            Assert.Contains("Keep it to three components.", synthesisBrief);
+            Assert.Contains(ideaIds[1], synthesisBrief);
+
+            var synth = await WaitEvaluatedAsync(lab, submittedId!);
+            Assert.True(synth.IsSynthesis());
+            Assert.Equal(new[] { p1, p2 }, synth.PaperIds); // p2 joined through its ideas
+            Assert.Equal("Script", synth.StrategyKind);
+            Assert.Equal(2, synth.Sources.Count);
+            Assert.Contains("sizing: volatility target", synth.Sources.Single(x => x.PaperId == p2).Contribution);
+            var e = synth.Evaluation!;
+            Assert.Null(e.Error);
+            Assert.Contains(e.Constituents, k => k.CandidateId == part.Id);
+            Assert.Contains("vs parts", e.ScoreParts.Keys);
+            Assert.Contains(e.Findings, f => f.StartsWith("vs parts:"));
+
+            // Every paper it draws on lists it; every idea it used knows it and its score.
+            Assert.Contains(await lab.ListCandidatesAsync(null, p2), c => c.Id == synth.Id);
+            Assert.Equal(2, (await lab.ListCandidatesAsync(null, p1)).Count);
+            Assert.Contains(synth.Id, (await lab.GetPaperAsync(p2))!.CandidateIds);
+            var usedIdea = (await lab.GetIdeaAsync(ideaIds[1]))!;
+            Assert.Contains(synth.Id, usedIdea.CandidateIds);
+            // The idea's score is written just after the candidate's.
+            for (int i = 0; i < 50 && usedIdea.BestScore == null; i++) { await Task.Delay(100); usedIdea = (await lab.GetIdeaAsync(ideaIds[1]))!; }
+            Assert.Equal(synth.Score, usedIdea.BestScore);
+            Assert.Equal($"papers:{p1}+{p2}", (await studio.GetAsync(synth.StrategyId))!.Origin);
+
+            for (int i = 0; i < 50 && (await lab.ListRunsAsync("synthesise")).First().Status == "running"; i++) await Task.Delay(100);
+            Assert.Equal("done", (await lab.ListRunsAsync("synthesise")).First().Status);
+        }
+
+        [Fact]
+        public async Task Briefs_Ask_For_Ideas_And_CSharp_And_Name_Only_Real_Tools()
+        {
+            var lab = new AlphaLab(db, studio, new CandidateEvaluator(studio, queue, jobs, runner, registry),
+                (_, _, _) => Task.FromResult<string?>("ok"), _ => Task.CompletedTask, _ => { }, (_, _) => { });
+            await lab.LoadAsync();
+            var paper = await lab.AddPaperAsync("Carry in crypto", "Funding rates predict returns.", "https://example.org/c", "klives");
+            var idea = await lab.AddIdeaAsync(new AlphaIdea { PaperId = paper.Id, Role = "signal", Name = "Funding carry", Summary = "Long low funding, short high funding." });
+            string analyse = lab.Brief(new[] { paper }, 1);
+            string synthesis = lab.SynthesisBrief(new[] { idea }, Array.Empty<ResearchPaper>(), Array.Empty<AlphaIdea>(), Array.Empty<AlphaCandidate>(), null);
+
+            Assert.Contains("op=idea_add", analyse);
+            Assert.Contains("C#", analyse);
+            Assert.Contains("kind=script", analyse);
+            Assert.Contains("paperIds=", analyse);
+            Assert.Contains(idea.Id, synthesis);
+            Assert.Contains("[signal]", synthesis);
+
+            var registry2 = OmniToolRegistry.Build(typeof(Omnipotent.Services.OmniTrader.OmniTrader).Assembly, _ => { });
+            var svc = registry2.GetService("omnitrader")!;
+            var allOps = svc.Groups.SelectMany(g => g.Operations.Select(o => o.Op)).ToHashSet();
+            foreach (var text in new[] { analyse, synthesis })
+            {
+                foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text, @"(omnitrader_\w+) op=(\w+)"))
+                    Assert.True(registry2.FindOnTool(m.Groups[1].Value, m.Groups[2].Value) != null, $"{m.Value} is not a tool");
+                foreach (System.Text.RegularExpressions.Match m in System.Text.RegularExpressions.Regex.Matches(text, @"(?<![\w_])op=(\w+)"))
+                    Assert.True(allOps.Contains(m.Groups[1].Value), $"op={m.Groups[1].Value} is not an omnitrader op");
+            }
         }
 
         [Fact]

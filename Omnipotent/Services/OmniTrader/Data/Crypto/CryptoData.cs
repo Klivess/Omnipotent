@@ -152,28 +152,42 @@ namespace Omnipotent.Services.OmniTrader.Data.Crypto
             }).ToList();
         }
 
-        public async Task<object> GetOrderBookAsync(string symbol, int depth = 50, CancellationToken ct = default)
+        public static string SpotSymbol(string symbol) => symbol.Trim().ToUpperInvariant().Replace("/", "").Replace("-", "");
+
+        /// <summary>A Binance spot depth snapshot of up to <paramref name="limit"/> levels a side (100, 500, 1000 or 5000).
+        /// Prices and sizes are parsed as exact decimals: a 0.01 tick must not drift into the wrong bucket.</summary>
+        public async Task<BookSnapshot> GetDepthAsync(string symbol, int limit, CancellationToken ct = default)
         {
-            string sym = symbol.ToUpperInvariant().Replace("/", "").Replace("-", "");
-            int limit = depth <= 5 ? 5 : depth <= 10 ? 10 : depth <= 20 ? 20 : depth <= 50 ? 50 : depth <= 100 ? 100 : 500;
+            string sym = SpotSymbol(symbol);
+            limit = limit <= 100 ? 100 : limit <= 500 ? 500 : limit <= 1000 ? 1000 : 5000;
             var json = await DataHttp.GetJsonAsync("binance-spot", "crypto", $"{Spot}/depth?symbol={sym}&limit={limit}", ct: ct);
-            var bids = (json["bids"] as JArray ?? new JArray()).Select(b => new[] { D(b[0]), D(b[1]) }).ToList();
-            var asks = (json["asks"] as JArray ?? new JArray()).Select(a => new[] { D(a[0]), D(a[1]) }).ToList();
-            double bestBid = bids.Count > 0 ? bids[0][0] : 0, bestAsk = asks.Count > 0 ? asks[0][0] : 0;
-            double mid = bestBid > 0 && bestAsk > 0 ? (bestBid + bestAsk) / 2 : 0;
-            double bidDepth = bids.Where(b => mid > 0 && b[0] >= mid * 0.99).Sum(b => b[0] * b[1]);
-            double askDepth = asks.Where(a => mid > 0 && a[0] <= mid * 1.01).Sum(a => a[0] * a[1]);
-            return new
-            {
-                Symbol = sym,
-                Bids = bids,
-                Asks = asks,
-                Mid = mid,
-                SpreadBps = mid > 0 ? (bestAsk - bestBid) / mid * 10000 : (double?)null,
-                BidDepth1Pct = bidDepth,
-                AskDepth1Pct = askDepth,
-                Imbalance = bidDepth + askDepth > 0 ? (bidDepth - askDepth) / (bidDepth + askDepth) : 0
-            };
+            return new BookSnapshot { Symbol = sym, Bids = Levels(json["bids"]), Asks = Levels(json["asks"]), Limit = limit, AsOfUtc = DateTime.UtcNow };
+        }
+
+        internal static List<BookLevel> Levels(JToken? side)
+        {
+            var list = new List<BookLevel>();
+            foreach (var l in side as JArray ?? new JArray())
+                if (Dec(l[0]) is { } p && Dec(l[1]) is { } s && p > 0 && s > 0) list.Add(new BookLevel(p, s));
+            return list;
+        }
+
+        private static decimal? Dec(JToken? t)
+        {
+            if (t is not JValue v || v.Value == null) return null;
+            string text = v.Value as string ?? Convert.ToString(v.Value, CultureInfo.InvariantCulture) ?? "";
+            return decimal.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out var d) ? d : null;
+        }
+
+        /// <summary>The symbol's price tick and lot step from Binance's exchange info.</summary>
+        public async Task<BookFilters?> GetBookFiltersAsync(string symbol, CancellationToken ct = default)
+        {
+            var json = await DataHttp.GetJsonAsync("binance-spot", "crypto", $"{Spot}/exchangeInfo?symbol={SpotSymbol(symbol)}", ct: ct);
+            var filters = json["symbols"]?.FirstOrDefault()?["filters"] as JArray;
+            if (filters == null) return null;
+            decimal? Filter(string type, string field) => Dec(filters.FirstOrDefault(f => f["filterType"]?.Value<string>() == type)?[field]);
+            var tick = Filter("PRICE_FILTER", "tickSize");
+            return tick is > 0m ? new BookFilters { Tick = tick.Value, Step = Filter("LOT_SIZE", "stepSize") ?? 0 } : null;
         }
 
         // ── perpetuals ────────────────────────────────────────────────────────────

@@ -42,18 +42,59 @@ namespace Omnipotent.Services.OmniTrader.Agent
             return list.Select(p => new
             {
                 p.Id, p.Title, Published = p.PublishedUtc?.ToString("yyyy-MM-dd"), p.Relevance, p.Feasibility,
-                p.Families, p.AssetClasses, p.DataNeeds, Status = p.Status.ToString(), p.Verdict
+                p.Families, p.AssetClasses, p.DataNeeds, Status = p.Status.ToString(), p.Verdict, Ideas = p.IdeaIds.Count
             });
         }
 
-        [OmniTool("paper_get", "Full record of one paper: abstract, authors, links (abs page + PDF), tags, prior verdict and candidates.", Group = "research")]
+        [OmniTool("paper_get", "Full record of one paper: abstract, authors, links (abs page + PDF), tags, prior verdict, the ideas recorded from it and its candidates.", Group = "research")]
         public async Task<object?> PaperGetAsync([OmniParam("Paper id, e.g. arxiv:2410.01234 or openalex:W123.")] string id)
-            => await Lab.GetPaperAsync(id) is { } p ? new
+        {
+            if (await Lab.GetPaperAsync(id) is not { } p) return null;
+            var recorded = await Lab.ListIdeasAsync(paperId: p.Id, limit: 100);
+            return new
             {
                 p.Id, p.Title, p.Authors, Published = p.PublishedUtc?.ToString("yyyy-MM-dd"), p.Venue, p.Url, p.PdfUrl, p.Doi,
                 p.Abstract, p.Relevance, p.Feasibility, p.Families, p.AssetClasses, p.DataNeeds, Status = p.Status.ToString(),
-                p.Verdict, p.Notes, p.CandidateIds
-            } : null;
+                p.Verdict, p.Notes, p.CandidateIds,
+                Ideas = recorded.Select(i => new { i.Id, i.Role, i.Name, i.Summary, i.Formula, i.Parameters, Used = i.CandidateIds.Count, i.BestScore })
+            };
+        }
+
+        [OmniTool("idea_add", "Record one reusable component of a paper in the idea library — a signal, filter, sizing, exit, universe, risk or timing rule — precise enough to implement. Record components even from papers you reject as standalone strategies: syntheses combine ideas from different papers. The same name for the same paper updates the existing idea.", Group = "research", Mutating = true)]
+        public async Task<string> IdeaAddAsync(
+            [OmniParam("Paper id the idea comes from.")] string paperId,
+            [OmniParam("The part of a strategy it supplies.", Values = new[] { "signal", "filter", "sizing", "exit", "universe", "risk", "timing" })] string role,
+            [OmniParam("Short name, e.g. \"12-1 month momentum\" or \"VIX term-structure regime filter\".")] string name,
+            [OmniParam("The rule in one or two sentences, as the paper states it.")] string summary,
+            [OmniParam("The rule in the formula language with the paper's numbers, when it can be written as one, e.g. roc(close, 252) - roc(close, 21) > 0. Must compile; leave it out otherwise.")] string? formula = null,
+            [OmniParam("The paper's parameters, e.g. \"12-month lookback, skip the last month, monthly rebalance\".")] string? parameters = null,
+            [OmniParam("What the paper reports for it: market, sample period, Sharpe or returns.")] string? evidence = null,
+            [OmniParam("Comma-separated asset classes it applies to (crypto, equities, fx, commodities, rates); defaults to the paper's.")] string? assets = null)
+        {
+            var idea = await Lab.AddIdeaAsync(new AlphaIdea
+            {
+                PaperId = paperId, Role = role, Name = name, Summary = summary, Formula = formula, Parameters = parameters, Evidence = evidence,
+                AssetClasses = assets?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList() ?? new(),
+                CreatedBy = Author
+            });
+            return $"Idea {idea.Id} recorded ({idea.Role}: {idea.Name}) for {idea.PaperId}.";
+        }
+
+        [OmniTool("ideas", "The idea library: components recorded from every paper analysed so far, best-scoring first. Use it to connect ideas from different papers into one strategy.", Group = "research")]
+        public async Task<object> IdeasAsync(
+            [OmniParam("Filter by role.", Values = new[] { "signal", "filter", "sizing", "exit", "universe", "risk", "timing" })] string? role = null,
+            [OmniParam("Text to search names, summaries, formulas and paper titles for.")] string? query = null,
+            [OmniParam("Only ideas from this paper.")] string? paperId = null,
+            [OmniParam("Rows to return (max 100).")] int limit = 30,
+            [OmniParam("Rows to skip, for paging.")] int offset = 0)
+        {
+            var list = await Lab.ListIdeasAsync(role, query, paperId, Math.Clamp(limit, 1, 100), Math.Max(0, offset));
+            return list.Select(i => new
+            {
+                i.Id, i.Role, i.Name, i.Summary, i.Formula, i.Parameters, i.Evidence, Assets = i.AssetClasses, i.PaperId, i.PaperTitle,
+                UsedIn = i.CandidateIds, i.BestScore
+            });
+        }
 
         [OmniTool("paper_verdict", "Record the outcome of analysing a paper: implemented (a candidate was submitted), rejected (no testable alpha on our data), or analysed. Notes should state the rule and anything not reproducible.", Group = "research", Mutating = true)]
         public async Task<string> PaperVerdictAsync(
@@ -72,19 +113,26 @@ namespace Omnipotent.Services.OmniTrader.Agent
             return $"Added {p.Id} (relevance {p.Relevance}).";
         }
 
-        [OmniTool("alpha_submit", "Submit a Studio strategy as the implementation of a paper's idea. OmniTrader evaluates it automatically (multi-symbol, 2x costs, walk-forward, deflated Sharpe) and ranks it.", Group = "research", Mutating = true)]
+        [OmniTool("alpha_submit", "Submit a Studio strategy as a candidate: one paper's idea, or a synthesis combining ideas from several papers (list every paper in paperIds and the ideas in ideaIds). OmniTrader evaluates it automatically (multi-symbol, 2x costs, walk-forward, deflated Sharpe; a synthesis is also compared with its single-paper parts) and ranks it.", Group = "research", Mutating = true)]
         public async Task<string> AlphaSubmitAsync(
             [OmniParam("Studio strategy id (st_...).")] string strategyId,
-            [OmniParam("One-sentence hypothesis being tested.")] string hypothesis,
-            [OmniParam("Paper id the idea came from, if any.")] string? paperId = null,
+            [OmniParam("One-sentence hypothesis being tested; for a synthesis, why the parts should work together.")] string hypothesis,
+            [OmniParam("Paper id the idea came from (the primary paper of a synthesis).")] string? paperId = null,
+            [OmniParam("Comma-separated ids of every paper the strategy draws on, for a synthesis.")] string? paperIds = null,
+            [OmniParam("Comma-separated idea ids (ai_...) the strategy implements; their papers are added automatically.")] string? ideaIds = null,
             [OmniParam("Comma-separated symbols to test on (optional; defaults by asset class).")] string? testSymbols = null,
             [OmniParam("Bar interval.", Values = new[] { "OneHour", "FourHour", "OneDay", "OneWeek" })] string? interval = null,
             string? notes = null)
         {
-            var c = await Lab.SubmitAsync(paperId, strategyId, hypothesis,
-                testSymbols?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries),
-                CandleClock.Parse(interval), Author, notes);
-            return $"Candidate {c.Id} queued for evaluation ({c.StrategyName} v{c.StrategyVersion}). Check with op=candidate_get.";
+            static List<string> Split(string? csv) => csv?.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList() ?? new();
+            var c = await Lab.SubmitAsync(new CandidateSubmission
+            {
+                StrategyId = strategyId, Hypothesis = hypothesis,
+                PaperIds = (paperId == null ? new List<string>() : new List<string> { paperId }).Concat(Split(paperIds)).ToList(),
+                IdeaIds = Split(ideaIds), TestSymbols = Split(testSymbols), Interval = CandleClock.Parse(interval), By = Author, Notes = notes
+            });
+            string kind = c.IsSynthesis() ? $"synthesis of {c.PaperIds.Count} papers" : c.PaperId != null ? $"from {c.PaperId}" : "no paper";
+            return $"Candidate {c.Id} queued for evaluation ({c.StrategyName} v{c.StrategyVersion}, {c.StrategyKind}, {kind}). Check with op=candidate_get.";
         }
 
         [OmniTool("candidates", "Alpha candidates ranked by evaluation score.", Group = "research")]
@@ -95,8 +143,10 @@ namespace Omnipotent.Services.OmniTrader.Agent
             var list = await Lab.ListCandidatesAsync(status, null, Math.Clamp(limit, 1, 100));
             return list.Select(c => new
             {
-                c.Id, c.StrategyId, c.StrategyName, c.PaperTitle, Status = c.Status.ToString(), c.Score, c.Hypothesis,
-                Sharpe = c.Evaluation?.Primary?.Sharpe, ReturnPct = c.Evaluation?.Primary?.ReturnPct, Dsr = c.Evaluation?.DeflatedSharpe
+                c.Id, c.StrategyId, c.StrategyName, c.StrategyKind, c.PaperTitle, Papers = c.SourcePaperIds(), Synthesis = c.IsSynthesis(), c.IdeaIds,
+                Status = c.Status.ToString(), c.Score, c.Hypothesis,
+                Sharpe = c.Evaluation?.Primary?.Sharpe, ReturnPct = c.Evaluation?.Primary?.ReturnPct, Dsr = c.Evaluation?.DeflatedSharpe,
+                VsParts = c.Evaluation?.Constituents is { Count: > 0 } k ? k[0].Delta : (double?)null
             });
         }
 
@@ -112,11 +162,22 @@ namespace Omnipotent.Services.OmniTrader.Agent
 
         // ── studio ───────────────────────────────────────────────────────────────
 
-        [OmniTool("reference", "Everything needed to write a strategy: the blueprint JSON schema with examples, the C# script API, the formula language and every indicator. Read once before writing.", Group = "studio")]
+        [OmniTool("reference", "Everything needed to write a strategy: the C# script API with worked examples (including one that combines ideas from several papers), the blueprint JSON schema, the formula language and every indicator. Read once before writing.", Group = "studio")]
         public string Reference() => StudioReference.Text;
 
-        [OmniTool("templates", "Starter strategies (blueprints and scripts) with their ids.", Group = "studio")]
+        [OmniTool("templates", "Starter strategies with their ids: blueprints, and C# scripts (ids script-*). Read one in full with op=template_get.", Group = "studio")]
         public object Templates() => Studio.Templates.Select(t => new { t.Id, t.Name, Kind = t.Kind.ToString(), t.Category, t.Description });
+
+        [OmniTool("template_get", "One starter strategy in full, as the definition op=create takes: complete C# source for a script template (working code for the script API), blueprint JSON otherwise.", Group = "studio")]
+        public object? TemplateGet([OmniParam("Template id from op=templates, e.g. script-keltner, script-zscore, script-xsmom.")] string id)
+        {
+            var t = Studio.Templates.FirstOrDefault(x => string.Equals(x.Id, id, StringComparison.OrdinalIgnoreCase));
+            if (t == null) return null;
+            string definition = t.Kind == StudioKind.Script
+                ? t.Source ?? ""
+                : JsonConvert.SerializeObject(t.Blueprint, Persistence.DocumentStore<StudioStrategy>.Json);
+            return new { t.Id, t.Name, Kind = t.Kind == StudioKind.Script ? "script" : "blueprint", t.Description, t.Symbol, Interval = t.Interval.ToString(), Definition = definition };
+        }
 
         [OmniTool("list", "Studio strategies (blueprints and scripts), newest first.", Group = "studio")]
         public async Task<object> ListAsync(string? query = null, [OmniParam("klives | kliveagent | alpha-lab")] string? author = null)
@@ -465,10 +526,78 @@ namespace Omnipotent.Services.OmniTrader.Agent
         public static string Text => text.Value;
         private static readonly Lazy<string> text = new(Build);
 
+        /// <summary>
+        /// A strategy built from three papers' ideas. Each component is its own method naming its source,
+        /// which is the shape the Alpha Lab asks syntheses to take. A test compiles and backtests it.
+        /// </summary>
+        internal const string SynthesisExample = """
+            [TradingStrategy("Trend + crash filter + vol target", "Time-series momentum, traded only outside high-volatility regimes, sized to a volatility target.")]
+            public class TrendCrashFilterVolTarget : ScriptStrategy
+            {
+                [Param("Momentum lookback", Min = 20, Max = 400)] public int Lookback { get; set; } = 252;
+                [Param("Vol percentile cap", Min = 50, Max = 100)] public double VolCap { get; set; } = 90;
+                [Param("Target vol %", Min = 5, Max = 80)] public double TargetVol { get; set; } = 25;
+
+                // Signal — <paper id>, <idea id>: long while the trailing 12-month return is positive.
+                private bool TrendUp() => Roc(Lookback) > 0;
+
+                // Filter — <paper id>, <idea id>: stand aside when 20-day realised volatility is in the top decile of the past year.
+                private bool CalmRegime() => F("percentrank(hv(20), 252)") < VolCap;
+
+                // Sizing — <paper id>, <idea id>: exposure = target volatility / realised volatility, at most 100%.
+                private double ExposurePct()
+                {
+                    double vol = HistVol(20);
+                    return double.IsNaN(vol) || vol <= 0 ? 0 : Math.Min(100, TargetVol / vol * 100);
+                }
+
+                public override void OnBar()
+                {
+                    if (double.IsNaN(Roc(Lookback)) || double.IsNaN(F("percentrank(hv(20), 252)"))) return; // warm-up
+                    Plot("exposure %", ExposurePct());
+                    if (TrendUp() && CalmRegime())
+                    {
+                        if (IsFlat || CurrentBar % 5 == 0) SetTargetPercent(ExposurePct()); // rebalance weekly, not every bar
+                    }
+                    else if (!IsFlat) Exit();
+                }
+            }
+            """;
+
         private static string Build()
         {
             var sb = new StringBuilder();
             sb.AppendLine("# OmniTrader strategy reference");
+            sb.AppendLine();
+            sb.AppendLine("Strategies are C# scripts (kind=script) or blueprints (kind=blueprint). Write C# for anything with state, several steps, custom sizing, a portfolio, or components from more than one paper; a blueprint suits a plain indicator rule.");
+            sb.AppendLine();
+            sb.AppendLine("## Script (kind=script) — C#");
+            sb.AppendLine("Derive from ScriptStrategy (one symbol: override void OnBar()) or ScriptUniverseStrategy (many: override void OnBar(UniverseView u), call SetWeights(dict of signed weights)). Optional [TradingStrategy(\"Name\",\"Description\")] on the class (RequiresUniverse = true for a universe script); [Param(\"Label\", Min=, Max=, Step=)] on public settable properties makes them inputs — the evaluation's walk-forward sweeps them between Min and Max. Usings for System, Linq, Collections, the trading API are implicit.");
+            sb.AppendLine("ScriptStrategy: Close/Open/High/Low/Volume, C(ago)/O/H/L/V, Time, CurrentBar; indicators Sma/Ema/Wma/Hma(n,ago), Rsi, Atr, Natr, Adx, Cci, Mfi, WilliamsR, Roc, StdDev, ZScore, PercentRank, Highest, Lowest, Vwap, Obv, HistVol (annualised %), Ibs, Macd(f,s,sig)→(Line,Signal,Hist), Bollinger(n,k)→(Upper,Mid,Lower), Keltner, Donchian, Stoch→(K,D), Supertrend→(Line,Direction), F(\"any formula\", ago), CrossAbove(\"a\",\"b\"), CrossBelow; position PositionSize, IsLong, IsShort, IsFlat, EntryPrice, BarsInTrade, OpenProfitPct, Cash, AccountEquity, MaxLeverage, HasPendingOrders; orders Buy(qty, sl, tp), Sell, BuyPercent(pct, sl, tp), ShortPercent, SetTargetPercent(signed pct), ExitLong(), ExitShort(), Exit(), LimitBuy/LimitSell(qty, price), StopBuy/StopSell(qty, stop), SetStopLoss(price), SetTakeProfit(price); Plot(name, value); Print(msg); override Initialize() and OnFill(FillEvent).");
+            sb.AppendLine("ScriptUniverseStrategy: properties UniverseSize, RegimeSymbol, BarNumber; override Symbols for a fixed basket; UniverseView u: u.Symbols, u.Time, u.Close(sym, ago), u.Volume(sym, ago), u.F(sym, formula, ago), u.Bars(sym); Holdings, AccountEquity, MaxLeverage, Plot.");
+            sb.AppendLine("Sandbox: no I/O, network, reflection, threads/Task.Run, processes, Environment, Console, DateTime.Now (use Time), unsafe/stackalloc/goto/finalizers, nothing in Omnipotent outside the trading API. Loops and recursion are budgeted per callback. Orders queued in OnBar submit after it returns; market orders fill next bar's open in evaluations.");
+            sb.AppendLine("Habits that avoid broken backtests: indicators are NaN during warm-up, so return early on double.IsNaN; keep state in fields (they persist across bars); BuyPercent/ShortPercent do nothing while a position or order is open, SetTargetPercent rebalances to a signed target; shorts only execute with leverage > 1; Plot the signal so the report shows what the strategy saw.");
+            foreach (var (id, title) in new[]
+            {
+                ("script-keltner", "Single symbol with state: breakout entry, ATR trailing stop kept in a field"),
+                ("script-zscore", "Long/short with a signed target position"),
+                ("script-xsmom", "Portfolio: rank a universe, hold the top N, regime filter"),
+            })
+            {
+                var t = StudioTemplates.All.FirstOrDefault(x => x.Id == id);
+                if (t?.Source == null) continue;
+                sb.AppendLine();
+                sb.AppendLine($"### Example: {title} ({id})");
+                sb.AppendLine("```csharp");
+                sb.AppendLine(t.Source.Trim());
+                sb.AppendLine("```");
+            }
+            sb.AppendLine();
+            sb.AppendLine("### Example: combining ideas from several papers");
+            sb.AppendLine("A synthesis gives each component its own method with a comment naming the paper and idea it implements, so the code records where every piece came from:");
+            sb.AppendLine("```csharp");
+            sb.AppendLine(SynthesisExample.Trim());
+            sb.AppendLine("```");
             sb.AppendLine();
             sb.AppendLine("## Blueprint (kind=blueprint) — JSON");
             sb.AppendLine("Fields: inputs[] {name,label,type:int|double|bool,default,min,max,step} · universe {mode:single|basket|universe, symbol, symbols[], topN, quoteAsset, regimeSymbol} · direction long|short|both · rules {entryLong, exitLong, entryShort, exitShort, filter} (each a ConditionGroup) · sizing {mode:percent|quote|risk|voltarget, value, maxPositions, maxPositionPct} · risk {stopLoss, takeProfit, trailing: {mode:none|percent|atr|r, value, atrLength}, maxBarsInTrade, cooldownBars, exitOnFilterOff} · ranking {score (formula), top, bottom, rebalanceBars, weighting:equal|inverse-vol|score, grossExposure, minDollarVolume}.");
@@ -477,12 +606,6 @@ namespace Omnipotent.Services.OmniTrader.Agent
             sb.AppendLine("Sizing: percent = % of equity per position; risk = % of equity lost at the stop (needs stopLoss); voltarget = target annual vol % per position. filter in basket/universe mode is evaluated on regimeSymbol. Shorts only execute with leverage > 1.");
             sb.AppendLine("Example single-symbol: {\"inputs\":[{\"name\":\"fast\",\"type\":\"int\",\"default\":20,\"min\":5,\"max\":100}],\"universe\":{\"mode\":\"single\",\"symbol\":\"BTCUSDT\"},\"rules\":{\"entryLong\":{\"logic\":\"all\",\"conditions\":[{\"kind\":\"compare\",\"left\":{\"kind\":\"indicator\",\"indicator\":\"ema\",\"params\":{\"length\":\"fast\"}},\"op\":\"crosses_above\",\"right\":{\"kind\":\"indicator\",\"indicator\":\"ema\",\"params\":{\"length\":50}}}]},\"exitLong\":{\"logic\":\"all\",\"conditions\":[{\"kind\":\"formula\",\"formula\":\"crossunder(ema(close, fast), ema(close, 50))\"}]}},\"sizing\":{\"mode\":\"percent\",\"value\":95},\"risk\":{\"stopLoss\":{\"mode\":\"atr\",\"value\":3,\"atrLength\":14}}}");
             sb.AppendLine("Example rotation: {\"universe\":{\"mode\":\"universe\",\"topN\":30,\"regimeSymbol\":\"BTCUSDT\"},\"rules\":{\"filter\":{\"conditions\":[{\"kind\":\"formula\",\"formula\":\"close > sma(close, 100)\"}]}},\"ranking\":{\"score\":\"roc(close, 30)\",\"top\":5,\"rebalanceBars\":7,\"weighting\":\"inverse-vol\",\"grossExposure\":0.95}}");
-            sb.AppendLine();
-            sb.AppendLine("## Script (kind=script) — C#");
-            sb.AppendLine("Derive from ScriptStrategy (one symbol: override void OnBar()) or ScriptUniverseStrategy (many: override void OnBar(UniverseView u), call SetWeights(dict of signed weights)). Optional [TradingStrategy(\"Name\",\"Description\")] on the class; [Param(\"Label\", Min=, Max=, Step=)] on public settable properties makes them inputs. Usings for System, Linq, Collections, the trading API are implicit.");
-            sb.AppendLine("ScriptStrategy: Close/Open/High/Low/Volume, C(ago)/O/H/L/V, Time, CurrentBar; indicators Sma/Ema/Wma/Hma(n,ago), Rsi, Atr, Natr, Adx, Cci, Mfi, WilliamsR, Roc, StdDev, ZScore, PercentRank, Highest, Lowest, Vwap, Obv, HistVol, Ibs, Macd(f,s,sig)→(Line,Signal,Hist), Bollinger(n,k)→(Upper,Mid,Lower), Keltner, Donchian, Stoch→(K,D), Supertrend→(Line,Direction), F(\"any formula\", ago), CrossAbove(\"a\",\"b\"), CrossBelow; position PositionSize, IsLong, IsShort, IsFlat, EntryPrice, BarsInTrade, OpenProfitPct, Cash, AccountEquity, MaxLeverage, HasPendingOrders; orders Buy(qty, sl, tp), Sell, BuyPercent(pct, sl, tp), ShortPercent, SetTargetPercent(signed pct), ExitLong(), ExitShort(), Exit(), LimitBuy/LimitSell(qty, price), StopBuy/StopSell(qty, stop), SetStopLoss(price), SetTakeProfit(price); Plot(name, value); Print(msg); override Initialize() and OnFill(FillEvent).");
-            sb.AppendLine("ScriptUniverseStrategy: properties UniverseSize, RegimeSymbol, BarNumber; override Symbols for a fixed basket; UniverseView u: u.Symbols, u.Time, u.Close(sym, ago), u.Volume(sym, ago), u.F(sym, formula, ago), u.Bars(sym); Holdings, AccountEquity, MaxLeverage, Plot.");
-            sb.AppendLine("Sandbox: no I/O, network, reflection, threads/Task.Run, processes, Environment, Console, DateTime.Now (use Time), unsafe/stackalloc/goto/finalizers, nothing in Omnipotent outside the trading API. Loops and recursion are budgeted per callback. Orders queued in OnBar submit after it returns; market orders fill next bar's open in evaluations.");
             sb.AppendLine();
             sb.AppendLine("## Formula language (blueprint formulas, ranking scores, F(), screens)");
             sb.AppendLine("Series: open high low close volume hl2 hlc3 ohlc4 hlcc4 bar_index time. Operators: + - * / % ^, > >= < <= == !=, and or not, cond ? a : b, x[n] (n bars ago, n ≥ 0), f(...).output. Booleans are 1/0; na during warm-up.");

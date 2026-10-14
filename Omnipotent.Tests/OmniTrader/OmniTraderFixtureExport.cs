@@ -321,8 +321,25 @@ namespace Omnipotent.Tests.OmniTrader
             // ── alpha lab ──
             AlphaLab? lab = null;
             var evaluator = new CandidateEvaluator(studio, queue, jobs, runner, registry);
-            lab = new AlphaLab(db, studio, evaluator, async (_, _, _) =>
+            var synthesisIdeas = new List<string>();
+            string? momentumPaper = null;
+            lab = new AlphaLab(db, studio, evaluator, async (brief, _, _) =>
             {
+                if (brief.Contains("synthesis run"))
+                {
+                    // A C# strategy built from two papers' ideas.
+                    var s = await studio.CreateAsync(new StudioDraft
+                    {
+                        Kind = StudioKind.Script, Source = Omnipotent.Services.OmniTrader.Agent.StudioReference.SynthesisExample,
+                        Name = "Trend + crash filter + vol target", DefaultSymbol = "BTCUSDT", DefaultInterval = TimeInterval.OneDay
+                    }, "kliveagent");
+                    await lab!.SubmitAsync(new CandidateSubmission
+                    {
+                        StrategyId = s.Id, Hypothesis = "Trend pays when volatility is calm; targeting volatility evens the risk across regimes.",
+                        PaperIds = new[] { momentumPaper! }, IdeaIds = synthesisIdeas, TestSymbols = Crypto.Take(3), Interval = TimeInterval.OneDay
+                    });
+                    return "Submitted one synthesis.";
+                }
                 var paperId = (await lab!.ListPapersAsync()).OrderByDescending(p => p.Relevance).First().Id;
                 await lab.SubmitAsync(paperId, ema.Id, "Trend persists across major crypto assets", Crypto.Take(3), TimeInterval.OneDay, "kliveagent");
                 await lab.SetVerdictAsync(paperId, "implemented", "EMA 20/50 crossover; parameters from the paper.", "kliveagent");
@@ -354,21 +371,56 @@ namespace Omnipotent.Tests.OmniTrader
             Assert.NotNull(cand);
             for (int i = 0; i < 50 && (await lab.ListRunsAsync("analyse")).FirstOrDefault()?.Status == "running"; i++) await Task.Delay(100);
 
+            // Ideas recorded from two papers, then a synthesis that connects them.
+            momentumPaper = topPaper.Id;
+            var volPaper = await lab.AddPaperAsync("Volatility-managed portfolios",
+                "Scaling exposure by inverse realised volatility raises Sharpe ratios across factors; momentum crashes cluster in high-volatility states.", "https://example.org/vol", "klives");
+            var carryPaper = (await lab.ListPapersAsync()).First(p => p.Title.StartsWith("Funding rates"));
+            synthesisIdeas.Add((await lab.AddIdeaAsync(new AlphaIdea { PaperId = topPaper.Id, Role = "signal", Name = "12-month time-series momentum", Summary = "Long while the trailing 252-day return is positive.", Formula = "roc(close, 252) > 0", Parameters = "252-day lookback", Evidence = "Sharpe above one on BTC and the largest coins, 2018-2025, after costs" })).Id);
+            synthesisIdeas.Add((await lab.AddIdeaAsync(new AlphaIdea { PaperId = volPaper.Id, Role = "filter", Name = "High-volatility stand-aside", Summary = "Stay out when 20-day realised volatility is in the top decile of the past year.", Formula = "percentrank(hv(20), 252) < 90", Parameters = "20-day vol, 252-day rank, 90th percentile" })).Id);
+            synthesisIdeas.Add((await lab.AddIdeaAsync(new AlphaIdea { PaperId = volPaper.Id, Role = "sizing", Name = "Volatility target", Summary = "Exposure equals target volatility over realised volatility, capped at 100%.", Parameters = "target 25% annualised" })).Id);
+            await lab.AddIdeaAsync(new AlphaIdea { PaperId = carryPaper.Id, Role = "signal", Name = "Funding carry", Summary = "Long the lowest-funding perpetuals, short the highest.", Parameters = "weekly rebalance, top/bottom quintile" });
+            var synthRun = await lab.SynthesiseAsync("manual", default, new[] { topPaper.Id, volPaper.Id });
+            Assert.NotNull(synthRun);
+            AlphaCandidate? synth = null;
+            for (int i = 0; i < 2400; i++)
+            {
+                synth = (await lab.ListCandidatesAsync()).FirstOrDefault(c => c.IsSynthesis());
+                if (synth != null && synth.Status is not (CandidateStatus.Proposed or CandidateStatus.Evaluating)) break;
+                await Task.Delay(100);
+            }
+            Assert.NotNull(synth?.Evaluation);
+            for (int i = 0; i < 50 && (await lab.ListRunsAsync("synthesise")).FirstOrDefault()?.Status == "running"; i++) await Task.Delay(100);
+
             var allPapers = await lab.ListPapersAsync(limit: 500);
             Write("alpha-papers", new { Total = allPapers.Count, Rows = allPapers.Select(TerminalRoutes.PaperRow) });
             foreach (var p in allPapers)
-                Write($"alpha-paper-{p.Id.Replace(':', '_')}", new { Paper = p, Candidates = (await lab.ListCandidatesAsync(null, p.Id, 50)).Select(TerminalRoutes.CandidateRow) });
+                Write($"alpha-paper-{p.Id.Replace(':', '_')}", await TerminalRoutes.PaperDetailAsync(lab, p));
             var cands = await lab.ListCandidatesAsync();
             Write("alpha-candidates", cands.Select(TerminalRoutes.CandidateRow));
             foreach (var c in cands) Write($"alpha-candidate-{c.Id}", c);
+            var ideas = await lab.ListIdeasAsync(limit: 500);
+            Write("alpha-ideas", new { Total = ideas.Count, Rows = ideas.Select(TerminalRoutes.IdeaRow) });
             Write("alpha-runs", (await lab.ListRunsAsync(null, 50)).Select(TerminalRoutes.RunRow));
-            Write("alpha-overview", new
+            Write("alpha-overview", await TerminalRoutes.AlphaOverviewAsync(lab));
+
+            // ── order book: a dense BTC-like book through the route's own view ──
+            var bookRng = new Random(5);
+            List<BookLevel> Side(decimal start, decimal dir)
             {
-                lab.Settings, lab.AgentBusy, LastIngestUtc = (DateTime?)DateTime.UtcNow.AddHours(-2), LastDispatchUtc = (DateTime?)DateTime.UtcNow.AddMinutes(-5),
-                Papers = await lab.PaperStatusCountsAsync(), Candidates = await lab.CandidateStatusCountsAsync(),
-                Runs = (await lab.ListRunsAsync(null, 15)).Select(TerminalRoutes.RunRow),
-                Leaders = cands.Where(c => c.Score.HasValue).OrderByDescending(c => c.Score).Take(10).Select(TerminalRoutes.CandidateRow)
-            });
+                var levels = new List<BookLevel>();
+                decimal price = start;
+                for (int i = 0; i < 1000; i++)
+                {
+                    bool wall = i % 97 == 41 || price % 50m == 0;
+                    decimal size = wall ? Math.Round(2m + (decimal)bookRng.NextDouble() * 6m, 4) : Math.Round(0.0001m + (decimal)Math.Pow(bookRng.NextDouble(), 3) * 0.6m, 5);
+                    levels.Add(new BookLevel(price, size));
+                    price += dir * 0.01m * (1 + bookRng.Next(0, 30));
+                }
+                return levels;
+            }
+            var book = new BookSnapshot { Symbol = "BTCUSDT", Bids = Side(83_435.99m, -1), Asks = Side(83_436.00m, 1), Limit = 1000, AsOfUtc = DateTime.UtcNow };
+            Write("orderbook-BTCUSDT", OrderBook.View(book, null, new BookFilters { Tick = 0.01m, Step = 0.00001m }, null, 20, "Binance spot"));
 
             // lab blotter after everything ran (alpha's primary job included)
             var (rows, total) = await jobs.QuerySummariesAsync(new BacktestJobFilter { Limit = 200 });
@@ -376,7 +428,14 @@ namespace Omnipotent.Tests.OmniTrader
             foreach (var r in rows.Where(r => !jobIds.Contains(r.Id))) Write($"backtest-{r.Id}", TerminalRoutes.JobDetail((await jobs.GetAsync(r.Id))!));
             Write("lab-strategies", registry.All.OrderBy(d => d.Source == "builtin" ? 1 : 0).ThenBy(d => d.Name)
                 .Select(d => new { d.Name, d.ClassName, d.Description, d.RequiresUniverse, d.Parameters, d.Source, d.StudioId, d.Version, d.Author }));
-            Write("studio-list", (await studio.ListAsync(null, null, null, true, 300)).Select(TerminalRoutes.StudioRow));
+            var allStudio = await studio.ListAsync(null, null, null, true, 300);
+            Write("studio-list", allStudio.Select(TerminalRoutes.StudioRow));
+            // Strategies the alpha lab created too (the synthesis is a C# script), so any listed row opens.
+            foreach (var s in allStudio)
+            {
+                var fresh = (await studio.GetAsync(s.Id))!;
+                Write($"studio-get-{s.Id}", TerminalRoutes.StudioDetail(fresh, registry.Resolve(fresh.ClassName), await studio.VersionsAsync(s.Id)));
+            }
 
             // ── alerts ──
             var alerts = new MarketAlertService(db, router, _ => Task.CompletedTask, (_, _) => { });

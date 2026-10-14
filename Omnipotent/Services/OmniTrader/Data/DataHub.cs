@@ -209,8 +209,35 @@ namespace Omnipotent.Services.OmniTrader.Data
         public Task<List<TimePoint>?> GetStablecoinsAsync(CancellationToken ct = default)
             => Cached("stables", TimeSpan.FromHours(6), async () => (List<TimePoint>?)await Crypto.GetStablecoinSupplyAsync(ct));
 
-        public Task<object?> GetOrderBookAsync(string symbol, int depth = 50, CancellationToken ct = default)
-            => Cached($"book:{symbol.ToUpperInvariant()}:{depth}", TimeSpan.FromSeconds(2), () => Crypto.GetOrderBookAsync(symbol, depth, ct)!);
+        /// <summary>
+        /// The order book grouped to <paramref name="group"/> (a sensible default for the price when null). The
+        /// ladder asks Binance for the smallest snapshot that fills the rows — 100 levels, then 500, then 1000 —
+        /// because a coarse grouping of a dense book needs many raw levels and the request weight grows with
+        /// them. Depth bands (±0.1–2%) come from a 5,000-level snapshot refreshed once a minute.
+        /// </summary>
+        public async Task<object?> GetOrderBookAsync(string symbol, int rows = 20, decimal? group = null, CancellationToken ct = default)
+        {
+            string sym = CryptoData.SpotSymbol(symbol);
+            var filters = await Cached($"book:filters:{sym}", TimeSpan.FromHours(12), async () =>
+            {
+                try { return await Crypto.GetBookFiltersAsync(sym, ct); }
+                catch { return null; }
+            });
+            BookSnapshot? ladder = null;
+            foreach (int limit in OrderBook.LadderLimits)
+            {
+                ladder = await Cached($"book:{sym}:{limit}", TimeSpan.FromSeconds(2), async () => (BookSnapshot?)await Crypto.GetDepthAsync(sym, limit, ct));
+                if (ladder == null) return null;
+                decimal tick = filters?.Tick is > 0m and var t ? t : OrderBook.InferTick(ladder);
+                decimal mid = OrderBook.MidOf(ladder);
+                decimal g = group is > 0m and var req ? OrderBook.Snap(req, tick) : OrderBook.DefaultGroup(OrderBook.GroupOptions(tick, mid), tick, mid);
+                if (OrderBook.Fills(ladder, g, tick, rows)) break;
+            }
+            BookSnapshot? deep = null;
+            try { deep = await Cached($"book:deep:{sym}", TimeSpan.FromMinutes(1), async () => (BookSnapshot?)await Crypto.GetDepthAsync(sym, 5000, ct)); }
+            catch { /* the bands fall back to the ladder and say how far it reaches */ }
+            return OrderBook.View(ladder!, deep, filters, group, rows, "Binance spot");
+        }
 
         private async Task<List<UniverseMember>> CryptoByVolumeAsync(int n, CancellationToken ct)
         {

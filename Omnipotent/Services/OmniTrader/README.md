@@ -1172,6 +1172,15 @@ and routers skip a source that is plainly down.
 | News | RSS (markets, crypto, macro feeds) | headlines, filterable by source |
 | Research | arXiv, OpenAlex | paper ingestion for the Alpha Lab (§37) |
 
+**Order book** (`Data/Crypto/OrderBook.cs`, `terminal/crypto/orderbook?symbol=&rows=&group=`). Binance spot
+depth parsed as exact decimals and grouped to a price increment — bids round down, asks round up, so a
+bucket never crosses the spread — with cumulative size per row (`[price, size, cumulative]`). Grouping
+choices run from the tick (exchange info, cached 12 h) in 1×/5× steps up to ~20 bps of price; the default
+is about 0.1 bps per row. The ladder asks for the smallest snapshot that fills the rows (100 → 500 → 1,000
+levels, request weight 5 → 25 → 50) and drops a bucket the snapshot cut in half. Depth bands (±0.1/0.5/1/2%)
+come from a 5,000-level snapshot refreshed once a minute; a band the snapshot does not reach is flagged
+`BidCovered`/`AskCovered = false` and shown as a lower bound, never as the full figure.
+
 `Data/UniverseCatalog.cs` holds the named universes (world indices, FX, commodities, rates, volatility,
 sector and factor ETFs, mega caps, crypto majors, and S&P 500 / FTSE 100 constituents refreshed weekly).
 `DataHub` caches per source — quotes for seconds, options for minutes, company, financials and filings
@@ -1264,18 +1273,32 @@ The Lab is the research front-end of the single `BacktestSession` (§10) — the
    title key, so the same paper from both sources is stored once.
 2. **Score** (`PaperScoring`): relevance and feasibility 0–100, strategy families, asset classes and data
    needs, from the title and abstract.
-3. **Dispatch** (every `AnalyseEveryHours`, default 8; at most `MaxAgentRunsPerDay`): the top
-   `PapersPerRun` papers above `MinRelevance` / `MinFeasibility` go to KliveAgent, which reads them,
-   writes a strategy through `omnitrader_studio`, and submits it with `omnitrader_research alpha_submit`
-   — or records why the paper is not implementable.
-4. **Evaluate** (`CandidateEvaluator`): a persisted primary backtest, breadth across
+3. **Dispatch** (every `AnalyseEveryHours`, default 8; at most `MaxAgentRunsPerDay` agent runs of either
+   kind): the top `PapersPerRun` papers above `MinRelevance` / `MinFeasibility` go to KliveAgent, which
+   reads them, records each reusable component in the **idea library** (`idea_add`), writes a strategy
+   through `omnitrader_studio` — C# (`ScriptStrategy` / `ScriptUniverseStrategy`) for anything with state,
+   several steps, custom sizing or a portfolio; a blueprint for a plain indicator rule — and submits it
+   with `omnitrader_research alpha_submit`, or records why the paper is not implementable.
+4. **Synthesise** (every `SynthesiseEveryHours`, default 24, `SynthesesPerRun` strategies; or from the UI
+   with chosen papers/ideas): KliveAgent gets the idea library grouped by role (signal, filter, sizing,
+   exit, universe, risk, timing), the leaderboard and the combinations already tested, and builds C#
+   strategies that connect ideas from at least two papers, one method per component naming its paper and
+   idea. A candidate with two or more papers (`PaperIds`) is a synthesis; every paper and idea it draws on
+   links back to it.
+5. **Evaluate** (`CandidateEvaluator`): a persisted primary backtest, breadth across
    `CryptoTestSymbols` / `EquityTestSymbols`, a 2× cost stress, walk-forward out-of-sample, and a
-   deflated Sharpe over every trial the lab has run. These roll into a 0–100 score with visible parts.
-   `Promising` (≥ `PromisingScore`) is pushed to Discord; `Rejected` below `RejectScore`; `Promoted` and
-   manual rejection are yours.
+   deflated Sharpe over every trial the lab has run. A synthesis is also compared with the single-paper
+   candidates of its papers on the symbols both were tested on (`Constituents`): beating its strongest part
+   by ≥ 0.1 Sharpe adds 5, falling ≥ 0.1 short takes 8 — a combination must earn its complexity. These roll
+   into a 0–100 score with visible parts. `Promising` (≥ `PromisingScore`) is pushed to Discord; `Rejected`
+   below `RejectScore`; `Promoted` and manual rejection are yours.
 
-Papers can also be added by hand (`alpha/paper/add`), starred, requeued or analysed immediately
-(`alpha/analyse`). Settings are live-editable (`alpha/settings`, `alpha.manage`).
+Ideas (`AlphaIdea`, collection `alpha-ideas`) carry a role, the rule, an optional formula (validated on
+save), the paper's parameters and evidence, the candidates built on them and the best score among those.
+Routes: `alpha/ideas` (role, text, paper filters), `alpha/idea/delete`, `alpha/synthesise` (`PaperIds`,
+`IdeaIds`, `Note`). Papers can also be added by hand (`alpha/paper/add`), starred, requeued or analysed
+immediately (`alpha/analyse`). Settings are live-editable (`alpha/settings`, `alpha.manage`); the overview
+route is never response-cached because settings and agent state live in memory.
 
 ## 38. Agent tools, terminal UI and tests
 
@@ -1285,9 +1308,13 @@ Papers can also be added by hand (`alpha/paper/add`), starred, requeued or analy
 | Tool | Ops |
 |---|---|
 | `omnitrader_data` | `quote`, `candles`, `screen`, `company`, `derivatives`, `macro`, `news`, `alert_set`, `alerts` |
-| `omnitrader_studio` | `reference`, `templates`, `list`, `get`, `create`, `update`, `validate`, `formula_check` |
+| `omnitrader_studio` | `reference`, `templates`, `template_get`, `list`, `get`, `create`, `update`, `validate`, `formula_check` |
 | `omnitrader_lab` | `strategies`, `quick_backtest`, `backtest`, `backtest_get`, `sweep`, `study_get` |
-| `omnitrader_research` | `papers`, `paper_get`, `paper_verdict`, `paper_add`, `alpha_submit`, `candidates`, `candidate_get`, `ingest_now` |
+| `omnitrader_research` | `papers`, `paper_get`, `paper_verdict`, `paper_add`, `idea_add`, `ideas`, `alpha_submit` (`paperIds`, `ideaIds` for a synthesis), `candidates`, `candidate_get`, `ingest_now` |
+
+`reference` leads with the C# script API and complete worked scripts (the `script-*` templates and a
+three-paper synthesis, `StudioReference.SynthesisExample`, which a test compiles and backtests);
+`template_get` returns any template as the `definition` `create` takes.
 
 **Terminal UI.** Client-rendered (`ssr: false`) pages under `/omnitrader`: Monitor (index), Security
 (`instrument`, function tabs GP chart, DES overview, HP stats, SEAS, OMON options, DER derivatives,

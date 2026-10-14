@@ -15,6 +15,8 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
     /// symbols at realistic costs with next-bar execution, a 2× cost stress, walk-forward on the main
     /// symbol when it has tunable inputs, and a deflated Sharpe that counts every candidate the lab has
     /// ever evaluated as a trial. The score is built so that one lucky symbol cannot carry a candidate.
+    /// A synthesis is also measured against the single-paper candidates of the papers it combines: a
+    /// combination has to beat its strongest part to be worth its extra complexity.
     /// </summary>
     public sealed class CandidateEvaluator
     {
@@ -33,18 +35,21 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
             this.registry = registry;
         }
 
-        public async Task<CandidateEvaluation> EvaluateAsync(AlphaCandidate candidate, ResearchPaper? paper, AlphaSettings settings,
-            IReadOnlyList<double> priorPerPeriodSharpes, CancellationToken ct = default)
+        /// <param name="papers">Every paper the candidate draws on (one for a replication).</param>
+        /// <param name="parts">For a synthesis: the evaluated single-paper candidates of those papers.</param>
+        public async Task<CandidateEvaluation> EvaluateAsync(AlphaCandidate candidate, IReadOnlyList<ResearchPaper> papers, AlphaSettings settings,
+            IReadOnlyList<double> priorPerPeriodSharpes, IReadOnlyList<AlphaCandidate>? parts = null, CancellationToken ct = default)
         {
             var eval = new CandidateEvaluation();
             var s = await studio.GetAsync(candidate.StrategyId, ct) ?? throw new InvalidOperationException("Strategy not found.");
             if (s.Status != StudioStatus.Valid) throw new InvalidOperationException("Strategy has compile errors.");
             candidate.StrategyVersion = s.Version;
+            candidate.StrategyKind = s.Kind.ToString();
             string className = $"{s.ClassName}@v{s.Version}";
             var descriptor = registry.Resolve(className) ?? throw new InvalidOperationException("Strategy could not be compiled.");
             bool universe = descriptor.RequiresUniverse;
 
-            var symbols = PickSymbols(candidate, paper, s, settings, universe);
+            var symbols = PickSymbols(candidate, papers, s, settings, universe);
             candidate.TestSymbols = symbols;
             string primary = symbols[0];
             bool crypto = !MarketDataRouter.UsesEquityFeed(primary, AssetClass.Unknown);
@@ -132,10 +137,54 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
             eval.DeflatedSharpe = Math.Round(dsr.Dsr, 4);
             eval.TrialsAccounted = trials;
 
+            // 6. A synthesis against its parts, on the symbols both were tested on.
+            if (candidate.IsSynthesis())
+                eval.Constituents = CompareConstituents(candidate, eval, parts ?? Array.Empty<AlphaCandidate>());
+
             eval.ScoreParts = ScoreParts(eval);
             eval.FinishedUtc = DateTime.UtcNow;
-            Describe(eval);
+            Describe(eval, candidate.IsSynthesis());
             return eval;
+        }
+
+        /// <summary>
+        /// The synthesis's median Sharpe against each part's on the symbols they share (their primary runs
+        /// when they share none). Only parts on the same bar interval compare; strongest part first.
+        /// </summary>
+        internal static List<ConstituentComparison> CompareConstituents(AlphaCandidate synthesis, CandidateEvaluation eval, IEnumerable<AlphaCandidate> parts)
+        {
+            var mine = SharpeBySymbol(eval, synthesis.TestSymbols);
+            var list = new List<ConstituentComparison>();
+            foreach (var p in parts)
+            {
+                if (p.Id == synthesis.Id || p.IsSynthesis() || p.Evaluation?.Primary == null || eval.Primary == null || p.Interval != synthesis.Interval) continue;
+                var theirs = SharpeBySymbol(p.Evaluation, p.TestSymbols);
+                var shared = mine.Keys.Where(theirs.ContainsKey).ToList();
+                double synth = shared.Count > 0 ? Median(shared.Select(x => mine[x])) : eval.Primary.Sharpe;
+                double part = shared.Count > 0 ? Median(shared.Select(x => theirs[x])) : p.Evaluation.Primary.Sharpe;
+                list.Add(new ConstituentComparison
+                {
+                    CandidateId = p.Id, StrategyName = p.StrategyName, PaperId = p.PaperId, Score = p.Score,
+                    Sharpe = Math.Round(part, 3), SynthesisSharpe = Math.Round(synth, 3), Delta = Math.Round(synth - part, 3), SharedSymbols = shared.Count,
+                });
+            }
+            return list.OrderByDescending(x => x.Sharpe).Take(8).ToList();
+        }
+
+        private static Dictionary<string, double> SharpeBySymbol(CandidateEvaluation e, IReadOnlyList<string> testSymbols)
+        {
+            var map = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+            foreach (var r in e.PerSymbol)
+                if (r.Error == null && r.Metrics != null && !string.IsNullOrEmpty(r.Symbol) && double.IsFinite(r.Metrics.Sharpe)) map[r.Symbol] = r.Metrics.Sharpe;
+            if (map.Count == 0 && e.Primary != null && testSymbols.Count > 0) map[testSymbols[0]] = e.Primary.Sharpe;
+            return map;
+        }
+
+        private static double Median(IEnumerable<double> values)
+        {
+            var v = values.OrderBy(x => x).ToList();
+            if (v.Count == 0) return 0;
+            return v.Count % 2 == 1 ? v[v.Count / 2] : (v[v.Count / 2 - 1] + v[v.Count / 2]) / 2;
         }
 
         public static double Score(CandidateEvaluation e) => Math.Round(Math.Clamp(e.ScoreParts.Values.Sum(), 0, 100), 1);
@@ -155,24 +204,41 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
             parts["trade count"] = Math.Round(Math.Min(1, (e.Primary?.Trades ?? 0) / 40.0) * 8, 2);
             double dd = e.Primary?.MaxDrawdownPct ?? 100;
             parts["drawdown"] = -Math.Round(Math.Clamp((dd - 30) / 40, 0, 1) * 12, 2);
+            // A combination that does not beat its strongest part adds complexity for nothing.
+            if (e.Constituents.Count > 0)
+            {
+                double delta = e.Constituents[0].Delta;
+                parts["vs parts"] = delta >= 0.1 ? 5 : delta > -0.1 ? 0 : -8;
+            }
             return parts;
         }
 
-        private static void Describe(CandidateEvaluation e)
+        private static void Describe(CandidateEvaluation e, bool synthesis = false)
         {
             if (e.Primary != null) e.Findings.Insert(0, $"primary: {e.Primary.ReturnPct:F1}% return, Sharpe {e.Primary.Sharpe:F2}, max DD {e.Primary.MaxDrawdownPct:F1}%, {e.Primary.Trades} trades");
             if (e.Batch != null) e.Findings.Add($"breadth: {e.Batch.Profitable}/{e.Batch.Symbols} profitable, median Sharpe {e.Batch.MedianSharpe:F2}");
             if (e.PrimaryStressed != null) e.Findings.Add($"2× costs: {e.PrimaryStressed.ReturnPct:F1}% return");
             if (e.OutOfSample != null) e.Findings.Add($"walk-forward OOS: Sharpe {e.OutOfSample.Sharpe:F2}, return {e.OutOfSample.ReturnPct:F1}%" + (e.WalkForwardEfficiency is { } wfe ? $", efficiency {wfe:F2}" : ""));
             e.Findings.Add($"deflated Sharpe {e.DeflatedSharpe:F2} over {e.TrialsAccounted} trials");
+            if (!synthesis) return;
+            if (e.Constituents.Count == 0)
+            {
+                e.Findings.Add("vs parts: no single-paper candidate of these papers on this interval to compare with");
+                return;
+            }
+            var best = e.Constituents[0];
+            string where = best.SharedSymbols > 0 ? $"on {best.SharedSymbols} shared symbol{(best.SharedSymbols == 1 ? "" : "s")}" : "on their primary runs";
+            e.Findings.Add(best.Delta >= 0
+                ? $"vs parts: beats its strongest part, {best.StrategyName} (Sharpe {best.Sharpe:F2}), by {best.Delta:+0.00} Sharpe {where}"
+                : $"vs parts: does not beat its strongest part, {best.StrategyName} (Sharpe {best.Sharpe:F2}): {best.Delta:+0.00;-0.00} Sharpe {where}");
         }
 
-        private static List<string> PickSymbols(AlphaCandidate c, ResearchPaper? paper, StudioStrategy s, AlphaSettings settings, bool universe)
+        private static List<string> PickSymbols(AlphaCandidate c, IReadOnlyList<ResearchPaper> papers, StudioStrategy s, AlphaSettings settings, bool universe)
         {
             if (universe) return new List<string> { s.Blueprint?.Universe.RegimeSymbol ?? s.DefaultSymbol };
             var explicitSymbols = c.TestSymbols.Select(x => x.Trim().ToUpperInvariant()).Where(x => x.Length > 0).Distinct().ToList();
             if (explicitSymbols.Count > 0) return explicitSymbols.Take(12).ToList();
-            var assets = paper?.AssetClasses ?? new List<string>();
+            var assets = papers.SelectMany(p => p.AssetClasses).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
             bool defaultCrypto = !MarketDataRouter.UsesEquityFeed(s.DefaultSymbol, AssetClass.Unknown);
             List<string> pick;
             if (assets.Contains("crypto") && !assets.Contains("equities")) pick = settings.CryptoTestSymbols;
