@@ -376,6 +376,38 @@ namespace Omnipotent.Services.OmniTrader.Persistence.Schema
                     simulated_value REAL NOT NULL
                 );
                 CREATE INDEX idx_firm_value_points_ts ON firm_value_points(ts);
+            "),
+
+            // ── v5: bar-open timestamps ───────────────────────────────────────────
+            // Binance bars used to be stamped with their CLOSE time and the forming bar was cached
+            // mid-flight. Every bar is now stamped with its OPEN time and only closed bars are cached,
+            // so the old rows would sit one bar off and must go. The cache refills on demand.
+            (5, @"
+                DELETE FROM candle_cache;
+                CREATE INDEX IF NOT EXISTS idx_candle_cache_series ON candle_cache(symbol, interval, ts);
+            "),
+
+            // ── v6: terminal documents ────────────────────────────────────────────
+            // Screens, studio strategies and their versions, research papers, alpha candidates, agent
+            // runs, studies and alerts are JSON documents partitioned by collection, with two text
+            // keys, a number and a timestamp lifted out for indexed queries (see DocumentStore).
+            (6, @"
+                CREATE TABLE documents (
+                    collection TEXT NOT NULL,
+                    id TEXT NOT NULL,
+                    k1 TEXT,
+                    k2 TEXT,
+                    n1 REAL,
+                    t1 TEXT,
+                    updated_utc TEXT NOT NULL,
+                    json TEXT NOT NULL,
+                    PRIMARY KEY (collection, id)
+                );
+                CREATE INDEX idx_documents_k1 ON documents(collection, k1);
+                CREATE INDEX idx_documents_k2 ON documents(collection, k2);
+                CREATE INDEX idx_documents_n1 ON documents(collection, n1);
+                CREATE INDEX idx_documents_t1 ON documents(collection, t1);
+                CREATE INDEX idx_documents_updated ON documents(collection, updated_utc);
             ")
         };
     }

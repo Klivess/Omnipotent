@@ -24,21 +24,29 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             return (maxDD, maxDDPct);
         }
 
-        public static decimal Sharpe(IReadOnlyList<EquityPoint> equityCurve)
+        /// <summary>Annualised Sharpe of per-bar equity returns (risk-free 0). <paramref name="barsPerYear"/>
+        /// comes from the interval and whether the market trades continuously.</summary>
+        public static decimal Sharpe(IReadOnlyList<EquityPoint> equityCurve, double barsPerYear = 252)
         {
-            if (equityCurve.Count < 2) return 0;
-            var returns = new List<decimal>(equityCurve.Count - 1);
+            var returns = PeriodReturns(equityCurve);
+            if (returns.Count < 2) return 0;
+            double mean = returns.Average();
+            double std = Math.Sqrt(returns.Sum(r => (r - mean) * (r - mean)) / (returns.Count - 1));
+            return std == 0 || !double.IsFinite(std) ? 0 : Clamp(mean / std * Math.Sqrt(barsPerYear));
+        }
+
+        private static List<double> PeriodReturns(IReadOnlyList<EquityPoint> equityCurve)
+        {
+            var returns = new List<double>(Math.Max(0, equityCurve.Count - 1));
             for (int i = 1; i < equityCurve.Count; i++)
             {
                 if (equityCurve[i - 1].Equity == 0) continue;
-                returns.Add((equityCurve[i].Equity - equityCurve[i - 1].Equity) / equityCurve[i - 1].Equity);
+                returns.Add((double)((equityCurve[i].Equity - equityCurve[i - 1].Equity) / equityCurve[i - 1].Equity));
             }
-            if (returns.Count == 0) return 0;
-            decimal mean = returns.Sum() / returns.Count;
-            decimal variance = returns.Sum(r => (r - mean) * (r - mean)) / returns.Count;
-            double std = Math.Sqrt((double)variance);
-            return std == 0 ? 0 : (decimal)(((double)mean) / std * Math.Sqrt(252));
+            return returns;
         }
+
+        private static decimal Clamp(double v) => !double.IsFinite(v) ? 0 : (decimal)Math.Clamp(v, -1e9, 1e9);
 
         public static decimal ProfitFactor(IReadOnlyList<TradeRecord> trades)
         {
@@ -48,8 +56,10 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
                 if (t.IsWin) gross += t.RealizedPnL;
                 else loss += Math.Abs(t.RealizedPnL);
             }
-            if (loss == 0) return gross > 0 ? decimal.MaxValue : 0;
-            return gross / loss;
+            // No losing trade: report a large finite value rather than decimal.MaxValue, which
+            // serialises as a 29-digit number and breaks every chart it touches.
+            if (loss == 0) return gross > 0 ? 999m : 0;
+            return Math.Min(999m, gross / loss);
         }
 
         public static decimal BuyAndHoldPnLPercent(IReadOnlyList<OHLCCandle> candles)
@@ -62,48 +72,26 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         }
 
         /// <summary>
-        /// Downside-deviation-adjusted return (annualised, √252). Only negative period
-        /// returns contribute to the denominator. Mirrors <see cref="Sharpe"/>.
+        /// Annualised Sortino: mean return over downside deviation, where downside deviation is the
+        /// root-mean-square of the negative returns taken over ALL observations (target 0).
         /// </summary>
-        public static decimal Sortino(IReadOnlyList<EquityPoint> equityCurve)
+        public static decimal Sortino(IReadOnlyList<EquityPoint> equityCurve, double barsPerYear = 252)
         {
-            if (equityCurve.Count < 2) return 0;
-            var returns = new List<double>(equityCurve.Count - 1);
-            for (int i = 1; i < equityCurve.Count; i++)
-            {
-                if (equityCurve[i - 1].Equity == 0) continue;
-                returns.Add((double)((equityCurve[i].Equity - equityCurve[i - 1].Equity) / equityCurve[i - 1].Equity));
-            }
-            if (returns.Count == 0) return 0;
+            var returns = PeriodReturns(equityCurve);
+            if (returns.Count < 2) return 0;
             double mean = returns.Average();
-            double downsideSumSq = 0;
-            int downsideCount = 0;
-            foreach (double r in returns)
-            {
-                if (r < 0) { downsideSumSq += r * r; downsideCount++; }
-            }
-            if (downsideCount == 0) return 0;
-            double downsideDev = Math.Sqrt(downsideSumSq / downsideCount);
-            return downsideDev == 0 ? 0 : (decimal)(mean / downsideDev * Math.Sqrt(252));
+            double downsideDev = Math.Sqrt(returns.Sum(r => r < 0 ? r * r : 0) / returns.Count);
+            return downsideDev == 0 ? 0 : Clamp(mean / downsideDev * Math.Sqrt(barsPerYear));
         }
 
-        /// <summary>
-        /// Annualised volatility of period-over-period equity returns, as a percentage (√252 scaling).
-        /// </summary>
-        public static decimal AnnualizedVolatilityPercent(IReadOnlyList<EquityPoint> equityCurve)
+        /// <summary>Annualised volatility of per-bar equity returns, as a percentage.</summary>
+        public static decimal AnnualizedVolatilityPercent(IReadOnlyList<EquityPoint> equityCurve, double barsPerYear = 252)
         {
-            if (equityCurve.Count < 2) return 0;
-            var returns = new List<double>(equityCurve.Count - 1);
-            for (int i = 1; i < equityCurve.Count; i++)
-            {
-                if (equityCurve[i - 1].Equity == 0) continue;
-                returns.Add((double)((equityCurve[i].Equity - equityCurve[i - 1].Equity) / equityCurve[i - 1].Equity));
-            }
-            if (returns.Count == 0) return 0;
+            var returns = PeriodReturns(equityCurve);
+            if (returns.Count < 2) return 0;
             double mean = returns.Average();
-            double variance = returns.Sum(r => (r - mean) * (r - mean)) / returns.Count;
-            double std = Math.Sqrt(variance);
-            return (decimal)(std * Math.Sqrt(252) * 100);
+            double std = Math.Sqrt(returns.Sum(r => (r - mean) * (r - mean)) / (returns.Count - 1));
+            return Clamp(std * Math.Sqrt(barsPerYear) * 100);
         }
 
         /// <summary>

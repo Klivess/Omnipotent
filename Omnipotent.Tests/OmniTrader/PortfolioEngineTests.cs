@@ -155,7 +155,12 @@ namespace Omnipotent.Tests.OmniTrader
             Assert.True(res.TotalPnL > 0m, $"expected profit, got {res.TotalPnL:F2}");
             Assert.InRange(res.TotalPnLPercent, 20m, 34m);
             Assert.Equal(30, res.EquityCurve.Count);
-            Assert.Empty(res.Trades);            // basket is held open → no completed round-trips
+            // The basket is held to the end: both legs are reported as still open, marked at the last close.
+            Assert.Equal(2, res.Trades.Count);
+            Assert.All(res.Trades, t => Assert.Equal("open", t.ExitReason));
+            Assert.All(res.Trades, t => Assert.Equal(29, t.BarsHeld));
+            Assert.NotNull(res.Analysis);
+            Assert.Equal(252, res.BarsPerYear); // "AAA" has the shape of an equity ticker → session calendar
         }
     }
 }

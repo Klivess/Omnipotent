@@ -8,7 +8,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting.Validation
     /// </summary>
     public static class CostSensitivity
     {
-        public readonly record struct Row(double Multiplier, decimal NetPnLPercent, decimal SharpeRatio, decimal MaxDrawdownPercent, decimal TotalFees);
+        public readonly record struct Row(double Multiplier, decimal NetPnLPercent, decimal SharpeRatio, decimal MaxDrawdownPercent, decimal TotalFees, int Trades = 0);
 
         /// <summary>
         /// <paramref name="sessionFactory"/> must build a fresh <see cref="BacktestSession"/> (fresh
@@ -26,7 +26,7 @@ namespace Omnipotent.Services.OmniTrader.Backtesting.Validation
             {
                 var cfg = ScaleCosts(baseCfg, (decimal)m);
                 var res = await sessionFactory(cfg).RunPortfolioAsync(ct);
-                rows.Add(new Row(m, res.TotalPnLPercent, res.SharpeRatio, res.MaxDrawdownPercent, res.TotalFeesPaid));
+                rows.Add(new Row(m, res.TotalPnLPercent, res.SharpeRatio, res.MaxDrawdownPercent, res.TotalFeesPaid, res.TotalTrades));
             }
             return rows;
         }
@@ -43,6 +43,15 @@ namespace Omnipotent.Services.OmniTrader.Backtesting.Validation
             FeeFraction = c.FeeFraction * mult,
             SlippageFraction = c.SlippageFraction * mult,
             Margin = c.Margin,
+            // Everything else carries over — dropping the execution model silently re-ran the
+            // stressed versions at signal-close fills.
+            FromUtc = c.FromUtc,
+            ToUtc = c.ToUtc,
+            Parameters = c.Parameters,
+            Execution = c.Execution,
+            Benchmark = c.Benchmark,
+            Label = c.Label,
+            Origin = c.Origin,
         };
     }
 }

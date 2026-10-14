@@ -130,8 +130,13 @@ namespace Omnipotent.Services.OmniTrader.Analytics
                 var instrument = instruments.Resolve(instrumentId);
                 string engineSymbol = instrument != null ? instruments.EngineSymbolFor(instrument.Id) : instrumentId;
 
+                // Closed bars plus the forming one: a watchlist row is a live reading, not last bar's close.
                 IReadOnlyList<OHLCCandle> candles;
-                try { candles = await marketData.GetHistoricalCandlesAsync(engineSymbol, interval, 250); }
+                try
+                {
+                    var fetch = await marketData.GetChartCandlesAsync(engineSymbol, interval, 250);
+                    candles = fetch.Forming is { } forming ? fetch.Closed.Append(forming).ToList() : fetch.Closed;
+                }
                 catch { candles = Array.Empty<OHLCCandle>(); }
 
                 if (candles.Count == 0)
@@ -282,7 +287,10 @@ namespace Omnipotent.Services.OmniTrader.Analytics
             TimeInterval.FifteenMinute => TimeInterval.FourHour,
             TimeInterval.ThirtyMinute => TimeInterval.FourHour,
             TimeInterval.OneHour => TimeInterval.OneDay,
+            TimeInterval.TwoHour => TimeInterval.OneDay,
             TimeInterval.FourHour => TimeInterval.OneDay,
+            TimeInterval.TwelveHour => TimeInterval.OneWeek,
+            TimeInterval.OneMonth => TimeInterval.OneMonth,
             _ => TimeInterval.OneWeek
         };
     }

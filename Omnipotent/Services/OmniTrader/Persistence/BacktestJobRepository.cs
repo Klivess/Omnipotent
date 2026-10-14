@@ -45,6 +45,26 @@ namespace Omnipotent.Services.OmniTrader.Persistence
         public decimal? SharpeRatio { get; init; }
         public decimal? MaxDrawdownPercent { get; init; }
         public int? TotalTrades { get; init; }
+        public double? CagrPct { get; init; }
+        public double? Sortino { get; init; }
+        public double? Calmar { get; init; }
+        public double? ProfitFactor { get; init; }
+        public double? ExposurePct { get; init; }
+        public double? BenchmarkReturnPct { get; init; }
+        public double? Alpha { get; init; }
+        public int? StrategyErrors { get; init; }
+    }
+
+    public sealed class BacktestJobFilter
+    {
+        /// <summary>Exact class, or a prefix ending in '*' (e.g. "studio:st_ab12*" for every version).</summary>
+        public string? StrategyClass { get; set; }
+        public string? Origin { get; set; }
+        public BacktestJobStatus? Status { get; set; }
+        public string? Symbol { get; set; }
+        public string? Text { get; set; }
+        public int Limit { get; set; } = 100;
+        public int Offset { get; set; }
     }
 
     public sealed class BacktestJobRepository
@@ -238,6 +258,112 @@ namespace Omnipotent.Services.OmniTrader.Persistence
                 });
             }
             return output;
+        }
+
+        /// <summary>Filtered job summaries for the lab: same compact extraction as the list snapshot,
+        /// plus the extended analysis headline (CAGR, Sortino, Calmar, profit factor, exposure, alpha).</summary>
+        public async Task<(List<BacktestJobSummaryRow> Rows, int Total)> QuerySummariesAsync(BacktestJobFilter filter, CancellationToken ct = default)
+        {
+            CacheDeps.NoteRead(CacheKey);
+            await using var conn = await db.OpenAsync(ct);
+            var where = new List<string>();
+            await using var cmd = conn.CreateCommand();
+            if (!string.IsNullOrWhiteSpace(filter.StrategyClass))
+            {
+                if (filter.StrategyClass!.EndsWith('*'))
+                {
+                    where.Add("strategy_class LIKE $cls ESCAPE '\\'");
+                    cmd.Parameters.AddWithValue("$cls", filter.StrategyClass[..^1].Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%");
+                }
+                else
+                {
+                    where.Add("strategy_class = $cls");
+                    cmd.Parameters.AddWithValue("$cls", filter.StrategyClass);
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(filter.Origin))
+            {
+                where.Add("json_extract(config_json, '$.Origin') = $origin");
+                cmd.Parameters.AddWithValue("$origin", filter.Origin);
+            }
+            if (filter.Status is { } st)
+            {
+                where.Add("status = $status");
+                cmd.Parameters.AddWithValue("$status", st.ToString().ToLowerInvariant());
+            }
+            if (!string.IsNullOrWhiteSpace(filter.Symbol))
+            {
+                where.Add("upper(json_extract(config_json, '$.Coin')) = $sym");
+                cmd.Parameters.AddWithValue("$sym", filter.Symbol!.ToUpperInvariant());
+            }
+            if (!string.IsNullOrWhiteSpace(filter.Text))
+            {
+                where.Add("(strategy_class LIKE $text OR json_extract(config_json, '$.Label') LIKE $text OR json_extract(config_json, '$.Coin') LIKE $text)");
+                cmd.Parameters.AddWithValue("$text", "%" + filter.Text + "%");
+            }
+            string clause = where.Count == 0 ? "" : "WHERE " + string.Join(" AND ", where);
+
+            await using (var count = conn.CreateCommand())
+            {
+                count.CommandText = $"SELECT COUNT(*) FROM backtest_jobs {clause}";
+                foreach (SqliteParameter prm in cmd.Parameters) count.Parameters.AddWithValue(prm.ParameterName, prm.Value);
+                filter.Limit = Math.Clamp(filter.Limit, 1, 1000);
+                var total = Convert.ToInt32(await count.ExecuteScalarAsync(ct));
+                cmd.CommandText = $@"SELECT id, strategy_class, config_json, status, progress_pct,
+                       candles_total, candles_done, queued_utc, started_utc, finished_utc, error,
+                       result_json IS NOT NULL AS has_result,
+                       json_extract(result_json, '$.InitialEquity', '$.FinalEquity',
+                           '$.WinningTrades', '$.TotalTrades', '$.SharpeRatio',
+                           '$.MaxDrawdownPercent') AS metrics,
+                       json_extract(result_json, '$.Analysis.CagrPct', '$.Analysis.Sortino', '$.Analysis.Calmar',
+                           '$.Analysis.ProfitFactor', '$.Analysis.ExposurePct', '$.Analysis.BenchmarkReturnPct',
+                           '$.Analysis.Alpha', '$.StrategyErrors') AS analysis
+                    FROM backtest_jobs {clause} ORDER BY queued_utc DESC LIMIT $l OFFSET $o";
+                cmd.Parameters.AddWithValue("$l", filter.Limit);
+                cmd.Parameters.AddWithValue("$o", Math.Max(0, filter.Offset));
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                var output = new List<BacktestJobSummaryRow>();
+                while (await reader.ReadAsync(ct))
+                {
+                    var config = JsonConvert.DeserializeObject<BacktestConfig>(reader.GetString(2))
+                        ?? throw new InvalidOperationException("Bad config_json in backtest_jobs row");
+                    bool hasResult = reader.GetBoolean(11);
+                    decimal?[] metrics = hasResult && !reader.IsDBNull(12)
+                        ? JsonConvert.DeserializeObject<decimal?[]>(reader.GetString(12)) ?? new decimal?[6]
+                        : new decimal?[6];
+                    double?[] a = hasResult && !reader.IsDBNull(13)
+                        ? JsonConvert.DeserializeObject<double?[]>(reader.GetString(13)) ?? new double?[8]
+                        : new double?[8];
+                    if (metrics.Length != 6) metrics = new decimal?[6];
+                    if (a.Length != 8) a = new double?[8];
+                    decimal initialEquity = metrics[0] ?? 0m;
+                    decimal finalEquity = metrics[1] ?? 0m;
+                    int winningTrades = (int)(metrics[2] ?? 0m);
+                    int totalTrades = (int)(metrics[3] ?? 0m);
+                    output.Add(new BacktestJobSummaryRow
+                    {
+                        Id = reader.GetString(0),
+                        StrategyClass = reader.GetString(1),
+                        Config = config,
+                        Status = ParseStatus(reader.GetString(3)),
+                        ProgressPct = reader.GetDouble(4),
+                        CandlesTotal = reader.IsDBNull(5) ? null : reader.GetInt32(5),
+                        CandlesDone = reader.IsDBNull(6) ? null : reader.GetInt32(6),
+                        QueuedUtc = DateTime.Parse(reader.GetString(7), CultureInfo.InvariantCulture).ToUniversalTime(),
+                        StartedUtc = reader.IsDBNull(8) ? null : DateTime.Parse(reader.GetString(8), CultureInfo.InvariantCulture).ToUniversalTime(),
+                        FinishedUtc = reader.IsDBNull(9) ? null : DateTime.Parse(reader.GetString(9), CultureInfo.InvariantCulture).ToUniversalTime(),
+                        Error = reader.IsDBNull(10) ? null : reader.GetString(10),
+                        TotalPnLPercent = hasResult ? initialEquity == 0m ? 0m : (finalEquity - initialEquity) / initialEquity * 100m : null,
+                        WinRate = hasResult ? totalTrades == 0 ? 0m : (decimal)winningTrades / totalTrades * 100m : null,
+                        SharpeRatio = hasResult ? metrics[4] ?? 0m : null,
+                        MaxDrawdownPercent = hasResult ? metrics[5] ?? 0m : null,
+                        TotalTrades = hasResult ? totalTrades : null,
+                        CagrPct = a[0], Sortino = a[1], Calmar = a[2], ProfitFactor = a[3], ExposurePct = a[4],
+                        BenchmarkReturnPct = a[5], Alpha = a[6], StrategyErrors = a[7] is { } se ? (int)se : null
+                    });
+                }
+                return (output, total);
+            }
         }
 
         public async Task<List<BacktestJobRow>> ListQueuedAsync(CancellationToken ct = default)

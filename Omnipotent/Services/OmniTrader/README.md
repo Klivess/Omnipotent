@@ -1,9 +1,10 @@
 # OmniTrader
 
-OmniTrader is the trading service inside Omnipotent. It has **two layers**:
+OmniTrader is the trading service inside Omnipotent. It has **three layers**:
 
 - **The strategy engine** (§1–§18) — a modular engine that runs the *same* strategy code across **backtest**, **paper** and **live**, over any symbol(s), single-asset or multi-asset. It knows nothing about any specific strategy.
 - **The firm layer** (§19–§31) — the trading *operating system* on top: venue adapters (Kraken spot + IG CFD), a canonical instrument master, a mandatory risk decision before every order, an audited order lifecycle, an immutable ledger reconciled against broker truth, a journal, alerting and operations.
+- **The terminal** (§32–§38) — market research and strategy development: a free-data hub (crypto, equities, macro, news, papers), charting with 92 indicators and a formula language, a screener, market alerts, the Strategy Studio (blueprints and C# scripts), the Lab (backtests, sweeps, walk-forward, Monte Carlo) and the Alpha Lab, which reads new papers and has KliveAgent turn them into tested strategies.
 
 The engine answers *"what should we trade?"*. The firm layer answers *"is the firm allowed to, did it actually happen, and can we prove it?"*
 
@@ -50,6 +51,16 @@ The engine answers *"what should we trade?"*. The firm layer answers *"is the fi
 30. [Real money, simulated money, adopted holdings](#30-real-money-simulated-money-and-holdings-you-already-own)
 31. [The UI](#31-the-ui)
 
+**Terminal**
+
+32. [Data hub](#32-data-hub)
+33. [Charts, indicators and formulas](#33-charts-indicators-and-formulas)
+34. [Screener and market alerts](#34-screener-and-market-alerts)
+35. [Strategy Studio](#35-strategy-studio)
+36. [Lab](#36-lab)
+37. [Alpha Lab](#37-alpha-lab)
+38. [Agent tools, terminal UI and tests](#38-agent-tools-terminal-ui-and-tests)
+
 ---
 
 ## 1. Mental model
@@ -89,7 +100,7 @@ The entry point is [`OmniTrader.cs`](OmniTrader.cs), which wires the DB, reposit
 
 | Folder | What's in it |
 |---|---|
-| [`Api/`](Api) | `OmniTraderRoutes.cs` — all HTTP endpoints + request DTOs. |
+| [`Api/`](Api) | `OmniTraderRoutes.cs` (engine endpoints), `FirmRoutes.cs` (firm layer), `TerminalRoutes*.cs` (terminal, studio, lab, alpha), `OmniTraderPerms.cs`. |
 | [`Backtesting/`](Backtesting) | `BacktestSession` (the one engine), `BacktestJobQueue` (worker), `BacktestResult` + `BacktestMetrics`, `MomentumBacktestRunner` (opt-in validation), `Validation/` (walk-forward, deflated Sharpe, survivorship, turnover, cost sensitivity). |
 | [`Contracts/`](Contracts) | `Models.cs` (candles, orders, fills, positions, configs, margin, `PortfolioBar`), `IStrategyHost`, `IOrderRouter`, `IMarketDataProvider`, `ExchangeFill`. |
 | [`Execution/`](Execution) | `SimulatedOrderRouter` (sim fills, spot+margin+brackets+liquidation), `KrakenOrderRouter` (real REST), `RiskGate` (live caps), `LiveLedger` (live position/PnL accounting), `KrakenSymbolMap`. |
@@ -97,6 +108,13 @@ The entry point is [`OmniTrader.cs`](OmniTrader.cs), which wires the DB, reposit
 | [`Persistence/`](Persistence) | `OmniTraderDb` (SQLite), one repository per table, `Schema/OmniTraderSchema.cs` (migrations). |
 | [`Sessions/`](Sessions) | `SessionManager` (creates/recovers/kills deployments), `PaperSession`, `LiveSession`, `MultiAssetSession`, `StrategyHost`. |
 | [`Strategy/`](Strategy) | `TradingStrategy` (base class), `StrategyRegistry` (attribute discovery), `StrategySymbols`/`UniverseSpec`, `StrategyContext`, `Indicators`, `Params/` (the `[Param]` system), `Momentum/` (helpers for the momentum strategy), `Strategies/` (concrete strategies). |
+| [`Data/`](Data) | `DataHub` (every free source, cached), `DataHttp`, `SourceHealth`, `UniverseCatalog`; `Crypto/`, `Equities/` (Yahoo, SEC EDGAR), `Macro/`, `News/` (§32). |
+| [`Technicals/`](Technicals) | `IndicatorCatalog` + `IndicatorEngine` (92 indicators), `TA.*` implementations, `Formula/` (the formula language) (§33). |
+| [`Screening/`](Screening) | `Screener` (fields, presets, formula filters/columns), `MarketAlerts` (§34). |
+| [`Studio/`](Studio), [`Scripting/`](Scripting) | `StudioService` (versioned strategies), `Blueprints/` (rule-tree compiler), `StudioTemplates`; `ScriptCompiler` (sandboxed Roslyn), `ScriptStrategy` (§35). |
+| [`Backtesting/Studies/`](Backtesting/Studies) | `StudyRunner`: sweep, walk-forward, Monte Carlo, batch (§36). |
+| [`Research/Alpha/`](Research/Alpha) | `AlphaLab` (ingest → score → agent → evaluate), `PaperSources`, `PaperScoring`, `CandidateEvaluator` (§37). |
+| [`Agent/`](Agent) | `OmniTraderAgentTools` — the KliveAgent tool surface (§38). |
 
 ---
 
@@ -441,7 +459,7 @@ All under `/api/omnitrader/` (see [`OmniTraderRoutes.cs`](Api/OmniTraderRoutes.c
 | POST | `backtest/cancel?id=` | request cancellation |
 | POST | `signals/flowsignal` | webhook for signal-driven strategies |
 
-The frontend is `pages/schemery/omnitrader.vue` in the management website (charts via TradingView `lightweight-charts` + Chart.js).
+The frontend is `pages/omnitrader/` in the management website (§31, §38).
 
 ---
 
@@ -1052,35 +1070,36 @@ settings, which one supplied the key, and each channel's state.
 
 ## 31. The UI
 
-`pages/omnitrader/` in the management website — ten pages over a shared component library in
-`components/OmniTrader/`, `composables/useOmniTrader.ts` and `assets/scss/omnitrader-os.scss`.
+`pages/omnitrader/` in the management website. The firm pages below use the component library in
+`components/OmniTrader/`, `composables/useOmniTrader.ts` and `assets/scss/omnitrader-os.scss`; the
+terminal pages (§38) add `components/Ot/`, `composables/useTerminal.ts` and
+`assets/scss/omnitrader-terminal.scss`. Both render inside the same `<OmniTraderShell>`.
 
 **Components.** Nuxt registers these path-prefixed, so a page uses `<OmniTraderShell>`, not `<Shell>`:
 
 | Component | Responsibility |
 |---|---|
-| `Shell` | environment band, scope selector, freshness, grouped nav with exception badges, blocker banners, density toggle, ⌘K palette |
+| `Shell` | environment band, scope selector, freshness, command line, ticker tape, grouped nav (Mkt / Research / Book / Sys) with exception badges, blocker banners, density toggle |
 | `Card` | card frame with a question subtitle, local controls, and the loading / empty / filtered / stale / partial / error states |
 | `Kpi` | label, value, unit, comparison **with its baseline named**, target, spark, drill-down |
 | `DataTable` | sticky header, sort, search, column visibility, pinned first column, paging, filtered/total counts, keyboard row access |
 | `LineChart` | one y-axis, crosshair + tooltip, keyboard readout, direct-labelled last value, axis-truncation disclosure, table view |
 | `BarList` | sorted horizontal bars, diverging around zero, top-N with the tail folded into "Other" |
-| `CandleChart` | candlesticks + volume via `lightweight-charts`, with a UTC OHLC readout under the crosshair |
 | `Sparkline`, `Meter`, `RuleList`, `Drawer`, `StateBlock` | trend shape; bullet meter with its threshold; the rule-level decision record; right-side inspection; typed non-success states |
 
 | Page | Primary decision |
 |---|---|
-| **Command Centre** (`/omnitrader`) | assess the operation and find what needs action |
-| **Instrument** (`/omnitrader/instrument?symbol=`) | study one symbol: candlesticks, live quote, analytics, position |
-| **Markets** | discover and evaluate market conditions |
-| **Strategies** | control the strategy lifecycle and authority |
+| **Desk** (`/omnitrader/desk`) | assess the operation and find what needs action |
+| **Watchlists** (`/omnitrader/markets`) | track the instruments you follow |
+| **Deploy** (`/omnitrader/strategies`) | control the strategy lifecycle and authority |
 | **Portfolio** | understand aggregate exposure and reconciliation |
 | **Risk** | prevent or reduce unacceptable exposure |
 | **Execution** | manage broker interaction and investigate fills |
-| **Research** | validate strategy logic and build promotion evidence |
 | **Performance** | measure outcomes and detect deterioration |
 | **Journal** | review the complete decision record |
-| **Systems** | operate and troubleshoot the platform |
+| **Systems** | operate and troubleshoot the platform, including data-source health |
+
+`/omnitrader` itself is the market monitor (§38); experiments moved into the Lab.
 
 Six design rules run through all of it:
 
@@ -1135,3 +1154,165 @@ classification, the exposure model, venue capabilities and the shared analytics.
   the risk engine both surface that text to the operator.
 - **Live authority is never implicit.** New live accounts start at `Observe`, and raising them
   requires a typed confirmation.
+
+---
+
+## 32. Data hub
+
+`Data/DataHub.cs` fronts every external source. All sources are free; FRED takes an optional free key
+(`FredKeyAsync`). Calls go through the shared clients in `DataHttp` and are timed into `SourceHealth`
+(calls, failures, latency, last error, Up/Degraded/Down) — the Systems page reads `terminal/sources`,
+and routers skip a source that is plainly down.
+
+| Area | Sources | Used for |
+|---|---|---|
+| Crypto | Binance spot + futures, Coinbase, Kraken, Bybit, OKX, Deribit, CoinGecko, DefiLlama, alternative.me | candles, order book, funding/basis/OI across venues, DVOL and options, market cap and dominance, trending, TVL and stablecoins, Fear & Greed |
+| Equities / FX / futures | Yahoo, SEC EDGAR | quotes, candles, movers, company profile, financials, options chains and term structure, XBRL facts, filings |
+| Macro | US Treasury, FRED, BLS, DBnomics, CBOE | yield curve (now / 1M / 1Y ago), any FRED series, CPI/payrolls, international series, VIX term structure |
+| News | RSS (markets, crypto, macro feeds) | headlines, filterable by source |
+| Research | arXiv, OpenAlex | paper ingestion for the Alpha Lab (§37) |
+
+`Data/UniverseCatalog.cs` holds the named universes (world indices, FX, commodities, rates, volatility,
+sector and factor ETFs, mega caps, crypto majors, and S&P 500 / FTSE 100 constituents refreshed weekly).
+`DataHub` caches per source — quotes for seconds, options for minutes, company, financials and filings
+for hours; live routes call `MarkUncacheable` so the API response cache never replays them.
+
+## 33. Charts, indicators and formulas
+
+`Technicals/` is one indicator engine shared by charts, the screener, alerts, blueprints and scripts.
+`IndicatorCatalog` describes 92 indicators in nine categories (moving averages, trend, momentum,
+volatility, volume, statistics, levels, patterns, price): typed inputs with defaults and ranges, and
+outputs with a pane (overlay or own), a style (`line`, `histogram`, `area`, `dots`, `step`, `markers`),
+a colour slot and an optional display offset.
+
+`POST terminal/chart` returns candles plus any number of indicator instances (each keyed by the caller,
+so two EMAs never collide), formula series and compare symbols aligned to the same bars:
+
+```json
+{ "Symbol": "BTCUSDT", "Interval": "FourHour", "Bars": 500,
+  "Indicators": [{ "Key": "s_ema20", "Id": "ema", "Inputs": { "length": 20 } }],
+  "Formulas":   [{ "Key": "f1", "Formula": "crossover(ema(close, 20), ema(close, 50))" }],
+  "Compare":    ["ETHUSDT"] }
+```
+
+**Formula language** (`Technicals/Formula`). Series `open high low close volume hl2 hlc3 ohlc4`,
+arithmetic, comparison and boolean operators, `[n]` for bars ago, 42 functions (`crossover`,
+`highest`, `lowest`, `roc`, `zscore`, `stdev`, `sum`, `iff`, …) and every catalog indicator by id —
+`rsi(14) < 30 and close > sma(close, 200)`. Boolean formulas drive chart signals, screener filters,
+alerts and blueprint conditions. `terminal/formula/check` returns errors with positions, lookback, and a
+preview (bars evaluated, true count, last value); `terminal/formula/reference` lists everything.
+
+`terminal/stats` adds trailing returns, a realised-volatility cone with percentiles, drawdown episodes,
+calendar years and technical snapshots; `terminal/seasonality` and `terminal/correlation` do what they say.
+
+## 34. Screener and market alerts
+
+`Screening/Screener.cs` runs a screen over a universe or symbol list on one interval: 25 built-in fields
+(returns over 1D–1Y and YTD, volume and relative volume, RSI, ATR %, realised vol, distance from 52w
+high/low and moving averages, ADX, trend score, gap, market cap, P/E, dividend yield), formula filters
+(all must hold), formula columns, sort and limit. Rows carry every column value, pass/fail and a spark.
+Presets ship in code; saved screens live in a `DocumentStore` (`screens.manage` to write).
+
+`Screening/MarketAlerts.cs` watches a formula on one symbol's closed bars. Modes: `Once` (fire then
+disable), `OnChange` (false → true), `EveryBar`. Alerts have an optional expiry and message, push to
+Discord when `Notify` is set, and log every firing as an `AlertEvent`. `terminal/alert/test` evaluates a
+condition over recent bars without saving it.
+
+## 35. Strategy Studio
+
+`Studio/StudioService.cs` stores user and agent strategies as versioned documents. Every save is a new
+version; any version can be restored or cloned. Two kinds compile to the same engine contract (§3), so a
+Studio strategy backtests, sweeps and deploys like a built-in one (strategy class `studio:<id>@<version>`):
+
+- **Blueprint** — a no-code rule tree (`Studio/Blueprints`). Universe (single, basket, ranked
+  universe), direction, typed inputs, condition groups for `entryLong`, `exitLong`, `entryShort`,
+  `exitShort` and `filter` (ALL/ANY, NOT, nested groups; each condition compares indicator, price, value,
+  input or formula operands with `>`, `crosses_above`, `between`, `rising` …, optionally held for N bars),
+  an optional ranking `score`, sizing (% equity, max positions, max position %) and risk (stop, target,
+  trailing stop, max bars, cooldown, exit when the filter turns off). `BlueprintCompiler` reports each
+  section as a formula so the rule is readable.
+- **Script** — C# against `ScriptStrategy` / `ScriptUniverseStrategy` (`Scripting/`), with `[Param]`
+  properties as tunable parameters and the indicator engine, orders and plotting in scope. Roslyn compiles
+  it in a collectible context. The sandbox rejects I/O, networking, reflection, processes, threads, unsafe
+  code and anything outside the trading namespaces; a guard rewriter bounds loops and call depth.
+
+`studio/check` compiles a draft and returns diagnostics with line/column plus the parameter schema;
+`studio/quick-test` backtests an unsaved draft synchronously; `studio/backtest` queues a full job.
+`studio/reference` is the authoring reference (blueprint schema, script API, formula functions,
+indicators) — the same text the agent reads. Templates live in `StudioTemplates.cs`.
+
+## 36. Lab
+
+The Lab is the research front-end of the single `BacktestSession` (§10) — there is no second engine.
+
+- **Backtests** — `lab/backtests` filters the job store by strategy (prefix with `*`), origin, status,
+  symbol and text, with paging; `lab/backtest` returns the full result with string enums.
+- **Studies** (`Backtesting/Studies`) — `Sweep` (grid over parameters, heatmap, per-parameter
+  sensitivity, and a deflated Sharpe for the winner over all trials), `WalkForward` (grid optimisation on
+  each in-sample window, the winner run on the next out-of-sample window, stitched OOS equity and
+  walk-forward efficiency), `MonteCarlo` (closed trades resampled with replacement: spread of final return
+  and max drawdown, risk of ruin) and `Batch` (one configuration across many symbols).
+- **Compare** — `lab/compare` normalises up to twelve equity curves to 100 and lines up their metrics.
+- **Experiments** — the hypothesis registry from §26.
+
+## 37. Alpha Lab
+
+`Research/Alpha/` turns new finance research into tested strategy candidates without supervision:
+
+1. **Ingest** (every `IngestEveryHours`, default 6): arXiv q-fin categories plus keyword searches, and
+   OpenAlex (journals, SSRN, preprint servers) over `LookbackDays`. Duplicates collapse on a normalised
+   title key, so the same paper from both sources is stored once.
+2. **Score** (`PaperScoring`): relevance and feasibility 0–100, strategy families, asset classes and data
+   needs, from the title and abstract.
+3. **Dispatch** (every `AnalyseEveryHours`, default 8; at most `MaxAgentRunsPerDay`): the top
+   `PapersPerRun` papers above `MinRelevance` / `MinFeasibility` go to KliveAgent, which reads them,
+   writes a strategy through `omnitrader_studio`, and submits it with `omnitrader_research alpha_submit`
+   — or records why the paper is not implementable.
+4. **Evaluate** (`CandidateEvaluator`): a persisted primary backtest, breadth across
+   `CryptoTestSymbols` / `EquityTestSymbols`, a 2× cost stress, walk-forward out-of-sample, and a
+   deflated Sharpe over every trial the lab has run. These roll into a 0–100 score with visible parts.
+   `Promising` (≥ `PromisingScore`) is pushed to Discord; `Rejected` below `RejectScore`; `Promoted` and
+   manual rejection are yours.
+
+Papers can also be added by hand (`alpha/paper/add`), starred, requeued or analysed immediately
+(`alpha/analyse`). Settings are live-editable (`alpha/settings`, `alpha.manage`).
+
+## 38. Agent tools, terminal UI and tests
+
+**Agent tools.** `Agent/OmniTraderAgentTools.cs` exposes the terminal to KliveAgent (service key
+`omnitrader`) as four tool groups — the same surface the UI uses:
+
+| Tool | Ops |
+|---|---|
+| `omnitrader_data` | `quote`, `candles`, `screen`, `company`, `derivatives`, `macro`, `news`, `alert_set`, `alerts` |
+| `omnitrader_studio` | `reference`, `templates`, `list`, `get`, `create`, `update`, `validate`, `formula_check` |
+| `omnitrader_lab` | `strategies`, `quick_backtest`, `backtest`, `backtest_get`, `sweep`, `study_get` |
+| `omnitrader_research` | `papers`, `paper_get`, `paper_verdict`, `paper_add`, `alpha_submit`, `candidates`, `candidate_get`, `ingest_now` |
+
+**Terminal UI.** Client-rendered (`ssr: false`) pages under `/omnitrader`: Monitor (index), Security
+(`instrument`, function tabs GP chart, DES overview, HP stats, SEAS, OMON options, DER derivatives,
+CN news, DATA bars), Screener, Crypto, Macro (curve, FRED, correlation, vol term), News, Alerts, Studio,
+Lab, Alpha. The command line takes `SYMBOL [FUNCTION|interval]` or a function code (`AAPL DES`,
+`BTCUSDT 4h`, `SCRN`, `CORR SPY TLT`, `YC`). Panels collapse, maximise and hide; grids sort, filter,
+choose columns and export CSV; chart studies, formulas, compare symbols, scale and interval persist per
+chart. UI state lives in `localStorage` under `ot.*`. Components are in `components/Ot/` (`Chart`,
+`Series`, `Grid`, `Panel`, `Quotes`, `BlueprintEditor`, `CodeEditor` (CodeMirror), `BacktestReport`, …).
+
+**Permissions.** `terminal.read`, `screens.manage`, `studio.read`, `studio.write`, `alpha.read`,
+`alpha.manage`.
+
+**Tests.**
+
+```bash
+# engine, terminal analytics, studio, studies, technicals, alpha lab
+DOTNET_ROLL_FORWARD=Major dotnet test Omnipotent.Tests/Omnipotent.Tests.csproj -c Release --filter "FullyQualifiedName~OmniTrader"
+# the same against the real free sources
+OMNITRADER_LIVE=1 DOTNET_ROLL_FORWARD=Major dotnet test Omnipotent.Tests/Omnipotent.Tests.csproj -c Release --filter "FullyQualifiedName~OmniTraderLiveDataTests"
+# regenerate the website's e2e fixtures from the engine
+OMNITRADER_FIXTURES="<website>/tests/e2e/fixtures/omnitrader" DOTNET_ROLL_FORWARD=Major dotnet test Omnipotent.Tests/Omnipotent.Tests.csproj -c Release --filter "FullyQualifiedName~OmniTraderFixtureExport"
+```
+
+Website e2e: `tests/e2e/omnitrader.spec.ts` with the mocked API in `tests/e2e/fixtures/omnitrader-api.ts`.
+Every test fails on any page error or console error. Run it against a production build
+(`nuxi build`, then `node .output/server/index.mjs` and `PLAYWRIGHT_BASE_URL=…`); the dev server's
+on-demand compilation stalls under Playwright.

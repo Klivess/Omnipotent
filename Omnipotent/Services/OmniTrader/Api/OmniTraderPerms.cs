@@ -81,6 +81,27 @@ namespace Omnipotent.Profiles.Permissions
         public static readonly PermissionDef SignalsSubmit = G.Define("signals.submit", "Signals", PermissionTier.Act,
             "Submit signals", "Send a flow signal to running strategies.", ProfileRank.Klives);
 
+        public static readonly PermissionDef TerminalRead = G.Define("terminal.read", "Terminal", PermissionTier.Read,
+            "Use the terminal", "Market data, fundamentals, derivatives, macro, news, screens and indicators.", ProfileRank.Guest);
+
+        public static readonly PermissionDef ScreensManage = G.Define("screens.manage", "Terminal", PermissionTier.Act,
+            "Save screens", "Create, edit and delete saved screens and layouts.", ProfileRank.Klives,
+            implies: new[] { "terminal.read" });
+
+        public static readonly PermissionDef StudioRead = G.Define("studio.read", "Studio", PermissionTier.Read,
+            "View studio strategies", "Blueprint and script strategies, their versions and runs.", ProfileRank.Guest);
+
+        public static readonly PermissionDef StudioWrite = G.Define("studio.write", "Studio", PermissionTier.Manage,
+            "Write strategies", "Create, edit, compile, test and delete blueprint and script strategies.", ProfileRank.Klives,
+            implies: new[] { "studio.read", "backtests.run" }, sensitive: true);
+
+        public static readonly PermissionDef AlphaRead = G.Define("alpha.read", "Research", PermissionTier.Read,
+            "View alpha research", "Research papers, alpha candidates and their evaluations.", ProfileRank.Guest);
+
+        public static readonly PermissionDef AlphaManage = G.Define("alpha.manage", "Research", PermissionTier.Manage,
+            "Run alpha research", "Ingest papers, dispatch analysis, judge candidates and change Alpha Lab settings.", ProfileRank.Klives,
+            implies: new[] { "alpha.read" });
+
         public static readonly PermissionDef VenuesManage = G.Define("venues.manage", "Venues", PermissionTier.Critical,
             "Manage venues and authority", "Connect trading venues and change an account's execution authority.", ProfileRank.Klives,
             sensitive: true);

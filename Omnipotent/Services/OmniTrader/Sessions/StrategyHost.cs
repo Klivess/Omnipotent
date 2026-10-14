@@ -22,6 +22,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         private readonly Func<decimal> baseFunc;
         private readonly Func<IReadOnlyDictionary<string, decimal>>? portfolioPositionsFunc;
         private readonly Func<decimal>? equityFunc;
+        private readonly Func<IReadOnlyList<OrderIntent>>? workingOrdersFunc;
         private readonly Action<string> logAction;
         private readonly Action<string, Exception?> errAction;
 
@@ -36,7 +37,8 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             Action<string, Exception?> err,
             decimal leverage = 1m,
             Func<IReadOnlyDictionary<string, decimal>>? portfolioPositionsFunc = null,
-            Func<decimal>? equityFunc = null)
+            Func<decimal>? equityFunc = null,
+            Func<IReadOnlyList<OrderIntent>>? workingOrdersFunc = null)
         {
             DeploymentId = deploymentId;
             Mode = mode;
@@ -50,11 +52,13 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             this.baseFunc = baseFunc;
             this.portfolioPositionsFunc = portfolioPositionsFunc;
             this.equityFunc = equityFunc;
+            this.workingOrdersFunc = workingOrdersFunc;
             this.logAction = log;
             this.errAction = err;
         }
 
         public Position? CurrentPosition => positionFunc();
+        public IReadOnlyList<OrderIntent> WorkingOrders => workingOrdersFunc?.Invoke() ?? Array.Empty<OrderIntent>();
         public decimal QuoteBalance => quoteFunc();
         public decimal BaseBalance => baseFunc();
 

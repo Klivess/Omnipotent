@@ -40,6 +40,20 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         public List<EquityPoint> EquityCurve { get; set; } = new();
         public List<OHLCCandle> Candles { get; set; } = new();
 
+        /// <summary>Bars per year used to annualise. 0 on results stored before it existed (read as 252).</summary>
+        public double BarsPerYear { get; set; }
+        public BacktestAnalysis? Analysis { get; set; }
+        public List<string> Symbols { get; set; } = new();
+        public string? BenchmarkSymbol { get; set; }
+        public ExecutionTiming Execution { get; set; }
+        public int StrategyErrors { get; set; }
+        public string? FirstStrategyError { get; set; }
+        public bool Liquidated { get; set; }
+        /// <summary>Series a script recorded with Plot(), downsampled for the chart.</summary>
+        public Dictionary<string, List<SeriesPoint>>? Plots { get; set; }
+
+        private double AnnualisationBars => BarsPerYear > 0 ? BarsPerYear : 252;
+
         // ---- Derived analytics ----
         // Computed from Trades / EquityCurve / Duration, all of which are persisted, so these
         // also enrich previously-stored backtests when re-fetched. Every divisor is guarded.
@@ -61,8 +75,8 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
         public decimal AlphaVsBuyAndHoldPercent => TotalPnLPercent - BuyAndHoldPnLPercent;
 
         // Risk-adjusted
-        public decimal SortinoRatio => BacktestMetrics.Sortino(EquityCurve);
-        public decimal AnnualizedVolatilityPercent => BacktestMetrics.AnnualizedVolatilityPercent(EquityCurve);
+        public decimal SortinoRatio => BacktestMetrics.Sortino(EquityCurve, AnnualisationBars);
+        public decimal AnnualizedVolatilityPercent => BacktestMetrics.AnnualizedVolatilityPercent(EquityCurve, AnnualisationBars);
         public decimal CalmarRatio => MaxDrawdownPercent == 0 ? 0 : AnnualizedReturnPercent / MaxDrawdownPercent;
         public decimal RecoveryFactor => MaxDrawdown == 0 ? 0 : TotalPnL / MaxDrawdown;
         public int MaxDrawdownDurationBars => BacktestMetrics.MaxDrawdownDuration(EquityCurve).bars;

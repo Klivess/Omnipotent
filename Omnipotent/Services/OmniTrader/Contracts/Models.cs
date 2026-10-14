@@ -1,5 +1,7 @@
 namespace Omnipotent.Services.OmniTrader.Contracts
 {
+    /// <summary>Bar size. The value is the bar length in minutes (OneMonth is nominally 30 days;
+    /// use <c>CandleClock</c> for exact bar boundaries).</summary>
     public enum TimeInterval
     {
         OneMinute = 1,
@@ -7,9 +9,12 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         FifteenMinute = 15,
         ThirtyMinute = 30,
         OneHour = 60,
+        TwoHour = 120,
         FourHour = 240,
+        TwelveHour = 720,
         OneDay = 1440,
-        OneWeek = 10080
+        OneWeek = 10080,
+        OneMonth = 43200
     }
 
     public enum SessionMode { Backtest, Paper, Live }
@@ -82,6 +87,18 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         /// backtest can record each trade's stop/target for charting. Null on exit/conditional fills.</summary>
         public decimal? StopLoss { get; init; }
         public decimal? TakeProfit { get; init; }
+
+        /// <summary>Why the fill happened: market | limit | stop | target | liquidation.</summary>
+        public string Reason { get; init; } = "market";
+    }
+
+    /// <summary>When a market order submitted from a bar callback executes in simulation.</summary>
+    public enum ExecutionTiming
+    {
+        /// <summary>At the signal bar's close (± slippage). Optimistic; the original engine behaviour.</summary>
+        SignalClose,
+        /// <summary>At the next bar's open (± slippage). What a live system can actually achieve.</summary>
+        NextOpen
     }
 
     public sealed class Position
@@ -188,6 +205,17 @@ namespace Omnipotent.Services.OmniTrader.Contracts
 
         /// <summary>User-chosen values for the strategy's [Param] properties (applied at run start).</summary>
         public Dictionary<string, object?>? Parameters { get; init; }
+
+        /// <summary>When market orders execute: at the signal bar's close or the next bar's open.</summary>
+        public ExecutionTiming Execution { get; init; } = ExecutionTiming.SignalClose;
+        /// <summary>Benchmark for alpha/beta. Defaults to the traded symbol (single) or the regime asset (universe).</summary>
+        public string? Benchmark { get; init; }
+        /// <summary>Free-text label shown in the run list.</summary>
+        public string? Label { get; init; }
+        /// <summary>Who queued the run: ui | kliveagent | alpha | study.</summary>
+        public string? Origin { get; init; }
+        /// <summary>Parent study (sweep / batch) the run belongs to, if any.</summary>
+        public string? StudyId { get; init; }
     }
 
     /// <summary>
@@ -266,6 +294,14 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         /// <summary>The protective bracket levels the position was opened with (if any), for charting.</summary>
         public decimal? StopLoss { get; init; }
         public decimal? TakeProfit { get; init; }
+        public string Symbol { get; init; } = "";
+        public int BarsHeld { get; init; }
+        /// <summary>Maximum adverse excursion, % of entry price (≥ 0).</summary>
+        public double MaePct { get; init; }
+        /// <summary>Maximum favourable excursion, % of entry price (≥ 0).</summary>
+        public double MfePct { get; init; }
+        /// <summary>signal | stop | target | limit | liquidation | open (still held at the end of the run).</summary>
+        public string ExitReason { get; init; } = "signal";
         public decimal RealizedPnL => IsShort
             ? (EntryPrice - ExitPrice) * Qty - Fees
             : (ExitPrice - EntryPrice) * Qty - Fees;

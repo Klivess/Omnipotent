@@ -8,153 +8,167 @@ using System.Text.Json;
 
 namespace Omnipotent.Services.OmniTrader.MarketData
 {
-    public sealed class BinanceMarketDataProvider : IMarketDataProvider
+    /// <summary>
+    /// Binance spot klines (REST + websocket). Bars are stamped with their OPEN time; the REST
+    /// response's trailing bar is split off as <see cref="CandleFetch.Forming"/> while it is open.
+    /// </summary>
+    public sealed class BinanceMarketDataProvider : IMarketDataProvider, ICandleSource
     {
         public string Name => "Binance";
-        private static readonly HttpClient httpClient = new();
+        private const string RestBase = "https://api.binance.com/api/v3/";
+        private static readonly HttpClient httpClient = new() { Timeout = TimeSpan.FromSeconds(20) };
+
+        public bool Supports(TimeInterval interval) => true;
 
         public async Task<IReadOnlyList<OHLCCandle>> GetHistoricalCandlesAsync(string symbol, TimeInterval interval, int count, CancellationToken ct = default)
-        {
-            string sym = symbol.ToUpperInvariant().Replace("/", "");
-            string intv = ToBinanceInterval(interval);
-            var output = new List<OHLCCandle>();
-            int remaining = count;
-            long? endTime = null;
-            int safetyLimit = 50;
+            => (await FetchLatestAsync(symbol, interval, count, ct)).Closed;
 
-            while (remaining > 0 && safetyLimit-- > 0)
+        public async Task<CandleFetch> FetchLatestAsync(string symbol, TimeInterval interval, int count, CancellationToken ct = default)
+        {
+            string sym = Normalize(symbol);
+            string intv = ToBinanceInterval(interval);
+            var rows = new List<(OHLCCandle Bar, long CloseMs)>();
+            int remaining = count + 1; // +1 for the forming bar the response usually ends with
+            long? endTime = null;
+            int safety = 60;
+
+            while (remaining > 0 && safety-- > 0)
             {
                 int batch = Math.Min(1000, remaining);
-                string url = $"https://api.binance.com/api/v3/klines?symbol={sym}&interval={intv}&limit={batch}";
+                string url = $"{RestBase}klines?symbol={sym}&interval={intv}&limit={batch}";
                 if (endTime.HasValue) url += $"&endTime={endTime.Value}";
-                var resp = await httpClient.GetAsync(url, ct);
-                if (!resp.IsSuccessStatusCode)
-                    throw new Exception($"Binance klines failed: {resp.StatusCode} {await resp.Content.ReadAsStringAsync(ct)}");
-                var body = await resp.Content.ReadAsStringAsync(ct);
-                var arr = JArray.Parse(body);
-                if (arr.Count == 0) break;
-                var batchCandles = new List<OHLCCandle>(arr.Count);
-                foreach (var k in arr)
-                {
-                    batchCandles.Add(new OHLCCandle(
-                        DateTimeOffset.FromUnixTimeMilliseconds((long)k[6]!).UtcDateTime,
-                        decimal.Parse((string)k[1]!, CultureInfo.InvariantCulture),
-                        decimal.Parse((string)k[2]!, CultureInfo.InvariantCulture),
-                        decimal.Parse((string)k[3]!, CultureInfo.InvariantCulture),
-                        decimal.Parse((string)k[4]!, CultureInfo.InvariantCulture),
-                        decimal.Parse((string)k[5]!, CultureInfo.InvariantCulture)));
-                }
-                output.InsertRange(0, batchCandles);
-                remaining -= batchCandles.Count;
-                long oldestOpen = (long)arr[0]![0]!;
-                endTime = oldestOpen - 1;
-                if (batchCandles.Count < batch) break;
+                var page = await GetPageAsync(url, ct);
+                if (page.Count == 0) break;
+                rows.InsertRange(0, page);
+                remaining -= page.Count;
+                endTime = new DateTimeOffset(page[0].Bar.Timestamp).ToUnixTimeMilliseconds() - 1;
+                if (page.Count < batch) break;
             }
 
-            return output
-                .GroupBy(c => c.Timestamp)
-                .Select(g => g.First())
-                .OrderBy(c => c.Timestamp)
-                .TakeLast(count)
-                .ToList();
+            return Split(rows, count);
         }
 
-        /// <summary>Fetch every closed candle whose open time falls in [fromUtc, toUtc], paging forward
-        /// (Binance returns ≤1000 per request). Used by date-range backtests.</summary>
-        public async Task<IReadOnlyList<OHLCCandle>> GetHistoricalCandlesRangeAsync(string symbol, TimeInterval interval, DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
+        public async Task<CandleFetch> FetchRangeAsync(string symbol, TimeInterval interval, DateTime fromUtc, DateTime toUtc, CancellationToken ct = default)
         {
-            string sym = symbol.ToUpperInvariant().Replace("/", "");
+            string sym = Normalize(symbol);
             string intv = ToBinanceInterval(interval);
-            long startMs = ((DateTimeOffset)DateTime.SpecifyKind(fromUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
-            long endMs = ((DateTimeOffset)DateTime.SpecifyKind(toUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+            long startMs = new DateTimeOffset(DateTime.SpecifyKind(fromUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
+            long endMs = new DateTimeOffset(DateTime.SpecifyKind(toUtc, DateTimeKind.Utc)).ToUnixTimeMilliseconds();
 
-            var output = new List<OHLCCandle>();
+            var rows = new List<(OHLCCandle Bar, long CloseMs)>();
             long cursor = startMs;
-            int safetyLimit = 500;
-
-            while (cursor <= endMs && safetyLimit-- > 0)
+            int safety = 600;
+            while (cursor <= endMs && safety-- > 0)
             {
-                string url = $"https://api.binance.com/api/v3/klines?symbol={sym}&interval={intv}&startTime={cursor}&endTime={endMs}&limit=1000";
-                var resp = await httpClient.GetAsync(url, ct);
-                if (!resp.IsSuccessStatusCode)
-                    throw new Exception($"Binance klines range failed: {resp.StatusCode} {await resp.Content.ReadAsStringAsync(ct)}");
-                var arr = JArray.Parse(await resp.Content.ReadAsStringAsync(ct));
-                if (arr.Count == 0) break;
-                foreach (var k in arr)
-                {
-                    output.Add(new OHLCCandle(
-                        DateTimeOffset.FromUnixTimeMilliseconds((long)k[6]!).UtcDateTime,
-                        decimal.Parse((string)k[1]!, CultureInfo.InvariantCulture),
-                        decimal.Parse((string)k[2]!, CultureInfo.InvariantCulture),
-                        decimal.Parse((string)k[3]!, CultureInfo.InvariantCulture),
-                        decimal.Parse((string)k[4]!, CultureInfo.InvariantCulture),
-                        decimal.Parse((string)k[5]!, CultureInfo.InvariantCulture)));
-                }
-                long lastOpen = (long)arr[^1]![0]!;
-                cursor = lastOpen + 1; // next page starts just after the last bar's open time
-                if (arr.Count < 1000) break;
+                string url = $"{RestBase}klines?symbol={sym}&interval={intv}&startTime={cursor}&endTime={endMs}&limit=1000";
+                var page = await GetPageAsync(url, ct);
+                if (page.Count == 0) break;
+                rows.AddRange(page);
+                cursor = new DateTimeOffset(page[^1].Bar.Timestamp).ToUnixTimeMilliseconds() + 1;
+                if (page.Count < 1000) break;
             }
-
-            return output
-                .GroupBy(c => c.Timestamp)
-                .Select(g => g.First())
-                .OrderBy(c => c.Timestamp)
-                .ToList();
+            return Split(rows, int.MaxValue);
         }
 
-        /// <summary>Latest traded price for a symbol (REST ticker) — drives the live forming candle.</summary>
+        private static async Task<List<(OHLCCandle Bar, long CloseMs)>> GetPageAsync(string url, CancellationToken ct)
+        {
+            using var resp = await httpClient.GetAsync(url, ct);
+            string body = await resp.Content.ReadAsStringAsync(ct);
+            if (!resp.IsSuccessStatusCode)
+                throw new HttpRequestException($"Binance klines {(int)resp.StatusCode}: {Trim(body)}");
+            var arr = JArray.Parse(body);
+            var page = new List<(OHLCCandle, long)>(arr.Count);
+            foreach (var k in arr)
+            {
+                page.Add((new OHLCCandle(
+                    DateTimeOffset.FromUnixTimeMilliseconds((long)k[0]!).UtcDateTime,
+                    D(k[1]), D(k[2]), D(k[3]), D(k[4]), D(k[5])), (long)k[6]!));
+            }
+            return page;
+        }
+
+        private CandleFetch Split(List<(OHLCCandle Bar, long CloseMs)> rows, int count)
+        {
+            long nowMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var closed = new List<OHLCCandle>(rows.Count);
+            OHLCCandle? forming = null;
+            var seen = new HashSet<DateTime>();
+            foreach (var (bar, closeMs) in rows.OrderBy(r => r.Bar.Timestamp))
+            {
+                if (!seen.Add(bar.Timestamp)) continue;
+                if (closeMs < nowMs) closed.Add(bar);
+                else forming = bar;
+            }
+            if (closed.Count > count) closed = closed.GetRange(closed.Count - count, count);
+            return new CandleFetch(closed, forming, Name);
+        }
+
+        /// <summary>Latest traded price (REST ticker).</summary>
         public async Task<decimal> GetLatestPriceAsync(string symbol, CancellationToken ct = default)
         {
-            string sym = symbol.ToUpperInvariant().Replace("/", "");
-            string url = $"https://api.binance.com/api/v3/ticker/price?symbol={sym}";
-            var resp = await httpClient.GetAsync(url, ct);
+            string url = $"{RestBase}ticker/price?symbol={Normalize(symbol)}";
+            using var resp = await httpClient.GetAsync(url, ct);
             if (!resp.IsSuccessStatusCode) return 0m;
             var obj = JObject.Parse(await resp.Content.ReadAsStringAsync(ct));
             return decimal.TryParse((string?)obj["price"], NumberStyles.Any, CultureInfo.InvariantCulture, out var p) ? p : 0m;
         }
 
+        /// <summary>Health key for the kline websocket (separate from REST, which can work when the socket is blocked).</summary>
+        public const string WebSocketSource = "Binance-ws";
+
+        /// <summary>
+        /// Closed bars pushed by the exchange websocket, stamped with their open time. Reconnects
+        /// with a short pause on a dropped socket; gives up after three failed connects in a row so
+        /// the caller can fall back to polling.
+        /// </summary>
         public async IAsyncEnumerable<OHLCCandle> StreamCandlesAsync(string symbol, TimeInterval interval, [EnumeratorCancellation] CancellationToken ct = default)
         {
-            string sym = symbol.ToLowerInvariant().Replace("/", "");
+            string sym = Normalize(symbol).ToLowerInvariant();
             string intv = ToBinanceInterval(interval);
             string endpoint = $"wss://stream.binance.com:9443/ws/{sym}@kline_{intv}";
+            int failedConnects = 0;
 
             while (!ct.IsCancellationRequested)
             {
                 ClientWebSocket? socket = null;
-                Exception? caught = null;
+                bool connected = false;
                 try
                 {
                     socket = new ClientWebSocket();
                     await socket.ConnectAsync(new Uri(endpoint), ct);
+                    connected = true;
+                    failedConnects = 0;
+                    Data.SourceHealth.Success(WebSocketSource, 0, "market-data");
                 }
                 catch (OperationCanceledException) { socket?.Dispose(); yield break; }
-                catch (Exception ex) { caught = ex; socket?.Dispose(); }
-
-                if (caught != null)
+                catch (Exception ex)
                 {
-                    await Task.Delay(3000, ct);
+                    socket?.Dispose();
+                    Data.SourceHealth.Failure(WebSocketSource, ex.Message, "market-data");
+                }
+
+                if (!connected)
+                {
+                    if (++failedConnects >= 3) yield break;
+                    try { await Task.Delay(3000, ct); } catch (OperationCanceledException) { yield break; }
                     continue;
                 }
 
                 byte[] buffer = new byte[32 * 1024];
                 while (socket!.State == WebSocketState.Open && !ct.IsCancellationRequested)
                 {
-                    string message;
                     OHLCCandle? candle;
                     try
                     {
-                        message = await ReceiveFullMessageAsync(socket, buffer, ct);
+                        string message = await ReceiveFullMessageAsync(socket, buffer, ct);
                         candle = TryParseClosedCandle(message);
                     }
-                    catch (OperationCanceledException) { break; }
                     catch { break; }
-                    if (candle.HasValue)
-                        yield return candle.Value;
+                    if (candle.HasValue) yield return candle.Value;
                 }
                 socket.Dispose();
-                if (!ct.IsCancellationRequested)
-                    await Task.Delay(3000, ct);
+                if (ct.IsCancellationRequested) yield break;
+                try { await Task.Delay(3000, ct); } catch (OperationCanceledException) { yield break; }
             }
         }
 
@@ -171,18 +185,19 @@ namespace Omnipotent.Services.OmniTrader.MarketData
             return Encoding.UTF8.GetString(ms.ToArray());
         }
 
-        private static OHLCCandle? TryParseClosedCandle(string json)
+        internal static OHLCCandle? TryParseClosedCandle(string json)
         {
             if (string.IsNullOrWhiteSpace(json)) return null;
             using var document = JsonDocument.Parse(json);
             if (!document.RootElement.TryGetProperty("k", out JsonElement kline)) return null;
             if (!kline.TryGetProperty("x", out JsonElement isClosed) || !isClosed.GetBoolean()) return null;
-            long closeMs = kline.GetProperty("T").GetInt64();
+            long openMs = kline.GetProperty("t").GetInt64();
             decimal P(string p) => decimal.Parse(kline.GetProperty(p).GetString()!, CultureInfo.InvariantCulture);
-            return new OHLCCandle(
-                DateTimeOffset.FromUnixTimeMilliseconds(closeMs).UtcDateTime,
+            return new OHLCCandle(DateTimeOffset.FromUnixTimeMilliseconds(openMs).UtcDateTime,
                 P("o"), P("h"), P("l"), P("c"), P("v"));
         }
+
+        public static string Normalize(string symbol) => symbol.ToUpperInvariant().Replace("/", "").Replace("-", "");
 
         public static string ToBinanceInterval(TimeInterval interval) => interval switch
         {
@@ -191,10 +206,16 @@ namespace Omnipotent.Services.OmniTrader.MarketData
             TimeInterval.FifteenMinute => "15m",
             TimeInterval.ThirtyMinute => "30m",
             TimeInterval.OneHour => "1h",
+            TimeInterval.TwoHour => "2h",
             TimeInterval.FourHour => "4h",
+            TimeInterval.TwelveHour => "12h",
             TimeInterval.OneDay => "1d",
             TimeInterval.OneWeek => "1w",
-            _ => "1m"
+            TimeInterval.OneMonth => "1M",
+            _ => "1h"
         };
+
+        private static decimal D(JToken? t) => decimal.Parse((string)t!, NumberStyles.Any, CultureInfo.InvariantCulture);
+        private static string Trim(string s) => s.Length <= 200 ? s : s[..200];
     }
 }

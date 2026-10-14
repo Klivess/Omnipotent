@@ -269,7 +269,10 @@ namespace Omnipotent.Services.OmniTrader.Api
                 int count = ParseInt(req.userParameters.Get("count"), 300, 20, 2000);
 
                 var (marketSymbol, assetClass, instrument) = ResolveSymbol(symbol);
-                var candles = await parent.MarketData.GetHistoricalCandlesAsync(marketSymbol, interval, count, assetClass);
+                var fetch = await parent.MarketData.GetChartCandlesAsync(marketSymbol, interval, count, assetClass);
+                var bars = fetch.Closed.Select(c => new { Ts = c.Timestamp, c.Open, c.High, c.Low, c.Close, c.Volume, Forming = false }).ToList();
+                if (fetch.Forming is { } f)
+                    bars.Add(new { Ts = f.Timestamp, f.Open, f.High, f.Low, f.Close, f.Volume, Forming = true });
 
                 await Json(req, new
                 {
@@ -278,13 +281,9 @@ namespace Omnipotent.Services.OmniTrader.Api
                     DisplayName = instrument?.DisplayName ?? marketSymbol,
                     AssetClass = assetClass.ToString(),
                     Interval = interval.ToString(),
-                    // The UI must be able to say whether "live" means a push feed or a poll.
+                    Source = fetch.Source,
                     Streaming = MarketDataRouter.IsStreamingLive(marketSymbol, assetClass),
-                    Candles = candles.Select(c => new
-                    {
-                        Ts = c.Timestamp,
-                        c.Open, c.High, c.Low, c.Close, c.Volume
-                    })
+                    Candles = bars
                 });
             });
 
@@ -319,8 +318,9 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }
 
                 decimal price = await parent.MarketData.GetLatestPriceAsync(marketSymbol, assetClass);
+                // Closed daily bars only: the newest one IS the previous session's close.
                 var recent = await parent.MarketData.GetHistoricalCandlesAsync(marketSymbol, TimeInterval.OneDay, 2, assetClass);
-                decimal previous = recent.Count > 1 ? recent[^2].Close : 0m;
+                decimal previous = recent.Count > 0 ? recent[^1].Close : 0m;
 
                 await Json(req, new
                 {
@@ -1326,10 +1326,10 @@ namespace Omnipotent.Services.OmniTrader.Api
         // ── helpers ───────────────────────────────────────────────────────────────
 
         private Task Get(string path, PermissionDef permission, Func<UserRequest, Task> handler)
-            => parent.CreateAPIRoute(path, handler, HttpMethod.Get, permission);
+            => parent.RegisterRouteAsync(path, handler, HttpMethod.Get, permission);
 
         private Task Post(string path, PermissionDef permission, Func<UserRequest, Task> handler)
-            => parent.CreateAPIRoute(path, handler, HttpMethod.Post, permission);
+            => parent.RegisterRouteAsync(path, handler, HttpMethod.Post, permission);
 
         private static Task Json(UserRequest req, object payload)
             => req.ReturnResponse(JsonConvert.SerializeObject(payload, JsonSettings));
@@ -1582,8 +1582,7 @@ namespace Omnipotent.Services.OmniTrader.Api
         private static int ParseInt(string? raw, int fallback, int min, int max)
             => int.TryParse(raw, out var v) ? Math.Clamp(v, min, max) : fallback;
 
-        private static TimeInterval? ParseInterval(string? raw)
-            => Enum.TryParse<TimeInterval>(raw, true, out var v) ? v : null;
+        private static TimeInterval? ParseInterval(string? raw) => MarketData.CandleClock.Parse(raw);
     }
 
     // ── response DTOs ─────────────────────────────────────────────────────────────

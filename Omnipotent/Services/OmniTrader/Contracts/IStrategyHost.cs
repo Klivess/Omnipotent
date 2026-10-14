@@ -27,6 +27,10 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         /// size target notionals off this; single-symbol callers can keep using QuoteBalance/BaseBalance.</summary>
         decimal Equity { get; }
 
+        /// <summary>Orders accepted but not yet filled: next-open market orders still queued and working
+        /// conditional orders. Hosts that fill synchronously report none.</summary>
+        IReadOnlyList<OrderIntent> WorkingOrders => Array.Empty<OrderIntent>();
+
         void Log(string message);
         void LogError(string message, Exception? ex = null);
     }

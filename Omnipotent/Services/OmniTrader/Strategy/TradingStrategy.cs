@@ -51,8 +51,23 @@ namespace Omnipotent.Services.OmniTrader.Strategy
         /// <summary>Total account equity (cash + marked value of every position).</summary>
         protected decimal Equity => Ctx.Host.Equity;
 
+        /// <summary>Orders accepted but not yet filled (next-open market orders, working stops/limits).</summary>
+        protected IReadOnlyList<OrderIntent> WorkingOrders => Ctx.Host.WorkingOrders;
+
         protected void Log(string msg) => Ctx.Host.Log(msg);
         protected void LogError(string msg, Exception? ex = null) => Ctx.Host.LogError(msg, ex);
+    }
+
+    /// <summary>
+    /// Optional fast path for strategies whose signals are vectorised. In a backtest the engine hands
+    /// the strategy every series in full before the first bar, so indicators are computed once rather
+    /// than per bar. This is only sound because every indicator is causal — value[i] depends on bars
+    /// ≤ i — and the strategy must still only read index ≤ the current bar. Live and paper sessions
+    /// never prime; the strategy computes from its growing history instead.
+    /// </summary>
+    public interface IPrimedStrategy
+    {
+        void Prime(IReadOnlyDictionary<string, IReadOnlyList<OHLCCandle>> series, TimeInterval interval);
     }
 
     [AttributeUsage(AttributeTargets.Class)]

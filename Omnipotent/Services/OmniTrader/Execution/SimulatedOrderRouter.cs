@@ -45,6 +45,10 @@ namespace Omnipotent.Services.OmniTrader.Execution
             // original single-symbol engine. When true, per-symbol books below are used instead and
             // margin/liquidation are evaluated portfolio-wide (gross notional vs equity × leverage).
             public bool PortfolioMode;
+            /// <summary>Portfolio mode only: when <see cref="ExecutionTiming.NextOpen"/>, market orders
+            /// queue in <see cref="PendingMarket"/> and fill at the next bar's open.</summary>
+            public ExecutionTiming Execution = ExecutionTiming.SignalClose;
+            public List<OrderIntent> PendingMarket { get; } = new();
             public Dictionary<string, decimal> BaseBalances { get; } = new(StringComparer.OrdinalIgnoreCase);
             public Dictionary<string, Position> Positions { get; } = new(StringComparer.OrdinalIgnoreCase);
             public Dictionary<string, decimal> Marks { get; } = new(StringComparer.OrdinalIgnoreCase);
@@ -125,6 +129,11 @@ namespace Omnipotent.Services.OmniTrader.Execution
                             intent.Error = $"No mark for {request.Symbol}";
                             return intent;
                         }
+                        if (state.Execution == ExecutionTiming.NextOpen)
+                        {
+                            state.PendingMarket.Add(intent);
+                            break;
+                        }
                         await FillMarketAsync(intent, request, ApplySlippage(mark, request.Side), state.CurrentBarTs);
                         break;
                     }
@@ -150,8 +159,35 @@ namespace Omnipotent.Services.OmniTrader.Execution
         public Task CancelOrderAsync(OrderIntent intent, CancellationToken ct = default)
         {
             state.OpenOrders.RemoveAll(o => o.Id == intent.Id);
+            state.PendingMarket.RemoveAll(o => o.Id == intent.Id);
             intent.Status = OrderStatus.Cancelled;
             return Task.CompletedTask;
+        }
+
+        /// <summary>
+        /// Conditional-order trigger and fill price for one bar, gap-aware: a stop the bar opened
+        /// through fills at the open (worse than the stop), a limit the bar opened through fills at
+        /// the open (better than the limit). Returns null when the order does not trigger.
+        /// </summary>
+        internal static (decimal Price, string Reason)? TriggerPrice(OrderRequest req, OHLCCandle candle)
+        {
+            switch (req.Type)
+            {
+                case OrderType.Limit when req.LimitPrice is { } limit:
+                    if (req.Side == OrderSide.Buy && candle.Low <= limit) return (Math.Min(candle.Open, limit), "limit");
+                    if (req.Side == OrderSide.Sell && candle.High >= limit) return (Math.Max(candle.Open, limit), "limit");
+                    return null;
+                case OrderType.StopLoss when req.StopPrice is { } stop:
+                    if (req.Side == OrderSide.Sell && candle.Low <= stop) return (Math.Min(candle.Open, stop), "stop");
+                    if (req.Side == OrderSide.Buy && candle.High >= stop) return (Math.Max(candle.Open, stop), "stop");
+                    return null;
+                case OrderType.TakeProfit when req.LimitPrice is { } target:
+                    if (req.Side == OrderSide.Sell && candle.High >= target) return (Math.Max(candle.Open, target), "target");
+                    if (req.Side == OrderSide.Buy && candle.Low <= target) return (Math.Min(candle.Open, target), "target");
+                    return null;
+                default:
+                    return null;
+            }
         }
 
         /// <summary>
@@ -175,39 +211,19 @@ namespace Omnipotent.Services.OmniTrader.Execution
                 if (intent.Status != OrderStatus.Open && intent.Status != OrderStatus.PartiallyFilled) continue;
                 if (!state.OpenOrders.Contains(intent)) continue; // OCO sibling already cancelled this bar
                 var req = intent.Request;
-                bool triggered = req.Type switch
-                {
-                    OrderType.Limit => req.Side == OrderSide.Buy
-                        ? candle.Low <= req.LimitPrice
-                        : candle.High >= req.LimitPrice,
-                    OrderType.StopLoss => req.Side == OrderSide.Sell
-                        ? candle.Low <= req.StopPrice
-                        : candle.High >= req.StopPrice,
-                    OrderType.TakeProfit => req.Side == OrderSide.Sell
-                        ? candle.High >= req.LimitPrice
-                        : candle.Low <= req.LimitPrice,
-                    _ => false
-                };
-                if (!triggered) continue;
+                var trigger = TriggerPrice(req, candle);
+                if (trigger == null) continue;
 
-                decimal fillPrice = req.Type switch
-                {
-                    OrderType.Limit => req.LimitPrice!.Value,
-                    OrderType.StopLoss => req.StopPrice!.Value,
-                    OrderType.TakeProfit => req.LimitPrice!.Value,
-                    _ => candle.Close
-                };
-                fillPrice = ApplySlippage(fillPrice, req.Side);
                 state.OpenOrders.Remove(intent);
-                await FillMarketAsync(intent, req, fillPrice, candle.Timestamp);
+                await FillMarketAsync(intent, req, ApplySlippage(trigger.Value.Price, req.Side), candle.Timestamp, trigger.Value.Reason);
             }
         }
 
-        private async Task FillMarketAsync(OrderIntent intent, OrderRequest req, decimal price, DateTime ts)
+        private async Task FillMarketAsync(OrderIntent intent, OrderRequest req, decimal price, DateTime ts, string reason = "market")
         {
             if (state.PortfolioMode)
             {
-                await FillPortfolioAsync(intent, req, price, ts);
+                await FillPortfolioAsync(intent, req, price, ts, reason);
                 return;
             }
 
@@ -284,7 +300,8 @@ namespace Omnipotent.Services.OmniTrader.Execution
                 FilledUtc = ts,
                 Symbol = req.Symbol,
                 StopLoss = req.StopLossPrice,
-                TakeProfit = req.TakeProfitPrice
+                TakeProfit = req.TakeProfitPrice,
+                Reason = reason
             };
             await onFillAsync(fill);
         }
@@ -297,7 +314,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
         /// Margin (&gt;1×) is evaluated portfolio-wide: an increase is rejected if it would push gross
         /// notional beyond equity × leverage.
         /// </summary>
-        private async Task FillPortfolioAsync(OrderIntent intent, OrderRequest req, decimal price, DateTime ts)
+        private async Task FillPortfolioAsync(OrderIntent intent, OrderRequest req, decimal price, DateTime ts, string reason = "market")
         {
             string sym = req.Symbol;
             decimal notional = req.Qty * price;
@@ -373,7 +390,8 @@ namespace Omnipotent.Services.OmniTrader.Execution
                 FilledUtc = ts,
                 Symbol = req.Symbol,
                 StopLoss = req.StopLossPrice,
-                TakeProfit = req.TakeProfitPrice
+                TakeProfit = req.TakeProfitPrice,
+                Reason = reason
             };
             await onFillAsync(fill);
         }
@@ -465,11 +483,24 @@ namespace Omnipotent.Services.OmniTrader.Execution
         {
             DateTime ts = state.CurrentBarTs;
             foreach (var kv in bar)
-            {
-                state.Marks[kv.Key] = kv.Value.Close;
                 if (kv.Value.Timestamp > ts) ts = kv.Value.Timestamp;
-            }
             state.CurrentBarTs = ts;
+
+            // Next-open execution: orders queued at the previous bar's close fill at this bar's open,
+            // with marks at the open so margin checks see the price the order actually traded at.
+            if (state.PendingMarket.Count > 0)
+            {
+                foreach (var kv in bar) state.Marks[kv.Key] = kv.Value.Open;
+                foreach (var intent in state.PendingMarket.ToList())
+                {
+                    if (!bar.TryGetValue(intent.Request.Symbol, out var candle)) continue;
+                    state.PendingMarket.Remove(intent);
+                    if (intent.Status == OrderStatus.Cancelled) continue;
+                    await FillMarketAsync(intent, intent.Request, ApplySlippage(candle.Open, intent.Request.Side), candle.Timestamp);
+                }
+            }
+
+            foreach (var kv in bar) state.Marks[kv.Key] = kv.Value.Close;
 
             if (state.MarginEnabled)
             {
@@ -484,31 +515,11 @@ namespace Omnipotent.Services.OmniTrader.Execution
                 if (!state.OpenOrders.Contains(intent)) continue; // OCO sibling already cancelled this bar
                 var req = intent.Request;
                 if (!bar.TryGetValue(req.Symbol, out var candle)) continue;
-                bool triggered = req.Type switch
-                {
-                    OrderType.Limit => req.Side == OrderSide.Buy
-                        ? candle.Low <= req.LimitPrice
-                        : candle.High >= req.LimitPrice,
-                    OrderType.StopLoss => req.Side == OrderSide.Sell
-                        ? candle.Low <= req.StopPrice
-                        : candle.High >= req.StopPrice,
-                    OrderType.TakeProfit => req.Side == OrderSide.Sell
-                        ? candle.High >= req.LimitPrice
-                        : candle.Low <= req.LimitPrice,
-                    _ => false
-                };
-                if (!triggered) continue;
+                var trigger = TriggerPrice(req, candle);
+                if (trigger == null) continue;
 
-                decimal fillPrice = req.Type switch
-                {
-                    OrderType.Limit => req.LimitPrice!.Value,
-                    OrderType.StopLoss => req.StopPrice!.Value,
-                    OrderType.TakeProfit => req.LimitPrice!.Value,
-                    _ => candle.Close
-                };
-                fillPrice = ApplySlippage(fillPrice, req.Side);
                 state.OpenOrders.Remove(intent);
-                await FillMarketAsync(intent, req, fillPrice, candle.Timestamp);
+                await FillMarketAsync(intent, req, ApplySlippage(trigger.Value.Price, req.Side), candle.Timestamp, trigger.Value.Reason);
             }
         }
 
@@ -576,7 +587,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
                     Status = OrderStatus.Pending,
                     PlacedUtc = DateTime.UtcNow
                 };
-                await FillMarketAsync(intent, req, ApplySlippage(AdversePrice(symbol, b), side), ts);
+                await FillMarketAsync(intent, req, ApplySlippage(AdversePrice(symbol, b), side), ts, "liquidation");
             }
         }
 
@@ -644,7 +655,7 @@ namespace Omnipotent.Services.OmniTrader.Execution
             state.Liquidated = true;
             log?.Invoke($"LIQUIDATION: {(b > 0m ? "long" : "short")} {absB} @ {fillP:F2} " +
                         $"(liqPrice={liqPrice:F2}, {lev:F1}x)");
-            await FillMarketAsync(intent, req, ApplySlippage(fillP, side), candle.Timestamp);
+            await FillMarketAsync(intent, req, ApplySlippage(fillP, side), candle.Timestamp, "liquidation");
         }
 
         private void UpdatePosition(OrderSide side, decimal qty, decimal price, DateTime ts, string symbol)

@@ -52,6 +52,7 @@ namespace Omnipotent.Services.OmniTrader.Strategy.Params
         public static void Apply(object strategy, IReadOnlyDictionary<string, object?>? values)
         {
             if (values == null || values.Count == 0) return;
+            if (strategy is IDynamicParameters dynamic) dynamic.ApplyParameters(values);
             foreach (var (prop, _) in AnnotatedProperties(strategy.GetType()))
             {
                 if (!TryGet(values, prop.Name, out var raw) || raw == null) continue;

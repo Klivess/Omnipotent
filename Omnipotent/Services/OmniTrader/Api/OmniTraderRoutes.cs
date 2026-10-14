@@ -19,7 +19,7 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         public async Task RegisterAsync()
         {
-            await parent.CreateAPIRoute("/api/omnitrader/status", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/status", async req =>
             {
                 var payload = new
                 {
@@ -33,16 +33,16 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(payload));
             }, HttpMethod.Get, OmniTraderPerms.StatusView);
 
-            await parent.CreateAPIRoute("/api/omnitrader/strategies", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/strategies", async req =>
             {
                 var items = parent.StrategyRegistry.All
-                    .Select(d => new { d.Name, d.ClassName, d.Description, d.RequiresUniverse, d.Parameters })
+                    .Select(d => new { d.Name, d.ClassName, d.Description, d.RequiresUniverse, d.Parameters, d.Source, d.StudioId, d.Version, d.Author })
                     .OrderBy(x => x.Name)
                     .ToList();
                 await req.ReturnResponse(JsonConvert.SerializeObject(items));
             }, HttpMethod.Get, OmniTraderPerms.StrategiesRead);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployments", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployments", async req =>
             {
                 string? body = GetDeploymentListSnapshot();
                 if (body == null)
@@ -54,7 +54,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(body, "application/json");
             }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -83,7 +83,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }));
             }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/equity", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/equity", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -96,7 +96,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             // Total account value over time = the summed equity of all deployments of a given mode
             // (default Live = the Kraken account), forward-filled so each deployment contributes its
             // last-known equity from when it first came online.
-            await parent.CreateAPIRoute("/api/omnitrader/portfolio/equity", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/portfolio/equity", async req =>
             {
                 string mode = req.userParameters.Get("mode") ?? "Live";
                 var all = await parent.DeploymentRepo.ListAllAsync();
@@ -118,7 +118,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }));
             }, HttpMethod.Get, OmniTraderPerms.PortfolioRead);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/chart", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/chart", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -174,7 +174,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }));
             }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/ticks", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/ticks", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -188,32 +188,27 @@ namespace Omnipotent.Services.OmniTrader.Api
                 var interval = row.Config.Interval;
 
                 decimal price = 0m;
-                try { price = await parent.MarketData.GetLatestPriceAsync(symbol); } catch { }
-
                 object? forming = null;
-                if (price > 0m)
+                try
                 {
-                    var bucket = BucketStart(DateTime.UtcNow, interval);
-                    decimal open = price, high = price, low = price;
-                    try
+                    var live = await parent.MarketData.GetChartCandlesAsync(symbol, interval, 2);
+                    if (live.Forming is { } f)
                     {
-                        // Merge with the current bucket's cached candle so the bar keeps its open/high/low.
-                        var recent = await parent.MarketData.GetHistoricalCandlesAsync(symbol, interval, 1);
-                        if (recent.Count > 0 && recent[^1].Timestamp == bucket)
-                        {
-                            open = recent[^1].Open;
-                            high = Math.Max(recent[^1].High, price);
-                            low = Math.Min(recent[^1].Low, price);
-                        }
+                        price = f.Close;
+                        forming = new { Timestamp = f.Timestamp, f.Open, f.High, f.Low, f.Close };
                     }
-                    catch { }
-                    forming = new { Timestamp = bucket, Open = open, High = high, Low = low, Close = price };
+                    else if (live.Closed.Count > 0) price = live.Closed[^1].Close;
+                }
+                catch { }
+                if (price <= 0m)
+                {
+                    try { price = await parent.MarketData.GetLatestPriceAsync(symbol); } catch { }
                 }
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Price = price, Forming = forming }));
             }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/create", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/create", async req =>
             {
                 try
                 {
@@ -231,7 +226,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }
             }, HttpMethod.Post, OmniTraderPerms.DeploymentsManage);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/arm-live", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/arm-live", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 string? token = req.userParameters.Get("confirm");
@@ -245,7 +240,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Armed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, OmniTraderPerms.DeploymentsGoLive);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/pause", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/pause", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -254,7 +249,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Paused = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, OmniTraderPerms.DeploymentsControl);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/resume", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/resume", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -263,7 +258,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Resumed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, OmniTraderPerms.DeploymentsControl);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/kill", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/kill", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -272,7 +267,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Killed = ok }), code: ok ? HttpStatusCode.OK : HttpStatusCode.NotFound);
             }, HttpMethod.Post, OmniTraderPerms.DeploymentsManage);
 
-            await parent.CreateAPIRoute("/api/omnitrader/deployment/delete", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/deployment/delete", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -281,7 +276,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Deleted = true }));
             }, HttpMethod.Post, OmniTraderPerms.DeploymentsManage);
 
-            await parent.CreateAPIRoute("/api/omnitrader/backtests", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/backtests", async req =>
             {
                 string? body = GetBacktestListSnapshot();
                 if (body == null)
@@ -293,7 +288,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(body, "application/json");
             }, HttpMethod.Get, OmniTraderPerms.BacktestsRead);
 
-            await parent.CreateAPIRoute("/api/omnitrader/backtest", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/backtest", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -317,7 +312,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }));
             }, HttpMethod.Get, OmniTraderPerms.BacktestsRead);
 
-            await parent.CreateAPIRoute("/api/omnitrader/backtest/create", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/backtest/create", async req =>
             {
                 try
                 {
@@ -334,7 +329,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 }
             }, HttpMethod.Post, OmniTraderPerms.BacktestsRun);
 
-            await parent.CreateAPIRoute("/api/omnitrader/backtest/cancel", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/backtest/cancel", async req =>
             {
                 string? id = req.userParameters.Get("id");
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
@@ -343,7 +338,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { Requested = true }));
             }, HttpMethod.Post, OmniTraderPerms.BacktestsRun);
 
-            await parent.CreateAPIRoute("/api/omnitrader/signals/flowsignal", async req =>
+            await parent.RegisterRouteAsync("/api/omnitrader/signals/flowsignal", async req =>
             {
                 try
                 {
