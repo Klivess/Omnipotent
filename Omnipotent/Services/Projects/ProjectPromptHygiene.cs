@@ -28,7 +28,8 @@ public static class ProjectPromptHygiene
         if (string.Equals(evt.Author, "klives", StringComparison.OrdinalIgnoreCase)
             || evt.Type == ProjectEventTypes.KlivesMessage)
             return true;
-        if (evt.Type is ProjectEventTypes.WakeDiagnostic or ProjectEventTypes.DigestRebuilt or ProjectEventTypes.WakeRetry)
+        if (evt.Type is ProjectEventTypes.WakeDiagnostic or ProjectEventTypes.DigestRebuilt or ProjectEventTypes.WakeRetry
+            or ProjectEventTypes.WakeWaiting)
             return false;
         return !ContainsContextBookkeeping(evt.Text);
     }
@@ -37,7 +38,8 @@ public static class ProjectPromptHygiene
     {
         ArgumentNullException.ThrowIfNull(hit);
         if (hit.Type == ProjectEventTypes.KlivesMessage) return true;
-        if (hit.Type is ProjectEventTypes.WakeDiagnostic or ProjectEventTypes.DigestRebuilt or ProjectEventTypes.WakeRetry)
+        if (hit.Type is ProjectEventTypes.WakeDiagnostic or ProjectEventTypes.DigestRebuilt or ProjectEventTypes.WakeRetry
+            or ProjectEventTypes.WakeWaiting)
             return false;
         return !ContainsContextBookkeeping(hit.Snippet);
     }

@@ -55,7 +55,10 @@ namespace Omnipotent.Services.Projects
         /// accepted the trigger (including the current wake when live steering accepted it), or null
         /// when the agent is unavailable or its bounded steering queue is full.
         /// </summary>
-        public string? Wake(Project project, ProjectAgentRecord agent, string trigger, bool queueIfBusy = true)
+        /// <param name="urgent">Klives just resumed the project: admit past the fleet budget.</param>
+        /// <param name="admissionPriority">Order among deferred wakes when a permit frees (higher first).</param>
+        public string? Wake(Project project, ProjectAgentRecord agent, string trigger, bool queueIfBusy = true,
+            bool urgent = false, int admissionPriority = 0)
         {
             if (project.Status != ProjectStatus.Active || agent.Retired) return null;
             // The caller's record can be a snapshot taken before the agent lost its slot — FinishWake
@@ -89,6 +92,8 @@ namespace Omnipotent.Services.Projects
                         var pending = steerQueue.GetOrAdd(key, _ => new ConcurrentQueue<string>());
                         if (pending.Count < MaxPendingTriggers && !pending.Contains(trigger)) pending.Enqueue(trigger);
                     }
+                    parent.NoteWakeWaiting(project.ProjectID, agent.AgentID, "provider",
+                        $"{ProjectWakeWaiting.AgentLabel(agent.AgentID)} is held while the model provider backs off; it retries {ProjectWakeWaiting.Until(admissionRetryAt, DateTime.UtcNow)}.");
                     return null;
                 }
 
@@ -100,8 +105,13 @@ namespace Omnipotent.Services.Projects
                 // Degraded for a shared provider outage, and its retry deadline would then refuse the
                 // very resume this gate is about to issue. Waiting for a permit is a healthy state
                 // with its own retention, and the gate starts this agent the moment one frees.
-                if (!parent.WakeAdmission.TryAdmit(project.ProjectID, agent.AgentID, trigger, out string capacity))
+                if (!parent.WakeAdmission.TryAdmit(project.ProjectID, agent.AgentID, trigger, out string capacity,
+                        mustAdmit: urgent, priority: admissionPriority))
+                {
+                    parent.NoteWakeWaiting(project.ProjectID, agent.AgentID, "capacity",
+                        $"{ProjectWakeWaiting.AgentLabel(agent.AgentID)} is waiting for LLM capacity ({capacity}). It starts by itself the moment a slot frees.");
                     return null;
+                }
 
                 string wakeID = Guid.NewGuid().ToString("N");
                 var lease = parent.RuntimeState.TryAcquireAgentWakeLease(project.ProjectID, agent.AgentID, wakeID);
@@ -112,6 +122,7 @@ namespace Omnipotent.Services.Projects
                 }
                 active = new ActiveWake(wakeID, lease.Lease.Generation, new CancellationTokenSource());
                 activeWakes[key] = active;
+                parent.ClearWakeWaiting(project.ProjectID, agent.AgentID);
                 // A trigger retained during admission is now in the initial seed. Do not
                 // deliver it again as fresh mid-wake steering and invite repeated actions.
                 if (steerQueue.TryGetValue(key, out var queued))

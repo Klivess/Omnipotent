@@ -296,6 +296,7 @@ namespace Omnipotent.Services.Projects
         public const string WakeDeferred = "wake-deferred";            // retryable infrastructure circuit is open until a typed retry time
         public const string WakeRetry = "wake-retry";                  // inference retry within the same wake; no tool replay
         public const string WakeDiagnostic = "wake-diagnostic";        // model/tool/limit accounting for a completed or interrupted wake
+        public const string WakeWaiting = "wake-waiting";              // a wake could not start yet (LLM capacity, provider backoff) — why the timeline is quiet
         public const string CommanderThought = "commander-thought";    // intermediate prose during a wake
         public const string AgentThought = "agent-thought";            // sub-agent intermediate prose during a wake
         public const string CommanderMessage = "commander-message";    // prose addressed to Klives

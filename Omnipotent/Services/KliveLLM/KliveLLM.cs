@@ -232,6 +232,19 @@ namespace Omnipotent.Services.KliveLLM
         internal static int AIRouterConversationBudget()
             => sharedAIRouterFairUse.ConversationBudget();
 
+        /// <summary>Hold one shared AIRouter slot back from background work while Klives is mid-conversation
+        /// with something that is not a KliveAgent chat (a Project's Commander). Renewed by calling again.</summary>
+        internal static void AIRouterEngageInteractiveReserve(string ownerId, TimeSpan ttl)
+            => sharedAIRouterFairUse.EngageInteractiveReserve(ownerId, ttl);
+
+        internal static void AIRouterReleaseInteractiveReserve(string ownerId)
+            => sharedAIRouterFairUse.ReleaseInteractiveReserve(ownerId);
+
+        /// <summary>The shared envelope's live state — slots in use, queue depth, mode — for surfaces that
+        /// explain to Klives why an agent is waiting.</summary>
+        internal static AIRouterFairUseLimiter.Snapshot AIRouterSnapshot()
+            => sharedAIRouterFairUse.Describe();
+
         /// <summary>
         /// The measured prefix lifetime the shared envelope is scheduling against, or null while the
         /// curve is still guessing. Prompt assembly needs this to tell a continuation whose prefix is

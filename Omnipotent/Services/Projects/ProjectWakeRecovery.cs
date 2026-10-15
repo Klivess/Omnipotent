@@ -51,6 +51,16 @@ internal sealed class ProjectWakeRecovery
 
     internal static string DependencyKey(string agentID) => ProjectProviderFailure.DependencyKey + ":" + agentID;
 
+    /// <summary>
+    /// How long the keepalive rests a Commander after <paramref name="consecutiveFailures"/> failed wakes in a
+    /// row: 5, 10, 20, 40, 80, then 120 minutes. It used to start at 30 and double to four hours, so two
+    /// transient infrastructure failures alone left a project silent for half an hour. A deterministic bug
+    /// still backs off geometrically; Klives' messages and resume skip the rest entirely.
+    /// </summary>
+    internal static TimeSpan KeepaliveBackoff(int consecutiveFailures) =>
+        consecutiveFailures < 2 ? TimeSpan.Zero
+            : TimeSpan.FromMinutes(Math.Min(120, 5 * Math.Pow(2, consecutiveFailures - 2)));
+
     // Authentication, account credit and rate limits can affect every route. A bad model/request
     // or a transient failure on one worker's route must not take healthy teammates offline.
     internal static bool IsSharedFailure(RemoteLLMException ex) => ex.Kind is

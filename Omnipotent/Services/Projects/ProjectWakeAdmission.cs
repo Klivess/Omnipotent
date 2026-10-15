@@ -36,9 +36,10 @@ public sealed class ProjectWakeAdmission
     internal const int WarmRestartFloor = 3;
 
     /// <summary>How long one extra conversation must prove itself before the next is admitted while
-    /// the survival curve is still guessing. Long enough for a cold conversation to take a turn, miss,
-    /// re-prefill and come back warm.</summary>
-    internal static readonly TimeSpan RampStep = TimeSpan.FromMinutes(3);
+    /// the survival curve is still guessing: about one cold first turn (60–120s on this router), which is
+    /// also the pace the AIRouter cold stagger admits them at anyway. It was three minutes, which left a
+    /// freshly restarted fleet crawling back for the better part of half an hour after every deploy.</summary>
+    internal static readonly TimeSpan RampStep = TimeSpan.FromSeconds(90);
 
     /// <summary>
     /// A wake stops counting against the budget once it has gone this long without a model turn.
@@ -58,7 +59,8 @@ public sealed class ProjectWakeAdmission
 
     /// <summary>One deferred wake. The trigger is retained so the resume is the wake that was asked
     /// for, not a generic nudge that loses why it was woken.</summary>
-    public readonly record struct DeferredWake(string ProjectID, string AgentID, string Trigger, DateTime QueuedAt)
+    public readonly record struct DeferredWake(string ProjectID, string AgentID, string Trigger, DateTime QueuedAt,
+        int Priority = 0)
     {
         public bool IsCommander => string.Equals(AgentID, CommanderAgentID, StringComparison.Ordinal);
     }
@@ -177,8 +179,12 @@ public sealed class ProjectWakeAdmission
     /// a reply is not, and the AIRouter scheduler makes the same exemption one layer down for exactly
     /// the same reason. Going one over the budget for a message costs a fraction of what it protects.
     /// </param>
+    /// <param name="priority">
+    /// Order among deferred wakes when a permit frees: higher first. A project Klives has just resumed
+    /// should restart ahead of background heartbeats, without overriding the budget itself.
+    /// </param>
     public bool TryAdmit(string projectID, string agentID, string trigger, out string reason,
-        bool mustAdmit = false)
+        bool mustAdmit = false, int priority = 0)
     {
         reason = "";
         if (string.IsNullOrWhiteSpace(projectID) || string.IsNullOrWhiteSpace(agentID)) return true;
@@ -206,7 +212,7 @@ public sealed class ProjectWakeAdmission
 
             reason = $"{active} of {budget} live conversations ({source}); "
                    + "starting another would push consecutive turns past the prompt-cache lifetime";
-            Defer(key, projectID, agentID, trigger, now);
+            Defer(key, projectID, agentID, trigger, now, priority);
             return false;
         }
     }
@@ -217,13 +223,16 @@ public sealed class ProjectWakeAdmission
         return new LiveWake { ProjectID = projectID, AgentID = agentID, AdmittedAt = now, LastTurnAt = now };
     }
 
-    private void Defer(string key, string projectID, string agentID, string trigger, DateTime now)
+    private void Defer(string key, string projectID, string agentID, string trigger, DateTime now, int priority = 0)
     {
         // A re-deferral keeps its ORIGINAL queue time: the wait is what earns the next free permit,
         // and restarting the clock on every retry would let a busy project starve a quiet one forever.
-        DateTime queuedAt = deferred.TryGetValue(key, out DeferredWake existing) ? existing.QueuedAt : now;
-        if (!deferred.ContainsKey(key) && deferred.Count >= MaxDeferred) return;
-        deferred[key] = new DeferredWake(projectID, agentID, trigger, queuedAt);
+        // Its priority only ever rises: a heartbeat re-deferring must not demote a resume.
+        bool known = deferred.TryGetValue(key, out DeferredWake existing);
+        DateTime queuedAt = known ? existing.QueuedAt : now;
+        int effectivePriority = known ? Math.Max(existing.Priority, priority) : priority;
+        if (!known && deferred.Count >= MaxDeferred) return;
+        deferred[key] = new DeferredWake(projectID, agentID, trigger, queuedAt, effectivePriority);
     }
 
     /// <summary>Record a model turn, so a conversation in a long tool call stops holding a permit it
@@ -314,7 +323,8 @@ public sealed class ProjectWakeAdmission
         var busy = new HashSet<string>(live.Values.Select(wake => wake.ProjectID), StringComparer.Ordinal);
         var promoted = new List<DeferredWake>();
         foreach (DeferredWake candidate in deferred.Values
-            .OrderBy(wake => busy.Contains(wake.ProjectID) ? 1 : 0)
+            .OrderByDescending(wake => wake.Priority)
+            .ThenBy(wake => busy.Contains(wake.ProjectID) ? 1 : 0)
             .ThenBy(wake => wake.IsCommander ? 0 : 1)
             .ThenBy(wake => wake.QueuedAt)
             .ToList())

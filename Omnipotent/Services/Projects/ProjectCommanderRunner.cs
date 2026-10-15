@@ -40,6 +40,15 @@ namespace Omnipotent.Services.Projects
         // so they do not incorrectly mark the wake as requiring a human-facing Discord reply.
         private readonly ConcurrentDictionary<string, ConcurrentQueue<string>> agentSteerQueue = new(StringComparer.Ordinal);
 
+        // What the instant-reply front desk already told Klives, shown to the Commander at its next turn
+        // boundary so its own reply carries substance instead of a second acknowledgement.
+        private sealed record InstantReplyNote(string Text, DateTime At);
+        private readonly ConcurrentDictionary<string, ConcurrentQueue<InstantReplyNote>> instantReplies = new(StringComparer.Ordinal);
+
+        /// <summary>Model turns sent at interactive priority after Klives speaks, until the Commander answers
+        /// him. Bounded: a wake can run for hours and must not hold the front of the queue that long.</summary>
+        internal const int KlivesInteractiveTurns = 3;
+
         // The live wake's cancellation source per project, so Klives can halt an in-flight wake
         // (pause/archive) instead of waiting for it to run itself out.
         private readonly ConcurrentDictionary<string, CancellationTokenSource> activeWakeCts = new(StringComparer.Ordinal);
@@ -132,10 +141,20 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public bool HasLiveWake(string projectID) => activeWakeCts.ContainsKey(projectID);
 
+        /// <summary>Records an instant reply already sent to Klives, for the Commander's next turn.</summary>
+        public void NoteInstantReply(string projectID, string reply)
+        {
+            if (string.IsNullOrWhiteSpace(projectID) || string.IsNullOrWhiteSpace(reply)) return;
+            var queue = instantReplies.GetOrAdd(projectID, _ => new ConcurrentQueue<InstantReplyNote>());
+            while (queue.Count >= 4 && queue.TryDequeue(out _)) { }
+            queue.Enqueue(new InstantReplyNote(reply, DateTime.UtcNow));
+        }
+
         public bool CancelActiveWake(string projectID)
         {
             steerQueue.TryRemove(projectID, out _);
             agentSteerQueue.TryRemove(projectID, out _);
+            instantReplies.TryRemove(projectID, out _);
             pendingTriggers.TryRemove(projectID, out _);
             if (activeWakeCts.TryGetValue(projectID, out var cts))
             {
@@ -173,16 +192,21 @@ namespace Omnipotent.Services.Projects
         /// project, the trigger is queued and re-wakes the Commander when the active wake ends
         /// (returns null) — one wake at a time, per §7, but no stimulus is ever dropped.
         /// </summary>
-        public string? Wake(Project project, string triggerDescription, bool queueIfBusy = true)
+        /// <param name="urgent">
+        /// Klives is waiting on this wake without having written a message — he pressed resume. It is
+        /// admitted past the fleet budget and its first model turn goes at interactive priority, exactly
+        /// like a reply to him, instead of queueing behind every background wake in the fleet.
+        /// </param>
+        public string? Wake(Project project, string triggerDescription, bool queueIfBusy = true, bool urgent = false)
         {
             // Planning projects wake too (to draft the Grand Plan and field Klives' messages);
             // execution tools stay gated until the plan is approved and the project flips Active.
             if (project.Status is not (ProjectStatus.Active or ProjectStatus.Planning)) return null;
             lock (WakeGate(project.ProjectID))
-                return WakeLocked(project, triggerDescription, queueIfBusy);
+                return WakeLocked(project, triggerDescription, queueIfBusy, urgent);
         }
 
-        private string? WakeLocked(Project project, string triggerDescription, bool queueIfBusy)
+        private string? WakeLocked(Project project, string triggerDescription, bool queueIfBusy, bool urgent = false)
         {
             var digest = parent.Digests.GetDigest(project.ProjectID);
             if (!string.IsNullOrWhiteSpace(digest.ActiveWakeID))
@@ -199,17 +223,38 @@ namespace Omnipotent.Services.Projects
 
             string wakeID = Guid.NewGuid().ToString("N");
             var runtime = parent.RuntimeState.Get(project.ProjectID);
+            // Klives writing (or pressing resume) is itself the instruction to try again now. A backoff
+            // left by earlier failures — up to fifteen minutes for an open circuit — used to hold his
+            // message in the inbox for the whole of it. One probe costs a failed request at worst; if the
+            // cause persists, the probe defers again on its own and the backoff resumes from there.
+            bool klivesWaiting = urgent || TriggeredByKlives(triggerDescription);
+            if (klivesWaiting && (ProjectWakeRecovery.BlockedUntil(runtime, "commander", DateTime.UtcNow) != null
+                                  || runtime.Health.Circuit.Status == ProjectCircuitStatus.Open))
+            {
+                parent.RuntimeState.ClearProviderAdmission(project.ProjectID);
+                if (runtime.Health.Circuit.Status == ProjectCircuitStatus.Open)
+                    parent.RuntimeState.CloseCircuit(project.ProjectID, halfOpen: true);
+                runtime = parent.RuntimeState.Get(project.ProjectID);
+            }
             if (ProjectWakeRecovery.BlockedUntil(runtime, "commander", DateTime.UtcNow) is { } admissionRetryAt)
             {
                 parent.RuntimeState.DeferProviderAdmission(project.ProjectID, "commander", admissionRetryAt);
                 if (queueIfBusy)
                     parent.RuntimeState.EnqueueTrigger(project.ProjectID, TriggerFor(triggerDescription));
+                parent.NoteWakeWaiting(project.ProjectID, "commander", "provider",
+                    $"The Commander is held while the model provider backs off; it retries {ProjectWakeWaiting.Until(admissionRetryAt, DateTime.UtcNow)}.");
                 return null;
             }
             if (runtime.Health.Circuit.Status == ProjectCircuitStatus.Open)
             {
                 if (!runtime.Health.Circuit.RetryAt.HasValue || runtime.Health.Circuit.RetryAt > DateTime.UtcNow)
+                {
+                    parent.NoteWakeWaiting(project.ProjectID, "commander", "circuit",
+                        runtime.Health.Circuit.RetryAt is { } circuitRetry
+                            ? $"The Commander is paused after repeated failures; it retries {ProjectWakeWaiting.Until(circuitRetry, DateTime.UtcNow)}."
+                            : "The Commander is paused after repeated failures until the cause is cleared (resume the project to retry now).");
                     return null;
+                }
                 parent.RuntimeState.CloseCircuit(project.ProjectID, halfOpen: true);
             }
 
@@ -218,10 +263,12 @@ namespace Omnipotent.Services.Projects
             // throughput, it takes every live conversation cold. The trigger stays in the durable
             // inbox and the gate starts this Commander as soon as a permit frees.
             if (!parent.WakeAdmission.TryAdmit(project.ProjectID, ProjectWakeAdmission.CommanderAgentID,
-                    triggerDescription, out string capacity, mustAdmit: TriggeredByKlives(triggerDescription)))
+                    triggerDescription, out string capacity, mustAdmit: klivesWaiting))
             {
                 if (queueIfBusy)
                     parent.RuntimeState.EnqueueTrigger(project.ProjectID, TriggerFor(triggerDescription));
+                parent.NoteWakeWaiting(project.ProjectID, "commander", "capacity",
+                    $"The Commander is waiting for LLM capacity ({capacity}). It starts by itself the moment a slot frees.");
                 return null;
             }
 
@@ -244,8 +291,10 @@ namespace Omnipotent.Services.Projects
 
             try
             {
-                digest.ActiveWakeID = wakeID; // legacy/UI mirror; runtime lease is authoritative
-                parent.Digests.SaveDigest(digest);
+                // Legacy/UI mirror; runtime lease is authoritative. Merged in place: a background digest
+                // rebuild may be writing the narrative fields of the same file right now.
+                parent.Digests.Update(project.ProjectID, d => d.ActiveWakeID = wakeID);
+                parent.ClearWakeWaiting(project.ProjectID, "commander");
                 parent.EventLog.Append(new ProjectEvent
                 {
                     ProjectID = project.ProjectID,
@@ -270,16 +319,17 @@ namespace Omnipotent.Services.Projects
                 }
                 parent.RuntimeState.ReleaseWakeLease(project.ProjectID, wakeID, acquired.Lease.Generation);
                 parent.WakeAdmission.Release(project.ProjectID, ProjectWakeAdmission.CommanderAgentID);
-                if (digest.ActiveWakeID == wakeID) { digest.ActiveWakeID = null; parent.Digests.SaveDigest(digest); }
+                parent.Digests.Update(project.ProjectID, d => { if (d.ActiveWakeID == wakeID) d.ActiveWakeID = null; });
                 throw;
             }
 
-            _ = Task.Run(() => ExecuteWakeAsync(project, wakeID, acquired.Lease.Generation, effectiveTrigger, claimedTriggerID));
+            _ = Task.Run(() => ExecuteWakeAsync(project, wakeID, acquired.Lease.Generation, effectiveTrigger, claimedTriggerID,
+                urgent));
             return wakeID;
         }
 
         private async Task ExecuteWakeAsync(Project project, string wakeID, long leaseGeneration, string triggerDescription,
-            string? claimedTriggerID)
+            string? claimedTriggerID, bool urgent = false)
         {
             string projectID = project.ProjectID;
             long wakeStartSeq = parent.EventLog.GetLastSequence(projectID);
@@ -318,6 +368,9 @@ namespace Omnipotent.Services.Projects
             // owed but never sent is how the Commander reads as unresponsive: every exit path below
             // must either carry prose to him or leave this false for the closing backstop.
             bool repliedToKlives = false;
+            // Turns that go to the front of the shared LLM queue because Klives is waiting on them.
+            int interactiveTurns = klivesInvolved ? KlivesInteractiveTurns : urgent ? 1 : 0;
+            bool instantRepliesOn = false;
             // Set once the provider is resolved; read by the RemoteLLMException handler below, which
             // is outside the scope the LLM service is declared in. A flat-fee router's rate limit is a
             // one-minute fair-use window, not a spent balance, and must not stand the project down for
@@ -347,6 +400,7 @@ namespace Omnipotent.Services.Projects
                 }
 
                 var settings = parent.Settings.Get(projectID);
+                instantRepliesOn = settings.InstantRepliesEnabled;
                 var modelRoutes = settings.CommanderRoutes.ToList();
                 if (modelRoutes.Count == 0) throw new InvalidOperationException("Commander has no configured model routes.");
                 // Index 0 is the primary. These routes are sent to whichever router KliveLLM's
@@ -422,9 +476,13 @@ namespace Omnipotent.Services.Projects
 
                 if (klivesInvolved)
                 {
-                    llm.AppendUserMessageToToolSession(sessionId,
-                        "Klives is waiting on an answer. Call reply_to_klives on your FIRST turn, then get on with the work — " +
-                        "this wake may run for hours and he should not have to wait that long to hear from you.");
+                    llm.AppendUserMessageToToolSession(sessionId, instantRepliesOn
+                        ? "Klives is waiting on an answer. He has already been sent an instant acknowledgement in your voice " +
+                          "(it appears in the conversation as your message). Do not acknowledge again: call reply_to_klives with " +
+                          "substance — the answer, the result, or a decision — on your FIRST turn if you can answer from what you " +
+                          "know, otherwise straight after the first piece of work that answers him. This wake may run for hours."
+                        : "Klives is waiting on an answer. Call reply_to_klives on your FIRST turn, then get on with the work — " +
+                          "this wake may run for hours and he should not have to wait that long to hear from you.");
                     if (!promptStart.Continued) protectedBriefMessages++;
                 }
                 var approvedPlan = parent.GrandPlans.GetCurrentApproved(projectID)?.Content;
@@ -491,9 +549,22 @@ namespace Omnipotent.Services.Projects
                         {
                             llm.AppendUserMessageToToolSession(sessionId,
                                 $"STEERING FROM KLIVES (mid-wake — take this into account now): {steer.Text}\n" +
-                                "He is waiting on an answer: call reply_to_klives THIS turn, then carry on working. Do not save your response for the end of the wake.");
+                                (instantRepliesOn
+                                    ? "He has been sent an instant acknowledgement in your voice. Act on this now; call reply_to_klives with the substance — the answer, the result, or a question — as soon as you have it, this turn if you already can."
+                                    : "He is waiting on an answer: call reply_to_klives THIS turn, then carry on working. Do not save your response for the end of the wake."));
                             klivesInvolved = true;
                             repliedToKlives = false; // a new message earns its own answer
+                            interactiveTurns = KlivesInteractiveTurns;
+                        }
+
+                    if (instantReplies.TryGetValue(projectID, out var notes))
+                        while (notes.TryDequeue(out var note))
+                        {
+                            if (DateTime.UtcNow - note.At > TimeSpan.FromMinutes(30)) continue; // stale: the event log has it
+                            llm.AppendUserMessageToToolSession(sessionId,
+                                $"(For your awareness) Seconds after Klives' latest message you sent him this instant reply: \"{note.Text}\" " +
+                                "Do not repeat or re-acknowledge it. Act on his message; use reply_to_klives for the substance " +
+                                "(the result, the answer that needed checking, or a question).");
                         }
 
                     if (agentSteerQueue.TryGetValue(projectID, out var aq))
@@ -526,6 +597,11 @@ namespace Omnipotent.Services.Projects
                             using var modelTurn = parent.WakeAdmission.BeginModelTurn(
                                 projectID, ProjectWakeAdmission.CommanderAgentID);
                             parent.Activity.BeginThinking(projectID, "commander", "commander", model);
+                            // Klives waiting on this turn puts it at the front of the shared queue, in every
+                            // scheduler mode; otherwise the session's own class (agent) applies.
+                            KliveLLM.AIRouterWorkClass? turnClass = interactiveTurns > 0
+                                ? KliveLLM.AIRouterWorkClass.Interactive : null;
+                            if (interactiveTurns > 0) interactiveTurns--;
                             resp = await providerRecovery.ExecuteAsync(async () =>
                             {
                                 var response = await llm.QueryToolSessionAsync(sessionId, toolDefs,
@@ -537,7 +613,8 @@ namespace Omnipotent.Services.Projects
                                 contextWindowTokensOverride: contextPolicy?.ContextWindowTokens,
                                 enableOpenRouterContextCompression: contextPolicy != null,
                                 samplingParameters: routeSampling,
-                                compactProtectPrefixMessages: protectedBriefMessages);
+                                compactProtectPrefixMessages: protectedBriefMessages,
+                                workClass: turnClass);
                                 if (!response.Success)
                                     throw ProjectProviderFailure.FromUnsuccessfulResponse(response.ErrorMessage, response.Model ?? model, maxOutputTokens);
                                 return response;
@@ -910,7 +987,7 @@ namespace Omnipotent.Services.Projects
                         if (actionTrail.Count > ProjectsContextBudget.WakeTailActions) actionTrail.RemoveAt(0);
                         // The Commander answered him inside the wake, so the closing backstop below
                         // must not append a second, redundant reply on top of it.
-                        if (toolName == "reply_to_klives" && result.Succeeded) repliedToKlives = true;
+                        if (toolName == "reply_to_klives" && result.Succeeded) { repliedToKlives = true; interactiveTurns = 0; }
 
                         // Vision return: the post-action screenshot rides a follow-up user message
                         // (tool-result image support is inconsistent across providers — same
@@ -1096,27 +1173,23 @@ namespace Omnipotent.Services.Projects
                         repliedToKlives = true;
                     }
 
-                    // Refresh budget/org in the digest, then compact — never in the hot path.
-                    //
-                    // Skipped when Klives cancelled this wake. The rebuild is a full utility-model
-                    // round trip and it runs BEFORE the single-flight marker is released below, so on
-                    // a pause it sits squarely between Klives pressing resume and the replacement wake
-                    // being allowed to start. Nothing is lost: the digest watermark is sequence-based,
-                    // so the next wake's rebuild covers this wake's events as well.
-                    if (modelResponses > 0 && outcome != ProjectEventTypes.WakeCancelled)
-                        await parent.RebuildDigestAfterWakeAsync(project, wakeStartSeq);
+                    // The digest rebuild no longer runs here. It is a full utility-model round trip at the
+                    // lowest priority in the AIRouter queue, and it used to sit in front of the release
+                    // below — so Klives' next message, a worker's report or a resume all waited for it.
+                    // It is scheduled after the next wake has been started (see the end of this block);
+                    // its digest writes are merged, so it can safely run beside that wake.
                 }
                 catch { /* never mask the wake outcome */ }
 
-                // Hold the single-flight marker through the complete postamble. Clearing it before
-                // the outcome and digest writes allowed a replacement wake to overlap those state
-                // mutations. The wake ID check fences a stale finally block defensively.
+                // Hold the single-flight marker through the outcome writes above. The wake ID check
+                // fences a stale finally block defensively.
                 lock (WakeGate(projectID))
                 {
-                    var digest = parent.Digests.GetDigest(projectID);
-                    digest.RecentStuckLoopTrips = stuckTrips;
-                    if (digest.ActiveWakeID == wakeID) digest.ActiveWakeID = null;
-                    parent.Digests.SaveDigest(digest);
+                    parent.Digests.Update(projectID, digest =>
+                    {
+                        digest.RecentStuckLoopTrips = stuckTrips;
+                        if (digest.ActiveWakeID == wakeID) digest.ActiveWakeID = null;
+                    });
                 }
 
                 long? verifiedProgressSequence = parent.EventLog.ReadSince(projectID, wakeStartSeq, max: 2000)
@@ -1179,7 +1252,41 @@ namespace Omnipotent.Services.Projects
                 else
                     parent.ResumeDeferredWakes(
                         parent.WakeAdmission.Release(projectID, ProjectWakeAdmission.CommanderAgentID));
+
+                // A productive Commander that stops while open work remains, with nobody else on it, is
+                // re-woken within a minute — while its prompt prefix is still warm — instead of idling
+                // until the 14-minute keepalive and then paying a cold restart.
+                if (!rollsStraightOn && outcome == ProjectEventTypes.WakeCompleted && productiveActions > 0 && !endedAtWorkSlice)
+                    ScheduleMomentum(project, wakeStartSeq);
+
+                // Refresh the standing digest in the background now that the next wake (if any) is
+                // already on its way. Skipped for a cancelled wake (Klives paused it): the watermark is
+                // sequence-based, so the next rebuild covers these events anyway.
+                if (modelResponses > 0 && outcome != ProjectEventTypes.WakeCancelled)
+                    parent.ScheduleDigestRebuild(project, wakeStartSeq);
             }
+        }
+
+        /// <summary>Queues the momentum follow-up described in <see cref="ProjectMomentum"/>, if it applies.</summary>
+        private void ScheduleMomentum(Project project, long wakeStartSeq)
+        {
+            try
+            {
+                string projectID = project.ProjectID;
+                var fresh = parent.Store.GetProject(projectID);
+                bool armedHook = parent.EventLog.ReadSince(projectID, wakeStartSeq, max: 2000)
+                    .Any(e => e.Type == ProjectEventTypes.HookChanged);
+                if (!ProjectMomentum.ShouldContinue(
+                        parent.Settings.Get(projectID).MomentumEnabled,
+                        fresh?.Status,
+                        parent.RuntimeState.HasOpenSteps(projectID),
+                        parent.SubAgentRunner.HasLiveWake(projectID),
+                        parent.Gates.ListPending(projectID).Count,
+                        armedHook))
+                    return;
+                parent.RuntimeState.EnqueueTrigger(projectID, ProjectMomentum.CreateTrigger(DateTime.UtcNow));
+            }
+            catch { /* momentum is an optimisation; the keepalive still covers the project */ }
         }
 
         /// <summary>Renews productive work in a fresh context. There is deliberately no continuation
@@ -1444,6 +1551,7 @@ namespace Omnipotent.Services.Projects
                 : text.StartsWith("Continuation:", StringComparison.Ordinal)
                     || text.StartsWith("Automatic context rollover:", StringComparison.Ordinal)
                     || text.StartsWith("Continue the active assignment", StringComparison.Ordinal)
+                    || text.StartsWith(ProjectMomentum.TriggerPrefix, StringComparison.Ordinal)
                     ? ProjectWakeTriggerKind.Continuation
                 : text.Contains("watchdog", StringComparison.OrdinalIgnoreCase) ? ProjectWakeTriggerKind.Recovery
                 : text.Contains("sub-agent", StringComparison.OrdinalIgnoreCase) ? ProjectWakeTriggerKind.AgentMessage

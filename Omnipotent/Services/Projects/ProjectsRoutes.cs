@@ -529,9 +529,12 @@ namespace Omnipotent.Services.Projects
                         PayloadJson = ProjectLifecycleEvents.Payload(
                             fromStatus, project.Status, wasBlocked ? "unblock" : "manual-resume"),
                     });
+                    // Urgent: Klives is watching this project restart, so the Commander skips the fleet's
+                    // conversation budget and its first turn goes at interactive priority.
                     parent.CommanderRunner.Wake(project, wasPlanning
                         ? "Project resumed by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
-                        : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.");
+                        : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.",
+                        urgent: true);
                     // Pause cancelled every worker's in-flight wake too, and nothing else brings them
                     // back: the heartbeat only nudges an agent once its quiet period (20 min, doubling
                     // to 4 h) has elapsed since its LAST wake — which the cancelled one just reset.
@@ -1651,6 +1654,19 @@ namespace Omnipotent.Services.Projects
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, ProjectsPerms.AgentsMessage);
+
+            // What each agent is doing, or why it is not and when it next runs. Live state (admission
+            // queue, provider backoff, the wall clock), so it is never served from the response cache.
+            await parent.RegisterHttpRouteAsync("/projects/schedule", async req =>
+            {
+                CacheDeps.MarkUncacheable("Live wake schedule");
+                try
+                {
+                    if (!RequireProject(req, out var project)) return;
+                    await req.ReturnResponse(Json(ProjectSchedule.Describe(parent, project!.ProjectID, DateTime.UtcNow)));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
             // ── Approvals ──
             await parent.RegisterHttpRouteAsync("/projects/gates", async req =>

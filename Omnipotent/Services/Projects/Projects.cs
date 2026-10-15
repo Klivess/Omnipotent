@@ -71,6 +71,9 @@ namespace Omnipotent.Services.Projects
         public ProjectGateManager Gates { get; private set; } = null!;
         public ProjectSubAgentManager SubAgents { get; private set; } = null!;
         public ProjectCommanderRunner CommanderRunner { get; private set; } = null!;
+        /// <summary>Answers Klives' chat messages within seconds, in the Commander's voice, while the working
+        /// loop picks them up (<see cref="ProjectSettings.InstantRepliesEnabled"/>).</summary>
+        public ProjectFrontDesk FrontDesk { get; private set; } = null!;
         // ── Phase 4: stimulus bus ──
         public StimulusHookStore Hooks { get; private set; } = null!;
         public StimulusQueue StimulusQueue { get; private set; } = null!;
@@ -317,6 +320,7 @@ namespace Omnipotent.Services.Projects
             SubAgents = new ProjectSubAgentManager(Store, EventLog);
             CommanderRunner = new ProjectCommanderRunner(this);
             SubAgentRunner = new ProjectSubAgentRunner(this);
+            FrontDesk = new ProjectFrontDesk(this);
             // Lets the runtime-state store repair a corrupt state file without ever dropping a lease
             // a live wake is still using. Until this is set the store treats "live wake" as unknown
             // and refuses to rebuild, which is the safe default.
@@ -731,6 +735,42 @@ namespace Omnipotent.Services.Projects
             }
         }
 
+        // projectID/agentID → (reason kind, when it was last written to the timeline).
+        private readonly ConcurrentDictionary<string, (string Kind, DateTime At)> wakeWaitingNotes = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Writes one timeline note saying why an agent is not working: waiting for LLM capacity, held by a
+        /// provider backoff, resting after failures. Before this, a refused wake left nothing behind, so a
+        /// project that was correctly queued looked exactly like one that had silently stalled. A note is
+        /// written when the reason changes, or again after a long silence — never once per keepalive tick.
+        /// </summary>
+        public void NoteWakeWaiting(string projectID, string agentID, string kind, string text)
+        {
+            try
+            {
+                string key = projectID + "/" + agentID;
+                DateTime now = DateTime.UtcNow;
+                if (wakeWaitingNotes.TryGetValue(key, out var last)
+                    && last.Kind == kind && now - last.At < ProjectWakeWaiting.RepeatAfter)
+                    return;
+                wakeWaitingNotes[key] = (kind, now);
+                EventLog.Append(new ProjectEvent
+                {
+                    ProjectID = projectID,
+                    AgentID = agentID,
+                    Type = ProjectEventTypes.WakeWaiting,
+                    Author = "system",
+                    Text = text,
+                    PayloadJson = JsonConvert.SerializeObject(new { reason = kind }),
+                });
+            }
+            catch { /* a diagnostic note must never break the wake path */ }
+        }
+
+        /// <summary>The agent is working again: the next refusal is news and gets its own note.</summary>
+        public void ClearWakeWaiting(string projectID, string agentID) =>
+            wakeWaitingNotes.TryRemove(projectID + "/" + agentID, out _);
+
         /// <summary>
         /// Reports a project whose keepalive slice threw, without letting the log drown. A corrupt
         /// runtime state throws on EVERY tick — four times a minute, per project — so this is rate
@@ -768,10 +808,7 @@ namespace Omnipotent.Services.Projects
             bool resumeDue = ProjectLoopRecovery.RetryDue(runtime.Checkpoint.ResumeAction, now, lastWake?.Timestamp);
             bool failureBackoff = false;
             if (consecutiveFailures >= 2 && !providerRetryDue && !resumeDue)
-            {
-                var backoff = TimeSpan.FromMinutes(Math.Min(240, 15 * Math.Pow(2, consecutiveFailures - 1)));
-                failureBackoff = now - outcomes[^1].Timestamp < backoff;
-            }
+                failureBackoff = now - outcomes[^1].Timestamp < ProjectWakeRecovery.KeepaliveBackoff(consecutiveFailures);
 
             // Durable work is queued, admission is open, and no wake is running: start one NOW
             // rather than waiting out the 14-minute floor below. Every caller that enqueues a
@@ -784,6 +821,12 @@ namespace Omnipotent.Services.Projects
                 && runtime.PendingTriggers.Any(t => t.ClaimedByWakeID == null
                     && ProjectRuntimeStateStore.EvaluateApplicability(t, runtime, now)
                         == ProjectWakeTriggerApplicability.Applicable);
+
+            if (failureBackoff && (lastWake == null || now - lastWake.Timestamp > TimeSpan.FromMinutes(14)))
+                NoteWakeWaiting(project.ProjectID, "commander", "failure-backoff",
+                    $"The Commander is resting after {consecutiveFailures} failed wakes in a row; it tries again "
+                    + $"{ProjectWakeWaiting.Until(outcomes[^1].Timestamp + ProjectWakeRecovery.KeepaliveBackoff(consecutiveFailures), now)}. "
+                    + "Message it or resume the project to retry immediately.");
 
             // If nothing has woken it in the last ~15 min, nudge it to reassess and act.
             if (!failureBackoff && !ProjectLoopRecovery.DefersAutomaticWake(runtime.Checkpoint.ResumeAction, now)
@@ -815,7 +858,13 @@ namespace Omnipotent.Services.Projects
         {
             if (project.Status != ProjectStatus.Active) return;   // Planning has no task force yet
             if (!Budget.IsWithinTokenBudget(project.ProjectID)) return;
-            foreach (var agent in SubAgents.ListActive(project.ProjectID))
+            // Klives pressing resume is a request for THIS project to run now. The agents carrying live
+            // milestones restart first and skip the fleet budget (a bounded few); the rest keep the budget
+            // but go to the front of its queue, ahead of every background heartbeat in the fleet.
+            int urgentLeft = ResumeUrgentWorkers;
+            foreach (var agent in SubAgents.ListActive(project.ProjectID)
+                .OrderByDescending(a => a.ActiveMilestoneIDs.Count)
+                .ThenByDescending(a => a.MissionKind == ProjectAgentMissionKind.Standing))
             {
                 try
                 {
@@ -828,14 +877,20 @@ namespace Omnipotent.Services.Projects
                     if (agent.WorkStatus == ProjectAgentWorkStatus.Idle
                         && agent.ActiveMilestoneIDs.Count == 0
                         && string.IsNullOrWhiteSpace(agent.Objective)) continue;
-                    SubAgentRunner.Wake(project, agent,
+                    bool urgent = urgentLeft > 0;
+                    string? wakeID = SubAgentRunner.Wake(project, agent,
                         "Project resumed by Klives — your wake was halted by the pause, not by you finishing. "
                         + "Rehydrate from your durable checkpoint and continue the assignment you still own.",
-                        queueIfBusy: false);
+                        queueIfBusy: false, urgent: urgent, admissionPriority: 50);
+                    if (urgent && wakeID != null) urgentLeft--;
                 }
                 catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: resume wake failed for {agent.AgentID}"); }
             }
         }
+
+        /// <summary>Workers a resume starts past the fleet budget. Bounded, because a resumed project with a
+        /// full roster must not take every conversation the fleet has.</summary>
+        internal const int ResumeUrgentWorkers = 2;
 
         /// <summary>
         /// Re-wakes workers whose assignment is still open but which have gone quiet. Before this, the
@@ -1196,6 +1251,10 @@ namespace Omnipotent.Services.Projects
             string? key, int priority, IEnumerable<string>? expectedArtifactPaths, string? batchID = null,
             bool allowRulePromotion = true)
         {
+            // Machine-generated notices (cap changes, retirements) also flow through here; only what Klives
+            // actually typed gets an instant reply. Broadcasts carry a batch ID and reach every project at
+            // once, so they are left to each Commander rather than fanning out one reply per project.
+            bool fromKlives = allowRulePromotion && string.IsNullOrWhiteSpace(batchID);
             text = (text ?? "").Trim();
             var expected = (expectedArtifactPaths ?? Array.Empty<string>()).Where(x => !string.IsNullOrWhiteSpace(x))
                 .Select(x => x.Trim()).ToList();
@@ -1293,7 +1352,16 @@ namespace Omnipotent.Services.Projects
             string? wakeID = null;
             if (project.Status is ProjectStatus.Active or ProjectStatus.Planning)
             {
-                if (string.Equals(deliveryTargetAgentID, "commander", StringComparison.OrdinalIgnoreCase))
+                bool toCommander = string.Equals(deliveryTargetAgentID, "commander", StringComparison.OrdinalIgnoreCase);
+                if (toCommander && fromKlives)
+                {
+                    // Klives is in the conversation now: keep one shared LLM slot free for its replies for a
+                    // few minutes, and answer him at once while the Commander's loop gets to the message.
+                    try { KliveLLM.KliveLLM.AIRouterEngageInteractiveReserve($"projects-chat:{project.ProjectID}", TimeSpan.FromMinutes(3)); }
+                    catch { /* capacity hint only */ }
+                    FrontDesk.Respond(project, directive, messageEvent.Sequence);
+                }
+                if (toCommander)
                     wakeID = CommanderRunner.DeliverHumanDirective(project, directive);
                 else
                 {
@@ -1895,6 +1963,10 @@ namespace Omnipotent.Services.Projects
             var llm = (KliveLLM.KliveLLM)llmServices[0];
             string sid = $"projects-{operation}-{Guid.NewGuid():N}";
             llm.StartToolSession(sid, null);
+            // A throwaway session: dropped on every exit, or each digest rebuild and triage call would
+            // stay resident in KliveLLM's session table for the life of the process.
+            try
+            {
             llm.AppendUserMessageToToolSession(sid, prompt);
             var lease = await Budget.TryAcquireLlmTurnAsync(projectID);
             if (lease == null) return null;
@@ -1941,6 +2013,8 @@ namespace Omnipotent.Services.Projects
                         });
                 return resp.Success ? resp.Response : null;
             }
+            }
+            finally { llm.ResetSession(sid); }
         }
 
         private Task<string?> QueryUtilityRoutesAsync(string projectID, string prompt)
@@ -3206,13 +3280,60 @@ namespace Omnipotent.Services.Projects
                 await Digests.RebuildDigestAsync(project, EventLog,
                     prompt => QueryUtilityRoutesAsync(project.ProjectID, prompt), preservePlan);
 
-                // Keep the budget line in the digest fresh even if the model didn't restate it.
-                var digest = Digests.GetDigest(project.ProjectID);
-                digest.BudgetState = Budget.DescribeState(project.ProjectID);
-                digest.OrgChart = SubAgents.DescribeOrgChart(project.ProjectID);
-                Digests.SaveDigest(digest);
+                // Keep the budget line in the digest fresh even if the model didn't restate it. Merged
+                // in place: this runs beside the next wake, which owns the digest's coordination fields.
+                string budgetState = Budget.DescribeState(project.ProjectID);
+                string orgChart = SubAgents.DescribeOrgChart(project.ProjectID);
+                Digests.Update(project.ProjectID, digest =>
+                {
+                    digest.BudgetState = budgetState;
+                    digest.OrgChart = orgChart;
+                });
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: post-wake digest rebuild failed (non-fatal)"); }
+        }
+
+        // 0 = idle, 1 = a rebuild is running, 2 = running and another wake ended meanwhile.
+        private readonly ConcurrentDictionary<string, int> digestRebuildState = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Runs the post-wake digest rebuild OFF the wake's critical path.
+        ///
+        /// It used to run inside the Commander's postamble, before the single-flight marker was released,
+        /// so everything that wanted the Commander next — Klives' message, a worker's report, a resume —
+        /// waited for a full utility-model round trip, and that round trip is the lowest-priority request
+        /// in the AIRouter queue. Nothing needs it first: the next wake's seed carries the recent events
+        /// verbatim, and the digest watermark is sequence-based, so a rebuild that finishes later folds in
+        /// exactly the same events. One rebuild per project at a time; a wake that ends while one runs
+        /// asks for one more pass instead of starting a second.
+        /// </summary>
+        public void ScheduleDigestRebuild(Project project, long wakeStartSeq)
+        {
+            string projectID = project.ProjectID;
+            while (true)
+            {
+                int state = digestRebuildState.GetOrAdd(projectID, 0);
+                if (state == 0)
+                {
+                    if (digestRebuildState.TryUpdate(projectID, 1, 0)) break;
+                    continue;
+                }
+                if (state == 1 && !digestRebuildState.TryUpdate(projectID, 2, 1)) continue;
+                return;
+            }
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    while (true)
+                    {
+                        await RebuildDigestAfterWakeAsync(project, wakeStartSeq);
+                        if (digestRebuildState.TryUpdate(projectID, 0, 1)) return;
+                        digestRebuildState[projectID] = 1; // another wake ended meanwhile: one more pass
+                    }
+                }
+                catch { digestRebuildState[projectID] = 0; }
+            });
         }
 
         /// <summary>
@@ -3928,13 +4049,14 @@ namespace Omnipotent.Services.Projects
                     $"Klives just remote-controlled your desktop directly ({inputEvents} input event(s)) — typically to clear a " +
                     "human-only obstacle such as a captcha or a login challenge. Take a fresh screenshot to see the current " +
                     "state, re-check whether your blocker is now resolved, and continue the task.";
+                // A harness notice, not something Klives typed: no instant reply, no rule promotion.
                 var receipt = record.AgentID == null
-                    ? MessageProjectWithReceipt(record.ProjectID, text, ProjectDirectiveKind.Steering)
+                    ? MessageProjectWithReceipt(record.ProjectID, text, ProjectDirectiveKind.Steering, allowRulePromotion: false)
                     : MessageAgentWithReceipt(record.ProjectID, record.AgentID, text, ProjectDirectiveKind.Steering);
                 // A per-agent desktop can outlive its retired agent; the commander still needs to know.
                 if (!receipt.Accepted && record.AgentID != null)
                     receipt = MessageProjectWithReceipt(record.ProjectID,
-                        $"[desktop of retired agent {record.AgentID}] " + text, ProjectDirectiveKind.Steering);
+                        $"[desktop of retired agent {record.AgentID}] " + text, ProjectDirectiveKind.Steering, allowRulePromotion: false);
                 if (!receipt.Accepted)
                     ServiceLog($"Projects: post-remote-control nudge for {record.ProjectID}/{record.AgentID ?? "commander"} was not accepted: {receipt.Reason}");
             }
@@ -3960,10 +4082,11 @@ namespace Omnipotent.Services.Projects
                 if (ExternalDesktopOwners.IsExternal(record.ProjectID) || action == "refresh-helpers") return;
                 string text = $"Klives ran '{action}' on your computer: {outcome} Re-inspect (browser op=inspect or desktop op=screenshot) before your next action.";
                 var receipt = record.AgentID == null
-                    ? MessageProjectWithReceipt(record.ProjectID, text, ProjectDirectiveKind.Steering)
+                    ? MessageProjectWithReceipt(record.ProjectID, text, ProjectDirectiveKind.Steering, allowRulePromotion: false)
                     : MessageAgentWithReceipt(record.ProjectID, record.AgentID, text, ProjectDirectiveKind.Steering);
                 if (!receipt.Accepted && record.AgentID != null)
-                    MessageProjectWithReceipt(record.ProjectID, $"[computer of agent {record.AgentID}] " + text, ProjectDirectiveKind.Steering);
+                    MessageProjectWithReceipt(record.ProjectID, $"[computer of agent {record.AgentID}] " + text,
+                        ProjectDirectiveKind.Steering, allowRulePromotion: false);
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to record a computer repair"); }
         }

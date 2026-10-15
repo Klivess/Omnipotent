@@ -513,6 +513,13 @@
         /// </summary>
         private int Compare(Waiter a, Waiter b, TimeSpan lifetime, bool enforcing)
         {
+            // A human waiting goes first in EVERY mode. Fifo and Observe switch off the cache-aware
+            // machinery, not this rule, which has nothing to do with caching: with arrival order alone,
+            // Klives' reply queued behind every background turn the fleet had already submitted.
+            bool aLive = AIRouterResidencyScheduler.IsLive(a.Info.Class);
+            bool bLive = AIRouterResidencyScheduler.IsLive(b.Info.Class);
+            if (aLive != bLive) return aLive ? -1 : 1;
+
             if (!enforcing) return a.EnqueuedAt.CompareTo(b.EnqueuedAt);
 
             int band = AIRouterResidencyScheduler.Band(a.Info.Class)

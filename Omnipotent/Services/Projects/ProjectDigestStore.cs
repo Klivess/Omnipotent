@@ -64,6 +64,24 @@ namespace Omnipotent.Services.Projects
             }
         }
 
+        /// <summary>
+        /// Read-modify-write under the store lock. A read followed by a separate save loses whatever
+        /// another writer committed in between — which is how a post-wake digest rebuild, now running in
+        /// the background, could otherwise erase the next wake's ActiveWakeID, or a wake could erase a
+        /// freshly rebuilt narrative.
+        /// </summary>
+        public ProjectDigest Update(string projectID, Action<ProjectDigest> mutate)
+        {
+            lock (LockFor(projectID))
+            {
+                var digest = GetDigest(projectID);
+                mutate(digest);
+                digest.ProjectID = projectID;
+                SaveDigest(digest);
+                return digest;
+            }
+        }
+
         /// <summary>All digests still pointing at an active wake (startup crash recovery).</summary>
         public List<ProjectDigest> AllDigestsWithActiveWakes()
         {
@@ -107,9 +125,11 @@ namespace Omnipotent.Services.Projects
             var digestEvents = newEvents.Where(ProjectPromptHygiene.IsAgentVisibleEvent).ToList();
             if (digestEvents.Count == 0)
             {
-                digest.LastDigestedSequence = newEvents[^1].Sequence;
-                SaveDigest(digest);
-                return digest;
+                long through = newEvents[^1].Sequence;
+                return Update(project.ProjectID, current =>
+                {
+                    if (current.LastDigestedSequence < through) current.LastDigestedSequence = through;
+                });
             }
 
             string prompt = ProjectCommanderPrompts.BuildDigestRebuildPrompt(project, digest, digestEvents);
@@ -118,10 +138,26 @@ namespace Omnipotent.Services.Projects
 
             var updated = ProjectCommanderPrompts.ParseDigestResponse(response, digest, preservePlanOfRecord);
             if (updated == null) return null;
-            updated.ProjectID = project.ProjectID;
-            updated.LastDigestedSequence = newEvents[^1].Sequence;
-            updated.ActiveWakeID = digest.ActiveWakeID; // rebuild never touches wake coordination
-            SaveDigest(updated);
+            long digestedThrough = newEvents[^1].Sequence;
+            bool applied = false;
+            // The model call above can take minutes and runs while the next wake may already be live.
+            // Merge only the narrative onto whatever is on disk NOW: wake coordination fields belong to
+            // the runners, and a rebuild that finished after a newer one must not roll the digest back.
+            var merged = Update(project.ProjectID, current =>
+            {
+                if (current.LastDigestedSequence > digestedThrough) return;
+                current.CurrentPlan = updated.CurrentPlan;
+                current.CurrentFocus = updated.CurrentFocus;
+                current.NextSteps = updated.NextSteps;
+                current.OrgChart = updated.OrgChart;
+                current.BudgetState = updated.BudgetState;
+                current.OpenThreads = updated.OpenThreads;
+                current.RollingSummary = updated.RollingSummary;
+                current.LastDigestedSequence = digestedThrough;
+                applied = true;
+            });
+            if (!applied) return merged;
+            updated = merged;
 
             eventLog.Append(new ProjectEvent
             {

@@ -190,6 +190,21 @@ namespace Omnipotent.Services.Projects
         /// <summary>Soft per-wake ceiling on outbound agent messages (advisory; never blocks a send).</summary>
         public int WorkerMessagesPerWake { get; set; } = Defaults.WorkerMessagesPerWake;
 
+        /// <summary>
+        /// Answer Klives' chat messages within seconds: one small interactive-priority model call on a
+        /// snapshot of the project replies in the Commander's voice while the working loop picks the
+        /// message up. Off restores the old behaviour, where the reply waited for the Commander's next
+        /// turn boundary.
+        /// </summary>
+        public bool InstantRepliesEnabled { get; set; } = Defaults.InstantRepliesEnabled;
+
+        /// <summary>
+        /// Keep going between wakes: a Commander that ends a productive wake while the step ledger still
+        /// has open work, and nobody else is working on it, is woken again within a minute — while its
+        /// prompt prefix is still warm — instead of idling until the next keepalive.
+        /// </summary>
+        public bool MomentumEnabled { get; set; } = Defaults.MomentumEnabled;
+
         public bool VisionEnabled { get; set; } = true;
 
         // ── Autonomy policy: Klives' hard limits, enforced at tool dispatch (ProjectAutonomyPolicy) ──
@@ -318,6 +333,8 @@ namespace Omnipotent.Services.Projects
                     RecentEventsConsidered = Math.Clamp(ParseInt(Text(value), Defaults.RecentEventsConsidered), 10, 500); break;
                 case "maxconsecutivecontinuations": break;
                 case "workerheartbeatenabled": WorkerHeartbeatEnabled = ParseBool(Text(value)); break;
+                case "instantrepliesenabled": InstantRepliesEnabled = ParseBool(Text(value)); break;
+                case "momentumenabled": MomentumEnabled = ParseBool(Text(value)); break;
                 case "workerheartbeatminutes":
                     WorkerHeartbeatMinutes = Math.Clamp(ParseInt(Text(value), Defaults.WorkerHeartbeatMinutes), 5, 720); break;
                 case "workerheartbeatmaxminutes":
@@ -459,6 +476,8 @@ namespace Omnipotent.Services.Projects
             // die after a single wake. The heartbeat re-wakes agents whose assignment is still open,
             // and backs off geometrically for any that keep waking with nothing productive to do.
             public const bool WorkerHeartbeatEnabled = true;
+            public const bool InstantRepliesEnabled = true;
+            public const bool MomentumEnabled = true;
             public const int WorkerHeartbeatMinutes = 20;
             public const int WorkerHeartbeatMaxMinutes = 240;
             /// <summary>Soft per-wake ceiling on a worker's outbound agent messages (advisory, never blocking).</summary>
