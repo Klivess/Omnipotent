@@ -14,7 +14,7 @@ namespace Omnipotent.Services.Projects.Containers
     /// <see cref="sendGate"/>. <see cref="CaptureFrameAsync"/> requests an update and awaits
     /// the next FramebufferUpdate applied by the receive loop.
     /// </summary>
-    public sealed class VncTransport : IDisposable
+    public sealed class VncTransport : IDisposable, IDesktopInput
     {
         private readonly string host;
         private readonly int port;
@@ -318,6 +318,18 @@ namespace Omnipotent.Services.Projects.Containers
         // ── input ──
 
         public Task MoveMouseAsync(int x, int y, CancellationToken ct = default) => SendPointerAsync(x, y, buttonMask, ct);
+
+        public string Route => "vnc";
+
+        /// <summary>Plays a planned pointer path sample by sample, holding each for its delay.</summary>
+        public async Task MovePathAsync(IReadOnlyList<MotionStep> path, CancellationToken ct = default)
+        {
+            foreach (var step in path)
+            {
+                await SendPointerAsync(step.X, step.Y, buttonMask, ct);
+                if (step.DelayMs > 0) await Task.Delay(step.DelayMs, ct);
+            }
+        }
 
         /// <summary>Move from the current pointer position by a relative delta. VNC carries
         /// absolute coordinates, so the transport interpolates a bounded path from its tracked

@@ -268,8 +268,14 @@ namespace Omnipotent.Tests.Projects
             Assert.True(ContainerDesktopManager.BrowserControlIsReady(installedOnly));
         }
 
+        /// <summary>
+        /// The panel and XFCE session are for a human looking at the desktop; the entrypoint restarts
+        /// them within seconds. Failing readiness over them used to restart the whole container and
+        /// kill the agent's browser mid-task. The display, window manager, a usable frame and an input
+        /// route are what an agent actually needs.
+        /// </summary>
         [Fact]
-        public void DesktopReadiness_RequiresTheHumanDesktopShellAndPanel()
+        public void DesktopReadiness_RequiresDisplayWindowManagerFrameAndInput_NotCosmeticShell()
         {
             var capabilities = new Dictionary<string, string>
             {
@@ -285,9 +291,15 @@ namespace Omnipotent.Tests.Projects
 
             Assert.True(ContainerDesktopManager.DesktopControlIsReady(capabilities));
             capabilities["panel"] = "down";
-            Assert.False(ContainerDesktopManager.DesktopControlIsReady(capabilities));
-            capabilities["panel"] = "up";
             capabilities["desktop-shell"] = "down";
+            Assert.True(ContainerDesktopManager.DesktopControlIsReady(capabilities));
+            capabilities["window-manager"] = "down";
+            Assert.False(ContainerDesktopManager.DesktopControlIsReady(capabilities));
+            capabilities["window-manager"] = "up";
+            capabilities["frame"] = "unavailable";
+            Assert.False(ContainerDesktopManager.DesktopControlIsReady(capabilities));
+            capabilities["frame"] = "usable";
+            capabilities["display"] = "down";
             Assert.False(ContainerDesktopManager.DesktopControlIsReady(capabilities));
         }
 

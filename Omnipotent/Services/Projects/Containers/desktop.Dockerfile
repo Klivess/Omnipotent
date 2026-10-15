@@ -26,7 +26,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         xdotool wmctrl xclip x11-utils x11-xserver-utils \
         curl ca-certificates util-linux \
         fonts-dejavu fonts-liberation fonts-noto-core fonts-noto-ui-core fonts-noto-color-emoji \
-        python3 python3-pip python3-venv python3-websocket \
+        python3 python3-pip python3-venv python3-websocket python3-pil \
         ffmpeg \
         sudo \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
@@ -70,11 +70,16 @@ RUN curl --fail --location --retry 3 \
     && python3 -m zipfile -e /tmp/nopecha.zip /usr/local/share/klive-nopecha \
     && rm /tmp/nopecha.zip
 
+# klive-computerd (served as browser-service.py, see that file) is the desktop's control plane: health,
+# exec, XTEST input, local screenshots, clipboard and window state over one loopback HTTP port, so the
+# harness reaches this machine without `docker exec` on any hot path. python3-pil makes its screenshots
+# a single in-process XCB grab; without it the daemon falls back to ffmpeg's x11grab.
+
 # Capability stamp — the preflight reads this to know what the image ships without probing each
 # tool. Bump "imageVersion" whenever the baked capability set changes so the staleness check and
 # the readiness summary stay meaningful.
 RUN printf '%s\n' \
-    '{"imageVersion":"13","capabilities":["display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","verified-text-entry","overlay-dismissal","challenge-solving","free-captcha-extension","python3","ffmpeg","human-fonts","browser-fingerprint","browser-service","input-receipts","cdp-tool","file-chooser-intercept","klive-cdp"],"display":":1"}' \
+    '{"imageVersion":"14","capabilities":["computerd","computerd-exec","computerd-input","computerd-screenshot","display","desktop-shell","panel","window-manager","chromium","firefox","browser-inspect","structured-browser-actions","browser-upload","tab-hygiene","native-dialog-detect","verified-text-entry","overlay-dismissal","challenge-solving","free-captcha-extension","python3","ffmpeg","human-fonts","browser-fingerprint","browser-service","input-receipts","cdp-tool","file-chooser-intercept","klive-cdp"],"display":":1"}' \
     > /etc/klive-desktop.json && chmod 0444 /etc/klive-desktop.json
 
 USER agent

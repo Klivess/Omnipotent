@@ -83,6 +83,16 @@ namespace Omnipotent.Services.Projects
         public Func<string, Task<string>>? DescribeKliveAgentContextAsync;
 
         /// <summary>
+        /// (projectID, agentID) → the agent's own computer as it stands: awake or asleep, the browser's
+        /// open tabs, and anything that happened to it since the agent last looked. Lets a wake resume on
+        /// the page it left instead of re-navigating to rediscover it. Never provisions or wakes a desktop.
+        /// </summary>
+        public Func<string, string, Task<string>>? DescribeComputerAsync;
+
+        /// <summary>projectID → Klives' autonomy limits for the project ("" when none are set).</summary>
+        public Func<string, string>? DescribeAutonomyPolicy;
+
+        /// <summary>
         /// Builds the full seed message for one Commander wake, triggered by
         /// <paramref name="triggerDescription"/> (a confirmed stimulus payload + verdict,
         /// a Klives message, a timer keepalive, or a watchdog force-wake reason).
@@ -192,11 +202,23 @@ namespace Omnipotent.Services.Projects
             try { externalActions = ProjectExternalActions.DescribeForPrompt(eventLog, project.ProjectID); }
             catch { externalActions = null; }
 
+            string? computer = null;
+            if (DescribeComputerAsync != null)
+            {
+                try { computer = await DescribeComputerAsync(project.ProjectID, "commander"); } catch { computer = null; }
+            }
+
+            string? autonomy = null;
+            if (DescribeAutonomyPolicy != null)
+            {
+                try { autonomy = DescribeAutonomyPolicy(project.ProjectID); } catch { autonomy = null; }
+            }
+
             return ProjectCommanderPrompts.BuildWakeSeed(project, digest, recent, hits,
                 ProjectPromptHygiene.ScrubTrigger(triggerDescription),
                 knowledge, observables, grandPlan, accounts, files, runtimeState, kliveAgentContext, directives,
                 recentEventsBudget, chronologicalEvents, approvals, taskForce, externalActions,
-                tokensUnmetered, briefSections);
+                tokensUnmetered, briefSections, computer, autonomy);
         }
 
         private static string Truncate(string s, int max) =>

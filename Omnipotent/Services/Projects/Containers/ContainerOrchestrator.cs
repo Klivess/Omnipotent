@@ -22,6 +22,8 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly Action<string> log;
         private readonly Func<string, string> imageForProject;  // projectID → image (per-project setting)
         private readonly string dockerUri;
+        // Where published container ports are reached from this process (the Docker host's loopback).
+        private readonly string daemonHost;
         private DockerClient? client;
         private readonly SemaphoreSlim clientGate = new(1, 1);
         private readonly ConcurrentDictionary<string, ImageBuildFlight> imageBuildFlights = new(StringComparer.OrdinalIgnoreCase);
@@ -60,13 +62,56 @@ namespace Omnipotent.Services.Projects.Containers
             ContainerRegistry registry,
             Action<string> log,
             Func<string, string> imageForProject,
-            string dockerUri)
+            string dockerUri,
+            string daemonHost = "127.0.0.1")
         {
             this.registry = registry;
             this.log = log ?? (_ => { });
             this.imageForProject = imageForProject;
             this.dockerUri = dockerUri;
+            this.daemonHost = string.IsNullOrWhiteSpace(daemonHost) ? "127.0.0.1" : daemonHost;
         }
+
+        /// <summary>
+        /// The in-container control daemon for a desktop, or an unconfigured client when the registry
+        /// has no published port for it (a container from before the service existed).
+        /// </summary>
+        public ComputerDaemonClient DaemonFor(string containerID)
+        {
+            var record = registry.All().LastOrDefault(r => string.Equals(r.ContainerID, containerID, StringComparison.Ordinal));
+            return new ComputerDaemonClient(daemonHost, record is { Lost: false, Suspended: false } ? record.BrowserServiceHostPort : 0, containerID);
+        }
+
+        /// <summary>Test seam: lets a test stand in a fake daemon without a registry record.</summary>
+        internal Func<string, ComputerDaemonClient>? DaemonOverride { get; set; }
+
+        private ComputerDaemonClient Daemon(string containerID) => DaemonOverride?.Invoke(containerID) ?? DaemonFor(containerID);
+
+        /// <summary>
+        /// The daemon carries an exec only when it provably can: the request either reaches it (and its
+        /// answer — even a timeout — is final) or provably did not, in which case docker exec runs the
+        /// command instead. Telemetry for which route served it is kept so the health page can show it.
+        /// </summary>
+        private async Task<ContainerShellResult?> TryDaemonExecAsync(string containerID, string? command,
+            IReadOnlyList<string>? argv, string? workingDirectory, int timeoutSeconds, bool idempotent, CancellationToken ct)
+        {
+            var daemon = Daemon(containerID);
+            if (!daemon.Configured) return null;
+            var outcome = await daemon.ExecAsync(command, argv, workingDirectory, timeoutSeconds, ct, idempotent);
+            if (outcome.Reached)
+            {
+                Interlocked.Increment(ref daemonExecs);
+                return outcome.Result;
+            }
+            Interlocked.Increment(ref dockerExecFallbacks);
+            return null;
+        }
+
+        private long daemonExecs;
+        private long dockerExecFallbacks;
+
+        /// <summary>How many in-container commands went through the daemon vs. fell back to docker exec.</summary>
+        public (long Daemon, long DockerExec) ExecRouteCounts => (Interlocked.Read(ref daemonExecs), Interlocked.Read(ref dockerExecFallbacks));
 
         internal ContainerOrchestrator(ContainerRegistry registry, DockerClient client)
             : this(registry, _ => { }, _ => "test-desktop", "http://localhost") => this.client = client;
@@ -256,6 +301,23 @@ namespace Omnipotent.Services.Projects.Containers
                 _ => throw new InvalidOperationException("Invalid isolated desktop-control command."),
             };
 
+            // The in-container daemon first: no Docker daemon on the path of a browser launch, which
+            // every navigation, physical click and challenge solve performs. The browser supervisor and
+            // the focus commands are idempotent, so any daemon failure may fall through to docker exec;
+            // an application launch is re-run only when the daemon provably never received it, or a
+            // slow answer would open the application twice.
+            bool idempotentControl = command is ContainerDesktopControlCommand.LaunchBrowser
+                or ContainerDesktopControlCommand.FocusBrowser or ContainerDesktopControlCommand.FocusTerminal
+                or ContainerDesktopControlCommand.FocusWindow;
+            var served = await TryDaemonExecAsync(containerID, null, cmd.ToArray(), "/home/agent",
+                (int)DesktopControlTimeout.TotalSeconds, idempotentControl, ct);
+            if (served != null)
+            {
+                if (served.ExitCode != 0)
+                    throw new InvalidOperationException($"Desktop control command failed (exit {served.ExitCode}): {(served.Stderr + served.Stdout).Trim()}");
+                return;
+            }
+
             // Bounded like every other daemon call. This one had no ceiling at all, and it is the
             // first thing every structured browser action does (LaunchAsync("browser")) — while
             // holding the per-container launch gate, so one wedged launch stalled the whole desktop
@@ -428,7 +490,10 @@ namespace Omnipotent.Services.Projects.Containers
             # the container default. CDP stays on loopback (page JS cannot read the debug port) so
             # structured inspection keeps working. A bash array preserves the literal "*" and any
             # spaces in the profile path across the two launch forms.
+            # --renderer-process-limit keeps a desktop inside its memory ceiling: tabs share renderer
+            # processes instead of each growing its own, which is what the kernel used to OOM-kill.
             common_args=(--no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check \
+              --renderer-process-limit=4 \
               --hide-crash-restore-bubble --password-store=basic --disable-blink-features=AutomationControlled \
               "--lang=${OMNIPOTENT_BROWSER_LANG:-en-US}" --start-maximized \
               --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "--remote-allow-origins=*" \
@@ -515,9 +580,19 @@ namespace Omnipotent.Services.Projects.Containers
         /// and receives no Docker socket or extra capability. The image intentionally grants
         /// that user passwordless sudo, matching the authority it already has in the GUI.
         /// </summary>
+        public Task<ContainerShellResult> ExecuteDesktopShellAsync(
+            string containerID, string command, string? workingDirectory, int timeoutSeconds,
+            CancellationToken ct = default) =>
+            ExecuteDesktopShellAsync(containerID, command, workingDirectory, timeoutSeconds, idempotent: false, ct);
+
+        /// <summary>
+        /// Runs a shell command inside a desktop. <paramref name="idempotent"/> marks harness probes that
+        /// may be re-run through docker exec after any daemon failure; an agent's own command is re-run
+        /// only when the daemon provably never received it, so nothing is ever executed twice.
+        /// </summary>
         public async Task<ContainerShellResult> ExecuteDesktopShellAsync(
             string containerID, string command, string? workingDirectory, int timeoutSeconds,
-            CancellationToken ct = default)
+            bool idempotent, CancellationToken ct = default)
         {
             if (string.IsNullOrWhiteSpace(command))
                 throw new ArgumentException("Provide a non-empty command.", nameof(command));
@@ -526,6 +601,10 @@ namespace Omnipotent.Services.Projects.Containers
 
             string workDir = ContainerShellResult.NormalizeWorkingDirectory(workingDirectory);
             int seconds = Math.Clamp(timeoutSeconds, 1, 900);
+
+            var served = await TryDaemonExecAsync(containerID, command, null, workDir, seconds, idempotent, ct);
+            if (served != null) return served;
+
             // The budget is ours to enforce, not the daemon's to respect: the inner command is
             // already bounded by GNU timeout, so anything past this is the host-side call hanging.
             try
@@ -832,12 +911,23 @@ namespace Omnipotent.Services.Projects.Containers
         {
             var shipped = ShippedHelperHashes(contextDir);
             var probe = await ExecuteDesktopShellAsync(containerID,
-                "sha256sum " + string.Join(" ", LiveHelperFiles.Select(name => "/usr/local/bin/" + name)) + " 2>/dev/null; true",
-                "/home/agent", 15, ct);
+                "sha256sum " + string.Join(" ", LiveHelperFiles.Select(name => "/usr/local/bin/" + name))
+                    + " " + ComputerDaemonToken.ContainerTokenPath + " 2>/dev/null; true",
+                "/home/agent", 15, idempotent: true, ct);
             if (probe.TimedOut)
                 throw new ContainerDaemonTimeoutException("The helper version probe timed out.");
+
+            // The daemon's credential travels with the helpers: a desktop that predates it, was adopted,
+            // or was rebuilt gets its token here, and the daemon reads it on the next request.
+            bool tokenDelivered = false;
+            if (!HasToken(probe.Stdout, ComputerDaemonToken.For(containerID)))
+            {
+                await DeliverComputerTokenAsync(containerID, ct);
+                tokenDelivered = true;
+            }
+
             var stale = StaleHelpers(probe.Stdout, shipped);
-            if (stale.Count == 0) return null;
+            if (stale.Count == 0) return tokenDelivered ? "delivered the computer-daemon token" : null;
 
             using var archive = new MemoryStream();
             using (var writer = new System.Formats.Tar.TarWriter(archive, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: true))
@@ -865,9 +955,82 @@ namespace Omnipotent.Services.Projects.Containers
             }, TimeSpan.FromSeconds(30), $"helper refresh in container {containerID[..Math.Min(12, containerID.Length)]}", ct);
 
             if (stale.Contains("browser-service.py"))
-                await ExecuteDesktopShellAsync(containerID, "pkill -f /usr/local/bin/browser-service.py >/dev/null 2>&1; true",
+            {
+                // Through docker exec on purpose: asking the daemon to kill itself mid-request would
+                // report a dropped connection. The entrypoint's supervisor restarts it within seconds.
+                await ExecuteViaDockerAsync(containerID, "pkill -f /usr/local/bin/browser-service.py >/dev/null 2>&1; true",
                     "/home/agent", 10, ct);
-            return "refreshed " + string.Join(", ", stale);
+                Daemon(containerID).Forget();
+            }
+            return "refreshed " + string.Join(", ", stale) + (tokenDelivered ? " and delivered the computer-daemon token" : "");
+        }
+
+        /// <summary>Whether `sha256sum` output shows the container already holds this token.</summary>
+        internal static bool HasToken(string sha256sumOutput, string token)
+        {
+            string expected = ComputerDaemonToken.FileHash(token);
+            foreach (string line in (sha256sumOutput ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                int space = line.IndexOf(' ');
+                if (space <= 0) continue;
+                if (line[(space + 1)..].Trim().TrimStart('*').EndsWith(ComputerDaemonToken.ContainerTokenFileName, StringComparison.Ordinal)
+                    && string.Equals(line[..space].Trim(), expected, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>Writes the desktop's daemon token into it through the Docker archive API (no exec).</summary>
+        public async Task DeliverComputerTokenAsync(string containerID, CancellationToken ct = default)
+        {
+            using var archive = new MemoryStream();
+            using (var writer = new System.Formats.Tar.TarWriter(archive, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: true))
+            {
+                writer.WriteEntry(new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile,
+                    ComputerDaemonToken.ContainerTokenFileName)
+                {
+                    DataStream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(ComputerDaemonToken.For(containerID) + "\n")),
+                    Mode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead,
+                    Uid = 0,
+                    Gid = 0,
+                });
+            }
+            archive.Position = 0;
+            await WithDeadlineAsync(async token =>
+            {
+                var docker = await GetClientAsync(token);
+                await docker.Containers.ExtractArchiveToContainerAsync(containerID,
+                    new ContainerPathStatParameters { Path = ComputerDaemonToken.ContainerTokenDirectory, AllowOverwriteDirWithFile = false },
+                    archive, token);
+                return true;
+            }, TimeSpan.FromSeconds(30), $"computer-daemon token delivery to {containerID[..Math.Min(12, containerID.Length)]}", ct);
+            Daemon(containerID).Forget();
+        }
+
+        /// <summary>A command through docker exec only — for the few calls that must not go through the
+        /// daemon (stopping the daemon itself).</summary>
+        private async Task ExecuteViaDockerAsync(string containerID, string command, string workingDirectory, int seconds, CancellationToken ct)
+        {
+            try
+            {
+                await WithDeadlineAsync(async execCt =>
+                {
+                    var docker = await GetClientAsync(execCt);
+                    var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
+                    {
+                        AttachStdout = true,
+                        AttachStderr = true,
+                        Tty = false,
+                        User = "agent",
+                        WorkingDir = workingDirectory,
+                        Cmd = new[] { "timeout", "--signal=TERM", "--kill-after=5s", $"{seconds}s", "bash", "-lc", command },
+                    }, execCt);
+                    using var output = await docker.Exec.StartAndAttachContainerExecAsync(created.ID, false, execCt);
+                    await output.ReadOutputToEndAsync(execCt);
+                    return true;
+                }, TimeSpan.FromSeconds(seconds + 15), $"a command in container {containerID[..Math.Min(12, containerID.Length)]}", ct);
+            }
+            catch (ContainerDaemonTimeoutException ex) { log($"Docker exec abandoned: {ex.Message}"); }
         }
 
         /// <summary>SHA-256 over the context's file names + normalised contents (order-stable), so
@@ -1008,6 +1171,12 @@ namespace Omnipotent.Services.Projects.Containers
                 throw;
             }
             log($"Created desktop container {create.ID[..12]} for project {projectID}{(agentID == null ? " (shared)" : $" agent {agentID}")} on 127.0.0.1:{record.VncHostPort}.");
+            try { await DeliverComputerTokenAsync(create.ID, ct); }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                // Not fatal: the first helper sync delivers it, and docker exec serves until then.
+                log($"Could not deliver the computer-daemon token to {create.ID[..12]} yet: {ex.Message}");
+            }
             return record;
         }
 

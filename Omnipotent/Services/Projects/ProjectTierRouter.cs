@@ -45,6 +45,7 @@ namespace Omnipotent.Services.Projects
             "recall_memories", "recall_memories_by_tag", "save_memory", "save_shortcut", "get_shortcuts", "delete_memory",
             "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
             "query_events", "cross_project_search",
+            "playbook_get", "playbook_save", "playbook_list",
         };
 
         /// <summary>Tools reserved to the Commander (strategy/lifecycle-level), not sub-agents.</summary>

@@ -123,6 +123,9 @@ namespace Omnipotent.Services.Projects
         public ProjectGrandPlanStore? GrandPlans { get; set; }
         /// <summary>Global shared account registry (accounts across all projects + KliveAgent). Null when the service is down.</summary>
         public Omnipotent.Services.AccountRegistry.AccountRegistry? Accounts { get; set; }
+
+        /// <summary>The global per-website playbooks (shared by every project).</summary>
+        public ProjectSitePlaybookStore? Playbooks { get; set; }
         /// <summary>The same live KliveAgent instance used by interactive execute_csharp. When
         /// present, Project scripts inherit the full ScriptGlobals service-discovery API.</summary>
         public Omnipotent.Services.KliveAgent.KliveAgent? KliveAgentService { get; set; }
@@ -1334,6 +1337,53 @@ namespace Omnipotent.Services.Projects
                     var tags = a["tags"] is JArray arr ? arr.Select(t => t.ToString()).ToArray() : Array.Empty<string>();
                     string id = await SharedGlobals(ct).SaveShortcut(title, content, tags);
                     return new CommanderToolResult($"Saved shared shortcut '{title}' ({ShortId(id)}).");
+                }
+
+                case "playbook_get":
+                {
+                    if (Playbooks == null) return FailedResult("Site playbooks are unavailable.");
+                    string domain = ((string?)a["domain"] ?? (string?)a["url"] ?? "").Trim();
+                    if (ProjectSitePlaybookStore.NormalizeDomain(domain) == null)
+                        return FailedResult("Provide 'domain' as a site host (example.com) or a URL on that site.");
+                    var found = Playbooks.FindForUrl(domain);
+                    return new CommanderToolResult(found == null
+                        ? $"No playbook for {ProjectSitePlaybookStore.NormalizeDomain(domain)} yet. When you get through this site, save one with playbook op:save."
+                        : ProjectSitePlaybookStore.Describe(found));
+                }
+
+                case "playbook_save":
+                {
+                    if (Playbooks == null) return FailedResult("Site playbooks are unavailable.");
+                    static List<string>? Strings(JToken? token) => token is JArray arr
+                        ? arr.Select(t => t.Type == JTokenType.String ? (string?)t ?? "" : t.ToString(Formatting.None)).ToList()
+                        : token?.Type == JTokenType.String ? new List<string> { (string?)token ?? "" } : null;
+                    List<SitePlaybookUrl>? urls = a["urls"] is JArray urlArray
+                        ? urlArray.OfType<JObject>().Select(u => new SitePlaybookUrl
+                            { Label = (string?)u["label"] ?? "", Url = (string?)u["url"] ?? "" }).ToList()
+                        : null;
+                    try
+                    {
+                        var saved = Playbooks.Save((string?)a["domain"] ?? (string?)a["url"] ?? "",
+                            $"project {project.Name} / {actingAgentID}", (string?)a["summary"], Strings(a["steps"]),
+                            Strings(a["pitfalls"]), urls, (bool?)a["verified"] == true, Strings(a["addPitfalls"]));
+                        return new CommanderToolResult($"Saved the {saved.Domain} playbook (revision {saved.Revisions}). " +
+                            "Every agent in every project now sees it when they navigate there.");
+                    }
+                    catch (InvalidOperationException ex) { return FailedResult(ex.Message); }
+                }
+
+                case "playbook_list":
+                {
+                    if (Playbooks == null) return FailedResult("Site playbooks are unavailable.");
+                    string query = ((string?)a["query"] ?? "").Trim();
+                    var list = Playbooks.List()
+                        .Where(p => query.Length == 0 || p.Domain.Contains(query, StringComparison.OrdinalIgnoreCase)
+                            || p.Summary.Contains(query, StringComparison.OrdinalIgnoreCase))
+                        .Take(60).ToList();
+                    if (list.Count == 0) return new CommanderToolResult(query.Length == 0 ? "No site playbooks yet." : $"No playbooks match '{query}'.");
+                    return new CommanderToolResult(string.Join("\n", list.Select(p =>
+                        $"{p.Domain} — {(p.Summary.Length > 0 ? p.Summary : "(no summary)")} [{p.Steps.Count} steps, {p.Pitfalls.Count} pitfalls; " +
+                        $"{(p.VerifiedAt is { } v ? "verified " + v.ToString("yyyy-MM-dd") : "unverified")}]")));
                 }
 
                 case "get_shortcuts":

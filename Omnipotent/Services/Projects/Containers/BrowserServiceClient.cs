@@ -24,7 +24,14 @@ namespace Omnipotent.Services.Projects.Containers
     {
         // One pooled client for the whole fleet. Per-request timeouts come from the CancellationToken;
         // the handler-level timeout is the outer backstop for a connection that hangs mid-body.
-        private static readonly HttpClient Http = new() { Timeout = Timeout.InfiniteTimeSpan };
+        // ConnectTimeout separates "never reached the service" (safe to fall back to exec) from "the
+        // service is working on it" (never re-run an action elsewhere) — see RunAsync.
+        private static readonly HttpClient Http = new(new SocketsHttpHandler
+        {
+            ConnectTimeout = TimeSpan.FromSeconds(4),
+            UseProxy = false,
+        })
+        { Timeout = Timeout.InfiniteTimeSpan };
 
         /// <summary>How long to wait on a service that should answer instantly before deciding it is
         /// not there. Short: the fallback costs an exec, and hesitating here is the cost we are
@@ -157,14 +164,26 @@ namespace Omnipotent.Services.Projects.Containers
                     .Where(x => !string.IsNullOrWhiteSpace(x))).Trim());
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (OperationCanceledException ex) when (ex.InnerException is not TimeoutException && !IsReadOnlyMode(mode))
+            {
+                // The request reached the service and our deadline elapsed while it worked. Re-running
+                // it through docker exec could click, type or submit a second time — the 2026 report's
+                // doubled form submissions — so a mutating mode reports the timeout instead. (A
+                // TimeoutException inner is the connect timeout: the request never left, fall back.)
+                return (false, "", $"The browser helper did not finish {mode} within {Math.Clamp(timeoutSeconds, 5, 900)}s. " +
+                    "The action may or may not have been applied — re-inspect the page before repeating it.");
+            }
             catch
             {
-                // Includes the deliberate case: the per-call deadline elapsed. Falling back to exec
-                // would hand the same slow work to the slower path, but the caller cannot tell a
-                // slow helper from an absent service, so exec stays the single recovery route.
+                // Never reached the service (refused, reset before sending) or a read-only mode timed
+                // out: running the same helper through docker exec is safe.
                 return null;
             }
         }
+
+        /// <summary>Modes that only read the browser. Repeating one through docker exec is harmless.</summary>
+        internal static bool IsReadOnlyMode(string mode) =>
+            mode is "tabs" or "dom" or "controls" or "accessibility" or "network" or "locate" or "receipt";
 
         private sealed class HealthBody
         {

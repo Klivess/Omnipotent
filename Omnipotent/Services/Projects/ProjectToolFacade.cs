@@ -136,6 +136,15 @@ public static class ProjectToolFacade
                 ("list_shortcuts", "get_shortcuts"),
             }),
 
+        ("playbook",
+            "Site playbooks — per-website recipes (steps that worked, key URLs, pitfalls) shared by every project. Shown automatically when you navigate to a site that has one; save one whenever you get through a site flow so nobody has to rediscover it.",
+            new[]
+            {
+                ("get", "playbook_get"),
+                ("save", "playbook_save"),
+                ("list", "playbook_list"),
+            }),
+
         ("knowledge",
             "Search Klives' whole cross-system knowledge base — other projects' decisions and outcomes, KliveAgent conversations and memories, Omniscience person facts, repo docs, cached web. Check here before spawning a research sub-agent.",
             new[]

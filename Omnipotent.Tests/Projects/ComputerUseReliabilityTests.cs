@@ -96,7 +96,8 @@ namespace Omnipotent.Tests.Projects
                 {
                     HttpListenerContext context;
                     try { context = await listener.GetContextAsync(); } catch { return; }
-                    Interlocked.Increment(ref serviceHits);
+                    // Only the helper route counts; the daemon's /health probe shares the port.
+                    if (context.Request.Url?.AbsolutePath == "/run") Interlocked.Increment(ref serviceHits);
                     context.Response.StatusCode = 400;
                     byte[] body = Encoding.UTF8.GetBytes("{\"error\":\"request body must be 1..4MiB\"}");
                     await context.Response.OutputStream.WriteAsync(body);

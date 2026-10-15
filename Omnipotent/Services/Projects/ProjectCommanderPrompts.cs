@@ -42,7 +42,9 @@ namespace Omnipotent.Services.Projects
             string? taskForceBlock = null,
             string? externalActionsBlock = null,
             bool tokensUnmetered = false,
-            List<ToolSessionBriefSection>? briefSections = null)
+            List<ToolSessionBriefSection>? briefSections = null,
+            string? computerBlock = null,
+            string? autonomyBlock = null)
         {
             var sb = new ToolSessionBriefBuilder();
 
@@ -69,6 +71,8 @@ namespace Omnipotent.Services.Projects
             sb.AppendLine($"Budgets: {tokenBudgetLine} · money ${project.MoneyBudgetUsd:0.##} (autonomous ≤ ${project.MoneyAutonomousThresholdUsd:0.##}/action) · agent cap {project.SubAgentCap}");
             sb.BeginSection("capabilities","── RUNTIME CAPABILITY TRUTH (authoritative) ──");
             sb.AppendLine(ProjectPromptHygiene.CapabilityTruth);
+            if (!string.IsNullOrWhiteSpace(autonomyBlock))
+                sb.AppendLine("KLIVES' AUTONOMY LIMITS (enforced at dispatch — plan around them):\n" + autonomyBlock);
 
             // This is intentionally ahead of the grand plan/digest/retrieval legs. A rule from
             // Klives is authoritative and must not be summarized away, outranked by a stale plan,
@@ -219,6 +223,14 @@ namespace Omnipotent.Services.Projects
                     x => ProjectsContextBudget.ScoreEvent(x.evt.Text, triggerDescription, x.idxFromEnd));
                 foreach (var x in fitted.OrderBy(x => x.evt.Sequence))
                     sb.AppendLine(DescribeEvent(x.evt));
+            }
+
+            // Live and volatile, so it sits with the trigger at the end where it cannot disturb the
+            // cached prefix of everything above it.
+            if (!string.IsNullOrWhiteSpace(computerBlock))
+            {
+                sb.BeginSection("computer","── YOUR COMPUTER (live state of your own desktop — resume from it) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(computerBlock, ProjectsContextBudget.ComputerBudget));
             }
 
             // The clock lives here, at the very end of the seed, rather than in the header. It is the

@@ -22,6 +22,12 @@ namespace Omnipotent.Services.Projects.Containers
         private readonly InputLockCoordinator? inputLock;
         private readonly SemaphoreSlim actionGate;
         private readonly BrowserServiceClient browserService;
+        private readonly ComputerDaemonClient daemon;
+        // The route this action's pointer/keyboard events take. VNC while it answers; the in-container
+        // daemon when it does not. Chosen once per action, before any input is sent.
+        private IDesktopInput input;
+        private readonly int fallbackWidth;
+        private readonly int fallbackHeight;
 
         /// <summary>
         /// How long an agent will queue behind another action on the same desktop before giving up.
@@ -60,7 +66,21 @@ namespace Omnipotent.Services.Projects.Containers
             public string? LastFreeChallengeDocument;
             public string? LastFreeChallengeError;
             public DateTime FreeChallengeRetryAfterUtc;
+            // Framebuffer geometry of the last frame, whichever route captured it. VNC knows it from the
+            // RFB handshake; a daemon capture reports it, so coordinates map without a VNC connection.
+            public int FramebufferWidth;
+            public int FramebufferHeight;
+            public string FrameRoute = "";
         }
+
+        /// <summary>Desktops whose VNC route recently failed, and until when to go straight to the daemon.
+        /// Without this every action would first sit through a VNC handshake timeout before falling back.</summary>
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> VncDownUntil = new(StringComparer.Ordinal);
+        private static readonly TimeSpan VncRetryAfter = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan VncConnectBudget = TimeSpan.FromSeconds(6);
+
+        /// <summary>One daemon input route per desktop, so its pointer position carries across actions.</summary>
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, DaemonDesktopInput> DaemonInputs = new(StringComparer.Ordinal);
 
         private static readonly HashSet<string> Tools = new(StringComparer.Ordinal)
         {
@@ -150,9 +170,13 @@ namespace Omnipotent.Services.Projects.Containers
             Func<string, Task<string>>? resolveSecretsAsync = null,
             Func<string, CancellationToken, Task<string>>? takeBrowserSessionAsync = null,
             int actionSettleMs = 350, int typingDelayMs = 18, TimeSpan? visualGateWait = null,
-            int browserServiceHostPort = 0, string browserServiceHost = "127.0.0.1")
+            int browserServiceHostPort = 0, string browserServiceHost = "127.0.0.1",
+            int desktopWidth = 0, int desktopHeight = 0)
         {
             browserService = new BrowserServiceClient(browserServiceHost, browserServiceHostPort);
+            daemon = new ComputerDaemonClient(browserServiceHost, browserServiceHostPort, containerID);
+            fallbackWidth = desktopWidth;
+            fallbackHeight = desktopHeight;
             this.visualGateWait = visualGateWait ?? DefaultVisualGateWait;
             this.transport = transport;
             this.containerID = containerID;
@@ -167,6 +191,56 @@ namespace Omnipotent.Services.Projects.Containers
             frameState = FrameStates.GetValue(transport, _ => new CachedFrameState());
             human = Humanizers.GetValue(transport, _ => new HumanizedInput(transport, HumanInputProfile.ForSeed(containerID)));
             desktop = new ContainerDesktopCommandBridge(transport, dockerControlAsync);
+            input = transport;
+        }
+
+        /// <summary>Tools whose result depends on sending pointer or keyboard events.</summary>
+        private static bool SendsInput(string tool) => tool is
+            "computer_move" or "computer_mouse_move_relative" or "computer_click" or "computer_drag" or
+            "computer_mouse_down" or "computer_mouse_up" or "computer_scroll" or "computer_type" or
+            "computer_key" or "computer_key_down" or "computer_key_up" or "computer_release_all" or
+            "computer_click_text" or "computer_click_browser_control" or "computer_upload_file";
+
+        /// <summary>
+        /// Picks how this action's input reaches the display. VNC when it is connected or connects within
+        /// a short budget; otherwise the in-container daemon, which drives the same display through XTEST.
+        /// A desktop whose x11vnc has wedged therefore keeps working instead of failing every pointer and
+        /// keyboard tool until it is restarted.
+        /// </summary>
+        private async Task<IDesktopInput> ResolveInputAsync(CancellationToken ct)
+        {
+            if (await TryVncAsync(ct)) return transport;
+            var health = await daemon.ControlPlaneAsync("input", ct);
+            if (health == null) return transport;   // nothing better: let VNC report its own error
+            int width = health.Screen?.Width > 0 ? health.Screen.Width : FramebufferSize().Width;
+            int height = health.Screen?.Height > 0 ? health.Screen.Height : FramebufferSize().Height;
+            var route = DaemonInputs.AddOrUpdate(containerID,
+                _ => new DaemonDesktopInput(daemon, width, height, transport.PointerX, transport.PointerY),
+                (_, existing) => existing.Width == width && existing.Height == height
+                    ? existing : new DaemonDesktopInput(daemon, width, height, existing.PointerX, existing.PointerY));
+            return route;
+        }
+
+        /// <summary>True when VNC is (or can quickly be made) usable. A failure parks VNC for a minute so
+        /// the following actions do not each pay the handshake timeout before using the daemon.</summary>
+        private async Task<bool> TryVncAsync(CancellationToken ct)
+        {
+            if (transport.Connected) return true;
+            if (VncDownUntil.TryGetValue(containerID, out var until) && DateTime.UtcNow < until && daemon.Configured) return false;
+            try
+            {
+                using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                budget.CancelAfter(VncConnectBudget);
+                await transport.ConnectAsync(budget.Token);
+                VncDownUntil.TryRemove(containerID, out _);
+                return transport.Connected;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch
+            {
+                if (daemon.Configured) VncDownUntil[containerID] = DateTime.UtcNow + VncRetryAfter;
+                return false;
+            }
         }
 
         public async Task<ComputerActionResult> ExecuteComputerActionAsync(ComputerActionRequest request, CancellationToken ct = default)
@@ -192,6 +266,11 @@ namespace Omnipotent.Services.Projects.Containers
         public async Task<ContainerToolResult> ExecuteAsync(string tool, string? argsJson, CancellationToken ct = default)
         {
             if (!Capabilities.Supports(tool)) return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.", ContainerToolFailureKind.Validation);
+            argsJson = BrowserRefAliases.ExpandArguments(containerID, argsJson, out string? unknownAlias);
+            if (unknownAlias != null)
+                return ContainerToolResult.Fail(
+                    $"ref '{unknownAlias}' is not one this desktop handed out (or it is too old). Inspect mode=controls again and use a ref from that result.",
+                    ContainerToolFailureKind.Validation);
             JsonDocument? doc = null;
             JsonElement a;
             try
@@ -223,7 +302,13 @@ namespace Omnipotent.Services.Projects.Containers
                 if (IsMutating(tool) && inputLock != null && agentID != null && !inputLock.TryAcquire(containerID, agentID))
                     return ContainerToolResult.Fail($"Desktop is currently controlled by agent {inputLock.CurrentHolder(containerID)}. Wait for its action to finish.", ContainerToolFailureKind.Contention);
 
-                return await DispatchAsync(tool, a, ct);
+                if (SendsInput(tool))
+                {
+                    input = await ResolveInputAsync(ct);
+                    human.Target = input;
+                }
+                var dispatched = await DispatchAsync(tool, a, ct);
+                return await WithComputerEventsAsync(tool, dispatched, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
             {
@@ -256,6 +341,24 @@ namespace Omnipotent.Services.Projects.Containers
                 doc?.Dispose();
                 if (usesVisualGate) actionGate.Release();
             }
+        }
+
+        /// <summary>
+        /// Prefixes a result with anything that happened to this computer since an agent last looked — a
+        /// browser crash, an OOM kill, a wedged browser the daemon restarted — so the cause arrives with
+        /// the symptom. Costs nothing when nothing happened (daemon health is cached for seconds).
+        /// </summary>
+        private async Task<ContainerToolResult> WithComputerEventsAsync(string tool, ContainerToolResult result, CancellationToken ct)
+        {
+            result = result with { Text = BrowserRefAliases.Shorten(containerID, result.Text) };
+            if (!daemon.Configured || tool is "computer_terminal" or "computer_clipboard_get" or "computer_clipboard_set") return result;
+            try
+            {
+                string events = ComputerAwareness.TakeNewEvents(containerID, await daemon.HealthAsync(ct));
+                return events.Length == 0 ? result : result with { Text = events + Environment.NewLine + result.Text };
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return result; }
         }
 
         /// <summary>Called by the wake lifecycle so a cancelled/retired agent cannot leave a
@@ -296,10 +399,10 @@ namespace Omnipotent.Services.Projects.Containers
                 case "computer_key":
                     return await KeyAsync(a, ct);
                 case "computer_key_down":
-                    await transport.KeyDownAsync(Str(a, "key") ?? throw new ArgumentException("Provide 'key'."), ct);
+                    await input.KeyDownAsync(Str(a, "key") ?? throw new ArgumentException("Provide 'key'."), ct);
                     return ContainerToolResult.Ok($"Holding {Str(a, "key")}.");
                 case "computer_key_up":
-                    return await MutateAsync($"Released {Str(a, "key")}.", () => transport.KeyUpAsync(Str(a, "key") ?? throw new ArgumentException("Provide 'key'."), ct), ct);
+                    return await MutateAsync($"Released {Str(a, "key")}.", () => input.KeyUpAsync(Str(a, "key") ?? throw new ArgumentException("Provide 'key'."), ct), ct);
                 case "computer_release_all":
                     await ReleaseWakeInputsAsync();
                     return await ScreenshotAsync("Released all held inputs and the desktop lease.", ct);
@@ -325,16 +428,17 @@ namespace Omnipotent.Services.Projects.Containers
                 case "computer_cdp":
                     return await CdpAsync(a, ct);
                 case "computer_clipboard_get":
-                    return ContainerToolResult.Ok(transport.GetClipboardText() is { } clip ? $"Clipboard: {clip}" : "Clipboard is unavailable until the desktop publishes a selection.");
+                    return await ClipboardGetAsync(ct);
                 case "computer_clipboard_set":
-                    return await MutateAsync("Clipboard set.", () => transport.SetClipboardTextAsync(Str(a, "text") ?? string.Empty, ct), ct);
+                    return await MutateAsync("Clipboard set.", () => ClipboardSetAsync(Str(a, "text") ?? string.Empty, ct), ct);
                 default: return ContainerToolResult.Fail($"Unsupported container computer tool '{tool}'.", ContainerToolFailureKind.Validation);
             }
         }
 
         private async Task<ContainerToolResult> WindowStateAsync(CancellationToken ct)
         {
-            string header = $"Desktop '{transport.DesktopName}' is {transport.Width}x{transport.Height}px. VNC connected: {transport.Connected}.";
+            var framebufferSize = FramebufferSize();
+            string header = $"Desktop '{transport.DesktopName}' is {framebufferSize.Width}x{framebufferSize.Height}px. VNC connected: {transport.Connected}.";
             if (terminalAsync == null) return ContainerToolResult.Ok(header);
 
             const string command =
@@ -430,7 +534,9 @@ namespace Omnipotent.Services.Projects.Containers
             string mode = (Str(a, "mode") ?? "dom").Trim().ToLowerInvariant();
             if (mode is not ("tabs" or "dom" or "controls" or "accessibility" or "network"))
                 return ContainerToolResult.Fail("mode must be tabs, dom, controls, accessibility, or network.", ContainerToolFailureKind.Validation);
-            int maxItems = Math.Clamp(Int(a, "maxItems", 80), 1, 200);
+            int maxItems = Math.Clamp(Int(a, "maxItems", mode == "controls" ? 150 : 80), 1, 300);
+            // The controls inventory renders one line per control unless raw JSON is asked for.
+            bool compact = mode == "controls" && !string.Equals(Str(a, "format"), "json", StringComparison.OrdinalIgnoreCase);
             // -1 means "whatever tab is actually in front". An explicit 0 used to be the default, so
             // every inspection after a couple of navigations described a stale background page.
             int tabIndex = RequestedTabIndex(a);
@@ -448,7 +554,7 @@ namespace Omnipotent.Services.Projects.Containers
                     stdout = served.Value.Stdout.Trim();
                     lastError = served.Value.Error;
                     if (served.Value.Ok && stdout.Length > 0 && stdout is not "null" and not "[]")
-                        return ContainerToolResult.Ok(Scrub(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000)));
+                        return ContainerToolResult.Ok(Scrub(ComputerAudit.Truncate(RenderInspection(stdout, compact), 24000)));
                 }
                 else
                 {
@@ -457,7 +563,7 @@ namespace Omnipotent.Services.Projects.Containers
                     lastError = string.Join(" ", new[] { last.Stderr, last.Stdout }
                         .Where(x => !string.IsNullOrWhiteSpace(x))).Trim();
                     if (last.Success && stdout.Length > 0 && stdout is not "null" and not "[]")
-                        return ContainerToolResult.Ok(Scrub(ComputerAudit.Truncate(AnnotateInspection(stdout), 24000)));
+                        return ContainerToolResult.Ok(Scrub(ComputerAudit.Truncate(RenderInspection(stdout, compact), 24000)));
                 }
                 if (attempt == 1)
                 {
@@ -481,7 +587,20 @@ namespace Omnipotent.Services.Projects.Containers
         private static int RequestedTabIndex(JsonElement a) =>
             HasInt(a, "tabIndex") ? Math.Clamp(Int(a, "tabIndex", -1), -1, 200) : -1;
 
-        internal static string AnnotateInspection(string inspectionJson)
+        /// <summary>Banners, then either the compact controls inventory or the raw JSON (short refs either way).</summary>
+        private string RenderInspection(string inspectionJson, bool compact)
+        {
+            if (!compact) return AnnotateInspection(inspectionJson);
+            try
+            {
+                return AnnotateInspection(inspectionJson, BrowserControlsRenderer.Render(inspectionJson, containerID));
+            }
+            catch (JsonException) { return AnnotateInspection(inspectionJson); }
+        }
+
+        internal static string AnnotateInspection(string inspectionJson) => AnnotateInspection(inspectionJson, null);
+
+        internal static string AnnotateInspection(string inspectionJson, string? rendered)
         {
             try
             {
@@ -500,10 +619,10 @@ namespace Omnipotent.Services.Projects.Containers
                         "clicks on the checkbox are scored as a bot and silently rejected, so you get one attempt, not several.\n";
                 if (root.ValueKind == JsonValueKind.Object && NativeDialogBanner(root) is { } dialog) banner += dialog;
                 if (root.ValueKind == JsonValueKind.Object) banner += HostileSurfaceAdvisories(root);
-                return banner + inspectionJson;
+                return banner + (rendered ?? inspectionJson);
             }
             catch (JsonException) { }
-            return inspectionJson;
+            return rendered ?? inspectionJson;
         }
 
         private static readonly Regex PaymentFrame = new(
@@ -1302,13 +1421,13 @@ namespace Omnipotent.Services.Projects.Containers
         /// route attaches when it finally returns, so it is closed and the close is checked.</summary>
         private async Task DismissNativeDialogAsync(CancellationToken ct)
         {
-            await transport.KeyChordAsync("escape", ct: ct);
+            await input.KeyChordAsync("escape", ct: ct);
             await Task.Delay(400, ct);
             var after = await RunBrowserHelperAsync("dialog", new { }, 20, ct);
             if (after.Ok && IsNativeDialogOpen(after.Stdout))
             {
                 await RunBrowserHelperAsync("dialog", new { activate = true }, 20, ct);
-                await transport.KeyChordAsync("escape", ct: ct);
+                await input.KeyChordAsync("escape", ct: ct);
                 await Task.Delay(400, ct);
             }
         }
@@ -1324,13 +1443,13 @@ namespace Omnipotent.Services.Projects.Containers
         {
             await RunBrowserHelperAsync("dialog", new { activate = true }, 20, ct);
             await Task.Delay(300, ct);
-            await transport.KeyChordAsync("ctrl+l", ct: ct);
+            await input.KeyChordAsync("ctrl+l", ct: ct);
             await Task.Delay(250, ct);
-            await transport.TypeTextAsync(path, typingDelayMs, ct);
+            await input.TypeTextAsync(path, typingDelayMs, ct);
             await Task.Delay(250, ct);
-            await transport.KeyChordAsync("delete", ct: ct);
+            await input.KeyChordAsync("delete", ct: ct);
             await Task.Delay(150, ct);
-            await transport.KeyChordAsync("enter", ct: ct);
+            await input.KeyChordAsync("enter", ct: ct);
 
             for (int attempt = 1; attempt <= 8; attempt++)
             {
@@ -1339,7 +1458,7 @@ namespace Omnipotent.Services.Projects.Containers
                 if (state.Ok && !IsNativeDialogOpen(state.Stdout))
                     return (true, "Typed the path into the visible file chooser's location bar and confirmed it; the dialog closed.");
                 if (attempt == 2)
-                    await transport.KeyChordAsync("enter", ct: ct);
+                    await input.KeyChordAsync("enter", ct: ct);
             }
             return (false, "The visible file chooser did not close after the path was entered.");
         }
@@ -1557,7 +1676,7 @@ namespace Omnipotent.Services.Projects.Containers
             if (dx == 0 && dy == 0) return ContainerToolResult.Ok("Relative pointer delta was zero.");
             int steps = Math.Clamp(Int(a, "steps", Math.Max(1, Math.Max(Math.Abs(dx), Math.Abs(dy)) / 25)), 1, 120);
             return await MutateAsync($"Moved pointer by ({dx},{dy}).",
-                () => human.Enabled ? human.MoveRelativeAsync(dx, dy, ct) : transport.MoveMouseRelativeAsync(dx, dy, steps, ct), ct);
+                () => human.Enabled ? human.MoveRelativeAsync(dx, dy, ct) : input.MoveMouseRelativeAsync(dx, dy, steps, ct), ct);
         }
 
         private async Task<ContainerToolResult> ClickAsync(JsonElement a, CancellationToken ct)
@@ -1786,7 +1905,7 @@ namespace Omnipotent.Services.Projects.Containers
         {
             int x = RequiredInt(a, "x"), y = RequiredInt(a, "y");
             var point = await ResolvePointAsync(x, y, ct);
-            await transport.MouseDownAsync(point.X, point.Y, ParseButton(Str(a, "button")), ct);
+            await input.MouseDownAsync(point.X, point.Y, ParseButton(Str(a, "button")), ct);
             return ContainerToolResult.Ok($"Mouse button held down at ({x},{y}).");
         }
 
@@ -1796,7 +1915,7 @@ namespace Omnipotent.Services.Projects.Containers
             return await MutateAsync("Mouse button released.", async () =>
             {
                 var point = await ResolvePointAsync(x, y, ct);
-                await transport.MouseUpAsync(point.X, point.Y, ParseButton(Str(a, "button")), ct);
+                await input.MouseUpAsync(point.X, point.Y, ParseButton(Str(a, "button")), ct);
             }, ct);
         }
 
@@ -1816,7 +1935,8 @@ namespace Omnipotent.Services.Projects.Containers
             var size = CoordinateSpace();
             int x = HasInt(a, "x") ? RequiredInt(a, "x") : Math.Max(0, (size.Width - 1) / 2);
             int y = HasInt(a, "y") ? RequiredInt(a, "y") : Math.Max(0, (size.Height - 1) / 2);
-            var point = MapPointToFramebuffer(x, y, size.Width, size.Height, transport.Width, transport.Height);
+            var framebuffer = FramebufferSize();
+            var point = MapPointToFramebuffer(x, y, size.Width, size.Height, framebuffer.Width, framebuffer.Height);
             return await MutateAsync($"Scrolled {Str(a, "direction") ?? "down"}.",
                 () => human.ScrollAsync(point.X, point.Y, dy, dx, ct), ct);
         }
@@ -1844,7 +1964,7 @@ namespace Omnipotent.Services.Projects.Containers
             var notes = new List<string>();
             string overlays = ComputerInputGuard.DescribeOverlays(pre);
             if (overlays.Length > 0) notes.Add(overlays);
-            await (human.Enabled ? human.TypeTextAsync(text, ct) : transport.TypeTextAsync(text, typingDelayMs, ct));
+            await (human.Enabled ? human.TypeTextAsync(text, ct) : input.TypeTextAsync(text, typingDelayMs, ct));
             await Task.Delay(actionSettleMs, ct);
 
             if (pre?.Focus is { Kind: "editable" } focus && pre.Armed.Count > 0)
@@ -2139,7 +2259,7 @@ namespace Omnipotent.Services.Projects.Containers
             int holdMs = Math.Clamp(Int(a, "holdMs", 55), 1, 2000);
             int repeats = Math.Clamp(Int(a, "repeats", 1), 1, 50);
             return await MutateAsync($"Pressed {chord}{(repeats > 1 ? $" {repeats} times" : "")}.",
-                () => transport.KeyChordAsync(chord, holdMs, repeats, ct), ct);
+                () => input.KeyChordAsync(chord, holdMs, repeats, ct), ct);
         }
 
         private async Task<ContainerToolResult> WaitAsync(JsonElement a, CancellationToken ct)
@@ -2191,13 +2311,13 @@ namespace Omnipotent.Services.Projects.Containers
                 : Array.Empty<string>();
             try
             {
-                foreach (var modifier in modifiers) await transport.KeyDownAsync(NormalizeModifier(modifier), ct);
+                foreach (var modifier in modifiers) await input.KeyDownAsync(NormalizeModifier(modifier), ct);
                 return await action();
             }
             finally
             {
                 for (int i = modifiers.Length - 1; i >= 0; i--)
-                    try { await transport.KeyUpAsync(NormalizeModifier(modifiers[i]), CancellationToken.None); } catch { }
+                    try { await input.KeyUpAsync(NormalizeModifier(modifiers[i]), CancellationToken.None); } catch { }
             }
         }
 
@@ -2217,7 +2337,7 @@ namespace Omnipotent.Services.Projects.Containers
             // Structured browser/CLI paths intentionally provision without connecting VNC. Their
             // returned DOM/tab state is already the postcondition, so do not turn a healthy action
             // into a slow framebuffer connection attempt merely to add an optional image.
-            if (!transport.Connected && beforeJpeg == null)
+            if (!VisualChannelLive() && beforeJpeg == null)
                 return ContainerToolResult.Ok(
                     label + " No framebuffer was attached for this operation; the structured text result is authoritative. " +
                     "Vision-capable agents may call desktop op=screenshot separately when pixels add value.");
@@ -2266,16 +2386,98 @@ namespace Omnipotent.Services.Projects.Containers
 
         private async Task<(byte[] bgra, int width, int height)> CaptureFrameWithRetryAsync(CancellationToken ct)
         {
-            try
+            Exception? vncFailure = null;
+            bool vncParked = VncDownUntil.TryGetValue(containerID, out var until) && DateTime.UtcNow < until && daemon.Configured;
+            if (!vncParked)
             {
-                return await transport.CaptureFrameAsync(ct);
+                try
+                {
+                    var frame = await transport.CaptureFrameAsync(ct);
+                    NoteFrame(frame.width, frame.height, "vnc");
+                    return frame;
+                }
+                catch (Exception first) when (!ct.IsCancellationRequested)
+                {
+                    // VncTransport drops its connection on receive-loop failure. One immediate retry
+                    // repairs transient docker-proxy/x11vnc disconnects without masking a real outage.
+                    try
+                    {
+                        var frame = await transport.CaptureFrameAsync(ct);
+                        NoteFrame(frame.width, frame.height, "vnc");
+                        return frame;
+                    }
+                    catch (Exception second) when (!ct.IsCancellationRequested)
+                    {
+                        vncFailure = second;
+                        _ = first;
+                        if (daemon.Configured) VncDownUntil[containerID] = DateTime.UtcNow + VncRetryAfter;
+                    }
+                }
             }
-            catch (Exception) when (!ct.IsCancellationRequested)
+
+            // The same display, captured inside the container. A wedged x11vnc or a broken port proxy
+            // on the VNC side no longer blinds the agent.
+            var captured = await daemon.CaptureBgraAsync(ct);
+            if (captured is { } daemonFrame)
             {
-                // VncTransport drops its connection on receive-loop failure. One immediate retry
-                // repairs transient docker-proxy/x11vnc disconnects without masking a real outage.
-                return await transport.CaptureFrameAsync(ct);
+                NoteFrame(daemonFrame.Width, daemonFrame.Height, "computerd");
+                return (daemonFrame.Bgra, daemonFrame.Width, daemonFrame.Height);
             }
+            if (vncFailure != null) System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(vncFailure).Throw();
+            // VNC was parked and the daemon could not capture either: give VNC one honest try.
+            var last = await transport.CaptureFrameAsync(ct);
+            NoteFrame(last.width, last.height, "vnc");
+            VncDownUntil.TryRemove(containerID, out _);
+            return last;
+        }
+
+        private void NoteFrame(int width, int height, string route)
+        {
+            lock (frameState.Gate)
+            {
+                frameState.FramebufferWidth = width;
+                frameState.FramebufferHeight = height;
+                frameState.FrameRoute = route;
+            }
+        }
+
+        /// <summary>A visual channel is live when VNC is connected or a frame was captured recently by
+        /// either route. Structured browser/CLI paths that never touched pixels stay text-only.</summary>
+        private bool VisualChannelLive()
+        {
+            // Input that just went through the daemon is a visual action like any VNC one.
+            if (transport.Connected || !ReferenceEquals(input, transport)) return true;
+            lock (frameState.Gate)
+                return frameState.Jpeg != null && DateTime.UtcNow - frameState.CapturedUtc <= TimeSpan.FromMinutes(2);
+        }
+
+        /// <summary>The framebuffer's real geometry: from the RFB session when connected, else from the
+        /// last captured frame, else from the desktop's creation record.</summary>
+        private (int Width, int Height) FramebufferSize()
+        {
+            if (transport.Width > 0 && transport.Height > 0) return (transport.Width, transport.Height);
+            lock (frameState.Gate)
+                if (frameState.FramebufferWidth > 0 && frameState.FramebufferHeight > 0)
+                    return (frameState.FramebufferWidth, frameState.FramebufferHeight);
+            if (input is DaemonDesktopInput daemonInput) return (daemonInput.Width, daemonInput.Height);
+            return (fallbackWidth, fallbackHeight);
+        }
+
+        private async Task<ContainerToolResult> ClipboardGetAsync(CancellationToken ct)
+        {
+            // xclip reads the real X selection. The VNC route only knows what x11vnc happened to announce
+            // since the connection opened, which is why it so often answered "unavailable".
+            string? text = await daemon.ClipboardGetAsync(ct);
+            if (text != null)
+                return ContainerToolResult.Ok(text.Length == 0 ? "Clipboard is empty." : $"Clipboard: {text}");
+            return ContainerToolResult.Ok(transport.GetClipboardText() is { } clip
+                ? $"Clipboard: {clip}" : "Clipboard is unavailable until the desktop publishes a selection.");
+        }
+
+        private async Task ClipboardSetAsync(string text, CancellationToken ct)
+        {
+            if (await daemon.ClipboardSetAsync(text, ct) == true) return;
+            await transport.SetClipboardTextAsync(text, ct);
         }
 
         private (byte[] jpeg, int width, int height) EncodeAndCacheDisplayFrame((byte[] bgra, int width, int height) frame)
@@ -2296,7 +2498,6 @@ namespace Omnipotent.Services.Projects.Containers
 
         private byte[]? RecentFrameJpeg()
         {
-            if (!transport.Connected) return null;
             lock (frameState.Gate)
             {
                 // Old frames are still valid coordinate metadata, but no longer useful as the
@@ -2314,21 +2515,27 @@ namespace Omnipotent.Services.Projects.Containers
                 if (frameState.Width > 0 && frameState.Height > 0)
                     return (frameState.Width, frameState.Height);
             }
-            return (transport.Width, transport.Height);
+            return FramebufferSize();
         }
 
         private async Task EnsureCoordinateSpaceAsync(CancellationToken ct)
         {
             var size = CoordinateSpace();
-            if (!transport.Connected || transport.Width <= 0 || transport.Height <= 0 || size.Width <= 0 || size.Height <= 0)
-                await transport.ConnectAsync(ct);
+            var framebuffer = FramebufferSize();
+            if (size.Width > 0 && size.Height > 0 && framebuffer.Width > 0 && framebuffer.Height > 0) return;
+            if (await TryVncAsync(ct)) return;
+            // No VNC session to learn the geometry from: the daemon knows its own screen.
+            var health = await daemon.HealthAsync(ct);
+            if (health?.Screen is { Width: > 0, Height: > 0 } screen) NoteFrame(screen.Width, screen.Height, frameState.FrameRoute);
+            else await transport.ConnectAsync(ct);   // surfaces the real VNC error
         }
 
         private async Task<(int X, int Y)> ResolvePointAsync(int x, int y, CancellationToken ct)
         {
             await EnsureCoordinateSpaceAsync(ct);
             var shown = CoordinateSpace();
-            return MapPointToFramebuffer(x, y, shown.Width, shown.Height, transport.Width, transport.Height);
+            var framebuffer = FramebufferSize();
+            return MapPointToFramebuffer(x, y, shown.Width, shown.Height, framebuffer.Width, framebuffer.Height);
         }
 
         /// <summary>
@@ -2358,7 +2565,9 @@ namespace Omnipotent.Services.Projects.Containers
 
         private async Task TryReleaseAsync()
         {
-            try { await transport.ReleaseAllAsync(CancellationToken.None); } catch { }
+            try { await input.ReleaseAllAsync(CancellationToken.None); } catch { }
+            if (!ReferenceEquals(input, transport) && transport.Connected)
+                try { await transport.ReleaseAllAsync(CancellationToken.None); } catch { }
         }
 
         // This predicate controls the shared *input* lease. Terminal execution is independently

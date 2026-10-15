@@ -1221,6 +1221,108 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, ProjectsPerms.OverviewView);
 
+            // ── Site playbooks (global, shared by every project) ──
+            await parent.RegisterHttpRouteAsync("/projects/playbooks", async req =>
+            {
+                try
+                {
+                    Services.KliveAPI.Caching.CacheDeps.NoteRead("projects:playbooks");
+                    await req.ReturnResponse(Json(parent.Playbooks.List()));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, ProjectsPerms.OverviewView);
+
+            await parent.RegisterHttpRouteAsync("/projects/playbooks/save", async req =>
+            {
+                try
+                {
+                    var body = ParseBody(req) ?? new JObject();
+                    static List<string>? Lines(JToken? token) => token is JArray array
+                        ? array.Select(t => (string?)t ?? "").ToList()
+                        : token?.Type == JTokenType.String
+                            ? ((string?)token ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList()
+                            : null;
+                    var urls = body["urls"] is JArray urlArray
+                        ? urlArray.OfType<JObject>().Select(u => new SitePlaybookUrl { Label = (string?)u["label"] ?? "", Url = (string?)u["url"] ?? "" }).ToList()
+                        : null;
+                    var saved = parent.Playbooks.Save((string?)body["domain"] ?? "", "Klives", (string?)body["summary"],
+                        Lines(body["steps"]), Lines(body["pitfalls"]), urls, (bool?)body["verified"] == true);
+                    await req.ReturnResponse(Json(saved));
+                }
+                catch (InvalidOperationException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
+
+            await parent.RegisterHttpRouteAsync("/projects/playbooks/delete", async req =>
+            {
+                try
+                {
+                    string domain = (string?)ParseBody(req)?["domain"] ?? "";
+                    await req.ReturnResponse(Json(new { deleted = parent.Playbooks.Delete(domain) }));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
+
+            // Every computer (or one project's) with what its in-container daemon reports: components,
+            // browser, memory/OOM, recent events. Live by definition, so never cached.
+            await parent.RegisterHttpRouteAsync("/projects/computers/list", async req =>
+            {
+                Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Live computer inventory with daemon health");
+                try
+                {
+                    if (parent.Desktops == null) { await req.ReturnResponse(Json(Array.Empty<object>())); return; }
+                    string? projectID = req.userParameters.Get("projectID");
+                    using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                    await req.ReturnResponse(Json(await parent.Desktops.DescribeComputersAsync(
+                        string.IsNullOrWhiteSpace(projectID) ? null : projectID, budget.Token)));
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, ProjectsPerms.OverviewView);
+
+            // The daemon's diagnostics for one computer: log tails, top memory users, its event journal.
+            await parent.RegisterHttpRouteAsync("/projects/computers/diagnostics", async req =>
+            {
+                Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("Live computer diagnostics");
+                try
+                {
+                    string? id = req.userParameters.Get("containerID");
+                    if (parent.Desktops == null || string.IsNullOrWhiteSpace(id)
+                        || parent.Desktops.Registry.All().All(r => r.ContainerID != id))
+                    {
+                        await req.ReturnResponse("Computer not found.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+                    string? diag = await parent.Desktops.ComputerDiagnosticsAsync(id!, budget.Token);
+                    await req.ReturnResponse(diag ?? "{\"ok\":false,\"error\":\"The computer's control daemon did not answer (asleep, outdated, or not yet authorised).\"}",
+                        "application/json");
+                }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Get, ProjectsPerms.DetailsRead);
+
+            // Named repairs, gentlest first: restart-browser, restart-components, restart-computer, refresh-helpers.
+            await parent.RegisterHttpRouteAsync("/projects/computers/repair", async req =>
+            {
+                try
+                {
+                    var body = ParseBody(req);
+                    string? id = (string?)body?["containerID"];
+                    string action = (string?)body?["action"] ?? "";
+                    var record = parent.Desktops?.Registry.All().LastOrDefault(r => r.ContainerID == id && !r.Lost);
+                    if (record == null)
+                    {
+                        await req.ReturnResponse("Computer not found.", code: HttpStatusCode.NotFound);
+                        return;
+                    }
+                    using var budget = new CancellationTokenSource(TimeSpan.FromMinutes(3));
+                    string outcome = await parent.Desktops!.RepairComputerAsync(record.ContainerID, action, budget.Token);
+                    parent.NoteComputerRepair(record, action, outcome);
+                    await req.ReturnResponse(Json(new { ok = true, record.ContainerID, action, outcome }));
+                }
+                catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
+                catch (Exception ex) { await Err(req, ex); }
+            }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
+
             await parent.RegisterHttpRouteAsync("/projects/computers/resume", async req =>
             {
                 try

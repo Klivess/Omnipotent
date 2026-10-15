@@ -98,6 +98,9 @@ namespace Omnipotent.Services.Projects
         /// <summary>Known accounts from the global shared registry (reuse before creating duplicates).</summary>
         public const int AccountsBudget = 1000;
 
+        /// <summary>The agent's own desktop: awake/asleep, open browser tabs, recent crashes.</summary>
+        public const int ComputerBudget = 450;
+
         /// <summary>
         /// Shared project-file summary (important inputs/assets, recent changes and a compact tree).
         /// The full filesystem remains available through list_files/stat_file and at /project.

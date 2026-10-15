@@ -191,6 +191,19 @@ namespace Omnipotent.Services.Projects
         public int WorkerMessagesPerWake { get; set; } = Defaults.WorkerMessagesPerWake;
 
         public bool VisionEnabled { get; set; } = true;
+
+        // ── Autonomy policy: Klives' hard limits, enforced at tool dispatch (ProjectAutonomyPolicy) ──
+
+        /// <summary>Sites agents must never use; navigation, fetches and HTTP calls to them are refused.</summary>
+        [JsonProperty(ObjectCreationHandling = ObjectCreationHandling.Replace)] public List<string> BlockedDomains { get; set; } = new();
+        /// <summary>Sites whose first use opens an approval card; an approval lasts a day.</summary>
+        [JsonProperty(ObjectCreationHandling = ObjectCreationHandling.Replace)] public List<string> AskFirstDomains { get; set; } = new();
+        /// <summary>Host PowerShell/Bash/C# tools. Off confines agents to their own desktops.</summary>
+        public bool AllowHostShell { get; set; } = true;
+        /// <summary>klivemail op:send. Off means agents draft mail for Klives instead of sending it.</summary>
+        public bool AllowOutboundEmail { get; set; } = true;
+        /// <summary>Registering new external accounts. Off means agents reuse the registry or ask.</summary>
+        public bool AllowAccountCreation { get; set; } = true;
         /// <summary>
         /// Stream model output so the Conversation panel can show who is generating and what. Turning
         /// this off returns every agent to the buffered request path — the indicator then only reports
@@ -312,6 +325,11 @@ namespace Omnipotent.Services.Projects
                 case "workermessagesperwake":
                     WorkerMessagesPerWake = Math.Clamp(ParseInt(Text(value), Defaults.WorkerMessagesPerWake), 1, 100); break;
                 case "visionenabled": VisionEnabled = ParseBool(Text(value)); break;
+                case "blockeddomains": BlockedDomains = ProjectAutonomyPolicy.ParseDomains(value); break;
+                case "askfirstdomains": AskFirstDomains = ProjectAutonomyPolicy.ParseDomains(value); break;
+                case "allowhostshell": AllowHostShell = ParseBool(Text(value)); break;
+                case "allowoutboundemail": AllowOutboundEmail = ParseBool(Text(value)); break;
+                case "allowaccountcreation": AllowAccountCreation = ParseBool(Text(value)); break;
                 case "liveactivitystreaming": LiveActivityStreaming = ParseBool(Text(value)); break;
                 case "containersenabled": ContainersEnabled = ParseBool(Text(value)); break;
                 case "desktopfirstwebsiteinteraction": DesktopFirstWebsiteInteraction = ParseBool(Text(value)); break;

@@ -121,6 +121,9 @@ THE ESCALATION BAR (this is where your judgment carries the safety of the whole 
 - DURABLE ENVIRONMENT FACTS: when you verify something about your environment that a later wake would otherwise re-derive (a service's in-process access path, an API's exact auth, where a tool lives, that the desktop is ready), record it with checkpoint op:upsert_fact (with evidence) — NOT in a prose status message. Checkpoint facts are seeded into every wake's TYPED EXECUTION STATE and survive compaction; prose does not. Re-deriving the same facts every wake is how a project burns its budget without progressing.
 - DEAD ENDS ARE DURABLE TOO: when an approach genuinely fails — a signup path the platform blocks, a library that won't build here, an API that returns the wrong shape, a UI route that dead-ends — record it with checkpoint op:record_dead_end (key, approach, outcome, and `instead` when you found a better route). The DEAD ENDS block in your TYPED EXECUTION STATE is seeded into every wake, so a recorded dead end still steers you thirty wakes later, long after the events describing it have left your recent window. Read that block before planning and do not re-attempt what is listed there without genuinely new information. If an approach later starts working, clear it with op:resolve_dead_end. Repeating a known-failed approach is the single most expensive mistake you can make.
 
+- SITE PLAYBOOKS: every project shares one playbook per website (playbook op:get/save/list). When you navigate to a site that has one it is shown to you automatically — follow it. The moment you get through a site flow (signup, login, posting, checkout, a settings change), save what worked with playbook op:save (summary, steps, key URLs, pitfalls, verified:true), and add a pitfall whenever something cost you attempts. One agent's success should make every later agent's first attempt succeed.
+- YOUR COMPUTER block (near the end of your wake seed) is the live state of your own desktop: the browser's open tabs and anything that happened to it while you were away. Resume from those tabs instead of re-navigating. Browser refs look like e12: pass them exactly as ref:""e12"".
+
 REFERENCE — {ScriptApiReference.Value}
 
 Be concise and concrete. Report measured facts, not adjectives. Everything you do is on the timeline Klives watches.
@@ -449,6 +452,28 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                 Tool("delete_memory", "Delete an obsolete, duplicate, or incorrect shared memory by full id or unique short-id prefix.",
                     Obj(new { id = Str("Memory id or unique prefix.") }, "id")),
 
+                // ── site playbooks: per-domain recipes shared by every project ──
+                Tool("playbook_get", "Read the shared playbook for a website (domain or any URL on it): what it is for, the steps that worked, the URLs that matter and the traps to avoid. It is also shown automatically when you navigate to a site that has one.",
+                    Obj(new { domain = Str("Site host or URL, e.g. upwork.com or https://www.upwork.com/signup.") }, "domain")),
+                Tool("playbook_save", "Write down how to get through a website once you have done it, so the next agent in ANY project gets it first time. Supplied fields replace the stored ones; omitted fields are kept. Save right after a flow works (signup, login, posting, checkout, settings) and add a pitfall whenever something cost you attempts.",
+                    Obj(new
+                    {
+                        domain = Str("Site host or URL, e.g. etsy.com."),
+                        summary = Str("One or two sentences: what this site is for in our work and the shortest path through it."),
+                        steps = Arr(Str("One concrete step that worked, e.g. 'Signup is at /join; choose \"Continue with email\", not Google'."), "Ordered steps that worked."),
+                        pitfalls = Arr(Str("A trap, e.g. 'Cookie wall: the reject button is second'."), "Replace the pitfall list."),
+                        addPitfalls = Arr(Str("A newly discovered trap."), "Append pitfalls without retyping the existing ones."),
+                        urls = Arr(new
+                        {
+                            type = "object",
+                            properties = new { label = Str("What it is, e.g. 'signup'."), url = Str("Absolute URL.") },
+                            required = new[] { "label", "url" },
+                        }, "Key URLs on this site."),
+                        verified = Bool("True when you just completed the flow successfully."),
+                    }, "domain")),
+                Tool("playbook_list", "List every site playbook (domain, summary, freshness) shared across projects.",
+                    Obj(new { query = Str("Optional filter on domain or summary text.") }, Array.Empty<string>())),
+
                 // ── cross-system knowledge + live web (KliveRAG) ──
                 Tool("search_knowledge", "Search Klives' whole knowledge base — OTHER projects' decisions/outcomes, KliveAgent conversations/memories, Omniscience person facts, repo docs, cached web. Use this before spawning a research sub-agent: the answer may already exist. Returns cited snippets with doc ids.",
                     Obj(new { query = Str("Free-text search query."), max = Num("Max results (default 8).") }, "query")),
@@ -699,12 +724,13 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                     tabIndex = ProjectNum("Optional tab to drive, from computer_browser_inspect(mode:'tabs'); omit for the active tab."),
                 }, "url")));
             Replace("computer_browser_inspect", Tool("computer_browser_inspect",
-                "Inspect the isolated browser structurally instead of guessing from pixels. Returns indexed tabs, DOM text/links/forms/fileInputs, accessibility nodes, or recent network resource timings — for the ACTIVE tab unless you name a tabIndex. It also reports any native (GTK) dialog blocking the page, which the DOM cannot see. Input values are never returned.",
+                "Inspect the isolated browser structurally instead of guessing from pixels. mode=controls is the one to act from: one line per actionable control — role, name, state (required/filled/empty/checked/DISABLED/off-screen/in frame f1) and a short ref like e12 to pass as ref:\"e12\" to any browser op. Other modes return indexed tabs, DOM text/links/forms/fileInputs, accessibility nodes, or recent network timings — for the ACTIVE tab unless you name a tabIndex. It also reports any native (GTK) dialog blocking the page, which the DOM cannot see. Input values are never returned.",
                 ProjectObj(new
                 {
                     mode = ProjectStr("tabs | dom | controls | accessibility | network (default dom)"),
-                    maxItems = ProjectNum("Maximum structured items, 1-200; default 80"),
+                    maxItems = ProjectNum("Maximum structured items, 1-300; default 150 for controls, 80 otherwise"),
                     tabIndex = ProjectNum("0-based index from mode=tabs; omit for the tab that is in front"),
+                    format = ProjectStr("controls only: 'json' for the raw inventory instead of the compact one-line-per-control view"),
                 })));
             tools.Add(Tool("computer_browser_action",
                 "Operate the SAME persistent visible Chromium session entirely through structured text/CLI control. Use inspect mode=controls, then target by its opaque ref or by semantic fields. Handles forms, open shadow roots, same/cross-origin frames, history, tabs, waits and scrolling without model vision. Every result returns bounded URL/title/tab/dialog state for verification. fill/type read the field back and FAIL if the value did not land, so a form you were told is filled really is. op=take_session copies a named Project agent's persistent browser sign-in to THIS desktop and restarts Chromium; raw session values never enter the result, and it replaces this desktop's prior profile. op=solve_challenge waits for the free CAPTCHA extension and reports observed response state. It needs no account/key, has a shared IP quota, and cannot guarantee success. Follow its recovery diagnosis; do not blindly repeat the solve or buy accounts. A click blocked by a cookie wall or modal clears it automatically and retries; op=dismiss_overlays sweeps them page-wide. op=script is a last-resort live-page escape hatch and rejects obvious secret/storage/network-exfiltration access; never embed credentials in script.",
@@ -716,7 +742,7 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                         @enum = new[] { "click", "fill", "type", "select", "check", "uncheck", "focus", "hover", "scroll_into_view", "scroll", "press", "wait", "back", "forward", "reload", "activate_tab", "close_tab", "script", "solve_challenge", "dismiss_overlays", "take_session" },
                         description = "The structured browser operation.",
                     },
-                    @ref = ProjectStr("Opaque control ref from computer_browser_inspect(mode:'controls'). Re-inspect if stale."),
+                    @ref = ProjectStr("Control ref from inspect mode=controls, e.g. e12. Re-inspect if it is reported stale."),
                     name = ProjectStr("Accessible name fragment."),
                     text = ProjectStr("Visible text fragment."),
                     role = ProjectStr("Accessible role, e.g. textbox, button, link, checkbox, combobox."),
@@ -749,7 +775,7 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                 description = "The page's upload control (the button/link you would click to choose a file): a ref from inspect mode=controls, or name/text/role/css/label, or x,y screenshot pixels.",
                 properties = new
                 {
-                    @ref = ProjectStr("Opaque control ref from computer_browser_inspect(mode:'controls')."),
+                    @ref = ProjectStr("Control ref from inspect mode=controls, e.g. e12."),
                     name = ProjectStr("Accessible name, e.g. 'Change avatar'."),
                     text = ProjectStr("Visible text fragment."),
                     role = ProjectStr("Accessible role, e.g. button."),
@@ -832,7 +858,7 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                     waitEvent = ProjectStr("For send: an event name to wait for after the command, e.g. Page.loadEventFired."),
                     waitMs = ProjectNum("For send: how long to wait for waitEvent, up to 60000; default 5000."),
                     selector = ProjectStr("For click/type/set_files: CSS selector (searched through frames and open shadow roots)."),
-                    @ref = ProjectStr("For click/type: control ref from computer_browser_inspect(mode:'controls')."),
+                    @ref = ProjectStr("For click/type: control ref from inspect mode=controls, e.g. e12."),
                     name = ProjectStr("For click/type: accessible name of the target control."),
                     role = ProjectStr("For click/type: accessible role of the target control."),
                     text = ProjectStr("For type: the text (vault/account placeholders allowed; never echoed back)."),
@@ -855,7 +881,7 @@ Token budget: ${project.TokenBudgetUsd:0.##}. Real-money budget: ${project.Money
                 }, "action")));
             tools.Add(Tool("computer_click_browser_control", "Locate a visible browser control by its accessible name/role/tag using read-only DOM geometry, reject disabled or overlay-intercepted targets, then click it with the real VNC mouse. This is the structured browser action for text agents and custom controls such as role=combobox; it never invokes a page event through CDP. Re-inspect after the click to verify state.", ProjectObj(new
             {
-                @ref = ProjectStr("Optional opaque ref from mode=controls. Re-inspect if stale."),
+                @ref = ProjectStr("Optional control ref from inspect mode=controls, e.g. e12. Re-inspect if stale."),
                 name = ProjectStr("Accessible name or visible text to match; optional when role/tag is sufficient."),
                 text = ProjectStr("Optional visible text fragment."),
                 role = ProjectStr("Optional accessible role, e.g. button, combobox, textbox, checkbox, link."),

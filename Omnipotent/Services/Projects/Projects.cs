@@ -105,6 +105,8 @@ namespace Omnipotent.Services.Projects
         public ProjectArtifactStore Artifacts { get; private set; } = null!;
         /// <summary>Named live values agents maintain for Klives' at-a-glance project dashboard.</summary>
         public ProjectObservableStore Observables { get; private set; } = null!;
+        /// <summary>Per-website recipes shared by every project, shown when an agent navigates there.</summary>
+        public ProjectSitePlaybookStore Playbooks { get; private set; } = null!;
         /// <summary>Adversarial council transcripts — the Commander's deliberation record.</summary>
         public ProjectCouncilStore Councils { get; private set; } = null!;
         /// <summary>Read-only project and fleet performance/cost analytics for the KM website.</summary>
@@ -210,6 +212,8 @@ namespace Omnipotent.Services.Projects
             WakeCycle.DescribeDirectives = (pid, trigger) => Directives.DescribeForPrompt(pid, "commander",
                 ProjectDirectiveStore.TryExtractDirectiveID(trigger));
             WakeCycle.DescribeKliveAgentContextAsync = DescribeKliveAgentContextAsync;
+            WakeCycle.DescribeComputerAsync = DescribeComputerForSeedAsync;
+            WakeCycle.DescribeAutonomyPolicy = pid => ProjectAutonomyPolicy.Describe(Settings.Get(pid));
             // Cross-system knowledge leg for wake seeds (KliveRAG). Excludes the project's own log
             // (already covered by the BM25 retrieval leg). Fails soft — no KliveRAG → no block.
             WakeCycle.KnowledgeSearchAsync = async (query, excludeProjectId) =>
@@ -374,6 +378,7 @@ namespace Omnipotent.Services.Projects
             };
             Artifacts = new ProjectArtifactStore(msg => ServiceLog(msg));
             Observables = new ProjectObservableStore(msg => ServiceLog(msg));
+            Playbooks = new ProjectSitePlaybookStore();
             // Live observable values render into every wake seed, so agents always see the
             // dashboard exactly as Klives does.
             WakeCycle.DescribeObservables = pid => Observables.DescribeAll(pid);
@@ -2033,6 +2038,15 @@ namespace Omnipotent.Services.Projects
                 projectSettings, toolName, argsJson, ProjectWorkspaceLocator.HostRoot(project.ProjectID));
             if (interactionViolation != null)
                 return new CommanderToolResult(interactionViolation) { Succeeded = false };
+            string? autonomyViolation = ProjectAutonomyPolicy.FindViolation(project.ProjectID, projectSettings, toolName, argsJson,
+                out string? askFirstDomain);
+            if (autonomyViolation != null)
+                return new CommanderToolResult(autonomyViolation) { Succeeded = false };
+            if (askFirstDomain != null)
+            {
+                var asked = await AskFirstAsync(project, actingAgentID, wakeID, askFirstDomain, toolName, argsJson, ct);
+                if (asked != null) return asked;
+            }
 
             if (toolName.StartsWith("computer_", StringComparison.Ordinal)
                 || toolName == "ensure_desktop_ready")
@@ -2082,6 +2096,7 @@ namespace Omnipotent.Services.Projects
                 NotifyDirectiveCompletedAsync = (directive, paths, summary) =>
                     NotifyDirectiveCompletionAsync(project, directive, paths, summary),
                 Accounts = GetAccountRegistry(),
+                Playbooks = Playbooks,
                 KliveAgentService = GetKliveAgentService(),
                 GrandPlans = GrandPlans,
                 ActivateProjectAsync = () => ActivateProjectAsync(project),
@@ -2117,6 +2132,37 @@ namespace Omnipotent.Services.Projects
                 WebFetchAsync = url => RagWebFetchAsync(url, project, actingAgentID, ct),
             };
             return await tools.DispatchAsync(toolName, argsJson, ct);
+        }
+
+        /// <summary>
+        /// An ask-first site: open an approval card describing exactly where the agent wants to go, and
+        /// let the call through only once Klives approves (approval then lasts a day for that site).
+        /// Returns the refusal to hand back, or null to proceed.
+        /// </summary>
+        private async Task<CommanderToolResult?> AskFirstAsync(Project project, string actingAgentID, string wakeID,
+            string domain, string toolName, string argsJson, CancellationToken ct)
+        {
+            string url = "";
+            try { url = (string?)JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson)["url"] ?? ""; } catch { }
+            var approvalArgs = JsonConvert.SerializeObject(new
+            {
+                title = $"Ask-first site: {domain}",
+                description = $"{actingAgentID} wants to use {toolName} on {url}. {domain} is on this project's ask-first list; " +
+                              "approving allows the whole task force to use it for 24 hours.",
+                rationale = "Klives marked this site 'ask first' in the project's autonomy policy.",
+            });
+            // Opened on the Commander's behalf whoever asked: a worker cannot open gates itself, and the
+            // card names the agent that actually wants the site.
+            var approvalTools = new ProjectCommanderTools(
+                project, EventLog, Digests, SubAgents, Gates, Budget, Vault, Store, "commander", wakeID);
+            var approval = await approvalTools.DispatchAsync("request_user_approval", approvalArgs, ct);
+            if (approval.ResultText.StartsWith("Klives Approve", StringComparison.Ordinal))
+            {
+                ProjectAutonomyPolicy.RecordApproval(project.ProjectID, domain);
+                return null;
+            }
+            return new CommanderToolResult($"AUTONOMY_POLICY: {domain} is an ask-first site and Klives did not approve this use. {approval.ResultText}")
+            { Succeeded = false };
         }
 
         /// <summary>
@@ -2442,6 +2488,38 @@ namespace Omnipotent.Services.Projects
             return new CommanderToolResult(readiness.Summary) { Succeeded = readiness.Ok };
         }
 
+        /// <summary>
+        /// The "YOUR COMPUTER" seed block for one agent: its desktop's live state and open tabs, from the
+        /// desktop's own control daemon. Purely observational — it never provisions or wakes a desktop —
+        /// and bounded so a slow host cannot hold up a wake.
+        /// </summary>
+        private async Task<string> DescribeComputerForSeedAsync(string projectID, string agentID)
+        {
+            if (Desktops == null || !OperatingSystem.IsWindows()) return "";
+            var project = Store.GetProject(projectID);
+            if (project == null || !Settings.Get(projectID).ContainersEnabled) return "";
+            try { return await DescribeComputerWindowsAsync(project, agentID); }
+            catch (Exception ex)
+            {
+                _ = ServiceLogError(ex, $"Projects: computer seed block failed for {projectID}/{agentID}");
+                return "";
+            }
+        }
+
+        [SupportedOSPlatform("windows")]
+        private async Task<string> DescribeComputerWindowsAsync(Project project, string agentID)
+        {
+            string? owner = project.DesktopAllocation == DesktopAllocationMode.SharedDesktopWithInputLock ? null : agentID;
+            var record = Desktops!.Registry.ForProject(project.ProjectID)
+                .Where(r => string.Equals(r.AgentID, owner, StringComparison.OrdinalIgnoreCase))
+                .OrderBy(r => r.Lost)
+                .ThenByDescending(r => r.LastUsedAt)
+                .FirstOrDefault();
+            if (record == null) return "";
+            using var budget = new CancellationTokenSource(TimeSpan.FromSeconds(6));
+            return await ComputerAwareness.DescribeForSeedAsync(record, Desktops.DaemonFor(record.ContainerID), budget.Token);
+        }
+
         private static string DesktopReadyFactKey(string actingAgentID) => "desktop-ready/" + actingAgentID;
         private static string DesktopDependencyKey(string actingAgentID) => "desktop/" + actingAgentID;
 
@@ -2474,6 +2552,8 @@ namespace Omnipotent.Services.Projects
                     requireVisualReady: !ProjectTierRouter.CanRunWithoutFramebuffer(toolName),
                     ct: ct);
                 var result = await adapter.ExecuteAsync(toolName, argsJson, ct);
+                if (result.Success && toolName is "computer_navigate" or "computer_open_browser")
+                    result = result with { Text = result.Text + PlaybookNoteFor(project.ProjectID, actingAgentID, argsJson) };
                 if (!result.Success)
                 {
                     bool infrastructureFailure = InvalidatesDesktopReadiness(result);
@@ -2592,6 +2672,27 @@ namespace Omnipotent.Services.Projects
                 }
                 return new CommanderToolResult($"{toolName} failed: {ex.Message}") { Succeeded = false };
             }
+        }
+
+        // (project|agent|domain) → when its playbook was last shown, so a wake that keeps navigating
+        // around one site is reminded once, not on every page.
+        private readonly ConcurrentDictionary<string, DateTime> playbookShown = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>The playbook for the site a navigation just landed on, once per agent per half hour.</summary>
+        private string PlaybookNoteFor(string projectID, string agentID, string argsJson)
+        {
+            try
+            {
+                string? url = (string?)JObject.Parse(string.IsNullOrWhiteSpace(argsJson) ? "{}" : argsJson)["url"];
+                var playbook = Playbooks?.FindForUrl(url);
+                if (playbook == null) return "";
+                string key = $"{projectID}|{agentID}|{playbook.Domain}";
+                if (playbookShown.TryGetValue(key, out var shown) && DateTime.UtcNow - shown < TimeSpan.FromMinutes(30)) return "";
+                playbookShown[key] = DateTime.UtcNow;
+                return Environment.NewLine + Environment.NewLine + ProjectSitePlaybookStore.Describe(playbook) + Environment.NewLine +
+                       "(Shared by an earlier run. Follow it; if it is wrong or you find a better path, fix it with playbook op:save.)";
+            }
+            catch { return ""; }
         }
 
         internal static bool InvalidatesDesktopReadiness(Containers.ContainerToolAdapter.ContainerToolResult result) =>
@@ -3838,6 +3939,33 @@ namespace Omnipotent.Services.Projects
                     ServiceLog($"Projects: post-remote-control nudge for {record.ProjectID}/{record.AgentID ?? "commander"} was not accepted: {receipt.Reason}");
             }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to nudge the agent after a remote-control session"); }
+        }
+
+        /// <summary>
+        /// Records a computer repair Klives asked for on the timeline and tells the computer's agent what
+        /// changed under it, so it re-checks instead of acting on a page that no longer exists.
+        /// </summary>
+        internal void NoteComputerRepair(DesktopContainerRecord record, string action, string outcome)
+        {
+            try
+            {
+                EventLog.Append(new ProjectEvent
+                {
+                    ProjectID = record.ProjectID,
+                    AgentID = record.AgentID ?? "commander",
+                    Type = ProjectEventTypes.Status,
+                    Author = "klives",
+                    Text = $"Computer {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} ({record.AgentID ?? "shared"}): {action} — {outcome}",
+                });
+                if (ExternalDesktopOwners.IsExternal(record.ProjectID) || action == "refresh-helpers") return;
+                string text = $"Klives ran '{action}' on your computer: {outcome} Re-inspect (browser op=inspect or desktop op=screenshot) before your next action.";
+                var receipt = record.AgentID == null
+                    ? MessageProjectWithReceipt(record.ProjectID, text, ProjectDirectiveKind.Steering)
+                    : MessageAgentWithReceipt(record.ProjectID, record.AgentID, text, ProjectDirectiveKind.Steering);
+                if (!receipt.Accepted && record.AgentID != null)
+                    MessageProjectWithReceipt(record.ProjectID, $"[computer of agent {record.AgentID}] " + text, ProjectDirectiveKind.Steering);
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to record a computer repair"); }
         }
     }
 }

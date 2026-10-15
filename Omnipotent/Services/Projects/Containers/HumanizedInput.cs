@@ -2,7 +2,7 @@ namespace Omnipotent.Services.Projects.Containers
 {
     /// <summary>
     /// Turns each high-level desktop action into the human-shaped sequence of RFB events planned by
-    /// <see cref="HumanInputPlanner"/> and replays it on the <see cref="VncTransport"/>. One instance
+    /// <see cref="HumanInputPlanner"/> and replays it on the desktop's <see cref="IDesktopInput"/> route (VNC or the in-container daemon). One instance
     /// lives per desktop (keyed by its pooled transport) so its pseudo-random stream advances
     /// continuously across every action — the same "person" moving and typing all session, never the
     /// same curve or gap twice. When the persona is disabled (kill switch / zero intensity) every
@@ -14,16 +14,27 @@ namespace Omnipotent.Services.Projects.Containers
     /// </summary>
     public sealed class HumanizedInput
     {
-        private readonly VncTransport transport;
+        private IDesktopInput transport;
         private readonly HumanInputProfile profile;
         private readonly Random rng;
         private readonly object rngLock = new();
 
-        public HumanizedInput(VncTransport transport, HumanInputProfile profile)
+        public HumanizedInput(IDesktopInput transport, HumanInputProfile profile)
         {
             this.transport = transport;
             this.profile = profile;
             rng = new Random(profile.LiveSeed);
+        }
+
+        /// <summary>
+        /// The route the next action's events take. One persona per desktop, whichever way its input
+        /// arrives: the adapter points this at VNC or at the in-container daemon before each action
+        /// (actions on a desktop are serialised by its action gate, so this never changes mid-action).
+        /// </summary>
+        public IDesktopInput Target
+        {
+            get => transport;
+            set => transport = value ?? transport;
         }
 
         public HumanInputProfile Profile => profile;
@@ -53,14 +64,8 @@ namespace Omnipotent.Services.Projects.Containers
             await MoveAsync(toX, toY, ct);
         }
 
-        private async Task ReplayPathAsync(IReadOnlyList<MotionStep> path, CancellationToken ct)
-        {
-            foreach (var step in path)
-            {
-                await transport.MoveMouseAsync(step.X, step.Y, ct);
-                if (step.DelayMs > 0) await Task.Delay(step.DelayMs, ct);
-            }
-        }
+        private Task ReplayPathAsync(IReadOnlyList<MotionStep> path, CancellationToken ct) =>
+            transport.MovePathAsync(path, ct);
 
         // ── clicks ───────────────────────────────────────────────────────────────────────────────
 

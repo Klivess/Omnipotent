@@ -62,11 +62,12 @@ namespace Omnipotent.Services.Projects.Containers
             this.log = log ?? (_ => { });
             this.vncHost = vncHost;
             registry = new ContainerRegistry(log);
-            orchestrator = new ContainerOrchestrator(registry, log, imageForProject, dockerUri);
+            orchestrator = new ContainerOrchestrator(registry, log, imageForProject, dockerUri, vncHost);
             bootstrapper = new ContainerDependencyBootstrapper(this.log);
             // A browser-service rejection now degrades to docker exec instead of failing the action;
             // this is where the harness/service disagreement still gets reported.
             BrowserServiceClient.Diagnostics = this.log;
+            ComputerDaemonClient.Diagnostics = this.log;
         }
 
         /// <summary>Boot reconciliation — reattach to surviving containers (§9 restart/redeploy).</summary>
@@ -362,11 +363,16 @@ namespace Omnipotent.Services.Projects.Containers
                    ?? candidates[0];
         }
 
-        // The capabilities a desktop MUST have before visual work is worth attempting. A display
-        // and VNC frame alone are only a framebuffer; require the actual desktop, panel, and
-        // window manager so the browser appears inside a normal, human-usable environment.
-        private static readonly string[] RequiredCapabilities =
-            { "display", "desktop-shell", "panel", "window-manager", "vnc", "frame" };
+        // What a desktop MUST have before visual work is worth attempting: a display, a window manager
+        // (focus, maximise, wmctrl), a frame the agent can see and a route for its input — VNC or the
+        // in-container daemon, whichever answers. The XFCE panel and session make the desktop pleasant
+        // for a human, but an agent can work without them, and the entrypoint restarts them within
+        // seconds; failing readiness over them used to restart the whole container, killing the
+        // browser and whatever the agent was halfway through.
+        private static readonly string[] RequiredCapabilities = { "display", "window-manager", "frame", "input" };
+
+        /// <summary>Components reported when down but never a reason to fail readiness or restart.</summary>
+        private static readonly string[] AdvisoryCapabilities = { "desktop-shell", "panel" };
 
         // Chromium being installed only proves the image contains a binary. Browser work also
         // requires the visible process, its local CDP endpoint, and a tab the inspection helper
@@ -429,6 +435,28 @@ namespace Omnipotent.Services.Projects.Containers
             var readiness = await ProbeReadinessAsync(record, ct);
             if (readiness.Ok) return readiness;
 
+            // Repair ladder, cheapest and least destructive first. A container restart kills the
+            // browser and everything the agent had open, so it is the last rung, not the first.
+            //   1. Wait one supervision cycle: the entrypoint restarts a dead window manager, panel or
+            //      session within five seconds, and a busy host can simply be slow to answer.
+            await Task.Delay(TimeSpan.FromSeconds(6), ct);
+            readiness = await ProbeReadinessAsync(record, ct);
+            if (readiness.Ok)
+                return WithSummaryPrefix(readiness, "Desktop ready after a transient fault cleared on its own. ");
+
+            //   2. Repair components in place through the daemon (no Docker on the path, no restart).
+            string? repairedInPlace = await RepairComponentsInPlaceAsync(record, readiness, ct);
+            if (repairedInPlace != null)
+            {
+                readiness = await ProbeReadinessAsync(record, ct);
+                if (readiness.Ok)
+                    return WithSummaryPrefix(readiness, $"Desktop ready after in-place repair ({repairedInPlace}). ");
+            }
+
+            //   3. Only a desktop whose display is gone, or that nothing can reach, is restarted.
+            if (!NeedsContainerRestart(readiness.Capabilities))
+                return readiness;
+
             // Repair the existing machine. Replacing it destroys apt installs and home files;
             // a temporary VNC or daemon fault is never evidence that those files are disposable.
             log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} failed readiness; restarting its existing container.");
@@ -455,6 +483,67 @@ namespace Omnipotent.Services.Projects.Containers
                 Capabilities = repaired.Capabilities,
                 Summary = "Desktop ready after automatic shell/VNC repair. " + repaired.Summary,
             };
+        }
+
+        private static DesktopReadiness WithSummaryPrefix(DesktopReadiness readiness, string prefix) => new()
+        {
+            Ok = readiness.Ok,
+            ContainerID = readiness.ContainerID,
+            ImageVersion = readiness.ImageVersion,
+            Capabilities = readiness.Capabilities,
+            Summary = prefix + readiness.Summary,
+        };
+
+        /// <summary>
+        /// A restart is warranted only when the display server itself is gone, or when neither the VNC
+        /// route nor the daemon can reach the desktop at all. Anything narrower is repaired in place.
+        /// </summary>
+        internal static bool NeedsContainerRestart(IReadOnlyDictionary<string, string> capabilities)
+        {
+            bool daemonUp = string.Equals(capabilities.GetValueOrDefault("computerd"), "up", StringComparison.Ordinal);
+            bool displayUp = string.Equals(capabilities.GetValueOrDefault("display"), "up", StringComparison.Ordinal);
+            bool vncUp = string.Equals(capabilities.GetValueOrDefault("vnc"), "up", StringComparison.Ordinal);
+            if (!daemonUp && !vncUp) return true;          // unreachable by every route
+            if (!displayUp && capabilities.ContainsKey("display")) return true;  // the display server died
+            return false;
+        }
+
+        /// <summary>
+        /// Restarts missing desktop components inside the container through the daemon: the window
+        /// manager (focus and maximise depend on it) and, when it is gone, the shell pieces. Returns what
+        /// was done, or null when there was nothing to do or no daemon to do it with.
+        /// </summary>
+        private async Task<string?> RepairComponentsInPlaceAsync(DesktopContainerRecord record, DesktopReadiness readiness,
+            CancellationToken ct)
+        {
+            var caps = readiness.Capabilities;
+            if (!string.Equals(caps.GetValueOrDefault("computerd"), "up", StringComparison.Ordinal)) return null;
+            var steps = new List<string>();
+            var script = new System.Text.StringBuilder("set +e\nexport DISPLAY=:1\nif [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi\n");
+            if (!CapabilityIsReady("window-manager", caps))
+            {
+                script.Append("pgrep -x xfwm4 >/dev/null 2>&1 || (nohup xfwm4 --compositor=off >>/tmp/xfwm4.log 2>&1 </dev/null &)\n");
+                steps.Add("window manager restarted");
+            }
+            if (!CapabilityIsReady("panel", caps))
+            {
+                script.Append("pgrep -x xfce4-panel >/dev/null 2>&1 || (nohup xfce4-panel >>/tmp/xfce4-panel.log 2>&1 </dev/null &)\n");
+                steps.Add("panel restarted");
+            }
+            if (steps.Count == 0) return null;
+            script.Append("sleep 2\n");
+            try
+            {
+                var result = await orchestrator.ExecuteDesktopShellAsync(record.ContainerID, script.ToString(), "/home/agent", 20, idempotent: true, ct);
+                log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} in-place repair: {string.Join(", ", steps)} (exit {result.ExitCode}).");
+                return string.Join(", ", steps);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                log($"Desktop {record.ContainerID[..Math.Min(12, record.ContainerID.Length)]} in-place repair failed: {ex.Message}");
+                return null;
+            }
         }
 
         private async Task<DesktopReadiness> EnsureBrowserReadyAsync(
@@ -545,24 +634,38 @@ namespace Omnipotent.Services.Projects.Containers
 
         private async Task<DesktopReadiness> ProbeReadinessAsync(DesktopContainerRecord record, CancellationToken ct)
         {
-            ContainerShellResult probe;
-            try { probe = await orchestrator.ExecuteDesktopShellAsync(record.ContainerID, ReadinessProbeScript, "/home/agent", 30, ct); }
-            catch (Exception ex)
+            // The daemon answers from inside the container over HTTP; only a desktop without one (or
+            // whose daemon is down) still pays for a docker exec probe.
+            var daemon = orchestrator.DaemonFor(record.ContainerID);
+            var health = await daemon.HealthAsync(ct, fresh: true);
+            Dictionary<string, string> caps;
+            if (health is { IsControlPlane: true })
             {
-                return new DesktopReadiness { Ok = false, ContainerID = record.ContainerID,
-                    Summary = $"Desktop is up but the readiness probe failed: {ex.Message}" };
+                caps = CapabilitiesFromHealth(health);
             }
-            if (!probe.Success)
-                return new DesktopReadiness { Ok = false, ContainerID = record.ContainerID,
-                    Summary = "Desktop readiness probe returned non-zero: " + probe.Format(2000) };
+            else
+            {
+                ContainerShellResult probe;
+                try { probe = await orchestrator.ExecuteDesktopShellAsync(record.ContainerID, ReadinessProbeScript, "/home/agent", 30, idempotent: true, ct); }
+                catch (Exception ex)
+                {
+                    return new DesktopReadiness { Ok = false, ContainerID = record.ContainerID,
+                        Summary = $"Desktop is up but the readiness probe failed: {ex.Message}" };
+                }
+                if (!probe.Success)
+                    return new DesktopReadiness { Ok = false, ContainerID = record.ContainerID,
+                        Summary = "Desktop readiness probe returned non-zero: " + probe.Format(2000) };
+                caps = ParseCapabilities(probe.Stdout);
+                caps["computerd"] = health == null ? "down" : "outdated";
+            }
 
-            var caps = ParseCapabilities(probe.Stdout);
             try
             {
                 var frame = await GetTransport(record).CaptureFrameAsync(ct);
                 caps["vnc"] = "up";
                 caps["frame"] = IsCompleteFrame(frame.bgra, frame.width, frame.height) ? "usable" : "incomplete";
                 caps["frame-size"] = $"{frame.width}x{frame.height}";
+                caps["frame-route"] = "vnc";
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
@@ -571,8 +674,25 @@ namespace Omnipotent.Services.Projects.Containers
                 caps["frame"] = "unavailable";
                 caps["vnc-error"] = ex.Message;
             }
+
+            // A wedged x11vnc is not a broken desktop when the daemon can see and drive the same display.
+            bool daemonInput = health is { IsControlPlane: true, AuthConfigured: true } && health.Has("input") && health.Tools.GetValueOrDefault("xdotool");
+            if (caps["frame"] != "usable" && health is { IsControlPlane: true, AuthConfigured: true } && health.Has("screenshot"))
+            {
+                var frame = await daemon.CaptureBgraAsync(ct);
+                if (frame is { } captured && IsCompleteFrame(captured.Bgra, captured.Width, captured.Height))
+                {
+                    caps["frame"] = "usable";
+                    caps["frame-size"] = $"{captured.Width}x{captured.Height}";
+                    caps["frame-route"] = "computerd";
+                }
+            }
+            caps["input"] = caps["vnc"] == "up" || daemonInput ? "up" : "down";
+            caps["input-route"] = caps["vnc"] == "up" ? "vnc" : daemonInput ? "computerd" : "none";
+
             caps.TryGetValue("image-version", out var imageVersion);
             var missing = RequiredCapabilities.Where(c => !CapabilityIsReady(c, caps)).ToList();
+            var degraded = DegradedCapabilities(caps);
             string capsText = string.Join(", ", new[]
             {
                 $"display {caps.GetValueOrDefault("display", "?")}",
@@ -587,6 +707,9 @@ namespace Omnipotent.Services.Projects.Containers
                 $"ffmpeg {caps.GetValueOrDefault("ffmpeg", "?")}",
             });
             bool ok = DesktopControlIsReady(caps);
+            string routes = $" Input via {caps.GetValueOrDefault("input-route", "vnc")}, frames via {caps.GetValueOrDefault("frame-route", "vnc")}, " +
+                            $"control daemon {caps.GetValueOrDefault("computerd", "down")}.";
+            string advisory = degraded.Count == 0 ? "" : $" Cosmetic components down (self-restarting, not blocking): {string.Join(", ", degraded)}.";
             return new DesktopReadiness
             {
                 Ok = ok,
@@ -594,8 +717,8 @@ namespace Omnipotent.Services.Projects.Containers
                 ImageVersion = imageVersion ?? "",
                 Capabilities = caps,
                 Summary = ok
-                    ? $"Desktop ready (image v{(string.IsNullOrEmpty(imageVersion) ? "?" : imageVersion)}): {capsText}."
-                    : $"Desktop degraded (image v{(string.IsNullOrEmpty(imageVersion) ? "?" : imageVersion)}): {capsText}. Missing: {string.Join(", ", missing)}.",
+                    ? $"Desktop ready (image v{(string.IsNullOrEmpty(imageVersion) ? "?" : imageVersion)}): {capsText}.{routes}{advisory}"
+                    : $"Desktop degraded (image v{(string.IsNullOrEmpty(imageVersion) ? "?" : imageVersion)}): {capsText}. Missing: {string.Join(", ", missing)}.{routes}",
             };
         }
 
@@ -605,14 +728,55 @@ namespace Omnipotent.Services.Projects.Containers
         internal static bool DesktopControlIsReady(IReadOnlyDictionary<string, string> capabilities) =>
             RequiredCapabilities.All(cap => CapabilityIsReady(cap, capabilities));
 
+        /// <summary>Advisory components that are down, for the readiness summary.</summary>
+        internal static IReadOnlyList<string> DegradedCapabilities(IReadOnlyDictionary<string, string> capabilities) =>
+            AdvisoryCapabilities.Where(cap => capabilities.ContainsKey(cap) && !CapabilityIsReady(cap, capabilities)).ToList();
+
         private static bool CapabilityIsReady(string capability, IReadOnlyDictionary<string, string> capabilities) =>
             capability switch
             {
+                // Input is served by VNC, or by the daemon when VNC is down. A probe that predates the
+                // daemon only reports "vnc", which is the input route it implies.
+                "input" => string.Equals(capabilities.GetValueOrDefault("input"), "up", StringComparison.Ordinal)
+                           || (!capabilities.ContainsKey("input")
+                               && string.Equals(capabilities.GetValueOrDefault("vnc"), "up", StringComparison.Ordinal)),
                 "display" or "desktop-shell" or "panel" or "window-manager" or "vnc" =>
                     string.Equals(capabilities.GetValueOrDefault(capability), "up", StringComparison.Ordinal),
                 "frame" => string.Equals(capabilities.GetValueOrDefault(capability), "usable", StringComparison.Ordinal),
                 _ => string.Equals(capabilities.GetValueOrDefault(capability), "yes", StringComparison.Ordinal),
             };
+
+        /// <summary>The exec probe's vocabulary, filled from the daemon's /health instead of a docker exec.</summary>
+        internal static Dictionary<string, string> CapabilitiesFromHealth(ComputerDaemonHealth health)
+        {
+            string Up(bool value) => value ? "up" : "down";
+            var image = health.Image?.Capabilities ?? new List<string>();
+            var caps = new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["display"] = Up(health.Component("display") || health.Component("xvfb")),
+                ["desktop-shell"] = Up(health.Component("session") && health.Component("desktop")),
+                ["panel"] = Up(health.Component("panel")),
+                ["window-manager"] = Up(health.Component("windowManager")),
+                ["xvfb"] = Up(health.Component("xvfb")),
+                ["x11vnc"] = Up(health.Component("x11vnc")),
+                ["chromium"] = image.Count == 0 || image.Contains("chromium") ? "yes" : "no",
+                ["firefox"] = image.Count == 0 || image.Contains("firefox") ? "yes" : "no",
+                ["browser-inspect"] = "yes",
+                ["ffmpeg"] = health.Tools.TryGetValue("ffmpeg", out bool ffmpeg) && ffmpeg ? "yes" : "no",
+                ["image-version"] = health.Image?.Version ?? "",
+                ["computerd"] = "up",
+                ["computerd-protocol"] = health.Protocol.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                ["browser-process"] = Up(health.Browser?.Process == true),
+                ["browser-cdp"] = Up(health.Browser?.Cdp == true),
+            };
+            if (health.Resources?.Memory is { } memory)
+            {
+                if (memory.UsedMB is { } used && memory.LimitMB is { } limit)
+                    caps["memory"] = $"{used:0}/{limit:0} MB";
+                if (memory.OomKills is { } kills) caps["oom-kills"] = kills.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            }
+            return caps;
+        }
 
         private static bool BrowserFailedToStart(IReadOnlyDictionary<string, string> capabilities) =>
             !string.Equals(capabilities.GetValueOrDefault("browser-process"), "up", StringComparison.Ordinal);
@@ -665,8 +829,138 @@ namespace Omnipotent.Services.Projects.Containers
                 // 0 on a container created before the helper service existed; the adapter then falls
                 // back to docker exec, so an old desktop keeps working without being recreated.
                 browserServiceHostPort: record.BrowserServiceHostPort,
-                browserServiceHost: vncHost);
+                browserServiceHost: vncHost,
+                desktopWidth: record.Width,
+                desktopHeight: record.Height);
         }
+
+        /// <summary>The control daemon of a desktop, for health pages and repair actions.</summary>
+        public ComputerDaemonClient DaemonFor(string containerID) => orchestrator.DaemonFor(containerID);
+
+        /// <summary>
+        /// Every computer (optionally one project's) with what its own daemon reports — the data behind
+        /// the website's computer pages. Probes run in parallel, each bounded, and a sleeping or missing
+        /// computer is never woken to be described.
+        /// </summary>
+        public async Task<List<object>> DescribeComputersAsync(string? projectID, CancellationToken ct = default)
+        {
+            var records = (projectID == null ? registry.All() : registry.ForProject(projectID))
+                .GroupBy(r => r.ContainerID, StringComparer.Ordinal).Select(g => g.Last()).ToList();
+            var described = await Task.WhenAll(records.Select(async record =>
+            {
+                ComputerDaemonHealth? health = null;
+                if (!record.Lost && !record.Suspended)
+                {
+                    using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    budget.CancelAfter(TimeSpan.FromSeconds(5));
+                    try { health = await DaemonFor(record.ContainerID).HealthAsync(budget.Token); }
+                    catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+                    catch { health = null; }
+                }
+                bool vnc = transports.TryGetValue(record.ContainerID, out var transport) && transport.Connected;
+                string state = record.Lost ? "missing" : record.Suspended ? "asleep"
+                    : health == null ? (vnc ? "running" : "unreachable")
+                    : health.Component("display") || health.Component("xvfb") ? "running" : "degraded";
+                var memory = health?.Resources?.Memory;
+                return (object)new
+                {
+                    record.ContainerID,
+                    record.ProjectID,
+                    AgentID = record.AgentID ?? "shared",
+                    record.Width,
+                    record.Height,
+                    record.CreatedAt,
+                    record.LastUsedAt,
+                    state,
+                    vncConnected = vnc,
+                    actionInFlight = actionGates.TryGetValue(record.ContainerID, out var gate) && gate.CurrentCount == 0,
+                    controlledBy = inputLock.CurrentHolder(record.ContainerID),
+                    daemon = health == null ? null : new
+                    {
+                        health.Protocol,
+                        health.UptimeSeconds,
+                        health.AuthConfigured,
+                        imageVersion = health.Image?.Version,
+                        health.Components,
+                        browser = new
+                        {
+                            up = health.BrowserUp,
+                            process = health.Browser?.Process ?? false,
+                            tabs = health.Browser?.Tabs,
+                            processes = health.Browser?.ProcessCount ?? 0,
+                        },
+                        memory = memory == null ? null : new { memory.UsedMB, memory.LimitMB, memory.AvailableMB, memory.OomKills },
+                        load = health.Resources?.Load1,
+                        cpus = health.Resources?.Cpus,
+                        diskFreeMB = health.Resources?.RootFreeMB,
+                        events = health.Events.TakeLast(8).Select(e => new { e.Seq, e.At, e.Kind, e.Message }).ToList(),
+                    },
+                };
+            }));
+            return described.ToList();
+        }
+
+        /// <summary>
+        /// A repair Klives (or the watchdog) asks for by name. Ordered from gentlest to most disruptive:
+        /// restarting the browser keeps everything but open pages; restarting desktop components keeps
+        /// the browser; restarting the computer keeps installed software, files and sign-ins but ends
+        /// every running process; refreshing helpers swaps in this build's in-container tooling.
+        /// </summary>
+        public async Task<string> RepairComputerAsync(string containerID, string action, CancellationToken ct = default)
+        {
+            var record = registry.All().LastOrDefault(r => r.ContainerID == containerID && !r.Lost)
+                ?? throw new InvalidOperationException("That computer is not in the registry (or its container is gone).");
+            string id12 = record.ContainerID[..Math.Min(12, record.ContainerID.Length)];
+            switch ((action ?? "").Trim().ToLowerInvariant())
+            {
+                case "restart-browser":
+                {
+                    if (record.Suspended) await ResumeDesktopAsync(record.ContainerID, ct);
+                    await orchestrator.ExecuteDesktopShellAsync(record.ContainerID,
+                        "pkill -x chromium >/dev/null 2>&1; for i in $(seq 1 20); do pgrep -x chromium >/dev/null || break; sleep 0.25; done; " +
+                        "pkill -KILL -x chromium >/dev/null 2>&1; true", "/home/agent", 20, idempotent: true, ct);
+                    await orchestrator.ExecuteDesktopControlAsync(record.ContainerID, ContainerDesktopControlCommand.LaunchBrowser, null, ct);
+                    log($"Desktop {id12}: browser restarted on request.");
+                    return "Browser restarted with its saved profile; sign-ins are kept, open pages were closed.";
+                }
+                case "restart-components":
+                {
+                    if (record.Suspended) await ResumeDesktopAsync(record.ContainerID, ct);
+                    const string script =
+                        "set +e\nexport DISPLAY=:1\nif [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi\n" +
+                        "pkill -x xfce4-panel; pkill -x xfdesktop; pkill -x xfwm4; sleep 1\n" +
+                        "(nohup xfwm4 --compositor=off >>/tmp/xfwm4.log 2>&1 </dev/null &)\n" +
+                        "(nohup xfce4-panel >>/tmp/xfce4-panel.log 2>&1 </dev/null &)\n" +
+                        "(nohup xfdesktop >>/tmp/xfdesktop.log 2>&1 </dev/null &)\nsleep 2\n";
+                    var result = await orchestrator.ExecuteDesktopShellAsync(record.ContainerID, script, "/home/agent", 30, idempotent: true, ct);
+                    log($"Desktop {id12}: desktop components restarted on request (exit {result.ExitCode}).");
+                    return "Window manager, panel and desktop restarted; the browser and other apps kept running.";
+                }
+                case "restart-computer":
+                {
+                    string owner = record.AgentID ?? "klives";
+                    if (record.Suspended) await ResumeDesktopAsync(record.ContainerID, ct);
+                    else await RestartDesktopAsync(record, owner, ct);
+                    log($"Desktop {id12}: computer restarted on request.");
+                    return "Computer restarted. Installed software, files and browser sign-ins are kept; running apps were closed.";
+                }
+                case "refresh-helpers":
+                {
+                    HelpersCurrent.TryRemove(record.ContainerID, out _);
+                    HelperRefreshRetryAfter.TryRemove(record.ContainerID, out _);
+                    string? refreshed = await orchestrator.SyncDesktopHelpersAsync(record.ContainerID, ResolveBuildContextDirectory(), ct);
+                    string? fingerprint = ShippedHelperFingerprint();
+                    if (fingerprint != null) HelpersCurrent[record.ContainerID] = fingerprint;
+                    return refreshed == null ? "Helpers were already current." : char.ToUpperInvariant(refreshed[0]) + refreshed[1..] + ".";
+                }
+                default:
+                    throw new ArgumentException("action must be restart-browser, restart-components, restart-computer or refresh-helpers.");
+            }
+        }
+
+        /// <summary>A desktop daemon's privileged JSON route for the website's diagnostics drawer.</summary>
+        public Task<string?> ComputerDiagnosticsAsync(string containerID, CancellationToken ct = default) =>
+            DaemonFor(containerID).GetJsonAsync("/diag", "diag", ct, timeoutSeconds: 15);
 
         // Desktops whose in-container helpers are known to match this build (container → fingerprint
         // of the shipped helpers), and when a failed refresh may be retried.
@@ -887,6 +1181,7 @@ namespace Omnipotent.Services.Projects.Containers
             var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(45);
             var transport = GetTransport(record);
             string lastError = "no framebuffer capture was attempted";
+            var daemon = orchestrator.DaemonFor(record.ContainerID);
             for (int attempt = 1; DateTime.UtcNow < deadline; attempt++)
             {
                 try
@@ -902,6 +1197,14 @@ namespace Omnipotent.Services.Projects.Containers
                 {
                     lastError = ex.Message;
                     if (attempt == 1) log($"Waiting for desktop {record.ContainerID[..12]} to come up ({ex.Message})…");
+                    // From the third attempt on, a frame the daemon captures proves the display is up
+                    // just as well; the agent's tools fall back to the daemon while VNC catches up.
+                    if (attempt >= 3 && await daemon.CaptureBgraAsync(ct) is { } captured
+                        && IsCompleteFrame(captured.Bgra, captured.Width, captured.Height))
+                    {
+                        log($"Desktop {record.ContainerID[..12]} is serving frames through its control daemon; VNC is not answering yet ({ex.Message}).");
+                        return;
+                    }
                     await Task.Delay(TimeSpan.FromSeconds(2), ct);
                 }
             }

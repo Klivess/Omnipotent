@@ -195,7 +195,11 @@ namespace Omnipotent.Tests.Projects
             Assert.Contains("xfdesktop", entrypoint);
             Assert.Contains("xfce4-panel", entrypoint);
             Assert.Contains("thunar mousepad ristretto", dockerfile);
-            Assert.Contains("\"imageVersion\":\"13\"", dockerfile);
+            Assert.Contains("\"imageVersion\":\"14\"", dockerfile);
+            // v14: klive-computerd — the in-container control plane (exec, input, screenshots) that
+            // takes docker exec off every hot path.
+            Assert.Contains("\"computerd\"", dockerfile);
+            Assert.Contains("python3-pil", dockerfile);
             // v13: verified physical input, the DevTools tool, chooser interception and the baked
             // klive-cdp client.
             Assert.Contains("\"input-receipts\"", dockerfile);

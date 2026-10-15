@@ -1090,6 +1090,13 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
             // at the end, where the rest of the per-wake content already lives.
             sb.BeginSection("capabilities","── RUNTIME CAPABILITY TRUTH (authoritative) ──");
             sb.AppendLine(ProjectPromptHygiene.CapabilityTruth);
+            try
+            {
+                string autonomy = parent.WakeCycle.DescribeAutonomyPolicy?.Invoke(project.ProjectID) ?? "";
+                if (!string.IsNullOrWhiteSpace(autonomy))
+                    sb.AppendLine("KLIVES' AUTONOMY LIMITS (enforced at dispatch — plan around them):\n" + autonomy);
+            }
+            catch { }
             string directives = "";
             try { directives = parent.Directives.DescribeForPrompt(project.ProjectID, agent.AgentID,
                 ProjectDirectiveStore.TryExtractDirectiveID(trigger)); } catch { }
@@ -1254,6 +1261,17 @@ THE PROJECT'S GOAL (context, not your whole job): {project.Goal}";
             string teamActivity = ProjectCommanderPrompts.RenderHistoryBlock(
                 "── WHAT THE REST OF THE TEAM HAS BEEN DOING ──", teamEvents, ProjectsContextBudget.TaskForceBudget, teamEntries);
             sb.AppendJournal("team-activity", teamActivity, teamEntries);
+
+            // The worker's own desktop as it stands, so it resumes on the page it left. Volatile, so it
+            // sits next to the trigger at the end of the seed.
+            string computer = "";
+            try { computer = parent.WakeCycle.DescribeComputerAsync == null
+                ? "" : await parent.WakeCycle.DescribeComputerAsync(project.ProjectID, agent.AgentID); } catch { }
+            if (!string.IsNullOrWhiteSpace(computer))
+            {
+                sb.BeginSection("computer","── YOUR COMPUTER (live state of your own desktop — resume from it) ──");
+                sb.AppendLine(ProjectsContextBudget.TruncateToTokens(computer, ProjectsContextBudget.ComputerBudget));
+            }
 
             sb.BeginSection("trigger","── YOUR TASK (this wake's trigger) ──", sendEveryWake: true);
             sb.AppendLine($"Now: {Data_Handling.TemporalFormat.ClockLine()} — all timestamps above and in your messages are UTC.");
