@@ -140,6 +140,26 @@ namespace Omnipotent.Services.OmniBlox.Build
             }
         }
 
+        /// <summary>
+        /// Writes a snapshot's files into another directory and returns a workspace there: a copy of an older
+        /// revision to compile from, leaving the working tree alone.
+        /// </summary>
+        public GameWorkspace Checkout(int revision, string directory)
+        {
+            string path = SnapshotPath(revision);
+            if (!File.Exists(path)) throw new FileNotFoundException($"No snapshot for revision {revision}.");
+            var copy = new GameWorkspace(directory, SnapshotsDirectory);
+            Directory.CreateDirectory(copy.Root);
+            using var zip = ZipFile.OpenRead(path);
+            foreach (var entry in zip.Entries)
+            {
+                string target = copy.ResolveSafe(entry.FullName);
+                Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+                entry.ExtractToFile(target, overwrite: true);
+            }
+            return copy;
+        }
+
         /// <summary>Which files differ between a snapshot and the working tree (added / changed / removed).</summary>
         public (List<string> Added, List<string> Changed, List<string> Removed) DiffAgainst(int revision)
         {

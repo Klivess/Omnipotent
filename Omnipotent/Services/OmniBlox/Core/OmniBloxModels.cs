@@ -54,6 +54,9 @@ namespace Omnipotent.Services.OmniBlox.Core
         public List<ProductRecord> Products { get; set; } = new();
         public PublishRecord Publish { get; set; } = new();
 
+        /// <summary>The owner playing the game at any stage: builds sent to Roblox and what those sessions reported.</summary>
+        public PlaytestState Playtest { get; set; } = new();
+
         // Live
         public LiveStats Stats { get; set; } = new();
         public List<MaintenanceRecord> Maintenance { get; set; } = new();
@@ -270,6 +273,97 @@ namespace Omnipotent.Services.OmniBlox.Core
         public string? LastLaunchError { get; set; }
     }
 
+    /// <summary>
+    /// The owner's playtests of one game. A playtest build simulates purchases, saves apart from the real game
+    /// and reports to <see cref="Sessions"/> instead of the game's own numbers, so nothing here touches players.
+    /// </summary>
+    public sealed class PlaytestState
+    {
+        public const int MaxSessions = 12;
+
+        /// <summary>Authenticates telemetry from playtest builds (never the game's real telemetry secret).</summary>
+        public string Secret { get; set; } = "";
+        /// <summary>While the owner is in the playtest, each new clean build is published and the server moved onto it.</summary>
+        public bool Follow { get; set; }
+        /// <summary>Bumped by "start fresh": playtest saves live in a DataStore named after it.</summary>
+        public int SaveSlot { get; set; } = 1;
+        public PlaytestPublish? LastPublish { get; set; }
+        /// <summary>One per playtest server (a Roblox server, or one run in Studio), newest last.</summary>
+        public List<PlaytestSession> Sessions { get; set; } = new();
+    }
+
+    public sealed class PlaytestPublish
+    {
+        public DateTime Utc { get; set; }
+        public long UniverseId { get; set; }
+        public long PlaceId { get; set; }
+        public long Version { get; set; }
+        /// <summary>"r12" is the clean build r12; "r12+" is the files as they were, past r12; "wip" is before the first clean build.</summary>
+        public string Build { get; set; } = "";
+        public int Revision { get; set; }
+        /// <summary>The game's own experience (private until launch) rather than the studio's playtest experience.</summary>
+        public bool OwnExperience { get; set; }
+        /// <summary>What went into the build (files, settings, products); the same inputs are not published twice.</summary>
+        public string Fingerprint { get; set; } = "";
+        /// <summary>Published by Follow after a clean build, not by the owner.</summary>
+        public bool Followed { get; set; }
+        /// <summary>Running servers were asked to move onto this version.</summary>
+        public bool ServersRestarted { get; set; }
+        public string? Note { get; set; }
+    }
+
+    public sealed class PlaytestSession
+    {
+        public string Server { get; set; } = "";
+        /// <summary>roblox or studio.</summary>
+        public string Where { get; set; } = "";
+        public string Build { get; set; } = "";
+        public DateTime StartedUtc { get; set; }
+        public DateTime LastEventUtc { get; set; }
+        /// <summary>Players on the server at its last report.</summary>
+        public int Players { get; set; }
+        public int Joins { get; set; }
+        /// <summary>Seconds played, from the sessions that have ended.</summary>
+        public long PlayedSeconds { get; set; }
+        public long Events { get; set; }
+        public int Deaths { get; set; }
+        /// <summary>The furthest funnel step reached (an obby's stage) and its name.</summary>
+        public int? FurthestStep { get; set; }
+        public string? FurthestStepName { get; set; }
+        public bool Completed { get; set; }
+        public long Earned { get; set; }
+        /// <summary>Gameplay events by name (unlocks, sales, upgrades, rewards…).</summary>
+        public Dictionary<string, long> Actions { get; set; } = new();
+        /// <summary>Product keys bought with simulated purchases.</summary>
+        public List<string> TestPurchases { get; set; } = new();
+        public List<PlaytestError> Errors { get; set; } = new();
+        public List<PlaytestFeedback> Feedback { get; set; } = new();
+    }
+
+    public sealed class PlaytestError
+    {
+        public string Message { get; set; } = "";
+        public string? Source { get; set; }
+        public long Count { get; set; }
+    }
+
+    public sealed class PlaytestFeedback
+    {
+        public DateTime Utc { get; set; }
+        /// <summary>1 Bad, 2 Okay, 3 Great.</summary>
+        public int Rating { get; set; }
+        public string Reason { get; set; } = "";
+    }
+
+    /// <summary>Which game the studio's playtest experience (OmniBlox_PlaytestSlot) is running.</summary>
+    public sealed class PlaytestOccupant
+    {
+        public string GameId { get; set; } = "";
+        public string Build { get; set; } = "";
+        public long Version { get; set; }
+        public DateTime Utc { get; set; }
+    }
+
     public sealed class LiveStats
     {
         public DateTime? LastSyncUtc { get; set; }
@@ -437,6 +531,8 @@ namespace Omnipotent.Services.OmniBlox.Core
         public List<OwnerTask> OwnerTasks { get; set; } = new();
         /// <summary>Experience slot ("u:p") → game id it holds.</summary>
         public Dictionary<string, string> SlotAssignments { get; set; } = new();
+        /// <summary>What the playtest experience runs now; null until the first playtest there.</summary>
+        public PlaytestOccupant? PlaytestSlot { get; set; }
         public Dictionary<string, UsageTotals> DailyUsage { get; set; } = new();
         /// <summary>The asset labeller's share of <see cref="DailyUsage"/> (already included in it).</summary>
         public Dictionary<string, UsageTotals> DailyLabelerUsage { get; set; } = new();

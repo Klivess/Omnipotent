@@ -18,6 +18,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public long? CreatorUserId { get; set; }
         public long? CreatorGroupId { get; set; }
         public List<ExperienceSlot> Slots { get; set; } = new();
+        /// <summary>A private experience kept for the owner's playtests of any game at any stage (never a game's slot).</summary>
+        public ExperienceSlot? PlaytestSlot { get; set; }
         public bool RequireLaunchApproval { get; set; } = true;
         public int MaxGamesInProduction { get; set; } = 1;
         public bool HarvesterEnabled { get; set; } = true;
@@ -53,6 +55,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public required Action<string> Log { get; init; }
         public Func<string, Task> Alert { get; init; } = _ => Task.CompletedTask;
         public StudioSettings Settings { get; set; } = new();
+
+        private Playtests? playtests;
+
+        /// <summary>The owner's playtests: builds of any revision, published to a private experience or downloaded for Studio.</summary>
+        public Playtests Playtests => LazyInitializer.EnsureInitialized(ref playtests, () => new Playtests(this));
 
         public RobloxCreator Creator => new(Settings.CreatorUserId, Settings.CreatorGroupId);
 

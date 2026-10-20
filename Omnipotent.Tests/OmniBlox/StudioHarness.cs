@@ -200,6 +200,8 @@ namespace Omnipotent.Tests.OmniBlox
         public byte[] ModelFile { get; set; } = Array.Empty<byte>();
         public byte[] Png { get; set; } = Array.Empty<byte>();
         public string EngineOutput { get; set; } = "{\"results\":[{\"passed\":12,\"failed\":0,\"results\":[]}]}";
+        /// <summary>Answer restartServers with 403, as a key without universe:write would get.</summary>
+        public bool RestartRefused { get; set; }
         private long nextVersion = 1, nextId = 7000;
 
         public IEnumerable<string> Urls(string method) => Requests.Where(r => r.Method == method).Select(r => r.Url);
@@ -261,6 +263,10 @@ namespace Omnipotent.Tests.OmniBlox
                 return new HttpResponseMessage(HttpStatusCode.NoContent) { Content = new StringContent("") };
             if (path.StartsWith("/cloud/v2/universes/") && request.Method == HttpMethod.Patch)
                 return Json(new { path = path.TrimStart('/') });
+            if (path.StartsWith("/cloud/v2/universes/") && path.EndsWith(":restartServers") && request.Method == HttpMethod.Post)
+                return RestartRefused
+                    ? new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"message\":\"insufficient scope\"}", Encoding.UTF8, "application/json") }
+                    : Json(new { });
             if (path.Contains("/thumbnail-personalization-api/"))
                 return Json(new { operationIds = new[] { "op1" } });
             if (path.Contains("/analytics-query-api/"))

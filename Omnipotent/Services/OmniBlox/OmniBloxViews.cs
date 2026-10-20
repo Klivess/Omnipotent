@@ -52,6 +52,8 @@ namespace Omnipotent.Services.OmniBlox
                 UniverseId = g.Slot?.UniverseId,
                 BuildRevision = g.Build.Revision,
                 LastBuildOk = g.Build.LastBuildOk,
+                // A world exists from Build on (what the game page's Play panel opens on).
+                Playable = g.Stage != GameStage.Research && !(g.Stage == GameStage.Abandoned && g.Build.Revision == 0),
                 TestPassed = g.LastTest?.Passed,
                 Cycles = g.StageCycles,
                 StageCycles = g.StageCycles.GetValueOrDefault(g.Stage),
@@ -197,12 +199,13 @@ namespace Omnipotent.Services.OmniBlox
             return new { Games = games.Select(GameSummary).ToList() };
         }
 
-        /// <summary>The whole dossier (minus its telemetry secret), its checklist, owner tasks and saved revisions; null when there is no such game.</summary>
+        /// <summary>The whole dossier (minus its telemetry secrets), its checklist, owner tasks, saved revisions and how to play it; null when there is no such game.</summary>
         public static object? GameDetail(StudioContext ctx, string gameId)
         {
             var game = ctx.Game(gameId);
             if (game == null) return null;
             game.TelemetrySecret = "";
+            game.Playtest.Secret = "";
             var tasks = ctx.Store.Read(s => s.Studio.OwnerTasks.Where(t => t.GameId == game.GameId).OrderByDescending(t => t.CreatedUtc).Select(OmniBloxStore.Clone).ToList());
             var workspace = ctx.Workspace(game.GameId);
             return new
@@ -214,6 +217,30 @@ namespace Omnipotent.Services.OmniBlox
                 OwnerTasks = tasks,
                 Revisions = workspace.Exists ? workspace.Revisions() : (IReadOnlyList<int>)Array.Empty<int>(),
                 Media = MediaFiles(ctx, game.GameId),
+                Playtest = Playtest(ctx, game),
+            };
+        }
+
+        /// <summary>
+        /// How the owner can play the game now: whether there is a world, whether Roblox is set up for it (and in
+        /// which private experience), whether the last build sent there is still what that experience runs, and
+        /// whether someone is in it. The builds sent and the sessions played are in the dossier's Playtest.
+        /// </summary>
+        public static object Playtest(StudioContext ctx, GameDossier game)
+        {
+            var access = ctx.Playtests.Describe(game);
+            var occupant = ctx.Store.Read(s => s.Studio.PlaytestSlot is { } o ? OmniBloxStore.Clone(o) : null);
+            var last = game.Playtest.LastPublish;
+            bool inExperience = last != null && (last.OwnExperience ? !game.Publish.IsPublic : occupant?.GameId == game.GameId);
+            var other = occupant != null && occupant.GameId != game.GameId && access is { Available: true, OwnExperience: false } ? ctx.Game(occupant.GameId) : null;
+            return new
+            {
+                Playable = ctx.Workspace(game.GameId).Exists,
+                Roblox = new { access.Available, access.OwnExperience, UniverseId = access.Slot?.UniverseId, PlaceId = access.Slot?.PlaceId, access.Reason },
+                InExperience = inExperience,
+                JoinUrl = inExperience ? Playtests.JoinUrl(last!.PlaceId) : null,
+                OtherGame = other == null ? null : new { other.GameId, Title = other.DisplayTitle, occupant!.Build },
+                Playing = ctx.Playtests.IsPlaying(game),
             };
         }
 

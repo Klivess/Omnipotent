@@ -115,6 +115,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     break;
             }
 
+            if (game.Stage is GameStage.Build or GameStage.Test or GameStage.Launch or GameStage.Live && Playtests.BriefingNote(game, ctx.Clock()) is { } playtest)
+                sb.AppendLine(playtest);
+
             var tasks = ctx.Store.Read(s => s.Studio.OwnerTasks.Where(t => t.Status == OwnerTaskStatus.Open && (t.GameId == game.GameId || t.GameId == null)).Select(t => t.Title).ToList());
             if (tasks.Count > 0) sb.AppendLine("Waiting on the owner: " + string.Join("; ", tasks));
 

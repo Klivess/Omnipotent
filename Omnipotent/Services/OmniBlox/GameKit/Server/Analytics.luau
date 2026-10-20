@@ -102,6 +102,9 @@ local function flush()
 				server = serverId,
 				placeVersion = game.PlaceVersion,
 				players = #Players:GetPlayers(),
+				-- A playtest build's batches go to the owner's playtest log; these say which build and where.
+				build = Config.Playtest and Config.Playtest.Build or nil,
+				where = Config.Playtest and Config.Playtest.Where or nil,
 				events = batch,
 			}),
 		})
@@ -128,8 +131,10 @@ function Analytics.Start()
 		sessions[player.UserId] = { id = HttpService:GenerateGUID(false), started = os.clock() }
 		Analytics.Event("session_start", player, nil)
 	end)
+	-- Players already here (Studio can add one before the kit starts) count as joining now.
 	for _, player in ipairs(Players:GetPlayers()) do
 		sessions[player.UserId] = { id = HttpService:GenerateGUID(false), started = os.clock() }
+		Analytics.Event("session_start", player, nil)
 	end
 	Players.PlayerRemoving:Connect(function(player)
 		local session = sessions[player.UserId]

@@ -101,6 +101,7 @@ namespace Omnipotent.Tests.OmniBlox
             await h.StepUntilAsync(() => ctx.Store.Read(s => s.Games.Values.Any(g => g.Stage == GameStage.Build && g.Cycles.Count(c => c.Role == "builder") >= 2)), 12);
             string building = ctx.Store.Read(s => s.Games.Values.Single(g => g.Stage == GameStage.Build).GameId);
             Assert.True(h.Game(building).Build.LastBuildOk, string.Join("; ", h.Game(building).Build.Errors));
+            await SeedPlaytestsAsync(h, building);
             h.Now = Now;
             SeedDailyMetrics(ctx, live); // after the steps: the analytics sweep merges the fake's single data point
 
@@ -165,7 +166,50 @@ namespace Omnipotent.Tests.OmniBlox
                 Building = building,
                 Abandoned = abandoned,
                 PineTree = FakeRoblox.AssetId,
+                PlaytestPlaceId = PlaytestSlot.PlaceId,
             }, OmniBloxViews.Json));
+        }
+
+        private static readonly ExperienceSlot PlaytestSlot = new() { UniverseId = 3003, PlaceId = 4004 };
+
+        /// <summary>
+        /// The owner trying game 2 while it is built: a Studio run last night, then the playtest experience now
+        /// (still in it, with Follow on), where a script error and some feedback came in.
+        /// </summary>
+        private static async Task SeedPlaytestsAsync(StudioHarness h, string gameId)
+        {
+            var ctx = h.Ctx;
+            ctx.Settings.PlaytestSlot = PlaytestSlot;
+            JObject Batch(string server, string build, string where, int players, params JObject[] events) =>
+                new() { ["server"] = server, ["build"] = build, ["where"] = where, ["players"] = players, ["events"] = new JArray(events) };
+            JObject E(string name, object? fields = null) =>
+                new() { ["n"] = name, ["s"] = "owner", ["f"] = fields == null ? null : JObject.FromObject(fields) };
+
+            ctx.Playtests.Ingest(gameId, Batch("studio-run-1", "r1+", Playtests.Studio, 1,
+                E("session_start"),
+                E("economy", new { flow = "Source", amount = 120, balance = 170, reason = "Collector" }),
+                E("tycoon_unlock", new { item = "Dropper1", price = 50 }),
+                E("purchase", new { key = "candy_500", kind = "product", robux = 0, test = true }),
+                E("feedback", new { rating = 3, reason = "want_more" }),
+                E("session_end", new { seconds = 262 })), Now.AddHours(-16));
+
+            h.Now = Now.AddMinutes(-12);
+            await ctx.Playtests.PublishAsync(gameId, "latest", fresh: false, followed: false, CancellationToken.None);
+            const string error = "ServerScriptService.Rebirth:12: attempt to compare number <= nil";
+            ctx.Playtests.Ingest(gameId, Batch("srv-playtest-7", "r2", Playtests.Roblox, 1,
+                E("session_start"),
+                E("tycoon_unlock", new { item = "Dropper1", price = 50 }),
+                E("economy", new { flow = "Source", amount = 340, balance = 390, reason = "Collector" }),
+                E("tycoon_unlock", new { item = "Upgrader", price = 250 })), Now.AddMinutes(-11));
+            ctx.Playtests.Ingest(gameId, Batch("srv-playtest-7", "r2", Playtests.Roblox, 1,
+                E("purchase", new { key = "double", kind = "pass", robux = 0, test = true }),
+                new JObject { ["n"] = "error", ["f"] = JObject.FromObject(new { message = error, source = "ServerScriptService.Rebirth", count = 1 }) },
+                E("economy", new { flow = "Source", amount = 610, balance = 750, reason = "Collector" }),
+                E("feedback", new { rating = 2, reason = "confusing" })), Now.AddMinutes(-6));
+            ctx.Playtests.Ingest(gameId, Batch("srv-playtest-7", "r2", Playtests.Roblox, 1,
+                new JObject { ["n"] = "error", ["f"] = JObject.FromObject(new { message = error, count = 3 }) },
+                new JObject { ["n"] = "heartbeat", ["f"] = JObject.FromObject(new { players = 1 }) }), Now.AddMinutes(-1));
+            ctx.Playtests.SetFollow(gameId, true);
         }
 
         /// <summary>The shared end-to-end scripts end each cycle with a stock line; give game 1 the hand-overs a real cycle writes.</summary>

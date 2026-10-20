@@ -58,6 +58,7 @@ namespace Omnipotent.Services.OmniBlox
                 ("/omniblox/game/files", GameFiles, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/game/file", GameFile, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/game/telemetry", GameTelemetry, get, OmniBloxPerms.StudioRead),
+                ("/omniblox/game/place", GamePlace, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/assets", Assets, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/asset", AssetDetail, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/asset/image", AssetImage, get, OmniBloxPerms.StudioRead),
@@ -70,6 +71,8 @@ namespace Omnipotent.Services.OmniBlox
                 ("/omniblox/games/pause", PauseGame, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/steer", SteerGame, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/maintain", MaintainGame, post, OmniBloxPerms.StudioAct),
+                ("/omniblox/games/playtest", PlaytestGame, post, OmniBloxPerms.StudioAct),
+                ("/omniblox/games/playtest/follow", PlaytestFollow, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/approve", ApproveLaunch, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/games/abandon", AbandonGame, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/studio/toggle", Toggle, post, OmniBloxPerms.StudioManage),
@@ -230,6 +233,31 @@ namespace Omnipotent.Services.OmniBlox
             await Respond(req, new { Path = Query(req, "path"), Content = text });
         }
 
+        /// <summary>A playtest build as a place file for Roblox Studio (which build it is comes back in X-OmniBlox-Build).</summary>
+        private async Task GamePlace(UserRequest req)
+        {
+            var game = RequireGame(RequiredQuery(req, "id"));
+            PlaytestBuild built;
+            try { built = Ctx.Playtests.Build(game.GameId, Query(req, "build", "latest"), Playtests.Studio); }
+            catch (PlaytestException ex) { throw Refused(ex); }
+            var headers = new NameValueCollection
+            {
+                ["Content-Disposition"] = $"attachment; filename=\"{Playtests.FileName(game, built.Label)}\"",
+                ["X-OmniBlox-Build"] = built.Label,
+            };
+            // Compiler messages are not always plain ASCII, which a header cannot carry.
+            if (built.Note != null) headers["X-OmniBlox-Note"] = Uri.EscapeDataString(built.Note);
+            Ctx.Event(EventLevel.Info, "playtest.studio", $"Playtest {built.Label} downloaded for Roblox Studio.", game.GameId);
+            await req.ReturnBinaryResponse(built.Compile.PlaceXml, "application/xml", HttpStatusCode.OK, headers);
+        }
+
+        private static RouteException Refused(PlaytestException ex) => new(ex.Problem switch
+        {
+            PlaytestProblem.NoWorld or PlaytestProblem.NoSuchBuild => HttpStatusCode.NotFound,
+            PlaytestProblem.DoesNotCompile => HttpStatusCode.UnprocessableEntity,
+            _ => HttpStatusCode.Conflict,
+        }, ex.Message);
+
         private async Task GameTelemetry(UserRequest req)
         {
             var game = RequireGame(RequiredQuery(req, "id"));
@@ -367,6 +395,58 @@ namespace Omnipotent.Services.OmniBlox
             await Respond(req, new { ok = true });
         }
 
+        /// <summary>Publishes a playtest build to the game's private experience and answers with the link that joins it.</summary>
+        private async Task PlaytestGame(UserRequest req)
+        {
+            var body = Body(req);
+            string id = Required(body, "gameId");
+            RequireGame(id);
+            string build = (string?)body["build"] is { Length: > 0 } b ? b.Trim() : "latest";
+            bool fresh = (bool?)body["fresh"] ?? false;
+            PlaytestPublishResult result;
+            try
+            {
+                result = await Ctx.Playtests.PublishAsync(id, build, fresh, followed: false, CancellationToken.None);
+            }
+            catch (PlaytestException ex)
+            {
+                throw Refused(ex);
+            }
+            catch (Roblox.RobloxApiException ex)
+            {
+                throw new RouteException(HttpStatusCode.BadGateway, "Roblox did not take the build: " + ex.Message);
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TimeoutException or TaskCanceledException)
+            {
+                throw new RouteException(HttpStatusCode.GatewayTimeout, "Could not reach Roblox: " + ex.Message);
+            }
+            var p = result.Publish;
+            await Respond(req, new
+            {
+                ok = true,
+                build = p.Build,
+                version = p.Version,
+                reused = result.Reused,
+                joinUrl = result.JoinUrl,
+                gameUrl = $"https://www.roblox.com/games/{p.PlaceId}",
+                universeId = p.UniverseId,
+                placeId = p.PlaceId,
+                ownExperience = p.OwnExperience,
+                serversRestarted = p.ServersRestarted,
+                warnings = result.Warnings,
+            });
+        }
+
+        private async Task PlaytestFollow(UserRequest req)
+        {
+            var body = Body(req);
+            string id = Required(body, "gameId");
+            if (body["follow"] is not JValue { Type: JTokenType.Boolean } follow) throw Bad("'follow' must be true or false.");
+            RequireGame(id);
+            Ctx.Playtests.SetFollow(id, (bool)follow);
+            await Respond(req, new { ok = true, follow = (bool)follow });
+        }
+
         private async Task AbandonGame(UserRequest req)
         {
             var body = Body(req);
@@ -395,8 +475,12 @@ namespace Omnipotent.Services.OmniBlox
             string gameId = req.req?.Headers["X-OmniBlox-Game"] ?? "";
             string key = req.req?.Headers["X-OmniBlox-Key"] ?? "";
             var game = gameId.Length > 0 ? Ctx.Game(gameId) : null;
-            if (game == null || string.IsNullOrEmpty(game.TelemetrySecret)
-                || !CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(game.TelemetrySecret)))
+            static bool Matches(string key, string secret) =>
+                secret.Length > 0 && CryptographicOperations.FixedTimeEquals(Encoding.UTF8.GetBytes(key), Encoding.UTF8.GetBytes(secret));
+            bool live = game != null && Matches(key, game.TelemetrySecret);
+            // Playtest builds carry their own key: what the owner does there stays out of the game's real numbers.
+            bool playtest = !live && game != null && Matches(key, game.Playtest.Secret);
+            if (!live && !playtest)
             {
                 await Respond(req, new { error = "unknown game or key" }, HttpStatusCode.Unauthorized);
                 return;
@@ -404,6 +488,11 @@ namespace Omnipotent.Services.OmniBlox
             JObject payload;
             try { payload = JObject.Parse(req.userMessageContent ?? ""); }
             catch (JsonException) { throw Bad("Not JSON."); }
+            if (playtest)
+            {
+                await Respond(req, new { ok = true, kept = Ctx.Playtests.Ingest(gameId, payload, DateTime.UtcNow) });
+                return;
+            }
             int kept = Ctx.Telemetry.Ingest(gameId, payload, DateTime.UtcNow);
             if (kept > 0)
                 Ctx.Store.Mutate(s =>

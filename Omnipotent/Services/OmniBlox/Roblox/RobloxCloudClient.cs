@@ -135,6 +135,17 @@ namespace Omnipotent.Services.OmniBlox.Roblox
                 () => new StringContent(body.ToString(Formatting.None), Encoding.UTF8, "application/json"), ct);
         }
 
+        /// <summary>
+        /// Moves the universe's running servers onto its newest published version (the Creator Dashboard's
+        /// "Restart servers for updates"); Roblox does nothing when no newer version exists.
+        /// </summary>
+        public async Task RestartServersAsync(long universeId, CancellationToken ct)
+        {
+            string url = $"{Base}/cloud/v2/universes/{universeId}:restartServers";
+            await SendAsync("universe", "restarting servers (universe:write)", HttpMethod.Post, url,
+                () => new StringContent("{}", Encoding.UTF8, "application/json"), ct);
+        }
+
         // ─────────────── Monetization ───────────────
 
         public async Task<GamePassInfo> CreateGamePassAsync(long universeId, ProductSpec spec, CancellationToken ct)

@@ -120,6 +120,7 @@ namespace Omnipotent.Services.OmniBlox
                 CreatorUserId = ParseId(await GetStringOmniSetting("OmniBlox_CreatorUserId", "")),
                 CreatorGroupId = ParseId(await GetStringOmniSetting("OmniBlox_CreatorGroupId", "")),
                 Slots = (await GetStringListOmniSetting("OmniBlox_ExperienceSlots", new List<string>())).Select(ExperienceSlot.Parse).Where(x => x != null).Select(x => x!).ToList(),
+                PlaytestSlot = ExperienceSlot.Parse(await GetStringOmniSetting("OmniBlox_PlaytestSlot", "")),
                 RequireLaunchApproval = await GetBoolOmniSetting("OmniBlox_RequireLaunchApproval", defaultValue: true),
                 MaxGamesInProduction = Math.Clamp(await GetIntOmniSetting("OmniBlox_MaxGamesInProduction", 1), 1, 3),
                 HarvesterEnabled = await GetBoolOmniSetting("OmniBlox_HarvesterEnabled", defaultValue: false),
@@ -127,6 +128,9 @@ namespace Omnipotent.Services.OmniBlox
                 DevExRate = double.TryParse(await GetStringOmniSetting("OmniBlox_DevExRate", "0.0038"), NumberStyles.Float, CultureInfo.InvariantCulture, out double rate) ? rate : 0.0038,
                 MaintenanceIntervalDays = Math.Clamp(await GetIntOmniSetting("OmniBlox_MaintenanceIntervalDays", 7), 1, 60),
             };
+            // The playtest experience runs unfinished builds, so a game is never given it as its own.
+            if (s.PlaytestSlot is { } playtest && s.Slots.RemoveAll(slot => slot.UniverseId == playtest.UniverseId) > 0 && ctx.Settings.PlaytestSlot?.UniverseId != playtest.UniverseId)
+                await ServiceLog($"[OmniBlox] experience {playtest.UniverseId} is the playtest experience (OmniBlox_PlaytestSlot), so it is not used as an experience slot.", false);
             // Mutate in place: the Roblox client holds a closure over this object.
             var t = ctx.Settings;
             t.Enabled = s.Enabled;
@@ -134,6 +138,7 @@ namespace Omnipotent.Services.OmniBlox
             t.CreatorUserId = s.CreatorUserId;
             t.CreatorGroupId = s.CreatorGroupId;
             t.Slots = s.Slots;
+            t.PlaytestSlot = s.PlaytestSlot;
             t.RequireLaunchApproval = s.RequireLaunchApproval;
             t.MaxGamesInProduction = s.MaxGamesInProduction;
             t.HarvesterEnabled = s.HarvesterEnabled;

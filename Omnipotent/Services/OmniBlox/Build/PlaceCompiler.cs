@@ -23,7 +23,16 @@ namespace Omnipotent.Services.OmniBlox.Build
         public List<ProductRecord> Products { get; init; } = new();
         public string? TelemetryUrl { get; init; }
         public string? TelemetrySecret { get; init; }
+        /// <summary>Set for the owner's playtest builds; null for the real game.</summary>
+        public PlaytestOptions? Playtest { get; init; }
     }
+
+    /// <summary>
+    /// What makes a build a playtest (Config.Playtest in the Game Kit): purchases are simulated, saves go to
+    /// <paramref name="DataStore"/> (or stay in memory, for Studio, where a place file has no DataStores), and
+    /// the HUD says which build it is.
+    /// </summary>
+    public sealed record PlaytestOptions(string Build, string Where, string DataStore, bool MemoryData);
 
     public sealed class CompileResult
     {
@@ -202,7 +211,7 @@ namespace Omnipotent.Services.OmniBlox.Build
         {
             var template = new Dictionary<string, object?>(StringComparer.Ordinal);
             foreach (var (k, v) in manifest.TemplateSettings) template[k] = v is JToken j ? j : v;
-            return new Dictionary<string, object?>(StringComparer.Ordinal)
+            var config = new Dictionary<string, object?>(StringComparer.Ordinal)
             {
                 ["GameId"] = input.GameId,
                 ["Title"] = manifest.Title,
@@ -240,6 +249,15 @@ namespace Omnipotent.Services.OmniBlox.Build
                     ["Secret"] = input.TelemetrySecret ?? "",
                 },
             };
+            if (input.Playtest is { } playtest)
+                config["Playtest"] = new Dictionary<string, object?>
+                {
+                    ["Build"] = playtest.Build,
+                    ["Where"] = playtest.Where,
+                    ["DataStore"] = playtest.DataStore,
+                    ["MemoryData"] = playtest.MemoryData,
+                };
+            return config;
         }
 
         // ─────────────── objects ───────────────

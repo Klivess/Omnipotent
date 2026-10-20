@@ -3,7 +3,9 @@
 -- "grant" such as "currency:500", "multiplier:2", "speed:24", "item:GravityCoil", "skipstage" or
 -- "flag:vip"; handlers for each kind are registered here or by the template. Receipts are recorded
 -- in the player's profile and saved before a purchase is confirmed, so nothing is granted twice or lost.
+-- In a playtest build (Config.Playtest) nothing is ever charged: buying grants the product at once.
 
+local HttpService = game:GetService("HttpService")
 local MarketplaceService = game:GetService("MarketplaceService")
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -19,6 +21,7 @@ local Util = require(Kit:WaitForChild("Util"))
 
 local Shop = {}
 
+local playtest = Config.Playtest ~= nil
 local grants: { [string]: (any, string, any) -> () } = {}
 local byKey: { [string]: any } = {}
 local byPassId: { [number]: any } = {}
@@ -125,7 +128,7 @@ local function applyOwnedPasses(player)
 	for _, product in ipairs(Config.Products or {}) do
 		if product.Kind == "GamePass" then
 			local owns = Shop.Owns(player, product.Key)
-			if not owns and (product.Id or 0) > 0 and Util.IsRealPlayer(player) then
+			if not owns and not playtest and (product.Id or 0) > 0 and Util.IsRealPlayer(player) then
 				local ok, result = pcall(function()
 					return MarketplaceService:UserOwnsGamePassAsync(player.UserId, product.Id)
 				end)
@@ -183,9 +186,41 @@ local function processReceipt(receipt)
 	return Enum.ProductPurchaseDecision.PurchaseGranted
 end
 
+-- A playtest purchase: granted at once and reported as a test (no Robux), so the owner can try every
+-- product without spending anything.
+local function testPurchase(player, product)
+	Analytics.Event("shop_prompt", player, { key = product.Key })
+	local isPass = product.Kind == "GamePass"
+	if isPass then
+		if Shop.Owns(player, product.Key) then
+			notify(player, "You already own " .. product.Name .. ".", "info")
+			return
+		end
+		local profile = Data.Get(player)
+		if profile then
+			profile.Owned[product.Key] = true
+			Data.MarkDirty(player)
+		end
+		if not applyGrant(player, product) then
+			notify(player, "The test purchase of " .. product.Name .. " did not work (see the output).", "info")
+			return
+		end
+	elseif not Shop.GrantPurchase(player, product, "playtest-" .. HttpService:GenerateGUID(false)) then
+		notify(player, "The test purchase of " .. product.Name .. " did not work (see the output).", "info")
+		return
+	end
+	Data.SaveSoon(player)
+	Analytics.Event("purchase", player, { key = product.Key, kind = if isPass then "pass" else "product", robux = 0, test = true })
+	notify(player, "Test purchase: " .. product.Name .. " (free in playtests)", "purchase")
+end
+
 function Shop.Prompt(player, key: string)
 	local product = byKey[key]
 	if not product or not Util.IsRealPlayer(player) then
+		return
+	end
+	if playtest then
+		testPurchase(player, product)
 		return
 	end
 	if (product.Id or 0) <= 0 then

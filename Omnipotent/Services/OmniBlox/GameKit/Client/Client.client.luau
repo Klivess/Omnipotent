@@ -1,7 +1,7 @@
 -- OmniKit · Client
 -- The HUD every game gets: currency, a shop for the game's passes and products, a feedback button,
 -- settings (music), toasts, first-time tips, and the template's own widget (obby stage counter with
--- "skip stage", tycoon bank, simulator bag and upgrades).
+-- "skip stage", tycoon bank, simulator bag and upgrades). A playtest build also shows which build it is.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -17,6 +17,7 @@ local player = Players.LocalPlayer
 local root = UI.Root("OmniKitHud")
 local currencyName = Config.CurrencyName or "Coins"
 local template = string.lower(Config.TemplateName or "")
+local playtest = if type(Config.Playtest) == "table" then Config.Playtest else nil
 
 -- Currency ------------------------------------------------------------------------------------------
 
@@ -41,6 +42,24 @@ local function watchCurrency()
 	amount.Changed:Connect(update)
 end
 task.spawn(watchCurrency)
+
+-- Playtest badge -------------------------------------------------------------------------------------
+-- Only in a playtest build: which build this is, and that nothing bought here costs anything.
+
+if playtest then
+	local playtestNote = "Playtest " .. tostring(playtest.Build or "") .. ": buying is free, and saves are kept apart from the real game."
+	local badge = UI.Button(root, "PLAYTEST · " .. tostring(playtest.Build or "?"), UDim2.fromScale(0.2, 0.045), UDim2.fromScale(0.015, 0.1), UI.Theme.PanelLight, function()
+		UI.Toast(root, playtestNote, "info")
+	end)
+	badge.TextColor3 = UI.Theme.Gold
+	local badgeLimit = Instance.new("UISizeConstraint")
+	badgeLimit.MaxSize = Vector2.new(260, 30)
+	badgeLimit.MinSize = Vector2.new(120, 22)
+	badgeLimit.Parent = badge
+	task.delay(2, function()
+		UI.Toast(root, playtestNote, "info")
+	end)
+end
 
 -- Toasts --------------------------------------------------------------------------------------------
 
@@ -68,7 +87,7 @@ sideLayout.Parent = side
 
 -- Shop ----------------------------------------------------------------------------------------------
 
-local shopModal, shopList = UI.Modal(root, "Shop")
+local shopModal, shopList = UI.Modal(root, if playtest then "Shop (free in playtests)" else "Shop")
 local owned: { [string]: boolean } = {}
 
 local function refreshOwned()
@@ -96,7 +115,8 @@ local function buildShop()
 		UI.Label(row, product.Name, UDim2.fromScale(0.62, 0.42), UDim2.fromScale(0.03, 0.08))
 		UI.Label(row, product.Description or "", UDim2.fromScale(0.62, 0.36), UDim2.fromScale(0.03, 0.54), UI.Theme.Muted, UI.Theme.Body)
 		local isPass = product.Kind == "GamePass"
-		local label = if isPass and owned[product.Key] then "Owned" else ("R$ " .. tostring(product.Price))
+		local price = (if playtest then "Test R$ " else "R$ ") .. tostring(product.Price)
+		local label = if isPass and owned[product.Key] then "Owned" else price
 		local button = UI.Button(row, label, UDim2.fromScale(0.3, 0.64), UDim2.fromScale(0.67, 0.18), if label == "Owned" then UI.Theme.Good else UI.Theme.Accent)
 		button.Activated:Connect(function()
 			if not (isPass and owned[product.Key]) then

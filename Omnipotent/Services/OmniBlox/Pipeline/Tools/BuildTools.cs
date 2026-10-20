@@ -398,6 +398,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 ws.Snapshot(revision);
                 Core.OmniBloxStore.WriteAtomic(Path.Combine(ctx.Store.BuildDirectory(gameId), "place.rbxlx"), result.PlaceXml);
                 foreach (var id in newAssets) ctx.Library.RecordUse(id, gameId, "placed");
+                ctx.Playtests.OnCleanBuild(gameId);
             }
             var sb = new StringBuilder();
             sb.AppendLine(ok ? $"BUILD OK — revision {revision}: {result.InstanceCount} instances, {result.ScriptCount} scripts, {result.Parts.Count} parts, {result.PlaceXml.Length / 1024} KB." : $"BUILD FAILED ({errors.Count} error(s)).");

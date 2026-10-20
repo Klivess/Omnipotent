@@ -13,7 +13,11 @@ local Util = require(game:GetService("ReplicatedStorage"):WaitForChild("OmniKit"
 
 local Data = {}
 
-local STORE_NAME = "OmniKit_v1"
+-- A playtest build (Config.Playtest) never touches the real game's saves: it uses a store of its own,
+-- or memory only where there are no DataStores (a place file opened in Studio). Decided here, at
+-- require time, because modules that start before Data (the leaderboard) ask about it.
+local playtest = Config.Playtest
+local STORE_NAME = if playtest and type(playtest.DataStore) == "string" and playtest.DataStore ~= "" then playtest.DataStore else "OmniKit_v1"
 local AUTOSAVE_SECONDS = 90
 local LOCK_STALE_SECONDS = 180 -- a lock older than this belongs to a dead server
 local LOCK_WAIT_SECONDS = 20
@@ -22,7 +26,7 @@ local profiles: { [number]: any } = {}
 local loadFailed: { [number]: boolean } = {}
 local dirtyAt: { [number]: number } = {}
 local store: DataStore? = nil
-local memoryOnly = false
+local memoryOnly = playtest ~= nil and playtest.MemoryData == true
 
 Data.Loaded = Util.Signal()
 Data.Changed = Util.Signal()
@@ -78,6 +82,13 @@ end
 function Data.UseMemory(enabled: boolean)
 	memoryOnly = enabled
 end
+
+function Data.IsMemoryOnly(): boolean
+	return memoryOnly
+end
+
+-- The DataStore profiles are saved in (the playtest's own one in a playtest build).
+Data.StoreName = STORE_NAME
 
 function Data.Get(player): any
 	return profiles[player.UserId]

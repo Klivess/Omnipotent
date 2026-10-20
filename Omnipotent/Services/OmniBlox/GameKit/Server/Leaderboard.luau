@@ -78,6 +78,20 @@ end
 
 local function refresh()
 	if not store then
+		if Data.IsMemoryOnly() then
+			-- No DataStores (a playtest opened in Studio): rank the players on this server instead.
+			local rows = {}
+			for _, player in ipairs(Players:GetPlayers()) do
+				local profile = Data.Get(player)
+				if profile then
+					table.insert(rows, { name = player.Name, value = math.floor(Leaderboard.Stat(profile)) })
+				end
+			end
+			table.sort(rows, function(a, b)
+				return a.value > b.value
+			end)
+			render(rows)
+		end
 		return
 	end
 	for _, player in ipairs(Players:GetPlayers()) do
@@ -113,11 +127,16 @@ function Leaderboard.Start()
 	if Config.Leaderboard == false then
 		return
 	end
-	local ok, result = pcall(function()
-		return DataStoreService:GetOrderedDataStore("OmniKit_Top_" .. (Config.Template and Config.Template.LeaderboardStat or "Earned"))
-	end)
-	if ok then
-		store = result
+	if not Data.IsMemoryOnly() then
+		-- A playtest ranks in a store named after its own save store, apart from the real game's board.
+		local prefix = if Config.Playtest then Data.StoreName .. "_Top_" else "OmniKit_Top_"
+		local stat = Config.Template and Config.Template.LeaderboardStat or "Earned"
+		local ok, result = pcall(function()
+			return DataStoreService:GetOrderedDataStore(string.sub(prefix .. stat, 1, 50))
+		end)
+		if ok then
+			store = result
+		end
 	end
 	task.spawn(function()
 		task.wait(15)

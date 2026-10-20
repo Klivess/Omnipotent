@@ -99,8 +99,32 @@ Places are published as XML (`.rbxlx`). The publishing API cannot carry unions (
 3. **Experience slots.** Create a few blank experiences in the Creator Dashboard and add each as `universeId:placeId` to `OmniBlox_ExperienceSlots`.
 4. **AIRouter.** OmniBlox only runs model work while `RemoteLLMProvider` is `AIRouter`.
 5. Open **Schemery → OmniBlox** on the KM site. Switch the **harvester** on first so the Asset Library fills up, then switch the **studio** on.
+6. **Playtest experience** (optional). To play any game in Roblox at any stage, live ones included, create one more blank experience. Give the key access to it and add it as `universeId:placeId` to `OmniBlox_PlaytestSlot` (see [Playtests](#playtests-playing-a-game-at-any-stage)). Without it, unlaunched games play in their own private experience, and Open in Studio needs nothing at all.
 
 Without a key OmniBlox still researches, harvests asset metadata and thumbnails, and builds and checks games offline; publishing, engine tests, model downloads and analytics wait for the key (the dashboard shows an owner task saying so).
+
+### Playtests: playing a game at any stage
+
+The owner can jump into any game from Build on, while it is being built, being tested, waiting to launch or live. On the dashboard, use **▶ Play** on a game card, in the game's header or on its World tab. The Play panel offers:
+
+- **Which build.** "Newest" is the files as they are right now, mid-cycle included. If they do not compile at that moment, the last clean build plays instead, and the panel says so. Any earlier clean revision (`r7`) can be played exactly as it was built, from its snapshot.
+- **▶ Play in Roblox.** OmniBlox compiles the build, publishes it to a private experience and opens `roblox.com/games/start?placeId=…`. That link launches the Roblox app, desktop or phone. Running servers are asked to move onto the new version (`universes/{id}:restartServers`), so pressing Play again while you are in the game brings you the new build. Pressing it for a build that is already there publishes nothing, so rejoining never restarts your server. "Start with fresh saves" starts the playtest's progress over.
+- **⤓ Open in Roblox Studio.** The same build as a `.rbxlx` file: open it and press Play (F5). This needs no API key and no experience.
+- **Follow the build.** While you are in the playtest (its server reported a player in the last 3 minutes), each new clean build the agents make is published to it and your server is moved onto it. You watch the game change as it is built. At most one push every 2 minutes; the newest build wins.
+
+**Where it plays.**
+- The studio's playtest experience, set with `OmniBlox_PlaytestSlot`, works for every game at every stage. It holds one game at a time, and playing another replaces it.
+- Without one, a game that has not launched plays in its own experience slot. That experience is private until launch, and a free slot is set aside on the first play, as Test would.
+- A public game never gets a playtest in its own experience.
+- Setup: create one more blank experience (it stays private), give the API key `universe-places` and `universe` write access to it, and add it as `universeId:placeId`.
+
+**A playtest build is safe to play.** It is the real game with the Game Kit's playtest mode on (`Config.Playtest`):
+- **Purchases.** Buying anything grants it at once as a free test purchase. Roblox is never asked to charge, and pass ownership comes from the playtest's own saves.
+- **Saves.** Saves go to a DataStore of their own (`OmniPlaytest_<game>_<n>`), never the game's. In Studio, where a place file has no DataStores, saves stay in memory. The leaderboard follows the same rules.
+- **Telemetry.** It goes to `/omniblox/telemetry` with a separate per-game playtest key, so it never touches the game's real numbers. It lands in the dossier's playtest log: one session per server, with how far you got, deaths, currency earned, gameplay events, test purchases, your in-game feedback and script errors.
+- **HUD.** The HUD shows a `PLAYTEST · r12` badge.
+
+**What playtests feed back.** The dashboard lists your recent playtests. The newest one from the last 3 days goes into the agents' briefing ("Current state"). A playtest is often the first time the game's scripts run with a real player and physics, which engine specs cannot cover. So its script errors are listed there word for word, for the builder to fix.
 
 ### What only the owner does
 
@@ -115,6 +139,7 @@ The dashboard's **Owner tasks** list is everything OmniBlox cannot or must not d
 | `OmniBlox_RobloxApiKey` | — | Open Cloud API key (sensitive) |
 | `OmniBlox_CreatorUserId` / `OmniBlox_CreatorGroupId` | — | Who owns uploaded assets |
 | `OmniBlox_ExperienceSlots` | — | `universeId:placeId` entries the bot may fill |
+| `OmniBlox_PlaytestSlot` | — | `universeId:placeId` of a private experience for the owner's playtests of any game at any stage (never used as an experience slot) |
 | `OmniBlox_RequireLaunchApproval` | `true` | Owner approves each game before it goes public |
 | `OmniBlox_MaxGamesInProduction` | `1` | Games in production at once (1–3) |
 | `OmniBlox_MaintenanceIntervalDays` | `7` | Maintenance interval once a game is past its first two weeks |
@@ -123,7 +148,7 @@ The dashboard's **Owner tasks** list is everything OmniBlox cannot or must not d
 
 ## HTTP API
 
-All under `/omniblox/`, permission group `omniblox`. Reads: `overview`, `games`, `game?id=`, `game/media`, `game/render`, `game/files`, `game/file`, `game/telemetry`, `assets`, `asset`, `asset/image`, `events`, `playbook`, `tasks`. Actions: `tasks/resolve` (not launch approvals), `games/new`, `games/pause`, `games/steer`, `games/maintain`; owner-level (`studio.manage`): `games/approve`, `games/abandon`, `studio/toggle`. `POST /omniblox/telemetry` is the public endpoint the games call, authenticated by a per-game secret.
+All under `/omniblox/`, permission group `omniblox`. Reads: `overview`, `games`, `game?id=` (includes `Playtest`: whether and where the game can be played), `game/media`, `game/render`, `game/files`, `game/file`, `game/place?id=&build=` (a playtest build as a place file; the build it is comes back in `X-OmniBlox-Build`, a fallback reason URL-encoded in `X-OmniBlox-Note`), `game/telemetry`, `assets`, `asset`, `asset/image`, `events`, `playbook`, `tasks`. Actions: `tasks/resolve` (not launch approvals), `games/new`, `games/pause`, `games/steer`, `games/maintain`, `games/playtest` (`{gameId, build, fresh}` → the join link), `games/playtest/follow` (`{gameId, follow}`); owner-level (`studio.manage`): `games/approve`, `games/abandon`, `studio/toggle`. `POST /omniblox/telemetry` is the public endpoint the games call, authenticated by a per-game secret (or, for playtest builds, the game's playtest key, which routes the batch to its playtest log).
 
 The JSON bodies are built in `OmniBloxViews.cs`, shared by the routes and the website's fixture export.
 
@@ -132,6 +157,7 @@ The JSON bodies are built in `OmniBloxViews.cs`, shared by the routes and the we
 KM site → **Schemery → OmniBlox** (`pages/schemery/omniblox`, components in `components/OmniBlox`, types and helpers in `composables/useOmniBlox.ts`):
 
 - **Studio**: owner tasks with their actions and file downloads, readiness banners, the studio and harvester switches, "New game" with an optional theme, KPIs (live games, the game in production, revenue with the DevEx estimate and "spent $0", players, model calls and cache hit rate, labelled models), every game as a card with its stage track, players and revenue across live games, model usage, the harvester, and the activity log.
+- **Play** (`?play=1` on a game, linked from every playable card and the studio header): build picker, Play in Roblox, Open in Studio, Follow, and the recent playtests with their errors and feedback.
 - **Game** (`/game/[id]`): stage track with the current exit checklist; tabs for the brief, milestones, last test, key facts, decisions and scored concepts; the world (3/4, above and spawn renders) with build problems and placed models; the store page, art, products and publishing record; numbers (Roblox analytics, telemetry sessions, funnel, feedback, purchases, script errors, maintenance and post-mortems); every cycle's hand-over; the workspace files; and the game's events. Pause, steer, maintain now, approve launch and abandon live in the header.
 - **Assets**: the library by status or by search, with a drawer showing the labeller's label, the measurements, what was stripped and where the model came from.
 - **Playbook**: every lesson with its outcome, confidence and evidence.
