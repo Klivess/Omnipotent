@@ -99,4 +99,9 @@
 		<None Update="Services\Projects\Containers\klive-cdp" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
+	<ItemGroup>
+		<!-- OmniBlox Game Kit: the Luau every generated Roblox game starts from, compiled into each place. -->
+		<EmbeddedResource Include="Services\OmniBlox\GameKit\**\*.luau" LogicalName="OmniBloxKit/%(RecursiveDir)%(Filename)%(Extension)" />
+	</ItemGroup>
+
 </Project>

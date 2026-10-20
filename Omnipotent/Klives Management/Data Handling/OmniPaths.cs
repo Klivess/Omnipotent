@@ -206,6 +206,9 @@ namespace Omnipotent.Data_Handling
             public static string KliveRAGDbFile = $"{KliveRAGDirectory}/kliverag.db";
             public static string KliveRAGSearxngDirectory = $"{KliveRAGDirectory}/searxng";
 
+            //OmniBlox (autonomous Roblox game studio)
+            public static string OmniBloxDirectory = $"{SavedDataDirectory}/OmniBlox";
+
             //KliveGames (game server deployment & management)
             public static string KliveGamesDirectory = $"{SavedDataDirectory}/KliveGames";
             public static string KliveGamesInstancesDirectory = $"{KliveGamesDirectory}/Instances";
