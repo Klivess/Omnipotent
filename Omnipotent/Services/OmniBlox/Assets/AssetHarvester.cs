@@ -13,10 +13,13 @@ namespace Omnipotent.Services.OmniBlox.Assets
         public int Analyzed { get; set; }
         public int Rejected { get; set; }
         public int Labeled { get; set; }
+        /// <summary>Models whose label from an older quality scale was re-rated against the calibrated anchors.</summary>
+        public int Relabeled { get; set; }
         public List<string> Notes { get; } = new();
 
         public override string ToString() =>
             $"query={Query ?? "-"} new={Discovered} thumbs={Thumbnails} analyzed={Analyzed} rejected={Rejected} labeled={Labeled}" +
+            (Relabeled > 0 ? $" re-rated={Relabeled}" : "") +
             (Notes.Count > 0 ? " · " + string.Join("; ", Notes) : "");
     }
 
@@ -72,7 +75,25 @@ namespace Omnipotent.Services.OmniBlox.Assets
         }
 
         public int DownloadsPerStep { get; set; } = 4;
-        public int LabelsPerStep { get; set; } = 2;
+
+        /// <summary>
+        /// Labels per step at most, back to back for as long as AIRouter stays idle. A burst reuses the
+        /// labeller's shared prompt head while the provider still has it cached; the same labels spread one
+        /// or two per step would mostly start cold.
+        /// </summary>
+        public int LabelsPerStep { get; set; } = 6;
+
+        /// <summary>
+        /// A cold start sends the reference examples only when at least this many models are waiting: warming
+        /// them costs about four models' worth of prefill, which a shorter burst would not earn back.
+        /// </summary>
+        public const int MinBurstForReference = 3;
+
+        private LabelReference? labelReference;
+        private DateTime lastReferenceCallUtc = DateTime.MinValue;
+        private DateTime lastReferenceAttemptUtc = DateTime.MinValue;
+        /// <summary>Re-rating failures per model this run; after two the model keeps its old label for now.</summary>
+        private readonly Dictionary<long, int> relabelFailures = new();
 
         /// <summary>Queue searches for what an upcoming game needs; they run before the general vocabulary.</summary>
         public void RequestAssets(IEnumerable<string> needs)
@@ -108,6 +129,7 @@ namespace Omnipotent.Services.OmniBlox.Assets
                 h.Discovered += report.Discovered;
                 h.Downloaded += report.Analyzed + report.Rejected;
                 h.Labeled += report.Labeled;
+                h.Relabeled += report.Relabeled;
                 h.LastRunUtc = now;
                 h.LastError = null;
                 s.MarkStudio();
@@ -219,8 +241,32 @@ namespace Omnipotent.Services.OmniBlox.Assets
         {
             var (ok, reason) = await llm.CheckAvailableAsync(ct);
             if (!ok) { report.Notes.Add("labelling paused: " + reason); return; }
-            foreach (var rec in library.NextForLabel(LabelsPerStep))
+            var fresh = library.NextForLabel(LabelsPerStep);
+            // Labels made on an older quality scale are re-rated once nothing new is waiting.
+            int room = LabelsPerStep - fresh.Count;
+            List<AssetRecord> Stale() => library.NextForRelabel(room + relabelFailures.Count, AssetLabeler.ScaleVersion)
+                .Where(r => relabelFailures.GetValueOrDefault(r.AssetId) < 2).Take(room).ToList();
+            var stale = Stale();
+            if (fresh.Count + stale.Count == 0) return;
+
+            // The reference head earns its keep while the provider still has it cached, or over a burst long
+            // enough to amortise warming it. A lone label after a pause goes without it.
+            LabelReference? reference = null;
+            if (clock() - lastReferenceCallUtc < llm.PrefixLifetime || fresh.Count + stale.Count >= MinBurstForReference)
             {
+                try { reference = await EnsureLabelReferenceAsync(ct); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or Newtonsoft.Json.JsonException or InvalidOperationException)
+                {
+                    report.Notes.Add("label references unavailable: " + ex.Message);
+                }
+            }
+            // Re-rating is only worth a call against the calibrated anchors; without them it would repeat the old
+            // scale. Building the anchors re-scores their calibration pool, so look again.
+            stale = reference == null ? new List<AssetRecord>() : Stale();
+
+            foreach (var rec in fresh.Concat(stale))
+            {
+                bool relabel = rec.Status == AssetStatus.Labeled;
                 if (!llm.HasSpareCapacity()) { report.Notes.Add("labelling waits for spare AIRouter capacity"); return; }
                 try
                 {
@@ -231,41 +277,161 @@ namespace Omnipotent.Services.OmniBlox.Assets
                         string path = library.RenderPath(rec.AssetId, view);
                         if (File.Exists(path)) renders.Add((view, await File.ReadAllBytesAsync(path, ct)));
                     }
-                    var result = await labeler.LabelAsync(rec, thumb, renders, ct);
-                    store.Mutate(s =>
-                    {
-                        s.Studio.LabelerUsage.Add(1, result.PromptTokens, result.CachedTokens, result.CompletionTokens);
-                        AddDailyUsage(s.Studio, clock(), 1, result.PromptTokens, result.CachedTokens, result.CompletionTokens);
-                        s.MarkStudio();
-                    });
-                    if (result.Label.Quality < 3)
-                    {
-                        library.SaveLabel(rec.AssetId, result.Label, clock());
-                        library.MarkRejected(rec.AssetId, "low quality: " + string.Join("; ", result.Label.Issues.DefaultIfEmpty("rated " + result.Label.Quality)));
-                        report.Rejected++;
-                    }
-                    else
-                    {
-                        library.SaveLabel(rec.AssetId, result.Label, clock());
-                        report.Labeled++;
-                    }
+                    var result = await labeler.LabelAsync(rec, thumb, renders, ct, reference);
+                    if (reference != null) lastReferenceCallUtc = clock();
+                    RecordLabelerUsage(result.PromptTokens, result.CachedTokens, result.CompletionTokens);
+                    SaveRating(rec.AssetId, result.Label, report, relabel);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
-                    library.MarkFailed(rec.AssetId, "label: " + ex.Message);
-                    report.Notes.Add($"label #{rec.AssetId}: {ex.Message}");
+                    // A model being re-rated keeps the label it has; only a first label can fail a model.
+                    if (relabel) relabelFailures[rec.AssetId] = relabelFailures.GetValueOrDefault(rec.AssetId) + 1;
+                    else library.MarkFailed(rec.AssetId, "label: " + ex.Message);
+                    report.Notes.Add($"{(relabel ? "re-rate" : "label")} #{rec.AssetId}: {ex.Message}");
                 }
             }
         }
 
-        internal static void AddDailyUsage(StudioState studio, DateTime now, long calls, long prompt, long cached, long completion)
+        /// <summary>Stores a label on the current scale; below 3 the model is rejected (it stays placeable where it is used).</summary>
+        private void SaveRating(long assetId, AssetLabel label, HarvestStepReport report, bool relabel)
+        {
+            library.SaveLabel(assetId, label, clock(), AssetLabeler.ScaleVersion);
+            if (label.Quality < 3)
+            {
+                library.MarkRejected(assetId, "low quality: " + string.Join("; ", label.Issues.DefaultIfEmpty("rated " + label.Quality)));
+                report.Rejected++;
+            }
+            else if (relabel) report.Relabeled++;
+            else report.Labeled++;
+        }
+
+        private void RecordLabelerUsage(long prompt, long cached, long completion) => store.Mutate(s =>
+        {
+            s.Studio.LabelerUsage.Add(1, prompt, cached, completion);
+            AddDailyUsage(s.Studio, clock(), 1, prompt, cached, completion, labeler: true);
+            s.MarkStudio();
+        });
+
+        /// <summary>
+        /// The labeller's reference examples, frozen in the studio state with copies of their pictures. Built
+        /// once the library has enough labels to calibrate on; rebuilt only for a new labeller prompt or a
+        /// missing file. Never refreshed otherwise: its bytes are the cached head of every label call, and its
+        /// scores are the scale every label is measured on. Null while there is nothing to build it from (a
+        /// failed or premature attempt is retried after an hour).
+        /// </summary>
+        internal async Task<LabelReference?> EnsureLabelReferenceAsync(CancellationToken ct)
+        {
+            var stored = store.Read(s => s.Studio.LabelerReference is { } r ? OmniBloxStore.Clone(r) : null);
+            if (stored != null && stored.PromptVersion == AssetLabeler.PromptVersion)
+            {
+                if (labelReference?.Version != stored.Version) labelReference = LoadLabelReference(stored);
+                if (labelReference != null) return labelReference;
+            }
+            if (clock() - lastReferenceAttemptUtc < TimeSpan.FromHours(1) || !llm.HasSpareCapacity()) return labelReference = null;
+            lastReferenceAttemptUtc = clock();
+            return labelReference = await BuildLabelReferenceAsync(stored, ct);
+        }
+
+        /// <summary>
+        /// Calibrates a pool of labelled models side by side, writes the calibrated scores back to their labels
+        /// (they are better measured than the ones they replace), and freezes the models nearest the anchor
+        /// levels as the reference examples, each carrying its calibrated score and the issues that set it.
+        /// </summary>
+        private async Task<LabelReference?> BuildLabelReferenceAsync(LabelReferenceSet? previous, CancellationToken ct)
+        {
+            var pool = AssetLabeler.PickCalibrationPool(library.ReferenceCandidates()
+                .Where(r => File.Exists(library.ThumbnailPath(r.AssetId)) && r.Renders.Any(v => File.Exists(library.RenderPath(r.AssetId, v)))));
+            if (pool.Count < AssetLabeler.MinCalibrationPool) return null;
+
+            var calibration = await labeler.CalibrateAsync(pool.Select(r => (r, File.ReadAllBytes(library.ThumbnailPath(r.AssetId)))).ToList(), ct);
+            RecordLabelerUsage(calibration.PromptTokens, calibration.CachedTokens, calibration.CompletionTokens);
+            var picked = AssetLabeler.PickReferences(pool, calibration.Scores);
+            if (picked.Count < AssetLabeler.MinReferenceExamples)
+            {
+                log($"[OmniBlox] Labeller calibration gave {calibration.Scores.Count} usable score(s) for {pool.Count} models; retrying later.");
+                return null;
+            }
+            var rescored = new HarvestStepReport();
+            foreach (var rec in pool.Where(r => calibration.Scores.ContainsKey(r.AssetId)))
+            {
+                var (quality, issues) = calibration.Scores[rec.AssetId];
+                var label = rec.Label!;
+                label.Quality = quality;
+                if (issues.Count > 0) label.Issues = issues;
+                SaveRating(rec.AssetId, label, rescored, relabel: true);
+            }
+
+            int version = (previous?.Version ?? 0) + 1;
+            string folder = LabelReferenceFolder(version);
+            Directory.CreateDirectory(folder);
+            var set = new LabelReferenceSet { Version = version, PromptVersion = AssetLabeler.PromptVersion, CreatedUtc = clock() };
+            foreach (var (rec, _, _) in picked)
+            {
+                var renders = rec.Renders
+                    .Where(v => File.Exists(library.RenderPath(rec.AssetId, v)))
+                    .Select(v => (v, File.ReadAllBytes(library.RenderPath(rec.AssetId, v))))
+                    .ToList();
+                var (text, images) = AssetLabeler.Request(rec, File.ReadAllBytes(library.ThumbnailPath(rec.AssetId)), renders);
+                var example = new LabelReferenceExample { AssetId = rec.AssetId, Quality = rec.Label!.Quality, Text = text, Answer = AssetLabeler.Answer(rec.Label!) };
+                for (int i = 0; i < images.Count; i++)
+                {
+                    string file = $"{rec.AssetId}-{i}.png";
+                    OmniBloxStore.WriteAtomic(Path.Combine(folder, file), images[i]);
+                    example.ImageFiles.Add(file);
+                }
+                set.Examples.Add(example);
+            }
+            store.Mutate(s => { s.Studio.LabelerReference = set; s.MarkStudio(); });
+            log($"[OmniBlox] Labeller reference set v{version}, calibrated on {pool.Count} models (scores {calibration.Scores.Values.Min(v => v.Quality):0.#}–{calibration.Scores.Values.Max(v => v.Quality):0.#}): " +
+                string.Join(", ", set.Examples.Select(e => $"#{e.AssetId} q{e.Quality:0.#}")) + ".");
+
+            // Earlier sets' pictures are sent by nothing any more.
+            foreach (string old in Directory.EnumerateDirectories(Path.GetDirectoryName(folder)!).Where(d => !string.Equals(d, folder, StringComparison.OrdinalIgnoreCase)))
+            {
+                try { Directory.Delete(old, recursive: true); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+            }
+            return LoadLabelReference(set);
+        }
+
+        /// <summary>The stored set with its pictures read back, or null when any file has gone.</summary>
+        private LabelReference? LoadLabelReference(LabelReferenceSet set)
+        {
+            string folder = LabelReferenceFolder(set.Version);
+            var examples = new List<(string, IReadOnlyList<byte[]>, string)>();
+            foreach (var example in set.Examples)
+            {
+                var images = new List<byte[]>();
+                foreach (string file in example.ImageFiles)
+                {
+                    string path = Path.Combine(folder, file);
+                    if (!File.Exists(path)) return null;
+                    images.Add(File.ReadAllBytes(path));
+                }
+                examples.Add((example.Text, images, example.Answer));
+            }
+            return new LabelReference { Version = set.Version, Examples = examples };
+        }
+
+        private string LabelReferenceFolder(int version) =>
+            Path.Combine(store.Root, "labeler-reference", "v" + version.ToString(System.Globalization.CultureInfo.InvariantCulture));
+
+        /// <summary>Adds to the day's totals, and to the labeller's or the agents' share of them.</summary>
+        internal static void AddDailyUsage(StudioState studio, DateTime now, long calls, long prompt, long cached, long completion,
+            long resent = 0, long resentCached = 0, bool labeler = false)
         {
             string day = now.ToString("yyyy-MM-dd");
-            if (!studio.DailyUsage.TryGetValue(day, out var u)) studio.DailyUsage[day] = u = new UsageTotals();
-            u.Add(calls, prompt, cached, completion);
-            if (studio.DailyUsage.Count > 120)
-                foreach (var old in studio.DailyUsage.Keys.OrderBy(k => k).Take(studio.DailyUsage.Count - 120).ToList())
-                    studio.DailyUsage.Remove(old);
+            Bump(studio.DailyUsage);
+            Bump(labeler ? studio.DailyLabelerUsage : studio.DailyAgentUsage);
+
+            void Bump(Dictionary<string, UsageTotals> daily)
+            {
+                if (!daily.TryGetValue(day, out var u)) daily[day] = u = new UsageTotals();
+                u.Add(calls, prompt, cached, completion);
+                u.AddResent(resent, resentCached);
+                if (daily.Count > 120)
+                    foreach (var old in daily.Keys.OrderBy(k => k).Take(daily.Count - 120).ToList())
+                        daily.Remove(old);
+            }
         }
     }
 }

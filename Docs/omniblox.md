@@ -43,6 +43,33 @@ The cycle ends when the agent calls `finish_cycle` (or the budget runs out, in w
 - The asset labeler only dispatches when the shared AIRouter queue is idle (nobody waiting, at most one request in flight).
 - Prompts follow `KliveLLM/PromptPrefixStability.cs`: stable text first, volatile text last, history append-only within a cycle.
 
+### Prompt cache
+
+AIRouter serves a request from its prefix cache only for the run of bytes it shares with an earlier request, counted from the first byte. One changed byte early in a prompt makes everything after it a miss. The dashboard's "cache hits" figure is the share of prompt tokens served from that cache, and AIRouter judges keys by it.
+
+**Agent cycles** re-send their transcript every turn, so nearly all of each request can be served from cache:
+
+- One tool list for the whole cycle, the wrap-up call included. The tool schemas are rendered at the head of the prompt. The old wrap-up offered only `finish_cycle`, which made its call re-prefill the entire cycle (up to ~70K tokens). A call to another tool at that point is answered "not run" instead of being executed.
+- The briefing is appended without KliveLLM's receipt stamp, since it closes with its own `Now:` line. Its sections run from rarest change to most frequent: brief, lessons, milestones, facts, decisions, hand-overs, state. The next cycle's briefing can then reuse everything above the first fact the last cycle added.
+- Each cycle report counts the tokens a turn re-sent (the previous request, an exact prefix of the next) and how many the cache served. The gap is waste: a prefix that expired during a long tool call or queue wait.
+
+Expected: re-sent prompt ~100% from cache. The raw hit rate is ~90–96%, because each turn's new tool output and pictures cannot be cached before they are first sent.
+
+**The asset labeller** makes one-shot vision calls whose pictures are new every time. Before this design, only the ~520-token system prompt was shared, which put the hit rate near 26%. Now:
+
+- The four schematic views are sent as one 2×2 sheet (768 px) rather than four 512 px pictures. That is about 36% fewer new tokens per call.
+- Every call opens with a frozen set of four **reference examples**: earlier models with their labels, chosen at calibrated scores of about 9, 2, 7 and 4 (see below). They are byte-identical in every call, so the provider caches them once. Measured on real prompts (`PromptCacheTests.AWarmLabelCall_IsMostlyItsSharedHead`), a warm call is ~83% cached.
+- The references cost about four models' worth of prefill whenever the cache has expired. So they are sent only while still warm (within `KliveLLM.EstimatedPrefixLifetime()`), or when at least three models are waiting. The harvester labels up to six per step, back to back while AIRouter stays idle.
+- The set is frozen in `studio.json` (`LabelerReference`) with copies of its pictures under `labeler-reference/v{n}/`. It is rebuilt only for a new `AssetLabeler.PromptVersion` or a missing file. **Bump `PromptVersion` whenever the labeller's system prompt, request text or answer format changes.**
+
+**Quality calibration.** The first labels each judged one model alone against a one-line scale, and nearly everything came out at 6 or 7. A model with nothing to compare against lands in the safe middle. Three changes give it a consistent context:
+
+- **Calibration.** When the reference set is built (once the library has at least six labels), one call shows ~12 models side by side as thumbnails and scores them against each other. The pool alternates the most and least promising by likes, votes and verified creator, one per category where possible. The four anchors are the models nearest 9, 2, 7 and 4 on that scale. They carry their calibrated score and the issues that set it. The pool's new scores are written back to the library.
+- **Rubric.** The labeller's prompt now has a six-band scale, with a description of each band. It also tells the model to place each model by comparing it with the anchors.
+- **Re-rating.** Labels made on the old scale (`label_version` 0) are re-rated against the anchors when nothing new is waiting, most-used models first. A re-rate that fails leaves the old label in place. `AssetLabeler.ScaleVersion` marks the scale. Bump it only when scores stop being comparable with earlier ones, because that re-rates the whole library.
+
+A literal 100% hit rate is not reachable, because every call carries something new. What should read ~100% is the "Re-sent prompt" row: the share of already-sent tokens the cache served.
+
 ### Roblox access
 
 | Capability | Endpoint | Auth |

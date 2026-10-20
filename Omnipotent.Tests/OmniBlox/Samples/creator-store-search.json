@@ -1,0 +1,295 @@
+{
+  "nextPageToken": "MV8xXzJfNTA=_dc8ed5dac8509882f5c95020e9365135",
+  "queryFacets": {
+    "appliedFacets": [],
+    "availableFacets": [
+      "sports",
+      "classic",
+      "off-road",
+      "convertible",
+      "electric",
+      "compact",
+      "sedan",
+      "jeep",
+      "limousine",
+      "monster truck"
+    ]
+  },
+  "creatorStoreAssets": [
+    {
+      "voting": {
+        "showVotes": true,
+        "upVotes": 17800,
+        "downVotes": 2200,
+        "canVote": false,
+        "hasVoted": false,
+        "voteCount": 20000,
+        "upVotePercent": 89
+      },
+      "creator": {
+        "creator": "user/324239408",
+        "userId": 324239408,
+        "name": "BadboyWestern",
+        "verified": true
+      },
+      "creatorStoreProduct": {
+        "purchasePrice": {
+          "currencyCode": "USD",
+          "quantity": {
+            "significand": 0,
+            "exponent": 0
+          }
+        },
+        "purchasable": true
+      },
+      "asset": {
+        "subTypes": [],
+        "hasScripts": true,
+        "scriptCount": 14,
+        "objectMeshSummary": {
+          "triangles": 97173,
+          "vertices": 198537
+        },
+        "instanceCounts": {
+          "script": 14,
+          "meshPart": 77,
+          "animation": 0,
+          "decal": 0,
+          "audio": 19,
+          "tool": 0
+        },
+        "capabilities": {
+          "shouldSandbox": true
+        },
+        "id": 6810376207,
+        "name": "2019 Sports Car // Rosh",
+        "description": "I can't release this when I put the brand in title\nJesco\nFast Car",
+        "assetTypeId": 10,
+        "socialLinks": [],
+        "previewAssets": {
+          "imagePreviewAssets": [],
+          "videoPreviewAssets": []
+        },
+        "createTime": "2021-05-13T14:36:11.533Z",
+        "updateTime": "2022-01-13T17:51:38.45Z",
+        "categoryPath": "3d__vehicles"
+      }
+    },
+    {
+      "voting": {
+        "showVotes": true,
+        "upVotes": 8800,
+        "downVotes": 1200,
+        "canVote": false,
+        "hasVoted": false,
+        "voteCount": 10000,
+        "upVotePercent": 88
+      },
+      "creator": {
+        "creator": "group/3529469",
+        "groupId": 3529469,
+        "name": "Roblox Resources",
+        "verified": true,
+        "latestGroupUpdaterUserId": 5687038647,
+        "latestGroupUpdaterUserName": "CreatorKnowledge"
+      },
+      "creatorStoreProduct": {
+        "purchasePrice": {
+          "currencyCode": "USD",
+          "quantity": {
+            "significand": 0,
+            "exponent": 0
+          }
+        },
+        "purchasable": true
+      },
+      "asset": {
+        "subTypes": [],
+        "hasScripts": false,
+        "scriptCount": 0,
+        "capabilities": {
+          "shouldSandbox": false
+        },
+        "id": 14215126016,
+        "name": "Car",
+        "description": "",
+        "assetTypeId": 10,
+        "socialLinks": [],
+        "previewAssets": {
+          "imagePreviewAssets": [],
+          "videoPreviewAssets": []
+        },
+        "createTime": "2023-07-27T18:14:59.837Z",
+        "updateTime": "2026-09-25T17:23:23.455Z",
+        "categoryPath": "3d__vehicles"
+      }
+    },
+    {
+      "voting": {
+        "showVotes": true,
+        "upVotes": 558,
+        "downVotes": 42,
+        "canVote": false,
+        "hasVoted": false,
+        "voteCount": 600,
+        "upVotePercent": 93
+      },
+      "creator": {
+        "creator": "user/2733953831",
+        "userId": 2733953831,
+        "name": "mootomotto",
+        "verified": true
+      },
+      "creatorStoreProduct": {
+        "purchasePrice": {
+          "currencyCode": "USD",
+          "quantity": {
+            "significand": 0,
+            "exponent": 0
+          }
+        },
+        "purchasable": true
+      },
+      "asset": {
+        "subTypes": [],
+        "hasScripts": true,
+        "scriptCount": 7,
+        "objectMeshSummary": {
+          "triangles": 4988,
+          "vertices": 8337
+        },
+        "instanceCounts": {
+          "script": 7,
+          "meshPart": 1,
+          "animation": 0,
+          "decal": 0,
+          "audio": 6,
+          "tool": 0
+        },
+        "capabilities": {
+          "shouldSandbox": true
+        },
+        "id": 9904414343,
+        "name": "Cow Car",
+        "description": "cow",
+        "assetTypeId": 10,
+        "socialLinks": [],
+        "previewAssets": {
+          "imagePreviewAssets": [],
+          "videoPreviewAssets": []
+        },
+        "createTime": "2022-06-13T23:53:36.213Z",
+        "updateTime": "2022-06-13T23:53:36.227Z",
+        "categoryPath": "3d__vehicles"
+      }
+    },
+    {
+      "voting": {
+        "showVotes": true,
+        "upVotes": 1840,
+        "downVotes": 160,
+        "canVote": false,
+        "hasVoted": false,
+        "voteCount": 2000,
+        "upVotePercent": 92
+      },
+      "creator": {
+        "creator": "user/1",
+        "userId": 1,
+        "name": "Roblox",
+        "verified": true
+      },
+      "creatorStoreProduct": {
+        "purchasePrice": {
+          "currencyCode": "USD",
+          "quantity": {
+            "significand": 0,
+            "exponent": 0
+          }
+        },
+        "purchasable": true
+      },
+      "asset": {
+        "subTypes": [],
+        "hasScripts": true,
+        "scriptCount": 4,
+        "objectMeshSummary": {
+          "triangles": 18969,
+          "vertices": 19485
+        },
+        "instanceCounts": {
+          "script": 4,
+          "meshPart": 52,
+          "animation": 2,
+          "decal": 12,
+          "audio": 8,
+          "tool": 0
+        },
+        "capabilities": {
+          "shouldSandbox": false
+        },
+        "id": 6418230807,
+        "name": "Police Car",
+        "description": "The Police Car: Jump behind the wheel of this high quality vehicle with realistic physics.\n\nKeywords: Cop, Patrol, Squad, Cruiser",
+        "assetTypeId": 10,
+        "socialLinks": [],
+        "previewAssets": {
+          "imagePreviewAssets": [],
+          "videoPreviewAssets": []
+        },
+        "createTime": "2021-02-19T22:12:35.087Z",
+        "updateTime": "2021-02-24T02:31:23.423Z",
+        "categoryPath": "3d__vehicles"
+      }
+    },
+    {
+      "voting": {
+        "showVotes": true,
+        "upVotes": 0,
+        "downVotes": 0,
+        "canVote": false,
+        "hasVoted": false,
+        "voteCount": 0,
+        "upVotePercent": 100
+      },
+      "creator": {
+        "creator": "user/3839059270",
+        "userId": 3839059270,
+        "name": "DominicF1Fan",
+        "verified": true
+      },
+      "creatorStoreProduct": {
+        "purchasePrice": {
+          "currencyCode": "USD",
+          "quantity": {
+            "significand": 0,
+            "exponent": 0
+          }
+        },
+        "purchasable": true
+      },
+      "asset": {
+        "subTypes": [],
+        "hasScripts": false,
+        "scriptCount": 0,
+        "capabilities": {
+          "shouldSandbox": true
+        },
+        "id": 12319404314,
+        "name": "race car",
+        "description": "",
+        "assetTypeId": 10,
+        "socialLinks": [],
+        "previewAssets": {
+          "imagePreviewAssets": [],
+          "videoPreviewAssets": []
+        },
+        "createTime": "2023-01-29T19:04:33.317Z",
+        "updateTime": "2023-01-29T19:04:33.317Z",
+        "categoryPath": "3d__vehicles"
+      }
+    }
+  ],
+  "totalResults": 1000,
+  "filteredKeyword": ""
+}

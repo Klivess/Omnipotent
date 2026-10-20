@@ -337,7 +337,7 @@ namespace Omnipotent.Tests.OmniBlox
                 var analysis = AssetAnalyzer.Analyze(m.Doc, id, name);
                 var renders = SchematicRenderer.RenderStandardViews(SchematicRenderer.PrimitivesOf(analysis.Model), 384);
                 library.SaveAnalysis(id, RbxXmlWriter.WriteBytes(m.Doc), analysis, analysis.Placeable ? renders : new List<(string, byte[])>(), 400, now);
-                if (label != null) library.SaveLabel(id, label, now);
+                if (label != null) library.SaveLabel(id, label, now, AssetLabeler.ScaleVersion);
             }
 
             var crate = Model("Wooden Crate");

@@ -251,6 +251,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 sb.AppendLine($"The game: {game.Brief?.Pitch} Core loop: {game.Brief?.CoreLoop}");
                 ctx.Llm.AppendUser(session, sb.ToString());
                 var turn = await ctx.Llm.QueryAsync(session, Array.Empty<ToolDefinition>(), new LlmCallOptions { MaxTokens = 600, Thinking = "low", WorkClass = AIRouterWorkClass.OneShot }, ct);
+                ctx.AddUsage(game.GameId, new CycleReport { Turns = 1, PromptTokens = turn.PromptTokens, CachedTokens = turn.CachedTokens, CompletionTokens = turn.CompletionTokens });
                 if (!turn.Success) return "(review unavailable)";
                 int start = turn.Text.IndexOf('{'), end = turn.Text.LastIndexOf('}');
                 if (start < 0 || end <= start) return "(review unreadable)";

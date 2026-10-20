@@ -1,0 +1,365 @@
+{
+  "header": {
+    "sorts": null,
+    "layoutData": {}
+  },
+  "sorts": [
+    {
+      "contentType": "Filters",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 693,
+      "primarySortId": 23,
+      "secondarySortId": 693,
+      "id": "filters_v5",
+      "sortId": "filters_v5",
+      "sortDisplayName": "",
+      "topicLayoutData": {},
+      "treatmentType": "Pills",
+      "filters": [
+        {
+          "filterId": "device_filter_v1",
+          "filterType": "device",
+          "filterDisplayName": "Device",
+          "filterOptions": [
+            {
+              "optionId": "all",
+              "optionDisplayName": "All Devices"
+            },
+            {
+              "optionId": "low_end_phone",
+              "optionDisplayName": "Entry-level Phone"
+            }
+          ],
+          "defaultOptionId": "computer",
+          "selectedOptionId": "all",
+          "filterLayoutData": {},
+          "inactiveOptionIds": [
+            "all"
+          ]
+        },
+        {
+          "filterId": "country_filter_v3",
+          "filterType": "country",
+          "filterDisplayName": "Location",
+          "filterOptions": [
+            {
+              "optionId": "all",
+              "optionDisplayName": "All Locations"
+            },
+            {
+              "optionId": "af",
+              "optionDisplayName": "Afghanistan"
+            }
+          ],
+          "defaultOptionId": "gb",
+          "selectedOptionId": "all",
+          "filterLayoutData": {},
+          "inactiveOptionIds": [
+            "all"
+          ]
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 691,
+      "primarySortId": 23,
+      "secondarySortId": 691,
+      "id": "Top_Trending_V6",
+      "sortId": "top-trending",
+      "appliedFilters": "device=all,age=all,country=all",
+      "sortDisplayName": "Top Trending",
+      "topicLayoutData": {
+        "infoText": "Top experiences with the largest relative increase in daily active users over the past week.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 66654135,
+          "rootPlaceId": 142823291,
+          "name": "Murder Mystery 2",
+          "playerCount": 391028,
+          "totalUpVotes": 10808545,
+          "totalDownVotes": 1091928,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Moderate",
+          "contentMaturity": "moderate",
+          "genreL1": "Survival"
+        },
+        {
+          "universeId": 6035872082,
+          "rootPlaceId": 17625359962,
+          "name": "[🎃] RIVALS",
+          "playerCount": 134520,
+          "totalUpVotes": 10820452,
+          "totalDownVotes": 732534,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Mild",
+          "contentMaturity": "mild",
+          "genreL1": "Shooter"
+        },
+        {
+          "universeId": 5203828273,
+          "rootPlaceId": 15101393044,
+          "name": "[🎃] Dress To Impress",
+          "playerCount": 52652,
+          "totalUpVotes": 4043279,
+          "totalDownVotes": 420981,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Roleplay & Avatar Sim"
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 692,
+      "primarySortId": 23,
+      "secondarySortId": 692,
+      "id": "Up_And_Coming_V6",
+      "sortId": "up-and-coming",
+      "appliedFilters": "device=all,age=all,country=all",
+      "sortDisplayName": "Up-and-Coming",
+      "topicLayoutData": {
+        "infoText": "Top experiences published within the last 28 days sorted by user growth.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 10769869378,
+          "rootPlaceId": 117097415191933,
+          "name": "Don’t Miss Your Flight! ✈️",
+          "playerCount": 12728,
+          "totalUpVotes": 323,
+          "totalDownVotes": 823,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        },
+        {
+          "universeId": 10769543742,
+          "rootPlaceId": 94278659624110,
+          "name": "Backseat Rally",
+          "playerCount": 16087,
+          "totalUpVotes": 6931,
+          "totalDownVotes": 456,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": ""
+        },
+        {
+          "universeId": 10769543567,
+          "rootPlaceId": 130906410042392,
+          "name": "Cat Battles 🐾",
+          "playerCount": 19605,
+          "totalUpVotes": 15276,
+          "totalDownVotes": 5174,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Action"
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 671,
+      "primarySortId": 23,
+      "secondarySortId": 671,
+      "id": "CCU_Based_V1",
+      "sortId": "top-playing-now",
+      "sortDisplayName": "Top Playing Now",
+      "subtitle": "Results for all devices and locations",
+      "topicLayoutData": {
+        "infoText": "Top experiences sorted by the number of concurrent users.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 10563114921,
+          "rootPlaceId": 107778070777162,
+          "name": "Steal An Egg",
+          "playerCount": 1047853,
+          "totalUpVotes": 3674192,
+          "totalDownVotes": 326541,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        },
+        {
+          "universeId": 66654135,
+          "rootPlaceId": 142823291,
+          "name": "Murder Mystery 2",
+          "playerCount": 391028,
+          "totalUpVotes": 10808545,
+          "totalDownVotes": 1091928,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Moderate",
+          "contentMaturity": "moderate",
+          "genreL1": "Survival"
+        },
+        {
+          "universeId": 1686885941,
+          "rootPlaceId": 4924922222,
+          "name": "Brookhaven 🏡RP",
+          "playerCount": 201123,
+          "totalUpVotes": 8659734,
+          "totalDownVotes": 1423244,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Roleplay & Avatar Sim"
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 222,
+      "primarySortId": 23,
+      "secondarySortId": 222,
+      "id": "Fun_With_Friends_V4",
+      "sortId": "fun-with-friends",
+      "appliedFilters": "device=all,age=all,country=all",
+      "sortDisplayName": "Fun with Friends",
+      "topicLayoutData": {
+        "infoText": "Experiences with at least 5000 users daily, sorted by the proportion of time spent as groups of friends. These experiences have at least 5,000 daily users, are within the top 10% of daily active users, or are among the top 30 most played experiences. The order of these experiences is subject to the device and location filters applied to this page.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 10737656087,
+          "rootPlaceId": 128899661081075,
+          "name": "👑THA BRONX 3👑",
+          "playerCount": 2026,
+          "totalUpVotes": 13649,
+          "totalDownVotes": 1255,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Moderate",
+          "contentMaturity": "moderate",
+          "genreL1": "Action"
+        },
+        {
+          "universeId": 6701277882,
+          "rootPlaceId": 121864768012064,
+          "name": "[🎃UPD] Fish It! 🐟",
+          "playerCount": 69925,
+          "totalUpVotes": 1346816,
+          "totalDownVotes": 279276,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        },
+        {
+          "universeId": 10415694629,
+          "rootPlaceId": 81734857983173,
+          "name": "Carry the Glass Together! [2 Player Obby]",
+          "playerCount": 2279,
+          "totalUpVotes": 27915,
+          "totalDownVotes": 3474,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Obby & Platformer"
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 237,
+      "primarySortId": 23,
+      "secondarySortId": 237,
+      "id": "Top_Revisited_Existing_Users_V4",
+      "sortId": "top-revisited",
+      "appliedFilters": "device=all,age=all,country=all",
+      "sortDisplayName": "Top Revisited",
+      "topicLayoutData": {
+        "infoText": "Experiences sorted by the proportion of users who come back after a week. These experiences have at least 5,000 daily users, are within the top 10% of daily active users, or are among the top 30 most played experiences. The order of these experiences is subject to the device and location filters applied to this page.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 1946714362,
+          "rootPlaceId": 5571328985,
+          "name": "[⌛] Bloodlines",
+          "playerCount": 2423,
+          "totalUpVotes": 46636,
+          "totalDownVotes": 10322,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Moderate",
+          "contentMaturity": "moderate",
+          "genreL1": "RPG"
+        },
+        {
+          "universeId": 8342498724,
+          "rootPlaceId": 98502499119821,
+          "name": "[☯UPD] Heavyweight Fishing",
+          "playerCount": 11470,
+          "totalUpVotes": 85369,
+          "totalDownVotes": 3432,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        },
+        {
+          "universeId": 6945584306,
+          "rootPlaceId": 94647229517154,
+          "name": "[HITBOX CHANGES 🛜] Azure Latch",
+          "playerCount": 3263,
+          "totalUpVotes": 1619245,
+          "totalDownVotes": 54084,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Sports & Racing"
+        }
+      ]
+    }
+  ],
+  "nextSortsPageToken": "eyJzdGFydCI6NiwiY291bnQiOjYsInNlc3Npb25faWQiOiI0OTU0N2Q3ZC1jNTI0LTRjNTEtOTQxYS03NDBmOGRkYTFkZDAiLCJkZXZpY2UiOiJhbGwiLCJjb3VudHJ5IjoiYWxsIiwicGFnZV9jb25maWdfbmFtZSI6IndpdGhfYWxwaGFfbG9jYXRpb25fZmlsdGVyX2FsbCJ9"
+}

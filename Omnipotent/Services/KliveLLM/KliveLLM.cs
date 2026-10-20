@@ -904,7 +904,8 @@ namespace Omnipotent.Services.KliveLLM
         /// Append a Projects wake seed without prepending another receipt-time stamp. Wake seeds are
         /// already temporally grounded by their trailing <c>Now:</c> line; putting a fresh timestamp
         /// in byte zero made every otherwise-stable wake prefix unique and defeated provider caching.
-        /// Ordinary user/steering messages must continue to use
+        /// OmniBlox's cycle briefings follow the same contract (stable sections first, a closing
+        /// <c>Now:</c> line) and use this too. Ordinary user/steering messages must continue to use
         /// <see cref="AppendUserMessageToToolSession"/>.
         /// </summary>
         public void AppendCacheStableWakeSeedToToolSession(string sessionId, string content)
@@ -930,17 +931,25 @@ namespace Omnipotent.Services.KliveLLM
         /// state. So after adding the new screenshot, all but the most recent <paramref name="keepRecentImages"/>
         /// image messages are flattened to a one-line text placeholder — the model always keeps the latest
         /// view(s) for current state, at a fraction of the tokens.
+        ///
+        /// <paramref name="stampReceipt"/> false is for content that must be byte-identical every time it
+        /// is sent, such as a fixed reference example shared by many one-shot calls: a receipt stamp at
+        /// its head would make each copy unique and none of it could be served from the prefix cache.
         /// </summary>
         public void AppendUserContentToToolSession(
             string sessionId,
             string text,
             List<(byte[] data, string mimeType)> images,
             int keepRecentImages = 3,
-            bool preservePromptPrefix = false)
+            bool preservePromptPrefix = false,
+            bool stampReceipt = true)
         {
             var parts = new List<object>();
             // Stamp even image-only turns: the text part carries the capture-receipt time.
-            parts.Add(new HFWrapper.HFTextPart { text = string.IsNullOrWhiteSpace(text) ? StampIncoming(null).TrimEnd() : StampIncoming(text) });
+            if (stampReceipt)
+                parts.Add(new HFWrapper.HFTextPart { text = string.IsNullOrWhiteSpace(text) ? StampIncoming(null).TrimEnd() : StampIncoming(text) });
+            else if (!string.IsNullOrEmpty(text))
+                parts.Add(new HFWrapper.HFTextPart { text = text });
             foreach (var (data, mimeType) in images ?? new List<(byte[], string)>())
             {
                 if (data == null || data.Length == 0) continue;
@@ -959,6 +968,20 @@ namespace Omnipotent.Services.KliveLLM
                     s.structuredMessages.Add(new HFWrapper.HFMessage { role = "user", content = parts });
                     if (!preservePromptPrefix) PruneOldToolImages(s, keepRecentImages);
                 }
+            }
+        }
+
+        /// <summary>
+        /// Append an assistant turn the caller wrote itself — the answer half of a fixed few-shot example.
+        /// Never stamped: it is not something that arrived, and it must stay byte-identical between the
+        /// calls that share it for their prefix to be served from cache.
+        /// </summary>
+        public void AppendAssistantMessageToToolSession(string sessionId, string content)
+        {
+            lock (sessions)
+            {
+                if (sessions.TryGetValue(sessionId, out var s))
+                    s.structuredMessages.Add(new HFWrapper.HFMessage { role = "assistant", content = content ?? string.Empty });
             }
         }
 

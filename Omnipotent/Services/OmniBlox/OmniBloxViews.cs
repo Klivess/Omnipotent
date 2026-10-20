@@ -86,7 +86,6 @@ namespace Omnipotent.Services.OmniBlox
                 s.Playbook.Count));
             string today = now.ToString("yyyy-MM-dd");
             string weekAgo = now.AddDays(-7).ToString("yyyy-MM-dd");
-            var week = studio.DailyUsage.Where(kv => string.CompareOrdinal(kv.Key, weekAgo) > 0).Select(kv => kv.Value).ToList();
             double revenue7 = games.Sum(g => g.Stats.Daily.Where(d => d.Date >= now.Date.AddDays(-7)).Sum(d => d.RevenueRobux ?? 0));
             double revenue30 = games.Sum(g => g.Stats.Daily.Where(d => d.Date >= now.Date.AddDays(-30)).Sum(d => d.RevenueRobux ?? 0));
             var library = ctx.Library.Stats();
@@ -124,6 +123,7 @@ namespace Omnipotent.Services.OmniBlox
                     studio.Harvester.Discovered,
                     studio.Harvester.Downloaded,
                     studio.Harvester.Labeled,
+                    studio.Harvester.Relabeled,
                     studio.Harvester.LastRunUtc,
                     studio.Harvester.LastError,
                     studio.Harvester.PriorityQueries,
@@ -133,14 +133,16 @@ namespace Omnipotent.Services.OmniBlox
                 Usage = new
                 {
                     Today = studio.DailyUsage.GetValueOrDefault(today) ?? new UsageTotals(),
-                    Week = new UsageTotals
-                    {
-                        Calls = week.Sum(u => u.Calls),
-                        PromptTokens = week.Sum(u => u.PromptTokens),
-                        CachedTokens = week.Sum(u => u.CachedTokens),
-                        CompletionTokens = week.Sum(u => u.CompletionTokens),
-                    },
+                    Week = SumAfter(studio.DailyUsage, weekAgo),
+                    // Week's two kinds of traffic (recorded separately since they were split, so they can add
+                    // up to less than Week for a while): agent cycles, mostly a re-sent transcript, and the
+                    // labeller's one-shot vision calls, whose new pictures no cache can serve.
+                    WeekAgents = SumAfter(studio.DailyAgentUsage, weekAgo),
+                    WeekLabeler = SumAfter(studio.DailyLabelerUsage, weekAgo),
                     Labeler = studio.LabelerUsage,
+                    LabelerReference = studio.LabelerReference is { } reference
+                        ? new { reference.Version, reference.CreatedUtc, Examples = reference.Examples.Count, Anchors = reference.Examples.Select(e => e.Quality).OrderByDescending(q => q).ToList() }
+                        : null,
                     Daily = studio.DailyUsage.OrderBy(kv => kv.Key).TakeLast(30).Select(kv => new { Day = kv.Key, kv.Value.Calls, kv.Value.PromptTokens, kv.Value.CachedTokens, kv.Value.CompletionTokens }).ToList(),
                 },
                 Money = new
@@ -156,6 +158,14 @@ namespace Omnipotent.Services.OmniBlox
                 PlaybookLessons = lessons,
                 Events = events,
             };
+        }
+
+        /// <summary>The days after <paramref name="afterDay"/> (yyyy-MM-dd), added up.</summary>
+        private static UsageTotals SumAfter(Dictionary<string, UsageTotals> daily, string afterDay)
+        {
+            var total = new UsageTotals();
+            foreach (var kv in daily.Where(kv => string.CompareOrdinal(kv.Key, afterDay) > 0)) total.Add(kv.Value);
+            return total;
         }
 
         /// <summary>Why the studio cannot do its work right now, most serious first. Needs the owner files as tasks are not repeated here.</summary>

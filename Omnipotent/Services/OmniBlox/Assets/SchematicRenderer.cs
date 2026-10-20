@@ -126,6 +126,45 @@ namespace Omnipotent.Services.OmniBlox.Assets
             };
         }
 
+        /// <summary>The standard views in sheet order: top-left, top-right, bottom-left, bottom-right.</summary>
+        public static readonly string[] SheetOrder = { "front", "right", "top", "iso" };
+
+        /// <summary>
+        /// The standard views composed into one sheet, two panels per row in <see cref="SheetOrder"/>, each
+        /// scaled to <paramref name="panel"/> pixels. A vision model charges for every image and every
+        /// pixel, and flat schematic views lose nothing a labeller needs at this size, so four 512-pixel
+        /// pictures become one 768-pixel picture. Null when there is no view to show.
+        /// </summary>
+        public static byte[]? ComposeSheet(IReadOnlyList<(string View, byte[] Png)> views, int panel = 384)
+        {
+            var ordered = SheetOrder
+                .Select(v => views.FirstOrDefault(x => x.View == v).Png)
+                .Where(png => png is { Length: > 0 })
+                .ToList();
+            if (ordered.Count == 0) return null;
+            int columns = Math.Min(2, ordered.Count), rows = (ordered.Count + 1) / 2;
+            using var surface = SKSurface.Create(new SKImageInfo(columns * panel, rows * panel, SKColorType.Rgba8888, SKAlphaType.Premul));
+            var canvas = surface.Canvas;
+            canvas.Clear(SKColors.White);
+            var sampling = new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.Linear);
+            for (int i = 0; i < ordered.Count; i++)
+            {
+                using var bitmap = SKBitmap.Decode(ordered[i]);
+                if (bitmap == null) continue;
+                using var image = SKImage.FromBitmap(bitmap);
+                float x = i % 2 * panel, y = i / 2 * panel;
+                canvas.DrawImage(image, new SKRect(x, y, x + panel, y + panel), sampling);
+            }
+            using (var rule = new SKPaint { Color = new SKColor(60, 66, 78), StrokeWidth = 2 })
+            {
+                if (columns > 1) canvas.DrawLine(panel, 0, panel, rows * panel, rule);
+                for (int r = 1; r < rows; r++) canvas.DrawLine(0, r * panel, columns * panel, r * panel, rule);
+            }
+            using var snapshot = surface.Snapshot();
+            using var data = snapshot.Encode(SKEncodedImageFormat.Png, 100);
+            return data.ToArray();
+        }
+
         public static (RbxVector3 Min, RbxVector3 Max) Bounds(IReadOnlyList<RenderPrimitive> parts)
         {
             if (parts.Count == 0) return (new RbxVector3(-1, -1, -1), new RbxVector3(1, 1, 1));

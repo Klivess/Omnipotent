@@ -336,6 +336,9 @@ namespace Omnipotent.Services.OmniBlox.Core
         public long PromptTokens { get; set; }
         public long CachedTokens { get; set; }
         public long CompletionTokens { get; set; }
+        /// <summary>See <see cref="UsageTotals.ResentTokens"/>.</summary>
+        public long ResentTokens { get; set; }
+        public long ResentCachedTokens { get; set; }
     }
 
     public sealed class Decision
@@ -352,6 +355,15 @@ namespace Omnipotent.Services.OmniBlox.Core
         public long PromptTokens { get; set; }
         public long CachedTokens { get; set; }
         public long CompletionTokens { get; set; }
+        /// <summary>
+        /// Prompt tokens a continuation turn sent AGAIN: the previous request of the same append-only
+        /// session, which is an exact prefix of this one. Unlike a turn's new tool output, these could
+        /// always have come from the provider's cache.
+        /// </summary>
+        public long ResentTokens { get; set; }
+        /// <summary>How many of <see cref="ResentTokens"/> the cache actually served. The gap is waste: a
+        /// prefix that expired between turns or was rewritten.</summary>
+        public long ResentCachedTokens { get; set; }
 
         public void Add(long calls, long prompt, long cached, long completion)
         {
@@ -359,6 +371,18 @@ namespace Omnipotent.Services.OmniBlox.Core
             PromptTokens += prompt;
             CachedTokens += cached;
             CompletionTokens += completion;
+        }
+
+        public void AddResent(long resent, long resentCached)
+        {
+            ResentTokens += resent;
+            ResentCachedTokens += Math.Min(resent, resentCached);
+        }
+
+        public void Add(UsageTotals other)
+        {
+            Add(other.Calls, other.PromptTokens, other.CachedTokens, other.CompletionTokens);
+            AddResent(other.ResentTokens, other.ResentCachedTokens);
         }
 
         [JsonIgnore]
@@ -414,10 +438,45 @@ namespace Omnipotent.Services.OmniBlox.Core
         /// <summary>Experience slot ("u:p") → game id it holds.</summary>
         public Dictionary<string, string> SlotAssignments { get; set; } = new();
         public Dictionary<string, UsageTotals> DailyUsage { get; set; } = new();
+        /// <summary>The asset labeller's share of <see cref="DailyUsage"/> (already included in it).</summary>
+        public Dictionary<string, UsageTotals> DailyLabelerUsage { get; set; } = new();
+        /// <summary>Everything else in <see cref="DailyUsage"/>: agent cycles and their one-shot reviews. Kept
+        /// on its own rather than as the difference, which would count days before the split as agent work.</summary>
+        public Dictionary<string, UsageTotals> DailyAgentUsage { get; set; } = new();
         public UsageTotals LabelerUsage { get; set; } = new();
+        /// <summary>The labeller's frozen reference examples (null until the library has labels to pick from).</summary>
+        public LabelReferenceSet? LabelerReference { get; set; }
         public HarvesterState Harvester { get; set; } = new();
         public DateTime? LastPortfolioReviewUtc { get; set; }
         public int GamesLaunched { get; set; }
+    }
+
+    /// <summary>
+    /// Earlier labels the labeller shows before every new model: anchors for its quality scale and
+    /// vocabulary, and a prefix that is byte-identical across calls so the provider caches it once
+    /// for all of them. Frozen when built (text, answer and image files) — any change to a byte
+    /// would make every later call miss it.
+    /// </summary>
+    public sealed class LabelReferenceSet
+    {
+        public int Version { get; set; }
+        /// <summary>The labeller prompt version it was built for; a new prompt rebuilds it.</summary>
+        public int PromptVersion { get; set; }
+        public DateTime CreatedUtc { get; set; }
+        public List<LabelReferenceExample> Examples { get; set; } = new();
+    }
+
+    public sealed class LabelReferenceExample
+    {
+        public long AssetId { get; set; }
+        /// <summary>Its score on the calibrated scale: the anchor level it stands for.</summary>
+        public double Quality { get; set; }
+        /// <summary>The user turn, exactly as sent.</summary>
+        public string Text { get; set; } = "";
+        /// <summary>The label JSON, exactly as sent as the assistant's answer.</summary>
+        public string Answer { get; set; } = "";
+        /// <summary>Image files in the set's folder, in the order they are sent.</summary>
+        public List<string> ImageFiles { get; set; } = new();
     }
 
     public sealed class HarvesterState
@@ -428,6 +487,8 @@ namespace Omnipotent.Services.OmniBlox.Core
         public long Discovered { get; set; }
         public long Downloaded { get; set; }
         public long Labeled { get; set; }
+        /// <summary>Labels re-rated on the current quality scale (AssetLabeler.ScaleVersion).</summary>
+        public long Relabeled { get; set; }
         public DateTime? LastRunUtc { get; set; }
         public string? LastError { get; set; }
     }

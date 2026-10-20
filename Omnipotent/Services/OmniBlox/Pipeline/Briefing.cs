@@ -7,8 +7,13 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
     /// <summary>
     /// Builds the first message of every cycle from the dossier: the goal and exit-criteria checklist, the
     /// brief, milestones, kept facts, the last hand-overs, decisions, relevant Playbook lessons, and the
-    /// stage's current state. Stable sections come first and volatile ones last, so even this message
-    /// reuses as much prompt cache as it can.
+    /// stage's current state.
+    ///
+    /// Sections are ordered by how often they change, rarest first, because the provider's prefix cache
+    /// can only reuse this message up to its first byte that differs from the previous cycle's: the brief
+    /// (fixed after research), lessons (change on a post-mortem), milestones (a few times a build), then
+    /// what every cycle grows (facts, decisions, hand-overs) and finally the live state and the clock.
+    /// It is sent without a receipt stamp; the closing "Now:" line dates it.
     /// </summary>
     public static class Briefing
     {
@@ -36,13 +41,6 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 sb.AppendLine();
             }
 
-            if (game.KeyFacts.Count > 0)
-            {
-                sb.AppendLine("## Facts to keep");
-                foreach (var f in game.KeyFacts.TakeLast(GameDossier.MaxKeyFacts)) sb.AppendLine("- " + f);
-                sb.AppendLine();
-            }
-
             var lessons = ctx.Playbook.ForStage(game.Stage, game.Brief?.Template ?? game.Brief?.Genre, 6);
             if (lessons.Count > 0)
             {
@@ -51,17 +49,24 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 sb.AppendLine();
             }
 
-            if (game.Decisions.Count > 0)
-            {
-                sb.AppendLine("## Decisions so far");
-                foreach (var d in game.Decisions.TakeLast(12)) sb.AppendLine($"- [{d.Stage}] {d.What}" + (d.Why.Length > 0 ? $" — because {d.Why}" : ""));
-                sb.AppendLine();
-            }
-
             if (game.Milestones.Count > 0)
             {
                 sb.AppendLine("## Milestones");
                 foreach (var m in game.Milestones) sb.AppendLine($"- [{(m.Done ? "x" : " ")}] {m.MilestoneId}: {m.Title}" + (string.IsNullOrWhiteSpace(m.Notes) ? "" : $" ({m.Notes})"));
+                sb.AppendLine();
+            }
+
+            if (game.KeyFacts.Count > 0)
+            {
+                sb.AppendLine("## Facts to keep");
+                foreach (var f in game.KeyFacts.TakeLast(GameDossier.MaxKeyFacts)) sb.AppendLine("- " + f);
+                sb.AppendLine();
+            }
+
+            if (game.Decisions.Count > 0)
+            {
+                sb.AppendLine("## Decisions so far");
+                foreach (var d in game.Decisions.TakeLast(12)) sb.AppendLine($"- [{d.Stage}] {d.What}" + (d.Why.Length > 0 ? $" — because {d.Why}" : ""));
                 sb.AppendLine();
             }
 

@@ -65,6 +65,8 @@ namespace Omnipotent.Services.OmniBlox.Assets
         public AssetLabel? Label { get; set; }
         public bool HasThumbnail { get; set; }
         public List<string> Renders { get; set; } = new();
+        /// <summary>The labeller's quality-scale version the label was made on (0: before calibrated anchors).</summary>
+        public int LabelVersion { get; set; }
         public int TimesUsed { get; set; }
         public List<string> UsageNotes { get; set; } = new();
         public string DiscoveredQuery { get; set; } = "";
@@ -162,6 +164,7 @@ CREATE TABLE IF NOT EXISTS assets (
   script_flags TEXT,
   scripts_removed INTEGER NOT NULL DEFAULT 0,
   label TEXT,
+  label_version INTEGER NOT NULL DEFAULT 0,
   category TEXT NOT NULL DEFAULT '',
   style TEXT NOT NULL DEFAULT '',
   quality REAL NOT NULL DEFAULT 0,
@@ -178,7 +181,20 @@ CREATE TABLE IF NOT EXISTS assets (
 CREATE INDEX IF NOT EXISTS ix_assets_status ON assets(status, priority DESC, up_votes DESC);
 CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(asset_id UNINDEXED, name, what, body, tokenize='porter unicode61');
 ");
+            // Libraries created before labels were versioned: their labels are on the old, uncalibrated scale (0).
+            if (!HasColumn(conn, "assets", "label_version"))
+                Exec(conn, "ALTER TABLE assets ADD COLUMN label_version INTEGER NOT NULL DEFAULT 0");
             lock (sync) db = conn;
+        }
+
+        private static bool HasColumn(SqliteConnection conn, string table, string column)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $"PRAGMA table_info({table})";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                if (string.Equals(r.GetString(1), column, StringComparison.OrdinalIgnoreCase)) return true;
+            return false;
         }
 
         public void Dispose()
@@ -314,6 +330,47 @@ LIMIT $n";
             }
         }
 
+        /// <summary>
+        /// Labelled models whose label was made on an older quality scale, the most used first: the
+        /// labeller re-rates them when it has nothing new to do.
+        /// </summary>
+        public List<AssetRecord> NextForRelabel(int limit, int scaleVersion)
+        {
+            if (limit <= 0) return new List<AssetRecord>();
+            lock (sync)
+            {
+                using var cmd = Db.CreateCommand();
+                cmd.CommandText = "SELECT * FROM assets WHERE status = 'labeled' AND label_version < $v AND has_thumbnail = 1 AND renders IS NOT NULL " +
+                                  "ORDER BY times_used DESC, priority DESC, up_votes DESC LIMIT $n";
+                cmd.Parameters.AddWithValue("$v", scaleVersion);
+                cmd.Parameters.AddWithValue("$n", limit);
+                return ReadRecords(cmd);
+            }
+        }
+
+        /// <summary>
+        /// Labelled models with a thumbnail and renders (a low label also survives rejection), from both ends
+        /// of their stored quality AND of their popularity, since stored scores may all sit in the middle:
+        /// what the labeller's calibration pool and reference examples are picked from.
+        /// </summary>
+        public List<AssetRecord> ReferenceCandidates(int each = 30)
+        {
+            lock (sync)
+            {
+                var found = new List<AssetRecord>();
+                foreach (string order in new[] { "quality DESC", "quality ASC", "creator_verified DESC, up_percent DESC", "up_percent ASC" })
+                {
+                    using var cmd = Db.CreateCommand();
+                    cmd.CommandText = "SELECT * FROM assets WHERE label IS NOT NULL AND has_thumbnail = 1 AND renders IS NOT NULL AND status IN ('labeled','rejected') " +
+                                      $"ORDER BY {order}, up_votes DESC, asset_id LIMIT $n";
+                    cmd.Parameters.AddWithValue("$n", each);
+                    foreach (var record in ReadRecords(cmd))
+                        if (!found.Any(r => r.AssetId == record.AssetId)) found.Add(record);
+                }
+                return found;
+            }
+        }
+
         // ─────────────── Analysis and labels ───────────────
 
         public void SaveAnalysis(long assetId, byte[] source, AssetAnalysis analysis, IReadOnlyList<(string View, byte[] Png)> renders, long triangles, DateTime nowUtc)
@@ -352,7 +409,8 @@ WHERE asset_id = $id";
             }
         }
 
-        public void SaveLabel(long assetId, AssetLabel label, DateTime nowUtc)
+        /// <param name="scaleVersion">The labeller's quality-scale version (AssetLabeler.ScaleVersion) the label was made on.</param>
+        public void SaveLabel(long assetId, AssetLabel label, DateTime nowUtc, int scaleVersion)
         {
             lock (sync)
             {
@@ -360,8 +418,9 @@ WHERE asset_id = $id";
                 using (var cmd = Db.CreateCommand())
                 {
                     cmd.Transaction = tx;
-                    cmd.CommandText = "UPDATE assets SET status = 'labeled', label = $label, category = $cat, style = $style, quality = $q, labeled_utc = $now WHERE asset_id = $id";
+                    cmd.CommandText = "UPDATE assets SET status = 'labeled', label = $label, label_version = $v, category = $cat, style = $style, quality = $q, labeled_utc = $now WHERE asset_id = $id";
                     cmd.Parameters.AddWithValue("$label", JsonConvert.SerializeObject(label, Json));
+                    cmd.Parameters.AddWithValue("$v", scaleVersion);
                     cmd.Parameters.AddWithValue("$cat", label.Category.ToLowerInvariant());
                     cmd.Parameters.AddWithValue("$style", label.Style.ToLowerInvariant());
                     cmd.Parameters.AddWithValue("$q", label.Quality);
@@ -639,6 +698,7 @@ FROM assets_fts JOIN assets a ON a.asset_id = assets_fts.asset_id WHERE assets_f
                     Placeable = L("placeable") == 1,
                     ScriptsRemoved = (int)L("scripts_removed"),
                     HasThumbnail = L("has_thumbnail") == 1,
+                    LabelVersion = (int)L("label_version"),
                     TimesUsed = (int)L("times_used"),
                     DiscoveredQuery = S("discovered_query") ?? "",
                     Priority = (int)L("priority"),

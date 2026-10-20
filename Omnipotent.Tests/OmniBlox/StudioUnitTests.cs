@@ -267,21 +267,31 @@ namespace Omnipotent.Tests.OmniBlox
         {
             public Queue<LlmTurn> Turns { get; } = new();
             public List<string> Users { get; } = new();
+            public List<string> StableUsers { get; } = new();
             public List<string> Results { get; } = new();
+            /// <summary>The tool names each query offered, in order.</summary>
+            public List<string> ToolLists { get; } = new();
+            public TimeSpan PrefixLifetime => TimeSpan.FromMinutes(5);
             public Task<(bool Ok, string? Reason)> CheckAvailableAsync(CancellationToken ct) => Task.FromResult((true, (string?)null));
             public bool HasSpareCapacity() => true;
             public void StartSession(string sessionId, string systemPrompt) { }
             public void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null) => Users.Add(text);
+            public void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null) => StableUsers.Add(text);
+            public void AppendAssistant(string sessionId, string text) { }
             public void AppendToolResult(string sessionId, string toolCallId, string toolName, string content) => Results.Add(content);
-            public Task<LlmTurn> QueryAsync(string sessionId, IReadOnlyList<ToolDefinition> tools, LlmCallOptions options, CancellationToken ct) =>
-                Task.FromResult(Turns.Count > 0 ? Turns.Dequeue() : new LlmTurn { Success = true, Text = "done talking" });
+            public Task<LlmTurn> QueryAsync(string sessionId, IReadOnlyList<ToolDefinition> tools, LlmCallOptions options, CancellationToken ct)
+            {
+                ToolLists.Add(string.Join(",", tools.Select(t => t.Name)));
+                return Task.FromResult(Turns.Count > 0 ? Turns.Dequeue() : new LlmTurn { Success = true, Text = "done talking" });
+            }
             public void EndSession(string sessionId) { }
         }
 
-        private static LlmTurn Call(string name, string args, long prompt = 1000) => new()
+        private static LlmTurn Call(string name, string args, long prompt = 1000, long cached = 0) => new()
         {
             Success = true,
             PromptTokens = prompt,
+            CachedTokens = cached,
             ToolCalls = new List<LlmToolCall> { new() { Id = Guid.NewGuid().ToString("N"), Name = name, ArgumentsJson = args } },
         };
 
@@ -351,6 +361,52 @@ namespace Omnipotent.Tests.OmniBlox
             var outcome = await new AgentCycleRunner(llm).RunAsync(Request(Tools(), wrapUp: 70_000), CancellationToken.None);
             Assert.Contains(llm.Users, u => u.Contains("context is nearly full"));
             Assert.True(outcome.Finished);
+        }
+
+        [Fact]
+        public async Task EveryCall_OffersTheSameTools_TheWrapUpIncluded()
+        {
+            // The tool schemas sit at the head of the prompt: a narrower list for the hand-over would make
+            // the provider prefill the whole cycle again. A wrong call then is answered, not run.
+            var llm = new OneShotLlm();
+            llm.Turns.Enqueue(Call("echo", "{\"text\":\"a\"}"));
+            llm.Turns.Enqueue(Call("echo", "{\"text\":\"b\"}"));
+            llm.Turns.Enqueue(Call("echo", "{\"text\":\"c\"}"));
+            llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"handed over\"}"));
+            var outcome = await new AgentCycleRunner(llm).RunAsync(Request(Tools(), maxTurns: 2), CancellationToken.None);
+
+            Assert.True(outcome.Finished);
+            Assert.Equal("handed over", outcome.Report.Done);
+            Assert.Equal(4, llm.ToolLists.Count);
+            Assert.Equal("echo,broken,finish_cycle", llm.ToolLists.Distinct().Single());
+            Assert.Contains(llm.Results, r => r.StartsWith("Not run: this cycle is over"));
+            Assert.DoesNotContain(llm.Results, r => r.StartsWith("echo c"));
+            Assert.Equal(4, outcome.Report.Turns); // every model call is counted, the hand-over's too
+        }
+
+        [Fact]
+        public async Task ReSentTokens_AreMeasuredAgainstWhatTheCacheServed()
+        {
+            var llm = new OneShotLlm();
+            llm.Turns.Enqueue(Call("echo", "{\"text\":\"a\"}", prompt: 1000, cached: 300));
+            llm.Turns.Enqueue(Call("echo", "{\"text\":\"b\"}", prompt: 1500, cached: 1000));
+            llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"done\"}", prompt: 2000, cached: 600));
+            var outcome = await new AgentCycleRunner(llm).RunAsync(Request(Tools()), CancellationToken.None);
+
+            // Turn 2 re-sent turn 1's 1000 tokens (all cached); turn 3 re-sent 1500 and got only 600 back.
+            Assert.Equal(2500, outcome.Report.ResentTokens);
+            Assert.Equal(1600, outcome.Report.ResentCachedTokens);
+            Assert.Equal(1900, outcome.Report.CachedTokens);
+        }
+
+        [Fact]
+        public async Task TheBriefing_GoesOutWithoutAReceiptStamp()
+        {
+            var llm = new OneShotLlm();
+            llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"done\"}"));
+            await new AgentCycleRunner(llm).RunAsync(Request(Tools()), CancellationToken.None);
+            Assert.Equal("brief", llm.StableUsers.Single());
+            Assert.DoesNotContain("brief", llm.Users);
         }
     }
 

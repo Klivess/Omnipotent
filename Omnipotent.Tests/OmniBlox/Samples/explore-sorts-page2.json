@@ -1,0 +1,359 @@
+{
+  "header": {
+    "sorts": null,
+    "layoutData": {}
+  },
+  "sorts": [
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 241,
+      "primarySortId": 23,
+      "secondarySortId": 241,
+      "id": "Top_Earning_L7RS_V4",
+      "sortId": "top-earning",
+      "appliedFilters": "device=all,age=all,country=all",
+      "sortDisplayName": "Top Earning",
+      "topicLayoutData": {
+        "infoText": "Experiences sorted by total robux spent in the last 7 days. These experiences have at least 5,000 daily users, are within the top 10% of daily active users, or are among the top 30 most played experiences. The order of these experiences is subject to the device and location filters applied to this page.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "nextPageToken": "eyJzdGFydCI6MTAwLCJjb3VudCI6MTAwLCJzb3J0X3Rva2VuIjo4ODc0NDI1NDY4MzIxMTg3MDY4fQ==",
+      "games": [
+        {
+          "universeId": 6035872082,
+          "rootPlaceId": 17625359962,
+          "name": "[🎃] RIVALS",
+          "playerCount": 134454,
+          "totalUpVotes": 10820452,
+          "totalDownVotes": 732534,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Mild",
+          "contentMaturity": "mild",
+          "genreL1": "Shooter"
+        },
+        {
+          "universeId": 10563114921,
+          "rootPlaceId": 107778070777162,
+          "name": "Steal An Egg",
+          "playerCount": 1047853,
+          "totalUpVotes": 3674192,
+          "totalDownVotes": 326541,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        },
+        {
+          "universeId": 383310974,
+          "rootPlaceId": 920587237,
+          "name": "[🎃] Adopt Me!",
+          "playerCount": 155571,
+          "totalUpVotes": 9577704,
+          "totalDownVotes": 1514596,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Roleplay & Avatar Sim"
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 669,
+      "primarySortId": 23,
+      "secondarySortId": 669,
+      "id": "Top_Paid_V5",
+      "sortId": "top-paid-access",
+      "sortDisplayName": "Top Paid Access",
+      "subtitle": "Results for all devices and locations",
+      "topicLayoutData": {
+        "infoText": "Paid access experiences sorted by daily revenue.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 1946714362,
+          "rootPlaceId": 5571328985,
+          "name": "[⌛] Bloodlines",
+          "playerCount": 2423,
+          "totalUpVotes": 46636,
+          "totalDownVotes": 10322,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Moderate",
+          "contentMaturity": "moderate",
+          "genreL1": "RPG"
+        },
+        {
+          "universeId": 9881334755,
+          "rootPlaceId": 131527649303934,
+          "name": "[🚧] Warrior Cats: Lake Territory",
+          "playerCount": 395,
+          "totalUpVotes": 17656,
+          "totalDownVotes": 395,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Roleplay & Avatar Sim"
+        },
+        {
+          "universeId": 3747388906,
+          "rootPlaceId": 10228136016,
+          "name": "[🗺️NEW MAP] Fallen Survival🏹",
+          "playerCount": 740,
+          "totalUpVotes": 47299,
+          "totalDownVotes": 8271,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Moderate",
+          "contentMaturity": "moderate",
+          "genreL1": "Action"
+        },
+        {
+          "universeId": 10684538441,
+          "rootPlaceId": 85524229158571,
+          "name": "GLADIATOR VR [PAID ACCESS]",
+          "playerCount": 0,
+          "totalUpVotes": 183,
+          "totalDownVotes": 66,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Moderate",
+          "contentMaturity": "moderate",
+          "genreL1": "Action"
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 670,
+      "primarySortId": 23,
+      "secondarySortId": 670,
+      "id": "Top_Rated_V5",
+      "sortId": "top-rated",
+      "sortDisplayName": "Top Rated",
+      "subtitle": "Results for all devices and locations",
+      "topicLayoutData": {
+        "infoText": "Experiences with at least 5000 users daily, that have both a high number and proportion of likes.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 10209534490,
+          "rootPlaceId": 137233438285284,
+          "name": "Chicken Farm 🐣",
+          "playerCount": 2385,
+          "totalUpVotes": 1159898,
+          "totalDownVotes": 12282,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        },
+        {
+          "universeId": 7028566528,
+          "rootPlaceId": 130739873848552,
+          "name": "[🦇VAMPIRE🐎] Basketball: Zero",
+          "playerCount": 5546,
+          "totalUpVotes": 7148994,
+          "totalDownVotes": 125188,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Sports & Racing"
+        },
+        {
+          "universeId": 10708913337,
+          "rootPlaceId": 113290951185459,
+          "name": "[🎃] Anime Dice",
+          "playerCount": 64719,
+          "totalUpVotes": 681945,
+          "totalDownVotes": 5624,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 223,
+      "primarySortId": 23,
+      "secondarySortId": 223,
+      "id": "Most_engaging_V4",
+      "sortId": "most-popular",
+      "appliedFilters": "device=all,age=all,country=all",
+      "sortDisplayName": "Most Popular",
+      "topicLayoutData": {
+        "infoText": "Top experiences sorted by daily users. These experiences have at least 5,000 daily users, are within the top 10% of daily active users, or are among the top 30 most played experiences. The order of these experiences is subject to the device and location filters applied to this page.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 10563114921,
+          "rootPlaceId": 107778070777162,
+          "name": "Steal An Egg",
+          "playerCount": 1047853,
+          "totalUpVotes": 3674307,
+          "totalDownVotes": 326558,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        },
+        {
+          "universeId": 1686885941,
+          "rootPlaceId": 4924922222,
+          "name": "Brookhaven 🏡RP",
+          "playerCount": 200989,
+          "totalUpVotes": 8659747,
+          "totalDownVotes": 1423244,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Roleplay & Avatar Sim"
+        },
+        {
+          "universeId": 7326934954,
+          "rootPlaceId": 79546208627805,
+          "name": "99 Nights in the Forest 🔦",
+          "playerCount": 135166,
+          "totalUpVotes": 5487115,
+          "totalDownVotes": 576759,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Survival"
+        }
+      ]
+    },
+    {
+      "contentType": "Songs",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 672,
+      "primarySortId": 23,
+      "secondarySortId": 672,
+      "id": "Top_Songs_V1",
+      "sortId": "music-top-100",
+      "sortDisplayName": "Music Top 100",
+      "subtitle": "Results for all devices and locations",
+      "topicLayoutData": {
+        "infoText": "Most popular music on Roblox in the past 7 days."
+      },
+      "treatmentType": "SongCarousel",
+      "songs": [
+        {
+          "assetId": 1839331423,
+          "title": "House Fashion",
+          "artist": "Ilan Moshe Abou",
+          "album": "HOUSE DELUXE",
+          "albumArtAssetId": 135071056560603,
+          "isPrivate": false,
+          "duration": 60
+        },
+        {
+          "assetId": 1837229579,
+          "title": "Sapology",
+          "artist": "Dominique Gabriel Depret",
+          "album": "AFRICA GEOPOLITICS",
+          "albumArtAssetId": 122530606466105,
+          "isPrivate": false,
+          "duration": 140
+        }
+      ]
+    },
+    {
+      "contentType": "Games",
+      "gameSetTypeId": 23,
+      "gameSetTargetId": 668,
+      "primarySortId": 23,
+      "secondarySortId": 668,
+      "id": "Trending_Music_Experiences_V4",
+      "sortId": "trending-music-experiences",
+      "sortDisplayName": "Trending Music Experiences",
+      "subtitle": "Results for all devices and locations",
+      "topicLayoutData": {
+        "infoText": "Music experiences with at least 2500 users daily that have the biggest relative increase in time spent over the last 2 weeks.",
+        "playButtonStyle": "Disabled"
+      },
+      "treatmentType": "Carousel",
+      "games": [
+        {
+          "universeId": 3510306533,
+          "rootPlaceId": 9397712855,
+          "name": "Rockstar Gymnastics and Cheer Playground 📣",
+          "playerCount": 19,
+          "totalUpVotes": 6974,
+          "totalDownVotes": 2143,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Roleplay & Avatar Sim"
+        },
+        {
+          "universeId": 7893515528,
+          "rootPlaceId": 89343390950953,
+          "name": "🎤 My Singing Brainrot",
+          "playerCount": 112,
+          "totalUpVotes": 590310,
+          "totalDownVotes": 20361,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Simulation"
+        },
+        {
+          "universeId": 6243673728,
+          "rootPlaceId": 18420677115,
+          "name": "Silly Night Vibin’ Animations [Revamp Beta]",
+          "playerCount": 11,
+          "totalUpVotes": 4761,
+          "totalDownVotes": 1783,
+          "isSponsored": false,
+          "nativeAdData": "",
+          "minimumAge": 0,
+          "ageRecommendationDisplayName": "Maturity: Minimal",
+          "contentMaturity": "minimal",
+          "genreL1": "Entertainment"
+        }
+      ]
+    }
+  ],
+  "nextSortsPageToken": "eyJzdGFydCI6MTIsImNvdW50Ijo2LCJzZXNzaW9uX2lkIjoiOGFlZWIwNGEtZjI0MC00MzE0LWFiNGItOGE5Njg5YjA5MWZkIiwiZGV2aWNlIjoiYWxsIiwiY291bnRyeSI6ImFsbCIsInBhZ2VfY29uZmlnX25hbWUiOiJ3aXRoX2FscGhhX2xvY2F0aW9uX2ZpbHRlcl9hbGwifQ=="
+}

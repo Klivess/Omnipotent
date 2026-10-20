@@ -108,9 +108,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             if (g != null)
             {
                 g.Usage.Add(report.Turns, report.PromptTokens, report.CachedTokens, report.CompletionTokens);
+                g.Usage.AddResent(report.ResentTokens, report.ResentCachedTokens);
                 s.MarkGame(gameId);
             }
-            AssetHarvester.AddDailyUsage(s.Studio, Clock(), report.Turns, report.PromptTokens, report.CachedTokens, report.CompletionTokens);
+            AssetHarvester.AddDailyUsage(s.Studio, Clock(), report.Turns, report.PromptTokens, report.CachedTokens, report.CompletionTokens,
+                report.ResentTokens, report.ResentCachedTokens);
             s.MarkStudio();
         });
     }

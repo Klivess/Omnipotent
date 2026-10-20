@@ -104,7 +104,10 @@ namespace Omnipotent.Services.OmniBlox.Roblox
 
         // ─────────────── Charts and games ───────────────
 
-        /// <summary>The home/charts sorts (Top Trending, Up-and-Coming, Top Playing Now, …), with their games.</summary>
+        /// <summary>
+        /// The home/charts sorts (Top Trending, Up-and-Coming, Top Playing Now, …), with their games, for all
+        /// devices and locations. Pages hold six sorts each; non-game sorts (the filter pills, the music chart) are skipped.
+        /// </summary>
         public async Task<List<ChartSort>> GetChartsAsync(CancellationToken ct, int maxPages = 3)
         {
             string session = Guid.NewGuid().ToString();
@@ -112,7 +115,8 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             string? token = null;
             for (int page = 0; page < maxPages; page++)
             {
-                string url = "https://apis.roblox.com/explore-api/v1/get-sorts?sessionId=" + session
+                // Unfiltered, Roblox ranks most sorts for computers in the caller's own country.
+                string url = "https://apis.roblox.com/explore-api/v1/get-sorts?sessionId=" + session + "&device=all&country=all"
                     + (token == null ? "" : "&sortsPageToken=" + Uri.EscapeDataString(token));
                 var json = await GetJsonAsync("public", url, ct);
                 foreach (var s in json["sorts"] as JArray ?? new JArray())

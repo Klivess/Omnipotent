@@ -29,6 +29,9 @@ namespace Omnipotent.Tests.OmniBlox
             public int Next;
             public int Turns;
             public JObject? Finish;
+            /// <summary>Every message in order, pictures as content hashes: what the provider would be sent.</summary>
+            public List<string> Messages = new();
+            public int LastPictureCount;
         }
 
         private readonly ConcurrentDictionary<string, Session> sessions = new();
@@ -36,8 +39,11 @@ namespace Omnipotent.Tests.OmniBlox
 
         public List<string> ToolResults { get; } = new();
         public List<string> Briefings { get; } = new();
+        /// <summary>The message list of every label call, at the moment it was sent.</summary>
+        public List<List<string>> LabelPrompts { get; } = new();
         public int ImageMessages { get; private set; }
         public bool Available { get; set; } = true;
+        public TimeSpan PrefixLifetime { get; set; } = TimeSpan.FromMinutes(5);
         public string LabelJson { get; set; } = JsonConvert.SerializeObject(new
         {
             what = "low-poly pine tree",
@@ -95,14 +101,42 @@ namespace Omnipotent.Tests.OmniBlox
                 s.Steps = steps;
                 s.Finish = finish;
             }
+            s.Messages.Add("system: " + systemPrompt);
             sessions[sessionId] = s;
         }
 
-        public void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null)
+        public void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null) => Append(sessionId, "user (stamped)", text, pngImages);
+
+        public void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null) => Append(sessionId, "user", text, pngImages);
+
+        public void AppendAssistant(string sessionId, string text)
+        {
+            if (sessions.TryGetValue(sessionId, out var s)) s.Messages.Add("assistant: " + text);
+        }
+
+        private void Append(string sessionId, string role, string text, IReadOnlyList<byte[]>? pngImages)
         {
             if (pngImages is { Count: > 0 }) ImageMessages++;
-            if (sessions.TryGetValue(sessionId, out var s) && s.Turns == 0 && s.Role is not ("label" or "compliance" or "postmortem")) Briefings.Add(text);
+            if (!sessions.TryGetValue(sessionId, out var s)) return;
+            if (s.Turns == 0 && s.Role is not ("label" or "calibrate" or "compliance" or "postmortem")) Briefings.Add(text);
+            var pictures = (pngImages ?? Array.Empty<byte[]>()).Select(p => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(p))[..12]);
+            s.Messages.Add($"{role}: {text} [{string.Join(",", pictures)}]");
+            s.LastPictureCount = pngImages?.Count ?? 0;
         }
+
+        /// <summary>How many calibrations ran.</summary>
+        public int Calibrations { get; private set; }
+
+        /// <summary>Scores side-by-side models evenly from 9 (the first picture) down to 2 (the last).</summary>
+        private static string CalibrationJson(int models) => JsonConvert.SerializeObject(new
+        {
+            scores = Enumerable.Range(1, models).Select(i => new
+            {
+                model = i,
+                quality = Math.Round(9 - 7.0 * (i - 1) / Math.Max(1, models - 1), 1),
+                issues = i * 2 > models ? new[] { "plain shapes and flat colours" } : Array.Empty<string>(),
+            }),
+        });
 
         public void AppendToolResult(string sessionId, string toolCallId, string toolName, string content)
         {
@@ -115,17 +149,22 @@ namespace Omnipotent.Tests.OmniBlox
             s.Turns++;
             switch (s.Role)
             {
-                case "label": return Text(LabelJson);
+                case "label":
+                    lock (LabelPrompts) LabelPrompts.Add(s.Messages.ToList());
+                    return Text(LabelJson);
+                case "calibrate":
+                    Calibrations++;
+                    return Text(CalibrationJson(s.LastPictureCount));
                 case "compliance": return Text(ComplianceJson);
                 case "postmortem": return Text(PostMortemJson);
             }
             if (s.Next < s.Steps.Count && tools.Any(t => t.Name == s.Steps[s.Next].Tool))
             {
                 var (tool, args) = s.Steps[s.Next++];
-                return Call(tool, args);
+                return Call(s, tool, args);
             }
             var finish = s.Finish ?? JObject.FromObject(new { summary = $"Scripted {s.Role} cycle done.", next_steps = new[] { "carry on" }, key_facts = new[] { $"{s.Role} ran" }, stage_complete = true });
-            return Call(AgentCycleRunner.FinishToolName, finish);
+            return Call(s, AgentCycleRunner.FinishToolName, finish);
         }
 
         public void EndSession(string sessionId) => sessions.TryRemove(sessionId, out _);
@@ -134,15 +173,23 @@ namespace Omnipotent.Tests.OmniBlox
 
         private int calls;
 
-        private Task<LlmTurn> Call(string tool, object args) => Task.FromResult(new LlmTurn
+        /// <summary>
+        /// Usage shaped like a warm append-only session: the first turn reuses only the role's cached head,
+        /// each later turn re-sends the previous prompt (all of it served from cache) plus ~1.5K new tokens.
+        /// </summary>
+        private Task<LlmTurn> Call(Session session, string tool, object args)
         {
-            Success = true,
-            ToolCalls = new List<LlmToolCall> { new() { Id = "call_" + Interlocked.Increment(ref calls), Name = tool, ArgumentsJson = args is string s ? s : JsonConvert.SerializeObject(args) } },
-            PromptTokens = 4000,
-            CachedTokens = 3200,
-            CompletionTokens = 200,
-            Model = "fake",
-        });
+            long prompt = 6000 + 1500L * (session.Turns - 1);
+            return Task.FromResult(new LlmTurn
+            {
+                Success = true,
+                ToolCalls = new List<LlmToolCall> { new() { Id = "call_" + Interlocked.Increment(ref calls), Name = tool, ArgumentsJson = args is string s ? s : JsonConvert.SerializeObject(args) } },
+                PromptTokens = prompt,
+                CachedTokens = session.Turns == 1 ? 4500 : prompt - 1500,
+                CompletionTokens = 200,
+                Model = "fake",
+            });
+        }
     }
 
     /// <summary>A stand-in for every Roblox endpoint OmniBlox calls, recording what it was asked.</summary>

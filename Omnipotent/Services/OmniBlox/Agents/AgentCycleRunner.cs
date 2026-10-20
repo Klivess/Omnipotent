@@ -35,6 +35,10 @@ namespace Omnipotent.Services.OmniBlox.Agents
     /// briefing, an append-only tool loop with a turn and context budget, and a structured hand-over
     /// (finish_cycle) at the end. The hand-over IS the compaction: the next cycle starts from the dossier,
     /// not from this transcript. Repeated identical failures and over-long cycles are steered to wrap up.
+    ///
+    /// Every request of a cycle is the previous one plus new messages, under one unchanging tool list,
+    /// so AIRouter's prefix cache can serve everything already sent (see KliveLLM/PromptPrefixStability).
+    /// The report counts those re-sent tokens and how many the cache served, so a lapse shows up.
     /// </summary>
     public sealed class AgentCycleRunner
     {
@@ -69,25 +73,40 @@ namespace Omnipotent.Services.OmniBlox.Agents
         public async Task<CycleOutcome> RunAsync(CycleRequest request, CancellationToken ct)
         {
             if (!request.Tools.Has(FinishToolName)) request.Tools.Add(FinishTool());
+            // One tool list for the whole cycle, wrap-up included: the schemas are rendered at the head of
+            // every prompt, so changing them for any one call re-prefills the transcript behind them.
+            var tools = request.Tools.Definitions;
             string session = $"omniblox-{request.Role}-{request.GameId}-{Guid.NewGuid():N}";
             var usage = new UsageTotals();
             int turns = 0, toolErrors = 0, nudges = 0, imageMessages = 0;
+            long previousPrompt = 0;
             bool wrapUpSent = false;
             JObject? finish = null;
             string? error = null;
             string lastText = "";
             var failureCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
+            void Account(LlmTurn turn)
+            {
+                usage.Add(1, turn.PromptTokens, turn.CachedTokens, turn.CompletionTokens);
+                // Append-only, so the previous request is an exact prefix of this one: all of it could
+                // have been served from cache, and whatever was not is a lapse worth seeing.
+                if (previousPrompt > 0 && turn.PromptTokens > 0) usage.AddResent(previousPrompt, turn.CachedTokens);
+                if (turn.PromptTokens > 0) previousPrompt = turn.PromptTokens;
+            }
+
             llm.StartSession(session, request.SystemPrompt);
             try
             {
-                llm.AppendUser(session, request.Briefing);
+                // The briefing closes with its own "Now:" line. A receipt stamp at its head would stop it
+                // sharing its stable sections with the previous cycle's briefing.
+                llm.AppendStableUser(session, request.Briefing);
                 while (turns < request.MaxTurns && finish == null)
                 {
                     ct.ThrowIfCancellationRequested();
                     turns++;
-                    var turn = await QueryWithRetryAsync(session, request.Tools.Definitions, request.Options, ct);
-                    usage.Add(1, turn.PromptTokens, turn.CachedTokens, turn.CompletionTokens);
+                    var turn = await QueryWithRetryAsync(session, tools, request.Options, ct);
+                    Account(turn);
                     if (!turn.Success)
                     {
                         error = turn.Error ?? "the model call failed";
@@ -144,18 +163,39 @@ namespace Omnipotent.Services.OmniBlox.Agents
 
                 if (finish == null && error == null)
                 {
-                    // Out of turns or nudges: ask once more for the hand-over, with only finish_cycle on offer.
-                    var only = new AgentToolbox().Add(FinishTool());
+                    // Out of turns or nudges: ask for the hand-over under the same tool list (offering only
+                    // finish_cycle would re-prefill the whole cycle for this one call). Other calls are
+                    // answered without running, so the request stays append-only; a second chance follows.
                     llm.AppendUser(session, "This cycle is over. Call finish_cycle now with a complete report of what was done and what comes next.");
-                    var last = await QueryWithRetryAsync(session, only.Definitions, request.Options, ct);
-                    usage.Add(1, last.PromptTokens, last.CachedTokens, last.CompletionTokens);
-                    var call = last.ToolCalls.FirstOrDefault(c => c.Name == FinishToolName);
-                    if (call != null)
+                    for (int attempt = 0; attempt < 2 && finish == null; attempt++)
                     {
-                        try { finish = JObject.Parse(call.ArgumentsJson); } catch { }
-                        llm.AppendToolResult(session, call.Id, call.Name, "Recorded.");
+                        turns++;
+                        var last = await QueryWithRetryAsync(session, tools, request.Options, ct);
+                        Account(last);
+                        if (!last.Success) break;
+                        if (last.ToolCalls.Count == 0)
+                        {
+                            if (!string.IsNullOrWhiteSpace(last.Text)) lastText = last.Text;
+                            break;
+                        }
+                        foreach (var call in last.ToolCalls)
+                        {
+                            string result = "Not run: this cycle is over. Call finish_cycle with your report.";
+                            if (call.Name == FinishToolName && finish == null)
+                            {
+                                try
+                                {
+                                    finish = JObject.Parse(call.ArgumentsJson);
+                                    result = "Recorded.";
+                                }
+                                catch (Newtonsoft.Json.JsonException)
+                                {
+                                    result = "ERROR: the arguments are not valid JSON. Call finish_cycle again with one JSON object.";
+                                }
+                            }
+                            llm.AppendToolResult(session, call.Id, call.Name, result);
+                        }
                     }
-                    else if (!string.IsNullOrWhiteSpace(last.Text)) lastText = last.Text;
                 }
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -180,6 +220,8 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 PromptTokens = usage.PromptTokens,
                 CachedTokens = usage.CachedTokens,
                 CompletionTokens = usage.CompletionTokens,
+                ResentTokens = usage.ResentTokens,
+                ResentCachedTokens = usage.ResentCachedTokens,
                 Outcome = error != null ? "error" : finish != null ? "finished" : "cut short",
                 Done = finish != null ? Args.Str(finish, "summary") : (error != null ? "Cycle failed: " + error : Clip(lastText, 1500)),
                 Problems = finish != null ? Args.List(finish, "problems") : new List<string>(),

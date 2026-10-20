@@ -50,8 +50,19 @@ namespace Omnipotent.Services.OmniBlox.Agents
         /// <summary>True when the shared AIRouter queue is idle enough for background work (the asset labeller).</summary>
         bool HasSpareCapacity();
 
+        /// <summary>How long AIRouter can be expected to keep an idle prompt prefix cached (measured when there is evidence).</summary>
+        TimeSpan PrefixLifetime { get; }
+
         void StartSession(string sessionId, string systemPrompt);
+        /// <summary>A user turn that arrived now: KliveLLM stamps its receipt time at the head.</summary>
         void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null);
+        /// <summary>
+        /// A user turn that must be byte-identical every time it is sent, so no receipt stamp at its head:
+        /// a briefing that ends with its own "Now:" line, or a fixed reference example many calls share.
+        /// </summary>
+        void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null);
+        /// <summary>An answer the caller wrote itself (the label half of a reference example).</summary>
+        void AppendAssistant(string sessionId, string text);
         void AppendToolResult(string sessionId, string toolCallId, string toolName, string content);
         Task<LlmTurn> QueryAsync(string sessionId, IReadOnlyList<ToolDefinition> tools, LlmCallOptions options, CancellationToken ct);
         void EndSession(string sessionId);
@@ -84,6 +95,8 @@ namespace Omnipotent.Services.OmniBlox.Agents
             return s.Waiting == 0 && s.InFlight <= 1 && s.PenaltyRemaining <= TimeSpan.Zero;
         }
 
+        public TimeSpan PrefixLifetime => KliveLlmService.EstimatedPrefixLifetime();
+
         private KliveLlmService Llm => resolve() ?? throw new InvalidOperationException("KliveLLM is not running.");
 
         public void StartSession(string sessionId, string systemPrompt) => Llm.StartToolSession(sessionId, systemPrompt);
@@ -96,6 +109,17 @@ namespace Omnipotent.Services.OmniBlox.Agents
             else
                 Llm.AppendUserMessageToToolSession(sessionId, text);
         }
+
+        public void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null)
+        {
+            if (pngImages is { Count: > 0 })
+                Llm.AppendUserContentToToolSession(sessionId, text, pngImages.Select(b => (b, "image/png")).ToList(),
+                    keepRecentImages: Math.Max(1, pngImages.Count), preservePromptPrefix: true, stampReceipt: false);
+            else
+                Llm.AppendCacheStableWakeSeedToToolSession(sessionId, text);
+        }
+
+        public void AppendAssistant(string sessionId, string text) => Llm.AppendAssistantMessageToToolSession(sessionId, text);
 
         public void AppendToolResult(string sessionId, string toolCallId, string toolName, string content) =>
             Llm.AppendToolResult(sessionId, toolCallId, toolName, content, preservePromptPrefix: true);

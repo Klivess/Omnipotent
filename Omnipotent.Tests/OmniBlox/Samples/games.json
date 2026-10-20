@@ -1,0 +1,121 @@
+{
+  "data": [
+    {
+      "id": 5203828273,
+      "rootPlaceId": 15101393044,
+      "name": "[🎃] Dress To Impress",
+      "description": "Create stunning outfits 👗💖⭐, and strut the runway to show off your unique style. Collaborate, compete, and explore a world of glamour with friends!\n\n⭐ Are you ready to be the TOP MODEL?\n👗 NEW ITEMS! Check them out.\n🍿 Vote for your favorite outfits!\n💃 Use poses on the runway to show off your outfit!\n\nFind more about Dress To Impress by joining our community.\nhttps://www.roblox.com/communities/17264167/Dress-To-Impress-Group#!/about",
+      "sourceName": null,
+      "sourceDescription": null,
+      "creator": {
+        "id": 17264167,
+        "name": "Dress To Impress Group",
+        "type": "Group",
+        "isRNVAccount": false,
+        "hasVerifiedBadge": true
+      },
+      "price": null,
+      "allowedGearGenres": [
+        "All"
+      ],
+      "allowedGearCategories": [],
+      "isGenreEnforced": false,
+      "copyingAllowed": false,
+      "playing": 52377,
+      "visits": 11195466047,
+      "maxPlayers": 13,
+      "created": "2023-10-18T09:11:36.563Z",
+      "updated": "2026-10-20T07:23:07.662Z",
+      "studioAccessToApisAllowed": false,
+      "createVipServersAllowed": false,
+      "universeAvatarType": "MorphToR15",
+      "genre": "All",
+      "genre_l1": "Roleplay & Avatar Sim",
+      "genre_l2": "Dress Up",
+      "untranslated_genre_l1": "roleplay_and_avatar_sim",
+      "isAllGenre": true,
+      "isFavoritedByUser": false,
+      "favoritedCount": 7639082,
+      "canonicalUrlPath": "/games/15101393044/Dress-To-Impress",
+      "isContentRestricted": false
+    },
+    {
+      "id": 10769798178,
+      "rootPlaceId": 123184865562509,
+      "name": "Make Rugs!",
+      "description": "Welcome to Make Rugs!\n\n🧶 Roll for rare yarn and discover new colors!  \n🎨 Pick a design and bring it to life with your tufting tool!  \n✂️ Shave your rugs smooth for a satisfying finish!  \n💰 Sell your creations to customers in your shop!  \n📱 Complete orders from your phone!  \n👷 Hire employees to help your studio grow!\n\nTurn your little workshop into a rug-making empire! ✨",
+      "sourceName": null,
+      "sourceDescription": null,
+      "creator": {
+        "id": 719686217,
+        "name": "Playmade",
+        "type": "Group",
+        "isRNVAccount": false,
+        "hasVerifiedBadge": false
+      },
+      "price": null,
+      "allowedGearGenres": [
+        "All"
+      ],
+      "allowedGearCategories": [],
+      "isGenreEnforced": false,
+      "copyingAllowed": false,
+      "playing": 6046,
+      "visits": 1512658,
+      "maxPlayers": 4,
+      "created": "2026-10-07T22:38:05.624Z",
+      "updated": "2026-10-20T04:33:08.061Z",
+      "studioAccessToApisAllowed": false,
+      "createVipServersAllowed": false,
+      "universeAvatarType": "MorphToR15",
+      "genre": "All",
+      "genre_l1": "Simulation",
+      "genre_l2": "Tycoon",
+      "untranslated_genre_l1": "simulation",
+      "isAllGenre": true,
+      "isFavoritedByUser": false,
+      "favoritedCount": 35379,
+      "canonicalUrlPath": "/games/123184865562509/Make-Rugs",
+      "isContentRestricted": false
+    },
+    {
+      "id": 10563114921,
+      "rootPlaceId": 107778070777162,
+      "name": "Steal An Egg",
+      "description": "🥚 Welcome to Steal An Egg!\n\nHow to Play:\n🥚 Steal eggs from pets\n🐣 Hatch eggs to collect rare pets\n💰 Earn money from your pets\n⬆️ Upgrade your treadmill and base\n🏃 Train on the treadmill to gain Speed\n🥷 Steal eggs from other players\n✨ Discover rarer eggs, pets, sizes, and mutations!\n\n🎮 Supports Desktop, Console, Mobile, and Tablet players",
+      "sourceName": null,
+      "sourceDescription": null,
+      "creator": {
+        "id": 825735094,
+        "name": "and Collect Rare Pets",
+        "type": "Group",
+        "isRNVAccount": false,
+        "hasVerifiedBadge": true
+      },
+      "price": null,
+      "allowedGearGenres": [
+        "All"
+      ],
+      "allowedGearCategories": [],
+      "isGenreEnforced": false,
+      "copyingAllowed": false,
+      "playing": 1058212,
+      "visits": 8810584096,
+      "maxPlayers": 7,
+      "created": "2026-07-25T07:50:51.492Z",
+      "updated": "2026-10-20T02:30:28.005Z",
+      "studioAccessToApisAllowed": false,
+      "createVipServersAllowed": false,
+      "universeAvatarType": "MorphToR15",
+      "genre": "All",
+      "genre_l1": "Simulation",
+      "genre_l2": "Tycoon",
+      "untranslated_genre_l1": "simulation",
+      "isAllGenre": true,
+      "isFavoritedByUser": false,
+      "favoritedCount": 8290215,
+      "canonicalUrlPath": "/games/107778070777162/Steal-An-Egg",
+      "isContentRestricted": false
+    }
+  ]
+}
