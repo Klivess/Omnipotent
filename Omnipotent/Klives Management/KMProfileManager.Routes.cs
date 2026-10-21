@@ -935,7 +935,7 @@ namespace Omnipotent.Profiles
                     "30d" => TimeSpan.FromDays(30),
                     _ => TimeSpan.FromHours(24),
                 };
-                var summary = Activity?.GetSummary(target.UserID, range) ?? new ProfileActivityStore.ActivitySummary();
+                var summary = Activity == null ? new ProfileActivityStore.ActivitySummary() : await Activity.GetSummaryAsync(target.UserID, range);
                 await Ok(req, summary);
             });
 

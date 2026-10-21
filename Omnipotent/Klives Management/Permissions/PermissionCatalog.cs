@@ -74,15 +74,24 @@ namespace Omnipotent.Profiles.Permissions
             get
             {
                 EnsureLoaded();
-                return byKey.Values
+                // Sorted once per catalog version: the directory and the owner's effective set ask for this on every call.
+                var cached = sortedAll;
+                long current = Version;
+                if (cached != null && cached.Version == current) return cached.Defs;
+                var defs = byKey.Values
                     .Where(d => d.IsStandard)
                     .OrderBy(d => d.Service, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(d => d.Area, StringComparer.OrdinalIgnoreCase)
                     .ThenBy(d => (int)d.Tier)
                     .ThenBy(d => d.Key, StringComparer.Ordinal)
                     .ToList();
+                sortedAll = new SortedCatalog(current, defs);
+                return defs;
             }
         }
+
+        private sealed record SortedCatalog(long Version, IReadOnlyList<PermissionDef> Defs);
+        private static volatile SortedCatalog? sortedAll;
 
         public static bool IsKnown(string key) => Get(key)?.IsStandard == true;
 

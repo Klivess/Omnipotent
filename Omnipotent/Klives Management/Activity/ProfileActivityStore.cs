@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Microsoft.Data.Sqlite;
 
@@ -51,12 +52,28 @@ namespace Omnipotent.Profiles.Activity
     /// What each profile did, for the profile console: its own SQLite database so it never contends
     /// with OmniDefence's shared write lock. Writes are fire-and-forget through a bounded queue and
     /// committed in batches; nothing on a request path ever waits on this store.
+    ///
+    /// The profile directory (list / get) asks for "requests in the last 24 h" and "last seen" per
+    /// profile on every call. Those are kept in memory, fed by <see cref="WriteBatch"/> and seeded
+    /// once from the database in the background, so the directory never touches the database.
     /// </summary>
     public sealed class ProfileActivityStore : IDisposable
     {
         private const int MaxQueue = 50_000;
         private const int BatchSize = 256;
         private static readonly TimeSpan BatchWindow = TimeSpan.FromMilliseconds(250);
+
+        private const long MinuteMs = 60_000;
+        private static readonly TimeSpan TallyWindow = TimeSpan.FromHours(24);
+        /// <summary>More minutes than the window holds, so two minutes inside the window never share a slot.</summary>
+        private const int TallySlots = 1500;
+        private static readonly TimeSpan SummaryFresh = TimeSpan.FromSeconds(15);
+        private static readonly TimeSpan SummaryStale = TimeSpan.FromMinutes(5);
+
+        private readonly ConcurrentDictionary<string, RequestTally> tallies = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<string, long> lastSeen = new(StringComparer.Ordinal);
+        private readonly ConcurrentDictionary<(string Profile, TimeSpan Range), SummaryEntry> summaries = new();
+        private Task? seeding;
 
         private readonly string dbPath;
         private readonly Action<string> log;
@@ -99,12 +116,17 @@ namespace Omnipotent.Profiles.Activity
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dbPath))!);
+                long seedUpToId;
                 using (var conn = Open())
                 {
                     Exec(conn, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
                     foreach (string ddl in Schema) Exec(conn, ddl);
+                    seedUpToId = Scalar<long>(conn, "SELECT COALESCE(MAX(id), 0) FROM requests;");
                 }
                 ready = true;
+                // Rows written from here on (ids above seedUpToId) are counted live by WriteBatch;
+                // the seed counts only what was already there, so nothing is counted twice.
+                seeding = Task.Run(() => Seed(seedUpToId));
                 writer = Task.Run(WriterLoop);
                 retention = Task.Run(RetentionLoop);
             }
@@ -253,8 +275,7 @@ namespace Omnipotent.Profiles.Activity
                         string day = DayOf(r.TsMs);
                         var key = (r.ProfileId, day, r.PermKey ?? "");
                         rollup.TryGetValue(key, out var agg);
-                        bool denied = r.Status == 401 || r.Status == 403;
-                        rollup[key] = (agg.Count + 1, agg.Denied + (denied ? 1 : 0), Math.Max(agg.Last, r.TsMs));
+                        rollup[key] = (agg.Count + 1, agg.Denied + (IsDenied(r.Status) ? 1 : 0), Math.Max(agg.Last, r.TsMs));
                         break;
                     case ActivityPageView v:
                         Set(pp, v.ProfileId, v.SessionId, v.TsMs, Trim(v.Path, 512), Trim(v.Title, 256), v.DwellMs);
@@ -282,6 +303,103 @@ namespace Omnipotent.Profiles.Activity
                 }
             }
             tx.Commit();
+
+            foreach (var item in items)
+            {
+                if (item is ActivityRequest r) NoteRequest(r);
+            }
+        }
+
+        private static bool IsDenied(int? status) => status == 401 || status == 403;
+
+        private void NoteRequest(ActivityRequest r)
+        {
+            tallies.GetOrAdd(r.ProfileId, _ => new RequestTally()).Add(r.TsMs, 1, IsDenied(r.Status) ? 1 : 0);
+            NoteSeen(r.ProfileId, r.TsMs);
+        }
+
+        private void NoteSeen(string profileId, long tsMs)
+            => lastSeen.AddOrUpdate(profileId, tsMs, (_, current) => Math.Max(current, tsMs));
+
+        /// <summary>
+        /// Loads the counters from what is already in the database. Runs once, in the background;
+        /// until it finishes the directory shows what has been counted so far.
+        /// </summary>
+        private void Seed(long upToRequestId)
+        {
+            try
+            {
+                using var conn = Open();
+                if (upToRequestId > 0)
+                {
+                    long from = DateTimeOffset.UtcNow.Subtract(TallyWindow).ToUnixTimeMilliseconds() - MinuteMs;
+                    // INDEXED BY: left alone SQLite would scan the whole table in profile order to
+                    // dodge a sort — every row for 90 days instead of the last 24 hours.
+                    using var cmd = Command(conn, @"SELECT profile_id, ts_ms / 60000, COUNT(*), SUM(CASE WHEN status IN (401, 403) THEN 1 ELSE 0 END)
+                        FROM requests INDEXED BY ix_req_ts WHERE ts_ms >= $s AND id <= $m GROUP BY profile_id, ts_ms / 60000;",
+                        ("$s", from), ("$m", upToRequestId));
+                    using var r = cmd.ExecuteReader();
+                    while (r.Read())
+                        tallies.GetOrAdd(r.GetString(0), _ => new RequestTally()).Add(r.GetInt64(1) * MinuteMs, r.GetInt64(2), r.GetInt64(3));
+                }
+                using var seen = Command(conn, "SELECT profile_id, MAX(last_ts_ms) FROM daily_rollup GROUP BY profile_id;");
+                using var rs = seen.ExecuteReader();
+                while (rs.Read()) NoteSeen(rs.GetString(0), rs.GetInt64(1));
+            }
+            catch (Exception ex)
+            {
+                log("KMProfiles: could not load the activity counters (they will build up from now on): " + ex.Message);
+            }
+        }
+
+        /// <summary>Blocks until the background seed has finished (tests, diagnostics).</summary>
+        internal bool WaitUntilSeeded(TimeSpan timeout) => seeding?.Wait(timeout) ?? true;
+
+        /// <summary>Requests and denials per minute for one profile, over a ring that covers the last 24 hours.</summary>
+        private sealed class RequestTally
+        {
+            private readonly object gate = new();
+            private readonly long[] minutes = new long[TallySlots];
+            private readonly long[] requests = new long[TallySlots];
+            private readonly long[] denied = new long[TallySlots];
+
+            public void Add(long tsMs, long requestCount, long deniedCount)
+            {
+                long minute = tsMs / MinuteMs;
+                long newest = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() / MinuteMs;
+                // Older than the window can't be shown; mustn't overwrite a slot that now belongs to a newer minute.
+                if (minute <= newest - (long)TallyWindow.TotalMinutes) return;
+                int slot = (int)(minute % TallySlots);
+                lock (gate)
+                {
+                    if (minutes[slot] > minute) return;
+                    if (minutes[slot] != minute)
+                    {
+                        minutes[slot] = minute;
+                        requests[slot] = 0;
+                        denied[slot] = 0;
+                    }
+                    requests[slot] += requestCount;
+                    denied[slot] += deniedCount;
+                }
+            }
+
+            /// <summary>Counts from the minute containing <paramref name="sinceMs"/> onwards.</summary>
+            public (long Requests, long Denied) Since(long sinceMs)
+            {
+                long from = sinceMs / MinuteMs;
+                long total = 0, deniedTotal = 0;
+                lock (gate)
+                {
+                    for (int i = 0; i < TallySlots; i++)
+                    {
+                        if (requests[i] == 0 || minutes[i] < from) continue;
+                        total += requests[i];
+                        deniedTotal += denied[i];
+                    }
+                }
+                return (total, deniedTotal);
+            }
         }
 
         private async Task RetentionLoop()
@@ -454,45 +572,63 @@ namespace Omnipotent.Profiles.Activity
             var buckets = new SortedDictionary<long, SummaryBucket>();
             for (long t = from / bucket * bucket; t <= to; t += bucket) buckets[t] = new SummaryBucket { T = t };
             var services = new HashSet<string>(StringComparer.Ordinal);
+            var routes = new HashSet<string>(StringComparer.Ordinal);
+            var permissions = new Dictionary<string, KeyCount>(StringComparer.Ordinal);
+            var ips = new Dictionary<string, IpUse>(StringComparer.Ordinal);
 
-            using (var cmd = Command(conn, @"SELECT (ts_ms / $bk) * $bk AS b, COALESCE(service, 'Other'), COUNT(*),
-                    SUM(CASE WHEN status IN (401, 403) THEN 1 ELSE 0 END), SUM(CASE WHEN status >= 500 THEN 1 ELSE 0 END)
-                    FROM requests WHERE profile_id = $p AND ts_ms >= $f GROUP BY b, 2;",
-                ("$bk", bucket), ("$p", profileId), ("$f", from)))
+            // One pass over the profile's requests feeds every breakdown below. They used to be five
+            // separate queries, each re-reading the same rows from disk.
+            using (var cmd = Command(conn, "SELECT ts_ms, service, status, route, perm_key, ip FROM requests WHERE profile_id = $p AND ts_ms >= $f;",
+                ("$p", profileId), ("$f", from)))
             using (var r = cmd.ExecuteReader())
             {
                 while (r.Read())
                 {
-                    long b = r.GetInt64(0);
-                    string svc = r.GetString(1);
-                    long count = r.GetInt64(2);
-                    long denied = r.GetInt64(3);
+                    long ts = r.GetInt64(0);
+                    string svc = r.IsDBNull(1) ? "Other" : r.GetString(1);
+                    int status = r.IsDBNull(2) ? 0 : r.GetInt32(2);
+                    bool denied = IsDenied(status);
+
+                    long b = ts / bucket * bucket;
                     if (!buckets.TryGetValue(b, out var sb)) buckets[b] = sb = new SummaryBucket { T = b };
-                    sb.ByService[svc] = sb.ByService.GetValueOrDefault(svc) + count;
-                    sb.Denied += denied;
+                    sb.ByService[svc] = sb.ByService.GetValueOrDefault(svc) + 1;
+                    if (denied) sb.Denied++;
                     services.Add(svc);
-                    summary.Requests += count;
-                    summary.Denied += denied;
-                    summary.Errors += r.GetInt64(4);
+                    summary.Requests++;
+                    if (denied) summary.Denied++;
+                    if (status >= 500) summary.Errors++;
+
+                    if (!r.IsDBNull(3)) routes.Add(r.GetString(3));
+
+                    string permKey = r.IsDBNull(4) ? "" : r.GetString(4);
+                    if (!permissions.TryGetValue(permKey, out var pc)) permissions[permKey] = pc = new KeyCount { Key = permKey };
+                    pc.Count++;
+                    if (denied) pc.Denied++;
+                    if (ts > pc.LastMs) pc.LastMs = ts;
+
+                    if (!r.IsDBNull(5))
+                    {
+                        string ip = r.GetString(5);
+                        if (ip.Length > 0)
+                        {
+                            if (!ips.TryGetValue(ip, out var use)) ips[ip] = use = new IpUse { Ip = ip, FirstMs = ts, LastMs = ts };
+                            use.Count++;
+                            if (ts < use.FirstMs) use.FirstMs = ts;
+                            if (ts > use.LastMs) use.LastMs = ts;
+                        }
+                    }
                 }
             }
             summary.Buckets = buckets.Values.ToList();
             summary.Services = services.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToList();
+            summary.DistinctRoutes = routes.Count;
+            summary.TopPermissions = permissions.Values.OrderByDescending(k => k.Count).ThenBy(k => k.Key, StringComparer.Ordinal).Take(15).ToList();
+            summary.Ips = ips.Values.OrderByDescending(i => i.LastMs).ThenBy(i => i.Ip, StringComparer.Ordinal).Take(20).ToList();
 
-            summary.DistinctRoutes = Scalar<int>(conn, "SELECT COUNT(DISTINCT route) FROM requests WHERE profile_id = $p AND ts_ms >= $f;",
-                ("$p", profileId), ("$f", from));
             summary.PageViews = Scalar<long>(conn, "SELECT COUNT(*) FROM page_views WHERE profile_id = $p AND ts_ms >= $f;",
                 ("$p", profileId), ("$f", from));
             summary.ActiveDays = Scalar<int>(conn, "SELECT COUNT(DISTINCT day) FROM daily_rollup WHERE profile_id = $p AND day >= $d;",
                 ("$p", profileId), ("$d", DayOf(from)));
-
-            using (var cmd = Command(conn, @"SELECT COALESCE(perm_key, ''), COUNT(*), SUM(CASE WHEN status IN (401, 403) THEN 1 ELSE 0 END), MAX(ts_ms)
-                    FROM requests WHERE profile_id = $p AND ts_ms >= $f GROUP BY 1 ORDER BY 2 DESC LIMIT 15;",
-                ("$p", profileId), ("$f", from)))
-            using (var r = cmd.ExecuteReader())
-            {
-                while (r.Read()) summary.TopPermissions.Add(new KeyCount { Key = r.GetString(0), Count = r.GetInt64(1), Denied = r.GetInt64(2), LastMs = r.GetInt64(3) });
-            }
 
             using (var cmd = Command(conn, @"SELECT COALESCE(path, ''), COUNT(*), SUM(dwell_ms), MAX(ts_ms) FROM page_views
                     WHERE profile_id = $p AND ts_ms >= $f GROUP BY 1 ORDER BY 3 DESC LIMIT 10;",
@@ -502,19 +638,58 @@ namespace Omnipotent.Profiles.Activity
                 while (r.Read()) summary.TopPages.Add(new KeyCount { Key = r.GetString(0), Count = r.GetInt64(1), Denied = r.IsDBNull(2) ? 0 : r.GetInt64(2), LastMs = r.GetInt64(3) });
             }
 
-            using (var cmd = Command(conn, @"SELECT ip, COUNT(*), MIN(ts_ms), MAX(ts_ms) FROM requests
-                    WHERE profile_id = $p AND ts_ms >= $f AND ip IS NOT NULL AND ip <> '' GROUP BY ip ORDER BY 4 DESC LIMIT 20;",
-                ("$p", profileId), ("$f", from)))
-            using (var r = cmd.ExecuteReader())
-            {
-                while (r.Read()) summary.Ips.Add(new IpUse { Ip = r.GetString(0), Count = r.GetInt64(1), FirstMs = r.GetInt64(2), LastMs = r.GetInt64(3) });
-            }
-
             summary.RecentDenials = GetTimeline(profileId, null, from, 20, new HashSet<string> { "request" }, null, deniedOnly: true);
             summary.Logins = GetTimeline(profileId, null, from, 40, new HashSet<string> { "event" })
                 .Where(e => e.Kind != null && (e.Kind.StartsWith("login", StringComparison.Ordinal) || e.Kind.StartsWith("session", StringComparison.Ordinal)))
                 .Take(20).ToList();
             return summary;
+        }
+
+        private sealed class SummaryEntry
+        {
+            public readonly object Gate = new();
+            public ActivitySummary? Value;
+            public DateTime ComputedUtc;
+            public Task<ActivitySummary>? Refresh;
+        }
+
+        /// <summary>
+        /// <see cref="GetSummary"/> for the profile console, off the caller's thread. A 30-day summary
+        /// reads every request the profile made, so the result is kept: younger than 15 s is served
+        /// as is, up to 5 minutes old is served at once while one background pass refreshes it, and
+        /// only the first look (or one after a long gap) waits for the computation.
+        /// </summary>
+        public Task<ActivitySummary> GetSummaryAsync(string profileId, TimeSpan range)
+        {
+            var entry = summaries.GetOrAdd((profileId, range), _ => new SummaryEntry());
+            lock (entry.Gate)
+            {
+                TimeSpan age = DateTime.UtcNow - entry.ComputedUtc;
+                if (entry.Value != null && age < SummaryFresh) return Task.FromResult(entry.Value);
+                entry.Refresh ??= Task.Run(() =>
+                {
+                    try
+                    {
+                        var value = GetSummary(profileId, range);
+                        lock (entry.Gate)
+                        {
+                            entry.Value = value;
+                            entry.ComputedUtc = DateTime.UtcNow;
+                        }
+                        return value;
+                    }
+                    catch (Exception ex)
+                    {
+                        log("KMProfiles: could not summarise profile activity: " + ex.Message);
+                        throw;
+                    }
+                    finally
+                    {
+                        lock (entry.Gate) entry.Refresh = null;
+                    }
+                });
+                return entry.Value != null && age < SummaryStale ? Task.FromResult(entry.Value) : entry.Refresh;
+            }
         }
 
         /// <summary>For each key the profile has used: how often and when last (all retained history).</summary>
@@ -531,25 +706,33 @@ namespace Omnipotent.Profiles.Activity
         }
 
         /// <summary>Latest request time per profile (for "last seen" in the directory).</summary>
-        public Dictionary<string, long> GetLastSeen()
-        {
-            var map = new Dictionary<string, long>(StringComparer.Ordinal);
-            if (!ready) return map;
-            using var conn = Open();
-            using var cmd = Command(conn, "SELECT profile_id, MAX(last_ts_ms) FROM daily_rollup GROUP BY profile_id;");
-            using var r = cmd.ExecuteReader();
-            while (r.Read()) map[r.GetString(0)] = r.GetInt64(1);
-            return map;
-        }
+        public Dictionary<string, long> GetLastSeen() => new(lastSeen, StringComparer.Ordinal);
 
-        /// <summary>Requests and denials per profile since <paramref name="sinceMs"/>.</summary>
+        /// <summary>
+        /// Requests and denials per profile since <paramref name="sinceMs"/>. Answered from memory
+        /// for anything inside the last 24 hours (the directory's case); a longer look-back falls
+        /// through to the database.
+        /// </summary>
         public Dictionary<string, (long Requests, long Denied)> GetCountsSince(long sinceMs)
         {
             var map = new Dictionary<string, (long, long)>(StringComparer.Ordinal);
             if (!ready) return map;
+            long windowStart = DateTimeOffset.UtcNow.Subtract(TallyWindow).ToUnixTimeMilliseconds();
+            if (sinceMs < windowStart - MinuteMs) return CountsFromDatabase(sinceMs);
+            foreach (var (profileId, tally) in tallies)
+            {
+                var (requests, denied) = tally.Since(sinceMs);
+                if (requests > 0) map[profileId] = (requests, denied);
+            }
+            return map;
+        }
+
+        internal Dictionary<string, (long Requests, long Denied)> CountsFromDatabase(long sinceMs)
+        {
+            var map = new Dictionary<string, (long, long)>(StringComparer.Ordinal);
             using var conn = Open();
             using var cmd = Command(conn, @"SELECT profile_id, COUNT(*), SUM(CASE WHEN status IN (401, 403) THEN 1 ELSE 0 END)
-                FROM requests WHERE ts_ms >= $s GROUP BY profile_id;", ("$s", sinceMs));
+                FROM requests INDEXED BY ix_req_ts WHERE ts_ms >= $s GROUP BY profile_id;", ("$s", sinceMs));
             using var r = cmd.ExecuteReader();
             while (r.Read()) map[r.GetString(0)] = (r.GetInt64(1), r.GetInt64(2));
             return map;
@@ -605,6 +788,7 @@ namespace Omnipotent.Profiles.Activity
             try { stop.Cancel(); } catch { }
             try { queue.Writer.TryComplete(); } catch { }
             try { writer?.Wait(TimeSpan.FromSeconds(3)); } catch { }
+            try { seeding?.Wait(TimeSpan.FromSeconds(3)); } catch { }
         }
     }
 }
