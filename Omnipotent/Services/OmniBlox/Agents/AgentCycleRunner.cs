@@ -11,11 +11,22 @@ namespace Omnipotent.Services.OmniBlox.Agents
         public required string SystemPrompt { get; init; }
         public required string Briefing { get; init; }
         public required AgentToolbox Tools { get; init; }
-        public int MaxTurns { get; init; } = 40;
-        /// <summary>Prompt size at which the agent is told to wrap up (append-only history keeps growing).</summary>
-        public long WrapUpAtPromptTokens { get; init; } = 70_000;
-        public int MaxImageMessages { get; init; } = 8;
+        /// <summary>
+        /// A guard against a runaway loop, not a work budget. A cycle normally ends when the agent reports, or hands
+        /// over when its context fills (<see cref="WrapUpAtPromptTokens"/>); the next cycle carries on from the
+        /// hand-over, so work is never cut off by a count.
+        /// </summary>
+        public int MaxTurns { get; init; } = 300;
+        /// <summary>Prompt size at which the agent is asked to hand over (append-only history keeps growing).</summary>
+        public long WrapUpAtPromptTokens { get; init; } = 120_000;
+        /// <summary>Turns the agent may take to finish the step it is on after being asked to hand over.</summary>
+        public int HandOverGraceTurns { get; init; } = 8;
+        public int MaxImageMessages { get; init; } = 30;
         public LlmCallOptions Options { get; init; } = new();
+        /// <summary>Sees the cycle as it runs (the dashboard's live view and the cycle log). Null: nobody watches.</summary>
+        public ICycleObserver? Observer { get; init; }
+        /// <summary>Messages from the owner that arrived since the last turn (id, text), delivered into the running cycle.</summary>
+        public Func<IReadOnlyList<(string Id, string Text)>>? OwnerMessages { get; init; }
     }
 
     public sealed class CycleOutcome
@@ -24,21 +35,32 @@ namespace Omnipotent.Services.OmniBlox.Agents
         public bool Finished { get; init; }
         public bool StageComplete { get; init; }
         public string? BlockedReason { get; init; }
-        public List<string> KeyFacts { get; init; } = new();
+        public List<KeyFact> KeyFacts { get; init; } = new();
+        public List<string> DropFacts { get; init; } = new();
+        public List<(string Id, string Response)> DirectivesDone { get; init; } = new();
         public List<Decision> NewDecisions { get; init; } = new();
         public string? Error { get; init; }
+        /// <summary>The model or its provider failed (not the agent): retried later, never counted against the game.</summary>
+        public bool ProviderError { get; init; }
         public int ToolErrors { get; init; }
     }
 
     /// <summary>
     /// Runs one work cycle: a fresh KliveLLM tool session seeded with the role prompt and the dossier
-    /// briefing, an append-only tool loop with a turn and context budget, and a structured hand-over
-    /// (finish_cycle) at the end. The hand-over IS the compaction: the next cycle starts from the dossier,
-    /// not from this transcript. Repeated identical failures and over-long cycles are steered to wrap up.
+    /// briefing, an append-only tool loop, and a structured hand-over (finish_cycle) at the end. The hand-over
+    /// IS the compaction: the next cycle starts from the dossier, not from this transcript.
+    ///
+    /// What the first studio got wrong, and this runner does instead:
+    /// - Replies were capped at 3-6K tokens with reasoning on, so long files and tool calls were cut off mid-way
+    ///   and the half-written call still ran. A reply that hits the output limit ("length") is now detected: a
+    ///   call whose arguments were cut off is not run, and the agent is told to write in smaller pieces.
+    /// - Cycles ended at a fixed turn count. They now end when the agent reports, or hand over when the context
+    ///   fills, and the next cycle continues; the turn limit only stops a runaway loop.
+    /// - Nobody could see a cycle until it ended. An observer now sees every call, result and picture.
+    /// - The owner's directions waited for the next briefing; they are now delivered into the running cycle.
     ///
     /// Every request of a cycle is the previous one plus new messages, under one unchanging tool list,
     /// so AIRouter's prefix cache can serve everything already sent (see KliveLLM/PromptPrefixStability).
-    /// The report counts those re-sent tokens and how many the cache served, so a lapse shows up.
     /// </summary>
     public sealed class AgentCycleRunner
     {
@@ -62,13 +84,20 @@ namespace Omnipotent.Services.OmniBlox.Agents
             Parameters = Schema.Object(
                 Schema.Req("summary", Schema.Str("What this cycle achieved, in a few sentences.")),
                 Schema.Opt("decisions", Schema.Arr(Schema.Object(Schema.Req("what", Schema.Str("The decision")), Schema.Req("why", Schema.Str("The reason"))), "Decisions made this cycle")),
-                Schema.Opt("problems", Schema.StrList("Open problems or risks")),
-                Schema.Opt("next_steps", Schema.StrList("Concrete next steps for the next cycle, in order")),
-                Schema.Opt("key_facts", Schema.StrList("Facts to keep verbatim (ids, names, numbers, file paths)")),
+                Schema.Opt("problems", Schema.StrList("Open problems or risks, one per item")),
+                Schema.Opt("next_steps", Schema.StrList("Concrete next steps for the next cycle, in order, one per item")),
+                Schema.Opt("key_facts", Schema.Arr(Schema.Object(
+                        Schema.Req("key", Schema.Str("A short topic, e.g. 'economy', 'file layout', 'plot layout', 'spawn'. A fact with the same key REPLACES the old one.")),
+                        Schema.Req("fact", Schema.Str("The fact, word for word: ids, file names, positions, numbers"))),
+                    "Facts to keep in every later briefing. Update a fact by reusing its key rather than adding a near-copy.")),
+                Schema.Opt("drop_facts", Schema.StrList("Keys of facts that are no longer true")),
+                Schema.Opt("directives_done", Schema.Arr(Schema.Object(Schema.Req("id", Schema.Str("The owner directive's id, e.g. d2")), Schema.Req("response", Schema.Str("What you did about it"))), "Owner directives you completed this cycle")),
                 Schema.Opt("stage_complete", Schema.Bool("True when every exit criterion of the current stage is met")),
                 Schema.Opt("blocked_reason", Schema.Str("Only if the owner must act before work can continue"))),
             Handler = (args, _) => Task.FromResult(new ToolResult { Text = "Cycle report recorded.", Finish = args }),
         };
+
+        public static string NewCycleId(DateTime utc) => $"c{utc:yyyyMMdd-HHmmss}-{Guid.NewGuid().ToString("N")[..4]}";
 
         public async Task<CycleOutcome> RunAsync(CycleRequest request, CancellationToken ct)
         {
@@ -76,11 +105,14 @@ namespace Omnipotent.Services.OmniBlox.Agents
             // One tool list for the whole cycle, wrap-up included: the schemas are rendered at the head of
             // every prompt, so changing them for any one call re-prefills the transcript behind them.
             var tools = request.Tools.Definitions;
+            var observer = request.Observer ?? NullCycleObserver.Instance;
+            var started = clock();
+            string cycleId = NewCycleId(started);
             string session = $"omniblox-{request.Role}-{request.GameId}-{Guid.NewGuid():N}";
             var usage = new UsageTotals();
-            int turns = 0, toolErrors = 0, nudges = 0, imageMessages = 0;
+            int turns = 0, toolErrors = 0, toolCalls = 0, nudges = 0, imageMessages = 0, truncations = 0, wrapUpTurn = 0, cutOffFailures = 0;
             long previousPrompt = 0;
-            bool wrapUpSent = false;
+            bool wrapUpSent = false, providerError = false, runaway = false;
             JObject? finish = null;
             string? error = null;
             string lastText = "";
@@ -93,38 +125,74 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 // have been served from cache, and whatever was not is a lapse worth seeing.
                 if (previousPrompt > 0 && turn.PromptTokens > 0) usage.AddResent(previousPrompt, turn.CachedTokens);
                 if (turn.PromptTokens > 0) previousPrompt = turn.PromptTokens;
+                observer.Usage(turn.PromptTokens, turn.CachedTokens, turn.CompletionTokens);
             }
 
+            void Say(string text)
+            {
+                llm.AppendUser(session, text);
+                observer.Note(text);
+            }
+
+            observer.Started(cycleId, request.Role, request.Stage);
             llm.StartSession(session, request.SystemPrompt);
             try
             {
                 // The briefing closes with its own "Now:" line. A receipt stamp at its head would stop it
                 // sharing its stable sections with the previous cycle's briefing.
                 llm.AppendStableUser(session, request.Briefing);
-                while (turns < request.MaxTurns && finish == null)
+                while (finish == null)
                 {
                     ct.ThrowIfCancellationRequested();
+                    if (turns >= request.MaxTurns) { runaway = true; break; }
+                    DeliverOwnerMessages(request, Say);
                     turns++;
                     var turn = await QueryWithRetryAsync(session, tools, request.Options, ct);
                     Account(turn);
+                    if (!turn.Success && turn.Truncated && ++cutOffFailures <= 4)
+                    {
+                        // A reply cut off inside a tool call the provider could not even parse: nothing was kept.
+                        truncations++;
+                        Say("Your last reply was cut off at the output limit in the middle of a tool call, so nothing ran. Send smaller calls: a long file as write_file (first part) followed by append_file, and changes to existing files as edit_file.");
+                        continue;
+                    }
                     if (!turn.Success)
                     {
                         error = turn.Error ?? "the model call failed";
+                        providerError = true;
                         break;
                     }
-                    if (!string.IsNullOrWhiteSpace(turn.Text)) lastText = turn.Text;
+                    cutOffFailures = 0;
+                    if (!string.IsNullOrWhiteSpace(turn.Text))
+                    {
+                        lastText = turn.Text;
+                        observer.AssistantText(turn.Text);
+                    }
+                    if (turn.Truncated) truncations++;
 
                     if (turn.ToolCalls.Count == 0)
                     {
-                        if (++nudges > 2) break;
-                        llm.AppendUser(session, "Keep going: act through the tools. When this cycle's work is done (or you must stop), call finish_cycle with a full report.");
+                        if (turn.Truncated)
+                        {
+                            Say("Your last reply was cut off at the output limit before it reached a tool call, so nothing ran. Keep replies short and act through the tools: write a long file in parts (write_file for the first part, then append_file), and change existing files with edit_file instead of rewriting them.");
+                            continue;
+                        }
+                        if (++nudges > 3) break;
+                        Say("Keep going: act through the tools. When this cycle's work is done (or you must stop), call finish_cycle with a full report.");
                         continue;
                     }
+                    nudges = 0;
 
                     var images = new List<byte[]>();
                     foreach (var call in turn.ToolCalls)
                     {
-                        var result = await request.Tools.ExecuteAsync(call.Name, call.ArgumentsJson, ct);
+                        toolCalls++;
+                        observer.ToolCall(call.Id, call.Name, call.ArgumentsJson);
+                        ToolResult result;
+                        if (turn.Truncated && !IsCompleteJson(call.ArgumentsJson))
+                            result = ToolResult.Error(CutOffMessage(call.Name));
+                        else
+                            result = await request.Tools.ExecuteAsync(call.Name, call.ArgumentsJson, ct);
                         string text = result.Text;
                         if (result.IsError)
                         {
@@ -133,7 +201,8 @@ namespace Omnipotent.Services.OmniBlox.Agents
                             int count = failureCounts[key] = failureCounts.GetValueOrDefault(key) + 1;
                             if (count >= 3) text += "\nThis exact call has now failed " + count + " times. Do something different: read the error, check your inputs, or take another approach.";
                         }
-                        llm.AppendToolResult(session, call.Id, call.Name, Clip(text, 12_000));
+                        llm.AppendToolResult(session, call.Id, call.Name, Clip(text, 16_000));
+                        observer.ToolResult(call.Id, call.Name, text, result.IsError, result.Images);
                         if (result.Images.Count > 0) images.AddRange(result.Images);
                         if (result.Finish != null) finish = result.Finish;
                     }
@@ -146,38 +215,45 @@ namespace Omnipotent.Services.OmniBlox.Agents
                         }
                         else
                         {
-                            llm.AppendUser(session, "(Image budget for this cycle is used up; further pictures are not shown. Finish what you can and call finish_cycle.)");
+                            Say("(This cycle's picture budget is used up; further pictures are not shown, but the text results still are. Finish what you can and hand over; the next cycle can look again.)");
                         }
                     }
-                    if (finish == null && !wrapUpSent && turn.PromptTokens >= request.WrapUpAtPromptTokens)
+                    if (finish != null) break;
+
+                    if (!wrapUpSent && turn.PromptTokens >= request.WrapUpAtPromptTokens)
                     {
                         wrapUpSent = true;
-                        llm.AppendUser(session, "This cycle's context is nearly full. Finish the step you are on, then call finish_cycle with a complete report — the next cycle will continue from it.");
+                        wrapUpTurn = turns;
+                        Say("This cycle's context is nearly full. Finish the step you are on (at most a few more calls), then call finish_cycle with a complete hand-over. Nothing is lost: the next cycle continues from your report, so put the exact next steps and facts in it.");
                     }
-                    if (finish == null && turns == request.MaxTurns - 2 && !wrapUpSent)
+                    else if (wrapUpSent && (turns - wrapUpTurn >= request.HandOverGraceTurns || turn.PromptTokens >= request.WrapUpAtPromptTokens * 135 / 100))
+                    {
+                        break; // into the hand-over below
+                    }
+                    if (!wrapUpSent && turns == request.MaxTurns - 3)
                     {
                         wrapUpSent = true;
-                        llm.AppendUser(session, "Two turns left in this cycle. Call finish_cycle with a complete report now.");
+                        wrapUpTurn = turns;
+                        Say("This cycle has run very long. Finish the step you are on, then call finish_cycle with a complete hand-over; the next cycle continues from it.");
                     }
                 }
 
                 if (finish == null && error == null)
                 {
-                    // Out of turns or nudges: ask for the hand-over under the same tool list (offering only
-                    // finish_cycle would re-prefill the whole cycle for this one call). Other calls are
-                    // answered without running, so the request stays append-only; a second chance follows.
-                    llm.AppendUser(session, "This cycle is over. Call finish_cycle now with a complete report of what was done and what comes next.");
+                    // Out of turns, nudges or context: ask for the hand-over under the same tool list (offering only
+                    // finish_cycle would re-prefill the whole cycle for this one call). Other calls are answered
+                    // without running, so the request stays append-only; a second chance follows.
+                    Say(runaway
+                        ? "This cycle is over (it ran far longer than any cycle should). Call finish_cycle now with a complete report of what was done and what comes next."
+                        : "This cycle is over. Call finish_cycle now with a complete report of what was done and exactly what comes next; the next cycle starts from it.");
                     for (int attempt = 0; attempt < 2 && finish == null; attempt++)
                     {
                         turns++;
                         var last = await QueryWithRetryAsync(session, tools, request.Options, ct);
                         Account(last);
                         if (!last.Success) break;
-                        if (last.ToolCalls.Count == 0)
-                        {
-                            if (!string.IsNullOrWhiteSpace(last.Text)) lastText = last.Text;
-                            break;
-                        }
+                        if (!string.IsNullOrWhiteSpace(last.Text)) lastText = last.Text;
+                        if (last.ToolCalls.Count == 0) continue;
                         foreach (var call in last.ToolCalls)
                         {
                             string result = "Not run: this cycle is over. Call finish_cycle with your report.";
@@ -190,10 +266,13 @@ namespace Omnipotent.Services.OmniBlox.Agents
                                 }
                                 catch (Newtonsoft.Json.JsonException)
                                 {
-                                    result = "ERROR: the arguments are not valid JSON. Call finish_cycle again with one JSON object.";
+                                    result = last.Truncated
+                                        ? "ERROR: your report was cut off at the output limit. Call finish_cycle again with a shorter report."
+                                        : "ERROR: the arguments are not valid JSON. Call finish_cycle again with one JSON object.";
                                 }
                             }
                             llm.AppendToolResult(session, call.Id, call.Name, result);
+                            observer.ToolResult(call.Id, call.Name, result, finish == null, Array.Empty<byte[]>());
                         }
                     }
                 }
@@ -211,21 +290,28 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 llm.EndSession(session);
             }
 
+            var now = clock();
             var report = new CycleReport
             {
-                Utc = clock(),
+                CycleId = cycleId,
+                StartedUtc = started,
+                Utc = now,
                 Stage = request.Stage,
                 Role = request.Role,
                 Turns = turns,
+                ToolCalls = toolCalls,
+                ToolErrors = toolErrors,
+                Truncations = truncations,
                 PromptTokens = usage.PromptTokens,
                 CachedTokens = usage.CachedTokens,
                 CompletionTokens = usage.CompletionTokens,
                 ResentTokens = usage.ResentTokens,
                 ResentCachedTokens = usage.ResentCachedTokens,
-                Outcome = error != null ? "error" : finish != null ? "finished" : "cut short",
+                Outcome = error != null ? "error" : finish == null ? "cut short" : wrapUpSent ? "handed over" : "finished",
+                Error = error,
                 Done = finish != null ? Args.Str(finish, "summary") : (error != null ? "Cycle failed: " + error : Clip(lastText, 1500)),
-                Problems = finish != null ? Args.List(finish, "problems") : new List<string>(),
-                NextSteps = finish != null ? Args.List(finish, "next_steps") : new List<string>(),
+                Problems = finish != null ? Args.Prose(finish, "problems").Take(20).ToList() : new List<string>(),
+                NextSteps = finish != null ? Args.Prose(finish, "next_steps").Take(20).ToList() : new List<string>(),
             };
             var decisions = new List<Decision>();
             if (finish?["decisions"] is JArray arr)
@@ -233,28 +319,109 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 {
                     string what = Args.Str(d, "what");
                     if (what.Length == 0) continue;
-                    decisions.Add(new Decision { Utc = clock(), Stage = request.Stage, What = Clip(what, 400), Why = Clip(Args.Str(d, "why"), 400) });
+                    decisions.Add(new Decision { Utc = now, Stage = request.Stage, What = Clip(what, 400), Why = Clip(Args.Str(d, "why"), 400) });
                     report.Decisions.Add(what);
                 }
+            observer.Finished(report);
             return new CycleOutcome
             {
                 Report = report,
                 Finished = finish != null,
                 StageComplete = finish != null && Args.Bool(finish, "stage_complete"),
                 BlockedReason = finish != null && Args.Str(finish, "blocked_reason") is { Length: > 0 } b ? b : null,
-                KeyFacts = finish != null ? Args.List(finish, "key_facts").Select(f => Clip(f, 300)).ToList() : new List<string>(),
+                KeyFacts = finish != null ? ReadFacts(finish["key_facts"], now, request.Stage) : new List<KeyFact>(),
+                DropFacts = finish != null ? Args.List(finish, "drop_facts") : new List<string>(),
+                DirectivesDone = finish != null ? ReadDirectivesDone(finish["directives_done"]) : new List<(string, string)>(),
                 NewDecisions = decisions,
                 Error = error,
+                ProviderError = providerError,
                 ToolErrors = toolErrors,
             };
         }
 
+        private static void DeliverOwnerMessages(CycleRequest request, Action<string> say)
+        {
+            if (request.OwnerMessages == null) return;
+            IReadOnlyList<(string Id, string Text)> messages;
+            try { messages = request.OwnerMessages(); }
+            catch { return; }
+            foreach (var (id, text) in messages)
+                say($"Message from the owner (directive {id}), just now: \"{text}\"\nThis takes priority over your current plan. Act on it, and when it is done list it in finish_cycle's directives_done with what you did.");
+        }
+
+        /// <summary>Facts from finish_cycle: objects {key, fact}, plain strings, or (the old glitch) one string holding a JSON array.</summary>
+        internal static List<KeyFact> ReadFacts(JToken? token, DateTime utc, GameStage stage)
+        {
+            var facts = new List<KeyFact>();
+            if (token == null || token.Type == JTokenType.Null) return facts;
+            if (token.Type == JTokenType.String)
+            {
+                string text = ((string?)token ?? "").Trim();
+                if (text.StartsWith('[') && text.EndsWith(']'))
+                {
+                    try { token = JToken.Parse(text); }
+                    catch (Newtonsoft.Json.JsonException) { /* read as lines below */ }
+                }
+                if (token.Type == JTokenType.String)
+                {
+                    foreach (var line in Args.ListOf(token, commas: false)) facts.Add(FactBook.Parse(line, utc, stage));
+                    return facts;
+                }
+            }
+            if (token is JObject single) token = new JArray(single);
+            foreach (var item in token as JArray ?? new JArray())
+            {
+                if (item is JObject o)
+                {
+                    string text = Args.Str(o, "fact") is { Length: > 0 } f ? f : Args.Str(o, "text") is { Length: > 0 } t ? t : Args.Str(o, "value");
+                    if (text.Length == 0) continue;
+                    facts.Add(new KeyFact { Key = FactBook.NormalizeKey(Args.Str(o, "key")), Text = FactBook.Normalize(text), Utc = utc, Stage = stage });
+                }
+                else if (item.Type == JTokenType.String && ((string?)item ?? "").Trim().Length > 0)
+                {
+                    facts.Add(FactBook.Parse((string)item!, utc, stage));
+                }
+            }
+            return facts.Take(30).ToList();
+        }
+
+        private static List<(string Id, string Response)> ReadDirectivesDone(JToken? token)
+        {
+            var list = new List<(string, string)>();
+            foreach (var item in token as JArray ?? new JArray())
+            {
+                if (item is JObject o && Args.Str(o, "id") is { Length: > 0 } id) list.Add((id, Clip(Args.Str(o, "response"), 600)));
+                else if (item.Type == JTokenType.String && ((string?)item ?? "").Trim() is { Length: > 0 } plain) list.Add((plain, ""));
+            }
+            return list;
+        }
+
+        private static bool IsCompleteJson(string json)
+        {
+            if (string.IsNullOrWhiteSpace(json)) return true; // a call with no arguments
+            try
+            {
+                JToken.Parse(json);
+                return true;
+            }
+            catch (Newtonsoft.Json.JsonException)
+            {
+                return false;
+            }
+        }
+
+        internal static string CutOffMessage(string tool) =>
+            $"NOT RUN: your reply hit the output limit while writing this {tool} call, so its arguments were cut off and nothing was changed. " +
+            "Send it again in smaller pieces: a long file as write_file (first part) followed by append_file calls, changes to existing files as edit_file, " +
+            "and long lists of objects split over several calls.";
+
         private async Task<LlmTurn> QueryWithRetryAsync(string session, IReadOnlyList<ToolDefinition> tools, LlmCallOptions options, CancellationToken ct)
         {
             var turn = await llm.QueryAsync(session, tools, options, ct);
-            for (int attempt = 1; !turn.Success && attempt <= 2; attempt++)
+            // A reply cut off at the output limit would only be cut off again: the caller handles it.
+            for (int attempt = 1; !turn.Success && !turn.Truncated && attempt <= 3; attempt++)
             {
-                await delay(TimeSpan.FromSeconds(5 * attempt), ct);
+                await delay(TimeSpan.FromSeconds(10 * attempt), ct);
                 turn = await llm.QueryAsync(session, tools, options, ct);
             }
             return turn;

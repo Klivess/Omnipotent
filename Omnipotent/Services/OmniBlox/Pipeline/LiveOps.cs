@@ -40,6 +40,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             var telemetry = ctx.Telemetry.Summarize(gameId, ctx.Clock().AddDays(-7));
             string extra = "## This week's numbers\n" + AnalyticsSync.Describe(game, 14) + "\n\n## The game's own telemetry (7 days)\n" + TelemetryStore.Describe(telemetry)
                 + (game.UrgentMaintenance ? "\n\nURGENT: this session was pulled forward because something looks broken (see errors above). Fix that first." : "");
+            var tools = MaintenanceTools.Create(ctx, gameId);
+            tools.OnInternalError = (tool, ex) => ctx.Log($"[OmniBlox] tool {tool} failed for {gameId}: {ex}");
             var outcome = await ctx.Runner.RunAsync(new CycleRequest
             {
                 GameId = gameId,
@@ -47,11 +49,19 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 Role = "maintainer",
                 SystemPrompt = AgentPrompts.Maintainer,
                 Briefing = Briefing.Build(game, ctx, extra),
-                Tools = MaintenanceTools.Create(ctx, gameId),
-                MaxTurns = 40,
-                Options = new LlmCallOptions { MaxTokens = 4096, Thinking = "medium" },
+                Tools = tools,
+                WrapUpAtPromptTokens = ctx.Settings.CycleContextTokens,
+                Options = new LlmCallOptions { MaxTokens = ctx.Settings.MaxOutputTokens, Thinking = Orchestrator.Effort(game, "medium") },
+                Observer = new CycleLog(ctx, gameId),
+                OwnerMessages = () => Orchestrator.TakeNewDirectives(ctx, gameId),
             }, ct);
             Orchestrator.Record(ctx, gameId, outcome);
+            if (outcome.ProviderError)
+            {
+                // The model was unreachable: nothing happened. Try again in an hour without logging a maintenance.
+                ctx.Update(gameId, g => g.NextMaintenanceUtc = ctx.Clock().AddHours(1));
+                return;
+            }
 
             game = ctx.Game(gameId)!;
             var record = new MaintenanceRecord { Utc = ctx.Clock(), Summary = Clip(outcome.Report.Done, 600), Urgent = game.UrgentMaintenance, Actions = outcome.Report.Decisions.Take(10).ToList() };
@@ -86,16 +96,17 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             var game = ctx.Game(gameId)!;
             if (game.Slot is not { } slot) return (false, "the game has no experience");
             if (!ctx.Cloud.HasKey) return (false, "no API key");
-            var run = BuildTools.RunBuild(ctx, gameId);
-            if (!run.Ok) return (false, "build failed: " + string.Join("; ", run.Compile.Errors.Take(3)));
+            var run = await BuildTools.RunBuildAsync(ctx, gameId, ct);
+            if (!run.Ok) return (false, "build failed: " + string.Join("; ", run.Compile.Errors.Concat(run.Types?.Errors.Select(d => d.ToString()) ?? Enumerable.Empty<string>()).Take(3)));
             int revision = ctx.Game(gameId)!.Build.Revision;
             try
             {
-                var engine = await EngineTests.RunAsync(ctx, slot, run.Compile.PlaceXml, ct);
-                if (!engine.Ok)
+                if (!StageGates.EnginePassed(ctx.Game(gameId)!))
                 {
-                    ctx.Update(gameId, g => g.UrgentMaintenance = false);
-                    return (false, "engine tests failed: " + string.Join("; ", engine.Failures.Take(3)));
+                    var (engine, message) = await BuildTools.RunEngineTestsAsync(ctx, gameId, ct, run);
+                    if (engine == null) return (false, "engine tests could not run: " + message);
+                    if (!engine.Ok && !TestStage.GameChecksPass(engine))
+                        return (false, "engine tests failed: " + EngineTests.Describe(engine).Split('\n').Skip(1).Take(3).Aggregate("", (a, b) => a + " " + b.Trim()));
                 }
                 var published = await ctx.Cloud.PublishPlaceAsync(slot.UniverseId, slot.PlaceId, run.Compile.PlaceXml, isXml: true, publish: true, ct);
                 if (!game.Store.Applied && game.Store.ComplianceOk == true)

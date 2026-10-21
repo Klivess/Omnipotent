@@ -46,6 +46,7 @@ namespace Omnipotent.Tests.OmniBlox
                 g.StageFailures[GameStage.Research] = 2;
                 g.Escalations = 2;
                 g.Usage.Add(96, 1_480_000, 1_310_000, 41_000);
+                g.AbandonedFromStage = GameStage.Research;
                 g.Stage = GameStage.Abandoned;
                 g.StageEnteredUtc = h.Now.AddDays(2);
                 g.AbandonReason = "Research took 12 cycles over two attempts and no concept reached the minimum score of 5 (space themes had too few usable free models).";
@@ -94,13 +95,28 @@ namespace Omnipotent.Tests.OmniBlox
             await h.StepUntilAsync(() => h.Game(live).Maintenance.Count == 3);
             ctx.Update(live, g => g.NextMaintenanceUtc = Now.AddDays(1).AddHours(4)); // out of game 2's way
 
-            // ── Game 2: researched yesterday, two build cycles in.
+            // ── Game 2: researched yesterday, two build cycles in; its engine run found a failing check and a boot error.
+            // (Game 1 holds the first experience slot; a second one lets game 2 run in the engine.)
+            ctx.Settings.Slots.Add(new ExperienceSlot { UniverseId = 5005, PlaceId = 6006 });
             h.Now = Now.AddHours(-26);
+            h.Roblox.EngineOutput = "{\"results\":[{\"passed\":4,\"failed\":1,\"results\":[" +
+                "{\"name\":\"Kit · new profiles start fresh\",\"ok\":true,\"phase\":\"kit\",\"owner\":\"kit\"}," +
+                "{\"name\":\"Load · every module loads\",\"ok\":true,\"phase\":\"load\",\"owner\":\"kit\"}," +
+                "{\"name\":\"Boot · the server starts\",\"ok\":true,\"phase\":\"boot\",\"owner\":\"kit\"}," +
+                "{\"name\":\"Places · a tycoon plot exists\",\"ok\":true,\"phase\":\"world\",\"owner\":\"kit\",\"warnings\":[\"only one plot: servers hold up to 6 players\"]}," +
+                "{\"name\":\"Factory · the first dropper is affordable\",\"ok\":false,\"detail\":\"starting candy 50 < first dropper 60\",\"phase\":\"game\",\"owner\":\"game\"}]," +
+                "\"errors\":[{\"message\":\"ServerScriptService.Welcome:4: attempt to concatenate nil with string\",\"phase\":\"boot\",\"trace\":\"ServerScriptService.Welcome:4\"}],\"warnings\":[]}]}";
             ScriptTycoonResearch(h.Llm);
             ScriptTycoonBuild(h.Llm);
             await h.StepUntilAsync(() => ctx.Store.Read(s => s.Games.Values.Any(g => g.Stage == GameStage.Build && g.Cycles.Count(c => c.Role == "builder") >= 2)), 12);
             string building = ctx.Store.Read(s => s.Games.Values.Single(g => g.Stage == GameStage.Build).GameId);
             Assert.True(h.Game(building).Build.LastBuildOk, string.Join("; ", h.Game(building).Build.Errors));
+            Assert.False(h.Game(building).Build.LastEngineRun!.Ok);
+            ctx.Update(building, g =>
+            {
+                g.Directives.Add(new OwnerDirective { DirectiveId = "d1", Utc = Now.AddHours(-20), Text = "Make the factory plot bigger: kids want room for twelve droppers.", Status = DirectiveStatus.Done, Response = "Doubled the plot to 100×100 and spaced the buttons out.", ResolvedUtc = Now.AddHours(-19), Delivered = true });
+                g.Directives.Add(new OwnerDirective { DirectiveId = "d2", Utc = Now.AddMinutes(-30), Text = "Add a candy machine finale that unlocks after the first rebirth.", Delivered = true });
+            });
             await SeedPlaytestsAsync(h, building);
             h.Now = Now;
             SeedDailyMetrics(ctx, live); // after the steps: the analytics sweep merges the fake's single data point
@@ -131,16 +147,29 @@ namespace Omnipotent.Tests.OmniBlox
                 Write($"files-{id}", OmniBloxViews.Files(ctx, id));
                 Write($"events-{id}", OmniBloxViews.Events(ctx, 200, id));
                 foreach (int days in new[] { 7, 30 }) Write($"telemetry-{id}-{days}", OmniBloxViews.Telemetry(ctx, id, days));
+                Write($"live-{id}", new { Live = ctx.Live.Get(id) });
+                foreach (string cycleId in CycleLog.Available(ctx, id).Take(6))
+                {
+                    var entries = CycleLog.Read(ctx, id, cycleId)!;
+                    Write($"cycle-{id}-{cycleId}", new { CycleId = cycleId, Report = h.Game(id).Cycles.FirstOrDefault(c => c.CycleId == cycleId), Entries = entries });
+                    foreach (string file in entries.SelectMany(e => e.Images).Distinct())
+                        if (CycleLog.ImagePath(ctx, id, cycleId, file) is { } picture) WriteBytes($"cycle/{id}/{cycleId}/{file}", Shrink(File.ReadAllBytes(picture), 960));
+                }
                 var workspace = ctx.Workspace(id);
                 if (workspace.Exists)
                 {
                     var contents = new JObject();
                     foreach (var file in workspace.ListFiles()) contents[file.Path] = workspace.ReadFile(file.Path);
                     File.WriteAllText(Path.Combine(output, $"filecontents-{id}.json"), contents.ToString(Formatting.None));
+                    Write($"map-{id}", OmniBloxViews.Map(ctx, id));
                     var compiled = ctx.Compile(id);
-                    if (compiled.Parts.Count > 0)
-                        foreach (string view in new[] { "iso", "overview", "spawn" })
-                            WriteBytes($"render/{id}-{view}.png", SceneRenderer.Render(compiled.Parts, workspace.LoadScene(), view, 960, 570));
+                    if (compiled.Parts.Count > 0 || compiled.Terrain != null)
+                    {
+                        var views = new List<string> { "map", "overview", "aerial", "iso", "spawn" };
+                        views.AddRange(workspace.LoadScene().Layout.Zones.Select(z => "zone:" + z.Id));
+                        foreach (string view in views)
+                            WriteBytes($"render/{id}-{view.Replace(':', '-')}.png", Shrink(ctx.RenderCompiled(id, compiled, view, 1280, 760), 960));
+                    }
                 }
                 foreach (string file in OmniBloxViews.MediaFiles(ctx, id))
                 {
@@ -237,12 +266,14 @@ namespace Omnipotent.Tests.OmniBlox
                     if (c.Done.StartsWith("Scripted ", StringComparison.Ordinal) && text.TryGetValue(c.Role, out var done)) c.Done = done;
                     if (c.NextSteps is ["carry on"] && next.TryGetValue(c.Role, out var steps)) c.NextSteps = steps.ToList();
                 }
-                g.KeyFacts = new List<string>
+                var at = g.Cycles.LastOrDefault()?.Utc ?? LaunchDay;
+                g.KeyFacts = new List<KeyFact>
                 {
-                    "Experience 1001, place 2002",
-                    "Products: Skip Stage (developer product, 25 R$), VIP (game pass, 149 R$)",
-                    "Checkpoint pads at z = 0, -14 and -28; gold finish at z = -42",
-                    "Lava kill brick 40×60 studs at y = -2",
+                    new() { Key = "experience", Text = "Experience 1001, place 2002", Utc = at, Stage = GameStage.Launch, Source = FactBook.Studio },
+                    new() { Key = "products", Text = "Skip Stage (developer product, 25 R$), VIP (game pass, 149 R$)", Utc = at, Stage = GameStage.Launch },
+                    new() { Key = "checkpoints", Text = "Checkpoint pads at z = 0, -14 and -28; gold finish at z = -42", Utc = at, Stage = GameStage.Build },
+                    new() { Key = "lava", Text = "Lava kill brick 40×60 studs at y = -2", Utc = at, Stage = GameStage.Build },
+                    new() { Key = "direction", Text = "Keep the first three stages easy: the owner's playtest showed younger players giving up on stage 2.", Utc = at, Stage = GameStage.Build, Source = FactBook.Owner },
                 };
                 foreach (var e in s.Events.Where(e => e.GameId == gameId))
                     foreach (var (role, done) in text)
@@ -310,7 +341,20 @@ namespace Omnipotent.Tests.OmniBlox
                 },
                 ("set_milestones", new { milestones = new[] { "Core loop: droppers, conveyor and collector", "Twelve buttons and a rebirth", "Polish: decoration, leaderboard and sounds" } }),
                 ("update_manifest", new { title = "Candy Factory Tycoon", currency_name = "Candy", starting_currency = 50, tips = new[] { "Step on the green buttons to buy!" } }),
-                ("set_lighting", new { preset = "day" }),
+                ("terrain_generate", new { size = new[] { 420, 420 }, biome = "candy", hills = 10, seed = 11, flat_radius = 110 }),
+                ("set_map_area", new { area = new[] { -140, -140, 140, 140 } }),
+                ("plan_map", new
+                {
+                    concept = "A candy island: the factory plot in the middle, a candy-cane grove to the east and a lollipop lake to the north-west.",
+                    zones = new object[]
+                    {
+                        new { id = "factory", name = "Factory", area = new[] { -50, -50, 50, 50 }, order = 1, purpose = "the plot: droppers, conveyor, collector, buttons", theme = "pink factory floor" },
+                        new { id = "grove", name = "Candy Grove", area = new[] { 60, -140, 140, 140 }, order = 2, purpose = "decoration and the rebirth statue", theme = "candy canes" },
+                    },
+                    paths = new object[] { new { from = "factory", to = "grove", points = new[] { new[] { 40, 0 }, new[] { 100, 0 } } } },
+                    landmarks = new object[] { new { name = "Giant Lollipop", position = new[] { 110, -90 }, note = "visible from the plot" } },
+                }),
+                ("set_lighting", new { preset = "candy" }),
                 ("add_objects", new
                 {
                     objects = new object[]
@@ -334,8 +378,12 @@ namespace Omnipotent.Tests.OmniBlox
                 },
                 ("place_asset", new { asset_id = FakeRoblox.AssetId, position = new[] { 30, 0, 24 }, yaw = 15 }),
                 ("place_asset", new { asset_id = 900105, position = new[] { -24, 0, 26 }, yaw = 0 }),
+                ("scatter_assets", new { asset_ids = new[] { 900105L, FakeRoblox.AssetId }, zone = "grove", count = 40, seed = 2 }),
                 ("write_file", new { path = "src/server/Welcome.server.luau", content = "local Players = game:GetService(\"Players\")\n\nPlayers.PlayerAdded:Connect(function(player)\n\tprint(\"Welcome to the factory,\", player.Name)\nend)\n" }),
-                ("build", new { }));
+                ("write_file", new { path = "src/tests/Factory.luau", content = "return {\n\t[\"the first dropper is affordable\"] = function(t)\n\t\tlocal p = t.player()\n\t\tt.ok(true)\n\tend,\n}\n" }),
+                ("build", new { }),
+                ("render_scene", new { view = "map" }),
+                ("run_tests", new { }));
         }
 
         // ─────────────── seeded data ───────────────

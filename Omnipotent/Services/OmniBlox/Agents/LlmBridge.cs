@@ -29,11 +29,20 @@ namespace Omnipotent.Services.OmniBlox.Agents
         public long CachedTokens { get; init; }
         public long CompletionTokens { get; init; }
         public string? Model { get; init; }
+        /// <summary>The provider's finish_reason; "length" means the reply hit the output cap.</summary>
+        public string? FinishReason { get; init; }
+
+        /// <summary>The reply was cut off at the output limit: its last tool call may be incomplete.</summary>
+        public bool Truncated => string.Equals(FinishReason, "length", StringComparison.OrdinalIgnoreCase);
     }
 
     public sealed class LlmCallOptions
     {
-        public int MaxTokens { get; init; } = 4096;
+        /// <summary>
+        /// The output cap for one reply, reasoning included. It must leave room for a whole source file after the
+        /// model has thought: the first studio ran agents at 3-6K, and long files and tool calls were cut off mid-way.
+        /// </summary>
+        public int MaxTokens { get; init; } = 16_384;
         public string? Thinking { get; init; } = "medium";
         public AIRouterWorkClass WorkClass { get; init; } = AIRouterWorkClass.Agent;
     }
@@ -137,7 +146,10 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 // Cycles are short and history is append-only; the runner enforces its own budget, so the
                 // generic compactor (which rewrites already-sent history) stays off.
                 compactAboveTokensOverride: 0,
-                workClass: options.WorkClass);
+                workClass: options.WorkClass,
+                // The studio picks its reasoning effort per role (deeper for design and debugging), so the
+                // level is sent to AIRouter rather than left at the provider's default.
+                honourThinkingOnAIRouter: true);
             return new LlmTurn
             {
                 Success = response.Success,
@@ -150,6 +162,7 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 CachedTokens = response.CachedPromptTokens,
                 CompletionTokens = response.CompletionTokens,
                 Model = response.Model,
+                FinishReason = response.FinishReason,
             };
         }
 

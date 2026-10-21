@@ -1,11 +1,11 @@
 -- OmniKit · Tycoon template
--- Each plot is a Model or Folder tagged "TycoonPlot" containing:
+-- Each plot is a Model or Folder tagged "TycoonPlot" (a tagged part works too: its parent is the plot) containing:
 --   Items/      models that start hidden and appear when bought (each may have an Income value per second)
 --   buttons     parts tagged "TycoonButton" with Price, Unlocks (an item's name) and optional Requires
 --   a collector part tagged "TycoonCollector" that moves the plot's bank into the owner's wallet
 -- Parts tagged "Dropper" inside items spit out little cubes (cosmetic; income comes from Income values).
 -- A player claims a free plot on joining; what they bought is saved and rebuilt in whichever plot they
--- get next time.
+-- get next time. Every button shows what it unlocks and its price. Reports quest events "unlock" and "collect".
 
 local CollectionService = game:GetService("CollectionService")
 local Players = game:GetService("Players")
@@ -15,6 +15,8 @@ local Config = require(script.Parent.Parent.Config)
 local Data = require(script.Parent.Parent.Data)
 local Currency = require(script.Parent.Parent.Currency)
 local Analytics = require(script.Parent.Parent.Analytics)
+local Effects = require(script.Parent.Parent.Effects)
+local Quests = require(script.Parent.Parent.Quests)
 local Shop = require(script.Parent.Parent.Shop)
 local Leaderboard = require(script.Parent.Parent.Leaderboard)
 local Kit = game:GetService("ReplicatedStorage"):WaitForChild("OmniKit")
@@ -38,13 +40,38 @@ local plots: { Plot } = {}
 local byOwner: { [number]: Plot } = {}
 
 local function itemIncome(item: Instance): number
-	local income = tonumber(Util.Setting(item, "Income", 0)) or 0
+	local income = Util.Number(item, "Income", 0)
 	for _, d in ipairs(item:GetDescendants()) do
 		if d:IsA("BasePart") then
-			income += tonumber(Util.Setting(d, "Income", 0)) or 0
+			income += Util.Number(d, "Income", 0)
 		end
 	end
 	return income
+end
+
+-- "Dropper · 50 🪙" over every button, so players can see what they are buying.
+local function labelButton(button: BasePart)
+	if button:FindFirstChild("ButtonLabel") then
+		return
+	end
+	local unlocks = tostring(Util.Setting(button, "Unlocks", "?"))
+	local price = Util.Number(button, "Price", 0)
+	local billboard = Instance.new("BillboardGui")
+	billboard.Name = "ButtonLabel"
+	billboard.Size = UDim2.fromOffset(200, 60)
+	billboard.StudsOffset = Vector3.new(0, button.Size.Y / 2 + 2.5, 0)
+	billboard.MaxDistance = 60
+	local label = Instance.new("TextLabel")
+	label.Size = UDim2.fromScale(1, 1)
+	label.BackgroundTransparency = 1
+	label.Font = Enum.Font.FredokaOne
+	label.TextScaled = true
+	label.TextColor3 = Color3.new(1, 1, 1)
+	label.TextStrokeTransparency = 0
+	local caption = tostring(Util.Setting(button, "Label", unlocks))
+	label.Text = caption .. "\n" .. (if price > 0 then Util.Format(price) .. " " .. Currency.Icon else "FREE")
+	label.Parent = billboard
+	billboard.Parent = button
 end
 
 local function setButtonVisible(button: BasePart, visible: boolean)
@@ -52,7 +79,7 @@ local function setButtonVisible(button: BasePart, visible: boolean)
 	button.CanCollide = visible
 	button.CanTouch = visible
 	for _, gui in ipairs(button:GetDescendants()) do
-		if gui:IsA("BillboardGui") or gui:IsA("SurfaceGui") then
+		if gui:IsA("LayerCollector") then
 			gui.Enabled = visible
 		end
 	end
@@ -98,7 +125,7 @@ local function reset(plot: Plot)
 end
 
 -- Buys a button for its plot's owner. Exposed for tests.
-function Tycoon.Buy(player, plot: Plot, button: BasePart): boolean
+function Tycoon.Buy(player: any, plot: Plot, button: BasePart): boolean
 	if plot.owner ~= player then
 		return false
 	end
@@ -110,9 +137,15 @@ function Tycoon.Buy(player, plot: Plot, button: BasePart): boolean
 	end
 	if not Currency.Spend(player, price, "TycoonUnlock", unlocks) then
 		Shop.Notify(player, "You need " .. Util.Format(price) .. " " .. Currency.Name .. " for that.", "info")
+		Effects.Sound(player, "error")
 		return false
 	end
 	unlock(plot, unlocks)
+	local item = plot.items:FindFirstChild(unlocks)
+	local at = if item and item:IsA("Model") then item:GetPivot().Position elseif item and item:IsA("BasePart") then item.Position else button.Position
+	Effects.Burst(at, Color3.fromRGB(255, 220, 90), 24)
+	Effects.Sound(player, "purchase")
+	Quests.Track(player, "unlock", 1)
 	local profile = Data.Get(player)
 	if profile then
 		profile.Upgrades[unlocks] = true
@@ -122,7 +155,7 @@ function Tycoon.Buy(player, plot: Plot, button: BasePart): boolean
 	return true
 end
 
-function Tycoon.Collect(player, plot: Plot): number
+function Tycoon.Collect(player: any, plot: Plot): number
 	if plot.owner ~= player or plot.bank < 1 then
 		return 0
 	end
@@ -130,10 +163,12 @@ function Tycoon.Collect(player, plot: Plot): number
 	plot.bank -= amount
 	local gained = Currency.Add(player, amount, "TycoonCollect")
 	sendState(plot)
+	Quests.Track(player, "collect", 1)
+	Effects.Reward(player, nil, "+" .. Util.Format(gained) .. " " .. Currency.Icon)
 	return gained
 end
 
-function Tycoon.Claim(player): Plot?
+function Tycoon.Claim(player: any): Plot?
 	if byOwner[player.UserId] then
 		return byOwner[player.UserId]
 	end
@@ -161,7 +196,7 @@ function Tycoon.Claim(player): Plot?
 	return nil
 end
 
-function Tycoon.Release(player)
+function Tycoon.Release(player: any)
 	local plot = byOwner[player.UserId]
 	byOwner[player.UserId] = nil
 	if plot then
@@ -173,14 +208,43 @@ function Tycoon.Plots(): { Plot }
 	return plots
 end
 
+-- The plot a tag stands for: a tagged Model or Folder is the plot; a tagged part (a floor plate, say) stands
+-- for the folder or model it sits in, which holds the buttons and items.
+local function plotRoot(tagged: Instance): Instance
+	if tagged:IsA("BasePart") then
+		local hasButtons = false
+		for _, d in ipairs(tagged:GetDescendants()) do
+			if CollectionService:HasTag(d, "TycoonButton") then
+				hasButtons = true
+				break
+			end
+		end
+		if not hasButtons and tagged.Parent and tagged.Parent ~= workspace then
+			return tagged.Parent
+		end
+	end
+	return tagged
+end
+Tycoon.PlotRoot = plotRoot
+
 function Tycoon.Index()
 	table.clear(plots)
-	for _, root in ipairs(CollectionService:GetTagged("TycoonPlot")) do
-		local items = root:FindFirstChild("Items")
-		if not items then
-			items = Instance.new("Folder")
-			items.Name = "Items"
-			items.Parent = root
+	local seen: { [Instance]: boolean } = {}
+	for _, tagged in ipairs(CollectionService:GetTagged("TycoonPlot")) do
+		local root = plotRoot(tagged)
+		if seen[root] then
+			continue
+		end
+		seen[root] = true
+		local items: Instance
+		local found = root:FindFirstChild("Items")
+		if found then
+			items = found
+		else
+			local folder = Instance.new("Folder")
+			folder.Name = "Items"
+			folder.Parent = root
+			items = folder
 		end
 		local stash = Instance.new("Folder")
 		stash.Name = "TycoonStash_" .. root:GetFullName()
@@ -192,6 +256,7 @@ function Tycoon.Index()
 		for _, d in ipairs(root:GetDescendants()) do
 			if d:IsA("BasePart") and CollectionService:HasTag(d, "TycoonButton") then
 				table.insert(buttons, d)
+				labelButton(d)
 			end
 		end
 		local plot: Plot = { root = root, owner = nil, bank = 0, income = 0, buttons = buttons, stash = stash, items = items, owned = {} }
@@ -213,7 +278,7 @@ function Tycoon.Start()
 				unlocked += 1
 			end
 		end
-		return { unlocked = unlocked, earned = profile and profile.Stats.Earned or 0 }
+		return { unlocked = unlocked, earned = if profile then profile.Stats.Earned or 0 else 0 }
 	end
 
 	for _, plot in ipairs(plots) do

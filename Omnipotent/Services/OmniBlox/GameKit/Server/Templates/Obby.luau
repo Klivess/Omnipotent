@@ -2,7 +2,8 @@
 -- Stages marked by parts tagged "Checkpoint" with a Stage value (1 = start). Touch the next checkpoint
 -- to advance (no skipping by glitching ahead), respawn at your furthest checkpoint, reach the part tagged
 -- "Finish" for the big reward. Progress saves. "skipstage" is a purchasable grant. Every stage is a step
--- in the "Obby" funnel, so OmniBlox can see exactly where players quit.
+-- in the "Obby" funnel, so OmniBlox can see exactly where players quit. Reports quest events "stage" and
+-- "finish".
 
 local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
@@ -11,6 +12,8 @@ local Config = require(script.Parent.Parent.Config)
 local Data = require(script.Parent.Parent.Data)
 local Currency = require(script.Parent.Parent.Currency)
 local Analytics = require(script.Parent.Parent.Analytics)
+local Effects = require(script.Parent.Parent.Effects)
+local Quests = require(script.Parent.Parent.Quests)
 local Shop = require(script.Parent.Parent.Shop)
 local Leaderboard = require(script.Parent.Parent.Leaderboard)
 local Kit = game:GetService("ReplicatedStorage"):WaitForChild("OmniKit")
@@ -19,9 +22,9 @@ local Util = require(Kit:WaitForChild("Util"))
 
 local Obby = {}
 
-local settings = Config.Template or {}
-local STAGE_REWARD = settings.StageReward or 5
-local FINISH_REWARD = settings.FinishReward or 250
+local settings: { [string]: any } = Config.Template or {}
+local STAGE_REWARD = tonumber(settings.StageReward) or 5
+local FINISH_REWARD = tonumber(settings.FinishReward) or 250
 
 local checkpoints: { [number]: BasePart } = {}
 Obby.StageCount = 0
@@ -45,7 +48,7 @@ function Obby.Checkpoint(stage: number): BasePart?
 	return checkpoints[stage]
 end
 
-local function sendState(player)
+local function sendState(player: any)
 	local profile = Data.Get(player)
 	if profile and Util.IsRealPlayer(player) then
 		Net.Event("ObbyState"):FireClient(player, {
@@ -57,7 +60,7 @@ local function sendState(player)
 	end
 end
 
-local function placeAtCheckpoint(player, character)
+local function placeAtCheckpoint(player: any, character: Model)
 	local profile = Data.Get(player)
 	if not profile then
 		return
@@ -74,7 +77,7 @@ local function placeAtCheckpoint(player, character)
 end
 
 -- Moves a player to a stage they have earned. Returns true when progress advanced. Exposed for tests.
-function Obby.Reach(player, stage: number): boolean
+function Obby.Reach(player: any, stage: number): boolean
 	local profile = Data.Get(player)
 	if not profile or stage ~= profile.Stage + 1 or not checkpoints[stage] then
 		return false
@@ -82,15 +85,22 @@ function Obby.Reach(player, stage: number): boolean
 	profile.Stage = stage
 	if stage > profile.BestStage then
 		profile.BestStage = stage
-		Currency.Add(player, STAGE_REWARD + stage, "StageReward")
+		local gained = Currency.Add(player, STAGE_REWARD + stage, "StageReward")
 		Analytics.Funnel(player, "Obby", stage, "Stage " .. stage)
+		Quests.Track(player, "stage", 1)
+		local checkpoint = checkpoints[stage]
+		if checkpoint then
+			Effects.Burst(checkpoint.Position + Vector3.new(0, 3, 0), Color3.fromRGB(120, 255, 160), 20, player)
+			Effects.Float(player, checkpoint.Position + Vector3.new(0, 4, 0), "Stage " .. stage .. "!  +" .. Util.Format(gained) .. " " .. Currency.Icon)
+		end
+		Effects.Sound(player, "notify")
 	end
 	Data.MarkDirty(player)
 	sendState(player)
 	return true
 end
 
-function Obby.Finish(player): boolean
+function Obby.Finish(player: any): boolean
 	local profile = Data.Get(player)
 	if not profile or profile.Stage < Obby.StageCount then
 		return false
@@ -100,14 +110,17 @@ function Obby.Finish(player): boolean
 		Currency.Add(player, FINISH_REWARD, "FinishReward", false)
 		Analytics.Funnel(player, "Obby", Obby.StageCount + 1, "Finished")
 		Analytics.Event("obby_complete", player, { stages = Obby.StageCount })
+		Quests.Track(player, "finish", 1)
 		Shop.Notify(player, "You beat the obby! +" .. Util.Format(FINISH_REWARD) .. " " .. Currency.Name, "reward")
+		Effects.Reward(player, nil, "🏆 +" .. Util.Format(FINISH_REWARD) .. " " .. Currency.Icon)
+		Effects.Sound(player, "victory")
 	end
 	Data.MarkDirty(player)
 	sendState(player)
 	return true
 end
 
-function Obby.SkipStage(player): boolean
+function Obby.SkipStage(player: any): boolean
 	local profile = Data.Get(player)
 	if not profile or profile.Stage >= Obby.StageCount then
 		return false
@@ -134,9 +147,9 @@ function Obby.Start()
 	Analytics.SessionSummary = function(player)
 		local profile = Data.Get(player)
 		return {
-			stage = profile and profile.Stage or 0,
-			best = profile and profile.BestStage or 0,
-			completed = profile and profile.Completed or false,
+			stage = if profile then profile.Stage else 0,
+			best = if profile then profile.BestStage else 0,
+			completed = if profile then profile.Completed else false,
 			stages = Obby.StageCount,
 		}
 	end
@@ -169,7 +182,7 @@ function Obby.Start()
 		Analytics.Funnel(player, "Obby", 1, "Joined")
 	end)
 
-	local function setup(player)
+	local function setup(player: Player)
 		player.CharacterAdded:Connect(function(character)
 			placeAtCheckpoint(player, character)
 		end)
@@ -182,10 +195,10 @@ function Obby.Start()
 	Net.Function("ObbyInfo").OnServerInvoke = function(player)
 		local profile = Data.Get(player)
 		return {
-			stage = profile and profile.Stage or 1,
+			stage = if profile then profile.Stage else 1,
 			total = Obby.StageCount,
-			best = profile and profile.BestStage or 1,
-			completed = profile and profile.Completed or false,
+			best = if profile then profile.BestStage else 1,
+			completed = if profile then profile.Completed else false,
 		}
 	end
 end

@@ -27,6 +27,10 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         /// <summary>US dollars paid per Robux by the Developer Exchange (shown as an estimate only).</summary>
         public double DevExRate { get; set; } = 0.0038;
         public int MaintenanceIntervalDays { get; set; } = 7;
+        /// <summary>The output cap of one agent reply (reasoning included); big enough for a whole source file.</summary>
+        public int MaxOutputTokens { get; set; } = 16_384;
+        /// <summary>A cycle hands over to the next one when its prompt reaches this size (the work carries on).</summary>
+        public long CycleContextTokens { get; set; } = 120_000;
     }
 
     /// <summary>Web research for the research loop (KliveRAG's SearXNG search and page fetch in production).</summary>
@@ -61,6 +65,52 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         /// <summary>The owner's playtests: builds of any revision, published to a private experience or downloaded for Studio.</summary>
         public Playtests Playtests => LazyInitializer.EnsureInitialized(ref playtests, () => new Playtests(this));
 
+        /// <summary>The cycles running now, for the dashboard's live view.</summary>
+        public LiveBoard Live { get; } = new();
+
+        /// <summary>The Luau type checker (luau-lsp); null where the studio runs without it (unit tests).</summary>
+        public LuauToolchain? Luau { get; init; }
+
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<long, (DateTime Stamp, SpriteImage? Image)> sprites = new();
+
+        /// <summary>Roblox's own picture of a library model (transparent background), decoded once; null when there is none.</summary>
+        public SpriteImage? SpriteFor(long assetId)
+        {
+            string path = Library.ThumbnailPath(assetId);
+            if (!File.Exists(path)) return null;
+            var stamp = File.GetLastWriteTimeUtc(path);
+            if (sprites.TryGetValue(assetId, out var cached) && cached.Stamp == stamp) return cached.Image;
+            SpriteImage? image;
+            try { image = SpriteImage.Decode(File.ReadAllBytes(path)); }
+            catch (IOException) { image = null; }
+            if (sprites.Count > 800) sprites.Clear();
+            sprites[assetId] = (stamp, image);
+            return image;
+        }
+
+        /// <summary>A picture of a game's world as it is now (see <see cref="WorldRenderer"/> for the views).</summary>
+        public byte[] Render(string gameId, string view, int width = 1280, int height = 760, bool labels = false, bool caption = true, bool marketing = false,
+            (System.Numerics.Vector3 Eye, System.Numerics.Vector3 Target, float Fov)? camera = null)
+        {
+            var result = Compile(gameId);
+            if (result.Parts.Count == 0 && result.Terrain == null) throw new InvalidOperationException("the world is empty");
+            return RenderCompiled(gameId, result, view, width, height, labels, caption, marketing, camera);
+        }
+
+        /// <summary>Everything the renderer needs to draw a compiled world: its parts, scene, terrain and the library's model pictures.</summary>
+        public RenderWorld RenderWorldFor(string gameId, CompileResult result) =>
+            new() { Parts = result.Parts, Scene = Workspace(gameId).LoadScene(), Terrain = result.Terrain, Sprite = SpriteFor };
+
+        public byte[] RenderCompiled(string gameId, CompileResult result, string view, int width = 1280, int height = 760, bool labels = false, bool caption = true, bool marketing = false,
+            (System.Numerics.Vector3 Eye, System.Numerics.Vector3 Target, float Fov)? camera = null)
+        {
+            var world = RenderWorldFor(gameId, result);
+            return WorldRenderer.Render(world, new RenderRequest
+            {
+                View = view, Width = width, Height = height, Labels = labels, Caption = caption && !marketing, Marketing = marketing, Camera = camera,
+            });
+        }
+
         public RobloxCreator Creator => new(Settings.CreatorUserId, Settings.CreatorGroupId);
 
         public GameWorkspace Workspace(string gameId) =>
@@ -91,8 +141,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             return new AssetPlacement(new RbxVector3(m.Pivot[0], m.Pivot[1], m.Pivot[2]), rec.Label?.FrontYaw ?? 0, new RbxVector3(m.SizeX, m.SizeY, m.SizeZ), rec.Label?.What is { Length: > 0 } w ? w : rec.Name);
         }
 
-        /// <summary>Compiles a game's workspace into a place (with the given product ids baked into its config).</summary>
-        public CompileResult Compile(string gameId)
+        /// <summary>
+        /// Compiles a game's workspace into a place (with the given product ids baked into its config). The
+        /// engine-test build starts its own scripts in Roblox's engine (see <see cref="CompileInput.EngineTest"/>).
+        /// </summary>
+        public CompileResult Compile(string gameId, bool engineTest = false)
         {
             var game = Game(gameId) ?? throw new KeyNotFoundException("No game " + gameId);
             return PlaceCompiler.Compile(new CompileInput
@@ -104,6 +157,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 Products = game.Products,
                 TelemetryUrl = TelemetryUrl,
                 TelemetrySecret = game.TelemetrySecret,
+                EngineTest = engineTest,
             });
         }
 

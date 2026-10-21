@@ -32,7 +32,7 @@ namespace Omnipotent.Tests.OmniBlox
                     CoreLoop = "Jump, reach a checkpoint, repeat.", MustHave = { "20 stages", "a finish" }, DoneWhen = { "every stage reachable" },
                 };
                 g.Milestones = new List<Milestone> { new() { MilestoneId = "m1", Title = "Core loop playable" } };
-                g.KeyFacts.Add("spawn is p1");
+                g.KeyFacts.Add(FactBook.Parse("spawn: p1", h.Now, GameStage.Build));
                 g.Decisions.Add(new Decision { Stage = GameStage.Build, What = "red lava", Why = "visible" });
             });
             string first = Briefing.Build(h.Game(id), h.Ctx);
@@ -40,7 +40,7 @@ namespace Omnipotent.Tests.OmniBlox
             // One cycle later: a new fact, a decision and a hand-over, and the clock has moved on.
             h.Ctx.Update(id, g =>
             {
-                g.KeyFacts.Add("stage 5 is p40");
+                g.KeyFacts.Add(FactBook.Parse("stage 5: p40", h.Now, GameStage.Build));
                 g.Decisions.Add(new Decision { Stage = GameStage.Build, What = "add a bounce pad", Why = "variety" });
                 g.Cycles.Add(new CycleReport { Utc = h.Now, Stage = GameStage.Build, Role = "builder", Outcome = "finished", Done = "Built stages 1-5." });
                 g.StageCycles[GameStage.Build] = 1;
@@ -49,7 +49,7 @@ namespace Omnipotent.Tests.OmniBlox
             string second = Briefing.Build(h.Game(id), h.Ctx);
 
             int shared = first.Zip(second).TakeWhile(p => p.First == p.Second).Count();
-            Assert.Equal(second.IndexOf("- stage 5 is p40", StringComparison.Ordinal), shared);
+            Assert.Equal(second.IndexOf("- stage 5: p40", StringComparison.Ordinal), shared);
             string[] order = { "## The brief", "## Milestones", "## Facts to keep", "## Decisions so far", "## The last hand-overs", "## Current state", "## Exit criteria" };
             var at = order.Select(heading => second.IndexOf(heading, StringComparison.Ordinal)).ToList();
             Assert.All(at, i => Assert.True(i >= 0));

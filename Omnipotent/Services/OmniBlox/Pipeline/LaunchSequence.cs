@@ -10,9 +10,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
     /// <summary>
     /// Publishes a game whose marketing is ready, one idempotent step at a time so a restart (or an owner
-    /// task) can interrupt it anywhere: API key → experience slot → compliance → products → final build →
-    /// engine tests → store page → homepage thumbnails → owner tasks for the things with no API (icon,
-    /// maturity questionnaire) → launch approval if required → publish → public.
+    /// task) can interrupt it anywhere: API key → experience slot → compliance → final build → engine tests →
+    /// retire an earlier game's products left in the slot → products → the publish build (with product ids) →
+    /// store page → homepage thumbnails → owner tasks for the things with no API (icon, maturity
+    /// questionnaire) → launch approval if required → publish → public. Nothing irreversible happens on Roblox
+    /// (products) until the game has run clean in the engine.
     /// </summary>
     public static class LaunchSequence
     {
@@ -50,8 +52,38 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 return (LaunchResult.BackToMarketing, "compliance failed: " + string.Join("; ", compliance.Errors));
             }
 
-            // 4. Products exist on Roblox (ids are baked into the place's config).
+            // 4. The final build and 5. the game running clean in Roblox's engine — before anything irreversible
+            // happens on Roblox (a broken game used to get its products created and then bounce back to Build).
+            Step("final build");
+            var build = await BuildTools.RunBuildAsync(ctx, gameId, ct);
+            if (!build.Ok) return (LaunchResult.BackToBuild, "the final build failed: " + BuildErrors(build));
+            Step("engine tests");
+            game = ctx.Game(gameId)!;
+            if (!StageGates.EnginePassed(game))
+            {
+                var (engine, message) = await BuildTools.RunEngineTestsAsync(ctx, gameId, ct, build);
+                if (engine == null) return (LaunchResult.Failed, "the engine tests could not run: " + message);
+                if (!engine.Ok && !TestStage.GameChecksPass(engine))
+                {
+                    ctx.Update(gameId, g => g.LastTest = new TestReport
+                    {
+                        Utc = ctx.Clock(), BuildRevision = engine.Revision, StaticOk = true, GeometryOk = true, EngineRan = true, EngineOk = false, EngineVersion = engine.Version, Engine = engine,
+                        Summary = "Engine tests failed before launch: " + engine.Summary,
+                        Issues = engine.Results.Where(r => !r.Ok && r.Phase != "kit").Select(r => new TestIssue { Severity = "error", Area = "engine " + r.Phase, Message = $"{r.Name}: {r.Detail}" })
+                            .Concat(engine.Errors.Select(e => new TestIssue { Severity = "error", Area = "runtime " + e.Phase, Message = (e.File != null ? $"{e.File}{(e.Line is int l ? ":" + l : "")}: " : "") + e.Message })).ToList(),
+                    });
+                    return (LaunchResult.BackToBuild, "engine tests failed before launch: " + engine.Summary);
+                }
+            }
+
+            // 6. An earlier game's products left in this experience come off sale.
+            Step("retire old products");
+            await RetireStaleProductsAsync(ctx, gameId, slot, ct);
+
+            // 7. Products exist on Roblox (ids are baked into the place's config).
             Step("products");
+            game = ctx.Game(gameId)!;
+            bool productsChanged = false;
             foreach (var product in game.Products.Where(p => p.RobloxId == null || p.SyncedUtc == null))
             {
                 var spec = new ProductSpec
@@ -82,6 +114,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                         p.RobloxId = id;
                         p.SyncedUtc = ctx.Clock();
                     });
+                    productsChanged = true;
                 }
                 catch (RobloxApiException ex) when (ex.IsAuth)
                 {
@@ -91,29 +124,23 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 }
             }
 
-            // 5. The final build (with product ids) and 6. its engine tests.
-            Step("final build");
-            var run = BuildTools.RunBuild(ctx, gameId);
-            if (!run.Ok) return (LaunchResult.BackToBuild, "the final build failed: " + string.Join("; ", run.Compile.Errors.Concat(run.Geometry.Where(g => g.IsError).Select(g => g.ToString())).Take(5)));
+            // 8. The publish build: the same files (so the same revision, which the engine run above covers) with the
+            // new product ids in its config.
             int revision = ctx.Game(gameId)!.Build.Revision;
-            Step("engine tests");
-            if (ctx.Game(gameId)!.Publish.EngineTestedRevision != revision)
+            if (productsChanged)
             {
-                var engine = await EngineTests.RunAsync(ctx, slot, run.Compile.PlaceXml, ct);
-                if (!engine.Ok)
-                {
-                    ctx.Update(gameId, g => g.LastTest = new TestReport
-                    {
-                        Utc = ctx.Clock(), BuildRevision = revision, StaticOk = true, GeometryOk = true, EngineRan = true, EngineOk = false, EngineVersion = engine.Version,
-                        Summary = "Engine tests failed before launch: " + engine.Message,
-                        Issues = engine.Failures.Select(f => new TestIssue { Severity = "error", Area = "engine", Message = f }).ToList(),
-                    });
-                    return (LaunchResult.BackToBuild, "engine tests failed: " + string.Join("; ", engine.Failures.Take(3)));
-                }
-                ctx.Update(gameId, g => { g.Publish.EngineTestedRevision = revision; g.Publish.LastSavedVersion = engine.Version; g.Publish.LastSavedRevision = revision; });
+                Step("publish build");
+                build = await BuildTools.RunBuildAsync(ctx, gameId, ct);
+                if (!build.Ok) return (LaunchResult.BackToBuild, "the publish build failed: " + BuildErrors(build));
+                if (ctx.Game(gameId)!.Build.Revision != revision) return (LaunchResult.Failed, "the game's files changed during the launch; starting the checks again");
             }
+            ctx.Update(gameId, g =>
+            {
+                g.Publish.EngineTestedRevision = revision;
+                if (g.Build.LastEngineRun is { } tested && tested.Revision == revision) { g.Publish.LastSavedVersion = tested.Version; g.Publish.LastSavedRevision = revision; }
+            });
 
-            // 7. Store page.
+            // 9. Store page.
             Step("store page");
             game = ctx.Game(gameId)!;
             if (!game.Store.Applied)
@@ -122,7 +149,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 ctx.Update(gameId, g => g.Store.Applied = true);
             }
 
-            // 8. Homepage thumbnails (experimental API; the owner task below covers it if this fails).
+            // 10. Homepage thumbnails (experimental API; the owner task below covers it if this fails).
             Step("thumbnails");
             bool thumbsUploaded = false;
             try
@@ -139,7 +166,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 ctx.Event(EventLevel.Info, "launch.thumbnails", "Homepage thumbnail upload was not accepted (" + ex.Message + "); left for the owner.", gameId);
             }
 
-            // 9. Things with no API: the owner does them once, with everything prepared.
+            // 11. Things with no API: the owner does them once, with everything prepared.
             Step("owner tasks");
             var files = new List<string>();
             if (game.Store.IconFile != null) files.Add(game.Store.IconFile);
@@ -152,7 +179,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     "Prepared honest answers:\n- " + string.Join("\n- ", compliance.QuestionnaireNotes), gameId, now);
             });
 
-            // 10. Launch approval.
+            // 12. Launch approval.
             Step("approval");
             if (ctx.Settings.RequireLaunchApproval && game.Publish.LaunchApprovedUtc == null)
             {
@@ -162,12 +189,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 return (LaunchResult.Waiting, "waiting for the owner's launch approval");
             }
 
-            // 11. Publish and 12. go public.
+            // 13. Publish and 14. go public.
             Step("publish");
             game = ctx.Game(gameId)!;
             if (game.Publish.LastPublishedRevision != revision)
             {
-                var published = await ctx.Cloud.PublishPlaceAsync(slot.UniverseId, slot.PlaceId, run.Compile.PlaceXml, isXml: true, publish: true, ct);
+                var published = await ctx.Cloud.PublishPlaceAsync(slot.UniverseId, slot.PlaceId, build.Compile.PlaceXml, isXml: true, publish: true, ct);
                 ctx.Update(gameId, g =>
                 {
                     g.Publish.LastPublishedVersion = published.VersionNumber;
@@ -204,14 +231,48 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             return (LaunchResult.Done, $"\"{game.Store.Title}\" is live");
         }
 
-        /// <summary>A small product image: the game's own world behind the product name.</summary>
+        private static string BuildErrors(BuildTools.BuildRun build) =>
+            string.Join("; ", build.Compile.Errors
+                .Concat(build.Types?.Errors.Select(d => d.ToString()) ?? Enumerable.Empty<string>())
+                .Concat(build.Geometry.Where(g => g.IsError).Select(g => g.ToString())).Take(5));
+
+        /// <summary>
+        /// A slot is reused after its game was abandoned, and that game may have created passes and products there
+        /// before it stopped (a launch that failed late). Left alone they would sell on the new game's page and grant
+        /// nothing. Takes them off sale once, and records it on the old game.
+        /// </summary>
+        private static async Task RetireStaleProductsAsync(StudioContext ctx, string gameId, ExperienceSlot slot, CancellationToken ct)
+        {
+            var stale = ctx.Store.Read(s => s.Games.Values
+                .Where(g => g.GameId != gameId && g.Stage == GameStage.Abandoned && g.Slot?.UniverseId == slot.UniverseId)
+                .SelectMany(g => g.Products.Where(p => p.RobloxId != null && !p.Retired).Select(p => (Game: g.GameId, Product: p)))
+                .ToList());
+            foreach (var (oldGame, product) in stale)
+            {
+                var spec = new ProductSpec { Name = Clip(product.Name, 50), Description = Clip(product.Description, 900), PriceRobux = Math.Max(1, product.PriceRobux), IsForSale = false };
+                try
+                {
+                    if (product.Kind == ProductKind.GamePass) await ctx.Cloud.UpdateGamePassAsync(slot.UniverseId, product.RobloxId!.Value, spec, ct);
+                    else await ctx.Cloud.UpdateDeveloperProductAsync(slot.UniverseId, product.RobloxId!.Value, spec, ct);
+                }
+                catch (RobloxApiException ex) when (ex.IsNotFound)
+                {
+                    // Already gone.
+                }
+                ctx.Update(oldGame, g =>
+                {
+                    if (g.Products.FirstOrDefault(p => p.Key == product.Key) is { } p) p.Retired = true;
+                });
+                ctx.Event(EventLevel.Info, "launch.retired", $"Took \"{product.Name}\" (from an abandoned game in the same experience) off sale.", gameId);
+            }
+        }
+
+        /// <summary>A small product image: the game's own world behind the product name, in the bright marketing look.</summary>
         private static byte[]? ProductIcon(StudioContext ctx, string gameId, ProductRecord product)
         {
             try
             {
-                var result = ctx.Compile(gameId);
-                if (result.Parts.Count == 0) return null;
-                var render = Build.SceneRenderer.Render(result.Parts, ctx.Workspace(gameId).LoadScene(), "iso", 600, 600, caption: false);
+                var render = ctx.Render(gameId, "iso", 600, 600, labels: false, caption: false, marketing: true);
                 return ctx.Marketing.MakeIcon(new ArtSpec { Headline = product.Name, SceneRender = render, Accent = new RbxColor3uint8(255, 190, 60) });
             }
             catch (Exception ex) when (ex is not OperationCanceledException)

@@ -169,15 +169,42 @@ namespace Omnipotent.Tests.OmniBlox
         }
 
         [Theory]
-        [InlineData("[{\"passed\":4,\"failed\":0,\"results\":[]}]", true, 0)]
-        [InlineData("[{\"passed\":3,\"failed\":1,\"results\":[{\"name\":\"Core · coins\",\"ok\":false,\"detail\":\"expected 10, got 0\"}]}]", false, 1)]
-        [InlineData("{\"results\":[{\"passed\":2,\"failed\":0,\"results\":[]}]}", true, 0)]
+        [InlineData("[{\"passed\":1,\"failed\":0,\"results\":[{\"name\":\"Core · coins\",\"ok\":true,\"phase\":\"game\"}]}]", true, 0)]
+        [InlineData("[{\"passed\":3,\"failed\":1,\"results\":[{\"name\":\"Core · coins\",\"ok\":false,\"detail\":\"expected 10, got 0\",\"phase\":\"game\"}]}]", false, 1)]
+        [InlineData("{\"results\":[{\"passed\":1,\"failed\":0,\"results\":[{\"name\":\"Kit · data\",\"ok\":true,\"phase\":\"kit\",\"owner\":\"kit\"}]}]}", true, 0)]
         public void EngineOutput_Parses(string output, bool ok, int failures)
         {
             var r = EngineTests.Parse(output, 3);
             Assert.Equal(ok, r.Ok);
-            Assert.Equal(failures, r.Failures.Count);
-            if (failures > 0) Assert.Contains("expected 10", r.Failures[0]);
+            Assert.Equal(failures, r.Results.Count(x => !x.Ok));
+            if (failures > 0) Assert.Contains("expected 10", r.Results.First(x => !x.Ok).Detail);
+        }
+
+        [Fact]
+        public void EngineOutput_WithNoResultsAtAll_IsAFailureNotAPass()
+        {
+            // An empty run proves nothing: the first studio could "pass" a run that never started a single check.
+            var r = EngineTests.Parse("[{\"passed\":0,\"failed\":0,\"results\":[]}]", 3);
+            Assert.False(r.Ok);
+            Assert.False(EngineTests.Parse("", 3).Ok);
+            Assert.False(EngineTests.Parse("not json at all", 3).Ok);
+        }
+
+        [Fact]
+        public void EngineOutput_KitControlFailures_AreMarkedAsTheStudiosAndRuntimeErrorsAreLocated()
+        {
+            const string output = "[{\"passed\":1,\"failed\":1,\"results\":[" +
+                "{\"name\":\"Kit · new profiles start with the configured currency\",\"ok\":false,\"detail\":\"expected 200, got 335\",\"phase\":\"kit\",\"owner\":\"kit\"}," +
+                "{\"name\":\"Forest · chopping pays\",\"ok\":true,\"phase\":\"game\",\"owner\":\"game\"}]," +
+                "\"errors\":[{\"message\":\"ServerScriptService.Systems.Forest:12: attempt to index nil with 'Health'\",\"phase\":\"boot\"}]}]";
+            var r = EngineTests.Parse(output, 7);
+            Assert.False(r.Ok);
+            Assert.True(r.KitFailed);
+            Assert.Single(r.Errors);
+            Assert.Contains("studio", r.Summary);
+            Assert.False(TestStage.GameChecksPass(r)); // a runtime error is the game's
+            r.Errors.Clear();
+            Assert.True(TestStage.GameChecksPass(r)); // only the kit's control failed: not the game's fault
         }
     }
 
@@ -322,7 +349,7 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.True(outcome.StageComplete);
             Assert.Equal("built the lobby", outcome.Report.Done);
             Assert.Equal("use red lava", outcome.NewDecisions.Single().What);
-            Assert.Equal("lobby is p12", outcome.KeyFacts.Single());
+            Assert.Equal("lobby is p12", outcome.KeyFacts.Single().Text);
             Assert.Equal("echo hi", llm.Results[0].Split('\n')[0]);
         }
 
@@ -346,7 +373,7 @@ namespace Omnipotent.Tests.OmniBlox
         {
             var llm = new OneShotLlm(); // only ever answers with text
             var outcome = await new AgentCycleRunner(llm).RunAsync(Request(Tools()), CancellationToken.None);
-            Assert.Equal(2, llm.Users.Count(u => u.StartsWith("Keep going")));
+            Assert.Equal(3, llm.Users.Count(u => u.StartsWith("Keep going")));
             Assert.Contains(llm.Users, u => u.StartsWith("This cycle is over"));
             Assert.False(outcome.Finished);
             Assert.Equal("cut short", outcome.Report.Outcome);
@@ -407,6 +434,45 @@ namespace Omnipotent.Tests.OmniBlox
             await new AgentCycleRunner(llm).RunAsync(Request(Tools()), CancellationToken.None);
             Assert.Equal("brief", llm.StableUsers.Single());
             Assert.DoesNotContain("brief", llm.Users);
+        }
+
+        [Fact]
+        public async Task AToolCallCutOffByTheOutputLimit_IsNotRun_AndTheModelIsToldToSplitIt()
+        {
+            // The first studio ran cut-off write_file calls, truncating the ends of files.
+            var llm = new OneShotLlm();
+            var cut = Call("echo", "{\"text\":\"half a fi");
+            llm.Turns.Enqueue(new LlmTurn { Success = true, FinishReason = "length", ToolCalls = cut.ToolCalls, PromptTokens = 1000 });
+            llm.Turns.Enqueue(Call("echo", "{\"text\":\"whole\"}"));
+            llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"done\"}"));
+            var outcome = await new AgentCycleRunner(llm).RunAsync(Request(Tools()), CancellationToken.None);
+            Assert.True(outcome.Finished);
+            Assert.Contains(llm.Results, r => r.Contains("NOT RUN") && r.Contains("output limit"));
+            Assert.DoesNotContain(llm.Results, r => r.StartsWith("echo half"));
+            Assert.Contains(llm.Results, r => r.StartsWith("echo whole"));
+            Assert.Equal(1, outcome.Report.Truncations);
+        }
+
+        [Fact]
+        public async Task TheOwnersMessages_ReachARunningCycle_AndComeBackAsDone()
+        {
+            var llm = new OneShotLlm();
+            llm.Turns.Enqueue(Call("echo", "{\"text\":\"a\"}"));
+            llm.Turns.Enqueue(Call("echo", "{\"text\":\"b\"}"));
+            llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"made it bigger\",\"directives_done\":[{\"id\":\"d1\",\"response\":\"doubled the map\"}]," +
+                "\"key_facts\":[{\"key\":\"map\",\"fact\":\"800 studs a side\"}],\"drop_facts\":[\"old map\"]}"));
+            int asked = 0;
+            var request = new CycleRequest
+            {
+                GameId = "g1", Stage = GameStage.Build, Role = "builder", SystemPrompt = "sys", Briefing = "brief", Tools = Tools(),
+                OwnerMessages = () => ++asked == 2 ? new[] { ("d1", "Make the map twice as big") } : Array.Empty<(string, string)>(),
+            };
+            var outcome = await new AgentCycleRunner(llm).RunAsync(request, CancellationToken.None);
+            Assert.Single(llm.Users, u => u.Contains("Message from the owner (directive d1)") && u.Contains("twice as big"));
+            Assert.Equal(("d1", "doubled the map"), outcome.DirectivesDone.Single());
+            Assert.Equal("map", outcome.KeyFacts.Single().Key);
+            Assert.Equal("800 studs a side", outcome.KeyFacts.Single().Text);
+            Assert.Contains("old map", outcome.DropFacts);
         }
     }
 

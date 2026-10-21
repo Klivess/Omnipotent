@@ -73,7 +73,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             public bool FootprintContains(float x, float z) => x >= Min.X && x <= Max.X && z >= Min.Z && z <= Max.Z;
         }
 
-        public static List<GeometryIssue> Verify(IReadOnlyList<WorldPart> parts, SceneDocument scene, GameManifest manifest)
+        public static List<GeometryIssue> Verify(IReadOnlyList<WorldPart> parts, SceneDocument scene, GameManifest manifest, TerrainMap? terrain = null)
         {
             var issues = new List<GeometryIssue>();
             if (parts.Count == 0)
@@ -85,7 +85,13 @@ namespace Omnipotent.Services.OmniBlox.Build
             var boxes = parts.Select(Box.Of).ToList();
             var objects = parts.Select((p, i) => (p, i)).GroupBy(x => x.p.ObjectId)
                 .ToDictionary(g => g.Key, g => (Parts: g.Select(x => x.p).ToList(), Box: Box.Union(g.Select(x => boxes[x.i]))));
-            var bounds = scene.Bounds;
+            // Scenery may stand outside the walled play area (it frames the map), but not outside the world.
+            var bounds = new MapBounds
+            {
+                HalfWidth = Math.Max(scene.Bounds.HalfWidth, terrain == null ? 0 : Math.Max(Math.Max(Math.Abs(terrain.OriginX), Math.Abs(terrain.MaxX)), Math.Max(Math.Abs(terrain.OriginZ), Math.Abs(terrain.MaxZ))) + 50),
+                MinY = Math.Min(scene.Bounds.MinY, (terrain?.Floor ?? 0) - 20),
+                MaxY = scene.Bounds.MaxY,
+            };
 
             // Budget
             if (parts.Count > PartLimit) issues.Add(new("error", "world", $"{parts.Count} parts is too many for phones (limit {PartLimit})"));
@@ -123,6 +129,11 @@ namespace Omnipotent.Services.OmniBlox.Build
                 }
                 foreach (var t in terrainTops)
                     if (t.FootprintContains(x, z) && t.Top <= box.Bottom + 0.75f && (best == null || t.Top > best)) best = t.Top;
+                if (terrain != null && terrain.Covers(x, z))
+                {
+                    float ground = terrain.HeightAt(x, z);
+                    if (ground <= box.Bottom + 0.75f && (best == null || ground > best)) best = ground;
+                }
                 return best;
             }
 
@@ -139,6 +150,12 @@ namespace Omnipotent.Services.OmniBlox.Build
                 else if (o.Box.Bottom - support.Value > 0.6f)
                 {
                     issues.Add(new("warning", obj.Id, $"\"{obj.Name}\" floats {o.Box.Bottom - support.Value:0.#} studs above the surface below it (set its y to {support.Value:0.#})"));
+                }
+                if (terrain != null && terrain.Covers(o.Box.Center.X, o.Box.Center.Z))
+                {
+                    float ground = terrain.HeightAt(o.Box.Center.X, o.Box.Center.Z);
+                    if (ground - o.Box.Bottom > MathF.Max(1.5f, height * 0.35f))
+                        issues.Add(new("warning", obj.Id, $"\"{obj.Name}\" is sunk {ground - o.Box.Bottom:0.#} studs into the terrain (the ground there is at y {ground:0.#}); give its position as [x, z] to stand it on the ground"));
                 }
                 // Half-buried: something solid passes through its middle height at its centre.
                 var centreProbe = new Box(new RbxVector3(o.Box.Center.X - 0.1f, o.Box.Bottom, o.Box.Center.Z - 0.1f), new RbxVector3(o.Box.Center.X + 0.1f, o.Box.Bottom + height * 0.35f, o.Box.Center.Z + 0.1f));
@@ -185,6 +202,8 @@ namespace Omnipotent.Services.OmniBlox.Build
             foreach (string spawnId in spawnIds)
             {
                 if (!objects.TryGetValue(spawnId, out var spawn)) continue;
+                if (terrain != null && terrain.Covers(spawn.Box.Center.X, spawn.Box.Center.Z) && terrain.HeightAt(spawn.Box.Center.X, spawn.Box.Center.Z) > spawn.Box.Top + 0.5f)
+                    issues.Add(new("error", spawnId, $"the spawn is buried in the terrain (the ground there is at y {terrain.HeightAt(spawn.Box.Center.X, spawn.Box.Center.Z):0.#}); raise it or flatten the ground (terrain_flatten)"));
                 var head = new Box(new RbxVector3(spawn.Box.Center.X - 1, spawn.Box.Top + 0.2f, spawn.Box.Center.Z - 1), new RbxVector3(spawn.Box.Center.X + 1, spawn.Box.Top + 6f, spawn.Box.Center.Z + 1));
                 foreach (var (otherId, other) in objects)
                 {

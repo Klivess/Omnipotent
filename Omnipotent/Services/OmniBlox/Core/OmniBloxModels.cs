@@ -71,7 +71,15 @@ namespace Omnipotent.Services.OmniBlox.Core
         // The brain
         public List<CycleReport> Cycles { get; set; } = new();
         public List<Decision> Decisions { get; set; } = new();
-        public List<string> KeyFacts { get; set; } = new();
+        /// <summary>
+        /// Facts kept word for word in every briefing. A fact with a key replaces the older fact with the same key,
+        /// so a cycle updates "economy" or "file layout" instead of piling up near-copies. Old dossiers stored plain
+        /// strings here; <see cref="KeyFactListConverter"/> reads both.
+        /// </summary>
+        [JsonConverter(typeof(KeyFactListConverter))]
+        public List<KeyFact> KeyFacts { get; set; } = new();
+        /// <summary>What the owner asked for (steering). Open ones lead every briefing until an agent reports them done.</summary>
+        public List<OwnerDirective> Directives { get; set; } = new();
         public Dictionary<GameStage, int> StageFailures { get; set; } = new();
         public Dictionary<GameStage, int> StageCycles { get; set; } = new();
         public UsageTotals Usage { get; set; } = new();
@@ -80,6 +88,12 @@ namespace Omnipotent.Services.OmniBlox.Core
         /// <summary>How many times the watchdog has had to step in on this game.</summary>
         public int Escalations { get; set; }
         public string? AbandonReason { get; set; }
+        /// <summary>The stage a game was in when it was abandoned, so the owner can revive it there.</summary>
+        public GameStage? AbandonedFromStage { get; set; }
+        /// <summary>Whether the game is moving: what the watchdog measures instead of counting cycles.</summary>
+        public ProgressState Progress { get; set; } = new();
+        /// <summary>Model or provider failures in a row (AIRouter down, queue full). They back off; they never count against the game.</summary>
+        public int ProviderFailures { get; set; }
 
         [JsonIgnore]
         public string DisplayTitle => !string.IsNullOrWhiteSpace(Store.Title) ? Store.Title
@@ -89,9 +103,114 @@ namespace Omnipotent.Services.OmniBlox.Core
         [JsonIgnore]
         public bool InProduction => Stage is GameStage.Research or GameStage.Build or GameStage.Test or GameStage.Launch;
 
-        public const int MaxCycleReports = 60;
+        public const int MaxCycleReports = 80;
         public const int MaxKeyFacts = 40;
+        public const int MaxKeyFactLength = 600;
         public const int MaxDecisions = 80;
+        public const int MaxDirectives = 40;
+    }
+
+    /// <summary>One fact a cycle asked to keep. <see cref="Key"/> is a short topic ("economy", "plot layout"); empty for an unkeyed fact.</summary>
+    public sealed class KeyFact
+    {
+        public string Key { get; set; } = "";
+        public string Text { get; set; } = "";
+        public DateTime Utc { get; set; }
+        public GameStage? Stage { get; set; }
+        /// <summary>Written by the owner (steering) or the studio itself (watchdog): never pushed out by an agent's facts.</summary>
+        public string Source { get; set; } = "agent";
+
+        public override string ToString() => Key.Length > 0 ? $"{Key}: {Text}" : Text;
+    }
+
+    /// <summary>Reads KeyFacts written as plain strings (old dossiers) or as objects, and always writes objects.</summary>
+    public sealed class KeyFactListConverter : JsonConverter<List<KeyFact>>
+    {
+        public override List<KeyFact> ReadJson(JsonReader reader, Type objectType, List<KeyFact>? existingValue, bool hasExistingValue, JsonSerializer serializer)
+        {
+            var list = new List<KeyFact>();
+            if (reader.TokenType == JsonToken.Null) return list;
+            var array = Newtonsoft.Json.Linq.JArray.Load(reader);
+            foreach (var item in array)
+            {
+                if (item.Type == Newtonsoft.Json.Linq.JTokenType.String)
+                {
+                    string text = ((string?)item ?? "").Trim();
+                    if (text.Length == 0) continue;
+                    // The old steering route wrote the owner's words as "Owner's direction (2026-10-21): …": keep them as the owner's.
+                    var owner = System.Text.RegularExpressions.Regex.Match(text, @"^Owner's direction \((?<day>\d{4}-\d\d-\d\d)\):\s*(?<text>.+)$", System.Text.RegularExpressions.RegexOptions.Singleline);
+                    if (owner.Success)
+                    {
+                        DateTime.TryParse(owner.Groups["day"].Value, System.Globalization.CultureInfo.InvariantCulture, System.Globalization.DateTimeStyles.AdjustToUniversal | System.Globalization.DateTimeStyles.AssumeUniversal, out var day);
+                        list.Add(new KeyFact { Key = "owner " + owner.Groups["day"].Value, Text = FactBook.Normalize(owner.Groups["text"].Value), Utc = day, Source = FactBook.Owner });
+                    }
+                    else list.Add(FactBook.Parse(text, default, null));
+                }
+                else if (item is Newtonsoft.Json.Linq.JObject obj)
+                {
+                    var fact = obj.ToObject<KeyFact>(serializer);
+                    if (fact != null && fact.Text.Trim().Length > 0) list.Add(fact);
+                }
+            }
+            return list;
+        }
+
+        public override void WriteJson(JsonWriter writer, List<KeyFact>? value, JsonSerializer serializer)
+        {
+            writer.WriteStartArray();
+            foreach (var fact in value ?? new List<KeyFact>())
+            {
+                writer.WriteStartObject();
+                writer.WritePropertyName("Key"); writer.WriteValue(fact.Key);
+                writer.WritePropertyName("Text"); writer.WriteValue(fact.Text);
+                writer.WritePropertyName("Utc"); writer.WriteValue(fact.Utc);
+                writer.WritePropertyName("Stage"); if (fact.Stage is GameStage s) writer.WriteValue(s.ToString()); else writer.WriteNull();
+                writer.WritePropertyName("Source"); writer.WriteValue(fact.Source);
+                writer.WriteEndObject();
+            }
+            writer.WriteEndArray();
+        }
+    }
+
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum DirectiveStatus { Open, Done, Dropped }
+
+    /// <summary>A direction from the owner. Shown at the top of every briefing while open; also delivered into a running cycle.</summary>
+    public sealed class OwnerDirective
+    {
+        public string DirectiveId { get; set; } = "";
+        public DateTime Utc { get; set; }
+        public string Text { get; set; } = "";
+        public DirectiveStatus Status { get; set; } = DirectiveStatus.Open;
+        /// <summary>What the agent said it did about it.</summary>
+        public string? Response { get; set; }
+        public DateTime? ResolvedUtc { get; set; }
+        /// <summary>Already shown to a running cycle (so it is not injected twice).</summary>
+        public bool Delivered { get; set; }
+    }
+
+    /// <summary>
+    /// Progress, as the watchdog measures it. A stage never runs out of cycles: what stops a game is a stall,
+    /// the same failure again and again with nothing changing, and even then the studio changes approach and
+    /// finally asks the owner rather than giving up on its own.
+    /// </summary>
+    public sealed class ProgressState
+    {
+        /// <summary>Cycles (or test runs) in a row that changed nothing that matters.</summary>
+        public int StalledCycles { get; set; }
+        /// <summary>The signature of the last failure; the same signature again counts as a stall.</summary>
+        public string? LastFailureSignature { get; set; }
+        /// <summary>The same failure signature in a row.</summary>
+        public int SameFailureCount { get; set; }
+        /// <summary>What progress looked like after the last cycle (clean revision, checklist met, milestones done…).</summary>
+        public string? LastMark { get; set; }
+        public DateTime? LastProgressUtc { get; set; }
+        /// <summary>How far up the stall ladder the game is: 0 none, 1 rethink, 2 deep dive, 3 asked the owner.</summary>
+        public int Level { get; set; }
+        /// <summary>The watchdog's current instruction to the agents (shown in the briefing until progress resets it).</summary>
+        public string? Directive { get; set; }
+        /// <summary>Recent watchdog interventions, newest last.</summary>
+        public List<string> History { get; set; } = new();
     }
 
     public sealed class ResearchNotes
@@ -189,6 +308,59 @@ namespace Omnipotent.Services.OmniBlox.Core
         public bool FeatureComplete { get; set; }
         /// <summary>Library models this game has placed (each counted once in the library's usage stats).</summary>
         public List<long> AssetsUsed { get; set; } = new();
+        /// <summary>Whether the last build was type-checked (and why not, when it was not).</summary>
+        public bool TypeChecked { get; set; }
+        public string? TypeCheckNote { get; set; }
+        /// <summary>The map report's score (0-100) at the last build, and what it found.</summary>
+        public int? MapScore { get; set; }
+        public List<string> MapFindings { get; set; } = new();
+        /// <summary>The newest engine test run (run_tests, the Test stage or a launch), with every case and runtime error.</summary>
+        public EngineRun? LastEngineRun { get; set; }
+        /// <summary>The Game Kit version the current revision was built on (a kit update makes the same files a new build).</summary>
+        public string? KitFingerprint { get; set; }
+    }
+
+    /// <summary>One run of the game in Roblox's engine (see Pipeline/EngineTests).</summary>
+    public sealed class EngineRun
+    {
+        public DateTime Utc { get; set; }
+        public int Revision { get; set; }
+        public bool Ran { get; set; }
+        public bool Ok { get; set; }
+        public long? Version { get; set; }
+        public int Passed { get; set; }
+        public int Failed { get; set; }
+        /// <summary>The kit's own checks (run before any game code) failed: a studio bug, not the game's.</summary>
+        public bool KitFailed { get; set; }
+        public string Summary { get; set; } = "";
+        public List<EngineCase> Results { get; set; } = new();
+        public List<EngineError> Errors { get; set; } = new();
+        public List<string> Warnings { get; set; } = new();
+    }
+
+    public sealed class EngineCase
+    {
+        public string Name { get; set; } = "";
+        public bool Ok { get; set; }
+        public string? Detail { get; set; }
+        /// <summary>kit (control, before game code), load, boot, world, game.</summary>
+        public string Phase { get; set; } = "";
+        /// <summary>kit or game.</summary>
+        public string Owner { get; set; } = "";
+        public double Seconds { get; set; }
+        public bool Skipped { get; set; }
+        public List<string> Warnings { get; set; } = new();
+    }
+
+    public sealed class EngineError
+    {
+        public string Message { get; set; } = "";
+        public string? Source { get; set; }
+        public string? Trace { get; set; }
+        public string Phase { get; set; } = "";
+        /// <summary>The game's file and line the error points at, when it could be found.</summary>
+        public string? File { get; set; }
+        public int? Line { get; set; }
     }
 
     public sealed class TestReport
@@ -203,6 +375,11 @@ namespace Omnipotent.Services.OmniBlox.Core
         public long? EngineVersion { get; set; }
         public List<TestIssue> Issues { get; set; } = new();
         public string Summary { get; set; } = "";
+        /// <summary>The run told nothing about the game: Roblox or the model could not be reached. Retried later.</summary>
+        public bool Infrastructure { get; set; }
+        /// <summary>The engine run this test was decided on (also kept as Build.LastEngineRun).</summary>
+        public EngineRun? Engine { get; set; }
+        public int? MapScore { get; set; }
     }
 
     public sealed class TestIssue
@@ -253,6 +430,8 @@ namespace Omnipotent.Services.OmniBlox.Core
         public string Grant { get; set; } = "";
         public long? RobloxId { get; set; }
         public DateTime? SyncedUtc { get; set; }
+        /// <summary>Taken off sale because the game was abandoned and its experience went to another game.</summary>
+        public bool Retired { get; set; }
     }
 
     public sealed class PublishRecord
@@ -418,15 +597,24 @@ namespace Omnipotent.Services.OmniBlox.Core
     /// <summary>One agent work cycle's structured hand-over — the compaction unit.</summary>
     public sealed class CycleReport
     {
+        /// <summary>Names the cycle's full log (games/&lt;id&gt;/cycles/&lt;CycleId&gt;.jsonl): every call, result and picture.</summary>
+        public string CycleId { get; set; } = "";
+        public DateTime? StartedUtc { get; set; }
         public DateTime Utc { get; set; }
         public GameStage Stage { get; set; }
         public string Role { get; set; } = "";
+        /// <summary>finished, handed over (context full; the next cycle continues), cut short, or error.</summary>
         public string Outcome { get; set; } = "";
         public string Done { get; set; } = "";
         public List<string> Decisions { get; set; } = new();
         public List<string> Problems { get; set; } = new();
         public List<string> NextSteps { get; set; } = new();
         public int Turns { get; set; }
+        public int ToolCalls { get; set; }
+        public int ToolErrors { get; set; }
+        /// <summary>Replies that hit the output limit (their cut-off calls were not run, and the agent was told).</summary>
+        public int Truncations { get; set; }
+        public string? Error { get; set; }
         public long PromptTokens { get; set; }
         public long CachedTokens { get; set; }
         public long CompletionTokens { get; set; }
@@ -545,6 +733,11 @@ namespace Omnipotent.Services.OmniBlox.Core
         public HarvesterState Harvester { get; set; } = new();
         public DateTime? LastPortfolioReviewUtc { get; set; }
         public int GamesLaunched { get; set; }
+        /// <summary>
+        /// Sounds known to be licensed for any experience (Roblox's and APM's uploads, found by search_sounds), by id.
+        /// A game may only use these or the kit's defaults: the first studio invented audio ids that played nothing.
+        /// </summary>
+        public Dictionary<long, string> LicensedAudio { get; set; } = new();
     }
 
     /// <summary>

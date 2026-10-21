@@ -294,7 +294,8 @@ namespace Omnipotent.Services.OmniBlox.Build
                     for (int i = 0; i < 3 && char.IsDigit(Peek()); i++) Advance();
                     return;
                 }
-                if ("abfnrtv\\\"'`{\n\r".IndexOf(e) >= 0) { Advance(); return; }
+                // \{ and \} keep braces literal in an interpolated string (Roblox's own code writes `\{...\}`).
+                if ("abfnrtv\\\"'`{}\n\r".IndexOf(e) >= 0) { Advance(); return; }
                 throw Error($"invalid escape sequence '\\{e}'");
             }
 
@@ -628,7 +629,7 @@ namespace Omnipotent.Services.OmniBlox.Build
                     {
                         if (Accept("..."))
                         {
-                            if (Is(":")) { i++; if (Is("...")) { i++; } Type(); }
+                            if (Is(":")) { i++; TypePackElement(); } // ...: number, ...: T...
                             break;
                         }
                         ExpectName("parameter name");
@@ -807,11 +808,19 @@ namespace Omnipotent.Services.OmniBlox.Build
                         i++;
                         if (!IsName && Cur.Kind != T.Keyword) throw Err($"expected a method name after ':', got {Describe(Cur)}");
                         string method = Take().Text;
+                        if (IsInstantiation) TypeInstantiation();
                         if (!(Is("(") || Is("{") || Cur.Kind == T.String))
                             throw Err($"expected '(' to call method '{method}', got {Describe(Cur)}");
                         CallArgs();
                         assignable = false;
                         isCall = true;
+                    }
+                    else if (IsInstantiation)
+                    {
+                        // Explicit type instantiation: React.useRef<<Frame?>>(nil). Never a comparison: '<' cannot start an expression.
+                        TypeInstantiation();
+                        assignable = false;
+                        isCall = false;
                     }
                     else if (Is("(") || Is("{") || Cur.Kind == T.String)
                     {
@@ -886,11 +895,28 @@ namespace Omnipotent.Services.OmniBlox.Build
                 Expect(">", "to close the generic list");
             }
 
-            private void ReturnType()
+            /// <summary>A return type: a type (a parenthesised one may be optional or part of a union: (() -> ())?), a pack, '...T' or 'T...'.</summary>
+            private void ReturnType() => TypePackElement();
+
+            /// <summary>One entry of a type list: a type, a variadic '...T', or a generic type pack 'T...'.</summary>
+            private void TypePackElement()
             {
-                if (Is("(")) TypePackOrType();
-                else if (Accept("...")) Type();
-                else Type();
+                if (Accept("...")) { Type(); return; }
+                Type();
+                Accept("...");
+            }
+
+            private bool IsInstantiation => Is("<") && Next().Kind == T.Op && Next().Text == "<";
+
+            /// <summary>'&lt;&lt;' types '&gt;&gt;' after a function or method name.</summary>
+            private void TypeInstantiation()
+            {
+                var open = Cur;
+                i += 2;
+                if (!Is(">"))
+                    do { TypePackElement(); } while (Accept(","));
+                Expect(">", $"to close the type instantiation at line {open.Line}");
+                Expect(">", $"to close the type instantiation at line {open.Line}");
             }
 
             private void Type()
@@ -938,14 +964,7 @@ namespace Omnipotent.Services.OmniBlox.Build
                     {
                         i++;
                         if (!Is(">"))
-                        {
-                            do
-                            {
-                                if (Is("(")) TypePackOrType();
-                                else if (Accept("...")) Type();
-                                else Type();
-                            } while (Accept(","));
-                        }
+                            do { TypePackElement(); } while (Accept(","));
                         Expect(">", "to close the type arguments");
                     }
                     return;
@@ -961,10 +980,9 @@ namespace Omnipotent.Services.OmniBlox.Build
                 {
                     do
                     {
-                        if (Accept("...")) { Type(); continue; }
                         // Named parameters in function types: (x: number) -> ()
                         if (IsName && Next().Kind == T.Op && Next().Text == ":") i += 2;
-                        Type();
+                        TypePackElement();
                     } while (Accept(","));
                 }
                 Expect(")", $"to close '(' at line {open.Line}");

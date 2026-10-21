@@ -47,6 +47,38 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             return page;
         }
 
+        /// <summary>A sound on the Creator Store, and who uploaded it.</summary>
+        public sealed record AudioHit(long Id, string Name, string Creator, double Seconds, string Type);
+
+        /// <summary>The creators whose uploads are licensed for every experience: Roblox itself and its music partner.</summary>
+        public static readonly string[] LicensedAudioCreators = { "Roblox", "APMOfficial" };
+
+        /// <summary>
+        /// Free sounds that are safe to use in any game: only Roblox's own uploads (sound effects) and APM's
+        /// (music, Roblox's licensing partner). Other users' audio may be private, deleted or someone else's song.
+        /// </summary>
+        public async Task<List<AudioHit>> SearchAudioAsync(string query, CancellationToken ct, int pages = 2)
+        {
+            var hits = new List<AudioHit>();
+            string? token = null;
+            for (int page = 0; page < pages; page++)
+            {
+                var args = new List<string> { "searchCategoryType=Audio", "maxPageSize=100", "searchView=Full", "maxPriceCents=0", "query=" + Uri.EscapeDataString(query.Trim()) };
+                if (token != null) args.Add("pageToken=" + Uri.EscapeDataString(token));
+                var json = await GetJsonAsync("toolbox", "https://apis.roblox.com/toolbox-service/v2/assets:search?" + string.Join("&", args), ct);
+                foreach (var entry in json["creatorStoreAssets"] as JArray ?? new JArray())
+                {
+                    var asset = entry["asset"];
+                    string creator = (string?)entry["creator"]?["name"] ?? "";
+                    if (asset == null || !LicensedAudioCreators.Contains(creator, StringComparer.Ordinal)) continue;
+                    hits.Add(new AudioHit((long?)asset["id"] ?? 0, ((string?)asset["name"] ?? "").Trim(), creator, (double?)asset["durationSeconds"] ?? 0, (string?)asset["audioType"] ?? ""));
+                }
+                token = (string?)json["nextPageToken"];
+                if (string.IsNullOrEmpty(token)) break;
+            }
+            return hits.Where(h => h.Id > 0).GroupBy(h => h.Id).Select(g => g.First()).ToList();
+        }
+
         internal static CreatorStoreAsset? ParseCreatorStoreAsset(JToken entry)
         {
             var asset = entry["asset"];

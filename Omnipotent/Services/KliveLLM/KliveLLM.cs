@@ -1637,6 +1637,7 @@ namespace Omnipotent.Services.KliveLLM
                     Success = false,
                     ErrorMessage = normalized.Error,
                     RawResponse = rawContent,
+                    FinishReason = response.choices[0].finish_reason,
                     SessionId = sessionId,
                     PromptTokens = response.usage?.prompt_tokens ?? 0,
                     CachedPromptTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
@@ -1693,6 +1694,7 @@ namespace Omnipotent.Services.KliveLLM
                 SessionId = sessionId,
                 Success = true,
                 ToolCalls = toolCalls,
+                FinishReason = response.choices[0].finish_reason,
                 PromptTokens = response.usage?.prompt_tokens ?? 0,
                 CachedPromptTokens = response.usage?.prompt_tokens_details?.cached_tokens ?? 0,
                 CacheWritePromptTokens = response.usage?.prompt_tokens_details?.cache_write_tokens ?? 0,
@@ -3629,6 +3631,11 @@ namespace Omnipotent.Services.KliveLLM
             // Native tool-calling path: populated when the model requested tool invocations
             // (finish_reason == "tool_calls"). Null/empty on an ordinary text completion.
             public List<HFWrapper.HFToolCall> ToolCalls { get; set; }
+
+            /// <summary>The provider's finish_reason for this turn ("stop", "tool_calls", "length"…). "length"
+            /// means the reply hit the output cap: its text, and any tool call still being written, are cut off.
+            /// Null when the provider did not report one. Only set on tool-session turns.</summary>
+            public string? FinishReason { get; set; }
         }
         public void ResetSession(string? sessionId)
         {

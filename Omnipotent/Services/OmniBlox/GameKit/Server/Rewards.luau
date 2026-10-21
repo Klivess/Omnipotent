@@ -1,11 +1,12 @@
 -- OmniKit · Rewards
 -- A daily login reward that grows with the streak (day 1…7), a reason to come back tomorrow.
+-- Off when game.json says "dailyRewards": false or the reward is 0.
 
 local Config = require(script.Parent.Config)
 local Data = require(script.Parent.Data)
 local Currency = require(script.Parent.Currency)
 local Analytics = require(script.Parent.Analytics)
-local Net = require(game:GetService("ReplicatedStorage"):WaitForChild("OmniKit"):WaitForChild("Net"))
+local Effects = require(script.Parent.Effects)
 local Util = require(game:GetService("ReplicatedStorage"):WaitForChild("OmniKit"):WaitForChild("Util"))
 
 local Rewards = {}
@@ -14,14 +15,23 @@ local CLAIM_AFTER = 20 * 3600 -- a "day" is 20 hours, so a regular evening playe
 local STREAK_BREAKS_AFTER = 48 * 3600
 local MAX_STREAK = 7
 
+-- The day-one reward (each day of a streak pays this times the streak).
 function Rewards.Base(): number
-	return (Config.Template and Config.Template.DailyReward) or 25
+	local amount = Config.DailyReward
+	if amount == nil and Config.Template then
+		amount = Config.Template.DailyReward
+	end
+	return math.max(0, tonumber(amount) or 25)
 end
 
--- Returns the amount granted (0 when not due yet). Exposed for tests.
-function Rewards.TryClaim(player, now: number?): number
+function Rewards.Enabled(): boolean
+	return Config.DailyRewards ~= false and Rewards.Base() > 0
+end
+
+-- Returns the amount granted (0 when not due yet, or when daily rewards are off). Exposed for tests.
+function Rewards.TryClaim(player: any, now: number?): number
 	local profile = Data.Get(player)
-	if not profile then
+	if not profile or not Rewards.Enabled() then
 		return 0
 	end
 	local time = now or os.time()
@@ -38,16 +48,14 @@ function Rewards.TryClaim(player, now: number?): number
 	Currency.Add(player, amount, "DailyReward", false)
 	Analytics.Event("daily_reward", player, { streak = profile.DailyStreak, amount = amount })
 	if Util.IsRealPlayer(player) then
-		Net.Event("Notify"):FireClient(player, {
-			text = string.format("Daily reward: +%s %s (day %d streak!)", Util.Format(amount), Currency.Name, profile.DailyStreak),
-			kind = "reward",
-		})
+		Effects.Toast(player, string.format("Daily reward: +%s %s (day %d streak!)", Util.Format(amount), Currency.Name, profile.DailyStreak), "reward")
+		Effects.Reward(player, nil, "+" .. Util.Format(amount) .. " " .. Currency.Icon)
 	end
 	return amount
 end
 
 function Rewards.Start()
-	if Config.DailyRewards == false then
+	if not Rewards.Enabled() then
 		return
 	end
 	Data.Loaded:Connect(function(player)

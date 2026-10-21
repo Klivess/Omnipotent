@@ -93,7 +93,7 @@ namespace Omnipotent.Tests.OmniBlox
 
             // The next clean build, and r1 is still there to play as it was.
             ws.DeleteFile("src/server/Broken.server.luau");
-            Assert.True(BuildTools.RunBuild(h.Ctx, id).Ok);
+            Assert.True((await BuildTools.RunBuildAsync(h.Ctx, id, CancellationToken.None)).Ok);
             Assert.Equal("r2", h.Ctx.Playtests.Build(id, "latest", Playtests.Roblox).Label);
             Assert.False(Has(h.Ctx.Playtests.Build(id, "r1", Playtests.Roblox).Compile.PlaceXml, "RisingLava"));
             Assert.True(Has(h.Ctx.Playtests.Build(id, "2", Playtests.Roblox).Compile.PlaceXml, "RisingLava"));
@@ -113,7 +113,7 @@ namespace Omnipotent.Tests.OmniBlox
             var access = h.Ctx.Playtests.Describe(h.Game(id));
             Assert.True(access.Available);
             Assert.True(access.OwnExperience);
-            Assert.Null(access.Slot); // borrowed on the first play, as Test would
+            Assert.Equal(2002, access.Slot!.PlaceId); // the builder's run_tests already took the game's own experience
 
             var first = await h.Ctx.Playtests.PublishAsync(id, "latest", fresh: false, followed: false, CancellationToken.None);
             Assert.False(first.Reused);
@@ -168,11 +168,12 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Equal(PlaytestProblem.NoRoblox, refused.Problem);
 
             h.Ctx.Settings.PlaytestSlot = new ExperienceSlot { UniverseId = 3003, PlaceId = 4004 };
+            int before = h.Roblox.Requests.Count; // the builder's engine runs saved test versions there earlier
             var result = await h.Ctx.Playtests.PublishAsync(id, "latest", false, false, CancellationToken.None);
             Assert.Equal("https://www.roblox.com/games/start?placeId=4004", result.JoinUrl);
             Assert.False(result.Publish.OwnExperience);
             Assert.Equal(id, h.Ctx.Store.Read(s => s.Studio.PlaytestSlot!.GameId));
-            Assert.DoesNotContain(h.Roblox.Requests, r => r.Url.Contains("/places/2002/versions") || r.Url.Contains("/universes/1001:"));
+            Assert.DoesNotContain(h.Roblox.Requests.Skip(before), r => r.Url.Contains("/places/2002/versions") || r.Url.Contains("/universes/1001:"));
 
             // The page shows the link while this game is what the playtest experience runs.
             var view = JObject.Parse(OmniBloxViews.Serialize(OmniBloxViews.GameDetail(h.Ctx, id)!));
@@ -272,7 +273,7 @@ namespace Omnipotent.Tests.OmniBlox
 
             // Nobody is in the playtest: a clean build stays where it is.
             ws.WriteFile("src/server/RisingLava.server.luau", "print('the lava rises')\n");
-            Assert.True(BuildTools.RunBuild(h.Ctx, id).Ok);
+            Assert.True((await BuildTools.RunBuildAsync(h.Ctx, id, CancellationToken.None)).Ok);
             await h.Ctx.Playtests.FollowTask;
             Assert.Equal("r1", h.Game(id).Playtest.LastPublish!.Build);
             Assert.Equal(1, Restarts());
@@ -280,7 +281,7 @@ namespace Omnipotent.Tests.OmniBlox
             // The owner is in (their server reports a player): the next clean build follows them.
             h.Ctx.Playtests.Ingest(id, JObject.FromObject(new { server = "srv-1", players = 1, build = "r1", where = "roblox", events = new object[] { new { n = "heartbeat" } } }), h.Now);
             ws.WriteFile("src/server/RisingLava.server.luau", "print('the lava rises faster')\n");
-            Assert.True(BuildTools.RunBuild(h.Ctx, id).Ok);
+            Assert.True((await BuildTools.RunBuildAsync(h.Ctx, id, CancellationToken.None)).Ok);
             await h.Ctx.Playtests.FollowTask;
             var last = h.Game(id).Playtest.LastPublish!;
             Assert.Equal("r3", last.Build);
@@ -290,7 +291,7 @@ namespace Omnipotent.Tests.OmniBlox
             // Follow off: builds stay put again.
             h.Ctx.Playtests.SetFollow(id, false);
             ws.WriteFile("src/server/RisingLava.server.luau", "print('the lava cools')\n");
-            Assert.True(BuildTools.RunBuild(h.Ctx, id).Ok);
+            Assert.True((await BuildTools.RunBuildAsync(h.Ctx, id, CancellationToken.None)).Ok);
             await h.Ctx.Playtests.FollowTask;
             Assert.Equal("r3", h.Game(id).Playtest.LastPublish!.Build);
             Assert.Equal(2, Restarts());

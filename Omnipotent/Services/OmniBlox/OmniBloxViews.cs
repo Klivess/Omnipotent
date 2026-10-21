@@ -28,10 +28,11 @@ namespace Omnipotent.Services.OmniBlox
         /// <summary>Below this many labelled models the overview suggests switching the harvester on.</summary>
         private const long SmallLibrary = 200;
 
-        public static object GameSummary(GameDossier g)
+        public static object GameSummary(StudioContext ctx, GameDossier g)
         {
-            var checklist = StageGates.Checklist(g);
-            int budget = StageGates.CycleBudget(g.Stage);
+            var checklist = StageGates.Checklist(g, ctx);
+            var live = ctx.Live.Peek(g.GameId);
+            var engine = g.Build.LastEngineRun;
             return new
             {
                 g.GameId,
@@ -57,7 +58,12 @@ namespace Omnipotent.Services.OmniBlox
                 TestPassed = g.LastTest?.Passed,
                 Cycles = g.StageCycles,
                 StageCycles = g.StageCycles.GetValueOrDefault(g.Stage),
-                StageCycleBudget = budget == int.MaxValue ? (int?)null : budget,
+                g.Build.MapScore,
+                g.Build.TypeChecked,
+                Engine = engine == null ? null : new { engine.Utc, engine.Revision, engine.Ok, engine.Passed, engine.Failed, engine.KitFailed, engine.Summary, Current = engine.Revision == g.Build.Revision },
+                OpenDirectives = g.Directives.Count(d => d.Status == DirectiveStatus.Open),
+                Watchdog = new { g.Progress.Level, Name = Watchdog.LevelName(g.Progress.Level), g.Progress.StalledCycles, g.Progress.LastProgressUtc },
+                Live = live == null ? null : new { live.CycleId, live.Role, live.Running, live.Status, live.StartedUtc, live.LastUtc, live.Turns, live.ToolCalls, live.ToolErrors, live.ContextTokens },
                 ChecklistMet = checklist.Count(c => c.Met),
                 ChecklistTotal = checklist.Count,
                 MilestonesDone = g.Milestones.Count(m => m.Done),
@@ -117,7 +123,7 @@ namespace Omnipotent.Services.OmniBlox
                 ctx.Settings.MaxGamesInProduction,
                 Attention = Attention(ctx, status, tasks, library, slotsFree),
                 StageCounts = Enum.GetValues<GameStage>().ToDictionary(st => st.ToString(), st => games.Count(g => g.Stage == st)),
-                Games = games.OrderByDescending(g => g.CreatedUtc).Select(GameSummary).ToList(),
+                Games = games.OrderByDescending(g => g.CreatedUtc).Select(g => GameSummary(ctx, g)).ToList(),
                 OwnerTasks = tasks.OrderByDescending(t => t.CreatedUtc).ToList(),
                 Library = library,
                 Harvester = new
@@ -196,7 +202,7 @@ namespace Omnipotent.Services.OmniBlox
         public static object Games(StudioContext ctx)
         {
             var games = ctx.Store.Read(s => s.Games.Values.OrderByDescending(g => g.CreatedUtc).Select(OmniBloxStore.Clone).ToList());
-            return new { Games = games.Select(GameSummary).ToList() };
+            return new { Games = games.Select(g => GameSummary(ctx, g)).ToList() };
         }
 
         /// <summary>The whole dossier (minus its telemetry secrets), its checklist, owner tasks, saved revisions and how to play it; null when there is no such game.</summary>
@@ -211,13 +217,35 @@ namespace Omnipotent.Services.OmniBlox
             return new
             {
                 Game = game,
-                Summary = GameSummary(game),
+                Summary = GameSummary(ctx, game),
                 Goal = StageGates.Goal(game.Stage),
-                Checklist = StageGates.Checklist(game),
+                Checklist = StageGates.Checklist(game, ctx),
                 OwnerTasks = tasks,
                 Revisions = workspace.Exists ? workspace.Revisions() : (IReadOnlyList<int>)Array.Empty<int>(),
                 Media = MediaFiles(ctx, game.GameId),
                 Playtest = Playtest(ctx, game),
+                // What the agent is doing right now (or did last), step by step, with the pictures it looked at.
+                Live = ctx.Live.Get(game.GameId),
+                // Cycles whose full log is still on disk (the newest CycleLog.KeepLogs).
+                CycleLogs = CycleLog.Available(ctx, game.GameId),
+                EngineAvailable = StageGates.EngineAvailable(ctx, game),
+                Watchdog = new
+                {
+                    game.Progress.Level,
+                    Name = Watchdog.LevelName(game.Progress.Level),
+                    game.Progress.StalledCycles,
+                    game.Progress.SameFailureCount,
+                    game.Progress.LastFailureSignature,
+                    game.Progress.LastProgressUtc,
+                    game.Progress.Directive,
+                    History = game.Progress.History,
+                    Ladder = new[]
+                    {
+                        $"after {Pipeline.Watchdog.RethinkAt} cycles without progress: rethink (a fresh approach, more reasoning)",
+                        $"after {Pipeline.Watchdog.DeepDiveAt}: deep dive (diagnose from first principles, the kit's source and the engine's own errors)",
+                        $"after {Pipeline.Watchdog.AskOwnerAt}: pause the game and ask the owner — it is never abandoned automatically",
+                    },
+                },
             };
         }
 
@@ -241,6 +269,34 @@ namespace Omnipotent.Services.OmniBlox
                 JoinUrl = inExperience ? Playtests.JoinUrl(last!.PlaceId) : null,
                 OtherGame = other == null ? null : new { other.GameId, Title = other.DisplayTitle, occupant!.Build },
                 Playing = ctx.Playtests.IsPlaying(game),
+            };
+        }
+
+        /// <summary>The map report on the game's current files (score, play area, findings, the plan); null when it has no world yet.</summary>
+        public static object? Map(StudioContext ctx, string gameId)
+        {
+            var ws = ctx.Workspace(gameId);
+            if (!ws.Exists) return null;
+            var result = ctx.Compile(gameId);
+            var scene = ws.LoadScene();
+            var analysis = Build.MapReport.Analyze(scene, result.Parts, result.Terrain, ws.LoadManifest());
+            return new
+            {
+                analysis.Score,
+                analysis.AreaWidth,
+                analysis.AreaDepth,
+                analysis.Objects,
+                analysis.DistinctModels,
+                analysis.DressedShare,
+                Findings = analysis.Findings.Select(f => new { f.Severity, f.Area, f.Message }).ToList(),
+                analysis.Facts,
+                Zones = scene.Layout.Zones.Select(z => new { z.Id, z.Name, z.Purpose, z.Area, z.Order, z.Theme }).ToList(),
+                Landmarks = scene.Layout.Landmarks.Select(l => new { l.Name, l.Position, l.ObjectId, l.Note }).ToList(),
+                scene.Layout.Concept,
+                Bounds = scene.Bounds.HasArea ? scene.Bounds.Area : null,
+                Terrain = result.Terrain == null ? null : new { result.Terrain.OriginX, result.Terrain.OriginZ, result.Terrain.MaxX, result.Terrain.MaxZ, scene.Land?.Biome },
+                Compiled = result.Ok,
+                Errors = result.Errors.Take(10).ToList(),
             };
         }
 

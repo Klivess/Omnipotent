@@ -3,6 +3,9 @@
 -- player joins and releases it when they leave, and a joining server waits briefly for another server
 -- to let go, so hopping between servers never loses progress. A profile that could not be read is
 -- never written back (no wiping saves on a DataStore outage).
+--
+-- Engine tests (Config.Testing) and Studio playtests keep profiles in memory only. Tests give every case
+-- its own fresh stand-in player and drop its profile afterwards (Data.Forget), so no test sees another's data.
 
 local DataStoreService = game:GetService("DataStoreService")
 local Players = game:GetService("Players")
@@ -26,15 +29,26 @@ local profiles: { [number]: any } = {}
 local loadFailed: { [number]: boolean } = {}
 local dirtyAt: { [number]: number } = {}
 local store: DataStore? = nil
-local memoryOnly = playtest ~= nil and playtest.MemoryData == true
+local memoryOnly = Config.Testing == true or (playtest ~= nil and playtest.MemoryData == true)
 
 Data.Loaded = Util.Signal()
 Data.Changed = Util.Signal()
 
-local function defaults()
+local function startingCurrencies(): { [string]: number }
+	local wallet = {}
+	for _, currency in ipairs(Config.Currencies or {}) do
+		if type(currency) == "table" and type(currency.Name) == "string" then
+			wallet[currency.Name] = tonumber(currency.Start) or 0
+		end
+	end
+	return wallet
+end
+
+function Data.Defaults(): { [string]: any }
 	return {
-		Version = 1,
+		Version = 2,
 		Currency = Config.StartingCurrency or 0,
+		Currencies = startingCurrencies(),
 		Stage = 1,
 		BestStage = 1,
 		Completed = false,
@@ -43,6 +57,10 @@ local function defaults()
 		ReceiptOrder = {},
 		Upgrades = {},
 		Stats = {},
+		Counters = {},
+		Zones = {},
+		Rebirths = 0,
+		Quest = { Index = 1, Progress = 0 },
 		LastDaily = 0,
 		DailyStreak = 0,
 		Settings = {},
@@ -56,6 +74,9 @@ local function reconcile(data, template)
 	for key, value in pairs(template) do
 		if data[key] == nil then
 			data[key] = if type(value) == "table" then table.clone(value) else value
+		elseif type(value) == "table" and type(data[key]) == "table" and next(value) ~= nil and #value == 0 then
+			-- Fill new keys inside nested tables (a new currency added to an existing game, for instance).
+			reconcile(data[key], value)
 		end
 	end
 	return data
@@ -65,7 +86,7 @@ local function keyFor(userId: number): string
 	return "u_" .. tostring(userId)
 end
 
-local function attempt(fn, tries: number)
+local function attempt(fn: () -> any, tries: number): (boolean, any)
 	local lastError = nil
 	for i = 1, tries do
 		local ok, result = pcall(fn)
@@ -90,16 +111,16 @@ end
 -- The DataStore profiles are saved in (the playtest's own one in a playtest build).
 Data.StoreName = STORE_NAME
 
-function Data.Get(player): any
+function Data.Get(player: any): any
 	return profiles[player.UserId]
 end
 
-function Data.IsLoaded(player): boolean
+function Data.IsLoaded(player: any): boolean
 	return profiles[player.UserId] ~= nil
 end
 
 -- Mutate a profile and tell listeners (UI sync, leaderstats) it changed.
-function Data.Update(player, mutator)
+function Data.Update(player: any, mutator: (any) -> any): any
 	local profile = profiles[player.UserId]
 	if not profile then
 		return nil
@@ -110,12 +131,23 @@ function Data.Update(player, mutator)
 	return result
 end
 
-function Data.MarkDirty(player)
+function Data.MarkDirty(player: any)
 	dirtyAt[player.UserId] = os.clock()
 	local profile = profiles[player.UserId]
 	if profile then
 		Data.Changed:Fire(player, profile)
 	end
+end
+
+-- A number the game counts per player (trees felled, cars washed…). Saved with the profile.
+function Data.Count(player: any, name: string, amount: number?): number
+	local profile = profiles[player.UserId]
+	if not profile then
+		return 0
+	end
+	profile.Counters[name] = (profile.Counters[name] or 0) + (amount or 1)
+	dirtyAt[player.UserId] = os.clock()
+	return profile.Counters[name]
 end
 
 local function getStore(): DataStore?
@@ -134,7 +166,7 @@ local function getStore(): DataStore?
 	return store
 end
 
-function Data.Load(player)
+function Data.Load(player: any): any
 	local userId = player.UserId
 	if profiles[userId] then
 		return profiles[userId]
@@ -146,8 +178,8 @@ function Data.Load(player)
 		while true do
 			local blocked = false
 			local ok, result = attempt(function()
-				return ds:UpdateAsync(keyFor(userId), function(old)
-					old = old or defaults()
+				return (ds :: DataStore):UpdateAsync(keyFor(userId), function(old)
+					old = old or Data.Defaults()
 					local lock = old._Session
 					if lock and lock.Job ~= game.JobId and os.time() - (lock.Time or 0) < LOCK_STALE_SECONDS and os.clock() < deadline then
 						blocked = true
@@ -173,7 +205,7 @@ function Data.Load(player)
 			task.wait(2)
 		end
 	end
-	data = reconcile(data or defaults(), defaults())
+	data = reconcile(data or Data.Defaults(), Data.Defaults())
 	data._Session = nil
 	data.Sessions += 1
 	profiles[userId] = data
@@ -181,7 +213,7 @@ function Data.Load(player)
 	return data
 end
 
-function Data.Save(player, release: boolean?): boolean
+function Data.Save(player: any, release: boolean?): boolean
 	local userId = player.UserId
 	local profile = profiles[userId]
 	local ds = getStore()
@@ -190,13 +222,14 @@ function Data.Save(player, release: boolean?): boolean
 	end
 	local snapshot = table.clone(profile)
 	local ok, err = attempt(function()
-		ds:UpdateAsync(keyFor(userId), function(old)
+		(ds :: DataStore):UpdateAsync(keyFor(userId), function(old)
 			if old and old._Session and old._Session.Job ~= game.JobId and os.time() - (old._Session.Time or 0) < LOCK_STALE_SECONDS then
 				return nil -- another server owns this profile now; never clobber it
 			end
 			snapshot._Session = if release then nil else { Job = game.JobId, Time = os.time() }
 			return snapshot
 		end)
+		return true
 	end, 3)
 	if not ok then
 		warn("[OmniKit] save failed for", userId, err)
@@ -207,11 +240,11 @@ function Data.Save(player, release: boolean?): boolean
 end
 
 -- Saves within a few seconds (purchases call this so a crash cannot lose a receipt).
-function Data.SaveSoon(player)
+function Data.SaveSoon(player: any)
 	task.spawn(Data.Save, player, false)
 end
 
-function Data.Release(player)
+function Data.Release(player: any)
 	local userId = player.UserId
 	if profiles[userId] then
 		Data.Save(player, true)
@@ -219,6 +252,13 @@ function Data.Release(player)
 	profiles[userId] = nil
 	loadFailed[userId] = nil
 	dirtyAt[userId] = nil
+end
+
+-- Drops a profile without saving it: tests clean up their stand-in players with this.
+function Data.Forget(player: any)
+	profiles[player.UserId] = nil
+	loadFailed[player.UserId] = nil
+	dirtyAt[player.UserId] = nil
 end
 
 function Data.Start()

@@ -10,9 +10,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
     /// The studio's control loop. One unit of work at a time (AIRouter's three slots are shared with every
     /// other agent): first a live game that is broken or due maintenance or a post-mortem, otherwise the
     /// game in production moves one step (a research, build or launch cycle, the test stage, or the launch
-    /// sequence), otherwise the next game starts. Stages advance only on their exit criteria. A watchdog
-    /// resets a stuck stage once, then abandons the game and moves on; three abandoned games in a row stop
-    /// the studio and tell the owner.
+    /// sequence), otherwise the next game starts. Stages advance only on their exit criteria.
+    ///
+    /// There is no cycle budget: a game keeps working until its stage is done. The <see cref="Watchdog"/>
+    /// measures progress instead and, when a game stalls, changes the approach and finally asks the owner;
+    /// only the owner abandons a game. A failure of the model or its provider is not the game's failure: it
+    /// backs off and tries again without counting anything against the game.
     /// </summary>
     public sealed class Orchestrator
     {
@@ -27,6 +30,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
         public static readonly TimeSpan WaitRecheck = TimeSpan.FromMinutes(10);
         public static readonly TimeSpan ErrorBackoff = TimeSpan.FromMinutes(5);
+        public static readonly TimeSpan MaxProviderBackoff = TimeSpan.FromMinutes(30);
         public const int AbandonedInARowLimit = 3;
 
         public async Task RunAsync(CancellationToken ct)
@@ -111,12 +115,14 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 return true;
             }
 
-            // 3. Room for a new game?
-            if (production.Count < Math.Max(1, ctx.Settings.MaxGamesInProduction))
+            // 3. Room for a new game? A game waiting on the owner (paused) still holds its place: the studio does
+            // not start something new behind the owner's back while one is waiting for a decision.
+            int holding = games.Count(g => g.InProduction);
+            if (holding < Math.Max(1, ctx.Settings.MaxGamesInProduction))
             {
                 if (AbandonedInARow(games) >= AbandonedInARowLimit)
                 {
-                    Status = $"stopped: the last {AbandonedInARowLimit} games were abandoned — see the escalations";
+                    Status = $"stopped: the last {AbandonedInARowLimit} games were abandoned — start one from the dashboard to go again";
                     return false;
                 }
                 string id = StartGame();
@@ -125,7 +131,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 return true;
             }
 
-            Status = production.Count > 0 ? "waiting: " + string.Join("; ", production.Select(g => $"\"{g.DisplayTitle}\" — {g.WaitingReason ?? "backing off"}")) : "idle";
+            Status = production.Count > 0
+                ? "waiting: " + string.Join("; ", production.Select(g => $"\"{g.DisplayTitle}\" — {g.WaitingReason ?? "backing off"}"))
+                : games.Any(g => g.InProduction && g.Paused) ? "waiting for you: " + string.Join("; ", games.Where(g => g.InProduction && g.Paused).Select(g => $"\"{g.DisplayTitle}\" is paused")) : "idle";
             return false;
         }
 
@@ -158,7 +166,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 StageEnteredUtc = now,
                 TelemetrySecret = StudioContext.NewSecret(),
             };
-            if (!string.IsNullOrWhiteSpace(themeHint)) game.KeyFacts.Add("The owner suggested exploring this theme: " + themeHint.Trim());
+            if (!string.IsNullOrWhiteSpace(themeHint))
+                game.Directives.Add(new OwnerDirective { DirectiveId = "d1", Utc = now, Text = "Explore this theme for the next game: " + themeHint.Trim() });
             ctx.Store.Mutate(s =>
             {
                 s.Games[id] = game;
@@ -171,34 +180,33 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public async Task AdvanceAsync(string gameId, CancellationToken ct)
         {
             var game = ctx.Game(gameId)!;
-            if (StageGates.IsMet(game) && game.Stage != GameStage.Launch)
+            if (StageGates.IsMet(game, ctx) && game.Stage != GameStage.Launch)
             {
                 Enter(gameId, NextStage(game.Stage));
                 return;
-            }
-            if (game.Stage != GameStage.Launch || !LaunchReady(game))
-            {
-                if (game.StageCycles.GetValueOrDefault(game.Stage) >= StageGates.CycleBudget(game.Stage) || game.StageFailures.GetValueOrDefault(game.Stage) >= 6)
-                {
-                    Watchdog(gameId, $"{game.Stage} has taken {game.StageCycles.GetValueOrDefault(game.Stage)} cycles and failed {game.StageFailures.GetValueOrDefault(game.Stage)} times");
-                    return;
-                }
             }
 
             switch (game.Stage)
             {
                 case GameStage.Research:
                     Status = $"researching \"{game.DisplayTitle}\"";
-                    await RunCycleAsync(gameId, "researcher", AgentPrompts.Researcher, ResearchTools.Create(ctx, gameId), 36, ct);
+                    await RunCycleAsync(gameId, "researcher", AgentPrompts.Researcher, ResearchTools.Create(ctx, gameId), "high", ct);
                     break;
                 case GameStage.Build:
                     Status = $"building \"{game.DisplayTitle}\" (revision {game.Build.Revision})";
-                    await RunCycleAsync(gameId, "builder", AgentPrompts.Builder, BuildTools.Create(ctx, gameId), 45, ct);
+                    await RunCycleAsync(gameId, "builder", AgentPrompts.Builder, BuildTools.Create(ctx, gameId), "medium", ct);
                     break;
                 case GameStage.Test:
                     {
                         Status = $"testing \"{game.DisplayTitle}\"";
                         var report = await TestStage.RunAsync(ctx, gameId, withReview: true, ct);
+                        if (report.Infrastructure)
+                        {
+                            // Roblox or the model was unreachable: nothing was learned about the game. Try again later.
+                            ctx.Update(gameId, g => g.NextAttemptUtc = ctx.Clock() + ErrorBackoff);
+                            return;
+                        }
+                        Watchdog.Observe(ctx, gameId, report.Issues.Where(i => i.Severity == "error").Select(i => $"{i.Area}: {i.Message}"), "a test run");
                         if (report.Passed) Enter(gameId, GameStage.Launch);
                         else
                         {
@@ -215,7 +223,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     if (!LaunchReady(game))
                     {
                         Status = $"marketing \"{game.DisplayTitle}\"";
-                        await RunCycleAsync(gameId, "marketer", AgentPrompts.Marketer, LaunchTools.Create(ctx, gameId), 36, ct);
+                        await RunCycleAsync(gameId, "marketer", AgentPrompts.Marketer, LaunchTools.Create(ctx, gameId), "medium", ct);
                     }
                     else
                     {
@@ -228,7 +236,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             }
 
             game = ctx.Game(gameId)!;
-            if (StageGates.IsMet(game) && game.Stage != GameStage.Launch) Enter(gameId, NextStage(game.Stage));
+            if (StageGates.IsMet(game, ctx) && game.Stage != GameStage.Launch) Enter(gameId, NextStage(game.Stage));
         }
 
         private static bool LaunchReady(GameDossier g) => StageGates.MarketingReady(g) && g.Publish.LaunchRequestedUtc != null;
@@ -257,9 +265,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 case LaunchResult.BackToMarketing:
                     ctx.Update(gameId, g => { g.WaitingReason = null; g.Publish.LastLaunchError = outcome.message; g.StageFailures[GameStage.Launch] = g.StageFailures.GetValueOrDefault(GameStage.Launch) + 1; });
                     ctx.Event(EventLevel.Warning, "launch.back", "Back to marketing: " + outcome.message, gameId);
+                    Watchdog.Observe(ctx, gameId, new[] { outcome.message }, "a launch step");
                     break;
                 case LaunchResult.BackToBuild:
                     ctx.Update(gameId, g => { g.Publish.LastLaunchError = outcome.message; g.Publish.LaunchRequestedUtc = null; g.Build.FeatureComplete = false; });
+                    Watchdog.Observe(ctx, gameId, new[] { outcome.message }, "a launch step");
                     Enter(gameId, GameStage.Build, outcome.message);
                     break;
                 default:
@@ -274,9 +284,13 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             }
         }
 
-        private async Task RunCycleAsync(string gameId, string role, string prompt, AgentToolbox tools, int maxTurns, CancellationToken ct)
+        /// <summary>The reasoning effort for a cycle: the role's own, raised to high while the watchdog says the game is stalling.</summary>
+        internal static string Effort(GameDossier game, string roleEffort) => game.Progress.Level >= 1 ? "high" : roleEffort;
+
+        private async Task RunCycleAsync(string gameId, string role, string prompt, AgentToolbox tools, string effort, CancellationToken ct)
         {
             var game = ctx.Game(gameId)!;
+            tools.OnInternalError = (tool, ex) => ctx.Log($"[OmniBlox] tool {tool} failed for {gameId}: {ex}");
             var outcome = await ctx.Runner.RunAsync(new CycleRequest
             {
                 GameId = gameId,
@@ -285,16 +299,13 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 SystemPrompt = prompt,
                 Briefing = Briefing.Build(game, ctx),
                 Tools = tools,
-                MaxTurns = maxTurns,
-                Options = new LlmCallOptions { MaxTokens = 6000, Thinking = "medium" },
+                WrapUpAtPromptTokens = ctx.Settings.CycleContextTokens,
+                Options = new LlmCallOptions { MaxTokens = ctx.Settings.MaxOutputTokens, Thinking = Effort(game, effort) },
+                Observer = new CycleLog(ctx, gameId),
+                OwnerMessages = () => TakeNewDirectives(ctx, gameId),
             }, ct);
             Record(ctx, gameId, outcome);
-            if (outcome.Error != null)
-                TryUpdate(gameId, g =>
-                {
-                    g.StageFailures[g.Stage] = g.StageFailures.GetValueOrDefault(g.Stage) + 1;
-                    g.NextAttemptUtc = ctx.Clock() + ErrorBackoff;
-                });
+            AfterCycle(ctx, gameId, outcome);
             if (outcome.BlockedReason is string blocked)
             {
                 var now = ctx.Clock();
@@ -304,7 +315,48 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             }
         }
 
-        /// <summary>Writes a cycle's hand-over into the dossier: report, decisions, kept facts, counters, usage.</summary>
+        /// <summary>
+        /// After a cycle: a provider failure backs off (longer each time in a row) without touching the game's
+        /// record; anything else is fed to the watchdog as progress or a stall.
+        /// </summary>
+        internal static void AfterCycle(StudioContext ctx, string gameId, CycleOutcome outcome)
+        {
+            if (outcome.ProviderError)
+            {
+                int failures = 0;
+                ctx.Update(gameId, g => failures = ++g.ProviderFailures);
+                var wait = TimeSpan.FromMinutes(Math.Min(MaxProviderBackoff.TotalMinutes, Math.Pow(2, Math.Min(failures, 6) - 1)));
+                ctx.Update(gameId, g => g.NextAttemptUtc = ctx.Clock() + wait);
+                ctx.Event(EventLevel.Warning, "model.unavailable", $"The model call failed ({Clip(outcome.Error ?? "", 200)}); trying again in {wait.TotalMinutes:0} min. This does not count against the game.", gameId);
+                return;
+            }
+            ctx.Update(gameId, g => g.ProviderFailures = 0);
+            var game = ctx.Game(gameId);
+            if (game == null) return;
+            var failuresNow = new List<string>();
+            if (outcome.Error != null) failuresNow.Add("the cycle failed: " + outcome.Error);
+            if (game.Stage == GameStage.Build && !game.Build.LastBuildOk && game.Build.LastBuildUtc != null) failuresNow.AddRange(game.Build.Errors.Take(8));
+            Watchdog.Observe(ctx, gameId, failuresNow, $"a {outcome.Report.Role} cycle");
+        }
+
+        /// <summary>Owner directives that a running cycle has not seen yet (marked as delivered).</summary>
+        internal static IReadOnlyList<(string Id, string Text)> TakeNewDirectives(StudioContext ctx, string gameId)
+        {
+            var list = new List<(string, string)>();
+            ctx.Store.Mutate(s =>
+            {
+                if (s.Game(gameId) is not { } g) return;
+                foreach (var d in g.Directives.Where(d => d.Status == DirectiveStatus.Open && !d.Delivered))
+                {
+                    d.Delivered = true;
+                    list.Add((d.DirectiveId, d.Text));
+                }
+                if (list.Count > 0) s.MarkGame(gameId);
+            });
+            return list;
+        }
+
+        /// <summary>Writes a cycle's hand-over into the dossier: report, decisions, kept facts, directives, counters, usage.</summary>
         public static void Record(StudioContext ctx, string gameId, CycleOutcome outcome)
         {
             ctx.Update(gameId, g =>
@@ -313,14 +365,20 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 if (g.Cycles.Count > GameDossier.MaxCycleReports) g.Cycles.RemoveRange(0, g.Cycles.Count - GameDossier.MaxCycleReports);
                 g.Decisions.AddRange(outcome.NewDecisions);
                 if (g.Decisions.Count > GameDossier.MaxDecisions) g.Decisions.RemoveRange(0, g.Decisions.Count - GameDossier.MaxDecisions);
-                foreach (var fact in outcome.KeyFacts)
-                    if (!g.KeyFacts.Contains(fact, StringComparer.OrdinalIgnoreCase)) g.KeyFacts.Add(fact);
-                if (g.KeyFacts.Count > GameDossier.MaxKeyFacts) g.KeyFacts.RemoveRange(0, g.KeyFacts.Count - GameDossier.MaxKeyFacts);
-                g.StageCycles[outcome.Report.Stage] = g.StageCycles.GetValueOrDefault(outcome.Report.Stage) + 1;
+                FactBook.Merge(g.KeyFacts, outcome.KeyFacts, outcome.DropFacts);
+                foreach (var (id, response) in outcome.DirectivesDone)
+                {
+                    var d = g.Directives.FirstOrDefault(x => x.DirectiveId.Equals(id.Trim(), StringComparison.OrdinalIgnoreCase));
+                    if (d == null || d.Status != DirectiveStatus.Open) continue;
+                    d.Status = DirectiveStatus.Done;
+                    d.Response = response.Length > 0 ? response : "done";
+                    d.ResolvedUtc = ctx.Clock();
+                }
+                if (!outcome.ProviderError) g.StageCycles[outcome.Report.Stage] = g.StageCycles.GetValueOrDefault(outcome.Report.Stage) + 1;
             });
             ctx.AddUsage(gameId, outcome.Report);
             ctx.Event(outcome.Error != null ? EventLevel.Warning : EventLevel.Info, "cycle." + outcome.Report.Role,
-                $"{outcome.Report.Role} cycle ({outcome.Report.Turns} turns, {outcome.Report.Outcome}): {Clip(outcome.Report.Done, 240)}", gameId);
+                $"{outcome.Report.Role} cycle ({outcome.Report.Turns} turns, {outcome.Report.ToolCalls} calls, {outcome.Report.Outcome}): {Clip(outcome.Report.Done, 240)}", gameId);
         }
 
         private static GameStage NextStage(GameStage stage) => stage switch
@@ -361,86 +419,110 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     if (g.Milestones.Count == 0)
                         g.Milestones = new List<Milestone>
                         {
-                            new() { MilestoneId = "m1", Title = "Core loop playable end to end" },
-                            new() { MilestoneId = "m2", Title = "Every must-have from the brief built" },
-                            new() { MilestoneId = "m3", Title = "Polish: decoration, lighting, signs, tips, balance" },
+                            new() { MilestoneId = "m1", Title = "Game design: the core loop, progression and economy numbers, the map plan and the first minute" },
+                            new() { MilestoneId = "m2", Title = "The world: terrain, zones, landmarks, paths and dressing — big, full and readable from the spawn" },
+                            new() { MilestoneId = "m3", Title = "Core loop playable end to end, with its own specs passing in run_tests" },
+                            new() { MilestoneId = "m4", Title = "Every must-have from the brief built, with progression and its UI" },
+                            new() { MilestoneId = "m5", Title = "Polish: onboarding, juice (effects, sounds, feedback), balance, every test green" },
                         };
                     if (string.IsNullOrEmpty(g.TelemetrySecret)) g.TelemetrySecret = StudioContext.NewSecret();
                 }
                 if (stage == GameStage.Launch && string.IsNullOrWhiteSpace(g.Store.Title) && g.Brief != null)
                     g.Store.Genre = g.Brief.Genre;
-                var previous = g.Stage;
                 g.Stage = stage;
                 g.StageEnteredUtc = now;
                 g.WaitingReason = null;
                 g.NextAttemptUtc = null;
-                // Re-entering a stage (Build after a failed test) keeps its count: rework spends the same budget.
+                // Re-entering a stage (Build after a failed test) keeps its count; it is a statistic, not a budget.
                 if (!g.StageCycles.ContainsKey(stage)) g.StageCycles[stage] = 0;
                 s.Touch(g, now);
                 s.AddEvent(EventLevel.Info, "game.stage", $"\"{g.DisplayTitle}\" → {stage}" + (why != null ? $" ({Clip(why, 200)})" : ""), gameId, now);
             });
         }
 
-        /// <summary>A stage ran over budget: reset its approach once, then give the game up.</summary>
-        public void Watchdog(string gameId, string why)
+        /// <summary>
+        /// The owner gives up on a game. It keeps everything (files, snapshots, history) and can be revived where it
+        /// stopped; its experience slot is freed for the next game.
+        /// </summary>
+        public static void Abandon(StudioContext ctx, string gameId, string reason)
         {
-            var game = ctx.Game(gameId)!;
             var now = ctx.Clock();
-            if (game.Escalations >= 1)
-            {
-                Slots.Release(ctx, gameId);
-                ctx.Store.Mutate(s =>
-                {
-                    var g = s.Game(gameId)!;
-                    g.Stage = GameStage.Abandoned;
-                    g.AbandonReason = why;
-                    g.StageEnteredUtc = now;
-                    g.Escalations++;
-                    s.Touch(g, now);
-                    s.AddEvent(EventLevel.Error, "game.abandoned", $"Gave up on \"{g.DisplayTitle}\": {why}", gameId, now);
-                });
-                _ = ctx.Alert($"OmniBlox gave up on \"{game.DisplayTitle}\" ({why}) and is moving on to the next game.");
-                return;
-            }
+            var game = ctx.Game(gameId) ?? throw new KeyNotFoundException("No game " + gameId);
+            if (game.Stage is GameStage.Live or GameStage.Sunset) throw new InvalidOperationException("Live games are sunset by maintenance, not abandoned.");
+            if (game.Stage == GameStage.Abandoned) return;
+            Slots.Release(ctx, gameId);
             ctx.Store.Mutate(s =>
             {
                 var g = s.Game(gameId)!;
-                g.Escalations++;
-                switch (g.Stage)
-                {
-                    case GameStage.Research:
-                        g.Concepts.Clear();
-                        g.Brief = null;
-                        g.KeyFacts.Add("Watchdog: the first research attempt stalled; start over and pick a simpler, clearly feasible idea.");
-                        break;
-                    case GameStage.Build:
-                        g.KeyFacts.Add("Watchdog: the build stalled; cut scope to the core loop plus the most important must-haves and finish.");
-                        g.Build.FeatureComplete = false;
-                        break;
-                    case GameStage.Test:
-                        g.Stage = GameStage.Build;
-                        g.StageEnteredUtc = now;
-                        g.Build.FeatureComplete = false;
-                        g.KeyFacts.Add("Watchdog: tests kept failing; fix the reported issues one by one, simplify anything fragile, and rebuild.");
-                        break;
-                    case GameStage.Launch:
-                        g.Publish.LaunchRequestedUtc = null;
-                        g.Store.ComplianceOk = null;
-                        g.KeyFacts.Add("Watchdog: launch stalled; simplify the store page and products and fix the compliance problems.");
-                        break;
-                }
-                g.StageCycles[g.Stage] = StageGates.CycleBudget(g.Stage) / 2;
-                g.StageFailures[g.Stage] = 0;
+                g.AbandonedFromStage = g.Stage;
+                g.Stage = GameStage.Abandoned;
+                g.AbandonReason = Clip(reason, 400);
+                g.StageEnteredUtc = now;
+                g.WaitingReason = null;
+                g.Paused = false;
+                s.ResolveOwnerTasks("stuck:" + gameId, now);
+                s.ResolveOwnerTasks("approve:" + gameId, now);
                 s.Touch(g, now);
-                s.FileOwnerTask(OwnerTaskKind.Escalation, "watchdog:" + gameId + ":" + g.Stage, $"OmniBlox is struggling with \"{g.DisplayTitle}\" ({g.Stage})",
-                    why + ". The studio is trying once more with a simpler approach; nothing is needed unless you want to steer it.", gameId, now);
+                s.AddEvent(EventLevel.Warning, "owner.abandon", "Abandoned by the owner: " + Clip(reason, 200), gameId, now);
             });
-            if (game.Stage == GameStage.Build && game.Build.Revision > 0)
+        }
+
+        /// <summary>
+        /// Brings an abandoned game back to the stage it was abandoned in (the owner's call). Its files, snapshots
+        /// and history are all still there; the watchdog starts over.
+        /// </summary>
+        public static void Revive(StudioContext ctx, string gameId)
+        {
+            var now = ctx.Clock();
+            ctx.Store.Mutate(s =>
             {
-                try { ctx.Workspace(gameId).Restore(game.Build.Revision); }
-                catch (Exception ex) when (ex is IOException or FileNotFoundException) { ctx.Log("[OmniBlox] watchdog restore failed: " + ex.Message); }
-            }
-            _ = ctx.Alert($"OmniBlox is struggling with \"{game.DisplayTitle}\" ({why}); retrying with a simpler approach.");
+                var g = s.Game(gameId) ?? throw new KeyNotFoundException("No game " + gameId);
+                if (g.Stage != GameStage.Abandoned) throw new InvalidOperationException("Only an abandoned game can be revived.");
+                var stage = g.AbandonedFromStage ?? (g.Brief == null ? GameStage.Research : GameStage.Build);
+                if (stage == GameStage.Test || stage == GameStage.Launch) stage = GameStage.Build; // re-earn the test on the current kit
+                if (g.Slot is { } slot)
+                {
+                    // Its experience may have gone to another game meanwhile: then it gets a free one when it next needs one.
+                    string key = slot.ToString();
+                    if (s.Studio.SlotAssignments.TryGetValue(key, out var holder) && holder != gameId && s.Game(holder) is { Stage: not GameStage.Abandoned })
+                        g.Slot = null;
+                    else
+                        s.Studio.SlotAssignments[key] = gameId;
+                    s.MarkStudio();
+                }
+                g.Stage = stage;
+                g.StageEnteredUtc = now;
+                g.AbandonReason = null;
+                g.Paused = false;
+                g.WaitingReason = null;
+                g.NextAttemptUtc = null;
+                g.Build.FeatureComplete = false;
+                g.Publish.LaunchRequestedUtc = null;
+                g.StageFailures.Clear();
+                Watchdog.Reset(g, now, "revived by the owner");
+                FactBook.Merge(g.KeyFacts, new[]
+                {
+                    new KeyFact { Key = "revived", Text = $"Revived by the owner on {now:yyyy-MM-dd} after it had been abandoned. The studio's Game Kit and tools have changed since: rebuild, run run_tests and fix what it reports rather than trusting older notes about failing tests.", Utc = now, Stage = stage, Source = FactBook.Studio },
+                });
+                s.Touch(g, now);
+                s.AddEvent(EventLevel.Success, "game.revived", $"\"{g.DisplayTitle}\" revived by the owner; back to {stage}.", gameId, now);
+            });
+        }
+
+        /// <summary>The owner resumed a game the watchdog paused (or any paused game): it starts over on the ladder.</summary>
+        public static void Resume(StudioContext ctx, string gameId)
+        {
+            var now = ctx.Clock();
+            ctx.Store.Mutate(s =>
+            {
+                var g = s.Game(gameId) ?? throw new KeyNotFoundException("No game " + gameId);
+                g.Paused = false;
+                g.WaitingReason = null;
+                g.NextAttemptUtc = null;
+                Watchdog.Reset(g, now, "resumed by the owner");
+                s.ResolveOwnerTasks("stuck:" + gameId, now);
+                s.Touch(g, now);
+            });
         }
 
         private void ResetWaiting(string gameId) => TryUpdate(gameId, g => { g.WaitingReason = null; g.NextAttemptUtc = null; });
@@ -464,7 +546,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 if (ctx.Cloud.HasKey) s.ResolveOwnerTasks("apikey", now);
                 if (Slots.AnyFree(ctx)) s.ResolveOwnerTasks("slots", now);
                 // A game waiting on the owner gets looked at again as soon as its task is done.
-                foreach (var g in s.Games.Values.Where(g => g.WaitingReason != null))
+                foreach (var g in s.Games.Values.Where(g => g.WaitingReason != null && !g.Paused))
                 {
                     bool stillBlocked = s.Studio.OwnerTasks.Any(t => t.Status == OwnerTaskStatus.Open && (t.GameId == g.GameId && t.Kind is OwnerTaskKind.LaunchApproval or OwnerTaskKind.Escalation || t.GameId == null && t.Kind is OwnerTaskKind.ApiKey or OwnerTaskKind.ExperienceSlot));
                     if (!stillBlocked && g.NextAttemptUtc > now)

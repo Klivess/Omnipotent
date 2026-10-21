@@ -86,6 +86,7 @@ namespace Omnipotent.Services.OmniBlox
                     Log = message => _ = ServiceLog(message, false),
                     Alert = AlertAsync,
                     Settings = settings,
+                    Luau = new Build.LuauToolchain(Path.Combine(root, "tools"), message => _ = ServiceLog(message, false)),
                 };
                 Context = ctx;
                 await RefreshSettingsAsync();
@@ -127,6 +128,8 @@ namespace Omnipotent.Services.OmniBlox
                 TelemetryBaseUrl = (await GetStringOmniSetting("OmniBlox_TelemetryBaseUrl", "https://klive.dev")).Trim(),
                 DevExRate = double.TryParse(await GetStringOmniSetting("OmniBlox_DevExRate", "0.0038"), NumberStyles.Float, CultureInfo.InvariantCulture, out double rate) ? rate : 0.0038,
                 MaintenanceIntervalDays = Math.Clamp(await GetIntOmniSetting("OmniBlox_MaintenanceIntervalDays", 7), 1, 60),
+                MaxOutputTokens = Math.Clamp(await GetIntOmniSetting("OmniBlox_MaxOutputTokens", 16_384), 4096, 65_536),
+                CycleContextTokens = Math.Clamp(await GetIntOmniSetting("OmniBlox_CycleContextTokens", 120_000), 40_000, 400_000),
             };
             // The playtest experience runs unfinished builds, so a game is never given it as its own.
             if (s.PlaytestSlot is { } playtest && s.Slots.RemoveAll(slot => slot.UniverseId == playtest.UniverseId) > 0 && ctx.Settings.PlaytestSlot?.UniverseId != playtest.UniverseId)
@@ -145,6 +148,8 @@ namespace Omnipotent.Services.OmniBlox
             t.TelemetryBaseUrl = string.IsNullOrWhiteSpace(s.TelemetryBaseUrl) ? "https://klive.dev" : s.TelemetryBaseUrl;
             t.DevExRate = s.DevExRate;
             t.MaintenanceIntervalDays = s.MaintenanceIntervalDays;
+            t.MaxOutputTokens = s.MaxOutputTokens;
+            t.CycleContextTokens = s.CycleContextTokens;
             try { ModelGate = await ctx.Llm.CheckAvailableAsync(CancellationToken.None); } catch { }
         }
 

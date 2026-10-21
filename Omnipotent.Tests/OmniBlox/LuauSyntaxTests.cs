@@ -34,6 +34,15 @@ namespace Omnipotent.Tests.OmniBlox
         [InlineData("local read = {read = 1}\nlocal t: {read x: number, write y: string} = nil :: any")]
         [InlineData("local u: (\"a\" | \"b\")? = nil\nlocal i: string & {} = nil :: any")]
         [InlineData("local function v(...: number): ...number return ... end")]
+        // Generic type packs, optional parenthesised types and explicit instantiation (all shipped in Roblox's own code).
+        [InlineData("local function identity<T...>(...: T...): T... return ... end")]
+        [InlineData("export type Constructor<T...> = (T...) -> {}\ntype ValueFactory<Result, Args...> = (Args...) -> Result")]
+        [InlineData("type Signal<T...> = { Connect: (self: Signal<T...>, callback: (T...) -> ()) -> () }")]
+        [InlineData("local function make<T...>(name: string): () -> T... return nil :: any end")]
+        [InlineData("local format = require(script.format) :: <T...>(string, T...) -> string")]
+        [InlineData("local f = function(): (() -> ())? return nil end\nlocal g = function(): (() -> ...any) | nil return nil end")]
+        [InlineData("local function pick(s: string): (Color3 | { number })? return nil end")]
+        [InlineData("local ref = React.useRef<<Frame?>>(nil)\nlocal ctx = React.createContext<<Config>>({})\nlocal r2 = obj:make<<React.Ref<GuiObject>?>>(nil)")]
         [InlineData("return")]
         [InlineData("local M = {}\nfunction M.new() return setmetatable({}, {__index = M}) end\nfunction M:go() end\nreturn M")]
         public void ValidLuau_Parses(string source)
@@ -98,7 +107,7 @@ namespace Omnipotent.Tests.OmniBlox
                     scripts++;
                     lines += LuauSyntax.CountLines(source);
                     var errors = LuauSyntax.Check(source).Where(i => i.IsError).ToList();
-                    if (errors.Count > 0) failures.Add($"{Path.GetFileName(path)} {inst.FullName}: {errors[0]}");
+                    if (errors.Count > 0) failures.Add($"{Path.GetFileName(path)} {inst.FullName}: {errors[0]} | {LineOf(source, errors[0].Line)}");
                 }
             }
             foreach (var path in Directory.EnumerateFiles(versions, "*.lua", SearchOption.AllDirectories))
@@ -108,10 +117,16 @@ namespace Omnipotent.Tests.OmniBlox
                 scripts++;
                 lines += LuauSyntax.CountLines(source);
                 var errors = LuauSyntax.Check(source).Where(i => i.IsError).ToList();
-                if (errors.Count > 0) failures.Add($"{Path.GetFileName(path)}: {errors[0]}");
+                if (errors.Count > 0) failures.Add($"{Path.GetFileName(path)}: {errors[0]} | {LineOf(source, errors[0].Line)}");
             }
             output.WriteLine($"{scripts} scripts, {lines} lines checked.");
-            Assert.True(failures.Count == 0, string.Join("\n", failures.Take(20)));
+            Assert.True(failures.Count == 0, failures.Count + " script(s) failed:\n" + string.Join("\n", failures.Take(40)));
+        }
+
+        private static string LineOf(string source, int line)
+        {
+            var lines = source.Split('\n');
+            return line >= 1 && line <= lines.Length ? lines[line - 1].Trim() : "";
         }
     }
 }

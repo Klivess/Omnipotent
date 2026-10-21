@@ -100,6 +100,19 @@ namespace Omnipotent.Services.OmniBlox.Build
 
         public string Relative(string fullPath) => Path.GetRelativePath(Root, fullPath).Replace('\\', '/');
 
+        /// <summary>A hash of every file's path and content: equal hashes mean nothing in the game changed.</summary>
+        public string ContentFingerprint()
+        {
+            using var sha = System.Security.Cryptography.IncrementalHash.CreateHash(System.Security.Cryptography.HashAlgorithmName.SHA256);
+            foreach (var file in ListFiles())
+            {
+                sha.AppendData(Encoding.UTF8.GetBytes(file.Path + "\0"));
+                sha.AppendData(File.ReadAllBytes(Path.Combine(Root, file.Path)));
+                sha.AppendData(new byte[] { 0 });
+            }
+            return Convert.ToHexString(sha.GetHashAndReset())[..24].ToLowerInvariant();
+        }
+
         // ─────────────── Snapshots ───────────────
 
         public string SnapshotPath(int revision) => Path.Combine(SnapshotsDirectory, $"r{revision:D4}.zip");

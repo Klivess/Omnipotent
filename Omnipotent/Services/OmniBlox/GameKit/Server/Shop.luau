@@ -1,8 +1,9 @@
 -- OmniKit · Shop
 -- Game passes (permanent perks) and developer products (repeatable purchases). Every product has a
--- "grant" such as "currency:500", "multiplier:2", "speed:24", "item:GravityCoil", "skipstage" or
--- "flag:vip"; handlers for each kind are registered here or by the template. Receipts are recorded
--- in the player's profile and saved before a purchase is confirmed, so nothing is granted twice or lost.
+-- "grant" such as "currency:500", "currency:Gems:50", "multiplier:2", "speed:24", "item:GravityCoil",
+-- "skipstage" or "flag:vip"; handlers for each kind are registered here, by the template or by the game
+-- (Shop.RegisterGrant). Receipts are recorded in the player's profile and saved before a purchase is
+-- confirmed, so nothing is granted twice or lost.
 -- In a playtest build (Config.Playtest) nothing is ever charged: buying grants the product at once.
 
 local HttpService = game:GetService("HttpService")
@@ -15,6 +16,7 @@ local Config = require(script.Parent.Config)
 local Data = require(script.Parent.Data)
 local Currency = require(script.Parent.Currency)
 local Analytics = require(script.Parent.Analytics)
+local Effects = require(script.Parent.Effects)
 local Kit = ReplicatedStorage:WaitForChild("OmniKit")
 local Net = require(Kit:WaitForChild("Net"))
 local Util = require(Kit:WaitForChild("Util"))
@@ -38,30 +40,39 @@ for _, product in ipairs(Config.Products or {}) do
 	end
 end
 
+-- Fired (player, product) after any purchase is granted (games use it for celebrations or quest steps).
+Shop.Purchased = Util.Signal()
+
 function Shop.Product(key: string): any
 	return byKey[key]
 end
 
-function Shop.RegisterGrant(kind: string, handler: (any, string, any) -> ())
+function Shop.Products(): { any }
+	return Config.Products or {}
+end
+
+function Shop.RegisterGrant(kind: string, handler: (player: any, argument: string, product: any) -> ())
 	grants[kind] = handler
 end
 
-function Shop.Owns(player, key: string): boolean
+function Shop.HasGrant(kind: string): boolean
+	return grants[kind] ~= nil
+end
+
+function Shop.Owns(player: any, key: string): boolean
 	local profile = Data.Get(player)
 	return profile ~= nil and profile.Owned[key] == true
 end
 
-local function notify(player, text: string, kind: string?)
-	if Util.IsRealPlayer(player) then
-		Net.Event("Notify"):FireClient(player, { text = text, kind = kind or "info" })
-	end
+local function notify(player: any, text: string, kind: string?)
+	Effects.Toast(player, text, kind)
 end
 Shop.Notify = notify
 
-local function applyGrant(player, product): boolean
+local function applyGrant(player: any, product: any): boolean
 	local grant = product.Grant or ""
 	local kind, argument = string.match(grant, "^([%w_]+):?(.*)$")
-	local handler = kind and grants[kind]
+	local handler = if kind then grants[kind] else nil
 	if not handler then
 		warn("[OmniKit] no handler for grant", grant)
 		return false
@@ -74,9 +85,15 @@ local function applyGrant(player, product): boolean
 	return true
 end
 
--- Built-in grants. Templates add their own (e.g. the obby's "skipstage").
+-- Built-in grants. Templates and games add their own (e.g. the obby's "skipstage").
+-- "currency:500" gives the main currency; "currency:Gems:50" gives 50 of the extra currency Gems.
 Shop.RegisterGrant("currency", function(player, argument)
-	Currency.Add(player, tonumber(argument) or 0, "Purchase", false)
+	local name, amount = string.match(argument, "^([%a_][%w_]*):(%d+)$")
+	if name then
+		Currency.Add(player, tonumber(amount) or 0, "Purchase", false, name)
+	else
+		Currency.Add(player, tonumber(argument) or 0, "Purchase", false)
+	end
 end)
 
 Shop.RegisterGrant("multiplier", function(player, argument)
@@ -96,9 +113,9 @@ Shop.RegisterGrant("speed", function(player, argument)
 	if not Util.IsRealPlayer(player) then
 		return
 	end
-	local function apply(character)
+	local function apply(character: Model)
 		local humanoid = character:WaitForChild("Humanoid", 10)
-		if humanoid then
+		if humanoid and humanoid:IsA("Humanoid") then
 			humanoid.WalkSpeed = math.max(humanoid.WalkSpeed, speed)
 		end
 	end
@@ -124,7 +141,7 @@ Shop.RegisterGrant("item", function(player, argument)
 end)
 
 -- Pass perks re-apply on every join (ownership is checked with Roblox, then cached in the profile).
-local function applyOwnedPasses(player)
+local function applyOwnedPasses(player: any)
 	for _, product in ipairs(Config.Products or {}) do
 		if product.Kind == "GamePass" then
 			local owns = Shop.Owns(player, product.Key)
@@ -146,7 +163,7 @@ local function applyOwnedPasses(player)
 end
 
 -- Grants a developer product once per purchase id. Exposed for tests (fake players, fake receipts).
-function Shop.GrantPurchase(player, product, purchaseId: string): boolean
+function Shop.GrantPurchase(player: any, product: any, purchaseId: string): boolean
 	local profile = Data.Get(player)
 	if not profile then
 		return false
@@ -163,7 +180,26 @@ function Shop.GrantPurchase(player, product, purchaseId: string): boolean
 		profile.Receipts[table.remove(profile.ReceiptOrder, 1)] = nil
 	end
 	Data.MarkDirty(player)
+	Shop.Purchased:Fire(player, product)
 	return true
+end
+
+-- Grants a game pass (tests and playtests call this; real passes come through Roblox).
+function Shop.GrantPass(player: any, product: any): boolean
+	local profile = Data.Get(player)
+	if not profile then
+		return false
+	end
+	if profile.Owned[product.Key] then
+		return true
+	end
+	profile.Owned[product.Key] = true
+	Data.MarkDirty(player)
+	local ok = applyGrant(player, product)
+	if ok then
+		Shop.Purchased:Fire(player, product)
+	end
+	return ok
 end
 
 local function processReceipt(receipt)
@@ -183,12 +219,13 @@ local function processReceipt(receipt)
 	Analytics.Event("purchase", player, { key = product.Key, kind = "product", robux = receipt.CurrencySpent })
 	Analytics.Custom(player, "Purchase_" .. product.Key, receipt.CurrencySpent)
 	notify(player, "Thanks for buying " .. product.Name .. "!", "purchase")
+	Effects.Reward(player, nil, "✨ " .. product.Name, Color3.fromRGB(120, 255, 140))
 	return Enum.ProductPurchaseDecision.PurchaseGranted
 end
 
 -- A playtest purchase: granted at once and reported as a test (no Robux), so the owner can try every
 -- product without spending anything.
-local function testPurchase(player, product)
+local function testPurchase(player: any, product: any)
 	Analytics.Event("shop_prompt", player, { key = product.Key })
 	local isPass = product.Kind == "GamePass"
 	if isPass then
@@ -196,25 +233,21 @@ local function testPurchase(player, product)
 			notify(player, "You already own " .. product.Name .. ".", "info")
 			return
 		end
-		local profile = Data.Get(player)
-		if profile then
-			profile.Owned[product.Key] = true
-			Data.MarkDirty(player)
-		end
-		if not applyGrant(player, product) then
-			notify(player, "The test purchase of " .. product.Name .. " did not work (see the output).", "info")
+		if not Shop.GrantPass(player, product) then
+			notify(player, "The test purchase of " .. product.Name .. " did not work (see the output).", "error")
 			return
 		end
 	elseif not Shop.GrantPurchase(player, product, "playtest-" .. HttpService:GenerateGUID(false)) then
-		notify(player, "The test purchase of " .. product.Name .. " did not work (see the output).", "info")
+		notify(player, "The test purchase of " .. product.Name .. " did not work (see the output).", "error")
 		return
 	end
 	Data.SaveSoon(player)
 	Analytics.Event("purchase", player, { key = product.Key, kind = if isPass then "pass" else "product", robux = 0, test = true })
 	notify(player, "Test purchase: " .. product.Name .. " (free in playtests)", "purchase")
+	Effects.Reward(player, nil, "✨ " .. product.Name, Color3.fromRGB(120, 255, 140))
 end
 
-function Shop.Prompt(player, key: string)
+function Shop.Prompt(player: any, key: string)
 	local product = byKey[key]
 	if not product or not Util.IsRealPlayer(player) then
 		return
@@ -247,15 +280,11 @@ function Shop.Start()
 		if not purchased or not product then
 			return
 		end
-		local profile = Data.Get(player)
-		if profile then
-			profile.Owned[product.Key] = true
-			Data.MarkDirty(player)
-		end
-		applyGrant(player, product)
+		Shop.GrantPass(player, product)
 		Analytics.Event("purchase", player, { key = product.Key, kind = "pass", robux = product.Price })
 		Analytics.Custom(player, "Purchase_" .. product.Key, product.Price)
 		notify(player, "You now own " .. product.Name .. "!", "purchase")
+		Effects.Reward(player, nil, "✨ " .. product.Name, Color3.fromRGB(120, 255, 140))
 	end)
 
 	Data.Loaded:Connect(function(player)

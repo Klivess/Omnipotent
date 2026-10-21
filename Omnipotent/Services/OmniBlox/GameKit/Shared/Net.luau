@@ -38,11 +38,11 @@ local function get(className: string, name: string)
 end
 
 function Net.Event(name: string): RemoteEvent
-	return get("RemoteEvent", name)
+	return get("RemoteEvent", name) :: RemoteEvent
 end
 
 function Net.Function(name: string): RemoteFunction
-	return get("RemoteFunction", name)
+	return get("RemoteFunction", name) :: RemoteFunction
 end
 
 return Net

@@ -199,7 +199,11 @@ namespace Omnipotent.Tests.OmniBlox
         public List<(string Method, string Url, string Body)> Requests { get; } = new();
         public byte[] ModelFile { get; set; } = Array.Empty<byte>();
         public byte[] Png { get; set; } = Array.Empty<byte>();
-        public string EngineOutput { get; set; } = "{\"results\":[{\"passed\":12,\"failed\":0,\"results\":[]}]}";
+        /// <summary>What the game's engine test run answers: a green run of the kit's phases unless a test says otherwise.</summary>
+        public string EngineOutput { get; set; } = "{\"results\":[{\"passed\":3,\"failed\":0,\"results\":[" +
+            "{\"name\":\"Kit · profiles start fresh\",\"ok\":true,\"phase\":\"kit\",\"owner\":\"kit\"}," +
+            "{\"name\":\"Load · every module loads\",\"ok\":true,\"phase\":\"load\",\"owner\":\"kit\"}," +
+            "{\"name\":\"Boot · the server starts cleanly\",\"ok\":true,\"phase\":\"boot\",\"owner\":\"kit\"}],\"errors\":[],\"warnings\":[]}]}";
         /// <summary>Answer restartServers with 403, as a key without universe:write would get.</summary>
         public bool RestartRefused { get; set; }
         private long nextVersion = 1, nextId = 7000;

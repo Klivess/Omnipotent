@@ -11,7 +11,7 @@ using static Omnipotent.Services.OmniBlox.Agents.Schema;
 
 namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
 {
-    /// <summary>The playtest reviewer's tools: look, read, report, decide. It cannot change the game.</summary>
+    /// <summary>The playtest reviewer's tools: look, read, measure, report, decide. It cannot change the game.</summary>
     public static class ReviewTools
     {
         public sealed class Verdict
@@ -21,21 +21,35 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
             public List<TestIssue> Issues { get; } = new();
         }
 
+        public static readonly string[] Looking = { "render_scene", "scene_summary", "map_report", "list_files", "read_file", "search_code", "view_asset", "get_manifest", "kit_reference", "pacing_check", "playbook_search" };
+
         public static AgentToolbox Create(StudioContext ctx, string gameId, Verdict verdict)
         {
-            var box = BuildTools.Create(ctx, gameId).Subset("render_scene", "scene_summary", "list_files", "read_file", "view_asset", "get_manifest", "playbook_search");
-            box.Add("report_issue", "Report one problem found in review.",
-                Object(Req("severity", Str("error = must fix before launch; warning = should fix", "error", "warning")), Req("area", Str("e.g. spawn, stage 7, shop, visuals")), Req("message", Str("What is wrong and what to do"))),
+            var box = BuildTools.Create(ctx, gameId).Subset(Looking);
+            box.Add("report_issue", "Report one problem found in review: what a player would hit, where, and what to change.",
+                Object(Req("severity", Str("error = must fix before launch (broken, confusing, unfinished or no fun); warning = should fix", "error", "warning")), Req("area", Str("e.g. spawn, first minute, zone 2, shop, HUD, visuals, economy")), Req("message", Str("What is wrong, where, and what to do"))),
                 args =>
                 {
-                    verdict.Issues.Add(new TestIssue { Severity = Args.Str(args, "severity", "warning") == "error" ? "error" : "warning", Area = Args.Str(args, "area"), Message = Args.Required(args, "message") });
-                    return ToolResult.Ok("Noted.");
+                    string message = Args.Required(args, "message");
+                    string area = Args.Str(args, "area");
+                    string severity = Args.Str(args, "severity", "warning") == "error" ? "error" : "warning";
+                    if (verdict.Issues.FirstOrDefault(i => i.Area.Equals(area, StringComparison.OrdinalIgnoreCase) && i.Message.Equals(message, StringComparison.OrdinalIgnoreCase)) is { } same)
+                    {
+                        if (same.Severity == severity) return ToolResult.Ok("Already noted.");
+                        same.Severity = severity;
+                        return ToolResult.Ok($"Changed to {severity}.");
+                    }
+                    verdict.Issues.Add(new TestIssue { Severity = severity, Area = area, Message = message });
+                    return ToolResult.Ok($"Noted ({verdict.Issues.Count} so far).");
                 });
-            box.Add("verdict", "Pass or fail the build.",
-                Object(Req("pass", Bool("True only if nothing is broken and a child could pick it up and have fun")), Req("summary", Str("Why"))),
+            box.Add("verdict", "Pass or fail the build. Fail it for any error you reported.",
+                Object(Req("pass", Bool("True only if nothing is broken and a child could pick it up and have fun")), Req("summary", Str("Why, in two or three sentences"))),
                 args =>
                 {
-                    verdict.Pass = Args.Bool(args, "pass");
+                    bool pass = Args.Bool(args, "pass");
+                    if (pass && verdict.Issues.Any(i => i.Severity == "error"))
+                        return ToolResult.Error("you reported errors (must-fix problems): a build with them cannot pass. Fail it, or downgrade an issue you no longer think must be fixed by reporting it again as a warning and explaining why.");
+                    verdict.Pass = pass;
                     verdict.Summary = Args.Required(args, "summary");
                     return ToolResult.Ok("Verdict recorded. Now call finish_cycle.");
                 });
@@ -60,7 +74,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 {
                     var game = ctx.Game(gameId)!;
                     if (!StageGates.MarketingReady(game))
-                        return ToolResult.Error("not ready: " + string.Join("; ", StageGates.Checklist(game).Where(c => !c.Met && !c.Text.Contains("public")).Select(c => c.Text)));
+                        return ToolResult.Error("not ready: " + string.Join("; ", StageGates.Checklist(game, ctx).Where(c => !c.Met && !c.Text.Contains("public")).Select(c => c.Text)));
                     ctx.Update(gameId, g => g.Publish.LaunchRequestedUtc = ctx.Clock());
                     return ToolResult.Ok("Launch requested. Call finish_cycle with stage_complete true.");
                 });
@@ -103,9 +117,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
             ArtSpec Spec(JObject args, int renderW, int renderH)
             {
                 var result = ctx.Compile(gameId);
-                if (result.Parts.Count == 0) throw new InvalidOperationException("the world is empty; nothing to show");
-                var scene = ctx.Workspace(gameId).LoadScene();
-                byte[] render = SceneRenderer.Render(result.Parts, scene, Args.Str(args, "view", "iso"), renderW, renderH, caption: false);
+                if (result.Parts.Count == 0 && result.Terrain == null) throw new InvalidOperationException("the world is empty; nothing to show");
+                // The store look: the real world, rendered vivid (stronger colour, a vignette, no overlays).
+                byte[] render = ctx.RenderCompiled(gameId, result, Args.Str(args, "view", "aerial"), renderW, renderH, labels: false, caption: false, marketing: true);
                 var featured = new List<byte[]>();
                 foreach (var idText in Args.List(args, "featured_asset_ids").Take(3))
                 {
@@ -114,7 +128,10 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     string path = ctx.Library.ThumbnailPath(id);
                     if (File.Exists(path)) featured.Add(File.ReadAllBytes(path));
                 }
-                var accent = Args.Str(args, "accent") is { Length: > 0 } a ? PlaceCompiler.ParseColor(a) : new RbxColor3uint8(76, 175, 255);
+                var theme = ctx.Workspace(gameId).LoadManifest().Theme;
+                var accent = Args.Str(args, "accent") is { Length: > 0 } a ? PlaceCompiler.ParseColor(a)
+                    : theme.TryGetValue("Accent", out var themed) && themed.Length > 0 ? PlaceCompiler.ParseColor(themed)
+                    : new RbxColor3uint8(76, 175, 255);
                 return new ArtSpec
                 {
                     Headline = Args.Required(args, "headline"),
@@ -126,8 +143,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 };
             }
 
-            box.Add("make_icon", "Make the 512×512 game icon from the real world: a render from 'view' (overview, iso, spawn or an object id), an optional featured model that is in the game, and a short headline readable on a phone.",
-                Object(Req("headline", Str("1-3 words")), Opt("view", Str("Render view")), Opt("featured_asset_ids", StrList("Up to 1 placed model to feature")), Opt("badge", Str("Optional tiny badge, e.g. NEW")), Opt("accent", Str("Accent colour"))),
+            box.Add("make_icon", "Make the 512×512 game icon from the real world in the bright store style (vivid colour, sunburst, chunky lettering): a render from 'view', an optional featured model that is in the game as a die-cut sticker, and a short headline readable on a phone (or none).",
+                Object(Req("headline", Str("1-3 words")), Opt("view", Str("What to show: aerial (default), iso, spawn, zone:<id>, an object id (close-up) or a camera \"x,y,z>x,y,z\"")), Opt("featured_asset_ids", StrList("Up to 1 placed model to feature")), Opt("badge", Str("Optional tiny badge, e.g. NEW")), Opt("accent", Str("Accent colour #RRGGBB (default: the game's theme accent, made vivid)"))),
                 args =>
                 {
                     byte[] png = ctx.Marketing.MakeIcon(Spec(args, 1024, 1024));
@@ -138,8 +155,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 });
 
             box.Add("make_thumbnail", "Make a 1920×1080 store thumbnail from the real world: a render, a big headline, a subtitle and up to 3 models that are really in the game. 'slot' 1-3 keeps several variants.",
-                Object(Req("headline", Str("Big text, 1-5 words")), Opt("subtitle", Str("Short line")), Opt("view", Str("Render view")), Opt("featured_asset_ids", StrList("Placed models to feature")),
-                    Opt("badge", Str("Optional badge")), Opt("accent", Str("Accent colour")), Opt("slot", Int("1-3 (default 1)"))),
+                Object(Req("headline", Str("Big text, 1-5 words")), Opt("subtitle", Str("Short line")), Opt("view", Str("What to show: aerial (default), iso, spawn, zone:<id>, an object id (close-up) or a camera \"x,y,z>x,y,z\"")), Opt("featured_asset_ids", StrList("Placed models to feature")),
+                    Opt("badge", Str("Optional badge")), Opt("accent", Str("Accent colour #RRGGBB (default: the game's theme accent, made vivid)")), Opt("slot", Int("1-3 (default 1)"))),
                 args =>
                 {
                     byte[] png = ctx.Marketing.MakeThumbnail(Spec(args, 1920, 1080));
@@ -164,7 +181,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                         .ToList();
                     string title = ctx.Game(gameId)!.DisplayTitle;
                     string output = Path.Combine(ctx.Store.MediaDirectory(gameId), "trailer.mp4");
-                    var (path, message) = await ctx.Marketing.MakeTrailerAsync(result.Parts, ctx.Workspace(gameId).LoadScene(), title, shots, output, ct, 960, 540);
+                    var (path, message) = await ctx.Marketing.MakeTrailerAsync(ctx.RenderWorldFor(gameId, result), title, shots, output, ct);
                     if (path != null) ctx.Update(gameId, g => g.Store.TrailerFile = "trailer.mp4");
                     return path != null ? ToolResult.Ok("Trailer saved: " + message) : ToolResult.Ok("No trailer: " + message);
                 });

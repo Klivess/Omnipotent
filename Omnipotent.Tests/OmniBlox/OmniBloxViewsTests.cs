@@ -65,9 +65,16 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Equal("Build", (string)d["Game"]!["Stage"]!);
             Assert.Equal(7.6, (double)d["Game"]!["Concepts"]![0]!["Scores"]!["Total"]!); // weighted total is serialized for the dashboard
             Assert.NotEmpty((string)d["Goal"]!);
-            Assert.Equal(5, ((JArray)d["Checklist"]!).Count);
+            // Built once, compiles, geometry, the map, the engine (a key and a slot exist here), milestones, feature complete.
+            Assert.Equal(7, ((JArray)d["Checklist"]!).Count);
+            Assert.Contains((JArray)d["Checklist"]!, c => ((string)c["Text"]!).Contains("run_tests"));
             Assert.All((JArray)d["Checklist"]!, c => Assert.NotNull(c["Met"]));
             Assert.Empty((JArray)d["Media"]!);
+            Assert.True((bool)d["EngineAvailable"]!);
+            Assert.Equal("moving", (string)d["Watchdog"]!["Name"]!);
+            Assert.NotNull(d["Live"]); // the research cycle just ran: its live view is still there
+            Assert.Equal("researcher", (string)d["Live"]!["Role"]!);
+            Assert.NotEmpty((JArray)d["CycleLogs"]!);
             Assert.Null(OmniBloxViews.GameDetail(h.Ctx, "nope"));
         }
 

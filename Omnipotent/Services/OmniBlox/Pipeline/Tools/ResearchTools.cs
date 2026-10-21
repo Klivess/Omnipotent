@@ -220,7 +220,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                         g.WorkingTitle = brief.Title;
                     });
                     ctx.Harvester.RequestAssets(brief.AssetNeeds);
-                    var gate = StageGates.Checklist(ctx.Game(gameId)!);
+                    var gate = StageGates.Checklist(ctx.Game(gameId)!, ctx);
                     return ToolResult.Ok("Brief saved; the harvester is looking for its models.\nExit criteria:\n" + string.Join("\n", gate.Select(c => $"- [{(c.Met ? "x" : " ")}] {c.Text}")));
                 });
 

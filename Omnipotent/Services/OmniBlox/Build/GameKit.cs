@@ -49,11 +49,30 @@ namespace Omnipotent.Services.OmniBlox.Build
             ["Dropper"] = "tycoon: cosmetic dropper inside an item",
             ["Collectible"] = "simulator: worth Value, respawns after Respawn seconds",
             ["SellZone"] = "simulator: touch to sell the bag",
+            ["ZoneGate"] = "blocks a zone until bought: Zone (name), Price, optional Currency (an extra currency) and Requires (another zone); shows a lock sign and an Unlock prompt, then turns see-through for that player",
+            ["Spin"] = "turns in place about Y at Speed degrees/second (default 90): coins, gems, rewards",
+            ["Bob"] = "floats gently up and down by Height (default 1) every Period seconds (1.6): pickups, signs",
+            ["Glow"] = "adds a point light: Color (default the part's), Range (14), Brightness (1.6)",
+            ["Sparkle"] = "adds sparkle particles: Color (default gold), Rate (6) — rewards, goals, rare things",
         };
 
         private static readonly Lazy<IReadOnlyList<KitFile>> files = new(LoadFiles);
+        private static readonly Lazy<string> fingerprint = new(() =>
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            foreach (var f in Files)
+            {
+                byte[] bytes = Encoding.UTF8.GetBytes(f.Path + "\n" + f.Source + "\n");
+                sha.TransformBlock(bytes, 0, bytes.Length, null, 0);
+            }
+            sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+            return Convert.ToHexString(sha.Hash!)[..16].ToLowerInvariant();
+        });
 
         public static IReadOnlyList<KitFile> Files => files.Value;
+
+        /// <summary>Identifies this version of the kit: a build of unchanged files on a different kit is a different build.</summary>
+        public static string Fingerprint => fingerprint.Value;
 
         private static IReadOnlyList<KitFile> LoadFiles()
         {

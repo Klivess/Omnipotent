@@ -520,12 +520,25 @@ WHERE asset_id = $id";
             return ReadRecords(cmd).FirstOrDefault();
         }
 
-        /// <summary>The cleaned model, ready to place (scripts and unsafe instances already removed).</summary>
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<long, (DateTime Stamp, byte[] Bytes)> modelBytes = new();
+
+        /// <summary>
+        /// The cleaned model, ready to place (scripts and unsafe instances already removed). A fresh copy every call
+        /// (the compiler moves its parts); the file's bytes are kept in memory, since a forest of 80 trees is 80
+        /// loads of the same model.
+        /// </summary>
         public RbxInstance? LoadModel(long assetId)
         {
             string path = CleanModelPath(assetId);
             if (!File.Exists(path)) return null;
-            var doc = RbxFile.Read(File.ReadAllBytes(path));
+            var stamp = File.GetLastWriteTimeUtc(path);
+            if (!modelBytes.TryGetValue(assetId, out var cached) || cached.Stamp != stamp)
+            {
+                cached = (stamp, File.ReadAllBytes(path));
+                if (modelBytes.Count > 600) modelBytes.Clear();
+                modelBytes[assetId] = cached;
+            }
+            var doc = RbxFile.Read(cached.Bytes);
             return doc.Roots.FirstOrDefault();
         }
 

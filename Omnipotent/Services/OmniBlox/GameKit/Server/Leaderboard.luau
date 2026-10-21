@@ -14,19 +14,20 @@ local Leaderboard = {}
 local REFRESH_SECONDS = 300
 
 -- Which number to rank players by; the template may replace this.
-Leaderboard.Stat = function(profile): number
-	return profile.Stats and profile.Stats.Earned or 0
+Leaderboard.Stat = function(profile: any): number
+	return if profile.Stats then profile.Stats.Earned or 0 else 0
 end
 Leaderboard.Title = "Top Players"
 
 local store: OrderedDataStore? = nil
 
 local function boardGui(part: BasePart): Frame
-	local gui = part:FindFirstChild("OmniLeaderboard")
-	if gui then
-		return gui:FindFirstChild("List")
+	local existing = part:FindFirstChild("OmniLeaderboard")
+	local existingList = if existing then existing:FindFirstChild("List") else nil
+	if existingList and existingList:IsA("Frame") then
+		return existingList
 	end
-	gui = Instance.new("SurfaceGui")
+	local gui = Instance.new("SurfaceGui")
 	gui.Name = "OmniLeaderboard"
 	gui.Face = Enum.NormalId.Front
 	gui.SizingMode = Enum.SurfaceGuiSizingMode.PixelsPerStud
@@ -124,7 +125,7 @@ local function refresh()
 end
 
 function Leaderboard.Start()
-	if Config.Leaderboard == false then
+	if Config.Leaderboard == false or Config.Testing == true then
 		return
 	end
 	if not Data.IsMemoryOnly() then

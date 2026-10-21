@@ -59,6 +59,10 @@ namespace Omnipotent.Services.OmniBlox
                 ("/omniblox/game/file", GameFile, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/game/telemetry", GameTelemetry, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/game/place", GamePlace, get, OmniBloxPerms.StudioRead),
+                ("/omniblox/game/live", GameLive, get, OmniBloxPerms.StudioRead),
+                ("/omniblox/game/cycle", GameCycle, get, OmniBloxPerms.StudioRead),
+                ("/omniblox/game/cycle/image", GameCycleImage, get, OmniBloxPerms.StudioRead),
+                ("/omniblox/game/map", GameMap, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/assets", Assets, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/asset", AssetDetail, get, OmniBloxPerms.StudioRead),
                 ("/omniblox/asset/image", AssetImage, get, OmniBloxPerms.StudioRead),
@@ -69,12 +73,17 @@ namespace Omnipotent.Services.OmniBlox
                 ("/omniblox/tasks/resolve", ResolveTask, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/new", NewGame, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/pause", PauseGame, post, OmniBloxPerms.StudioAct),
+                ("/omniblox/games/resume", ResumeGame, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/steer", SteerGame, post, OmniBloxPerms.StudioAct),
+                ("/omniblox/games/directive", DirectiveAction, post, OmniBloxPerms.StudioAct),
+                ("/omniblox/games/build", BuildGame, post, OmniBloxPerms.StudioAct),
+                ("/omniblox/games/test", TestGame, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/maintain", MaintainGame, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/playtest", PlaytestGame, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/playtest/follow", PlaytestFollow, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/approve", ApproveLaunch, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/games/abandon", AbandonGame, post, OmniBloxPerms.StudioManage),
+                ("/omniblox/games/revive", ReviveGame, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/studio/toggle", Toggle, post, OmniBloxPerms.StudioManage),
             };
 
@@ -204,17 +213,54 @@ namespace Omnipotent.Services.OmniBlox
             await req.ReturnBinaryResponse(await File.ReadAllBytesAsync(path), type, HttpStatusCode.OK, headers);
         }
 
+        /// <summary>
+        /// The world as the agents see it: view = map (plan overlay), overview, aerial, iso, spawn, zone:&lt;id&gt;, an
+        /// object id or a camera "x,y,z&gt;x,y,z"; labels=1 draws object ids; marketing=1 uses the bright store look.
+        /// </summary>
         private async Task GameRender(UserRequest req)
         {
             var game = RequireGame(RequiredQuery(req, "id"));
             if (!Ctx.Workspace(game.GameId).Exists) throw NotFound("This game has no world yet.");
             var result = Ctx.Compile(game.GameId);
-            if (result.Parts.Count == 0) throw NotFound("The world is empty.");
+            if (result.Parts.Count == 0 && result.Terrain == null) throw NotFound("The world is empty.");
             string view = Query(req, "view", "iso");
+            int width = int.TryParse(Query(req, "w", "1280"), out int w) ? Math.Clamp(w, 320, 1920) : 1280;
+            int height = int.TryParse(Query(req, "h", "760"), out int h) ? Math.Clamp(h, 240, 1080) : 760;
             byte[] png;
-            try { png = SceneRenderer.Render(result.Parts, Ctx.Workspace(game.GameId).LoadScene(), view, 1280, 760); }
-            catch (ArgumentException ex) { throw Bad(ex.Message); }
+            try { png = Ctx.RenderCompiled(game.GameId, result, view, width, height, labels: Query(req, "labels") is "1" or "true", caption: false, marketing: Query(req, "marketing") is "1" or "true"); }
+            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or FormatException) { throw Bad(ex.Message); }
             await req.ReturnBinaryResponse(png, "image/png");
+        }
+
+        /// <summary>The cycle the game is running now (or ran last), step by step; null when none has run since the server started.</summary>
+        private async Task GameLive(UserRequest req)
+        {
+            var game = RequireGame(RequiredQuery(req, "id"));
+            await Respond(req, new { Live = Ctx.Live.Get(game.GameId) });
+        }
+
+        /// <summary>One past cycle's full log (every message, tool call and result, with picture names).</summary>
+        private async Task GameCycle(UserRequest req)
+        {
+            var game = RequireGame(RequiredQuery(req, "id"));
+            string cycle = RequiredQuery(req, "cycle");
+            var entries = CycleLog.Read(Ctx, game.GameId, cycle) ?? throw NotFound("That cycle's log is gone (only the newest " + CycleLog.KeepLogs + " are kept) or never existed.");
+            var report = game.Cycles.FirstOrDefault(c => c.CycleId == cycle);
+            await Respond(req, new { CycleId = cycle, Report = report, Entries = entries });
+        }
+
+        private async Task GameCycleImage(UserRequest req)
+        {
+            var game = RequireGame(RequiredQuery(req, "id"));
+            string path = CycleLog.ImagePath(Ctx, game.GameId, RequiredQuery(req, "cycle"), RequiredQuery(req, "file")) ?? throw NotFound("No such picture.");
+            await req.ReturnBinaryResponse(await File.ReadAllBytesAsync(path), "image/png");
+        }
+
+        /// <summary>The map report on the game's current files: score, play area, coverage, zones, spawn, findings.</summary>
+        private async Task GameMap(UserRequest req)
+        {
+            var game = RequireGame(RequiredQuery(req, "id"));
+            await Respond(req, OmniBloxViews.Map(Ctx, game.GameId) ?? throw NotFound("This game has no world yet."));
         }
 
         private async Task GameFiles(UserRequest req)
@@ -364,26 +410,134 @@ namespace Omnipotent.Services.OmniBlox
             string id = Required(body, "gameId");
             bool paused = (bool?)body["paused"] ?? true;
             RequireGame(id);
-            Ctx.Update(id, g => g.Paused = paused);
+            if (!paused) Orchestrator.Resume(Ctx, id);
+            else Ctx.Update(id, g => g.Paused = true);
             Ctx.Event(EventLevel.Info, "owner.pause", paused ? "Paused by the owner." : "Resumed by the owner.", id);
             await Respond(req, new { ok = true });
         }
 
+        /// <summary>Unpauses a game (including one the watchdog paused to ask for help); the watchdog starts over.</summary>
+        private async Task ResumeGame(UserRequest req)
+        {
+            string id = Required(Body(req), "gameId");
+            RequireGame(id);
+            Orchestrator.Resume(Ctx, id);
+            Ctx.Event(EventLevel.Info, "owner.resume", "Resumed by the owner; the watchdog starts over.", id);
+            await Respond(req, new { ok = true });
+        }
+
+        /// <summary>
+        /// The owner's direction for a game. It becomes a directive: delivered to a cycle that is running now (at its
+        /// next turn), leading every briefing until an agent reports it done (or the owner drops it). Steering a game
+        /// the watchdog paused also resumes it — the direction is the help it asked for.
+        /// </summary>
         private async Task SteerGame(UserRequest req)
         {
             var body = Body(req);
             string id = Required(body, "gameId");
             string note = Required(body, "note");
-            if (note.Length > 600) throw Bad("Keep the note under 600 characters.");
+            if (note.Length > 2000) throw Bad("Keep the direction under 2000 characters.");
             RequireGame(id);
-            Ctx.Update(id, g =>
+            var now = Ctx.Clock();
+            string directiveId = "";
+            bool resumed = false;
+            Ctx.Store.Mutate(s =>
             {
-                g.KeyFacts.Add("Owner's direction (" + DateTime.UtcNow.ToString("yyyy-MM-dd") + "): " + note);
-                if (g.KeyFacts.Count > GameDossier.MaxKeyFacts) g.KeyFacts.RemoveAt(0);
+                var g = s.Game(id)!;
+                int n = 1;
+                while (g.Directives.Any(d => d.DirectiveId == "d" + n)) n++;
+                directiveId = "d" + n;
+                g.Directives.Add(new OwnerDirective { DirectiveId = directiveId, Utc = now, Text = note });
+                // Keep the history bounded: the oldest closed directives go first; open ones always stay.
+                int excess = g.Directives.Count - 60;
+                if (excess > 0)
+                    foreach (var old in g.Directives.Where(d => d.Status != DirectiveStatus.Open).Take(excess).ToList()) g.Directives.Remove(old);
                 g.NextAttemptUtc = null;
+                if (g.Paused && g.Progress.Level >= 3)
+                {
+                    g.Paused = false;
+                    g.WaitingReason = null;
+                    Watchdog.Reset(g, now, "the owner gave a direction");
+                    s.ResolveOwnerTasks("stuck:" + id, now);
+                    resumed = true;
+                }
+                s.Touch(g, now);
+                s.AddEvent(EventLevel.Info, "owner.steer", $"Owner's direction ({directiveId}): " + (note.Length > 300 ? note[..300] + "…" : note), id, now);
             });
-            Ctx.Event(EventLevel.Info, "owner.steer", "Owner's direction: " + note, id);
+            await Respond(req, new { ok = true, directiveId, resumed });
+        }
+
+        /// <summary>Drops an open directive the owner no longer wants (or reopens one that was closed).</summary>
+        private async Task DirectiveAction(UserRequest req)
+        {
+            var body = Body(req);
+            string id = Required(body, "gameId");
+            string directiveId = Required(body, "directiveId");
+            string action = (string?)body["action"] ?? "drop";
+            if (action is not ("drop" or "reopen")) throw Bad("action must be 'drop' or 'reopen'.");
+            RequireGame(id);
+            bool found = false;
+            Ctx.Store.Mutate(s =>
+            {
+                var g = s.Game(id)!;
+                var d = g.Directives.FirstOrDefault(x => x.DirectiveId.Equals(directiveId, StringComparison.OrdinalIgnoreCase));
+                if (d == null) return;
+                found = true;
+                if (action == "drop") { d.Status = DirectiveStatus.Dropped; d.ResolvedUtc = Ctx.Clock(); }
+                else { d.Status = DirectiveStatus.Open; d.ResolvedUtc = null; d.Delivered = false; d.Response = null; }
+                s.Touch(g, Ctx.Clock());
+            });
+            if (!found) throw NotFound("No such directive.");
             await Respond(req, new { ok = true });
+        }
+
+        /// <summary>Builds the game's current files now and answers with the full report (syntax, types, geometry, map).</summary>
+        private async Task BuildGame(UserRequest req)
+        {
+            string id = Required(Body(req), "gameId");
+            RequireGame(id);
+            if (!Ctx.Workspace(id).Exists) throw NotFound("This game has no files yet.");
+            var run = await Pipeline.Tools.BuildTools.RunBuildAsync(Ctx, id, CancellationToken.None);
+            Ctx.Event(run.Ok ? EventLevel.Info : EventLevel.Warning, "owner.build", run.Ok ? $"Built r{Ctx.Game(id)!.Build.Revision} on the owner's request." : "The owner's build failed.", id);
+            await Respond(req, new { ok = run.Ok, report = run.Report, revision = Ctx.Game(id)!.Build.Revision, mapScore = run.Map.Score });
+        }
+
+        /// <summary>
+        /// Runs the game in Roblox's engine now, in the background (about a minute); the result lands in the game's
+        /// Build.LastEngineRun and its event log.
+        /// </summary>
+        private async Task TestGame(UserRequest req)
+        {
+            string id = Required(Body(req), "gameId");
+            var game = RequireGame(id);
+            if (!Ctx.Workspace(id).Exists) throw NotFound("This game has no files yet.");
+            if (!Ctx.Cloud.HasKey) throw new RouteException(HttpStatusCode.Conflict, "Engine tests need the Roblox API key (OmniSetting OmniBlox_RobloxApiKey).");
+            if (game.Slot == null && !Slots.AnyFree(Ctx)) throw new RouteException(HttpStatusCode.Conflict, "Engine tests need an experience slot, and every slot is taken.");
+            if (Pipeline.Tools.BuildTools.EngineRunning(id)) throw new RouteException(HttpStatusCode.Conflict, "An engine test run is already going for this game.");
+            var ctx = Ctx;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var (run, message) = await Pipeline.Tools.BuildTools.RunEngineTestsAsync(ctx, id, CancellationToken.None);
+                    ctx.Event(run is { Ok: true } ? EventLevel.Success : EventLevel.Warning, "owner.test", "Engine test run (owner's request): " + (run?.Summary ?? message), id);
+                }
+                catch (Exception ex)
+                {
+                    ctx.Event(EventLevel.Error, "owner.test", "The engine test run failed: " + ex.Message, id);
+                    ctx.Log("[OmniBlox] owner engine test for " + id + " failed: " + ex);
+                }
+            });
+            await Respond(req, new { ok = true, started = true });
+        }
+
+        private async Task ReviveGame(UserRequest req)
+        {
+            string id = Required(Body(req), "gameId");
+            RequireGame(id);
+            try { Orchestrator.Revive(Ctx, id); }
+            catch (InvalidOperationException ex) { throw Bad(ex.Message); }
+            await Respond(req, new { ok = true, stage = Ctx.Game(id)!.Stage });
         }
 
         private async Task MaintainGame(UserRequest req)
@@ -451,12 +605,10 @@ namespace Omnipotent.Services.OmniBlox
         {
             var body = Body(req);
             string id = Required(body, "gameId");
-            string reason = (string?)body["reason"] ?? "abandoned by the owner";
-            var game = RequireGame(id);
-            if (game.Stage is GameStage.Live or GameStage.Sunset) throw Bad("Live games are sunset by maintenance, not abandoned.");
-            Slots.Release(Ctx, id);
-            Ctx.Update(id, g => { g.Stage = GameStage.Abandoned; g.AbandonReason = reason; g.StageEnteredUtc = DateTime.UtcNow; });
-            Ctx.Event(EventLevel.Warning, "owner.abandon", "Abandoned by the owner: " + reason, id);
+            string reason = (string?)body["reason"] is { Length: > 0 } r ? r.Trim() : "abandoned by the owner";
+            RequireGame(id);
+            try { Orchestrator.Abandon(Ctx, id, reason); }
+            catch (InvalidOperationException ex) { throw Bad(ex.Message); }
             await Respond(req, new { ok = true });
         }
 

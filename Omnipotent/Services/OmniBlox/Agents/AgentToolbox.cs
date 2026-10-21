@@ -53,8 +53,11 @@ namespace Omnipotent.Services.OmniBlox.Agents
         public bool Has(string name) => byName.ContainsKey(name);
 
         /// <summary>A toolbox holding only the named tools (in this toolbox's order).</summary>
+        /// <summary>A toolbox of just these tools (in this toolbox's order). A name it does not have is a bug, not a quiet omission.</summary>
         public AgentToolbox Subset(params string[] names)
         {
+            var missing = names.Where(n => !Has(n)).ToList();
+            if (missing.Count > 0) throw new InvalidOperationException("no such tool(s) to subset: " + string.Join(", ", missing));
             var box = new AgentToolbox();
             foreach (var t in tools.Where(t => names.Contains(t.Name))) box.Add(t);
             return box;
@@ -95,11 +98,21 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 throw;
             }
             catch (Exception ex) when (ex is ArgumentException or FormatException or InvalidOperationException or KeyNotFoundException
-                                           or JsonException or IOException or InvalidCastException or Roblox.RobloxApiException or Roblox.RobloxKeyMissingException)
+                                           or JsonException or IOException or InvalidCastException or Roblox.RobloxApiException or Roblox.RobloxKeyMissingException
+                                           or TimeoutException or HttpRequestException or UnauthorizedAccessException)
             {
                 return ToolResult.Error(ex.Message);
             }
+            catch (Exception ex)
+            {
+                // A bug in one tool must not end the whole cycle: the agent hears about it and can work around it.
+                OnInternalError?.Invoke(name, ex);
+                return ToolResult.Error($"the tool '{name}' failed inside the studio ({ex.GetType().Name}: {ex.Message}). This is not your fault; try another way, or carry on with other work.");
+            }
         }
+
+        /// <summary>Told about a tool that threw something unexpected (logged by the studio).</summary>
+        public Action<string, Exception>? OnInternalError { get; set; }
     }
 
     /// <summary>Tiny JSON-schema builder so tool definitions stay readable.</summary>
@@ -166,12 +179,43 @@ namespace Omnipotent.Services.OmniBlox.Agents
             return s is "true" or "1" or "yes";
         }
 
-        public static List<string> List(JObject a, string key)
+        /// <summary>
+        /// A list argument. Models sometimes send a list as one string: a JSON array inside a string is unwrapped,
+        /// lines become items, and a single line is split on commas only when every piece is a short word or id
+        /// ("obby, tycoon", "12, 15"). A sentence that merely contains commas ("x at [16, 0.15, 44]") stays whole.
+        /// </summary>
+        public static List<string> List(JObject a, string key) => ListOf(a[key], commas: true);
+
+        /// <summary>A list of sentences (facts, problems, steps): never split on commas.</summary>
+        public static List<string> Prose(JObject a, string key) => ListOf(a[key], commas: false);
+
+        public static List<string> ListOf(JToken? t, bool commas)
         {
-            var t = a[key];
-            if (t is JArray arr) return arr.Select(x => x.Type == JTokenType.String ? (string)x! : x.ToString(Formatting.None)).Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
-            if (t != null && t.Type == JTokenType.String) return ((string)t!).Split(new[] { ',', '\n' }, StringSplitOptions.RemoveEmptyEntries).Select(x => x.Trim()).ToList();
-            return new List<string>();
+            if (t is JArray arr)
+                return arr.Select(x => x.Type == JTokenType.String ? (string)x! : x.ToString(Formatting.None)).Select(Unbullet).Where(x => x.Length > 0).ToList();
+            if (t == null || t.Type != JTokenType.String) return new List<string>();
+            string text = ((string)t!).Trim();
+            if (text.Length == 0) return new List<string>();
+            if (text.StartsWith('[') && text.EndsWith(']'))
+            {
+                try
+                {
+                    if (JToken.Parse(text) is JArray inner) return ListOf(inner, commas);
+                }
+                catch (JsonException) { /* not JSON after all: read it as text */ }
+            }
+            var lines = text.Split('\n').Select(Unbullet).Where(x => x.Length > 0).ToList();
+            if (lines.Count > 1 || !commas) return lines;
+            var pieces = text.Split(',').Select(x => x.Trim()).Where(x => x.Length > 0).ToList();
+            bool simple = pieces.Count > 1 && pieces.All(p => p.Length <= 40 && p.Count(char.IsWhiteSpace) <= 3 && !p.Contains('[') && !p.Contains(']'));
+            return simple ? pieces : lines;
+        }
+
+        private static string Unbullet(string s)
+        {
+            s = s.Trim();
+            if (s.StartsWith("- ", StringComparison.Ordinal) || s.StartsWith("* ", StringComparison.Ordinal) || s.StartsWith("• ", StringComparison.Ordinal)) s = s[2..].Trim();
+            return s;
         }
 
         public static float[]? Vec3(JObject a, string key)

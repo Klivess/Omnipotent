@@ -66,6 +66,7 @@ namespace Omnipotent.Tests.OmniBlox
                 ("write_file", new { path = "src/server/Welcome.server.luau", content = "local Players = game:GetService(\"Players\")\nPlayers.PlayerAdded:Connect(function(player)\n\tprint(\"Welcome\", player.Name)\nend)\n" }),
                 ("write_file", new { path = "src/tests/Stages.luau", content = "return { [\"has stages\"] = function(t) t.ok(true) end }\n" }),
                 ("build", new { }),
+                ("run_tests", new { }),
                 ("update_milestone", new { id = "m1", done = true }),
                 ("update_milestone", new { id = "m2", done = true }),
                 ("update_milestone", new { id = "m3", done = true }),
@@ -227,6 +228,8 @@ namespace Omnipotent.Tests.OmniBlox
                 ("update_milestone", new { id = "m1", done = true }),
                 ("update_milestone", new { id = "m2", done = true }),
                 ("update_milestone", new { id = "m3", done = true }),
+                ("update_milestone", new { id = "m4", done = true }),
+                ("update_milestone", new { id = "m5", done = true }),
                 ("mark_feature_complete", new { notes = "core loop done" }));
             ScriptReview(h.Llm);
             ScriptMarketing(h.Llm, featureAsset: false);
@@ -269,19 +272,32 @@ namespace Omnipotent.Tests.OmniBlox
         }
 
         [Fact]
-        public async Task TheWatchdogResetsAStuckStageOnce_ThenAbandonsTheGame()
+        public async Task AStuckGame_ClimbsTheWatchdogLadder_ThenPausesAndAsksTheOwner_AndIsNeverAbandoned()
         {
             using var h = new StudioHarness();
-            // A researcher that never writes a brief.
-            for (int i = 0; i < 12; i++) h.Llm.Script("researcher", new { summary = "still thinking", stage_complete = false }, ("save_finding", new { finding = "nothing yet" }));
-            await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().Escalations == 1, 20);
+            // A researcher that never writes a brief (and changes nothing the watchdog counts as progress).
+            for (int i = 0; i < 14; i++) h.Llm.Script("researcher", new { summary = "still thinking", stage_complete = false });
+            await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().Paused, 20);
             var game = h.OnlyGame();
             Assert.Equal(GameStage.Research, game.Stage);
-            Assert.Contains(game.KeyFacts, f => f.StartsWith("Watchdog"));
-            Assert.Contains(h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList()), t => t.Kind == OwnerTaskKind.Escalation);
+            Assert.Equal(3, game.Progress.Level);
+            Assert.Equal(1, game.Escalations);
+            Assert.Contains(game.Progress.History, line => line.Contains("level 1"));
+            Assert.Contains(game.Progress.History, line => line.Contains("level 2"));
+            Assert.Contains(h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList()), t => t.Kind == OwnerTaskKind.Escalation && t.DedupeKey == "stuck:" + game.GameId);
 
-            await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Values.Any(g => g.Stage == GameStage.Abandoned)), 20);
-            Assert.Equal(GameStage.Abandoned, h.Game(game.GameId).Stage);
+            // Paused, it waits however long it takes: nothing runs and nothing gives up on it.
+            int cycles = game.Cycles.Count;
+            for (int i = 0; i < 5; i++) await h.Orchestrator.StepAsync(CancellationToken.None);
+            Assert.Equal(cycles, h.Game(game.GameId).Cycles.Count);
+            Assert.NotEqual(GameStage.Abandoned, h.Game(game.GameId).Stage);
+
+            // The owner resumes it: the ladder starts over and the task is resolved.
+            Services.OmniBlox.Pipeline.Orchestrator.Resume(h.Ctx, game.GameId);
+            var resumed = h.Game(game.GameId);
+            Assert.False(resumed.Paused);
+            Assert.Equal(0, resumed.Progress.Level);
+            Assert.DoesNotContain(h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList()), t => t.DedupeKey == "stuck:" + game.GameId && t.Status == OwnerTaskStatus.Open);
         }
     }
 }

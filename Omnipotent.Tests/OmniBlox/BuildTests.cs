@@ -111,6 +111,32 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Equal(2.0, pad.FindFirstChild("Stage")!.GetAs<double>("Value"));
             Assert.Equal(new RbxColor3uint8(0x4C, 0xAF, 0x50), pad.Color);
             Assert.Contains(all, i => i.ClassName == "SpawnLocation" && i.Name == "Start");
+            Assert.Contains("local config: { [string]: any } =", configSource);
+            Assert.DoesNotContain("Telemetry", publicConfig.GetString("Source")!);
+            // The engine-test flavour only exists for run_tests: the real place runs its scripts as scripts.
+            Assert.DoesNotContain(all, i => i.ClassName == "ModuleScript" && i.Get("Tags")?.Value is byte[] t && Encoding.UTF8.GetString(t).Contains("OmniTestScript"));
+        }
+
+        [Fact]
+        public void TheEngineTestBuild_TurnsServerScriptsIntoStartableModules()
+        {
+            // Roblox's Luau execution loads a place without running its scripts, so the test runner starts them itself.
+            using var dir = new TempDir();
+            var ws = ObbyWorkspace(dir.Path);
+            var (load, info) = TreeAsset();
+            var result = PlaceCompiler.Compile(new CompileInput { GameId = "g_test", Workspace = ws, LoadAsset = load, AssetInfo = info, EngineTest = true, TelemetryUrl = "https://example.test/omniblox/telemetry" });
+            Assert.True(result.Ok, string.Join("\n", result.Errors));
+            var all = RbxFile.Read(result.PlaceXml).AllInstances().ToList();
+            var hello = all.Single(i => i.Name == "Hello");
+            Assert.Equal("ModuleScript", hello.ClassName);
+            Assert.StartsWith("return function(...)", hello.GetString("Source")!);
+            Assert.Contains("OmniTestScript", Encoding.UTF8.GetString((byte[])hello.Get("Tags")!.Value!));
+            Assert.True(LuauSyntax.IsValid(hello.GetString("Source")!), hello.GetString("Source"));
+            var boot = all.Single(i => i.Name == "OmniKitBoot");
+            Assert.Equal("ModuleScript", boot.ClassName);
+            Assert.Contains("Testing = true", all.Single(i => i.Name == "Config" && i.Parent?.Name == "OmniKitServer").GetString("Source")!);
+            Assert.False(all.Single(i => i.ClassName == "HttpService").GetBool("HttpEnabled"));
+            Assert.Equal("src/server/Hello.server.luau", result.FileFor(hello.FullName));
         }
 
         [Fact]
