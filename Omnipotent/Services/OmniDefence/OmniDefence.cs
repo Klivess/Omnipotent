@@ -24,7 +24,9 @@ namespace Omnipotent.Services.OmniDefence
     public partial class OmniDefence : OmniService
     {
         private OmniDefenceStore store = null!;
-        private IpThreatTracker tracker = null!;
+        // Null until the store has opened. The service counts as active from the moment it starts,
+        // so request-path hooks must treat a null tracker as "not ready yet", never dereference it.
+        private volatile IpThreatTracker tracker = null!;
         private OmniDefenceOverviewSnapshot? overviewSnapshot;
         private OmniDefenceReadSnapshotCache? readSnapshots;
         private OmniDefenceScanner scanner = new();
@@ -155,16 +157,22 @@ namespace Omnipotent.Services.OmniDefence
         //  Pre-dispatch hook from KliveAPI
         // ------------------------------------------------------------------
 
+        /// <summary>
+        /// Gate decision for one request. Until the IP records have loaded there is nothing to judge
+        /// with, so requests pass: a null tracker used to throw here, and KliveAPI answered every
+        /// request on the server with a 500 for as long as the store took to open.
+        /// </summary>
         public IpThreatTracker.GateDecision EvaluateRequestGate(string ip, string route)
         {
-            if (string.IsNullOrEmpty(ip)) return IpThreatTracker.GateDecision.Allow;
-            if (tracker.IsLinkedToKlives(ip)) return IpThreatTracker.GateDecision.Allow;
+            var records = tracker;
+            if (string.IsNullOrEmpty(ip) || records is null) return IpThreatTracker.GateDecision.Allow;
+            if (records.IsLinkedToKlives(ip)) return IpThreatTracker.GateDecision.Allow;
             // Honeypot routes always honeypot regardless of IP status.
             if (honeypotRoutes.ContainsKey(route)) return IpThreatTracker.GateDecision.Honeypot;
-            var decision = tracker.Evaluate(ip);
+            var decision = records.Evaluate(ip);
             if (decision != IpThreatTracker.GateDecision.Allow) return decision;
 
-            var rec = tracker.Get(ip);
+            var rec = records.Get(ip);
             if (TryApplyBlockedRegion(rec, out string regionReason))
             {
                 _ = PersistRegionBlockAsync(rec!, regionReason);
@@ -174,7 +182,7 @@ namespace Omnipotent.Services.OmniDefence
             return IpThreatTracker.GateDecision.Allow;
         }
 
-        public bool IsLinkedToKlives(string ip) => tracker.IsLinkedToKlives(ip);
+        public bool IsLinkedToKlives(string ip) => tracker?.IsLinkedToKlives(ip) == true;
 
         /// <summary>
         /// Registers an auth failure for the IP and returns the count of failures
@@ -183,7 +191,7 @@ namespace Omnipotent.Services.OmniDefence
         /// offenders.
         /// </summary>
         public int RegisterAuthFailure(string ip)
-            => tracker.RecordAuthFailureAndCount(ip, TimeSpan.FromMinutes(10));
+            => tracker?.RecordAuthFailureAndCount(ip, TimeSpan.FromMinutes(10)) ?? 0;
 
         public bool IsHoneypotRoute(string route) => honeypotRoutes.ContainsKey(route);
 
@@ -195,17 +203,20 @@ namespace Omnipotent.Services.OmniDefence
         {
             try
             {
-                if (!string.IsNullOrEmpty(row.Ip))
+                // Requests that land while the store is still opening are not scored (there is no
+                // tracker yet); they used to throw here and log one error per request.
+                var records = tracker;
+                if (!string.IsNullOrEmpty(row.Ip) && records is not null)
                 {
-                    tracker.LinkProfile(tracker.GetOrCreate(row.Ip!), row.ProfileId, row.ProfileName, row.ProfileRank, row.UtcTimestamp);
-                    var rec = tracker.RecordOutcome(row.Ip!, outcome);
+                    records.LinkProfile(records.GetOrCreate(row.Ip!), row.ProfileId, row.ProfileName, row.ProfileRank, row.UtcTimestamp);
+                    var rec = records.RecordOutcome(row.Ip!, outcome);
                     _ = EnrichIpRecordAsync(rec);
                     if (string.IsNullOrWhiteSpace(rec.AssociatedProfileId)) _ = MaybeAlertAsync(rec, row);
                 }
                 // Queued, not inserted: this runs in the finally of every API request, so
                 // a per-row transaction here sets the write lock's arrival rate to the
                 // site's total traffic and every reader queues behind it.
-                store.EnqueueRequest(row);
+                store?.EnqueueRequest(row);
             }
             catch (Exception ex)
             {

@@ -1386,11 +1386,13 @@ CREATE INDEX IF NOT EXISTS idx_upload_items_session ON upload_items(session_id,p
 
     private SqliteConnection OpenConnection()
     {
+        // Private cache: a shared one reintroduces table-level locks between connections, so file
+        // listings queued behind every write despite WAL.
         var connection = new SqliteConnection(new SqliteConnectionStringBuilder
         {
             DataSource = databasePath,
             Mode = SqliteOpenMode.ReadWriteCreate,
-            Cache = SqliteCacheMode.Shared,
+            Cache = SqliteCacheMode.Private,
             Pooling = true,
         }.ToString());
         connection.Open();

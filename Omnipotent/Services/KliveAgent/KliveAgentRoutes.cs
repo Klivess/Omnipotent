@@ -126,6 +126,9 @@ namespace Omnipotent.Services.KliveAgent
         {
             await service.CreateAPIRoute("/kliveagent/status", async (req) =>
             {
+                // Live in-memory state. Marked here rather than by a cache-busting query on the site,
+                // which made every poll a new URL and so a new CORS preflight.
+                KliveAPI.Caching.CacheDeps.MarkUncacheable("live agent start-up state");
                 var (ready, state, progress, message) = service.GetInitializationStatus();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { ready, state, progress, message,
                     codebase = service.GetCodebaseInitializationStatus() }));
@@ -382,6 +385,8 @@ namespace Omnipotent.Services.KliveAgent
             // page can show it live even before (or between) runs.
             await CreateDurableRoute("/kliveagent/computer", async (req) =>
             {
+                // The settings read below are tracked, the computer's live state is not: never cache it.
+                KliveAPI.Caching.CacheDeps.MarkUncacheable("live computer state");
                 try
                 {
                     string setting = await service.GetDropdownOmniSetting("KliveAgent_ComputerTarget",
@@ -918,6 +923,7 @@ namespace Omnipotent.Services.KliveAgent
         {
             await CreateDurableRoute("/kliveagent/stats/prompt-cache", async req =>
             {
+                KliveAPI.Caching.CacheDeps.MarkUncacheable("live prompt-cache statistics");
                 try
                 {
                     var result = service.PromptCache.GetSnapshot(req.userParameters["range"], req.userParameters["bucket"]);

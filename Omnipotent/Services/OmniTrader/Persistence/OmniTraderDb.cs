@@ -20,11 +20,15 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(dbPath))!);
             DbPath = dbPath;
 
+            // Private cache, not Shared: a shared cache brings back table-level locks between this
+            // process's connections, so a reader waited out a writer's whole transaction (up to the
+            // 30 s busy timeout) even though WAL lets readers run beside a writer. Writers are already
+            // serialised by writeLock.
             connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = DbPath,
                 Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Shared,
+                Cache = SqliteCacheMode.Private,
                 Pooling = true
             }.ToString();
         }

@@ -408,6 +408,35 @@ namespace Omnipotent.Services.OmniTrader.Persistence.Schema
                 CREATE INDEX idx_documents_n1 ON documents(collection, n1);
                 CREATE INDEX idx_documents_t1 ON documents(collection, t1);
                 CREATE INDEX idx_documents_updated ON documents(collection, updated_utc);
+            "),
+
+            // ── v7: backtest list columns ─────────────────────────────────────────
+            // In backtest_jobs, queued/started/finished/error are stored after result_json (several MB
+            // per finished job), so reading them walks that blob's overflow pages, and nothing indexed
+            // queued_utc: listing the newest 100 jobs read every job ever run, then parsed 100 results
+            // twice for their headline numbers (3-4 s per request). The list's fields, with the metrics
+            // extracted once, now live in this small table, kept in step by BacktestJobRepository.
+            (7, @"
+                CREATE TABLE backtest_job_list (
+                    id TEXT PRIMARY KEY,
+                    queued_utc TEXT NOT NULL,
+                    started_utc TEXT,
+                    finished_utc TEXT,
+                    error TEXT,
+                    metrics_json TEXT,
+                    analysis_json TEXT
+                );
+                INSERT INTO backtest_job_list (id, queued_utc, started_utc, finished_utc, error, metrics_json, analysis_json)
+                SELECT id, queued_utc, started_utc, finished_utc, error,
+                    CASE WHEN result_json IS NULL OR NOT json_valid(result_json) THEN NULL
+                         ELSE json_extract(result_json, '$.InitialEquity', '$.FinalEquity', '$.WinningTrades',
+                              '$.TotalTrades', '$.SharpeRatio', '$.MaxDrawdownPercent') END,
+                    CASE WHEN result_json IS NULL OR NOT json_valid(result_json) THEN NULL
+                         ELSE json_extract(result_json, '$.Analysis.CagrPct', '$.Analysis.Sortino', '$.Analysis.Calmar',
+                              '$.Analysis.ProfitFactor', '$.Analysis.ExposurePct', '$.Analysis.BenchmarkReturnPct',
+                              '$.Analysis.Alpha', '$.StrategyErrors') END
+                FROM backtest_jobs;
+                CREATE INDEX idx_backtest_job_list_queued ON backtest_job_list(queued_utc);
             ")
         };
     }

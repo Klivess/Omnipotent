@@ -23,11 +23,12 @@ namespace Omnipotent.Services.Tripwires
             DbPath = dbPath ?? OmniPaths.GetPath(OmniPaths.GlobalPaths.TripwireDbFile);
             string? directory = Path.GetDirectoryName(DbPath);
             if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+            // Private cache: shared mode's table-level locks block readers behind writers despite WAL.
             connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = DbPath,
                 Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Shared,
+                Cache = SqliteCacheMode.Private,
                 Pooling = true,
             }.ToString();
         }

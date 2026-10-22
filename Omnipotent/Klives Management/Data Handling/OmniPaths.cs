@@ -227,16 +227,25 @@ namespace Omnipotent.Data_Handling
         {
             return Environment.GetEnvironmentVariable("server") == "server";
         }
+        /// <summary>
+        /// True when the text is a JSON object or array. KliveAPI runs this on every JSON response it
+        /// sends, so well-formed text (nearly all of it) is confirmed by a forward-only reader over a
+        /// pooled UTF-8 copy instead of a Newtonsoft document: a 4 MB response used to cost tens of MB
+        /// of short-lived objects. Text that reader refuses still gets Newtonsoft's more lenient parse,
+        /// so nothing accepted before is rejected now.
+        /// </summary>
         public static bool IsValidJson(string strInput)
         {
             if (string.IsNullOrWhiteSpace(strInput)) { return false; }
-            strInput = strInput.Trim();
-            if ((strInput.StartsWith("{") && strInput.EndsWith("}")) || //For object
-                (strInput.StartsWith("[") && strInput.EndsWith("]"))) //For array
+            ReadOnlySpan<char> text = strInput.AsSpan().Trim();
+            bool container = (text[0] == '{' && text[^1] == '}') //For object
+                || (text[0] == '[' && text[^1] == ']'); //For array
+            if (container)
             {
+                if (IsWellFormedJson(text)) return true;
                 try
                 {
-                    var obj = JToken.Parse(strInput);
+                    var obj = JToken.Parse(strInput.Trim());
                     return true;
                 }
                 catch (JsonReaderException jex)
@@ -257,6 +266,31 @@ namespace Omnipotent.Data_Handling
             }
 
         }
+
+        private static bool IsWellFormedJson(ReadOnlySpan<char> text)
+        {
+            byte[] utf8 = System.Buffers.ArrayPool<byte>.Shared.Rent(System.Text.Encoding.UTF8.GetMaxByteCount(text.Length));
+            try
+            {
+                int length = System.Text.Encoding.UTF8.GetBytes(text, utf8);
+                var reader = new System.Text.Json.Utf8JsonReader(utf8.AsSpan(0, length), new System.Text.Json.JsonReaderOptions
+                {
+                    AllowTrailingCommas = true,
+                    CommentHandling = System.Text.Json.JsonCommentHandling.Skip,
+                });
+                while (reader.Read()) { }
+                return true;
+            }
+            catch (System.Text.Json.JsonException)
+            {
+                return false;
+            }
+            finally
+            {
+                System.Buffers.ArrayPool<byte>.Shared.Return(utf8);
+            }
+        }
+
         public static bool DoesPropertyExist(dynamic settings, string name)
         {
             if (settings is ExpandoObject)

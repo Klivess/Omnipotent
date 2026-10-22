@@ -67,8 +67,14 @@ namespace Omnipotent.Services.MemeScraper
         private volatile DiskUsage? diskUsage;
         private int diskScanRunning;
         private readonly SemaphoreSlim thumbnailSlots = new(3, 3);
+        // New reels get their thumbnail made as they are downloaded, one FFmpeg run at a time (so a
+        // library page keeps two of the three slots). Making every one on first view queued a page's
+        // worth behind three slots: the last pictures of a freshly scraped page took close to a minute.
+        private readonly SemaphoreSlim backgroundThumbnailSlot = new(1, 1);
         private readonly ConcurrentDictionary<string, DateTime> thumbnailFailures = new();
         private OmniTumblrMediaTools? mediaTools;
+        // A thumbnail is one frame of a video that never changes, so the browser can keep it.
+        private const string ThumbnailCaching = "private, max-age=604800";
 
         private static string? Param(UserRequest request, string key) => request.userParameters?[key];
 
@@ -211,31 +217,52 @@ namespace Omnipotent.Services.MemeScraper
                     await Error(request, "A preview could not be made (is FFmpeg installed?).", HttpStatusCode.NotFound);
                     return;
                 }
-                await thumbnailSlots.WaitAsync();
-                try
+                if (!await EnsureThumbnailAsync(postId, video))
                 {
-                    if (!File.Exists(thumb))
-                    {
-                        mediaTools ??= new OmniTumblrMediaTools(OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory));
-                        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-                        // A nominal 10 s length seeks ~1 s in, past the black first frame most reels open on;
-                        // a clip shorter than that falls back to its first frame.
-                        bool made = await mediaTools.CreateThumbnailAsync(video, thumb, 10, timeout.Token)
-                                    || await mediaTools.CreateThumbnailAsync(video, thumb, null, timeout.Token);
-                        if (!made)
-                        {
-                            thumbnailFailures[postId] = DateTime.UtcNow;
-                            await Error(request, "A preview could not be made (is FFmpeg installed?).", HttpStatusCode.NotFound);
-                            return;
-                        }
-                    }
-                }
-                finally
-                {
-                    thumbnailSlots.Release();
+                    await Error(request, "A preview could not be made (is FFmpeg installed?).", HttpStatusCode.NotFound);
+                    return;
                 }
             }
-            await request.ReturnBinaryResponse(await File.ReadAllBytesAsync(thumb), "image/jpeg");
+            await request.ReturnFileResponse(thumb, "image/jpeg", ThumbnailCaching);
+        }
+
+        /// <summary>Makes the reel's thumbnail unless it exists; false when FFmpeg could not.</summary>
+        private async Task<bool> EnsureThumbnailAsync(string postId, string video)
+        {
+            string thumb = ThumbnailPath(postId);
+            if (File.Exists(thumb)) return true;
+            await thumbnailSlots.WaitAsync();
+            try
+            {
+                if (File.Exists(thumb)) return true;
+                mediaTools ??= new OmniTumblrMediaTools(OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory));
+                using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+                // A nominal 10 s length seeks ~1 s in, past the black first frame most reels open on;
+                // a clip shorter than that falls back to its first frame.
+                bool made = await mediaTools.CreateThumbnailAsync(video, thumb, 10, timeout.Token)
+                            || await mediaTools.CreateThumbnailAsync(video, thumb, null, timeout.Token);
+                if (!made) thumbnailFailures[postId] = DateTime.UtcNow;
+                return made;
+            }
+            finally
+            {
+                thumbnailSlots.Release();
+            }
+        }
+
+        /// <summary>Makes a just-downloaded reel's thumbnail in the background, ahead of its first view.</summary>
+        private void QueueThumbnail(InstagramScrapeUtilities.InstagramReel reel)
+        {
+            string? postId = reel.PostID;
+            string? video = VideoPath(reel);
+            if (postId == null || video == null || !SafeFileId.IsMatch(postId)) return;
+            _ = Task.Run(async () =>
+            {
+                await backgroundThumbnailSlot.WaitAsync();
+                try { await EnsureThumbnailAsync(postId, video); }
+                catch { /* the library page makes it on first view instead */ }
+                finally { backgroundThumbnailSlot.Release(); }
+            });
         }
 
         /// <summary>Streams the downloaded video (the website fetches it as a blob for the preview player).</summary>
@@ -257,8 +284,19 @@ namespace Omnipotent.Services.MemeScraper
             }
             string contentType = OmniTumblrMediaTools.MimeFor(path);
             var headers = new NameValueCollection { { "Content-Disposition", $"inline; filename=\"{Path.GetFileName(path)}\"" }, { "X-Content-Type-Options", "nosniff" } };
-            await using var destination = request.PrepareStreamResponse(contentType, source.Length, HttpStatusCode.OK, headers);
-            await source.CopyToAsync(destination);
+            try
+            {
+                await using var destination = request.PrepareStreamResponse(contentType, source.Length, HttpStatusCode.OK, headers);
+                await source.CopyToAsync(destination);
+            }
+            catch (Exception ex) when (ex is HttpListenerException or ObjectDisposedException
+                                           || (ex is IOException && ex.InnerException is HttpListenerException or System.Net.Sockets.SocketException))
+            {
+                // The preview was closed (or the page left) mid-download and the browser dropped the
+                // connection. Nothing more can be sent, and it is not a server fault: it used to surface
+                // as a 500 with an error log after most of the video had already gone out.
+                if (request.Trace != null) request.Trace.ClientDisconnected = true;
+            }
         }
 
         // ───────────────────────────── Settings ─────────────────────────────

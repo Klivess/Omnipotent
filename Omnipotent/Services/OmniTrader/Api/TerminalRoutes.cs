@@ -238,7 +238,8 @@ namespace Omnipotent.Services.OmniTrader.Api
             var compare = new Dictionary<string, (IReadOnlyList<OHLCCandle>? Bars, string? Error)>(StringComparer.OrdinalIgnoreCase);
             if (r.Compare is { Count: > 0 } && candles.Count > 0)
             {
-                foreach (var other in r.Compare.Select(c => c.Trim().ToUpperInvariant()).Where(c => c.Length > 0 && c != symbol).Distinct().Take(8))
+                // Fetched together: each can be a provider round trip, and one after another they added up.
+                async Task<(string Symbol, IReadOnlyList<OHLCCandle>? Bars, string? Error)> FetchAsync(string other)
                 {
                     try
                     {
@@ -246,10 +247,13 @@ namespace Omnipotent.Services.OmniTrader.Api
                             ? await parent.MarketData.GetHistoricalCandlesRangeAsync(other, interval, r.From.Value, r.To ?? DateTime.UtcNow)
                             : (await parent.MarketData.GetChartCandlesAsync(other, interval, Math.Min(candles.Count + 50, 20_000))) is var cf
                                 && cf.Forming is { } of ? cf.Closed.Append(of).ToList() : cf.Closed;
-                        compare[other] = (bars, null);
+                        return (other, bars, null);
                     }
-                    catch (Exception ex) { compare[other] = (null, ex.Message); }
+                    catch (Exception ex) { return (other, null, ex.Message); }
                 }
+                var others = r.Compare.Select(c => c.Trim().ToUpperInvariant()).Where(c => c.Length > 0 && c != symbol).Distinct().Take(8);
+                foreach (var (other, bars, error) in await Task.WhenAll(others.Select(FetchAsync)))
+                    compare[other] = (bars, error);
             }
 
             return ChartPayload(symbol, interval, candles, forming != null, source, r.Indicators, r.Formulas, ext, compare);
@@ -331,16 +335,19 @@ namespace Omnipotent.Services.OmniTrader.Api
 
         private async Task<Dictionary<string, BarSeries?>> ExternalSeriesAsync(IEnumerable<string> symbols, TimeInterval interval, int bars)
         {
-            var ext = new Dictionary<string, BarSeries?>(StringComparer.OrdinalIgnoreCase);
-            foreach (var sym in symbols.Distinct(StringComparer.OrdinalIgnoreCase).Take(10))
+            // Fetched together, as for chart comparisons.
+            async Task<(string Symbol, BarSeries? Series)> FetchAsync(string sym)
             {
                 try
                 {
                     var b = await parent.MarketData.GetHistoricalCandlesAsync(sym.ToUpperInvariant(), interval, Math.Clamp(bars + 50, 50, 20_000));
-                    ext[sym] = b.Count == 0 ? null : BarSeries.From(b);
+                    return (sym, b.Count == 0 ? null : BarSeries.From(b));
                 }
-                catch { ext[sym] = null; }
+                catch { return (sym, null); }
             }
+            var ext = new Dictionary<string, BarSeries?>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (sym, series) in await Task.WhenAll(symbols.Distinct(StringComparer.OrdinalIgnoreCase).Take(10).Select(FetchAsync)))
+                ext[sym] = series;
             return ext;
         }
 

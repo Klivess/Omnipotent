@@ -67,6 +67,11 @@ namespace Omnipotent.Services.OmniTrader.Persistence
         public int Offset { get; set; }
     }
 
+    /// <summary>
+    /// Backtest jobs. Every write keeps backtest_job_list (schema v7) in step with backtest_jobs: the
+    /// list reads its timestamps, error and headline metrics from there, because in backtest_jobs those
+    /// columns sit behind the multi-megabyte result_json and cost a walk of its overflow pages per row.
+    /// </summary>
     public sealed class BacktestJobRepository
     {
         private const string CacheKey = "omnitrader:backtests";
@@ -74,12 +79,38 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public BacktestJobRepository(OmniTraderDb db) { this.db = db; }
 
+        /// <summary>The list's headline numbers out of a serialized result (NULL in, NULL out).</summary>
+        private static string MetricsOf(string json) =>
+            $"json_extract({json}, '$.InitialEquity', '$.FinalEquity', '$.WinningTrades', '$.TotalTrades', '$.SharpeRatio', '$.MaxDrawdownPercent')";
+
+        private static string AnalysisOf(string json) =>
+            $"json_extract({json}, '$.Analysis.CagrPct', '$.Analysis.Sortino', '$.Analysis.Calmar', '$.Analysis.ProfitFactor', " +
+            "'$.Analysis.ExposurePct', '$.Analysis.BenchmarkReturnPct', '$.Analysis.Alpha', '$.StrategyErrors')";
+
+        /// <summary>Runs one multi-statement command atomically (both tables or neither).</summary>
+        private static async Task ExecuteInTransactionAsync(SqliteConnection conn, string sql, Action<SqliteParameterCollection> bind, CancellationToken ct)
+        {
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = sql;
+                bind(cmd.Parameters);
+                await cmd.ExecuteNonQueryAsync(ct);
+            }
+            await tx.CommitAsync(ct);
+        }
+
         public Task InsertAsync(BacktestJobRow row, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
         {
+            await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
             await using var cmd = conn.CreateCommand();
+            cmd.Transaction = tx;
             cmd.CommandText = @"INSERT INTO backtest_jobs
                 (id, strategy_class, config_json, status, progress_pct, candles_total, candles_done, result_json, error, queued_utc, started_utc, finished_utc, cancellation_requested)
-                VALUES ($id,$sc,$cj,$s,$p,$ct,$cd,$rj,$e,$q,$st,$f,$cr)";
+                VALUES ($id,$sc,$cj,$s,$p,$ct,$cd,$rj,$e,$q,$st,$f,$cr);
+                INSERT INTO backtest_job_list (id, queued_utc, started_utc, finished_utc, error, metrics_json, analysis_json)
+                VALUES ($id,$q,$st,$f,$e," + MetricsOf("$rj") + "," + AnalysisOf("$rj") + ")";
             cmd.Parameters.AddWithValue("$id", row.Id);
             cmd.Parameters.AddWithValue("$sc", row.StrategyClass);
             cmd.Parameters.AddWithValue("$cj", JsonConvert.SerializeObject(row.Config));
@@ -94,6 +125,7 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$f", (object?)row.FinishedUtc?.ToString("o") ?? DBNull.Value);
             cmd.Parameters.AddWithValue("$cr", row.CancellationRequested ? 1 : 0);
             await cmd.ExecuteNonQueryAsync(ct);
+            await tx.CommitAsync(ct);
             CacheDeps.Bump(CacheKey);
         }, ct);
 
@@ -121,26 +153,32 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public Task StartAsync(string id, DateTime startedUtc, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
         {
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = "UPDATE backtest_jobs SET status='running', started_utc=$t WHERE id=$id";
-            cmd.Parameters.AddWithValue("$t", startedUtc.ToString("o"));
-            cmd.Parameters.AddWithValue("$id", id);
-            await cmd.ExecuteNonQueryAsync(ct);
+            await ExecuteInTransactionAsync(conn, @"
+                UPDATE backtest_jobs SET status='running', started_utc=$t WHERE id=$id;
+                UPDATE backtest_job_list SET started_utc=$t WHERE id=$id;", p =>
+            {
+                p.AddWithValue("$t", startedUtc.ToString("o"));
+                p.AddWithValue("$id", id);
+            }, ct);
             CacheDeps.Bump(CacheKey);
         }, ct);
 
         public Task CompleteAsync(string id, BacktestJobStatus status, BacktestResult? result, string? error, DateTime finishedUtc, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
         {
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"UPDATE backtest_jobs
+            await ExecuteInTransactionAsync(conn, @"
+                UPDATE backtest_jobs
                 SET status=$s, result_json=$r, error=$e, finished_utc=$f, progress_pct=CASE WHEN $s='succeeded' THEN 100 ELSE progress_pct END
-                WHERE id=$id";
-            cmd.Parameters.AddWithValue("$s", status.ToString().ToLowerInvariant());
-            cmd.Parameters.AddWithValue("$r", (object?)(result == null ? null : JsonConvert.SerializeObject(result)) ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$e", (object?)error ?? DBNull.Value);
-            cmd.Parameters.AddWithValue("$f", finishedUtc.ToString("o"));
-            cmd.Parameters.AddWithValue("$id", id);
-            await cmd.ExecuteNonQueryAsync(ct);
+                WHERE id=$id;
+                UPDATE backtest_job_list
+                SET error=$e, finished_utc=$f, metrics_json=" + MetricsOf("$r") + ", analysis_json=" + AnalysisOf("$r") + @"
+                WHERE id=$id;", p =>
+            {
+                p.AddWithValue("$s", status.ToString().ToLowerInvariant());
+                p.AddWithValue("$r", (object?)(result == null ? null : JsonConvert.SerializeObject(result)) ?? DBNull.Value);
+                p.AddWithValue("$e", (object?)error ?? DBNull.Value);
+                p.AddWithValue("$f", finishedUtc.ToString("o"));
+                p.AddWithValue("$id", id);
+            }, ct);
             CacheDeps.Bump(CacheKey);
         }, ct);
 
@@ -165,11 +203,14 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public Task MarkOrphansFailedAsync(string error, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
         {
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = "UPDATE backtest_jobs SET status='failed', error=$e, finished_utc=$f WHERE status='running'";
-            cmd.Parameters.AddWithValue("$e", error);
-            cmd.Parameters.AddWithValue("$f", DateTime.UtcNow.ToString("o"));
-            await cmd.ExecuteNonQueryAsync(ct);
+            // The list rows first: the second statement is what stops these jobs counting as running.
+            await ExecuteInTransactionAsync(conn, @"
+                UPDATE backtest_job_list SET error=$e, finished_utc=$f WHERE id IN (SELECT id FROM backtest_jobs WHERE status='running');
+                UPDATE backtest_jobs SET status='failed', error=$e, finished_utc=$f WHERE status='running';", p =>
+            {
+                p.AddWithValue("$e", error);
+                p.AddWithValue("$f", DateTime.UtcNow.ToString("o"));
+            }, ct);
             CacheDeps.Bump(CacheKey);
         }, ct);
 
@@ -198,11 +239,18 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             return output;
         }
 
+        // Everything the list shows. Every backtest_jobs column read here precedes result_json, and the
+        // metrics were extracted when the result was written (any stored result yields a metrics array),
+        // so no result is touched. "l" drives the join (CROSS JOIN fixes the loop order) so ORDER BY +
+        // LIMIT walks idx_backtest_job_list_queued.
+        private const string SummarySelect = @"SELECT j.id, j.strategy_class, j.config_json, j.status, j.progress_pct,
+                       j.candles_total, j.candles_done, l.queued_utc, l.started_utc, l.finished_utc, l.error,
+                       l.metrics_json IS NOT NULL AS has_result, l.metrics_json, l.analysis_json
+                FROM backtest_job_list l CROSS JOIN backtest_jobs j ON j.id = l.id";
+
         /// <summary>
-        /// The list needs five summary metrics. SQLite extracts their compact source fields without
-        /// transferring and deserializing Trades, EquityCurve, Candles, and validation data for every
-        /// completed job. Derived metrics are calculated here so older stored results work too.
-        /// The full result remains available through GetAsync for the single-job route.
+        /// The dashboard's recent jobs with their headline metrics. Derived metrics are calculated here
+        /// so older stored results work too; the full result stays available through GetAsync.
         /// </summary>
         public async Task<List<BacktestJobSummaryRow>> ListRecentSummariesAsync(int limit = 50,
             CancellationToken ct = default)
@@ -210,14 +258,69 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"SELECT id, strategy_class, config_json, status, progress_pct,
-                       candles_total, candles_done, queued_utc, started_utc, finished_utc, error,
-                       result_json IS NOT NULL AS has_result,
-                       json_extract(result_json, '$.InitialEquity', '$.FinalEquity',
-                           '$.WinningTrades', '$.TotalTrades', '$.SharpeRatio',
-                           '$.MaxDrawdownPercent') AS metrics
-                FROM backtest_jobs ORDER BY queued_utc DESC LIMIT $l";
+            cmd.CommandText = SummarySelect + " ORDER BY l.queued_utc DESC LIMIT $l";
             cmd.Parameters.AddWithValue("$l", limit);
+            return await ReadSummariesAsync(cmd, ct);
+        }
+
+        /// <summary>Filtered job summaries for the lab, with the extended analysis headline
+        /// (CAGR, Sortino, Calmar, profit factor, exposure, alpha).</summary>
+        public async Task<(List<BacktestJobSummaryRow> Rows, int Total)> QuerySummariesAsync(BacktestJobFilter filter, CancellationToken ct = default)
+        {
+            CacheDeps.NoteRead(CacheKey);
+            await using var conn = await db.OpenAsync(ct);
+            var where = new List<string>();
+            await using var cmd = conn.CreateCommand();
+            if (!string.IsNullOrWhiteSpace(filter.StrategyClass))
+            {
+                if (filter.StrategyClass!.EndsWith('*'))
+                {
+                    where.Add("j.strategy_class LIKE $cls ESCAPE '\\'");
+                    cmd.Parameters.AddWithValue("$cls", filter.StrategyClass[..^1].Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%");
+                }
+                else
+                {
+                    where.Add("j.strategy_class = $cls");
+                    cmd.Parameters.AddWithValue("$cls", filter.StrategyClass);
+                }
+            }
+            if (!string.IsNullOrWhiteSpace(filter.Origin))
+            {
+                where.Add("json_extract(j.config_json, '$.Origin') = $origin");
+                cmd.Parameters.AddWithValue("$origin", filter.Origin);
+            }
+            if (filter.Status is { } st)
+            {
+                where.Add("j.status = $status");
+                cmd.Parameters.AddWithValue("$status", st.ToString().ToLowerInvariant());
+            }
+            if (!string.IsNullOrWhiteSpace(filter.Symbol))
+            {
+                where.Add("upper(json_extract(j.config_json, '$.Coin')) = $sym");
+                cmd.Parameters.AddWithValue("$sym", filter.Symbol!.ToUpperInvariant());
+            }
+            if (!string.IsNullOrWhiteSpace(filter.Text))
+            {
+                where.Add("(j.strategy_class LIKE $text OR json_extract(j.config_json, '$.Label') LIKE $text OR json_extract(j.config_json, '$.Coin') LIKE $text)");
+                cmd.Parameters.AddWithValue("$text", "%" + filter.Text + "%");
+            }
+            string clause = where.Count == 0 ? "" : "WHERE " + string.Join(" AND ", where);
+
+            await using (var count = conn.CreateCommand())
+            {
+                count.CommandText = $"SELECT COUNT(*) FROM backtest_jobs j {clause}";
+                foreach (SqliteParameter prm in cmd.Parameters) count.Parameters.AddWithValue(prm.ParameterName, prm.Value);
+                filter.Limit = Math.Clamp(filter.Limit, 1, 1000);
+                var total = Convert.ToInt32(await count.ExecuteScalarAsync(ct));
+                cmd.CommandText = $"{SummarySelect} {clause} ORDER BY l.queued_utc DESC LIMIT $l OFFSET $o";
+                cmd.Parameters.AddWithValue("$l", filter.Limit);
+                cmd.Parameters.AddWithValue("$o", Math.Max(0, filter.Offset));
+                return (await ReadSummariesAsync(cmd, ct), total);
+            }
+        }
+
+        private static async Task<List<BacktestJobSummaryRow>> ReadSummariesAsync(SqliteCommand cmd, CancellationToken ct)
+        {
             await using var reader = await cmd.ExecuteReaderAsync(ct);
             var output = new List<BacktestJobSummaryRow>();
             while (await reader.ReadAsync(ct))
@@ -228,7 +331,11 @@ namespace Omnipotent.Services.OmniTrader.Persistence
                 decimal?[] metrics = hasResult && !reader.IsDBNull(12)
                     ? JsonConvert.DeserializeObject<decimal?[]>(reader.GetString(12)) ?? new decimal?[6]
                     : new decimal?[6];
-                if (metrics.Length != 6) throw new InvalidOperationException("Bad result_json metrics in backtest_jobs row");
+                double?[] a = hasResult && !reader.IsDBNull(13)
+                    ? JsonConvert.DeserializeObject<double?[]>(reader.GetString(13)) ?? new double?[8]
+                    : new double?[8];
+                if (metrics.Length != 6) metrics = new decimal?[6];
+                if (a.Length != 8) a = new double?[8];
                 decimal initialEquity = metrics[0] ?? 0m;
                 decimal finalEquity = metrics[1] ?? 0m;
                 int winningTrades = (int)(metrics[2] ?? 0m);
@@ -246,124 +353,16 @@ namespace Omnipotent.Services.OmniTrader.Persistence
                     StartedUtc = reader.IsDBNull(8) ? null : DateTime.Parse(reader.GetString(8), CultureInfo.InvariantCulture).ToUniversalTime(),
                     FinishedUtc = reader.IsDBNull(9) ? null : DateTime.Parse(reader.GetString(9), CultureInfo.InvariantCulture).ToUniversalTime(),
                     Error = reader.IsDBNull(10) ? null : reader.GetString(10),
-                    TotalPnLPercent = hasResult
-                        ? initialEquity == 0m ? 0m : (finalEquity - initialEquity) / initialEquity * 100m
-                        : null,
-                    WinRate = hasResult
-                        ? totalTrades == 0 ? 0m : (decimal)winningTrades / totalTrades * 100m
-                        : null,
+                    TotalPnLPercent = hasResult ? initialEquity == 0m ? 0m : (finalEquity - initialEquity) / initialEquity * 100m : null,
+                    WinRate = hasResult ? totalTrades == 0 ? 0m : (decimal)winningTrades / totalTrades * 100m : null,
                     SharpeRatio = hasResult ? metrics[4] ?? 0m : null,
                     MaxDrawdownPercent = hasResult ? metrics[5] ?? 0m : null,
-                    TotalTrades = hasResult ? totalTrades : null
+                    TotalTrades = hasResult ? totalTrades : null,
+                    CagrPct = a[0], Sortino = a[1], Calmar = a[2], ProfitFactor = a[3], ExposurePct = a[4],
+                    BenchmarkReturnPct = a[5], Alpha = a[6], StrategyErrors = a[7] is { } se ? (int)se : null
                 });
             }
             return output;
-        }
-
-        /// <summary>Filtered job summaries for the lab: same compact extraction as the list snapshot,
-        /// plus the extended analysis headline (CAGR, Sortino, Calmar, profit factor, exposure, alpha).</summary>
-        public async Task<(List<BacktestJobSummaryRow> Rows, int Total)> QuerySummariesAsync(BacktestJobFilter filter, CancellationToken ct = default)
-        {
-            CacheDeps.NoteRead(CacheKey);
-            await using var conn = await db.OpenAsync(ct);
-            var where = new List<string>();
-            await using var cmd = conn.CreateCommand();
-            if (!string.IsNullOrWhiteSpace(filter.StrategyClass))
-            {
-                if (filter.StrategyClass!.EndsWith('*'))
-                {
-                    where.Add("strategy_class LIKE $cls ESCAPE '\\'");
-                    cmd.Parameters.AddWithValue("$cls", filter.StrategyClass[..^1].Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%");
-                }
-                else
-                {
-                    where.Add("strategy_class = $cls");
-                    cmd.Parameters.AddWithValue("$cls", filter.StrategyClass);
-                }
-            }
-            if (!string.IsNullOrWhiteSpace(filter.Origin))
-            {
-                where.Add("json_extract(config_json, '$.Origin') = $origin");
-                cmd.Parameters.AddWithValue("$origin", filter.Origin);
-            }
-            if (filter.Status is { } st)
-            {
-                where.Add("status = $status");
-                cmd.Parameters.AddWithValue("$status", st.ToString().ToLowerInvariant());
-            }
-            if (!string.IsNullOrWhiteSpace(filter.Symbol))
-            {
-                where.Add("upper(json_extract(config_json, '$.Coin')) = $sym");
-                cmd.Parameters.AddWithValue("$sym", filter.Symbol!.ToUpperInvariant());
-            }
-            if (!string.IsNullOrWhiteSpace(filter.Text))
-            {
-                where.Add("(strategy_class LIKE $text OR json_extract(config_json, '$.Label') LIKE $text OR json_extract(config_json, '$.Coin') LIKE $text)");
-                cmd.Parameters.AddWithValue("$text", "%" + filter.Text + "%");
-            }
-            string clause = where.Count == 0 ? "" : "WHERE " + string.Join(" AND ", where);
-
-            await using (var count = conn.CreateCommand())
-            {
-                count.CommandText = $"SELECT COUNT(*) FROM backtest_jobs {clause}";
-                foreach (SqliteParameter prm in cmd.Parameters) count.Parameters.AddWithValue(prm.ParameterName, prm.Value);
-                filter.Limit = Math.Clamp(filter.Limit, 1, 1000);
-                var total = Convert.ToInt32(await count.ExecuteScalarAsync(ct));
-                cmd.CommandText = $@"SELECT id, strategy_class, config_json, status, progress_pct,
-                       candles_total, candles_done, queued_utc, started_utc, finished_utc, error,
-                       result_json IS NOT NULL AS has_result,
-                       json_extract(result_json, '$.InitialEquity', '$.FinalEquity',
-                           '$.WinningTrades', '$.TotalTrades', '$.SharpeRatio',
-                           '$.MaxDrawdownPercent') AS metrics,
-                       json_extract(result_json, '$.Analysis.CagrPct', '$.Analysis.Sortino', '$.Analysis.Calmar',
-                           '$.Analysis.ProfitFactor', '$.Analysis.ExposurePct', '$.Analysis.BenchmarkReturnPct',
-                           '$.Analysis.Alpha', '$.StrategyErrors') AS analysis
-                    FROM backtest_jobs {clause} ORDER BY queued_utc DESC LIMIT $l OFFSET $o";
-                cmd.Parameters.AddWithValue("$l", filter.Limit);
-                cmd.Parameters.AddWithValue("$o", Math.Max(0, filter.Offset));
-                await using var reader = await cmd.ExecuteReaderAsync(ct);
-                var output = new List<BacktestJobSummaryRow>();
-                while (await reader.ReadAsync(ct))
-                {
-                    var config = JsonConvert.DeserializeObject<BacktestConfig>(reader.GetString(2))
-                        ?? throw new InvalidOperationException("Bad config_json in backtest_jobs row");
-                    bool hasResult = reader.GetBoolean(11);
-                    decimal?[] metrics = hasResult && !reader.IsDBNull(12)
-                        ? JsonConvert.DeserializeObject<decimal?[]>(reader.GetString(12)) ?? new decimal?[6]
-                        : new decimal?[6];
-                    double?[] a = hasResult && !reader.IsDBNull(13)
-                        ? JsonConvert.DeserializeObject<double?[]>(reader.GetString(13)) ?? new double?[8]
-                        : new double?[8];
-                    if (metrics.Length != 6) metrics = new decimal?[6];
-                    if (a.Length != 8) a = new double?[8];
-                    decimal initialEquity = metrics[0] ?? 0m;
-                    decimal finalEquity = metrics[1] ?? 0m;
-                    int winningTrades = (int)(metrics[2] ?? 0m);
-                    int totalTrades = (int)(metrics[3] ?? 0m);
-                    output.Add(new BacktestJobSummaryRow
-                    {
-                        Id = reader.GetString(0),
-                        StrategyClass = reader.GetString(1),
-                        Config = config,
-                        Status = ParseStatus(reader.GetString(3)),
-                        ProgressPct = reader.GetDouble(4),
-                        CandlesTotal = reader.IsDBNull(5) ? null : reader.GetInt32(5),
-                        CandlesDone = reader.IsDBNull(6) ? null : reader.GetInt32(6),
-                        QueuedUtc = DateTime.Parse(reader.GetString(7), CultureInfo.InvariantCulture).ToUniversalTime(),
-                        StartedUtc = reader.IsDBNull(8) ? null : DateTime.Parse(reader.GetString(8), CultureInfo.InvariantCulture).ToUniversalTime(),
-                        FinishedUtc = reader.IsDBNull(9) ? null : DateTime.Parse(reader.GetString(9), CultureInfo.InvariantCulture).ToUniversalTime(),
-                        Error = reader.IsDBNull(10) ? null : reader.GetString(10),
-                        TotalPnLPercent = hasResult ? initialEquity == 0m ? 0m : (finalEquity - initialEquity) / initialEquity * 100m : null,
-                        WinRate = hasResult ? totalTrades == 0 ? 0m : (decimal)winningTrades / totalTrades * 100m : null,
-                        SharpeRatio = hasResult ? metrics[4] ?? 0m : null,
-                        MaxDrawdownPercent = hasResult ? metrics[5] ?? 0m : null,
-                        TotalTrades = hasResult ? totalTrades : null,
-                        CagrPct = a[0], Sortino = a[1], Calmar = a[2], ProfitFactor = a[3], ExposurePct = a[4],
-                        BenchmarkReturnPct = a[5], Alpha = a[6], StrategyErrors = a[7] is { } se ? (int)se : null
-                    });
-                }
-                return (output, total);
-            }
         }
 
         public async Task<List<BacktestJobRow>> ListQueuedAsync(CancellationToken ct = default)

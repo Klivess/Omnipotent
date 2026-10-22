@@ -270,10 +270,31 @@ namespace Omnipotent.Services.OmniDefence
             StartAuditFlusher();
         }
 
+        /// <summary>
+        /// od_settings key holding the highest request id the scrub has already examined. Bump the
+        /// version when <see cref="KliveAPI.KliveAPI.ShouldRedactSensitiveSettingsAudit"/> learns a
+        /// new pattern, so the next start re-examines every historical row once under the new rule.
+        /// </summary>
+        internal const string ScrubWatermarkKey = "audit_scrub_v1_through_id";
+
         private async Task<bool> ScrubLegacySensitiveSettingsAuditsAsync()
         {
             const int batchSize = 500;
-            long afterId = 0;
+            // Rows written by this build are redacted before they are queued, so only rows that
+            // already existed when it started can need scrubbing. The scan used to walk the whole
+            // request log on every start (its route filters cannot use an index), and OmniDefence
+            // gates every API request but only becomes ready after this returns. Each start now
+            // resumes from where the previous one finished.
+            long afterId = await ReadScrubWatermarkAsync();
+            long throughId;
+            using (var max = Connection.CreateCommand())
+            {
+                max.CommandText = "SELECT COALESCE(MAX(id), 0) FROM requests";
+                throughId = Convert.ToInt64(await max.ExecuteScalarAsync() ?? 0L);
+            }
+            if (afterId > throughId) afterId = 0; // the log was rebuilt under a kept settings table
+            if (throughId <= afterId) return false;
+
             bool changed = false;
             while (true)
             {
@@ -282,13 +303,14 @@ namespace Omnipotent.Services.OmniDefence
                 using (var select = Connection.CreateCommand())
                 {
                     select.CommandText = @"SELECT id, route, body_text FROM requests
-                        WHERE id > $after AND
+                        WHERE id > $after AND id <= $through AND
                             (route = '/OmniGlobalSettings' COLLATE NOCASE OR route LIKE '/OmniGlobalSettings/%'
                              OR route = '/batch' COLLATE NOCASE) AND
                             (query IS NOT NULL OR body_text IS NOT NULL OR body_hash IS NOT NULL OR body_length != 0
                              OR body_truncated != 0 OR headers_json IS NOT NULL OR user_agent IS NOT NULL OR client_page IS NOT NULL)
                         ORDER BY id LIMIT $limit";
                     select.Parameters.AddWithValue("$after", afterId);
+                    select.Parameters.AddWithValue("$through", throughId);
                     select.Parameters.AddWithValue("$limit", batchSize);
                     using var reader = await select.ExecuteReaderAsync();
                     while (await reader.ReadAsync())
@@ -326,7 +348,24 @@ namespace Omnipotent.Services.OmniDefence
                 checkpoint.CommandText = "PRAGMA wal_checkpoint(TRUNCATE)";
                 await checkpoint.ExecuteNonQueryAsync();
             }
+            using (var mark = Connection.CreateCommand())
+            {
+                mark.CommandText = "INSERT INTO od_settings (key, value) VALUES ($k,$v) ON CONFLICT(key) DO UPDATE SET value=excluded.value";
+                mark.Parameters.AddWithValue("$k", ScrubWatermarkKey);
+                mark.Parameters.AddWithValue("$v", throughId.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                await mark.ExecuteNonQueryAsync();
+            }
             return changed;
+        }
+
+        private async Task<long> ReadScrubWatermarkAsync()
+        {
+            using var cmd = Connection.CreateCommand();
+            cmd.CommandText = "SELECT value FROM od_settings WHERE key = $k";
+            cmd.Parameters.AddWithValue("$k", ScrubWatermarkKey);
+            return await cmd.ExecuteScalarAsync() is string text
+                && long.TryParse(text, System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out long id)
+                && id > 0 ? id : 0;
         }
 
         /// <summary>

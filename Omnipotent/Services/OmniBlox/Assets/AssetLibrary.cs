@@ -123,6 +123,16 @@ namespace Omnipotent.Services.OmniBlox.Assets
         private readonly string directory;
         private readonly object sync = new();
         private SqliteConnection? db;
+        // The studio overview reads these counts on every poll: three full scans of the assets table
+        // under the library lock, which harvests and labelling hold too. They are kept until a write
+        // that can move them (statsVersion, bumped under the lock), and while a harvest holds the lock
+        // the last copy is shown rather than waited for.
+        private sealed record StatsSnapshot(long Version, LibraryStats Stats);
+        private volatile StatsSnapshot? statsCache;
+        private long statsVersion;
+
+        /// <summary>Called under the lock by every write that can change a count in <see cref="Stats"/>.</summary>
+        private void CountsChanged() => Interlocked.Increment(ref statsVersion);
 
         private static readonly JsonSerializerSettings Json = new() { NullValueHandling = NullValueHandling.Ignore };
 
@@ -260,6 +270,7 @@ ON CONFLICT(asset_id) DO UPDATE SET up_votes = excluded.up_votes, down_votes = e
                     }
                 }
                 tx.Commit();
+                if (added > 0) CountsChanged();
             }
             return added;
         }
@@ -295,6 +306,7 @@ ON CONFLICT(asset_id) DO UPDATE SET up_votes = excluded.up_votes, down_votes = e
                 cmd.CommandText = "UPDATE assets SET has_thumbnail = 1, status = CASE WHEN status = 'discovered' THEN 'previewed' ELSE status END WHERE asset_id = $id";
                 cmd.Parameters.AddWithValue("$id", assetId);
                 cmd.ExecuteNonQuery();
+                CountsChanged();
             }
         }
 
@@ -406,6 +418,7 @@ WHERE asset_id = $id";
                 cmd.Parameters.AddWithValue("$now", Iso(nowUtc));
                 cmd.Parameters.AddWithValue("$id", assetId);
                 cmd.ExecuteNonQuery();
+                CountsChanged();
             }
         }
 
@@ -442,6 +455,7 @@ WHERE asset_id = $id";
                     IndexText(assetId, record.Name, label.What, body, tx);
                 }
                 tx.Commit();
+                CountsChanged();
             }
         }
 
@@ -456,6 +470,7 @@ WHERE asset_id = $id";
                 cmd.Parameters.AddWithValue("$r", Clip(reason, 400));
                 cmd.Parameters.AddWithValue("$id", assetId);
                 cmd.ExecuteNonQuery();
+                CountsChanged();
             }
         }
 
@@ -469,6 +484,7 @@ WHERE asset_id = $id";
                 cmd.Parameters.AddWithValue("$r", (object?)reason ?? DBNull.Value);
                 cmd.Parameters.AddWithValue("$id", assetId);
                 cmd.ExecuteNonQuery();
+                CountsChanged();
             }
         }
 
@@ -608,31 +624,49 @@ FROM assets_fts JOIN assets a ON a.asset_id = assets_fts.asset_id WHERE assets_f
 
         public LibraryStats Stats()
         {
-            var stats = new LibraryStats();
-            lock (sync)
+            var cached = statsCache;
+            if (cached != null && cached.Version == Interlocked.Read(ref statsVersion)) return cached.Stats;
+            bool taken = false;
+            try
             {
-                using (var cmd = Db.CreateCommand())
+                if (cached != null) Monitor.TryEnter(sync, 100, ref taken);
+                else Monitor.Enter(sync, ref taken);
+                if (!taken) return cached!.Stats; // a harvest or labelling pass holds the library: show the last counts
+                // Writers bump the version under this lock, so it matches exactly what is read here.
+                var fresh = new StatsSnapshot(Interlocked.Read(ref statsVersion), ComputeStatsLocked());
+                statsCache = fresh;
+                return fresh.Stats;
+            }
+            finally
+            {
+                if (taken) Monitor.Exit(sync);
+            }
+        }
+
+        private LibraryStats ComputeStatsLocked()
+        {
+            var stats = new LibraryStats();
+            using (var cmd = Db.CreateCommand())
+            {
+                cmd.CommandText = "SELECT status, COUNT(*) FROM assets GROUP BY status";
+                using var r = cmd.ExecuteReader();
+                while (r.Read()) stats.ByStatus[r.GetString(0)] = r.GetInt64(1);
+            }
+            using (var cmd = Db.CreateCommand())
+            {
+                cmd.CommandText = "SELECT COUNT(*), SUM(placeable) FROM assets";
+                using var r = cmd.ExecuteReader();
+                if (r.Read())
                 {
-                    cmd.CommandText = "SELECT status, COUNT(*) FROM assets GROUP BY status";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read()) stats.ByStatus[r.GetString(0)] = r.GetInt64(1);
+                    stats.Total = r.GetInt64(0);
+                    stats.Placeable = r.IsDBNull(1) ? 0 : r.GetInt64(1);
                 }
-                using (var cmd = Db.CreateCommand())
-                {
-                    cmd.CommandText = "SELECT COUNT(*), SUM(placeable) FROM assets";
-                    using var r = cmd.ExecuteReader();
-                    if (r.Read())
-                    {
-                        stats.Total = r.GetInt64(0);
-                        stats.Placeable = r.IsDBNull(1) ? 0 : r.GetInt64(1);
-                    }
-                }
-                using (var cmd = Db.CreateCommand())
-                {
-                    cmd.CommandText = "SELECT category, COUNT(*) FROM assets WHERE status = 'labeled' AND category <> '' GROUP BY category ORDER BY COUNT(*) DESC LIMIT 12";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read()) stats.TopCategories.Add(new CategoryCount(r.GetString(0), r.GetInt64(1)));
-                }
+            }
+            using (var cmd = Db.CreateCommand())
+            {
+                cmd.CommandText = "SELECT category, COUNT(*) FROM assets WHERE status = 'labeled' AND category <> '' GROUP BY category ORDER BY COUNT(*) DESC LIMIT 12";
+                using var r = cmd.ExecuteReader();
+                while (r.Read()) stats.TopCategories.Add(new CategoryCount(r.GetString(0), r.GetInt64(1)));
             }
             return stats;
         }

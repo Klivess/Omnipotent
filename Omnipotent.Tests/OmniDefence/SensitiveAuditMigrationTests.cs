@@ -104,6 +104,72 @@ public sealed class SensitiveAuditMigrationTests
     }
 
     [Fact]
+    public async Task Startup_Resumes_The_Scrub_After_The_Rows_It_Already_Examined()
+    {
+        // The scrub used to walk the whole request log on every start, and OmniDefence (which gates
+        // every API request) only became ready once it finished.
+        string directory = Path.Combine(Path.GetTempPath(), "audit-watermark-" + Guid.NewGuid().ToString("N"));
+        string path = Path.Combine(directory, "audit.db");
+        OmniDefenceStore? store = null;
+        try
+        {
+            store = new OmniDefenceStore(path);
+            await store.InitializeAsync();
+            await InsertSensitiveRowAsync(store, "first-secret");
+            await CloseAsync(store);
+            SqliteConnection.ClearAllPools();
+
+            store = new OmniDefenceStore(path);
+            await store.InitializeAsync();
+            Assert.True(store.SensitiveAuditMigrationChangedRows);
+            long examinedThrough = await ScalarLongAsync(store,
+                $"SELECT CAST(value AS INTEGER) FROM od_settings WHERE key = '{OmniDefenceStore.ScrubWatermarkKey}'");
+            Assert.Equal(1, examinedThrough);
+
+            // Put a secret back into the already-examined row (a rescan would remove it again) and add a
+            // new legacy row past the watermark, as an older build running in between would have.
+            using (var restore = store.Connection.CreateCommand())
+            {
+                restore.CommandText = "UPDATE requests SET body_text = 'already-examined' WHERE id = 1";
+                await restore.ExecuteNonQueryAsync();
+            }
+            await InsertSensitiveRowAsync(store, "second-secret");
+            await CloseAsync(store);
+            SqliteConnection.ClearAllPools();
+
+            store = new OmniDefenceStore(path);
+            await store.InitializeAsync();
+            var rows = await store.QueryAsync("SELECT * FROM requests ORDER BY id", new());
+            Assert.Equal("already-examined", rows[0]["body_text"]);
+            AssertPayloadRemoved(rows[1]);
+            Assert.Equal(2, await ScalarLongAsync(store,
+                $"SELECT CAST(value AS INTEGER) FROM od_settings WHERE key = '{OmniDefenceStore.ScrubWatermarkKey}'"));
+        }
+        finally
+        {
+            await CloseAsync(store);
+            SqliteConnection.ClearAllPools();
+            try { Directory.Delete(directory, recursive: true); } catch { }
+        }
+    }
+
+    private static async Task InsertSensitiveRowAsync(OmniDefenceStore store, string secret)
+    {
+        using var insert = store.Connection.CreateCommand();
+        insert.CommandText = @"INSERT INTO requests (utc_ts, route, query, body_text, body_hash, body_length, headers_json, ip, status_code)
+            VALUES (1, '/OmniGlobalSettings/Set', 'q', $secret, 'hash', 11, 'headers', '127.0.0.1', 200)";
+        insert.Parameters.AddWithValue("$secret", secret);
+        await insert.ExecuteNonQueryAsync();
+    }
+
+    private static async Task<long> ScalarLongAsync(OmniDefenceStore store, string sql)
+    {
+        using var cmd = store.Connection.CreateCommand();
+        cmd.CommandText = sql;
+        return Convert.ToInt64(await cmd.ExecuteScalarAsync());
+    }
+
+    [Fact]
     public void SnapshotCleanup_RemovesLegacyGeneratedFilesAndKeepsCurrentAndUnrelatedFiles()
     {
         string directory = Path.Combine(Path.GetTempPath(), "snapshot-security-" + Guid.NewGuid().ToString("N"));

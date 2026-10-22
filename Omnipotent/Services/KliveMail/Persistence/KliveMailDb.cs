@@ -21,7 +21,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             {
                 DataSource = dbPath,
                 Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Shared,
+                Cache = SqliteCacheMode.Private,
                 Pooling = true
             }.ToString();
         }
@@ -31,11 +31,13 @@ namespace Omnipotent.Services.KliveMail.Persistence
             Directory.CreateDirectory(dir);
             DbPath = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveMailDbFile);
 
+            // Private cache: shared mode's table-level locks made mailbox reads wait out every
+            // write transaction (up to the 30 s busy timeout) despite WAL.
             connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = DbPath,
                 Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Shared,
+                Cache = SqliteCacheMode.Private,
                 Pooling = true
             }.ToString();
         }

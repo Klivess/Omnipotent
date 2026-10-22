@@ -442,7 +442,11 @@ namespace Omnipotent.Services.MemeScraper
                 try
                 {
                     await mediaManager.SaveInstagramReel(instagramReel);
-                    if (mediaManager.TryAddReel(instagramReel)) Interlocked.Increment(ref downloaded);
+                    if (mediaManager.TryAddReel(instagramReel))
+                    {
+                        Interlocked.Increment(ref downloaded);
+                        QueueThumbnail(instagramReel);
+                    }
                 }
                 catch (Exception ex)
                 {

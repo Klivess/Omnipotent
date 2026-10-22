@@ -15,6 +15,26 @@ namespace Omnipotent.Services.PortForwardManager
 {
     public class PortForwardManager : OmniService
     {
+        // UPnP is slow: discovery is an SSDP search with a 4 s budget, and listing the mappings walks
+        // the router's table one SOAP call per entry. The admin page polls the list every 10 s, so each
+        // poll cost ~2 s of router round trips. The gateway and its table rarely change, so the device
+        // is reused and one list snapshot is shared, refreshed in the background once it is older than
+        // ListFreshFor, and dropped whenever this service changes a mapping.
+        private static readonly TimeSpan ListFreshFor = TimeSpan.FromSeconds(30);
+        // Past this age a request waits for a fresh read instead of being shown an old table.
+        private static readonly TimeSpan ListMaxStale = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan DeviceReuseFor = TimeSpan.FromMinutes(10);
+        private sealed record ListSnapshot(DateTime AsOfUtc, string Json);
+        private volatile ListSnapshot? listSnapshot;
+        private Task<ListSnapshot>? listRefresh;
+        private int listRefreshGeneration;
+        // Bumped by every change made here, so a read that started before the change is never
+        // published (or shared) as the current table.
+        private int listGeneration;
+        private readonly object listRefreshLock = new();
+        private NatDevice? cachedDevice;
+        private DateTime cachedDeviceUtc;
+
         public PortForwardManager()
         {
             name = "PortForwardManager";
@@ -84,7 +104,7 @@ namespace Omnipotent.Services.PortForwardManager
         // Uses a permanent lifetime (0).
         public async Task<bool> EnsurePortForwarded(int publicPort, int privatePort, string protocol, string description)
         {
-            var device = await DiscoverDeviceAsync();
+            var device = await DiscoverDeviceAsync(reuse: false);
             if (device == null)
             {
                 return false;
@@ -105,6 +125,7 @@ namespace Omnipotent.Services.PortForwardManager
             var privateIpAddr = IPAddress.Parse(GetLocalIPAddress());
             var newMapping = new Open.Nat.Mapping(protocolEnum, privateIpAddr, privatePort, publicPort, 0, description);
             await device.CreatePortMapAsync(newMapping);
+            InvalidateList();
             return true;
         }
 
@@ -120,24 +141,30 @@ namespace Omnipotent.Services.PortForwardManager
         // Removes a port mapping. Returns true if a device was present and the delete was attempted.
         public async Task<bool> RemovePortForward(int publicPort, string protocol)
         {
-            var device = await DiscoverDeviceAsync();
+            var device = await DiscoverDeviceAsync(reuse: false);
             if (device == null) return false;
             var protocolEnum = protocol.ToUpper() == "UDP" ? Open.Nat.Protocol.Udp : Open.Nat.Protocol.Tcp;
             try
             {
                 await device.DeletePortMapAsync(new Open.Nat.Mapping(protocolEnum, publicPort, publicPort));
+                InvalidateList();
                 return true;
             }
             catch { return false; }
         }
 
-        private async Task<NatDevice?> DiscoverDeviceAsync()
+        private async Task<NatDevice?> DiscoverDeviceAsync(bool reuse = true)
         {
+            var known = cachedDevice;
+            if (reuse && known != null && DateTime.UtcNow - cachedDeviceUtc < DeviceReuseFor) return known;
             try
             {
                 var discoverer = new NatDiscoverer();
                 using var cts = new CancellationTokenSource(4000); // 4 seconds timeout
-                return await discoverer.DiscoverDeviceAsync(PortMapper.Upnp, cts);
+                var device = await discoverer.DiscoverDeviceAsync(PortMapper.Upnp, cts);
+                cachedDevice = device;
+                cachedDeviceUtc = DateTime.UtcNow;
+                return device;
             }
             catch (NatDeviceNotFoundException)
             {
@@ -196,29 +223,77 @@ namespace Omnipotent.Services.PortForwardManager
         {
             try
             {
-                var localIp = GetLocalIPAddress();
-                var device = await DiscoverDeviceAsync();
-                if (device == null)
+                var snapshot = listSnapshot;
+                if (snapshot == null || DateTime.UtcNow - snapshot.AsOfUtc > ListMaxStale)
+                    snapshot = await RefreshListAsync();
+                else if (DateTime.UtcNow - snapshot.AsOfUtc > ListFreshFor)
+                    _ = RefreshInBackgroundAsync();
+                await req.ReturnResponse(snapshot.Json, "application/json");
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Error in HandleListRequest");
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { success = false, error = ex.Message }), "application/json", code: HttpStatusCode.InternalServerError);
+            }
+        }
+
+        private async Task RefreshInBackgroundAsync()
+        {
+            try { await RefreshListAsync(); }
+            catch (Exception ex) { await ServiceLogError(ex, "Refreshing the port mapping list failed; serving the previous list.", false); }
+        }
+
+        /// <summary>Single-flight: concurrent callers share one walk of the router's table.</summary>
+        private Task<ListSnapshot> RefreshListAsync()
+        {
+            lock (listRefreshLock)
+            {
+                int generation = Volatile.Read(ref listGeneration);
+                if (listRefresh is { IsCompleted: false } running && listRefreshGeneration == generation) return running;
+                var refresh = BuildListSnapshotAsync(generation);
+                listRefresh = refresh;
+                listRefreshGeneration = generation;
+                return refresh;
+            }
+        }
+
+        private async Task<ListSnapshot> BuildListSnapshotAsync(int generation)
+        {
+            DateTime asOf = DateTime.UtcNow;
+            var localIp = GetLocalIPAddress();
+            var device = await DiscoverDeviceAsync();
+            object result;
+            if (device == null)
+            {
+                result = new
                 {
-                    var emptyResult = new
-                    {
-                        success = false,
-                        error = "No UPnP-enabled gateway device was discovered on the network.",
-                        localIp = localIp,
-                        externalIp = "Unknown",
-                        mappings = new List<PortMappingModel>()
-                    };
-                    await req.ReturnResponse(JsonConvert.SerializeObject(emptyResult), "application/json");
-                    return;
+                    success = false,
+                    error = "No UPnP-enabled gateway device was discovered on the network.",
+                    localIp,
+                    externalIp = "Unknown",
+                    mappings = new List<PortMappingModel>(),
+                    asOfUtc = asOf,
+                };
+            }
+            else
+            {
+                IPAddress? externalAddress;
+                IEnumerable<Open.Nat.Mapping> openNatMappings;
+                try
+                {
+                    var externalIpTask = device.GetExternalIPAsync();
+                    var mappingsTask = device.GetAllMappingsAsync();
+                    await Task.WhenAll(externalIpTask, mappingsTask);
+                    externalAddress = externalIpTask.Result;
+                    openNatMappings = mappingsTask.Result;
                 }
-
-                var externalIpTask = device.GetExternalIPAsync();
-                var mappingsTask = device.GetAllMappingsAsync();
-
-                await Task.WhenAll(externalIpTask, mappingsTask);
-
-                var externalIp = externalIpTask.Result?.ToString() ?? "Unknown";
-                var openNatMappings = mappingsTask.Result;
+                catch
+                {
+                    // A reused device can go stale (gateway rebooted, new address): find it again once.
+                    device = await DiscoverDeviceAsync(reuse: false) ?? throw new InvalidOperationException("The UPnP gateway stopped answering.");
+                    externalAddress = await device.GetExternalIPAsync();
+                    openNatMappings = await device.GetAllMappingsAsync();
+                }
 
                 var mappingsList = new List<PortMappingModel>();
                 foreach (var mapping in openNatMappings)
@@ -239,21 +314,26 @@ namespace Omnipotent.Services.PortForwardManager
                     });
                 }
 
-                var result = new
+                result = new
                 {
                     success = true,
-                    localIp = localIp,
-                    externalIp = externalIp,
-                    mappings = mappingsList
+                    localIp,
+                    externalIp = externalAddress?.ToString() ?? "Unknown",
+                    mappings = mappingsList,
+                    asOfUtc = asOf,
                 };
+            }
 
-                await req.ReturnResponse(JsonConvert.SerializeObject(result), "application/json");
-            }
-            catch (Exception ex)
-            {
-                await ServiceLogError(ex, "Error in HandleListRequest");
-                await req.ReturnResponse(JsonConvert.SerializeObject(new { success = false, error = ex.Message }), "application/json", code: HttpStatusCode.InternalServerError);
-            }
+            var snapshot = new ListSnapshot(asOf, JsonConvert.SerializeObject(result));
+            if (generation == Volatile.Read(ref listGeneration)) listSnapshot = snapshot;
+            return snapshot;
+        }
+
+        /// <summary>A mapping changed through this service: the next list reads the router again.</summary>
+        private void InvalidateList()
+        {
+            Interlocked.Increment(ref listGeneration);
+            listSnapshot = null;
         }
 
         private async Task HandleAddRequest(UserRequest req)
@@ -268,7 +348,7 @@ namespace Omnipotent.Services.PortForwardManager
                     return;
                 }
 
-                var device = await DiscoverDeviceAsync();
+                var device = await DiscoverDeviceAsync(reuse: false);
                 if (device == null)
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { success = false, error = "No UPnP device found." }), "application/json", code: HttpStatusCode.ServiceUnavailable);
@@ -285,6 +365,7 @@ namespace Omnipotent.Services.PortForwardManager
 
                 var mapping = new Open.Nat.Mapping(protocol, privateIpAddr, model.PrivatePort, model.PublicPort, model.LifetimeSeconds, model.Description);
                 await device.CreatePortMapAsync(mapping);
+                InvalidateList();
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, message = $"Port {model.PublicPort} successfully forwarded to {privateIpAddr}:{model.PrivatePort} ({model.Protocol})." }), "application/json");
             }
@@ -307,7 +388,7 @@ namespace Omnipotent.Services.PortForwardManager
                     return;
                 }
 
-                var device = await DiscoverDeviceAsync();
+                var device = await DiscoverDeviceAsync(reuse: false);
                 if (device == null)
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { success = false, error = "No UPnP device found." }), "application/json", code: HttpStatusCode.ServiceUnavailable);
@@ -317,6 +398,7 @@ namespace Omnipotent.Services.PortForwardManager
                 var protocol = model.Protocol.ToUpper() == "UDP" ? Open.Nat.Protocol.Udp : Open.Nat.Protocol.Tcp;
                 var mapping = new Open.Nat.Mapping(protocol, model.PrivatePort, model.PublicPort);
                 await device.DeletePortMapAsync(mapping);
+                InvalidateList();
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, message = $"Port forward mapping for {model.PublicPort} ({model.Protocol}) successfully deleted." }), "application/json");
             }
@@ -339,7 +421,7 @@ namespace Omnipotent.Services.PortForwardManager
                     return;
                 }
 
-                var device = await DiscoverDeviceAsync();
+                var device = await DiscoverDeviceAsync(reuse: false);
                 if (device == null)
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { success = false, error = "No UPnP device found." }), "application/json", code: HttpStatusCode.ServiceUnavailable);
@@ -367,7 +449,9 @@ namespace Omnipotent.Services.PortForwardManager
                 }
 
                 var newMapping = new Open.Nat.Mapping(newProtocol, newPrivateIpAddr, editModel.NewMapping.PrivatePort, editModel.NewMapping.PublicPort, editModel.NewMapping.LifetimeSeconds, editModel.NewMapping.Description);
+                InvalidateList(); // the old mapping is already gone, whatever happens next
                 await device.CreatePortMapAsync(newMapping);
+                InvalidateList();
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, message = "Port forward mapping successfully updated." }), "application/json");
             }

@@ -400,8 +400,22 @@ namespace Omnipotent.Services.KliveAPI
                         }
                     }
 
+                    if (req.HttpMethod == "HEAD")
+                    {
+                        // A HEAD response carries headers only. Writing the body into it threw, and the
+                        // error path turned every HEAD (even "HEAD /") into a 500.
+                        SetTimingHeaders(resp);
+                        resp.StatusCode = (int)code;
+                        resp.ContentLength64 = 0;
+                        trace?.Enter(TelemetryStage.ResponseWrite);
+                        if (trace != null) trace.ResponseBytes = 0;
+                        resp.OutputStream.Close();
+                        trace?.Enter(TelemetryStage.Teardown);
+                        return;
+                    }
+
                     // Negotiated compression for compressible payloads worth the CPU.
-                    if (!confidentialResponse && HttpResponseHelpers.IsCompressibleContentType(contentType) && req.HttpMethod != "HEAD")
+                    if (!confidentialResponse && HttpResponseHelpers.IsCompressibleContentType(contentType))
                     {
                         resp.Headers.Set("Vary", "Accept-Encoding");
                         if (buffer.Length >= 1024 && string.IsNullOrEmpty(resp.Headers["Content-Encoding"]))
@@ -577,6 +591,62 @@ namespace Omnipotent.Services.KliveAPI
                 }
             }
 
+            /// <summary>
+            /// Answers with a payload identified by <paramref name="etag"/>, a validator the caller
+            /// derives cheaply (a file's size and write time, a render's inputs). A request that already
+            /// holds that version gets a body-less 304 and <paramref name="load"/> never runs.
+            /// <paramref name="cacheControl"/> decides how long the browser may reuse it without asking:
+            /// image routes used to send neither, so every page view downloaded every picture again.
+            /// </summary>
+            public async Task ReturnValidatedBinaryResponse(string etag, Func<Task<byte[]>> load, string contentType,
+                string cacheControl, NameValueCollection? headers = null)
+            {
+                if (capture == null && req.HttpMethod == "GET" && HttpResponseHelpers.ETagMatches(req.Headers["If-None-Match"], etag))
+                {
+                    trace?.Enter(TelemetryStage.Encode);
+                    try
+                    {
+                        HttpListenerResponse resp = context.Response;
+                        if (headers != null)
+                        {
+                            for (int i = 0; i < headers.Count; i++) resp.Headers.Set(headers.GetKey(i), headers.Get(i));
+                        }
+                        resp.Headers.Set("ETag", etag);
+                        resp.Headers.Set("Cache-Control", cacheControl);
+                        resp.Headers.Set("Access-Control-Allow-Origin", "*");
+                        resp.Headers.Set("Access-Control-Expose-Headers", "*");
+                        SetTimingHeaders(resp);
+                        resp.StatusCode = (int)HttpStatusCode.NotModified;
+                        resp.ContentLength64 = 0;
+                        trace?.Enter(TelemetryStage.ResponseWrite);
+                        if (trace != null) { trace.NotModified = true; trace.ResponseBytes = 0; }
+                        resp.OutputStream.Close();
+                        trace?.Enter(TelemetryStage.Teardown);
+                    }
+                    catch (Exception ex) when (ex is HttpListenerException or IOException or ObjectDisposedException)
+                    {
+                        if (trace != null) trace.ClientDisconnected = true;
+                    }
+                    return;
+                }
+
+                var merged = headers == null ? new NameValueCollection() : new NameValueCollection(headers);
+                merged["ETag"] = etag;
+                merged["Cache-Control"] = cacheControl;
+                await ReturnBinaryResponse(await load(), contentType, HttpStatusCode.OK, merged);
+            }
+
+            /// <summary>
+            /// Serves a file with a validator built from its size and last write time (no hashing), so
+            /// an unchanged file costs a 304. See <see cref="ReturnValidatedBinaryResponse"/>.
+            /// </summary>
+            public Task ReturnFileResponse(string path, string contentType, string cacheControl, NameValueCollection? headers = null)
+            {
+                var info = new FileInfo(path);
+                string etag = "W/\"" + info.Length.ToString("x") + "-" + info.LastWriteTimeUtc.Ticks.ToString("x") + "\"";
+                return ReturnValidatedBinaryResponse(etag, () => File.ReadAllBytesAsync(path), contentType, cacheControl, headers);
+            }
+
             public Stream PrepareStreamResponse(string contentType, long contentLength, HttpStatusCode code = HttpStatusCode.OK, NameValueCollection headers = null)
             {
                 if (capture != null)
@@ -681,6 +751,9 @@ namespace Omnipotent.Services.KliveAPI
         private int _inFlightRequests;
         private long _lastContextAcceptedUtcTicks;
         private long _lastRequestCompletedUtcTicks;
+        // Last time a faulting OmniDefence gate was logged (Environment.TickCount64), so a broken
+        // gate logs once a minute instead of once per request.
+        private long _lastGateFaultLogTicks = -60_000;
         // Requests slower than this get a one-line log with a runtime-health snapshot.
         private const int SlowRequestLogThresholdMs = 3000;
         private Thread? _healthHeartbeatThread;
@@ -1759,6 +1832,16 @@ namespace Omnipotent.Services.KliveAPI
         }
 
         /// <summary>
+        /// The client hung up while its request body was still being read. That is the caller's
+        /// doing, not a server fault, so it is recorded as a 499 rather than an error-logged 500.
+        /// </summary>
+        internal sealed class RequestBodyAbortedException : IOException
+        {
+            public RequestBodyAbortedException(Exception inner)
+                : base("The client disconnected while sending the request body.", inner) { }
+        }
+
+        /// <summary>
         /// Read-only wrapper that keeps the HttpListener request stream unread until
         /// the route handler consumes it, while enforcing the route limit and hashing
         /// the bytes that are successfully delivered to the handler.
@@ -1992,7 +2075,16 @@ namespace Omnipotent.Services.KliveAPI
                     requested = (int)Math.Min(buffer.Length, detectionWindow);
                 }
 
-                int read = await req.InputStream.ReadAsync(buffer.AsMemory(0, requested));
+                int read;
+                try
+                {
+                    read = await req.InputStream.ReadAsync(buffer.AsMemory(0, requested));
+                }
+                catch (Exception ex) when (ex is HttpListenerException or IOException
+                                               or ObjectDisposedException or System.Net.Sockets.SocketException)
+                {
+                    throw new RequestBodyAbortedException(ex);
+                }
                 if (read == 0) break;
 
                 totalRead = checked(totalRead + read);
@@ -2071,6 +2163,27 @@ namespace Omnipotent.Services.KliveAPI
         }
 
         private OmniDefenceService? _defenceCache;
+        /// <summary>
+        /// The defence gate fails open. A fault inside OmniDefence costs protection for that request,
+        /// never the request itself: a throwing gate used to answer every request on the server,
+        /// /ping included, with a 500 until OmniDefence recovered.
+        /// </summary>
+        private IpThreatTracker.GateDecision EvaluateDefenceGate(OmniDefenceService defence, string ip, string route)
+        {
+            try
+            {
+                return defence.EvaluateRequestGate(ip, route);
+            }
+            catch (Exception ex)
+            {
+                long now = Environment.TickCount64;
+                long last = Interlocked.Read(ref _lastGateFaultLogTicks);
+                if (now - last >= 60_000 && Interlocked.CompareExchange(ref _lastGateFaultLogTicks, now, last) == last)
+                    _ = ServiceLogError(ex, "OmniDefence request gate failed; requests are let through until it recovers.");
+                return IpThreatTracker.GateDecision.Allow;
+            }
+        }
+
         private OmniDefenceService? TryGetDefence()
         {
             if (_defenceCache != null && _defenceCache.IsServiceActive()) return _defenceCache;
@@ -2361,7 +2474,7 @@ namespace Omnipotent.Services.KliveAPI
                 if (defence != null && !string.IsNullOrEmpty(defenceIp) && !skipDefenceGateForOwner)
                 {
                     trace?.Enter(TelemetryStage.DefenceGate);
-                    var decision = defence.EvaluateRequestGate(defenceIp, route);
+                    var decision = EvaluateDefenceGate(defence, defenceIp, route);
                     trace?.Enter(TelemetryStage.Prologue);
                     if (decision != IpThreatTracker.GateDecision.Allow && trace != null) trace.Denied = true;
                     if (decision == IpThreatTracker.GateDecision.Block)
@@ -2611,6 +2724,16 @@ namespace Omnipotent.Services.KliveAPI
                 defenceOutcome = RequestOutcome.ClientError;
                 try { context.Response.KeepAlive = false; } catch { }
                 await ReturnPayloadTooLargeAsync(context, ex.MaxBodyBytes);
+            }
+            catch (RequestBodyAbortedException ex)
+            {
+                // Nothing can be written back to a caller that has gone. 499 ("client closed
+                // request") keeps these out of the server-error rate and the error log.
+                if (trace != null) trace.ClientDisconnected = true;
+                defenceOutcome = RequestOutcome.ClientError;
+                try { context.Response.StatusCode = 499; } catch { }
+                try { context.Response.Abort(); } catch { }
+                _ = ServiceLog($"Client disconnected while sending the request body for {statsMethod} {statsRoute} ({ex.InnerException?.GetType().Name}).", false);
             }
             catch (Exception ex)
             {

@@ -25,11 +25,12 @@ namespace Omnipotent.Services.Projects
             this.eventLog = eventLog;
             string path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsDirectory), "retrieval.sqlite");
             Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+            // Private cache: shared mode's table-level locks made searches wait out ingest writes.
             connectionString = new SqliteConnectionStringBuilder
             {
                 DataSource = path,
                 Mode = SqliteOpenMode.ReadWriteCreate,
-                Cache = SqliteCacheMode.Shared,
+                Cache = SqliteCacheMode.Private,
             }.ToString();
             EnsureSchema();
         }

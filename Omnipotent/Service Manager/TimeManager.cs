@@ -231,8 +231,11 @@ namespace Omnipotent.Service_Manager
                 {
                     ServiceLogError(ex, "Error in TimeManager WaitLoop.");
                 }
+                // No GC.Collect() here. One used to run on every 2 s pass: a blocking, compacting
+                // full collection of the whole heap ~30 times a minute that froze every thread in the
+                // process, every in-flight API request included (API telemetry: ~26 gen2 GCs/min and
+                // 75-80 ms of GC pause per second even when the server was otherwise idle).
                 await Task.Delay(2000);
-                GC.Collect();
             }
         }
 

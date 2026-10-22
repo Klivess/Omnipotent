@@ -26,6 +26,20 @@ namespace Omnipotent.Services.OmniBlox
         private static readonly TimeSpan ReadyWait = TimeSpan.FromSeconds(20);
         private const long MaxTelemetryBytes = 512 * 1024;
 
+        // Pictures used to go out with no validator, so every visit re-downloaded every thumbnail
+        // (~50 KB each, dozens per page, the slowest route on the server). Library pictures and cycle
+        // images never change in place; media URLs carry a version (v) whenever the site has one.
+        private const string LibraryImageCaching = "private, max-age=3600, stale-while-revalidate=86400";
+        private const string ImmutableImageCaching = "private, max-age=86400";
+        private const string RevalidateCaching = "private, no-cache";
+
+        // Compiling a place costs ~1-2 s, and the game page asks for several views and a map report of
+        // the same world. Results are kept per workspace state (every file's path, size and write time);
+        // the time bound only covers library relabels, which change placements without touching the files.
+        private static readonly TimeSpan WorldCacheFor = TimeSpan.FromMinutes(10);
+        private const int WorldCacheEntries = 48;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime BuiltUtc, object Value)> worldCache = new(StringComparer.Ordinal);
+
         private readonly OmniBlox service;
         private KliveApi? api;
 
@@ -181,6 +195,32 @@ namespace Omnipotent.Services.OmniBlox
 
         private GameDossier RequireGame(string id) => Ctx.Game(id) ?? throw NotFound("No game " + id);
 
+        /// <summary>The workspace's state without reading any file: paths, sizes and write times.</summary>
+        private static string WorldStamp(Build.GameWorkspace workspace)
+        {
+            var sb = new StringBuilder();
+            foreach (var file in workspace.ListFiles())
+                sb.Append(file.Path).Append('|').Append(file.Bytes).Append('|').Append(file.ModifiedUtc.Ticks).Append('\n');
+            return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())), 0, 12);
+        }
+
+        private T WorldCached<T>(string key, Func<T> build) where T : class
+        {
+            DateTime now = DateTime.UtcNow;
+            if (worldCache.TryGetValue(key, out var hit) && now - hit.BuiltUtc < WorldCacheFor && hit.Value is T cached) return cached;
+            T value = build();
+            if (worldCache.Count >= WorldCacheEntries)
+            {
+                foreach (var stale in worldCache.OrderBy(kv => kv.Value.BuiltUtc).Take(worldCache.Count - WorldCacheEntries + 1).ToList())
+                    worldCache.TryRemove(stale.Key, out _);
+            }
+            worldCache[key] = (now, value);
+            return value;
+        }
+
+        private static string WeakETag(string key) =>
+            "W/\"" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)), 0, 12) + "\"";
+
         // ─────────────── GET (bodies built by OmniBloxViews) ───────────────
 
         private StudioStatus Status() => new(
@@ -210,7 +250,8 @@ namespace Omnipotent.Services.OmniBlox
             if (!File.Exists(path)) throw NotFound("Not made yet.");
             string type = file.EndsWith(".mp4", StringComparison.OrdinalIgnoreCase) ? "video/mp4" : "image/png";
             var headers = new NameValueCollection { ["Content-Disposition"] = $"inline; filename=\"{game.GameId}-{file}\"" };
-            await req.ReturnBinaryResponse(await File.ReadAllBytesAsync(path), type, HttpStatusCode.OK, headers);
+            // The site versions these URLs (v = the game's last update), so a versioned copy can be reused.
+            await req.ReturnFileResponse(path, type, Query(req, "v").Length > 0 ? ImmutableImageCaching : RevalidateCaching, headers);
         }
 
         /// <summary>
@@ -220,16 +261,25 @@ namespace Omnipotent.Services.OmniBlox
         private async Task GameRender(UserRequest req)
         {
             var game = RequireGame(RequiredQuery(req, "id"));
-            if (!Ctx.Workspace(game.GameId).Exists) throw NotFound("This game has no world yet.");
-            var result = Ctx.Compile(game.GameId);
-            if (result.Parts.Count == 0 && result.Terrain == null) throw NotFound("The world is empty.");
+            var workspace = Ctx.Workspace(game.GameId);
+            if (!workspace.Exists) throw NotFound("This game has no world yet.");
             string view = Query(req, "view", "iso");
             int width = int.TryParse(Query(req, "w", "1280"), out int w) ? Math.Clamp(w, 320, 1920) : 1280;
             int height = int.TryParse(Query(req, "h", "760"), out int h) ? Math.Clamp(h, 240, 1080) : 760;
-            byte[] png;
-            try { png = Ctx.RenderCompiled(game.GameId, result, view, width, height, labels: Query(req, "labels") is "1" or "true", caption: false, marketing: Query(req, "marketing") is "1" or "true"); }
-            catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or FormatException) { throw Bad(ex.Message); }
-            await req.ReturnBinaryResponse(png, "image/png");
+            bool labels = Query(req, "labels") is "1" or "true";
+            bool marketing = Query(req, "marketing") is "1" or "true";
+            // The time bucket ends a browser's copy when the server's does, so a library relabel (which moves
+            // models without touching the workspace) shows up within WorldCacheFor there too.
+            long bucket = DateTime.UtcNow.Ticks / WorldCacheFor.Ticks;
+            string key = $"render|{game.GameId}|{WorldStamp(workspace)}|{bucket}|{view}|{width}x{height}|{labels}|{marketing}";
+            // Revalidated on every view: an unchanged world costs a 304 and no compile.
+            await req.ReturnValidatedBinaryResponse(WeakETag(key), () => Task.FromResult(WorldCached(key, () =>
+            {
+                var result = Ctx.Compile(game.GameId);
+                if (result.Parts.Count == 0 && result.Terrain == null) throw NotFound("The world is empty.");
+                try { return Ctx.RenderCompiled(game.GameId, result, view, width, height, labels: labels, caption: false, marketing: marketing); }
+                catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or FormatException) { throw Bad(ex.Message); }
+            })), "image/png", RevalidateCaching);
         }
 
         /// <summary>The cycle the game is running now (or ran last), step by step; null when none has run since the server started.</summary>
@@ -253,14 +303,18 @@ namespace Omnipotent.Services.OmniBlox
         {
             var game = RequireGame(RequiredQuery(req, "id"));
             string path = CycleLog.ImagePath(Ctx, game.GameId, RequiredQuery(req, "cycle"), RequiredQuery(req, "file")) ?? throw NotFound("No such picture.");
-            await req.ReturnBinaryResponse(await File.ReadAllBytesAsync(path), "image/png");
+            await req.ReturnFileResponse(path, "image/png", ImmutableImageCaching);
         }
 
         /// <summary>The map report on the game's current files: score, play area, coverage, zones, spawn, findings.</summary>
         private async Task GameMap(UserRequest req)
         {
             var game = RequireGame(RequiredQuery(req, "id"));
-            await Respond(req, OmniBloxViews.Map(Ctx, game.GameId) ?? throw NotFound("This game has no world yet."));
+            var workspace = Ctx.Workspace(game.GameId);
+            if (!workspace.Exists) throw NotFound("This game has no world yet.");
+            var map = WorldCached($"map|{game.GameId}|{WorldStamp(workspace)}",
+                () => OmniBloxViews.Map(Ctx, game.GameId) ?? throw NotFound("This game has no world yet."));
+            await Respond(req, map);
         }
 
         private async Task GameFiles(UserRequest req)
@@ -333,7 +387,7 @@ namespace Omnipotent.Services.OmniBlox
                 : view is "front" or "right" or "top" or "iso" ? Ctx.Library.RenderPath(id, view)
                 : throw Bad("view must be thumb, front, right, top or iso");
             if (!File.Exists(path)) throw NotFound("No such image yet.");
-            await req.ReturnBinaryResponse(await File.ReadAllBytesAsync(path), "image/png");
+            await req.ReturnFileResponse(path, "image/png", LibraryImageCaching);
         }
 
         private Task Events(UserRequest req)
