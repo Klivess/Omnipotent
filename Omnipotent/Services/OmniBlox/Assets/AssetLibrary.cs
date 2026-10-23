@@ -134,6 +134,20 @@ namespace Omnipotent.Services.OmniBlox.Assets
         /// <summary>Called under the lock by every write that can change a count in <see cref="Stats"/>.</summary>
         private void CountsChanged() => Interlocked.Increment(ref statsVersion);
 
+        /// <summary>Changes whenever a model is added, analysed, labelled or rejected (what caches of the library key on).</summary>
+        public long Version => Interlocked.Read(ref statsVersion);
+
+        /// <summary>Every labelled, placeable model (the world generator's catalog is built from these).</summary>
+        public List<AssetRecord> Labeled()
+        {
+            lock (sync)
+            {
+                using var cmd = Db.CreateCommand();
+                cmd.CommandText = "SELECT * FROM assets WHERE status = 'labeled' AND placeable = 1";
+                return ReadRecords(cmd);
+            }
+        }
+
         private static readonly JsonSerializerSettings Json = new() { NullValueHandling = NullValueHandling.Ignore };
 
         public AssetLibrary(string directory) => this.directory = Path.GetFullPath(directory);

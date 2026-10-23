@@ -28,10 +28,10 @@ namespace Omnipotent.Services.Omniscience.Replica
         private readonly HttpClient http;
 
         // Tunables — modest by default to keep first training under a few minutes on a typical corpus.
-        private const int MaxMessagesForVoice = 250;
-        private const int MaxMessagesForOpinions = 250;
+        private const int MaxMessagesForVoice = 140;
+        private const int MaxMessagesForOpinions = 140;
         private const int MaxReflexExemplarsPerLabel = 4;
-        private const int MaxReflexStimuliToClassify = 200;
+        private const int MaxReflexStimuliToClassify = 100;
         private const int MaxStylisticExemplars = 30;
         private const int MaxRelationsToProfile = 8;
         private const int MaxRelationSamples = 20;
@@ -41,9 +41,6 @@ namespace Omnipotent.Services.Omniscience.Replica
         // them so chat-time critique/system prompt can apply them uniformly.
         private static readonly string[] DefaultForbiddenPatterns =
         {
-            "as an AI",
-            "as a language model",
-            "I'm just an AI",
             "I cannot",
             "I'm sorry, but",
             "It's important to note",
@@ -91,10 +88,18 @@ namespace Omnipotent.Services.Omniscience.Replica
 
                 var dossier = new ReplicaDossier
                 {
+                    PipelineVersion = "temporal-v2",
+                    TrainingCutoff = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     DisplayName = person.DisplayName,
                     Handles = person.Handles,
                     Stats = ComputeCorpusStats(allMessages),
                 };
+
+                // Materialise annual era/style summaries before any generation. Chat-time
+                // still recomputes against its exact as-of cutoff to prevent future leakage.
+                await UpdateStage(jobId, ReplicaStage.Temporal, 4, "Mapping personality and style eras", ct);
+                await service.ReplicaTemporal.RebuildAsync(personId, ct);
+                dossier.Stats.EraCount = (await service.ReplicaTemporal.GetErasAsync(personId, false, ct)).Count;
 
                 var llms = await service.GetServicesByType<KliveLLM.KliveLLM>();
                 if (llms == null || llms.Length == 0)
@@ -103,20 +108,20 @@ namespace Omnipotent.Services.Omniscience.Replica
 
                 // ── Stage 1: voice ──
                 await UpdateStage(jobId, ReplicaStage.Voice, 5, "Building voice rulebook", ct);
-                var voiceSamples = SampleEvenly(allMessages.Where(m => !string.IsNullOrWhiteSpace(m.Content) && m.Content!.Length >= 3).ToList(), MaxMessagesForVoice);
+                var voiceSamples = SampleAcrossEras(allMessages.Where(m => !string.IsNullOrWhiteSpace(m.Content) && m.Content!.Length >= 3).ToList(), MaxMessagesForVoice);
                 dossier.VoiceRulebookMarkdown = await CallLLM(llm,
-                    ReplicaPromptBuilder.BuildVoicePrompt(person.DisplayName, person.Handles, voiceSamples.Select(m => m.Content!).ToList()),
+                    ReplicaPromptBuilder.BuildVoicePrompt(person.DisplayName, person.Handles, voiceSamples.Select(WithEraLabel).ToList()),
                     ReplicaPromptBuilder.VoiceSystemPrompt, 2048, ct);
                 dossier.Stats.MessagesUsedForVoice = voiceSamples.Count;
 
                 // ── Stage 2: opinions ──
                 await UpdateStage(jobId, ReplicaStage.Opinions, 25, "Extracting opinion ledger", ct);
-                var opinionSamples = SampleEvenly(allMessages.Where(m => !string.IsNullOrWhiteSpace(m.Content) && m.Content!.Length >= 30).ToList(), MaxMessagesForOpinions);
+                var opinionSamples = SampleAcrossEras(allMessages.Where(m => !string.IsNullOrWhiteSpace(m.Content) && m.Content!.Length >= 30).ToList(), MaxMessagesForOpinions);
                 if (opinionSamples.Count > 0)
                 {
                     // We use one shot: feed everything as a single "general" cluster. Topical
                     // clustering is a future improvement; for now the LLM organises the ledger.
-                    string opinionPrompt = ReplicaPromptBuilder.BuildOpinionPrompt(person.DisplayName, "all topics combined", opinionSamples.Select(m => m.Content!).ToList());
+                    string opinionPrompt = ReplicaPromptBuilder.BuildOpinionPrompt(person.DisplayName, "all topics combined", opinionSamples.Select(WithEraLabel).ToList());
                     dossier.OpinionLedgerMarkdown = await CallLLM(llm, opinionPrompt, ReplicaPromptBuilder.OpinionSystemPrompt, 2048, ct);
                     dossier.Stats.MessagesUsedForOpinions = opinionSamples.Count;
                 }
@@ -198,12 +203,14 @@ namespace Omnipotent.Services.Omniscience.Replica
             var pairs = await LoadReplyPairsAsync(personId, ct);
             if (pairs.Count == 0) return new();
 
-            // Trim to a manageable batch — bias toward longer, more substantive stimuli first.
-            var ranked = pairs
+            // Preserve terse replies and every era instead of training only on the
+            // longest, most formal messages. An even temporal stride is deterministic.
+            var eligible = pairs
                 .Where(p => !string.IsNullOrWhiteSpace(p.StimulusContent) && !string.IsNullOrWhiteSpace(p.ReplyContent))
-                .OrderByDescending(p => p.StimulusContent!.Length + p.ReplyContent!.Length)
-                .Take(MaxReflexStimuliToClassify)
-                .ToList();
+                .OrderBy(p => p.ReplySentAt).ToList();
+            int stride = Math.Max(1, (int)Math.Ceiling(eligible.Count / (double)MaxReflexStimuliToClassify));
+            var ranked = eligible.Where((_, index) => index % stride == 0)
+                .Take(MaxReflexStimuliToClassify).ToList();
 
             var byLabel = new Dictionary<string, List<ReplicaExemplar>>(StringComparer.OrdinalIgnoreCase);
             foreach (var pair in ranked)
@@ -226,6 +233,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                 if (list.Count >= MaxReflexExemplarsPerLabel) continue;
                 list.Add(new ReplicaExemplar
                 {
+                    MessageId = pair.ReplyMessageId,
                     Stimulus = pair.StimulusContent,
                     Reply = pair.ReplyContent!,
                     ConversationId = pair.ConversationId,
@@ -256,13 +264,18 @@ namespace Omnipotent.Services.Omniscience.Replica
             // contains punctuation, not pure URL). We also prefer ones that ARE replies so
             // the chat orchestrator can format them as user→assistant pairs.
             var pairs = await LoadReplyPairsAsync(personId, ct);
-            var scored = pairs
-                .Where(p => !string.IsNullOrWhiteSpace(p.ReplyContent))
+            var candidates = pairs.Where(p => !string.IsNullOrWhiteSpace(p.ReplyContent)).ToList();
+            var primary = candidates.OrderByDescending(p => ScoreStylistic(p.ReplyContent!)).Take(MaxStylisticExemplars / 2).ToList();
+            var selectedIds = new HashSet<string>(primary.Select(p => p.ReplyMessageId), StringComparer.Ordinal);
+            var remaining = candidates.Where(p => !selectedIds.Contains(p.ReplyMessageId)).OrderBy(p => p.ReplySentAt).ToList();
+            int slots = MaxStylisticExemplars - primary.Count;
+            int stride = Math.Max(1, (int)Math.Ceiling(remaining.Count / (double)Math.Max(1, slots)));
+            var diverse = primary.Concat(remaining.Where((_, index) => index % stride == 0).Take(slots)).ToList();
+            var scored = diverse
                 .Select(p => (pair: p, score: ScoreStylistic(p.ReplyContent!)))
-                .OrderByDescending(x => x.score)
-                .Take(MaxStylisticExemplars)
                 .Select(x => new ReplicaExemplar
                 {
+                    MessageId = x.pair.ReplyMessageId,
                     Stimulus = x.pair.StimulusContent,
                     Reply = x.pair.ReplyContent!,
                     ConversationId = x.pair.ConversationId,
@@ -280,6 +293,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                     .Take(MaxStylisticExemplars)
                     .Select(x => new ReplicaExemplar
                     {
+                        MessageId = x.msg.MessageId,
                         Stimulus = null,
                         Reply = x.msg.Content!,
                         ConversationId = x.msg.ConversationId,
@@ -320,7 +334,7 @@ namespace Omnipotent.Services.Omniscience.Replica
             // Co-author message counts in shared conversations.
             using var topCmd = conn.CreateCommand();
             topCmd.CommandText = $@"
-                SELECT pi.platform, pi.platform_username, COALESCE(pi.display_name, pi.platform_username) AS dn,
+                SELECT pi.identity_id, pi.platform, pi.platform_username, COALESCE(pi.display_name, pi.platform_username) AS dn,
                        p.person_id AS other_person_id, COUNT(*) AS msg_count
                 FROM messages m
                 JOIN platform_identities pi ON pi.identity_id = m.author_identity_id
@@ -335,30 +349,33 @@ namespace Omnipotent.Services.Omniscience.Replica
             int idx = 0; foreach (var i in idents) topCmd.Parameters.AddWithValue("$i" + idx++, i);
             topCmd.Parameters.AddWithValue("$lim", MaxRelationsToProfile);
 
-            var relations = new List<(string platform, string? puser, string dn, int count)>();
+            var relations = new List<(string identityId, string platform, string? puser, string dn, int count)>();
             using (var r = topCmd.ExecuteReader())
             {
                 while (r.Read())
                 {
                     relations.Add((
                         r.GetString(0),
-                        r.IsDBNull(1) ? null : r.GetString(1),
-                        r.IsDBNull(2) ? "(unknown)" : r.GetString(2),
-                        r.GetInt32(4)));
+                        r.GetString(1),
+                        r.IsDBNull(2) ? null : r.GetString(2),
+                        r.IsDBNull(3) ? "(unknown)" : r.GetString(3),
+                        r.GetInt32(5)));
                 }
             }
 
             foreach (var rel in relations)
             {
                 using var sCmd = conn.CreateCommand();
-                sCmd.CommandText = @"SELECT content FROM messages
-                    WHERE author_identity_id IN (
-                        SELECT identity_id FROM platform_identities WHERE platform=$pl AND platform_username=$pu
-                    )
-                    AND content IS NOT NULL AND length(content) >= 8
-                    ORDER BY sent_at DESC LIMIT $n";
-                sCmd.Parameters.AddWithValue("$pl", rel.platform);
-                sCmd.Parameters.AddWithValue("$pu", (object?)rel.puser ?? DBNull.Value);
+                // Learn the SUBJECT's register in conversations shared with this identity.
+                // The old query sampled the other person's global messages, contaminating
+                // the relational voice map with somebody else's writing.
+                sCmd.CommandText = $@"SELECT m.content FROM messages m
+                    WHERE m.author_identity_id IN ({inC})
+                      AND m.conversation_id IN (SELECT conversation_id FROM messages WHERE author_identity_id=$other)
+                      AND m.content IS NOT NULL AND length(m.content) >= 3
+                    ORDER BY m.sent_at DESC LIMIT $n";
+                int subjectIndex = 0; foreach (var identity in idents) sCmd.Parameters.AddWithValue("$i" + subjectIndex++, identity);
+                sCmd.Parameters.AddWithValue("$other", rel.identityId);
                 sCmd.Parameters.AddWithValue("$n", MaxRelationSamples);
                 var samples = new List<string>();
                 using var sr = sCmd.ExecuteReader();
@@ -702,6 +719,31 @@ namespace Omnipotent.Services.Omniscience.Replica
 
         // ── Misc helpers ──
 
+        private static string WithEraLabel(MessageRow message)
+        {
+            int year = DateTimeOffset.FromUnixTimeMilliseconds(message.SentAt).UtcDateTime.Year;
+            return $"[{year}] {message.Content}";
+        }
+
+        private static List<MessageRow> SampleAcrossEras(List<MessageRow> messages, int target)
+        {
+            if (messages.Count <= target) return new List<MessageRow>(messages);
+            var groups = messages.GroupBy(m => DateTimeOffset.FromUnixTimeMilliseconds(m.SentAt).UtcDateTime.Year)
+                .OrderBy(g => g.Key).ToList();
+            int perEra = Math.Max(1, (int)Math.Ceiling(target / (double)groups.Count));
+            var buckets = groups.Select(g => SampleEvenly(g.ToList(), perEra)).ToList();
+            var picks = new List<MessageRow>(target);
+            for (int i = 0; i < perEra && picks.Count < target; i++)
+            {
+                foreach (var bucket in buckets)
+                {
+                    if (i < bucket.Count) picks.Add(bucket[i]);
+                    if (picks.Count >= target) break;
+                }
+            }
+            return picks.OrderBy(m => m.SentAt).ToList();
+        }
+
         private static List<MessageRow> SampleEvenly(List<MessageRow> messages, int target)
         {
             if (messages.Count <= target) return new List<MessageRow>(messages);
@@ -733,9 +775,9 @@ namespace Omnipotent.Services.Omniscience.Replica
 
         private static async Task<string> CallLLM(KliveLLM.KliveLLM llm, string prompt, string systemPrompt, int maxTokens, CancellationToken ct, bool useFreeModel = false)
         {
-            // KliveLLM is not cancellable today; we honour the token at the boundary only.
             ct.ThrowIfCancellationRequested();
-            var resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: maxTokens, systemPrompt: systemPrompt, useFreeModel: useFreeModel);
+            var resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: maxTokens,
+                systemPrompt: systemPrompt, useFreeModel: useFreeModel, cancellationToken: ct);
             if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response))
                 throw new InvalidOperationException("KliveLLM returned empty/unsuccessful response.");
             return resp.Response.Trim();

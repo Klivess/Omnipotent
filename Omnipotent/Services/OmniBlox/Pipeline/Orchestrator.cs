@@ -193,6 +193,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     await RunCycleAsync(gameId, "researcher", AgentPrompts.Researcher, ResearchTools.Create(ctx, gameId), "high", ct);
                     break;
                 case GameStage.Build:
+                    // A game that reached Build before the world generator existed gets its generated baseline first.
+                    TryScaffold(gameId);
                     Status = $"building \"{game.DisplayTitle}\" (revision {game.Build.Revision})";
                     await RunCycleAsync(gameId, "builder", AgentPrompts.Builder, BuildTools.Create(ctx, gameId), "medium", ct);
                     break;
@@ -220,6 +222,15 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                         return;
                     }
                 case GameStage.Launch:
+                    // Gate 1: the owner plays this build and signs it off before any marketing work.
+                    if (Approvals.SignoffNeeded(ctx, game))
+                    {
+                        if (!ctx.Store.Read(s => s.Studio.OwnerTasks.Any(t => t.Status == OwnerTaskStatus.Open && t.Kind == OwnerTaskKind.BuildSignoff && t.GameId == gameId && t.Title.Contains($"(r{game.Build.Revision})", StringComparison.Ordinal))))
+                            Approvals.RequestSignoff(ctx, gameId);
+                        Status = $"\"{game.DisplayTitle}\" is waiting for you to play r{game.Build.Revision} and sign it off";
+                        ctx.Update(gameId, g => g.NextAttemptUtc = ctx.Clock() + WaitRecheck);
+                        return;
+                    }
                     if (!LaunchReady(game))
                     {
                         Status = $"marketing \"{game.DisplayTitle}\"";
@@ -241,6 +252,20 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
         private static bool LaunchReady(GameDossier g) => StageGates.MarketingReady(g) && g.Publish.LaunchRequestedUtc != null;
 
+        /// <summary>Makes the game's generated baseline when it has none (never fatal: the builder can design_world itself).</summary>
+        private void TryScaffold(string gameId)
+        {
+            try
+            {
+                if (GameScaffold.Ensure(ctx, gameId) is { } done) ctx.Log($"[OmniBlox] {gameId}: {done}");
+            }
+            catch (Exception ex) when (ex is IOException or InvalidOperationException or ArgumentException or Newtonsoft.Json.JsonException or KeyNotFoundException)
+            {
+                ctx.Log($"[OmniBlox] {gameId}: the baseline could not be generated: {ex}");
+                ctx.Event(EventLevel.Warning, "build.scaffold", "The baseline world could not be generated: " + ex.Message, gameId);
+            }
+        }
+
         private async Task LaunchStepAsync(string gameId, CancellationToken ct)
         {
             (LaunchResult result, string message) outcome;
@@ -253,6 +278,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 outcome = (LaunchResult.Failed, ex.Message);
             }
             var game = ctx.Game(gameId)!;
+            if (outcome.result != LaunchResult.Failed && game.Publish.LaunchFailures > 0) ctx.Update(gameId, g => g.Publish.LaunchFailures = 0);
             switch (outcome.result)
             {
                 case LaunchResult.Done:
@@ -273,14 +299,27 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     Enter(gameId, GameStage.Build, outcome.message);
                     break;
                 default:
-                    ctx.Update(gameId, g =>
                     {
-                        g.Publish.LastLaunchError = outcome.message;
-                        g.StageFailures[GameStage.Launch] = g.StageFailures.GetValueOrDefault(GameStage.Launch) + 1;
-                        g.NextAttemptUtc = ctx.Clock() + ErrorBackoff;
-                    });
-                    ctx.Event(EventLevel.Error, "launch.failed", "Launch step failed: " + outcome.message, gameId);
-                    break;
+                        // Each failure in a row waits twice as long (5 min, 10, 20… up to 6 h), and after a few the
+                        // owner is asked: the first studio hammered one refused request every five minutes for hours.
+                        int failures = game.Publish.LaunchFailures + 1;
+                        var wait = TimeSpan.FromMinutes(Math.Min(360, ErrorBackoff.TotalMinutes * Math.Pow(2, failures - 1)));
+                        ctx.Update(gameId, g =>
+                        {
+                            g.Publish.LastLaunchError = outcome.message;
+                            g.Publish.LaunchFailures = failures;
+                            g.StageFailures[GameStage.Launch] = g.StageFailures.GetValueOrDefault(GameStage.Launch) + 1;
+                            g.NextAttemptUtc = ctx.Clock() + wait;
+                        });
+                        ctx.Event(EventLevel.Error, "launch.failed", $"Launch step failed ({failures} in a row; next try in {wait.TotalMinutes:0} min): " + outcome.message, gameId);
+                        if (failures == 4)
+                        {
+                            ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.Escalation, "launchfail:" + gameId, $"The launch of \"{game.DisplayTitle}\" keeps failing",
+                                $"The step \"{game.Publish.LastLaunchStep}\" failed {failures} times in a row: {outcome.message}\nThe studio keeps retrying, more slowly each time. Fix what the error points at (often an API key permission) and Resume the game.", gameId, ctx.Clock()));
+                            await ctx.Alert($"OmniBlox: the launch of \"{game.DisplayTitle}\" keeps failing at \"{game.Publish.LastLaunchStep}\": {outcome.message}");
+                        }
+                        break;
+                    }
             }
         }
 
@@ -403,11 +442,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     ws.EnsureCreated(new GameManifest
                     {
                         Title = brief.Title,
-                        Template = brief.Template,
+                        Template = GameScaffold.TemplateFor(brief, new GameManifest()),
                         TemplateSettings = new Dictionary<string, object>(),
                     });
                     ctx.Harvester.RequestAssets(brief.AssetNeeds);
                 }
+                TryScaffold(gameId);
             }
             ctx.Store.Mutate(s =>
             {
@@ -419,11 +459,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     if (g.Milestones.Count == 0)
                         g.Milestones = new List<Milestone>
                         {
-                            new() { MilestoneId = "m1", Title = "Game design: the core loop, progression and economy numbers, the map plan and the first minute" },
-                            new() { MilestoneId = "m2", Title = "The world: terrain, zones, landmarks, paths and dressing — big, full and readable from the spawn" },
-                            new() { MilestoneId = "m3", Title = "Core loop playable end to end, with its own specs passing in run_tests" },
-                            new() { MilestoneId = "m4", Title = "Every must-have from the brief built, with progression and its UI" },
-                            new() { MilestoneId = "m5", Title = "Polish: onboarding, juice (effects, sounds, feedback), balance, every test green" },
+                            new() { MilestoneId = "m1", Title = "Know the baseline: read design.md, look at the renders (spawn, aerial, every zone), map_report and the economy timeline; write in design.md what will make this game special" },
+                            new() { MilestoneId = "m2", Title = "The world: tune the world spec (zone names and biomes, the models, density, lighting) with design_world until every render looks great and the map scores 85+" },
+                            new() { MilestoneId = "m3", Title = "The loop for this brief: the template configured (tool, items, tiers, prices with balance_economy); custom systems only for what the template lacks, each with specs; run_tests green" },
+                            new() { MilestoneId = "m4", Title = "Every must-have from the brief built, with its UI and quests" },
+                            new() { MilestoneId = "m5", Title = "Polish: the tutorial quests, juice (effects, sounds, music), theme colours, and every test green on the final build" },
                         };
                     if (string.IsNullOrEmpty(g.TelemetrySecret)) g.TelemetrySecret = StudioContext.NewSecret();
                 }
@@ -548,7 +588,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 // A game waiting on the owner gets looked at again as soon as its task is done.
                 foreach (var g in s.Games.Values.Where(g => g.WaitingReason != null && !g.Paused))
                 {
-                    bool stillBlocked = s.Studio.OwnerTasks.Any(t => t.Status == OwnerTaskStatus.Open && (t.GameId == g.GameId && t.Kind is OwnerTaskKind.LaunchApproval or OwnerTaskKind.Escalation || t.GameId == null && t.Kind is OwnerTaskKind.ApiKey or OwnerTaskKind.ExperienceSlot));
+                    bool stillBlocked = s.Studio.OwnerTasks.Any(t => t.Status == OwnerTaskStatus.Open && (t.GameId == g.GameId && t.Kind is OwnerTaskKind.LaunchApproval or OwnerTaskKind.BuildSignoff or OwnerTaskKind.Escalation || t.GameId == null && t.Kind is OwnerTaskKind.ApiKey or OwnerTaskKind.ExperienceSlot));
                     if (!stillBlocked && g.NextAttemptUtc > now)
                     {
                         g.NextAttemptUtc = now;

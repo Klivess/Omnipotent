@@ -96,6 +96,7 @@ namespace Omnipotent.Services.OmniBlox
                 ("/omniblox/games/playtest", PlaytestGame, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/playtest/follow", PlaytestFollow, post, OmniBloxPerms.StudioAct),
                 ("/omniblox/games/approve", ApproveLaunch, post, OmniBloxPerms.StudioManage),
+                ("/omniblox/games/reject", RejectLaunch, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/games/abandon", AbandonGame, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/games/revive", ReviveGame, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/studio/toggle", Toggle, post, OmniBloxPerms.StudioManage),
@@ -409,8 +410,8 @@ namespace Omnipotent.Services.OmniBlox
             string action = (string?)body["action"] ?? "done";
             if (action is not ("done" or "dismiss")) throw Bad("action must be 'done' or 'dismiss'.");
             var kind = Ctx.Store.Read(s => s.Studio.OwnerTasks.FirstOrDefault(t => t.TaskId == id)?.Kind) ?? throw NotFound("No such task.");
-            // Going public is studio.manage (games/approve); this route only needs studio.act.
-            if (kind == OwnerTaskKind.LaunchApproval) throw Bad("Approve the launch (or abandon the game) from the game itself.");
+            // The launch gates are studio.manage (games/approve, games/reject); this route only needs studio.act.
+            if (kind is OwnerTaskKind.LaunchApproval or OwnerTaskKind.BuildSignoff) throw Bad("Approve it (or request changes) from the game itself.");
             OwnerTask? task = null;
             Ctx.Store.Mutate(s =>
             {
@@ -430,21 +431,40 @@ namespace Omnipotent.Services.OmniBlox
             await Respond(req, new { ok = true });
         }
 
+        /// <summary>
+        /// The owner passes a launch gate: { gameId, gate: "build" | "launch", note? }. Without a gate, the one the game
+        /// is waiting at. Approves exactly the revision (and, for the launch, the store page and products) it has now.
+        /// </summary>
         private async Task ApproveLaunch(UserRequest req)
         {
-            string id = Required(Body(req), "gameId");
+            var body = Body(req);
+            string id = Required(body, "gameId");
             var game = RequireGame(id);
-            if (game.Stage != GameStage.Launch) throw Bad("This game is not waiting to launch.");
-            Ctx.Store.Mutate(s =>
-            {
-                var g = s.Game(id)!;
-                g.Publish.LaunchApprovedUtc = DateTime.UtcNow;
-                g.NextAttemptUtc = DateTime.UtcNow;
-                s.ResolveOwnerTasks("approve:" + id, DateTime.UtcNow);
-                s.Touch(g, DateTime.UtcNow);
-                s.AddEvent(EventLevel.Success, "owner.approved", $"Launch of \"{g.DisplayTitle}\" approved.", id);
-            });
-            await Respond(req, new { ok = true });
+            if (game.Stage != GameStage.Launch) throw Bad("This game is not waiting at a launch gate.");
+            string gate = ((string?)body["gate"])?.Trim().ToLowerInvariant() is { Length: > 0 } g ? g : Approvals.SignoffNeeded(Ctx, game) ? Approvals.BuildGate : Approvals.LaunchGate;
+            if (gate is not (Approvals.BuildGate or Approvals.LaunchGate)) throw Bad("gate must be 'build' or 'launch'.");
+            if (gate == Approvals.LaunchGate && Approvals.SignoffNeeded(Ctx, game)) throw Bad($"Sign off the build (r{game.Build.Revision}) first: play it, then approve the build.");
+            if (gate == Approvals.LaunchGate && !StageGates.MarketingReady(game)) throw Bad("The store page, icon, thumbnails and compliance check are not ready yet; the launch can be approved once they are.");
+            try { Approvals.Approve(Ctx, id, gate, Clip((string?)body["note"] ?? "", 1000)); }
+            catch (InvalidOperationException ex) { throw Bad(ex.Message); }
+            await Respond(req, new { ok = true, gate });
+        }
+
+        /// <summary>
+        /// The owner asks for changes at a gate: { gameId, gate, note, backToBuild? }. The note becomes a direction for
+        /// the agents; the build gate (or backToBuild) sends the game back to Build, the launch gate to marketing.
+        /// </summary>
+        private async Task RejectLaunch(UserRequest req)
+        {
+            var body = Body(req);
+            string id = Required(body, "gameId");
+            var game = RequireGame(id);
+            string gate = ((string?)body["gate"])?.Trim().ToLowerInvariant() is { Length: > 0 } g ? g : Approvals.SignoffNeeded(Ctx, game) ? Approvals.BuildGate : Approvals.LaunchGate;
+            if (gate is not (Approvals.BuildGate or Approvals.LaunchGate)) throw Bad("gate must be 'build' or 'launch'.");
+            string note = Clip(Required(body, "note"), 2000);
+            try { Approvals.RequestChanges(Ctx, service.Orchestrator, id, gate, note, (bool?)body["backToBuild"] ?? false); }
+            catch (Exception ex) when (ex is InvalidOperationException or ArgumentException) { throw Bad(ex.Message); }
+            await Respond(req, new { ok = true, gate });
         }
 
         private async Task NewGame(UserRequest req)
@@ -557,16 +577,19 @@ namespace Omnipotent.Services.OmniBlox
         }
 
         /// <summary>
-        /// Runs the game in Roblox's engine now, in the background (about a minute); the result lands in the game's
-        /// Build.LastEngineRun and its event log.
+        /// Runs the game in Roblox's engine now — or in the studio's local engine while there is no API key or slot —
+        /// in the background (about a minute); the result lands in the game's Build.LastEngineRun and its event log.
         /// </summary>
         private async Task TestGame(UserRequest req)
         {
             string id = Required(Body(req), "gameId");
             var game = RequireGame(id);
             if (!Ctx.Workspace(id).Exists) throw NotFound("This game has no files yet.");
-            if (!Ctx.Cloud.HasKey) throw new RouteException(HttpStatusCode.Conflict, "Engine tests need the Roblox API key (OmniSetting OmniBlox_RobloxApiKey).");
-            if (game.Slot == null && !Slots.AnyFree(Ctx)) throw new RouteException(HttpStatusCode.Conflict, "Engine tests need an experience slot, and every slot is taken.");
+            bool local = !StageGates.EngineAvailable(Ctx, game);
+            if (local && !StageGates.LocalEngineStandsIn(Ctx, game))
+                throw new RouteException(HttpStatusCode.Conflict, Ctx.Cloud.HasKey
+                    ? "Engine tests need an experience slot, and every slot is taken."
+                    : "Engine tests need the Roblox API key (OmniSetting OmniBlox_RobloxApiKey).");
             if (Pipeline.Tools.BuildTools.EngineRunning(id)) throw new RouteException(HttpStatusCode.Conflict, "An engine test run is already going for this game.");
             var ctx = Ctx;
             _ = Task.Run(async () =>
@@ -582,7 +605,7 @@ namespace Omnipotent.Services.OmniBlox
                     ctx.Log("[OmniBlox] owner engine test for " + id + " failed: " + ex);
                 }
             });
-            await Respond(req, new { ok = true, started = true });
+            await Respond(req, new { ok = true, started = true, local });
         }
 
         private async Task ReviveGame(UserRequest req)
@@ -721,5 +744,7 @@ namespace Omnipotent.Services.OmniBlox
                 });
             await Respond(req, new { ok = true, kept });
         }
+
+        private static string Clip(string s, int max) => s.Length <= max ? s : s[..max];
     }
 }

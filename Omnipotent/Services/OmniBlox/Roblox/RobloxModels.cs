@@ -170,6 +170,8 @@ namespace Omnipotent.Services.OmniBlox.Roblox
         public int PriceRobux { get; set; }
         public bool IsForSale { get; set; } = true;
         public byte[]? ImagePng { get; set; }
+        /// <summary>Send only whether it is for sale (taking an old product off sale without re-sending its text).</summary>
+        public bool OnlySaleState { get; set; }
     }
 
     public enum LuauTaskState { Unspecified, Queued, Processing, Cancelled, Complete, Failed }

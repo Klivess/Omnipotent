@@ -39,9 +39,25 @@ namespace Omnipotent.Services.Omniscience.Replica
         public string Apply(string personId, string draft)
         {
             if (string.IsNullOrWhiteSpace(draft)) return draft;
-            var fp = GetFingerprint(personId);
-            if (fp.SampleSize < 50) return draft; // not enough data to enforce anything
+            return ApplyCore(GetFingerprint(personId), draft);
+        }
 
+        /// <summary>Applies the exact era/facet fingerprint measured for this turn.</summary>
+        public string Apply(ReplicaStyleProfile temporal, string draft)
+        {
+            if (string.IsNullOrWhiteSpace(draft)) return draft;
+            return ApplyCore(new StyleFingerprint
+            {
+                SampleSize = temporal.SampleSize,
+                LowercaseStartRate = temporal.LowercaseStartRate,
+                TerminalPeriodRate = temporal.TerminalPeriodRate,
+                DominantLaughFamily = temporal.DominantLaughFamily,
+            }, draft);
+        }
+
+        private static string ApplyCore(StyleFingerprint fp, string draft)
+        {
+            if (fp.SampleSize < 50) return draft; // not enough data to enforce anything
             string text = draft.Trim();
 
             // Casing: if they almost never start with a capital, neither does the replica.

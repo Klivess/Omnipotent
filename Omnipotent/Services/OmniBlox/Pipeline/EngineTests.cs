@@ -103,7 +103,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         private static readonly Regex ScriptLine = new(@"(?<name>[A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)+):(?<line>\d+):", RegexOptions.Compiled);
 
         /// <summary>Finds the game file and line an engine error points at ("ServerScriptService.Forest:150: …").</summary>
-        private static EngineError Locate(EngineError error, CompileResult? compiled)
+        internal static EngineError Locate(EngineError error, CompileResult? compiled)
         {
             if (compiled == null) return error;
             foreach (Match m in ScriptLine.Matches(error.Message + "\n" + (error.Trace ?? "")))
@@ -127,6 +127,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         {
             var sb = new System.Text.StringBuilder();
             sb.AppendLine($"Engine tests on r{run.Revision}" + (run.Version is long v ? $" (place version {v})" : "") + $": {(run.Ok ? "PASSED" : "FAILED")} — {run.Summary}");
+            if (run.Local)
+                sb.AppendLine("(In the studio's local engine, a stand-in for Roblox's with no physics, replication or clients, used until the Roblox API key and an experience slot exist. Roblox's engine runs the game again before launch.)");
             foreach (var r in run.Results.Where(r => !r.Ok))
                 sb.AppendLine($"- FAIL [{r.Phase}/{r.Owner}] {r.Name}: {r.Detail}");
             foreach (var e in run.Errors)
@@ -137,7 +139,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             if (maxPassed > 0)
                 foreach (var r in run.Results.Where(r => r.Ok).Take(maxPassed)) sb.AppendLine($"- ok {r.Name}" + (r.Skipped ? $" (did not apply: {r.Detail})" : ""));
             if (run.KitFailed)
-                sb.AppendLine("The kit's own control checks failed before any game code was loaded: that is a bug in the studio's Game Kit, not in this game. It has been reported; work on everything else.");
+                sb.AppendLine(run.Local
+                    ? "The kit's own control checks failed in the local engine before any game code was loaded: that is a bug in the studio's Game Kit or in the local engine, not in this game. It has been reported; work on everything else."
+                    : "The kit's own control checks failed before any game code was loaded: that is a bug in the studio's Game Kit, not in this game. It has been reported; work on everything else.");
             return sb.ToString();
         }
     }

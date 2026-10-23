@@ -151,7 +151,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
         {
             why = null;
             if (path.Equals("game.json", StringComparison.OrdinalIgnoreCase)) { why = "edit game.json with update_manifest"; return false; }
-            if (path.Equals("scene.json", StringComparison.OrdinalIgnoreCase)) { why = "change the world with the scene tools (add_objects, place_asset, terrain_*, plan_map…)"; return false; }
+            if (path.Equals("scene.json", StringComparison.OrdinalIgnoreCase)) { why = "change the world with the world tools (design_world, place_asset, scatter_assets, add_objects, update_objects, terrain_sculpt…)"; return false; }
             if (path.StartsWith("src/", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".md", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) return true;
             why = "scripts live under src/ (server/, server/systems/, client/, client/controllers/, shared/, character/, gui/ or tests/); notes go in design.md";
             return false;

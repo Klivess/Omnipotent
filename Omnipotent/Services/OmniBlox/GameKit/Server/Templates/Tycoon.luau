@@ -113,6 +113,31 @@ local function unlock(plot: Plot, name: string)
 	refreshButtons(plot)
 end
 
+-- Every label on the plot's owner sign (a two-sided sign has two).
+local function setSign(plot: Plot, text: string)
+	local sign = plot.root:FindFirstChild("OwnerSign", true)
+	if sign then
+		for _, d in ipairs(sign:GetDescendants()) do
+			if d:IsA("TextLabel") then
+				d.Text = text
+			end
+		end
+	end
+end
+
+-- Puts a player's character at their plot's entrance (a part named PlotSpawn), facing into the plot.
+local function sendHome(player: Player, plot: Plot)
+	task.spawn(function()
+		local character = player.Character or player.CharacterAdded:Wait()
+		local root = character:WaitForChild("HumanoidRootPart", 10)
+		local spot = plot.root:FindFirstChild("PlotSpawn", true)
+		if root and root:IsA("BasePart") and spot and spot:IsA("BasePart") then
+			task.wait(0.2)
+			root.CFrame = spot.CFrame + Vector3.new(0, 3, 0)
+		end
+	end)
+end
+
 local function reset(plot: Plot)
 	for _, item in ipairs(plot.items:GetChildren()) do
 		item.Parent = plot.stash
@@ -122,6 +147,7 @@ local function reset(plot: Plot)
 	plot.income = 0
 	table.clear(plot.owned)
 	refreshButtons(plot)
+	setSign(plot, "Free plot — walk in!")
 end
 
 -- Buys a button for its plot's owner. Exposed for tests.
@@ -183,12 +209,10 @@ function Tycoon.Claim(player: any): Plot?
 				end
 			end
 			refreshButtons(plot)
-			local sign = plot.root:FindFirstChild("OwnerSign", true)
-			if sign and Util.IsRealPlayer(player) then
-				local label = sign:FindFirstChildWhichIsA("TextLabel", true)
-				if label then
-					label.Text = player.DisplayName .. "'s Tycoon"
-				end
+			if Util.IsRealPlayer(player) then
+				setSign(plot, player.DisplayName .. "'s Tycoon")
+				sendHome(player, plot)
+				Shop.Notify(player, "🏠 This is your tycoon — step on the green button to start!", "reward")
 			end
 			return plot
 		end
@@ -312,6 +336,15 @@ function Tycoon.Start()
 		end
 	end)
 	Players.PlayerRemoving:Connect(Tycoon.Release)
+	-- Owners respawn at their own plot.
+	Players.PlayerAdded:Connect(function(player)
+		player.CharacterAdded:Connect(function()
+			local plot = byOwner[player.UserId]
+			if plot then
+				sendHome(player, plot)
+			end
+		end)
+	end)
 
 	-- Income every second, cosmetic drops every two.
 	task.spawn(function()

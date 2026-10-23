@@ -161,7 +161,9 @@ binary telemetry, tracking device state and storing firmware.
 [`KliveTechStreamProtocol`](Omnipotent/Services/KliveTechHub/KliveTechStreamProtocol.cs))
 
 Omniscience runs locally, importing linked data and producing aggregate behavioural statistics and
-deductions. Public screenshots hide people and source data.
+deductions. Its v2 investigation workspace adds temporal analysis, evidence exports and a clearly
+labelled, era-aware Replica engine. [Architecture and feature guide →](Docs/omniscience.md)
+Public screenshots hide people and source data.
 
 ## Screenshots
 

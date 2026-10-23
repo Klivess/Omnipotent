@@ -72,7 +72,9 @@ namespace Omnipotent.Services.Omniscience.Ingest
                     cmd.ExecuteNonQuery();
                 }
 
-                // 5. Insert message.
+                // 5. Insert message and update its O(1) directory summaries atomically.
+                long sentAt = new DateTimeOffset(msg.SentAt).ToUnixTimeMilliseconds();
+                long capturedAt = new DateTimeOffset(now).ToUnixTimeMilliseconds();
                 using (var cmd = conn.CreateCommand())
                 {
                     cmd.Transaction = tx;
@@ -85,15 +87,16 @@ namespace Omnipotent.Services.Omniscience.Ingest
                     cmd.Parameters.AddWithValue("$pmid", msg.PlatformMessageId);
                     cmd.Parameters.AddWithValue("$c", conversationId);
                     cmd.Parameters.AddWithValue("$a", authorIdentityId);
-                    cmd.Parameters.AddWithValue("$sent", new DateTimeOffset(msg.SentAt).ToUnixTimeMilliseconds());
+                    cmd.Parameters.AddWithValue("$sent", sentAt);
                     cmd.Parameters.AddWithValue("$edit", msg.EditedAt.HasValue ? new DateTimeOffset(msg.EditedAt.Value).ToUnixTimeMilliseconds() : (object)DBNull.Value);
                     cmd.Parameters.AddWithValue("$content", (object?)msg.Content ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("$reply", msg.ReplyToPlatformMessageId == null ? (object)DBNull.Value : (msg.Platform + ":" + msg.ReplyToPlatformMessageId));
                     cmd.Parameters.AddWithValue("$lang", DBNull.Value); // filled by analytics module later
                     cmd.Parameters.AddWithValue("$raw", (object?)msg.RawJson ?? DBNull.Value);
-                    cmd.Parameters.AddWithValue("$cap", new DateTimeOffset(now).ToUnixTimeMilliseconds());
+                    cmd.Parameters.AddWithValue("$cap", capturedAt);
                     cmd.ExecuteNonQuery();
                 }
+                Analytics.ActivitySummaryStore.RecordMessage(conn, tx, authorIdentityId, conversationId, sentAt, capturedAt);
 
                 tx.Commit();
             }

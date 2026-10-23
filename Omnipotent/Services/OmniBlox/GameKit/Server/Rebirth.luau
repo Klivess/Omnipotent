@@ -11,6 +11,7 @@ local Data = require(script.Parent.Data)
 local Currency = require(script.Parent.Currency)
 local Analytics = require(script.Parent.Analytics)
 local Effects = require(script.Parent.Effects)
+local Quests = require(script.Parent.Quests)
 local Kit = game:GetService("ReplicatedStorage"):WaitForChild("OmniKit")
 local Net = require(Kit:WaitForChild("Net"))
 local Util = require(Kit:WaitForChild("Util"))
@@ -68,6 +69,7 @@ function Rebirth.Try(player: any): boolean
 	if root then
 		Effects.Burst(root.Position, Color3.fromRGB(255, 120, 255), 40)
 	end
+	Quests.Track(player, "rebirth", 1)
 	Rebirth.Done:Fire(player, profile.Rebirths)
 	return true
 end

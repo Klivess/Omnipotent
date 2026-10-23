@@ -47,6 +47,10 @@ namespace Omnipotent.Services.OmniBlox.Marketing
         private static readonly string[] Profanity = { "fuck", "shit", "bitch", "cunt", "nigg", "fagg", "retard", "whore", "slut", "dick" };
 
         private static readonly string[] RandomItemWords = { "random", "mystery", "loot box", "lootbox", "gacha", "spin the wheel", "lucky crate", "crate", "egg hatch", "roll" };
+        /// <summary>Words that mean chance, whatever the product grants.</summary>
+        private static readonly string[] ChanceWords = { "random", "mystery", "loot box", "lootbox", "gacha", "spin the wheel", "lucky", "chance", "odds", "egg hatch" };
+        /// <summary>Grants that give exactly what they say.</summary>
+        private static readonly string[] FixedGrants = { "currency:", "multiplier:", "speed:", "flag:", "item:", "skipstage" };
 
         private static readonly Regex Url = new(@"(https?://|www\.|\.com\b|\.gg\b|\.net\b|discord\.gg|bit\.ly)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
         private static readonly Regex Email = new(@"[\w.+-]+@[\w-]+\.[\w.]+", RegexOptions.Compiled);
@@ -89,7 +93,10 @@ namespace Omnipotent.Services.OmniBlox.Marketing
                 if (p.PriceRobux < 1 || p.PriceRobux > 10_000) report.Errors.Add($"product \"{p.Name}\" costs {p.PriceRobux} Robux; keep prices between 1 and 10,000");
                 if (p.Kind == ProductKind.GamePass && p.PriceRobux > 2_500) report.Warnings.Add($"game pass \"{p.Name}\" at {p.PriceRobux} Robux is far above typical prices for young players");
                 string blob = (p.Name + " " + p.Description + " " + p.Grant).ToLowerInvariant();
-                if (RandomItemWords.Any(w => HasWord(blob, w)))
+                // A container word ("crate", "chest") on a fixed grant (500 coins, a pass) is a bundle, not a lottery;
+                // words of chance are random whatever the grant.
+                bool fixedGrant = FixedGrants.Any(g => (p.Grant ?? "").Trim().StartsWith(g, StringComparison.OrdinalIgnoreCase));
+                if (ChanceWords.Any(w => HasWord(blob, w)) || !fixedGrant && RandomItemWords.Any(w => HasWord(blob, w)))
                     report.Errors.Add($"product \"{p.Name}\" looks like a paid random item; those need published odds and age gating — sell a specific item instead");
                 if (string.IsNullOrWhiteSpace(p.Description)) report.Warnings.Add($"product \"{p.Name}\" has no description of what the player gets");
             }

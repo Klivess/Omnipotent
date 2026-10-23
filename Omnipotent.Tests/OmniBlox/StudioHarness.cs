@@ -311,7 +311,8 @@ namespace Omnipotent.Tests.OmniBlox
         public Orchestrator Orchestrator { get; }
         public AssetHarvester Harvester { get; }
 
-        public StudioHarness(bool apiKey = true, bool requireApproval = false)
+        /// <param name="localEngine">The studio's local engine (none unless given, as in a studio that cannot run one).</param>
+        public StudioHarness(bool apiKey = true, bool requireApproval = false, ILocalEngine? localEngine = null)
         {
             ResearchTools.ClearChartCache();
             var analysis = AssetAnalysisTests.SampleTree();
@@ -329,6 +330,7 @@ namespace Omnipotent.Tests.OmniBlox
                 CreatorUserId = 42,
                 Slots = { new ExperienceSlot { UniverseId = 1001, PlaceId = 2002 } },
                 RequireLaunchApproval = requireApproval,
+                RequireBuildSignoff = requireApproval,
                 HarvesterEnabled = true,
             };
             var store = new OmniBloxStore(Path.Combine(dir.Path, "studio"));
@@ -357,6 +359,7 @@ namespace Omnipotent.Tests.OmniBlox
                 Clock = clock,
                 Log = _ => { },
                 Settings = settings,
+                LocalEngine = localEngine,
             };
             Orchestrator = new Orchestrator(Ctx);
         }

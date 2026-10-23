@@ -237,6 +237,25 @@ if #products > 0 then
 	end)
 end
 
+-- ─────────────────────────────── panels the world's stands open ───────────────────────────────
+
+local panels: { [string]: () -> () } = {}
+panels.shop = function()
+	if shopModal then
+		shopModal.Visible = true
+	else
+		UI.Toast(root, "The shop opens soon!", "info")
+	end
+end
+task.spawn(function()
+	Net.Event("OpenPanel").OnClientEvent:Connect(function(name)
+		local open = if type(name) == "string" then panels[name] else nil
+		if open then
+			open()
+		end
+	end)
+end)
+
 -- ─────────────────────────────── template widgets ───────────────────────────────
 
 local top = UI.ProgressBar(root, UDim2.fromOffset(420, 46), UDim2.new(0.5, 0, 0, 20), Theme.Accent, Vector2.new(0.5, 0))
@@ -285,13 +304,30 @@ elseif template == "tycoon" then
 elseif template == "simulator" then
 	top.Frame.Visible = true
 	top.Set(0, "🎒 0 / 0")
+	local verb = "Chop"
+	local toolIcon = "🪓"
+	local actionButton: TextButton? = nil
+	local function label(): string
+		return toolIcon .. " " .. string.upper(verb)
+	end
 	Net.Event("SimState").OnClientEvent:Connect(function(state)
-		if type(state) == "table" then
-			local capacity = math.max(1, tonumber(state.capacity) or 1)
-			local bag = tonumber(state.bag) or 0
-			top.Set(bag / capacity, string.format("🎒 %s / %s%s", Util.Format(bag), Util.Format(capacity), if bag >= capacity then "  FULL — SELL!" else ""))
+		if type(state) ~= "table" then
+			return
+		end
+		local capacity = math.max(1, tonumber(state.capacity) or 1)
+		local bag = tonumber(state.bag) or 0
+		top.Set(bag / capacity, string.format("🎒 %s / %s%s", Util.Format(bag), Util.Format(capacity), if bag >= capacity then "  FULL — SELL!" else ""))
+		if type(state.verb) == "string" then
+			verb = state.verb
+		end
+		if type(state.tool) == "table" and type(state.tool.icon) == "string" then
+			toolIcon = state.tool.icon
+		end
+		if actionButton then
+			actionButton.Text = label()
 		end
 	end)
+
 	local modal, list = UI.Modal(root, "Upgrades", "⬆️")
 	local function build()
 		for _, child in ipairs(list:GetChildren()) do
@@ -305,8 +341,25 @@ elseif template == "simulator" then
 		if not ok or type(info) ~= "table" then
 			return
 		end
-		for index, upgrade in ipairs(info.upgrades or {}) do
-			local card = UI.Card(list, string.format("%s  (level %d/%d)", upgrade.name, upgrade.level, upgrade.max or upgrade.level), nil, upgrade.icon or "⬆️", index)
+		local order = 1
+		local current = if type(info.tool) == "table" then info.tool else {}
+		if type(info.nextTool) == "table" then
+			local nextTool = info.nextTool
+			local card = UI.Card(list, tostring(nextTool.icon or "🪓") .. " " .. tostring(nextTool.name), string.format("%s power %s → %s", tostring(info.verb or "Chop"), tostring(current.power or 1), tostring(nextTool.power)), "⚒️", order)
+			local button = UI.Button(card, Util.Format(tonumber(nextTool.price) or 0) .. " " .. currencyIcon, UDim2.fromOffset(170, 56), UDim2.new(1, -184, 0.5, -28), Theme.Gold, function()
+				Net.Event("BuyUpgrade"):FireServer("tool")
+				task.wait(0.4)
+				build()
+			end)
+			button.ZIndex = 25
+		elseif current.name then
+			local card = UI.Card(list, tostring(current.icon or "🪓") .. " " .. tostring(current.name), "The best there is!", "⚒️", order)
+			local button = UI.Button(card, "MAX", UDim2.fromOffset(170, 56), UDim2.new(1, -184, 0.5, -28), Theme.Good)
+			button.ZIndex = 25
+		end
+		for _, upgrade in ipairs(info.upgrades or {}) do
+			order += 1
+			local card = UI.Card(list, string.format("%s  (level %d/%d)", upgrade.name, upgrade.level, upgrade.max or upgrade.level), nil, upgrade.icon or "⬆️", order)
 			local text = if upgrade.next then (Util.Format(upgrade.next) .. " " .. currencyIcon) else "MAX"
 			local button = UI.Button(card, text, UDim2.fromOffset(170, 56), UDim2.new(1, -184, 0.5, -28), if upgrade.next then Theme.Accent else Theme.Good, function()
 				if upgrade.next then
@@ -318,9 +371,148 @@ elseif template == "simulator" then
 			button.ZIndex = 25
 		end
 	end
-	addMenuButton("⬆️", "Upgrades", Theme.Accent, function()
+	panels.upgrades = function()
 		build()
 		modal.Visible = true
+	end
+	addMenuButton("⬆️", "Upgrades", Theme.Accent, panels.upgrades)
+
+	-- The action button: a big thumb-sized button that swings the tool at the nearest node in reach.
+	local function swing()
+		local character = player.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+		if not character or not humanoid then
+			return
+		end
+		local tool = character:FindFirstChildOfClass("Tool")
+		if not tool then
+			local backpack = player:FindFirstChildOfClass("Backpack")
+			local stowed = backpack and backpack:FindFirstChildOfClass("Tool")
+			if stowed then
+				humanoid:EquipTool(stowed)
+				tool = stowed
+			end
+		end
+		if tool then
+			tool:Activate()
+		else
+			Net.Event("Harvest"):FireServer(nil)
+		end
+	end
+	local button = UI.Button(root, label(), UDim2.fromOffset(200, 104), UDim2.new(1, -24, 1, -160), Theme.Good, swing)
+	button.AnchorPoint = Vector2.new(1, 1)
+	button.TextSize = 34
+	actionButton = button
+
+	-- Health bars over nodes being hit, and a little wobble on every hit.
+	local function adornee(node: Instance): BasePart?
+		if node:IsA("BasePart") then
+			return node
+		end
+		if node:IsA("Model") and node.PrimaryPart then
+			return node.PrimaryPart
+		end
+		return node:FindFirstChildWhichIsA("BasePart", true)
+	end
+	local function heightOf(node: Instance): number
+		if node:IsA("Model") then
+			local _, size = node:GetBoundingBox()
+			return size.Y
+		elseif node:IsA("BasePart") then
+			return node.Size.Y
+		end
+		return 6
+	end
+	type Bar = { gui: BillboardGui, fill: Frame, shown: number }
+	local bars: { [Instance]: Bar } = {}
+	local function showBar(node: Instance)
+		local hp = tonumber(node:GetAttribute("Hp")) or 0
+		local max = math.max(1, tonumber(node:GetAttribute("MaxHp")) or 1)
+		local entry = bars[node]
+		if not entry then
+			local part = adornee(node)
+			if not part then
+				return
+			end
+			local gui = Instance.new("BillboardGui")
+			gui.Name = "OmniNodeHealth"
+			gui.Size = UDim2.fromOffset(120, 18)
+			gui.AlwaysOnTop = true
+			gui.LightInfluence = 0
+			gui.MaxDistance = 80
+			gui.Adornee = part
+			gui.StudsOffsetWorldSpace = Vector3.new(0, heightOf(node) * 0.55 + 2, 0)
+			gui.Parent = root
+			local back = Instance.new("Frame")
+			back.Size = UDim2.fromScale(1, 1)
+			back.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
+			back.BorderSizePixel = 0
+			back.Parent = gui
+			UI.Corner(back, 8)
+			local fill = Instance.new("Frame")
+			fill.Size = UDim2.fromScale(1, 1)
+			fill.BackgroundColor3 = Theme.Good
+			fill.BorderSizePixel = 0
+			fill.Parent = back
+			UI.Corner(fill, 8)
+			entry = { gui = gui, fill = fill, shown = 0 }
+			bars[node] = entry
+		end
+		local e = entry :: Bar
+		e.fill.Size = UDim2.fromScale(math.clamp(hp / max, 0, 1), 1)
+		e.gui.Enabled = hp > 0 and hp < max and node:GetAttribute("Alive") ~= false
+		local stamp = os.clock()
+		e.shown = stamp
+		task.delay(3, function()
+			if e.shown == stamp then
+				e.gui.Enabled = false
+			end
+		end)
+	end
+	local function watch(node: Instance)
+		node:GetAttributeChangedSignal("Hp"):Connect(function()
+			showBar(node)
+		end)
+	end
+	for _, node in ipairs(CollectionService:GetTagged("Resource")) do
+		watch(node)
+	end
+	CollectionService:GetInstanceAddedSignal("Resource"):Connect(watch)
+	local wobbling: { [Instance]: boolean } = {}
+	local function wobble(node: Instance)
+		if wobbling[node] or not node:IsA("PVInstance") then
+			return
+		end
+		wobbling[node] = true
+		task.spawn(function()
+			local pv = node :: PVInstance
+			local pivot = pv:GetPivot()
+			local bottom = pivot.Position
+			if node:IsA("Model") then
+				local cf, size = node:GetBoundingBox()
+				bottom = cf.Position - Vector3.new(0, size.Y / 2, 0)
+			end
+			local origin = CFrame.new(bottom)
+			local relative = origin:Inverse() * pivot
+			for i = 1, 6 do
+				local angle = math.rad(5) * (if i % 2 == 0 then -1 else 1) * (1 - i / 7)
+				pv:PivotTo(origin * CFrame.Angles(angle, 0, angle * 0.6) * relative)
+				task.wait(0.03)
+			end
+			pv:PivotTo(pivot)
+			wobbling[node] = nil
+		end)
+	end
+	task.spawn(function()
+		Net.Event("NodeHit").OnClientEvent:Connect(function(node)
+			if typeof(node) == "Instance" then
+				wobble(node)
+				local part = adornee(node)
+				if part then
+					burst(part.Position + Vector3.new(0, 2, 0), Color3.fromRGB(230, 200, 140), 6)
+				end
+			end
+		end)
 	end)
 end
 
@@ -352,10 +544,11 @@ if type(Config.Rebirth) == "table" and Config.Rebirth.Enabled ~= false and (tonu
 		end)
 		button.ZIndex = 25
 	end
-	addMenuButton("🌟", "Rebirth", Color3.fromRGB(190, 110, 255), function()
+	panels.rebirth = function()
 		build()
 		modal.Visible = true
-	end)
+	end
+	addMenuButton("🌟", "Rebirth", Color3.fromRGB(190, 110, 255), panels.rebirth)
 end
 
 -- ─────────────────────────────── quests and the guide line ───────────────────────────────
@@ -379,7 +572,10 @@ local function targetPart(name: string): BasePart?
 		local here = if character and character.PrimaryPart then character.PrimaryPart.Position else Vector3.zero
 		local best, bestDistance = nil, math.huge
 		for _, tagged in ipairs(CollectionService:GetTagged(name)) do
-			local p = if tagged:IsA("BasePart") then tagged elseif tagged:IsA("Model") then tagged.PrimaryPart else nil
+			local p = if tagged:IsA("BasePart") then tagged elseif tagged:IsA("Model") then (tagged.PrimaryPart or tagged:FindFirstChildWhichIsA("BasePart", true)) else nil
+			if p and (tagged:GetAttribute("Alive") == false or p.Transparency >= 1) then
+				p = nil -- a harvested node waiting to grow back is no target
+			end
 			if p then
 				local d = (p.Position - here).Magnitude
 				if d < bestDistance then

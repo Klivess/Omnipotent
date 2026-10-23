@@ -403,6 +403,11 @@ namespace Omnipotent.Services.OmniBlox.Build
             }
             foreach (var (objectId, info) in spriteObjects)
                 sprites.Add((info.Bottom, info.Height, info.Width, 0, info.Image, info.Center, info.Radius, objectId));
+            // Sign text, on the faces the game puts it on.
+            var signs = world.Scene.Objects.Where(o => o.Kind == SceneKinds.Text && !string.IsNullOrWhiteSpace(o.Text)).ToDictionary(o => o.Id, o => o, StringComparer.Ordinal);
+            foreach (var p in world.Parts)
+                if (p.Kind == SceneKinds.Text && signs.TryGetValue(p.ObjectId, out var sign))
+                    foreach (var face in SignFaces(p, sign)) opaque.Add(face);
 
             // Sun shadows.
             var shadow = BuildShadowMap(opaque, min, max, light.Sun, sprites);
@@ -435,6 +440,65 @@ namespace Omnipotent.Services.OmniBlox.Build
             using var image = surface.Snapshot();
             using var data = image.Encode(SKEncodedImageFormat.Png, 100);
             return data.ToArray();
+        }
+
+        // ─────────────────────────────── sign text ───────────────────────────────
+
+        private static readonly ConcurrentDictionary<(string Text, int W, int H), SpriteImage> signTextures = new();
+
+        /// <summary>The text of a sign as textured quads just off its front face (and its back for a two-sided sign), reading the right way round.</summary>
+        private static IEnumerable<Mesh> SignFaces(WorldPart part, SceneObject sign)
+        {
+            var size = part.Size;
+            if (size.X < 0.2f || size.Y < 0.2f) yield break;
+            int w = 512, h = Math.Clamp((int)(512 * size.Y / size.X), 48, 512);
+            var texture = signTextures.GetOrAdd((sign.Text!, w, h), key => TextTexture(key.Text, key.W, key.H));
+            if (signTextures.Count > 400) signTextures.Clear();
+            var c = V(part.CFrame.Position);
+            var right = V(part.CFrame.RightVector) * (size.X / 2 * 0.96f);
+            var up = V(part.CFrame.UpVector) * (size.Y / 2 * 0.92f);
+            var look = V(part.CFrame.LookVector);
+            foreach (bool back in sign.TwoSided == true ? new[] { false, true } : new[] { false })
+            {
+                var n = back ? -look : look;
+                var centre = c + n * (size.Z / 2 + 0.04f);
+                // Seen from the front, the board's RightVector points to the viewer's left; from behind, to their right.
+                var left = back ? -right : right;
+                var mesh = new Mesh { Texture = texture, CastsShadow = false };
+                Vertex Corner(Vector3 at, float u, float v) => new() { World = at, Normal = n, Color = Vector3.One, Uv = new Vector2(u, v) };
+                mesh.Quad(Corner(centre + left + up, 0, 0), Corner(centre - left + up, 1, 0), Corner(centre - left - up, 1, 1), Corner(centre + left - up, 0, 1));
+                yield return mesh;
+            }
+        }
+
+        /// <summary>White, outlined text filling a texture (emoji are left out: the renderer has no emoji font).</summary>
+        private static SpriteImage TextTexture(string text, int w, int h)
+        {
+            string clean = new string(text.Where(ch => ch < 0x2190 && !char.IsSurrogate(ch)).ToArray()).Trim();
+            if (clean.Length == 0) clean = text.Length > 0 ? "?" : "";
+            using var bitmap = new SKBitmap(new SKImageInfo(w, h, SKColorType.Rgba8888, SKAlphaType.Unpremul));
+            using (var canvas = new SKCanvas(bitmap))
+            {
+                canvas.Clear(SKColors.Transparent);
+                using var typeface = SKTypeface.FromFamilyName("Arial", SKFontStyle.Bold) ?? SKTypeface.Default;
+                float size = h * 0.72f;
+                using var font = new SKFont(typeface, size);
+                while (size > 8 && font.MeasureText(clean) > w * 0.92f) font.Size = size *= 0.92f;
+                using var stroke = new SKPaint { Color = new SKColor(20, 20, 30), IsAntialias = true, Style = SKPaintStyle.Stroke, StrokeWidth = MathF.Max(2, size * 0.12f) };
+                using var fill = new SKPaint { Color = SKColors.White, IsAntialias = true };
+                float baseline = h / 2f + size * 0.36f;
+                canvas.DrawText(clean, w / 2f, baseline, SKTextAlign.Center, font, stroke);
+                canvas.DrawText(clean, w / 2f, baseline, SKTextAlign.Center, font, fill);
+            }
+            var pixels = new byte[w * h * 4];
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                {
+                    var col = bitmap.GetPixel(x, y);
+                    int i = (y * w + x) * 4;
+                    pixels[i] = col.Red; pixels[i + 1] = col.Green; pixels[i + 2] = col.Blue; pixels[i + 3] = col.Alpha;
+                }
+            return new SpriteImage { Width = w, Height = h, Pixels = pixels, Opaque = (0, 0, w - 1, h - 1), Average = Vector3.One };
         }
 
         // ─────────────────────────────── views ───────────────────────────────
@@ -807,6 +871,14 @@ namespace Omnipotent.Services.OmniBlox.Build
                     var world = a.V.World * pw0 + b.V.World * pw1 + c.V.World * pw2;
                     var normal = smooth ? Vector3.Normalize(a.V.Normal * pw0 + b.V.Normal * pw1 + c.V.Normal * pw2) : a.V.Normal;
                     var albedo = a.V.Color * pw0 + b.V.Color * pw1 + c.V.Color * pw2;
+                    if (mesh.Texture != null)
+                    {
+                        // A textured face (a sign's text): see-through where the texture is.
+                        var uv = a.V.Uv * pw0 + b.V.Uv * pw1 + c.V.Uv * pw2;
+                        var tex = mesh.Texture.Sample(uv.X, uv.Y);
+                        if (tex.W < 0.5f) continue;
+                        albedo = new Vector3(tex.X, tex.Y, tex.Z);
+                    }
                     var color = Shade(albedo, normal, world, light, shadow, mesh.Emissive);
                     if (mesh.Alpha < 0.999f) color = Vector3.Lerp(frame.Color[idx], color, mesh.Alpha);
                     frame.Color[idx] = color;

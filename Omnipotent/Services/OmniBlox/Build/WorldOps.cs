@@ -31,6 +31,56 @@ namespace Omnipotent.Services.OmniBlox.Build
             return best ?? 0;
         }
 
+        /// <summary>
+        /// After the terrain changes (terrain_generate, terrain_sculpt), everything that stood on the old ground stands
+        /// on the new: library models are re-seated (the lowest ground under their contact footprint), parts and kit
+        /// props move by how much the ground moved under them, a prop as one piece. What was deliberately up in the
+        /// air (more than 1.5 studs above the old ground) stays where it is. Returns how many objects moved.
+        /// </summary>
+        public static int Reground(SceneDocument scene, TerrainMap? before, TerrainMap? after, Func<long, WorldGen.CatalogEntry?> catalog)
+        {
+            if (after == null) return 0;
+            float Old(float x, float z) => before != null && before.Covers(x, z) ? before.HeightAt(x, z) : GroundAt(scene, null, x, z);
+            float New(float x, float z) => after.Covers(x, z) ? after.HeightAt(x, z) : Old(x, z);
+            int moved = 0;
+            var groupShift = new Dictionary<string, float?>(StringComparer.Ordinal);
+            foreach (var o in scene.Objects)
+            {
+                float x = o.Position[0], z = o.Position[2];
+                if (o.Kind == SceneKinds.Asset && o.AssetId is long id)
+                {
+                    var e = catalog(id);
+                    float scale = o.Scale <= 0 ? 1 : o.Scale;
+                    float oldSeat = e != null ? WorldGen.Generation.SeatOn(Old, e, x, z, o.Yaw, scale).Y : Old(x, z) - 0.3f;
+                    if (MathF.Abs(o.Position[1] - oldSeat) > 1.5f && MathF.Abs(o.Position[1] - Old(x, z)) > 1.5f) continue;
+                    float y = e != null ? WorldGen.Generation.SeatOn(New, e, x, z, o.Yaw, scale).Y : New(x, z) - 0.3f;
+                    if (MathF.Abs(y - o.Position[1]) < 0.05f) continue;
+                    o.Position[1] = MathF.Round(y, 2);
+                    moved++;
+                    continue;
+                }
+                if (o.Group != null)
+                {
+                    // A prop moves as one, by the shift under its first piece (its own posts stay on its own base).
+                    if (!groupShift.TryGetValue(o.Group, out var shift))
+                    {
+                        float bottom = o.Position[1] - (o.Size is { Length: 3 } sz ? sz[1] / 2 : 0.5f);
+                        shift = bottom - Old(x, z) <= 1.5f ? New(x, z) - Old(x, z) : null;
+                        groupShift[o.Group] = shift;
+                    }
+                    if (shift is float d && MathF.Abs(d) >= 0.05f) { o.Position[1] = MathF.Round(o.Position[1] + d, 2); moved++; }
+                    continue;
+                }
+                float half = o.Size is { Length: 3 } s ? s[1] / 2 : 0.5f;
+                if (o.Position[1] - half - Old(x, z) > 1.5f) continue;
+                float delta = New(x, z) - Old(x, z);
+                if (MathF.Abs(delta) < 0.05f) continue;
+                o.Position[1] = MathF.Round(o.Position[1] + delta, 2);
+                moved++;
+            }
+            return moved;
+        }
+
         /// <summary>What every compiled object occupies on the ground (its bounding box as a circle).</summary>
         public static List<Footprint> Footprints(IReadOnlyList<WorldPart> parts, float ignoreBiggerThan = 60)
         {

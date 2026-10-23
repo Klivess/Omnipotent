@@ -21,6 +21,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         /// <summary>A private experience kept for the owner's playtests of any game at any stage (never a game's slot).</summary>
         public ExperienceSlot? PlaytestSlot { get; set; }
         public bool RequireLaunchApproval { get; set; } = true;
+        /// <summary>The owner plays and signs off each tested build before any marketing work starts.</summary>
+        public bool RequireBuildSignoff { get; set; } = true;
         public int MaxGamesInProduction { get; set; } = 1;
         public bool HarvesterEnabled { get; set; } = true;
         public string TelemetryBaseUrl { get; set; } = "https://klive.dev";
@@ -70,6 +72,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
         /// <summary>The Luau type checker (luau-lsp); null where the studio runs without it (unit tests).</summary>
         public LuauToolchain? Luau { get; init; }
+
+        /// <summary>The local engine (Lune), which runs the engine test while Roblox's cannot (no API key or slot); null where the studio runs without it.</summary>
+        public ILocalEngine? LocalEngine { get; init; }
 
         private readonly System.Collections.Concurrent.ConcurrentDictionary<long, (DateTime Stamp, SpriteImage? Image)> sprites = new();
 
@@ -132,6 +137,22 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
         public void Event(EventLevel level, string kind, string message, string? gameId = null) =>
             Store.Mutate(s => s.AddEvent(level, kind, message, gameId, Clock()));
+
+        private (long Version, Build.WorldGen.AssetCatalog Catalog)? catalog;
+        private readonly object catalogLock = new();
+
+        /// <summary>The library sorted by role, style and biome for the world generator and the map report (rebuilt when the library changes).</summary>
+        public Build.WorldGen.AssetCatalog Catalog()
+        {
+            long version = Library.Version;
+            lock (catalogLock)
+            {
+                if (catalog is { } c && c.Version == version) return c.Catalog;
+                var built = Build.WorldGen.AssetCatalog.FromRecords(Library.Labeled());
+                catalog = (version, built);
+                return built;
+            }
+        }
 
         /// <summary>How to stand a library asset on the ground, from its measurements and label.</summary>
         public AssetPlacement? AssetInfo(long assetId)

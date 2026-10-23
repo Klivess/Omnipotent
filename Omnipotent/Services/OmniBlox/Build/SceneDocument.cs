@@ -28,8 +28,14 @@ namespace Omnipotent.Services.OmniBlox.Build
         public Dictionary<string, FolderSpec> Folders { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>The map plan: zones, the paths between them and the landmarks a player navigates by.</summary>
         public LayoutPlan Layout { get; set; } = new();
+        /// <summary>The design the world was generated from (<see cref="WorldGen.WorldGenerator"/>); null for a hand-built world.</summary>
+        public WorldGen.WorldSpec? Spec { get; set; }
 
         public SceneObject? Find(string id) => Objects.FirstOrDefault(o => o.Id == id);
+
+        /// <summary>A deep copy (through JSON, so it is exactly what would be saved and loaded).</summary>
+        public static SceneDocument Clone(SceneDocument scene) =>
+            JsonConvert.DeserializeObject<SceneDocument>(JsonConvert.SerializeObject(scene, Json), Json) ?? new SceneDocument();
 
         public string NextId(string prefix)
         {
@@ -150,10 +156,14 @@ namespace Omnipotent.Services.OmniBlox.Build
         public float BorderWidth { get; set; } = 70;
         /// <summary>Water fills everything below this level (null = no water).</summary>
         public float? WaterLevel { get; set; }
+        /// <summary>Gentle rolling of the ground everywhere, the flat core included (studs; 0 = none). Flatten and plateau steps still level their areas.</summary>
+        public float Undulation { get; set; }
+        /// <summary>Studs between the rolls of <see cref="Undulation"/>.</summary>
+        public float UndulationScale { get; set; } = 70;
         public List<TerrainOp> Ops { get; set; } = new();
     }
 
-    /// <summary>One sculpting step: flatten, raise, lower, lake, path, paint or plateau.</summary>
+    /// <summary>One sculpting step: flatten, raise, lower, lake, path, ramp, paint or plateau.</summary>
     public sealed class TerrainOp
     {
         public string Kind { get; set; } = "flatten";
@@ -163,8 +173,10 @@ namespace Omnipotent.Services.OmniBlox.Build
         /// <summary>Points (x, z) of a path or polygon.</summary>
         public List<float[]>? Points { get; set; }
         public float Width { get; set; } = 12;
-        /// <summary>Target height for flatten/plateau, amount for raise/lower, depth for a lake.</summary>
+        /// <summary>Target height for flatten/plateau, amount for raise/lower, depth for a lake; a ramp's height at its first point.</summary>
         public float Height { get; set; }
+        /// <summary>A ramp's height at its last point (it climbs evenly between).</summary>
+        public float? EndHeight { get; set; }
         public string? Material { get; set; }
         /// <summary>How soft the edge is (0 = hard, 1 = very soft).</summary>
         public float Falloff { get; set; } = 0.5f;
@@ -201,10 +213,20 @@ namespace Omnipotent.Services.OmniBlox.Build
         public int Order { get; set; } = 1;
         /// <summary>Its look ("autumn forest", "candy desert").</summary>
         public string Theme { get; set; } = "";
+        /// <summary>A round zone: centre x, z and radius (generated maps); the rectangle bounds it.</summary>
+        public float[]? Circle { get; set; }
+        /// <summary>Where the way in is (its gate, for a gated zone).</summary>
+        public float[]? Entrance { get; set; }
+        /// <summary>The zone's ground height.</summary>
+        public float? Elevation { get; set; }
+        /// <summary>Players must unlock it (a ZoneGate guards its entrance and the kit keeps them out until they do).</summary>
+        public bool Gated { get; set; }
 
         [JsonIgnore] public float CenterX => (Area[0] + Area[2]) / 2;
         [JsonIgnore] public float CenterZ => (Area[1] + Area[3]) / 2;
-        public bool Contains(float x, float z) => x >= Area[0] && x <= Area[2] && z >= Area[1] && z <= Area[3];
+        public bool Contains(float x, float z) => Circle is { Length: 3 } c
+            ? (x - c[0]) * (x - c[0]) + (z - c[1]) * (z - c[1]) <= c[2] * c[2]
+            : x >= Area[0] && x <= Area[2] && z >= Area[1] && z <= Area[3];
     }
 
     public sealed class MapPath
@@ -248,6 +270,11 @@ namespace Omnipotent.Services.OmniBlox.Build
         public float[]? Rotation { get; set; }
         public float Scale { get; set; } = 1;
 
+        /// <summary>"gen" for what the world generator made (a regeneration replaces it); null for what an agent placed.</summary>
+        public string? Source { get; set; }
+        /// <summary>The prop this part belongs to (a sign's board and its posts): the verifier never reports the pieces of one prop touching each other.</summary>
+        public string? Group { get; set; }
+
         // asset
         public long? AssetId { get; set; }
         /// <summary>Recolours every part of an asset ("#RRGGBB"), e.g. a golden version of a tree.</summary>
@@ -272,6 +299,8 @@ namespace Omnipotent.Services.OmniBlox.Build
 
         // text sign
         public string? Text { get; set; }
+        /// <summary>A sign readable from both sides (the text on its back face too).</summary>
+        public bool? TwoSided { get; set; }
 
         /// <summary>CollectionService tags the Game Kit reacts to (Checkpoint, KillBrick, Coin, …).</summary>
         public List<string> Tags { get; set; } = new();

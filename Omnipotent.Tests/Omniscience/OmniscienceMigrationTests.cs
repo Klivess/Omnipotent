@@ -34,7 +34,7 @@ namespace Omnipotent.Tests.Omniscience
             using var conn = db.Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version;";
-            Assert.Equal(11, Convert.ToInt32(cmd.ExecuteScalar()));
+            Assert.Equal(12, Convert.ToInt32(cmd.ExecuteScalar()));
         }
 
         [Theory]
@@ -66,6 +66,14 @@ namespace Omnipotent.Tests.Omniscience
         [InlineData("replica_fidelity_runs")]
         [InlineData("watchlists")]
         [InlineData("person_link_suggestions")]
+        [InlineData("person_message_counts")]
+        [InlineData("conversation_message_counts")]
+        [InlineData("replica_era_profiles")]
+        [InlineData("replica_feedback")]
+        [InlineData("workspace_saved_queries")]
+        [InlineData("workspace_query_history")]
+        [InlineData("workspace_notes")]
+        [InlineData("workspace_pins")]
         public void Migrate_CreatesExpectedTable(string table)
         {
             using var conn = db.Open();
@@ -99,13 +107,29 @@ namespace Omnipotent.Tests.Omniscience
         }
 
         [Fact]
+        public void Migrate_AddsTemporalReplicaAndWorkspaceColumns()
+        {
+            using var conn = db.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT
+                (SELECT COUNT(*) FROM pragma_table_info('replica_chats') WHERE name IN ('as_of_at','context_kind','summary','summary_through_message_id')),
+                (SELECT COUNT(*) FROM pragma_table_info('replica_chat_messages') WHERE name IN ('as_of_at','context_kind','evidence_json','style_json','generation_version')),
+                (SELECT COUNT(*) FROM pragma_table_info('replica_fidelity_runs') WHERE name IN ('method','metadata_json'))";
+            using var r = cmd.ExecuteReader();
+            Assert.True(r.Read());
+            Assert.Equal(4, r.GetInt32(0));
+            Assert.Equal(5, r.GetInt32(1));
+            Assert.Equal(2, r.GetInt32(2));
+        }
+
+        [Fact]
         public void Migrate_IsIdempotent()
         {
             db.Migrate(); // second run must not throw (ALTER TABLE is version-guarded)
             using var conn = db.Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version;";
-            Assert.Equal(11, Convert.ToInt32(cmd.ExecuteScalar()));
+            Assert.Equal(12, Convert.ToInt32(cmd.ExecuteScalar()));
         }
 
         [Fact]

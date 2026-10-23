@@ -195,9 +195,9 @@ namespace Omnipotent.Services.KliveRAG.Connectors
             {
                 cmd.CommandText = @"SELECT p.person_id, p.profile_markdown, p.generated_at
                     FROM personality_profiles p
-                    JOIN (SELECT person_id, MAX(generated_at) mx FROM personality_profiles GROUP BY person_id) latest
+                    JOIN (SELECT person_id, MAX(generated_at) mx FROM personality_profiles WHERE era IS NULL GROUP BY person_id) latest
                       ON latest.person_id = p.person_id AND latest.mx = p.generated_at
-                    WHERE p.generated_at > $wm AND p.profile_markdown IS NOT NULL";
+                    WHERE p.generated_at > $wm AND p.profile_markdown IS NOT NULL AND p.era IS NULL";
                 cmd.Parameters.AddWithValue("$wm", watermark);
                 using var r = cmd.ExecuteReader();
                 while (r.Read())

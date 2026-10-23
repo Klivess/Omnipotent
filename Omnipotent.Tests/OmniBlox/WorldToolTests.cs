@@ -3,15 +3,17 @@ using Omnipotent.Services.OmniBlox.Agents;
 using Omnipotent.Services.OmniBlox.Build;
 using Omnipotent.Services.OmniBlox.Core;
 using Omnipotent.Services.OmniBlox.Marketing;
+using Omnipotent.Services.OmniBlox.Pipeline;
 using Omnipotent.Services.OmniBlox.Pipeline.Tools;
 using SkiaSharp;
 
 namespace Omnipotent.Tests.OmniBlox
 {
     /// <summary>
-    /// The builder's world, through the very tools an agent calls: terrain, the play area, the map plan,
-    /// scattering and lines of models, a build, the map report and the renders it looks at. With
-    /// OMNIBLOX_RENDER_OUT set, every picture (and store art made from them) is written there to be looked at.
+    /// The builder's world, through the very tools an agent calls: the generated baseline, design_world, local
+    /// sculpting (what stands there moves with the ground), hand-placed extras, a build, the map report and the
+    /// renders it looks at. With OMNIBLOX_RENDER_OUT set, every picture (and store art made from them) is written
+    /// there to be looked at.
     /// </summary>
     public class WorldToolTests
     {
@@ -37,77 +39,47 @@ namespace Omnipotent.Tests.OmniBlox
             return result;
         }
 
-        /// <summary>A simulator map the way the builder prompt asks for one: a hub, two themed zones, paths, a lake, dressing and a landmark.</summary>
-        internal static async Task DressAsync(AgentToolbox box)
+        /// <summary>
+        /// What a builder does to the generated baseline: reads the spec, changes the look and regenerates, raises a
+        /// gentle hill in a zone (what stands there moves with the ground) and adds a few models of its own there.
+        /// </summary>
+        internal static async Task<MapZone> DecorateAsync(StudioHarness h, string id, AgentToolbox box)
         {
-            long tree = FakeRoblox.AssetId;
-            await Call(box, "terrain_generate", new { size = new[] { 640, 640 }, biome = "meadow", hills = 14, seed = 7, flat_radius = 120 });
-            await Call(box, "set_map_area", new { area = new[] { -220, -220, 220, 220 } });
-            await Call(box, "plan_map", new
-            {
-                concept = "A sunny island: the hub with the shop in the middle, the Pine Woods to the west, the Golden Meadow to the east past the lake.",
-                zones = new object[]
-                {
-                    new { id = "hub", name = "Camp", area = new[] { -60, -60, 60, 60 }, order = 1, purpose = "shop, sell spot, first trees", theme = "sunny clearing" },
-                    new { id = "woods", name = "Pine Woods", area = new[] { -220, -220, -70, 220 }, order = 2, purpose = "the first forest", theme = "dense pines" },
-                    new { id = "meadow", name = "Golden Meadow", area = new[] { 70, -220, 220, 220 }, order = 3, purpose = "rare golden trees", theme = "flowers and gold" },
-                },
-                paths = new object[]
-                {
-                    new { from = "hub", to = "woods", points = new[] { new[] { 0, 0 }, new[] { -150, 0 } } },
-                    new { from = "hub", to = "meadow", points = new[] { new[] { 0, 0 }, new[] { 150, 0 } } },
-                },
-                landmarks = new object[] { new { name = "Watch Tower", position = new[] { 0, -40 }, note = "seen from everywhere" } },
-            });
-            await Call(box, "terrain_sculpt", new
-            {
-                ops = new object[]
-                {
-                    new { kind = "path", points = new[] { new[] { 0, 0 }, new[] { -150, 0 } }, width = 12, material = "Ground" },
-                    new { kind = "path", points = new[] { new[] { 0, 0 }, new[] { 150, 0 } }, width = 12, material = "Ground" },
-                    new { kind = "lake", center = new[] { 110, 140 }, radius = 32, height = 6 },
-                },
-            });
-            await Call(box, "set_lighting", new { preset = "sunny" });
-            await Call(box, "add_objects", new
-            {
-                objects = new object[]
-                {
-                    new { kind = "spawn", name = "Start", position = new[] { 0, 30 }, size = new[] { 8, 1, 8 }, yaw = 0 },
-                    new { name = "ShopFloor", folder = "Hub/Shop", position = new[] { 0, -20 }, size = new[] { 24, 1, 16 }, color = "#C8A27A", material = "WoodPlanks" },
-                    new { name = "ShopRoof", folder = "Hub/Shop", position = new[] { 0, 9, -20 }, size = new[] { 28, 2, 20 }, color = "#E53935" },
-                    new { name = "ShopSign", kind = "text", folder = "Hub/Shop", position = new[] { 0, 12, -10 }, size = new[] { 14, 3, 1 }, text = "AXE SHOP" },
-                    new { name = "SellPad", position = new[] { 20, 0 }, size = new[] { 10, 1, 10 }, color = "#43A047", material = "Neon", tags = new[] { "SellZone" } },
-                    new { name = "WatchTower", folder = "Hub", position = new[] { 0, 22, -40 }, size = new[] { 8, 44, 8 }, color = "#8D6E63", material = "WoodPlanks" },
-                    new { name = "Beacon", folder = "Hub", position = new[] { 0, 46, -40 }, size = new[] { 6, 4, 6 }, color = "#FFD54F", material = "Neon", tags = new[] { "Glow", "Sparkle" } },
-                },
-            });
-            await Call(box, "scatter_assets", new { asset_ids = new[] { tree }, zone = "woods", count = 70, seed = 3 });
-            await Call(box, "scatter_assets", new { asset_ids = new[] { tree }, zone = "meadow", count = 40, seed = 4, scale = new[] { 0.7, 1.1 } });
-            await Call(box, "scatter_assets", new { asset_ids = new[] { tree }, area = new[] { new[] { -60, 40 }, new[] { 60, 60 } }, count = 8, seed = 5 });
-            await Call(box, "scatter_assets", new { asset_ids = new[] { tree }, area = new[] { new[] { -70, 62 }, new[] { 70, 220 } }, count = 30, seed = 6, scale = new[] { 0.8, 1.3 } });
-            await Call(box, "scatter_assets", new { asset_ids = new[] { tree }, area = new[] { new[] { -70, -220 }, new[] { 70, -62 } }, count = 30, seed = 8, scale = new[] { 0.8, 1.3 } });
-            await Call(box, "place_along", new { points = new[] { new[] { -60, 0 }, new[] { -140, 0 } }, spacing = 16, offset = 9, both_sides = true, part = new { size = new[] { 1, 8, 1 }, color = "#FFF59D", material = "Neon" }, name = "PathLamp" });
-            await Call(box, "place_ring", new { center = new[] { 0, 0 }, radius = 46, count = 10, part = new { size = new[] { 3, 6, 3 }, color = "#8D6E63", material = "Wood" }, name = "Stump", tags = new[] { "Collectible" }, config = new { Value = 1 } });
+            string spec = (await Call(box, "design_world", new { })).Text;
+            Assert.Contains("\"Layout\": \"hub\"", spec);
+            Assert.Contains("\"Biome\": \"forest\"", spec);
+            string regenerated = (await Call(box, "design_world", new { spec = new { density = 1.2, lighting = "golden" }, seed = 11 })).Text;
+            Assert.Contains("Regenerated", regenerated);
+            Assert.Contains("ECONOMY", regenerated);
+            var zone = h.Ctx.Workspace(id).LoadScene().Layout.Zones.First(z => z.Gated);
+            string raised = (await Call(box, "terrain_sculpt", new { ops = new object[] { new { kind = "raise", center = new[] { zone.Circle![0], zone.Circle[1] }, radius = 26, height = 2, falloff = 0.9 } } })).Text;
+            Assert.Contains("moved onto the new", raised);
+            await Call(box, "scatter_assets", new { asset_ids = new[] { FakeRoblox.AssetId }, zone = zone.Id, count = 5, seed = 3 });
+            return zone;
         }
 
         [Fact]
-        public async Task TheWorldTools_BuildABigDressedMap_ThatTheReportAndTheRendererUnderstand()
+        public async Task TheGeneratedWorld_WithTheBuildersOwnTouches_IsAMapTheReportAndTheRendererUnderstand()
         {
             var (h, id, box) = await SimulatorAsync();
             using var _ = h;
-            await DressAsync(box);
+            var raisedZone = await DecorateAsync(h, id, box);
 
+            var scene = h.Ctx.Workspace(id).LoadScene();
+            var zones = scene.Layout.Zones.Where(z => z.Id != "hub").OrderBy(z => z.Order).ToList();
+            Assert.True(zones.Count >= 3, "zones: " + zones.Count);
             string summary = (await Call(box, "scene_summary", new { limit = 10 })).Text;
-            Assert.Contains("Pine Woods", summary);
+            Assert.Contains(zones[0].Name, summary);
 
             string build = (await Call(box, "build", new { })).Text;
             Assert.Contains("BUILD OK — revision 1", build);
             var game = h.Game(id);
             Assert.True(game.Build.LastBuildOk, string.Join("\n", game.Build.Errors));
-            Assert.NotNull(game.Build.MapScore);
-            Assert.True(game.Build.MapScore >= 60, $"map score {game.Build.MapScore}: " + string.Join(" | ", game.Build.MapFindings));
+            Assert.True(game.Build.MapScore >= StageGates.MinMapScore, $"map score {game.Build.MapScore}: " + string.Join(" | ", game.Build.MapFindings));
             Assert.DoesNotContain(game.Build.MapFindings, f => f.StartsWith("[error]", StringComparison.Ordinal));
+            Assert.False(game.Build.MapFindings.Any(f => f.Contains("floats") || f.Contains("is sunk")), string.Join("\n", game.Build.MapFindings));
+            Assert.False(string.IsNullOrEmpty(game.Build.Economy), "a simulator's build plays its economy");
+            Assert.Empty(game.Build.EconomyFindings);
 
             // A rebuild of unchanged files is the same revision (so a passing engine run on it still counts).
             string again = (await Call(box, "build", new { })).Text;
@@ -116,11 +88,11 @@ namespace Omnipotent.Tests.OmniBlox
 
             var report = await Call(box, "map_report", new { });
             Assert.Contains("Map score", report.Text);
-            Assert.Contains("zone woods", report.Text);
+            Assert.Contains($"zone {raisedZone.Id}", report.Text);
             Assert.Single(report.Images);
 
             string? output = Environment.GetEnvironmentVariable("OMNIBLOX_RENDER_OUT");
-            foreach (string view in new[] { "map", "overview", "aerial", "iso", "spawn", "zone:woods", "zone:meadow" })
+            foreach (string view in new[] { "map", "overview", "aerial", "iso", "spawn" }.Concat(zones.Select(z => "zone:" + z.Id)))
             {
                 var shot = await Call(box, "render_scene", new { view });
                 var png = Assert.Single(shot.Images);
@@ -152,15 +124,42 @@ namespace Omnipotent.Tests.OmniBlox
         }
 
         [Fact]
+        public async Task HandEditsOfWhatTheGeneratorOwns_AreRefused_WithTheWayToMakeTheChange()
+        {
+            var (h, id, box) = await SimulatorAsync();
+            using var _ = h;
+            var before = JsonConvert.SerializeObject(h.Ctx.Workspace(id).LoadScene());
+            foreach (var (tool, args) in new (string, object)[]
+            {
+                ("terrain_generate", new { hills = 30, flat_radius = 40 }),
+                ("set_map_area", new { area = new[] { -50, -50, 50, 50 } }),
+                ("plan_map", new { concept = "one long corridor" }),
+            })
+            {
+                var refused = await box.ExecuteAsync(tool, JsonConvert.SerializeObject(args), CancellationToken.None);
+                Assert.True(refused.IsError, tool + " was allowed");
+                Assert.Contains("design_world", refused.Text);
+                Assert.Contains("terrain_sculpt", refused.Text);
+            }
+            Assert.Equal(before, JsonConvert.SerializeObject(h.Ctx.Workspace(id).LoadScene()));
+
+            // The template decides the layout.
+            var wrong = await box.ExecuteAsync("design_world", JsonConvert.SerializeObject(new { spec = new { layout = "course" } }), CancellationToken.None);
+            Assert.True(wrong.IsError);
+            Assert.Contains("layout 'hub'", wrong.Text);
+        }
+
+        [Fact]
         public async Task AnEmptyWorld_IsCalledOutByTheMapReport_AndCannotBeDeclaredComplete()
         {
             var (h, id, box) = await SimulatorAsync();
             using var _ = h;
+            h.Ctx.Workspace(id).SaveScene(new SceneDocument()); // what the first studio's builder started from
             await Call(box, "add_objects", new { objects = new object[] { new { kind = "spawn", name = "Start", position = new[] { 0, 0.5, 0 }, size = new[] { 6, 1, 6 } } } });
             await Call(box, "build", new { });
             var game = h.Game(id);
             Assert.True(game.Build.LastBuildOk);
-            Assert.True(game.Build.MapScore < 60, "an empty map scored " + game.Build.MapScore);
+            Assert.True(game.Build.MapScore <= MapReport.BlockedCap, "an empty map scored " + game.Build.MapScore);
             Assert.Contains(game.Build.MapFindings, f => f.Contains("No play area"));
             Assert.Contains(game.Build.MapFindings, f => f.Contains("no ground"));
 
@@ -176,7 +175,6 @@ namespace Omnipotent.Tests.OmniBlox
         {
             var (h, id, box) = await SimulatorAsync();
             using var _ = h;
-            await DressAsync(box);
             await Call(box, "write_file", new { path = "src/tests/Forest.luau", content = "return {\n\t[\"chopping pays\"] = function(t)\n\t\tlocal p = t.player()\n\t\tt.eq(1, 2, \"coins after a chop\")\n\tend,\n}\n" });
             h.Roblox.EngineOutput = "{\"results\":[{\"passed\":1,\"failed\":1,\"results\":[" +
                 "{\"name\":\"Kit · profiles start fresh\",\"ok\":true,\"phase\":\"kit\",\"owner\":\"kit\"}," +

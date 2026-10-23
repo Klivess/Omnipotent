@@ -203,6 +203,11 @@ namespace Omnipotent.Services.OmniBlox.Roblox
         private static MultipartFormDataContent ProductForm(ProductSpec spec, bool includeName)
         {
             var form = new MultipartFormDataContent();
+            if (spec.OnlySaleState)
+            {
+                form.Add(new StringContent(spec.IsForSale ? "true" : "false"), "isForSale");
+                return form;
+            }
             if (includeName) form.Add(new StringContent(spec.Name), "name");
             form.Add(new StringContent(spec.Description ?? ""), "description");
             form.Add(new StringContent(spec.PriceRobux.ToString(CultureInfo.InvariantCulture)), "price");

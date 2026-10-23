@@ -10,7 +10,7 @@ namespace Omnipotent.Services.OmniBlox.Core
     public enum EventLevel { Info, Success, Warning, Error }
 
     [JsonConverter(typeof(StringEnumConverter))]
-    public enum OwnerTaskKind { ApiKey, Creator, ExperienceSlot, LaunchApproval, UploadIcon, Questionnaire, Escalation, Other }
+    public enum OwnerTaskKind { ApiKey, Creator, ExperienceSlot, LaunchApproval, UploadIcon, Questionnaire, Escalation, Other, BuildSignoff }
 
     [JsonConverter(typeof(StringEnumConverter))]
     public enum OwnerTaskStatus { Open, Done, Dismissed }
@@ -314,19 +314,27 @@ namespace Omnipotent.Services.OmniBlox.Core
         /// <summary>The map report's score (0-100) at the last build, and what it found.</summary>
         public int? MapScore { get; set; }
         public List<string> MapFindings { get; set; } = new();
+        /// <summary>The economy check on the last build (a bot playing the game's own numbers), and its problems.</summary>
+        public string? Economy { get; set; }
+        public List<string> EconomyFindings { get; set; } = new();
         /// <summary>The newest engine test run (run_tests, the Test stage or a launch), with every case and runtime error.</summary>
         public EngineRun? LastEngineRun { get; set; }
         /// <summary>The Game Kit version the current revision was built on (a kit update makes the same files a new build).</summary>
         public string? KitFingerprint { get; set; }
     }
 
-    /// <summary>One run of the game in Roblox's engine (see Pipeline/EngineTests).</summary>
+    /// <summary>One run of the game in Roblox's engine (see Pipeline/EngineTests), or in the studio's local engine (Pipeline/LocalEngine).</summary>
     public sealed class EngineRun
     {
         public DateTime Utc { get; set; }
         public int Revision { get; set; }
         public bool Ran { get; set; }
         public bool Ok { get; set; }
+        /// <summary>
+        /// It ran in the studio's local engine (Lune), a stand-in with no physics, replication or clients, because
+        /// Roblox's could not run the game yet. Counts only while that is so; a launch always runs Roblox's.
+        /// </summary>
+        public bool Local { get; set; }
         public long? Version { get; set; }
         public int Passed { get; set; }
         public int Failed { get; set; }
@@ -434,6 +442,18 @@ namespace Omnipotent.Services.OmniBlox.Core
         public bool Retired { get; set; }
     }
 
+    /// <summary>The owner's decision at a launch gate.</summary>
+    public sealed class ApprovalRecord
+    {
+        /// <summary>build (sign-off) or launch.</summary>
+        public string Gate { get; set; } = "";
+        /// <summary>approved or changes.</summary>
+        public string Decision { get; set; } = "";
+        public string Note { get; set; } = "";
+        public int Revision { get; set; }
+        public DateTime Utc { get; set; }
+    }
+
     public sealed class PublishRecord
     {
         public long? LastSavedVersion { get; set; }
@@ -445,6 +465,16 @@ namespace Omnipotent.Services.OmniBlox.Core
         public bool IsPublic { get; set; }
         public DateTime? LaunchRequestedUtc { get; set; }
         public DateTime? LaunchApprovedUtc { get; set; }
+        /// <summary>The owner played this revision and signed it off for marketing (the build gate).</summary>
+        public int? SignoffRevision { get; set; }
+        public DateTime? SignoffUtc { get; set; }
+        /// <summary>The launch approval is for this revision with this store page and these products (see Approvals.Fingerprint).</summary>
+        public int? ApprovedRevision { get; set; }
+        public string? ApprovedFingerprint { get; set; }
+        /// <summary>Every decision the owner made at a gate, newest last.</summary>
+        public List<ApprovalRecord> Approvals { get; set; } = new();
+        /// <summary>Launch steps that failed in a row (the retry waits longer each time, and the owner is asked after a few).</summary>
+        public int LaunchFailures { get; set; }
         public DateTime? WentPublicUtc { get; set; }
         /// <summary>The engine-test result for the revision about to be published (launch and updates).</summary>
         public int? EngineTestedRevision { get; set; }

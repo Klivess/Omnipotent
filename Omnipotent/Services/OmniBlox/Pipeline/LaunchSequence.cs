@@ -53,7 +53,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             }
 
             // 4. The final build and 5. the game running clean in Roblox's engine — before anything irreversible
-            // happens on Roblox (a broken game used to get its products created and then bounce back to Build).
+            // happens on Roblox (a broken game used to get its products created and then bounce back to Build). A
+            // pass in the local engine, which stood in before the key and slot existed, does not count here.
             Step("final build");
             var build = await BuildTools.RunBuildAsync(ctx, gameId, ct);
             if (!build.Ok) return (LaunchResult.BackToBuild, "the final build failed: " + BuildErrors(build));
@@ -74,6 +75,19 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     });
                     return (LaunchResult.BackToBuild, "engine tests failed before launch: " + engine.Summary);
                 }
+            }
+
+            // The launch approval: for this revision, this store page and these products — before anything happens on Roblox.
+            Step("approval");
+            game = ctx.Game(gameId)!;
+            if (!Approvals.LaunchApproved(ctx, game))
+            {
+                var art = new List<string>();
+                if (game.Store.IconFile != null) art.Add(game.Store.IconFile);
+                art.AddRange(game.Store.ThumbnailFiles);
+                if (!ctx.Store.Read(s => s.Studio.OwnerTasks.Any(t => t.Status == OwnerTaskStatus.Open && t.Kind == OwnerTaskKind.LaunchApproval && t.GameId == gameId)))
+                    Approvals.RequestLaunch(ctx, gameId, slot, art.Distinct(), compliance.QuestionnaireNotes);
+                return (LaunchResult.Waiting, "waiting for the owner's launch approval");
             }
 
             // 6. An earlier game's products left in this experience come off sale.
@@ -137,7 +151,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             ctx.Update(gameId, g =>
             {
                 g.Publish.EngineTestedRevision = revision;
-                if (g.Build.LastEngineRun is { } tested && tested.Revision == revision) { g.Publish.LastSavedVersion = tested.Version; g.Publish.LastSavedRevision = revision; }
+                if (g.Build.LastEngineRun is { Local: false } tested && tested.Revision == revision) { g.Publish.LastSavedVersion = tested.Version; g.Publish.LastSavedRevision = revision; }
             });
 
             // 9. Store page.
@@ -178,16 +192,6 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 s.FileOwnerTask(OwnerTaskKind.Questionnaire, "questionnaire:" + gameId, $"Answer the maturity questionnaire for \"{game.Store.Title}\"",
                     "Prepared honest answers:\n- " + string.Join("\n- ", compliance.QuestionnaireNotes), gameId, now);
             });
-
-            // 12. Launch approval.
-            Step("approval");
-            if (ctx.Settings.RequireLaunchApproval && game.Publish.LaunchApprovedUtc == null)
-            {
-                ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.LaunchApproval, "approve:" + gameId, $"Approve the launch of \"{game.Store.Title}\"",
-                    $"Built, tested and ready. Look it over (thumbnails, store page, products) and approve it on the OmniBlox dashboard. Experience {slot.UniverseId}.", gameId, now,
-                    files.Concat(game.Store.ThumbnailFiles).Distinct()));
-                return (LaunchResult.Waiting, "waiting for the owner's launch approval");
-            }
 
             // 13. Publish and 14. go public.
             Step("publish");
@@ -249,7 +253,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 .ToList());
             foreach (var (oldGame, product) in stale)
             {
-                var spec = new ProductSpec { Name = Clip(product.Name, 50), Description = Clip(product.Description, 900), PriceRobux = Math.Max(1, product.PriceRobux), IsForSale = false };
+                // Only "not for sale": the old name and description are not sent again (Roblox's firewall refused
+                // a full update of an old product for hours and blocked the whole launch).
+                var spec = new ProductSpec { Name = Clip(product.Name, 50), Description = "", PriceRobux = Math.Max(1, product.PriceRobux), IsForSale = false, OnlySaleState = true };
                 try
                 {
                     if (product.Kind == ProductKind.GamePass) await ctx.Cloud.UpdateGamePassAsync(slot.UniverseId, product.RobloxId!.Value, spec, ct);
@@ -258,6 +264,13 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 catch (RobloxApiException ex) when (ex.IsNotFound)
                 {
                     // Already gone.
+                }
+                catch (RobloxApiException ex)
+                {
+                    // Never block the launch on an old game's leftovers: the owner takes it off sale by hand.
+                    ctx.Store.Mutate(st => st.FileOwnerTask(OwnerTaskKind.Other, "retire:" + product.RobloxId, $"Take \"{product.Name}\" off sale",
+                        $"An abandoned game left this {(product.Kind == ProductKind.GamePass ? "game pass" : "developer product")} (id {product.RobloxId}) on sale in experience {slot.UniverseId}, and Roblox refused to change it ({ex.Message}). Set it to not for sale in the Creator Dashboard.", gameId, ctx.Clock()));
+                    ctx.Event(EventLevel.Warning, "launch.retire", $"Could not take \"{product.Name}\" off sale ({ex.Message}); the owner was asked to.", gameId);
                 }
                 ctx.Update(oldGame, g =>
                 {

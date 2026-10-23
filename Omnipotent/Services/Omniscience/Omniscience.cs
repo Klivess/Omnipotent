@@ -10,6 +10,7 @@ using Omnipotent.Services.Omniscience.Radar;
 using Omnipotent.Services.Omniscience.Replica;
 using Omnipotent.Services.Omniscience.Scheduling;
 using Omnipotent.Services.Omniscience.Search;
+using Omnipotent.Services.Omniscience.Workspace;
 using Omnipotent.Services.KliveAPI.Caching;
 using System;
 using System.IO;
@@ -35,6 +36,7 @@ namespace Omnipotent.Services.Omniscience
         public KliveBotIngester KliveBotFeed { get; private set; } = null!;
         public KlivesRadar Radar { get; private set; } = null!;
         public AnalyticsEngine Analytics { get; private set; } = null!;
+        public ActivitySummaryStore ActivitySummaries { get; private set; } = null!;
         public PersonalityProfiler Profiler { get; private set; } = null!;
         public OmniscienceScheduler Scheduler { get; private set; } = null!;
         public MaintenanceJobs Maintenance { get; private set; } = null!;
@@ -47,6 +49,7 @@ namespace Omnipotent.Services.Omniscience
         public TargetSuggestionEngine TargetSuggestions { get; private set; } = null!;
         public HypothesisWatcher Hypotheses { get; private set; } = null!;
         public IdentityLinkEngine IdentityLinks { get; private set; } = null!;
+        public ReplicaTemporalAnalyzer ReplicaTemporal { get; private set; } = null!;
         public ReplicaTrainer ReplicaTrainer { get; private set; } = null!;
         public ReplicaChatOrchestrator ReplicaChat { get; private set; } = null!;
         public ReplicaFidelity ReplicaFidelity { get; private set; } = null!;
@@ -107,6 +110,7 @@ namespace Omnipotent.Services.Omniscience
             Pipeline.OnImageAttachmentSaved += (attachmentId, path) => Ocr.Enqueue(attachmentId, path);
 
             Analytics = new AnalyticsEngine(this, Db);
+            ActivitySummaries = new ActivitySummaryStore(Db, msg => _ = ServiceLog(msg));
             Profiler = new PersonalityProfiler(this, Db);
             Scheduler = new OmniscienceScheduler(this, Analytics, Profiler);
             Maintenance = new MaintenanceJobs(this, Db, Ocr);
@@ -136,13 +140,13 @@ namespace Omnipotent.Services.Omniscience
                 if (DateTime.UtcNow - msg.SentAt > TimeSpan.FromMinutes(30)) return; // backfill noise
                 _ = Task.Run(() => Extraction.MarkConversationPriorityAsync(msg.Platform, msg.ChannelId ?? ""));
             };
+            ReplicaTemporal = new ReplicaTemporalAnalyzer(Db);
             ReplicaTrainer = new ReplicaTrainer(this, Db, Http);
             ReplicaChat = new ReplicaChatOrchestrator(this, Db, Http);
             ReplicaFidelity = new ReplicaFidelity(this, Db);
 
             // Drop-folder imports (Discord data packages, WhatsApp exports) + daily briefing.
             Imports = new ImportWatcher(this, Db, Pipeline);
-            Imports.Start();
             Briefing = new DailyBriefing(this, Db);
 
             // Routes first so the UI is responsive even before sources load.
@@ -154,6 +158,8 @@ namespace Omnipotent.Services.Omniscience
             await searchRoutes.RegisterRoutes();
             var deductionRoutes = new DeductionRoutes(this);
             await deductionRoutes.RegisterRoutes();
+            var workspaceRoutes = new WorkspaceRoutes(this);
+            await workspaceRoutes.RegisterRoutes();
             await ReplicaFidelity.RegisterRoutes();
             // The preview is built on its own background loop; requests only read
             // the last completed, age-bounded snapshot.
@@ -189,6 +195,18 @@ namespace Omnipotent.Services.Omniscience
                 }
             }, HttpMethod.Post, OmnisciencePerms.AnalysisRun);
             await ServiceLog("[Omniscience] API routes registered.");
+
+            // Routes stay responsive while the one-time legacy-count rebuild runs. No
+            // ingester starts until it finishes, preserving exact incremental counts.
+            try
+            {
+                await ActivitySummaries.EnsureBackfilledAsync(cts.Token);
+                OmniscienceRoutes.InvalidateCachePrefix("persons|");
+                OmniscienceRoutes.InvalidateCachePrefix("conversations|");
+            }
+            catch (OperationCanceledException) when (cts.IsCancellationRequested) { return; }
+            catch { /* already logged; ingesters can still populate summaries incrementally */ }
+            Imports.Start();
 
             // Start Discord ingest (will start gateways for every saved source).
             try

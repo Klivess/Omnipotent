@@ -102,6 +102,8 @@
 	<ItemGroup>
 		<!-- OmniBlox Game Kit: the Luau every generated Roblox game starts from, compiled into each place. -->
 		<EmbeddedResource Include="Services\OmniBlox\GameKit\**\*.luau" LogicalName="OmniBloxKit/%(RecursiveDir)%(Filename)%(Extension)" />
+		<!-- OmniBlox local engine: the kit's engine test run in Lune, for games the studio cannot run in Roblox yet. -->
+		<EmbeddedResource Include="Services\OmniBlox\LocalEngine\engine.luau" LogicalName="OmniBloxLocalEngine/engine.luau" />
 	</ItemGroup>
 
 </Project>

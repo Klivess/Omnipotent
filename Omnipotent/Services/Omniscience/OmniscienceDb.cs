@@ -101,6 +101,7 @@ namespace Omnipotent.Services.Omniscience
                 (9, SchemaV9),
                 (10, SchemaV10),
                 (11, SchemaV11),
+                (12, SchemaV12),
             };
 
             foreach (var (version, sql) in migrations)
@@ -122,6 +123,109 @@ namespace Omnipotent.Services.Omniscience
 
             tx.Commit();
         }
+
+        // ── Migration: v12 (O(1) directory activity summaries) ──
+        // The directory used to GROUP BY every message for each request. These small
+        // tables are rebuilt once for an existing corpus and incremented transactionally
+        // by IngestPipeline afterwards.
+        private const string SchemaV12 = @"
+CREATE TABLE IF NOT EXISTS person_message_counts (
+    person_id TEXT PRIMARY KEY,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    first_message_at INTEGER,
+    last_message_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_person_counts_activity ON person_message_counts(message_count DESC, last_message_at DESC);
+
+CREATE TABLE IF NOT EXISTS conversation_message_counts (
+    conversation_id TEXT PRIMARY KEY,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    first_message_at INTEGER,
+    last_message_at INTEGER,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conversation_counts_activity ON conversation_message_counts(message_count DESC, last_message_at DESC);
+
+-- Temporal Replica v2: annual summaries, immutable chat scopes and separate evidence.
+CREATE TABLE IF NOT EXISTS replica_era_profiles (
+    person_id TEXT NOT NULL,
+    era TEXT NOT NULL,
+    start_at INTEGER NOT NULL,
+    end_at INTEGER NOT NULL,
+    first_message_at INTEGER NOT NULL,
+    last_message_at INTEGER NOT NULL,
+    message_count INTEGER NOT NULL,
+    style_json TEXT NOT NULL,
+    computed_at INTEGER NOT NULL,
+    PRIMARY KEY(person_id, era)
+);
+CREATE INDEX IF NOT EXISTS idx_replica_eras_person ON replica_era_profiles(person_id, era DESC);
+
+ALTER TABLE replica_chats ADD COLUMN as_of_at INTEGER;
+ALTER TABLE replica_chats ADD COLUMN context_kind TEXT NOT NULL DEFAULT 'auto';
+ALTER TABLE replica_chats ADD COLUMN summary TEXT;
+ALTER TABLE replica_chats ADD COLUMN summary_through_message_id INTEGER;
+
+ALTER TABLE replica_chat_messages ADD COLUMN as_of_at INTEGER;
+ALTER TABLE replica_chat_messages ADD COLUMN context_kind TEXT;
+ALTER TABLE replica_chat_messages ADD COLUMN evidence_json TEXT;
+ALTER TABLE replica_chat_messages ADD COLUMN style_json TEXT;
+ALTER TABLE replica_chat_messages ADD COLUMN generation_version TEXT;
+
+CREATE TABLE IF NOT EXISTS replica_feedback (
+    feedback_id TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL,
+    chat_id INTEGER,
+    chat_message_id INTEGER,
+    rating INTEGER NOT NULL,
+    note TEXT,
+    as_of_at INTEGER,
+    context_kind TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_replica_feedback_person ON replica_feedback(person_id, created_at DESC);
+
+ALTER TABLE replica_fidelity_runs ADD COLUMN method TEXT;
+ALTER TABLE replica_fidelity_runs ADD COLUMN metadata_json TEXT;
+
+-- Operator workspace: reusable investigations, annotations and a configurable directory.
+CREATE TABLE IF NOT EXISTS workspace_saved_queries (
+    query_id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    query_json TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_used_at INTEGER,
+    use_count INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_queries_used ON workspace_saved_queries(last_used_at DESC, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS workspace_query_history (
+    history_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query_text TEXT NOT NULL,
+    scope_json TEXT,
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_query_history ON workspace_query_history(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS workspace_notes (
+    note_id TEXT PRIMARY KEY,
+    person_id TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tags TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_notes_person ON workspace_notes(person_id, updated_at DESC);
+
+CREATE TABLE IF NOT EXISTS workspace_pins (
+    person_id TEXT PRIMARY KEY,
+    pinned_at INTEGER NOT NULL,
+    sort_order INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_workspace_pins_order ON workspace_pins(sort_order, pinned_at DESC);
+";
 
         // ── Migration: v11 (self-disclosure fast-track + cross-platform identity links) ──
         // priority on extraction_cursors lets ingest-time self-disclosure detection jump

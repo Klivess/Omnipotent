@@ -179,7 +179,7 @@ namespace Omnipotent.Services.Omniscience.Profiling
             {
                 using var prev = conn.CreateCommand();
                 prev.CommandText = @"SELECT profile_markdown FROM personality_profiles
-                    WHERE person_id=$p ORDER BY generated_at DESC LIMIT 1";
+                    WHERE person_id=$p AND era IS NULL ORDER BY generated_at DESC LIMIT 1";
                 prev.Parameters.AddWithValue("$p", personId);
                 previousMarkdown = prev.ExecuteScalar() as string;
             }
@@ -295,7 +295,7 @@ namespace Omnipotent.Services.Omniscience.Profiling
 
             // Uniform stride within the era — recency weighting is meaningless inside one year.
             var trimmed = new List<string>();
-            int stride = Math.Max(1, samples.Count / 200);
+            int stride = Math.Max(1, (int)Math.Ceiling(samples.Count / 200.0));
             for (int i = 0; i < samples.Count && trimmed.Count < 200; i += stride) trimmed.Add(samples[i]);
 
             string prompt = ProfilePromptBuilder.Build(
@@ -306,7 +306,7 @@ namespace Omnipotent.Services.Omniscience.Profiling
             if (llms == null || llms.Length == 0) return false;
             var llm = (KliveLLM.KliveLLM)llms[0];
             var resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 1800,
-                systemPrompt: ProfilePromptBuilder.SystemPrompt, useFreeModel: true);
+                systemPrompt: ProfilePromptBuilder.EraSystemPrompt, useFreeModel: true, cancellationToken: ct);
             if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response)) return false;
 
             string narrative = resp.Response;

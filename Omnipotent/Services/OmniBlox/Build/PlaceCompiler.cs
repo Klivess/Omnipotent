@@ -333,6 +333,12 @@ namespace Omnipotent.Services.OmniBlox.Build
                 ["Template"] = template,
                 ["Terrain"] = terrainConfig,
                 ["Water"] = terrain?.WaterLevel != null ? new Dictionary<string, object?> { ["Color"] = WaterColor(scene), ["Transparency"] = 0.3 } : null,
+                // Gated zones' ground: the kit keeps players out of a zone until they unlock it (Progression).
+                ["Zones"] = scene.Layout.Zones.Where(z => z.Gated && z.Circle is { Length: 3 } && z.Entrance is { Length: 2 })
+                    .Select(z => (object?)new Dictionary<string, object?>
+                    {
+                        ["Name"] = z.Name, ["Center"] = new[] { z.Circle![0], z.Circle[1] }, ["Radius"] = z.Circle[2], ["Entrance"] = z.Entrance,
+                    }).ToList(),
                 ["Bounds"] = scene.Bounds.HasArea ? new Dictionary<string, object?>
                 {
                     ["MinX"] = scene.Bounds.MinX, ["MinZ"] = scene.Bounds.MinZ, ["MaxX"] = scene.Bounds.MaxX, ["MaxZ"] = scene.Bounds.MaxZ,
@@ -414,16 +420,22 @@ namespace Omnipotent.Services.OmniBlox.Build
                     {
                         inst = new RbxInstance("Part", name);
                         SetPartBasics(inst, obj, obj.SizeVector ?? new RbxVector3(10, 4, 0.5f), obj.Color ?? "#1E2430", obj.Material ?? "SmoothPlastic");
-                        var gui = inst.AddChild(new RbxInstance("SurfaceGui", "Sign"));
-                        gui.Set("Face", RbxValue.Token(5)); // Front
-                        var label = gui.AddChild(new RbxInstance("TextLabel", "Text"));
-                        label.Set("Size", RbxValue.UDim2(new RbxUDim2(new RbxUDim(1, 0), new RbxUDim(1, 0))));
-                        label.Set("BackgroundTransparency", RbxValue.Float(1));
-                        label.Set("Text", RbxValue.Str(obj.Text ?? name));
-                        label.Set("TextScaled", RbxValue.Bool(true));
-                        label.Set("TextColor3", RbxValue.Color(new RbxColor3(1, 1, 1)));
-                        label.Set("TextStrokeTransparency", RbxValue.Float(0));
-                        label.Set("FontFace", new RbxValue(RbxType.Font, new RbxFont("rbxasset://fonts/families/FredokaOne.json", 400, "Normal", "")));
+                        // Front (5) always; Back (2) too for a sign read from both ways.
+                        foreach (var (face, guiName) in obj.TwoSided == true ? new[] { (5u, "Sign"), (2u, "SignBack") } : new[] { (5u, "Sign") })
+                        {
+                            var gui = inst.AddChild(new RbxInstance("SurfaceGui", guiName));
+                            gui.Set("Face", RbxValue.Token(face));
+                            gui.Set("SizingMode", RbxValue.Token(1)); // PixelsPerStud: text the same size on every board
+                            gui.Set("PixelsPerStud", RbxValue.Float(40));
+                            var label = gui.AddChild(new RbxInstance("TextLabel", "Text"));
+                            label.Set("Size", RbxValue.UDim2(new RbxUDim2(new RbxUDim(1, 0), new RbxUDim(1, 0))));
+                            label.Set("BackgroundTransparency", RbxValue.Float(1));
+                            label.Set("Text", RbxValue.Str(obj.Text ?? name));
+                            label.Set("TextScaled", RbxValue.Bool(true));
+                            label.Set("TextColor3", RbxValue.Color(new RbxColor3(1, 1, 1)));
+                            label.Set("TextStrokeTransparency", RbxValue.Float(0));
+                            label.Set("FontFace", new RbxValue(RbxType.Font, new RbxFont("rbxasset://fonts/families/FredokaOne.json", 400, "Normal", "")));
+                        }
                         break;
                     }
                 case SceneKinds.Part:

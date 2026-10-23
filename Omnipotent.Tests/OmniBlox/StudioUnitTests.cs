@@ -60,6 +60,15 @@ namespace Omnipotent.Tests.OmniBlox
         }
 
         [Fact]
+        public void AFixedBundle_NamedLikeAContainer_IsFine_ButAChanceWordAlwaysFails()
+        {
+            var bundle = ComplianceChecker.Check(Page(), new[] { Product("Starter Crate", 49, "currency:500", description: "500 coins, always") }, null);
+            Assert.DoesNotContain(bundle.Errors, e => e.Contains("paid random item"));
+            var lucky = ComplianceChecker.Check(Page(), new[] { Product("Lucky Crate", 49, "currency:500", description: "500 coins") }, null);
+            Assert.Contains(lucky.Errors, e => e.Contains("paid random item"));
+        }
+
+        [Fact]
         public void TooLongText_Fails()
         {
             var r = ComplianceChecker.Check(Page(new string('A', 3) + new string('b', 60), new string('x', 1200)), Array.Empty<ProductRecord>(), null);

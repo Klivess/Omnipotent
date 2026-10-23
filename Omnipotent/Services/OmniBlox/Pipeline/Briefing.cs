@@ -177,9 +177,18 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             if (game.Stage == GameStage.Test) return;
             if (bs.MapScore is int score)
             {
-                sb.AppendLine($"Map: score {score}/100 (the bar is {StageGates.MinMapScore}; aim for 80+).");
+                sb.AppendLine($"Map: score {score}/100 (the bar is {StageGates.MinMapScore} with no [error]; aim for 85+).");
                 foreach (var f in bs.MapFindings.Take(10)) sb.AppendLine("- " + f);
             }
+            if (bs.Economy is { Length: > 0 } economy)
+            {
+                // The bot's summary line and its problems (the full timeline is in map_report).
+                sb.AppendLine("Economy check: " + economy.Split('\n')[0].Trim());
+                foreach (var f in bs.EconomyFindings.Take(6)) sb.AppendLine("- " + f);
+            }
+            var decisions = game.Publish.Approvals.Where(a => a.Decision == "changes").OrderByDescending(a => a.Utc).Take(3).ToList();
+            foreach (var d in decisions)
+                sb.AppendLine($"The owner asked for changes at the {(d.Gate == Approvals.BuildGate ? "build sign-off" : "launch approval")} of r{d.Revision} ({d.Utc:yyyy-MM-dd}): {d.Note}");
             if (bs.LastEngineRun is { } run)
             {
                 bool current = run.Revision == bs.Revision;
@@ -189,6 +198,10 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             else if (StageGates.EngineAvailable(ctx, game) && game.Stage == GameStage.Build)
             {
                 sb.AppendLine("Engine tests: never run — run_tests runs the game in Roblox's engine.");
+            }
+            else if (StageGates.LocalEngineStandsIn(ctx, game) && game.Stage == GameStage.Build)
+            {
+                sb.AppendLine("Engine tests: never run — run_tests boots it and plays it through in the studio's local engine (no Roblox API key or experience slot yet).");
             }
             if (game.LastTest is { } t)
             {

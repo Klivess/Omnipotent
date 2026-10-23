@@ -39,6 +39,69 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
         {
             var ws = ctx.Workspace(gameId);
 
+            box.Add("design_world", "The world's design, and regenerating it. With no arguments: the current world spec (layout, biome, art style, lighting, density, water, the hub, the zones with their resources and prices, the obby course or the tycoon plots, the model palette). "
+                + "Give spec (any of its fields) to change it; a zones list you give replaces the zones (each: id, name, biome, theme, price, resource {kind, assets, count, hp, value, respawn, scale}, landmark, palette {role: [asset ids]}). "
+                + "Then the world is regenerated: terrain, layout, gameplay objects and scenery the generator made are rebuilt; objects you placed yourself stay. For a simulator the economy is rebalanced on the new map (balance false to keep your prices). "
+                + "Biomes: meadow, forest, autumn, snow, desert, beach, jungle, volcanic, candy, spooky, crystal. Roles for palette: tree, conifer, palm, deadtree, bush, flower, grass, rock, boulder, mushroom, stump, log, crystal, cactus, fence, lamp, bench, sign, building, stall, landmark, fountain, statue, campfire, crate, barrel, cart, pumpkin, candy, well.",
+                Object(Opt("spec", Free("Fields of the world spec to change, e.g. {\"density\": 1.3, \"zones\": [...]}")), Opt("regenerate", Bool("Rebuild the world now (default true)")),
+                    Opt("seed", Int("A new layout and scatter (keeps the design)")), Opt("balance", Bool("Rebalance a simulator's prices on the new map (default true)"))),
+                args =>
+                {
+                    var scene = ws.LoadScene();
+                    var manifest = ws.LoadManifest();
+                    var game = ctx.Game(gameId)!;
+                    string template = (manifest.Template ?? "").ToLowerInvariant();
+                    var spec = scene.Spec ?? (game.Brief != null ? GameScaffold.SpecFor(game.Brief, GameScaffold.TemplateFor(game.Brief, manifest), scene.Objects.Count + 1) : new Build.WorldGen.WorldSpec());
+                    if (args["spec"] == null && args["seed"] == null && args["regenerate"] == null)
+                        return ToolResult.Ok("World spec (change any field with design_world spec):\n" + JsonConvert.SerializeObject(spec, Formatting.Indented, new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore }));
+                    if (args["spec"] is JObject change)
+                    {
+                        var merged = JObject.FromObject(spec);
+                        MergeInto(merged, change);
+                        try { spec = merged.ToObject<Build.WorldGen.WorldSpec>() ?? spec; }
+                        catch (JsonException ex) { return ToolResult.Error("the spec does not fit: " + ex.Message); }
+                    }
+                    if (args["seed"] != null) spec.Seed = Args.Int(args, "seed", spec.Seed);
+                    string expected = template switch { "obby" => "course", "tycoon" => "plots", _ => "hub" };
+                    if (!string.Equals(spec.Layout, expected, StringComparison.OrdinalIgnoreCase))
+                        return ToolResult.Error($"a {template} game's world has layout '{expected}' (the template decides the layout)");
+                    if (!Args.Bool(args, "regenerate", true))
+                    {
+                        scene.Spec = spec;
+                        ws.SaveScene(scene);
+                        return ToolResult.Ok("World spec saved (not regenerated yet).");
+                    }
+                    var result = Build.WorldGen.WorldGenerator.Generate(spec, manifest, ctx.Catalog(), scene);
+                    string economy = "";
+                    if (template == "simulator" && Args.Bool(args, "balance", true))
+                        economy = GameScaffold.TuneEconomy(manifest, result.Scene);
+                    // Quests that point at things the new world no longer has are remade.
+                    if (manifest.Quests.Count == 0 || manifest.Quests.Any(q => q.Target is { } t && t.StartsWith("Gate_", StringComparison.Ordinal) && !result.Scene.Objects.Any(o => o.Name == t)))
+                        manifest.Quests = GameScaffold.QuestsFor(template, manifest, result.Scene);
+                    manifest.Save(ws.ManifestPath);
+                    ws.SaveScene(result.Scene);
+                    var compiled = ctx.Compile(gameId);
+                    var map = MapReport.Analyze(result.Scene, compiled.Parts, compiled.Terrain, manifest, catalog: ctx.Catalog().Get);
+                    string text = "Regenerated. " + result.Describe() + "\n" + map.Describe() + (economy.Length > 0 ? "\nECONOMY (rebalanced on this map):\n" + economy : "")
+                        + "\nLook at it: render_scene spawn, aerial and zone:<id>.";
+                    if (compiled.Parts.Count == 0 && compiled.Terrain == null) return ToolResult.Ok(text);
+                    return ToolResult.WithImages(text, new[] { ctx.RenderCompiled(gameId, compiled, "map", 1280, 760, labels: false) });
+                });
+
+            box.Add("balance_economy", "Simulator only: rebalance every price (zones, tools, bag, speed, rebirth) with a bot that plays the game's own numbers on its map, so a good player meets a gentle schedule (a sale in ~1 minute, a tool in the first minute or two, a new zone every several minutes, rebirth ~25 minutes after the last zone). Run it after changing node hits/values, tools or the map. Returns the bot's timeline.",
+                Object(),
+                args =>
+                {
+                    var manifest = ws.LoadManifest();
+                    if (!string.Equals(manifest.Template, "simulator", StringComparison.OrdinalIgnoreCase)) return ToolResult.Error("only a simulator's economy is balanced this way");
+                    var scene = ws.LoadScene();
+                    string report = GameScaffold.TuneEconomy(manifest, scene);
+                    if (report.Length == 0) return ToolResult.Error("there are no resource nodes in the map to balance against (design_world makes them)");
+                    manifest.Save(ws.ManifestPath);
+                    ws.SaveScene(scene);
+                    return ToolResult.Ok("Prices rebalanced (gates and game.json updated).\n" + report);
+                });
+
             box.Add("scene_summary", "The world as data: terrain, play area, layout plan, folders, lighting, and the objects (id, kind, name, folder, position, size, tags), optionally one folder.",
                 Object(Opt("folder", Str("Only this folder")), Opt("limit", Int("Max objects (default 120)"))),
                 args =>
@@ -51,8 +114,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     sb.AppendLine($"{scene.Objects.Count} objects; lighting {scene.Lighting.Preset}; {scene.Terrain.Count} simple terrain fill(s).");
                     if (scene.Land is { } land)
                         sb.AppendLine($"Terrain: {land.Size[0]:0}×{land.Size[1]:0} studs centred ({land.Center[0]:0}, {land.Center[1]:0}), {land.Biome}/{land.Material ?? "biome ground"}, hills {land.Hills:0} (flat within {land.FlatRadius:0} of the centre), border {land.BorderHeight:0} high, water {(land.WaterLevel is float w ? "at y " + w.ToString("0.#", CultureInfo.InvariantCulture) : "none")}, {land.Ops.Count} sculpt step(s).");
-                    else sb.AppendLine("Terrain: none generated (terrain_generate).");
-                    sb.AppendLine(scene.Bounds.HasArea ? $"Play area: x {scene.Bounds.MinX:0}…{scene.Bounds.MaxX:0}, z {scene.Bounds.MinZ:0}…{scene.Bounds.MaxZ:0} (walls {(scene.Bounds.Walls ? "on" : "off")})." : "Play area: not set (set_map_area).");
+                    else sb.AppendLine("Terrain: none generated (design_world).");
+                    sb.AppendLine(scene.Bounds.HasArea ? $"Play area: x {scene.Bounds.MinX:0}…{scene.Bounds.MaxX:0}, z {scene.Bounds.MinZ:0}…{scene.Bounds.MaxZ:0} (walls {(scene.Bounds.Walls ? "on" : "off")})." : "Play area: not set (design_world generates one).");
                     if (scene.Layout.Zones.Count > 0)
                         sb.AppendLine("Zones: " + string.Join("; ", scene.Layout.Zones.OrderBy(z => z.Order).Select(z => $"{z.Order}. {z.Id} {z.Name} [{V(z.Area)}] {z.Purpose}")));
                     if (scene.Layout.Paths.Count > 0) sb.AppendLine("Paths: " + string.Join("; ", scene.Layout.Paths.Select(p => $"{p.From}→{p.To} ({p.Points.Count} points)")));
@@ -65,7 +128,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     return ToolResult.Ok(sb.ToString());
                 });
 
-            box.Add("terrain_generate", "Generate the map's terrain: a flat core at y = 0 for building, rolling hills outside it, mountains along the edges so the world has no visible end, optional water. Make it 80-150 studs bigger than the play area on every side. Keeps sculpt steps unless reset is true. Biomes pick the materials of slopes, peaks and shores.",
+            box.Add("terrain_generate", "Generate the map's terrain: a flat core at y = 0 for building, rolling hills outside it, mountains along the edges so the world has no visible end, optional water. Make it 80-150 studs bigger than the play area on every side. Keeps sculpt steps unless reset is true. Biomes pick the materials of slopes, peaks and shores. Only for a world that was not generated: a generated world's ground comes from design_world.",
                 Object(Opt("size", Arr(new JObject { ["type"] = "number" }, "[x, z] studs (default 640 × 640)")), Opt("center", Arr(new JObject { ["type"] = "number" }, "[x, z] (default 0, 0)")),
                     Opt("biome", Str("Look of slopes/peaks/shores", "meadow", "forest", "desert", "snow", "beach", "volcanic", "candy")), Opt("material", Str("Ground material (Grass, LeafyGrass, Sand, Snow, Ground…)")),
                     Opt("hills", Num("Hill height outside the flat core, studs (0 = flat; 8-20 is gentle)")), Opt("hill_scale", Num("Studs between hills (default 120)")), Opt("seed", Int("Changes the shape")),
@@ -75,6 +138,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 args =>
                 {
                     var scene = ws.LoadScene();
+                    if (scene.Spec != null) return Generated("terrain_generate", "its ground (zone plateaus, ramped roads, the lake, the mountains past the edge) is shaped round the layout");
+                    var before = TerrainOf(scene);
                     var land = scene.Land ?? new TerrainRecipe();
                     if (Args.Bool(args, "reset")) land.Ops.Clear();
                     if (Vec2(args, "size") is { } size) land.Size = new[] { Math.Clamp(size[0], 64, 2048), Math.Clamp(size[1], 64, 2048) };
@@ -97,9 +162,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     if (Args.Num(args, "border_width") is double bw) land.BorderWidth = (float)Math.Clamp(bw, 8, 400);
                     if (args["water_level"] != null) land.WaterLevel = Args.Num(args, "water_level") is double wl ? (float)wl : null;
                     scene.Land = land;
-                    ws.SaveScene(scene);
                     var map = TerrainOf(scene)!;
-                    return ToolResult.Ok($"Terrain: {map.Width}×{map.Depth} cells of {map.Cell:0.#} studs covering x {map.OriginX:0}…{map.MaxX:0}, z {map.OriginZ:0}…{map.MaxZ:0}; heights {map.Heights.Min():0.#}…{map.Heights.Max():0.#}; materials {string.Join(", ", map.MaterialNames)}. Look at it with render_scene (map, aerial).");
+                    int moved = WorldOps.Reground(scene, before, map, ctx.Catalog().Get);
+                    ws.SaveScene(scene);
+                    return ToolResult.Ok($"Terrain: {map.Width}×{map.Depth} cells of {map.Cell:0.#} studs covering x {map.OriginX:0}…{map.MaxX:0}, z {map.OriginZ:0}…{map.MaxZ:0}; heights {map.Heights.Min():0.#}…{map.Heights.Max():0.#}; materials {string.Join(", ", map.MaterialNames)}." +
+                        (moved > 0 ? $" {moved} object(s) standing on the old ground were moved onto the new." : "") + " Look at it with render_scene (map, aerial).");
                 });
 
             box.Add("terrain_sculpt", "Sculpt the terrain, in order: flatten/plateau (a round area to a height, e.g. a plaza or a building pad), raise/lower (a hill or dip), lake (a round pond; sets water), river (water along points), path (a walkable path along points, painted with a material), paint (a material over a circle or polygon). Use undo to drop the last steps, clear to drop all.",
@@ -112,6 +179,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 {
                     var scene = ws.LoadScene();
                     if (scene.Land == null) return ToolResult.Error("there is no terrain yet; call terrain_generate first");
+                    var before = TerrainOf(scene);
                     if (Args.Bool(args, "clear")) scene.Land.Ops.Clear();
                     int undo = Math.Clamp(Args.Int(args, "undo", 0), 0, scene.Land.Ops.Count);
                     if (undo > 0) scene.Land.Ops.RemoveRange(scene.Land.Ops.Count - undo, undo);
@@ -136,18 +204,21 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                         scene.Land.Ops.Add(op);
                         added.Add(op.Kind);
                     }
-                    ws.SaveScene(scene);
                     var map = TerrainOf(scene)!;
-                    return ToolResult.Ok($"{(added.Count > 0 ? "Added " + string.Join(", ", added) : "No steps added")}; {scene.Land.Ops.Count} step(s) in all. Heights now {map.Heights.Min():0.#}…{map.Heights.Max():0.#}, water {(map.WaterLevel is float w ? "at y " + w.ToString("0.#", CultureInfo.InvariantCulture) : "none")}.");
+                    int moved = WorldOps.Reground(scene, before, map, ctx.Catalog().Get);
+                    ws.SaveScene(scene);
+                    return ToolResult.Ok($"{(added.Count > 0 ? "Added " + string.Join(", ", added) : "No steps added")}; {scene.Land.Ops.Count} step(s) in all. Heights now {map.Heights.Min():0.#}…{map.Heights.Max():0.#}, water {(map.WaterLevel is float w ? "at y " + w.ToString("0.#", CultureInfo.InvariantCulture) : "none")}." +
+                        (moved > 0 ? $" {moved} object(s) standing on the old ground were moved onto the new." : ""));
                 });
 
-            box.Add("set_map_area", "Set the play area: the rectangle players stay inside. The kit puts invisible walls on its edges and puts anyone who falls off back at the spawn. Keep scenery (mountains, forest edges) just outside it to frame the map.",
+            box.Add("set_map_area", "Set the play area: the rectangle players stay inside. The kit puts invisible walls on its edges and puts anyone who falls off back at the spawn. Keep scenery (mountains, forest edges) just outside it to frame the map. Only for a world that was not generated (design_world sizes a generated one).",
                 Object(Req("area", Arr(new JObject { ["type"] = "number" }, "[minX, minZ, maxX, maxZ]")), Opt("walls", Bool("Invisible walls on the edges (default true)"))),
                 args =>
                 {
                     var a = (args["area"] as JArray)?.Select(x => (float)x).ToArray();
                     if (a is not { Length: 4 } || a[2] <= a[0] || a[3] <= a[1]) return ToolResult.Error("area must be [minX, minZ, maxX, maxZ] with max above min");
                     var scene = ws.LoadScene();
+                    if (scene.Spec != null) return Generated("set_map_area", "its play area is sized to the layout, with the tree line and mountains just outside it");
                     scene.Bounds.Area = a;
                     scene.Bounds.Walls = Args.Bool(args, "walls", true);
                     ws.SaveScene(scene);
@@ -156,7 +227,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     return ToolResult.Ok($"Play area {a[2] - a[0]:0}×{a[3] - a[1]:0} studs." + warn);
                 });
 
-            box.Add("plan_map", "Write (or replace) the map plan before building: a one-paragraph concept, the zones players move through in order (1 = the spawn hub), the paths between them and a landmark per zone. The map view draws it and the map report checks the world against it.",
+            box.Add("plan_map", "Write (or replace) the map plan before building: a one-paragraph concept, the zones players move through in order (1 = the spawn hub), the paths between them and a landmark per zone. The map view draws it and the map report checks the world against it. Only for a world that was not generated (a generated world's plan is its layout; design_world changes it).",
                 Object(Opt("concept", Str("What the map is and how a player moves through it")),
                     Opt("zones", Arr(Object(Req("id", Str("Short id, e.g. hub, z1")), Req("name", Str("Name shown to players")), Req("area", Arr(new JObject { ["type"] = "number" }, "[minX, minZ, maxX, maxZ]")),
                         Opt("purpose", Str("What happens there")), Opt("order", Int("1 = spawn hub")), Opt("theme", Str("Its look"))), "Zones")),
@@ -165,6 +236,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 args =>
                 {
                     var scene = ws.LoadScene();
+                    if (scene.Spec != null) return Generated("plan_map", "its map plan (the zones, their gates and roads) is the layout the generator built; zones that players are walked out of until they pay come from it");
                     var plan = scene.Layout;
                     if (args["concept"] != null) plan.Concept = Clip(Args.Str(args, "concept"), 800);
                     if (args["zones"] is JArray zones)
@@ -334,25 +406,27 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     return ToolResult.Ok($"Lighting set to {preset}. render_scene shows the look.");
                 });
 
-            box.Add("set_terrain", "Simple terrain fills (blocks or balls of a material). Prefer terrain_generate for a whole map.",
-                Object(Req("fills", Arr(Object(Opt("shape", Str("block or ball")), Req("material", Str("Grass, Sand, Water, Rock, Snow, Ground, Mud, Ice, Slate, Sandstone, LeafyGrass, Asphalt, Basalt, CrackedLava")),
-                    Req("center", Vec3("Centre")), Req("size", Vec3("Size"))), "Terrain fills")), Opt("replace", Bool("Replace existing fills (default true)"))),
-                args =>
-                {
-                    var scene = ws.LoadScene();
-                    if (Args.Bool(args, "replace", true)) scene.Terrain.Clear();
-                    foreach (var f in (args["fills"] as JArray ?? new JArray()).OfType<JObject>().Take(40))
-                    {
-                        var c = Args.Vec3(f, "center") ?? throw new ArgumentException("terrain center must be [x, y, z]");
-                        var s = Args.Vec3(f, "size") ?? throw new ArgumentException("terrain size must be [x, y, z]");
-                        scene.Terrain.Add(new TerrainFill { Shape = Args.Str(f, "shape", "block").ToLowerInvariant() == "ball" ? "ball" : "block", Material = Args.Str(f, "material", "Grass"), Center = c, Size = s });
-                    }
-                    ws.SaveScene(scene);
-                    return ToolResult.Ok($"{scene.Terrain.Count} terrain fill(s).");
-                });
-
             AddPlacement(box, ctx, gameId, ws);
         }
+
+        /// <summary>
+        /// Merges a change into the spec, matching names in any case (agents write "course", the spec has "Course"), so a
+        /// nested change keeps the fields it does not name; lists are replaced whole.
+        /// </summary>
+        internal static void MergeInto(JObject target, JObject change)
+        {
+            foreach (var prop in change.Properties())
+            {
+                var existing = target.Properties().FirstOrDefault(p => string.Equals(p.Name, prop.Name, StringComparison.OrdinalIgnoreCase));
+                if (existing?.Value is JObject into && prop.Value is JObject from) MergeInto(into, from);
+                else target[existing?.Name ?? prop.Name] = prop.Value.DeepClone();
+            }
+        }
+
+        /// <summary>The refusal for a hand edit of what the world generator owns.</summary>
+        private static ToolResult Generated(string tool, string why) =>
+            ToolResult.Error($"this world is generated from its world spec and {why}, so {tool} would break it. Change the design with design_world (biome, zones, density, water, lighting, seed, …; it regenerates and keeps what you placed by hand), " +
+                "make local ground changes with terrain_sculpt (everything standing there moves with the ground), and add your own things with place_asset, scatter_assets, place_along and add_objects.");
 
         private static void AddPlacement(AgentToolbox box, StudioContext ctx, string gameId, GameWorkspace ws)
         {

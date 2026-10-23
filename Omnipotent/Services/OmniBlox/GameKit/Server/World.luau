@@ -18,6 +18,7 @@ local Currency = require(script.Parent.Currency)
 local Analytics = require(script.Parent.Analytics)
 local Effects = require(script.Parent.Effects)
 local Util = require(game:GetService("ReplicatedStorage"):WaitForChild("OmniKit"):WaitForChild("Util"))
+local Net = require(game:GetService("ReplicatedStorage"):WaitForChild("OmniKit"):WaitForChild("Net"))
 
 local World = {}
 
@@ -216,6 +217,7 @@ end
 -- ─────────────────────────────── tagged behaviour ───────────────────────────────
 
 function World.Start()
+	Net.Event("OpenPanel") -- made now, so clients waiting for it never hang
 	World.BuildTerrain()
 	World.BuildBounds()
 	if Config.Testing ~= true then
@@ -349,6 +351,34 @@ function World.Start()
 		local height = Util.Number(part, "Height", 1)
 		local info = TweenInfo.new(Util.Number(part, "Period", 1.6), Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
 		TweenService:Create(part, info, { CFrame = part.CFrame + Vector3.new(0, height, 0) }):Play()
+	end)
+
+	-- Stands: stepping on a stand's mat (or using its prompt) opens a HUD panel (upgrades, shop, rebirth).
+	onTag("Stand", function(part)
+		local panel = tostring(setting(part, "Panel", "shop"))
+		local ready = Util.Debouncer(2.5)
+		local function open(player: Player)
+			if ready(player.UserId) then
+				Net.Event("OpenPanel"):FireClient(player, panel)
+			end
+		end
+		part.Touched:Connect(function(hit)
+			local player = Util.PlayerFromHit(hit)
+			if player then
+				open(player)
+			end
+		end)
+		local prompt = Instance.new("ProximityPrompt")
+		prompt.Name = "OpenPrompt"
+		prompt.ActionText = "Open"
+		prompt.ObjectText = string.upper(string.sub(panel, 1, 1)) .. string.sub(panel, 2)
+		prompt.HoldDuration = 0
+		prompt.MaxActivationDistance = 12
+		prompt.RequiresLineOfSight = false
+		prompt.Parent = part
+		prompt.Triggered:Connect(function(player)
+			Net.Event("OpenPanel"):FireClient(player, panel)
+		end)
 	end)
 
 	onTag("Glow", function(part)

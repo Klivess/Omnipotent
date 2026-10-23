@@ -59,14 +59,20 @@ namespace Omnipotent.Tests.OmniBlox
             await h.Harvester.RunOnceAsync(CancellationToken.None);
             SeedLibrary(ctx.Library, h.Now);
 
-            // ── Game 1: idea to live.
+            // ── Game 1: idea to live, through the owner's two gates (play and sign off the build, then approve the launch).
             h.Now = LaunchDay;
+            ctx.Settings.RequireBuildSignoff = true;
+            ctx.Settings.RequireLaunchApproval = true;
             PipelineEndToEndTests.ScriptResearch(h.Llm);
             PipelineEndToEndTests.ScriptBuild(h.Llm);
             PipelineEndToEndTests.ScriptReview(h.Llm);
             PipelineEndToEndTests.ScriptMarketing(h.Llm);
-            await h.StepUntilAsync(() => ctx.Store.Read(s => s.Games.Values.Any(g => g.Stage == GameStage.Live)), 40);
-            string live = ctx.Store.Read(s => s.Games.Values.Single(g => g.Stage == GameStage.Live).GameId);
+            await h.StepUntilAsync(() => ctx.Store.Read(s => s.Games.Values.Any(g => g.WaitingReason?.Contains("sign it off") == true)), 40);
+            string live = ctx.Store.Read(s => s.Games.Values.Single(g => g.Stage == GameStage.Launch).GameId);
+            Approvals.Approve(ctx, live, Approvals.BuildGate, "Played it to the finish: the jumps are fair and the lava reads as danger.");
+            await h.StepUntilAsync(() => h.Game(live).WaitingReason?.Contains("launch approval") == true, 40);
+            Approvals.Approve(ctx, live, Approvals.LaunchGate, "Store page and prices look right.");
+            await h.StepUntilAsync(() => h.Game(live).Stage == GameStage.Live, 40);
             PolishHandovers(ctx, live);
 
             IngestTelemetry(ctx, live);
@@ -247,14 +253,14 @@ namespace Omnipotent.Tests.OmniBlox
             var text = new Dictionary<string, string>
             {
                 ["researcher"] = "Lava obbies are trending (Lava Rush Obby: 5,400 playing, 90% likes) and the library has forest models. Chose a lava obby through a pine forest; brief written with Skip Stage and VIP.",
-                ["builder"] = "Three stages over a lava floor with checkpoints, a gold finish and a pine tree. Every milestone is done and the build is clean.",
+                ["builder"] = "Shortened the generated course to sixteen stages over the lava basin (one new mechanic at a time, a checkpoint at every stage) and put a pine tree on the start platform. Every milestone is done and the build is clean.",
                 ["tester"] = "Clear path, fair jumps, the lava is obvious. Engine specs passed.",
                 ["marketer"] = "Store page, icon and thumbnail made from the real world; compliance passed; launch requested.",
             };
             var next = new Dictionary<string, string[]>
             {
-                ["researcher"] = new[] { "Builder: three stages first, then the lava and the finish" },
-                ["builder"] = new[] { "Tester: play it from the spawn", "Check the pine tree sits on the ground" },
+                ["researcher"] = new[] { "Builder: start from the generated course; keep the first stages easy" },
+                ["builder"] = new[] { "Tester: play it from the spawn", "Check the first five stages are easy" },
                 ["tester"] = new[] { "Marketer: lead with the lava in the thumbnail" },
                 ["marketer"] = new[] { "Wait for the launch sequence; upload the icon by hand" },
             };
@@ -271,8 +277,8 @@ namespace Omnipotent.Tests.OmniBlox
                 {
                     new() { Key = "experience", Text = "Experience 1001, place 2002", Utc = at, Stage = GameStage.Launch, Source = FactBook.Studio },
                     new() { Key = "products", Text = "Skip Stage (developer product, 25 R$), VIP (game pass, 149 R$)", Utc = at, Stage = GameStage.Launch },
-                    new() { Key = "checkpoints", Text = "Checkpoint pads at z = 0, -14 and -28; gold finish at z = -42", Utc = at, Stage = GameStage.Build },
-                    new() { Key = "lava", Text = "Lava kill brick 40×60 studs at y = -2", Utc = at, Stage = GameStage.Build },
+                    new() { Key = "course", Text = "16 stages snaking in rows from the start platform (top at y 14, z 120) to the gold finish; a checkpoint pad at every stage", Utc = at, Stage = GameStage.Build },
+                    new() { Key = "lava", Text = "An invisible kill floor just above the lava basin catches every fall", Utc = at, Stage = GameStage.Build },
                     new() { Key = "direction", Text = "Keep the first three stages easy: the owner's playtest showed younger players giving up on stage 2.", Utc = at, Stage = GameStage.Build, Source = FactBook.Owner },
                 };
                 foreach (var e in s.Events.Where(e => e.GameId == gameId))
@@ -332,53 +338,27 @@ namespace Omnipotent.Tests.OmniBlox
             llm.Script("builder",
                 new
                 {
-                    summary = "Laid out the first plot: floor, conveyor, collector and the first two buttons. The build compiles; droppers are next.",
-                    decisions = new[] { new { what = "One 80×80 plot per player", why = "room for 12 buttons without crowding on phones" } },
-                    problems = new[] { "Only two buttons so far; the brief wants twelve" },
-                    next_steps = new[] { "Add droppers inside the plot's Items folder", "Wire the rebirth button" },
-                    key_facts = new[] { "Collector is at (0, 0.5, -20)" },
+                    summary = "Read the generated baseline (four plots round a plaza, twelve buttons each in price order) and gave it the candy look. The build compiles; the first dropper's price is next.",
+                    decisions = new[] { new { what = "Kept the generated plots and gave them the candy theme", why = "every plot already has its line of twelve buttons in price order, a collector and a spawn" } },
+                    problems = new[] { "Players start with 50 candy but the first dropper costs 60" },
+                    next_steps = new[] { "Lower the first dropper or raise the starting candy", "Line the plaza with candy canes" },
+                    key_facts = new[] { "Four candy plots face the plaza; the shop and the leaderboard are by the spawn" },
                     stage_complete = false,
                 },
                 ("set_milestones", new { milestones = new[] { "Core loop: droppers, conveyor and collector", "Twelve buttons and a rebirth", "Polish: decoration, leaderboard and sounds" } }),
                 ("update_manifest", new { title = "Candy Factory Tycoon", currency_name = "Candy", starting_currency = 50, tips = new[] { "Step on the green buttons to buy!" } }),
-                ("terrain_generate", new { size = new[] { 420, 420 }, biome = "candy", hills = 10, seed = 11, flat_radius = 110 }),
-                ("set_map_area", new { area = new[] { -140, -140, 140, 140 } }),
-                ("plan_map", new
-                {
-                    concept = "A candy island: the factory plot in the middle, a candy-cane grove to the east and a lollipop lake to the north-west.",
-                    zones = new object[]
-                    {
-                        new { id = "factory", name = "Factory", area = new[] { -50, -50, 50, 50 }, order = 1, purpose = "the plot: droppers, conveyor, collector, buttons", theme = "pink factory floor" },
-                        new { id = "grove", name = "Candy Grove", area = new[] { 60, -140, 140, 140 }, order = 2, purpose = "decoration and the rebirth statue", theme = "candy canes" },
-                    },
-                    paths = new object[] { new { from = "factory", to = "grove", points = new[] { new[] { 40, 0 }, new[] { 100, 0 } } } },
-                    landmarks = new object[] { new { name = "Giant Lollipop", position = new[] { 110, -90 }, note = "visible from the plot" } },
-                }),
-                ("set_lighting", new { preset = "candy" }),
-                ("add_objects", new
-                {
-                    objects = new object[]
-                    {
-                        new { kind = "spawn", name = "Start", position = new[] { 0, 0.5, 34 }, size = new[] { 8, 1, 8 } },
-                        new { name = "Floor", position = new[] { 0, -0.5, 0 }, size = new[] { 80, 1, 80 }, color = "#F8BBD0", material = "SmoothPlastic" },
-                        new { name = "Conveyor", position = new[] { 0, 0.5, -6 }, size = new[] { 4, 1, 24 }, color = "#424242", tags = new[] { "Conveyor" }, config = new { Speed = 8 } },
-                        new { name = "Collector", position = new[] { 0, 0.5, -20 }, size = new[] { 6, 1, 6 }, color = "#FFC107", material = "Neon", tags = new[] { "TycoonCollector" } },
-                        new { name = "BuyDropper", position = new[] { 8, 0.25, 10 }, size = new[] { 4, 0.5, 4 }, color = "#4CAF50", tags = new[] { "TycoonButton" }, config = new { Price = 50, Unlocks = "Dropper1" } },
-                        new { name = "BuyUpgrader", position = new[] { -8, 0.25, 10 }, size = new[] { 4, 0.5, 4 }, color = "#2196F3", tags = new[] { "TycoonButton" }, config = new { Price = 250, Unlocks = "Upgrader" } },
-                    },
-                }),
+                ("design_world", new { }),
+                ("design_world", new { spec = new { biome = "candy", lighting = "candy", plots = new { count = 4, theme = "candy" } } }),
                 ("build", new { }),
-                ("update_milestone", new { id = "m1", done = false, notes = "conveyor and collector in; droppers next" }));
+                ("update_milestone", new { id = "m1", done = false, notes = "the plots work; the first dropper is too dear" }));
             llm.Script("builder",
                 new
                 {
-                    summary = "Placed decoration around the plot and added the welcome script. Revision 2 compiles with no geometry errors.",
-                    next_steps = new[] { "Add droppers", "Ten more buttons" },
+                    summary = "Lined the plaza with candy canes and added the welcome script and a spec. Revision 2 compiles with no geometry errors.",
+                    next_steps = new[] { "Fix the first dropper's price", "Add the candy machine finale" },
                     stage_complete = false,
                 },
-                ("place_asset", new { asset_id = FakeRoblox.AssetId, position = new[] { 30, 0, 24 }, yaw = 15 }),
-                ("place_asset", new { asset_id = 900105, position = new[] { -24, 0, 26 }, yaw = 0 }),
-                ("scatter_assets", new { asset_ids = new[] { 900105L, FakeRoblox.AssetId }, zone = "grove", count = 40, seed = 2 }),
+                ("scatter_assets", new { asset_ids = new[] { 900105L, FakeRoblox.AssetId }, zone = "plaza", count = 8, seed = 2 }),
                 ("write_file", new { path = "src/server/Welcome.server.luau", content = "local Players = game:GetService(\"Players\")\n\nPlayers.PlayerAdded:Connect(function(player)\n\tprint(\"Welcome to the factory,\", player.Name)\nend)\n" }),
                 ("write_file", new { path = "src/tests/Factory.luau", content = "return {\n\t[\"the first dropper is affordable\"] = function(t)\n\t\tlocal p = t.player()\n\t\tt.ok(true)\n\tend,\n}\n" }),
                 ("build", new { }),

@@ -28,17 +28,16 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
 
         private const string Overview =
 @"HOW A GAME IS PUT TOGETHER
-- The Game Kit (already in every game) does saving, currencies, the shop and purchases, daily rewards, the leaderboard, feedback, analytics, zones and gates, rebirth, quests with a guide line, effects and sounds, terrain and map edges, the HUD, and the template's core loop.
+- The studio generated the baseline when the game reached Build (design.md says what it made): the template (obby, tycoon or simulator) already runs the whole core loop, game.json configures it, and the world was generated from a world spec (design_world shows and edits it).
+- The Game Kit (in every game) does saving, currencies, the shop and purchases, daily rewards, the leaderboard, feedback, analytics, zones and gates (players are kept out of a locked zone), rebirth, quests with a guide line, effects and sounds, terrain and map edges, the HUD with the template's widgets (a simulator's action button, bag bar and node health bars), stands that open panels, and the template's core loop.
 - Your code is only what is special about THIS game:
   src/server/systems/<Name>.luau   game systems: a ModuleScript returning { Priority = 100?, Start = function() … end, …your API }. The kit's Boot requires and starts every one (lower Priority first) after the kit and before players load, so Data.Loaded listeners you connect in Start see every player. Put ALL server logic here: it is what the engine tests can start and check.
-  src/server/<Name>.server.luau    a plain Script, only for tiny glue (systems are better).
-  src/client/controllers/<Name>.luau  client modules returning { Start = function(hud) … end }: the kit HUD calls them with its API (kit_reference client).
-  src/client/<Name>.client.luau    a plain LocalScript.
+  src/client/controllers/<Name>.luau  client modules returning { Start = function(hud) … end }: the kit HUD calls them with its API (kit_reference client). Never a second HUD.
   src/shared/<Name>.luau           modules both sides require (game.ReplicatedStorage.Shared.<Name>): item tables, prices, shared constants.
   src/tests/<Name>.luau            specs: return { ['what it checks'] = function(t) … end } (kit_reference testing).
-  design.md                        the game design: core loop, progression and economy numbers, the map plan, the first minute.
+  design.md                        the game design.
 - game.json (update_manifest): currencies, theme, sounds, quests, rebirth, tips, template settings.
-- scene.json (the world tools): terrain, play area, map plan, objects, folders, lighting.
+- scene.json (design_world and the world tools): the world spec, terrain, play area, map plan, objects, folders, lighting. What the generator made is regenerated from the spec; what you place by hand stays.
 - Requiring the kit: local Kit = game:GetService('ServerScriptService'):WaitForChild('OmniKitServer'); local Currency = require(Kit:WaitForChild('Currency'))
   Shared kit modules: local OmniKit = game:GetService('ReplicatedStorage'):WaitForChild('OmniKit'); local Net = require(OmniKit:WaitForChild('Net'))";
 
@@ -61,13 +60,14 @@ Effects (juice from the server; clients draw it)
   Effects.Burst(position, color?, count?, player?) · Effects.Float(player?, position, text, color?) · Effects.Sound(player?, name, position?) · Effects.Toast(player, text, kind?) · Effects.Reward(player, position?, text, color?)
 Analytics
   Analytics.Event(name, player?, fields?) · Analytics.Funnel(player, funnel, step, stepName?) · Analytics.Custom(player, name, value?) · Analytics.Economy(player, 'Source'|'Sink', amount, balance, reason, sku?, currency?)
-Progression (zones): Progression.Has(player, zone) · Progression.Unlock(player, zone) → bool · Progression.Gates() · Progression.Unlocked:Connect(fn(player, zone))
+Progression (zones): Progression.Has(player, zone) · Progression.Accessible(player, zone) (open zones too) · Progression.Unlock(player, zone) → bool · Progression.Gates() · Progression.LockedAt(player, position) → region? · Progression.Unlocked:Connect(fn(player, zone))
 Rebirth: Rebirth.Enabled · Rebirth.Try(player) → bool · Rebirth.Count(player) · Rebirth.Cost(player) · Rebirth.Bonus(count) · Rebirth.Done:Connect(fn(player, count)) — reset your own state there
 Quests: Quests.Track(player, event, amount?) → finished? · Quests.State(player) · Quests.List · Quests.Completed:Connect(fn(player, quest))
 Rewards: Rewards.Enabled() · Rewards.TryClaim(player, now?) → amount · Rewards.Base()
 World: World.SpawnPoint() → CFrame · World.BuildTerrain() (already done at start)
 Leaderboard: Leaderboard.Title = '…' · Leaderboard.Stat = function(profile) return number end
-Templates: Templates.Simulator: Collect(player, value) → added, Sell(player) → gained, BuyUpgrade(player, key) → bool, Level(player, key), Capacity(player), Bag(player), Upgrades
+Templates: Templates.Simulator: Hit(player, node, force?) → (damage, broke), Nearest(player) → node?, Nodes() → {Node}, Node(inst), Restore(inst), CanHarvest(player, zone?), Collect(player, value) → added, Sell(player) → gained,
+           BuyTool(player) → bool, ToolTier(player), Tool(player), Power(player), Cooldown(player), BuyUpgrade(player, key) → bool, Level(player, key), Capacity(player), Bag(player), Upgrades, Tools, Verb, ToolName
            Templates.Obby: Reach(player, stage) → bool, SkipStage(player), Finish(player), StageCount, Index()
            Templates.Tycoon: Plots(), Buy(player, plot, button), Collect(player, plot), Claim(player)
 SHARED MODULES (require(game.ReplicatedStorage.OmniKit.<Name>))
@@ -96,11 +96,15 @@ Style rules (kids play on phones): big touch targets (≥ 56 px), few words, emo
 Server → client: create remotes with Net (Net.Event('PetHatched'):FireClient(player, data)); the client listens with Net.Event('PetHatched').OnClientEvent:Connect(fn).";
 
         private const string Templates =
-@"obby — checkpoints are parts tagged Checkpoint with config Stage = 1..N (1 is at the spawn; put the spawn on or next to it). A part tagged Finish after the last stage. Players advance one stage at a time; progress saves; 'skipstage' products skip one stage. Settings: StageReward (default 5 + stage), FinishReward (250). Make each stage a short challenge (3-8 jumps), mark hazards red/neon (KillBrick), ramp difficulty, mix in Mover/Spinner/Disappearing/Bounce parts, and put a lava/void floor tagged KillBrick under the course. Quest events: stage, finish.
-tycoon — each plot is a FOLDER tagged TycoonPlot (set_folder path='Tycoon/Plot1' tags=['TycoonPlot']) holding: an 'Items' folder of item models/parts (hidden until bought; give items or their parts config Income = currency per second), parts tagged TycoonButton with config Price, Unlocks (an item's name) and optional Requires (another item's name) and Label (shown on the button), and a part tagged TycoonCollector (touch to bank income). Put each object in the plot by its folder ('Tycoon/Plot1/Items' for items, 'Tycoon/Plot1' for buttons). Make 4-6 identical plots spaced apart. Droppers (tag Dropper inside items) are cosmetic. Quest events: unlock, collect.
-simulator — parts tagged Collectible (Value, Respawn) spread over zones of rising Value; a part tagged SellZone; upgrades in template settings Upgrades = [{Key: 'capacity'|'speed'|'value', Name, Icon, Costs: [...], Step}], BaseCapacity (25). A game with its own core loop (chop, wash, mine…) keeps the template for its HUD and upgrades and writes its loop as a system. Quest events: collect, sell, upgrade.
-sandbox — no core loop from the kit: write it yourself as systems, using Currency, Data, Shop, Effects, Quests and Analytics.
-Every template: currencies on the leaderboard, a shop of the game's products, daily rewards, feedback, telemetry, zones/rebirth/quests when game.json sets them.";
+@"simulator — the harvest loop, all in the kit:
+  Resource nodes: models (or parts) tagged Resource with config Zone (its zone's name), Hp (hits at power 1), Value (bag units when broken), Respawn (seconds), Kind. The world generator places them in every zone; design_world zones[].resource sets kind, count, hp, value, respawn, scale and the models (assets).
+  The tool: every player holds one from the start (template_settings ToolName, ToolStyle axe|pickaxe|hammer|wand, Verb, ItemIcon); a tap, a click or the HUD's big action button swings it at the nearest node in reach (12 studs). Tool tiers: template_settings Tools = [{Name, Icon, Power, Cooldown, Price}], bought in order at the upgrade stand or the Upgrades menu.
+  The bag: BaseCapacity + the capacity upgrade; full bags sell at a part tagged SellZone (the generated hub has a glowing SELL pad by the spawn). Upgrades = [{Key: capacity|speed|value, Name, Icon, Costs: [...], Step}].
+  A node in a locked zone cannot be hit, and players are walked back out of a locked zone. Broken nodes grow back. Walk-over parts tagged Collectible still work.
+  balance_economy prices it all so a bot meets the pacing targets. Quest events: harvest (a node broken), the verb in lower case (chop, mine…), collect (bag units), sell, tool, upgrade, zone, rebirth.
+obby — checkpoints are parts tagged Checkpoint with config Stage = 1..N (stage 1 by the spawn), a part tagged Finish after the last; the generated course ramps difficulty and themes. Settings: StageReward, FinishReward. Quest events: stage, finish.
+tycoon — each plot is a folder tagged TycoonPlot holding an Items folder (models hidden until bought, each with config Income per second), parts tagged TycoonButton (Price, Unlocks = an item's name, Requires = the item before it, Label), a part tagged TycoonCollector, a sign named OwnerSign and a part named PlotSpawn (players are sent to their plot). The generated plots have 12 items with rising prices. Quest events: unlock, collect.
+Every template: currencies on the leaderboard, a shop of the game's products (stands tagged Stand with config Panel = shop|upgrades|rebirth open the panels), daily rewards, feedback, telemetry, zones/rebirth/quests when game.json sets them.";
 
         private const string Progression =
 @"PROGRESSION — what keeps a player coming back. Set them in game.json (update_manifest):
@@ -112,14 +116,13 @@ Pacing targets for a simulator: first purchase in under a minute, first upgrade 
 
         private const string World =
 @"BUILDING A GREAT MAP (kids judge a game in its first 10 seconds, by what they see from the spawn)
-1. Plan first (plan_map): a spawn hub in the middle with the shop and the first activity in sight; 3-6 zones around it that open in order (rising reward, each a different theme: meadow → autumn forest → snowy peaks → lava cave), paths linking them, one landmark per zone (a giant tree, a glowing crystal, a tower) visible from far away. Typical play area 400-600 studs a side for a simulator; an obby is a course instead.
-2. Ground (terrain_generate): terrain 100-150 studs bigger than the play area on every side, a flat core for the hub, gentle hills (8-20), border mountains (40-80) so the world never ends in a void. Sculpt: flatten pads for buildings, a lake or river, raise hills between zones, paths (Ground/Cobblestone/Sand) between zones.
-3. Edges (set_map_area): the rectangle players stay in; keep scenery just outside it so the edge is a forest or a cliff, never an invisible wall in an empty field.
-4. Hub: shop, sell spot, upgrade stands, the first collectibles, signs, lamp posts, benches, flowers — busy and bright. The spawn faces the action (yaw towards the hub's centre or the first zone).
-5. Zones: each themed and dressed — scatter_assets 30-80 trees/rocks/bushes per zone (mix 3-5 models), flowers and props near paths, place_along fences and lamps on paths, a landmark, its gate. No empty field larger than ~60×60 studs: the map report finds them.
-6. Scale: a character is 5 studs tall and 2 wide; doors 6-8 tall; paths 10-16 wide; a plaza 40-80 across; trees 15-40 tall. Use the library's measured sizes (view_asset) and scale models to match each other.
-7. Look: set_lighting (sunny or golden for most games), bright saturated colours, neon accents on things to interact with, Glow/Sparkle tags on rewards and goals.
-8. Check it: render_scene map (layout with zones and labels), aerial and iso (how it looks), spawn (the first impression), zone:<id> (each zone), then map_report (empty patches, density, spawn view, edges). Fix and look again. Aim for a map score of 80+.
+The world is generated from its world spec: design_world shows it; give it changes and it regenerates (your hand-placed objects stay). What the generator does, so you do not have to:
+- Layout: a spawn hub in the middle (the sell pad and upgrade stand in sight of the spawn, the shop, the rebirth altar, the leaderboard, a centrepiece, benches, lamps, a hedge), zones round it in the order they open, each on its own plateau a little higher than the last, a ramped road from the hub to each with a signpost, a gate at each paid zone's entrance, a landmark at each zone's far side; forested ridges or a lake between zones; mountains past the edge.
+- Placement: every model stands on the ground at the lowest point under it (trees on their trunk), refuses slopes too steep for it, faces what it should (stands and signs face the hub, gates face the road), keeps clear of roads and of everything else, in one art style, inside a part budget phones carry.
+- Dressing in layers: a ring of trees round each zone (open at its gate), groves and clearings between zones, bushes, flowers and rocks by the roads, a few of the biome's own touches in each zone (mushrooms, pumpkins, cacti, crystals…), a tree line past the play area.
+What you decide (design_world spec): layout (hub for a simulator, course for an obby, plots for a tycoon), biome of the hub and of each zone (meadow, forest, autumn, snow, desert, beach, jungle, volcanic, candy, spooky, crystal), zone names and themes, each zone's resource, the art style (stylized for most games), density (0.5-1.6), lighting (sunny, golden, night, spooky, tropical, snowy, candy, overcast), water (auto, lake, none), and the palette: which library models to use for each role (browse_assets / search_assets; one style; never PBR or realistic models in a cartoon map — they lose their textures and come out grey).
+Then check: render_scene spawn (the first impression), aerial, map, zone:<id> for each zone, and map_report — it scores ground and edge, coverage, density and composition, gameplay layout, landmarks and navigation, variety and style, and correctness; any [error] caps the score at 45. The bar is 75; aim for 85+.
+Hand tools for extras: place_asset (one model, [x, z] stands it on the ground), scatter_assets (a patch of models), place_along (lamps, fences), place_ring, add_objects (parts, lights, signs — a text sign needs a post under it), terrain_sculpt (a pond, a path, a hill). Scale: a character is 5 studs tall; doors 6-8; roads 12-16 wide; trees 15-45 tall.
 Positions: [x, z] stands anything on the ground; y is up; −Z is Roblox's forward (yaw 0).";
 
         private const string Luau =
@@ -159,10 +162,11 @@ Positions: [x, z] stands anything on the ground; y is up; −Z is Roblox's forwa
 
         private const string Testing =
 @"TESTING
-- build: compiles, checks every file's syntax and types (strict), runs the geometry checks and the map report. It does NOT run the game.
-- run_tests: runs the game in Roblox's real engine (needs the API key). Phases: kit (the kit's own checks, before your code: a failure there is a studio bug, not yours), load (every module loads), boot (the whole server starts — kit, your systems and scripts — and runs for 8 s; every error is reported with your file and line), world (spawn, products, quests, gates, the template's loop), game (your specs). There are no players or physics in the engine test: Touched never fires and characters do not exist, so test your systems by calling their API with t.player() stand-ins.
+- build: compiles, checks every file's syntax and types (strict), runs the geometry checks, the map report (with walking checks: can a player reach the sell pad, every zone and every node from the spawn) and, for a simulator, the economy check (a bot plays your numbers on your map: first sale, first purchase, each zone, rebirth). It does NOT run the game.
+- run_tests: runs the game in Roblox's real engine; until the studio has the Roblox API key and an experience slot it runs it in the studio's local engine instead (the same task, phases and checks on a stand-in for what the kit and common server code use, without physics, replication or clients; Roblox's engine runs the game again before launch). Phases: kit (the kit's own checks, before your code: a failure there is a studio bug, not yours), load (every module loads), boot (the whole server starts — kit, your systems and scripts — and runs for 8 s; every error is reported with your file and line), world (spawn, products, quests, gates and the template's PLAYTHROUGH: a stand-in player harvests in the first zone, sells, buys a tool, unlocks every zone in order and harvests there; buys out a tycoon plot button by button; reaches every obby stage), game (your specs). There are no players or physics in the engine test: Touched never fires and characters do not exist, so test your systems by calling their API with t.player() stand-ins.
 - Specs: src/tests/<Name>.luau returns { ['what it checks'] = function(t) … end }. t.player() (a fresh stand-in with a loaded profile), t.ok(cond, msg), t.eq(actual, expected, msg), t.near(a, b, eps?, msg), t.fail(msg), t.warn(msg) (does not fail), t.skip(reason), t.wait(seconds), t.find(name), t.tagged(tag), t.events(name) (analytics events recorded so far).
-  Example: ['chopping a tree pays'] = function(t) local Forest = require(game.ServerScriptService.Systems.Forest); local p = t.player(); local tree = t.tagged('Tree')[1]; t.ok(Forest.Chop(p, tree), 'chop works'); t.ok(Currency.Get(p) > 0, 'it paid') end
-- When a check fails, diagnose_failure shows its source and the code it exercises. Fix the cause, run_tests again; never declare done on a failing run.";
+  Example: ['a mined crystal pays'] = function(t) local Simulator = require(game.ServerScriptService.OmniKitServer.Templates.Simulator); local p = t.player(); local node = Simulator.Nodes()[1]; repeat local _, broke = Simulator.Hit(p, node.inst, true) until broke; t.ok(Simulator.Bag(p) > 0, 'the bag filled'); t.ok(Simulator.Sell(p) > 0, 'selling pays') end
+- When a check fails, diagnose_failure shows its source and the code it exercises. Fix the cause, run_tests again; never declare done on a failing run.
+- In the local engine, a real Roblox API it has no stand-in for fails as '<Name> is not a valid member of <Thing>'. If build type-checked that call, your code is right: report it in finish_cycle's problems instead of rewriting working code around it.";
     }
 }

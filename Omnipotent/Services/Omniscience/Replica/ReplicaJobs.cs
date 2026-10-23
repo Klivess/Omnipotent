@@ -17,6 +17,7 @@ namespace Omnipotent.Services.Omniscience.Replica
     /// <summary>Stage names persisted into <c>replica_training_jobs.stage</c>.</summary>
     public static class ReplicaStage
     {
+        public const string Temporal = "temporal";
         public const string Voice = "voice";
         public const string Opinions = "opinions";
         public const string Reflexes = "reflexes";
@@ -47,6 +48,8 @@ namespace Omnipotent.Services.Omniscience.Replica
     /// </summary>
     public class ReplicaDossier
     {
+        [JsonProperty("pipeline_version")] public string PipelineVersion { get; set; } = "legacy";
+        [JsonProperty("training_cutoff")] public long TrainingCutoff { get; set; }
         [JsonProperty("display_name")] public string DisplayName { get; set; } = string.Empty;
         [JsonProperty("handles")] public List<string> Handles { get; set; } = new();
         [JsonProperty("voice_rulebook")] public string VoiceRulebookMarkdown { get; set; } = string.Empty;
@@ -64,9 +67,12 @@ namespace Omnipotent.Services.Omniscience.Replica
     /// </summary>
     public class ReplicaExemplar
     {
+        [JsonProperty("message_id")] public string? MessageId { get; set; }
+        [JsonProperty("stimulus_message_id")] public string? StimulusMessageId { get; set; }
         [JsonProperty("stimulus")] public string? Stimulus { get; set; }
         [JsonProperty("reply")] public string Reply { get; set; } = string.Empty;
         [JsonProperty("conversation_id")] public string? ConversationId { get; set; }
+        [JsonProperty("context_kind")] public string? ContextKind { get; set; }
         [JsonProperty("sent_at")] public long SentAt { get; set; }
         [JsonProperty("score")] public float Score { get; set; }
     }
@@ -75,6 +81,7 @@ namespace Omnipotent.Services.Omniscience.Replica
     public class ReplicaCorpusStats
     {
         [JsonProperty("total_messages")] public int TotalMessages { get; set; }
+        [JsonProperty("era_count")] public int EraCount { get; set; }
         [JsonProperty("messages_used_for_voice")] public int MessagesUsedForVoice { get; set; }
         [JsonProperty("messages_used_for_opinions")] public int MessagesUsedForOpinions { get; set; }
         [JsonProperty("avg_message_length")] public double AverageMessageLength { get; set; }

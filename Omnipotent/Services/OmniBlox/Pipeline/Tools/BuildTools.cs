@@ -205,7 +205,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 Object(),
                 async (_, ct) => ToolResult.Ok((await RunBuildAsync(ctx, gameId, ct)).Report));
 
-            box.Add("run_tests", "Run the game in Roblox's real engine: the kit's own checks, every module loading, the whole server booting for 8 s (every runtime error with its file and line), the world checks and your specs. Takes about a minute. Run it after each meaningful change; the Build stage needs it to pass on the current build.",
+            box.Add("run_tests", "Run the game in Roblox's real engine — or, until the studio has the Roblox API key and an experience slot, in its local engine (a stand-in without physics, replication or clients): the kit's own checks, every module loading, the whole server booting for 8 s (every runtime error with its file and line), the world checks with the template's playthrough, and your specs. Takes about a minute. Run it after each meaningful change; the Build stage needs it to pass on the current build.",
                 Object(),
                 async (_, ct) =>
                 {
@@ -229,9 +229,14 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 args =>
                 {
                     var compiled = ctx.Compile(gameId);
-                    var analysis = MapReport.Analyze(ws.LoadScene(), compiled.Parts, compiled.Terrain, ws.LoadManifest());
-                    if (!Args.Bool(args, "picture", true) || (compiled.Parts.Count == 0 && compiled.Terrain == null)) return ToolResult.Ok(analysis.Describe());
-                    return ToolResult.WithImages(analysis.Describe(), new[] { ctx.RenderCompiled(gameId, compiled, "map", 1280, 760, labels: false) });
+                    var catalog = ctx.Catalog();
+                    var scene = ws.LoadScene();
+                    var manifest = ws.LoadManifest();
+                    var analysis = MapReport.Analyze(scene, compiled.Parts, compiled.Terrain, manifest, catalog: catalog.Get);
+                    string text = analysis.Describe();
+                    if (EconomyOf(manifest, scene) is { } economy) text += "\nECONOMY (a bot playing your numbers on this map):\n" + economy.Describe();
+                    if (!Args.Bool(args, "picture", true) || (compiled.Parts.Count == 0 && compiled.Terrain == null)) return ToolResult.Ok(text);
+                    return ToolResult.WithImages(text, new[] { ctx.RenderCompiled(gameId, compiled, "map", 1280, 760, labels: false) });
                 });
 
             box.Add("diagnose_failure", "Explain a failing check or runtime error from the last run_tests: shows the check's own source (kit or game), the kit or game functions it calls, and for an error the code around its line. Use it before changing anything to fix a failure.",
@@ -297,7 +302,13 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
 
         // ─────────────── build ───────────────
 
-        public sealed record BuildRun(bool Ok, string Report, CompileResult Compile, List<GeometryIssue> Geometry, LuauAnalysis? Types, MapAnalysis Map);
+        public sealed record BuildRun(bool Ok, string Report, CompileResult Compile, List<GeometryIssue> Geometry, LuauAnalysis? Types, MapAnalysis Map, EconomyReport? Economy = null);
+
+        /// <summary>The economy check for a simulator (null for other templates): a bot plays the game's own numbers on its map.</summary>
+        public static EconomyReport? EconomyOf(GameManifest manifest, SceneDocument scene) =>
+            string.Equals(manifest.Template, "simulator", StringComparison.OrdinalIgnoreCase) && scene.Objects.Any(o => o.Tags.Contains("Resource", StringComparer.OrdinalIgnoreCase))
+                ? Economy.Simulate(SimulatorEconomy.FromGame(manifest, scene))
+                : null;
 
         /// <summary>
         /// Compile, type-check, verify the geometry and measure the map; record the result in the dossier;
@@ -318,14 +329,16 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
             var result = ctx.Compile(gameId);
             var scene = ws.LoadScene();
             var manifest = ws.LoadManifest();
-            var geometry = result.Parts.Count > 0 ? GeometryVerifier.Verify(result.Parts, scene, manifest, result.Terrain) : new List<GeometryIssue>();
+            var geometry = result.Parts.Count > 0 ? GeometryVerifier.Verify(result.Parts, scene, manifest, result.Terrain, ctx.Catalog().Get) : new List<GeometryIssue>();
             LuauAnalysis? types = null;
             if (result.Ok && ctx.Luau != null)
             {
                 try { types = await LuauAnalyzer.AnalyzeAsync(ctx.Luau, result.Scripts, ct); }
                 catch (Exception ex) when (ex is not OperationCanceledException) { types = new LuauAnalysis { Ran = false, Problem = ex.Message }; }
             }
-            var map = MapReport.Analyze(scene, result.Parts, result.Terrain, manifest);
+            var catalog = ctx.Catalog();
+            var map = MapReport.Analyze(scene, result.Parts, result.Terrain, manifest, geometry, catalog.Get);
+            var economy = EconomyOf(manifest, scene);
             var typeErrors = types?.Errors.ToList() ?? new List<LuauDiagnostic>();
             bool ok = result.Ok && !geometry.Any(g => g.IsError) && typeErrors.Count == 0;
             var errors = result.Errors.Concat(typeErrors.Select(d => "[types] " + d)).Concat(geometry.Where(g => g.IsError).Select(g => "[geometry] " + g)).ToList();
@@ -349,6 +362,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 g.Build.TypeCheckNote = types == null ? (ctx.Luau == null ? "no type checker in this studio" : "not type-checked: the build did not compile") : types.Problem;
                 g.Build.MapScore = map.Score;
                 g.Build.MapFindings = map.Findings.Where(f => f.Severity != "info").Select(f => f.ToString()).Take(20).ToList();
+                g.Build.Economy = economy == null ? null : Clip(economy.Describe(), 3000);
+                g.Build.EconomyFindings = economy?.Findings.Select(f => f.ToString()).ToList() ?? new List<string>();
                 if (ok)
                     foreach (var id in result.AssetsUsed.Keys)
                         if (!g.Build.AssetsUsed.Contains(id)) { g.Build.AssetsUsed.Add(id); newAssets.Add(id); }
@@ -369,14 +384,21 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
             if (errors.Count > 0) sb.AppendLine("Errors:\n" + string.Join("\n", errors.Take(30).Select(e => "- " + e)));
             if (warnings.Count > 0) sb.AppendLine("Warnings:\n" + string.Join("\n", warnings.Take(20).Select(e => "- " + e)));
             sb.AppendLine($"Map: score {map.Score}/100" + (map.Errors.Any() ? " — blocking: " + string.Join(" | ", map.Errors.Select(f => f.Message).Take(3)) : map.Findings.Count > 0 ? " — " + string.Join(" | ", map.Findings.Where(f => f.Severity != "info").Select(f => f.Message).Take(2)) : "") + " (map_report for the details).");
+            if (map.Play is { Checked: true } play && play.Findings.Count > 0)
+                sb.AppendLine("Walking: " + string.Join(" | ", play.Findings.Select(f => f.ToString()).Take(4)));
+            if (economy != null)
+                sb.AppendLine("Economy: " + (economy.Findings.Count == 0 ? "a bot playing your numbers meets every pacing target" : string.Join(" | ", economy.Findings.Select(f => f.ToString()).Take(4)))
+                    + $" (first sale {economy.FirstSellSeconds:0} s, every zone {(economy.AllZonesMinutes is double all ? all.ToString("0", CultureInfo.InvariantCulture) + " min" : "never")}; map_report shows the timeline).");
             if (ok)
             {
                 var game = ctx.Game(gameId)!;
                 sb.AppendLine(game.Build.LastEngineRun is { } last && last.Revision == revision && last.Ok
-                    ? "Engine tests: passed on this build."
-                    : "Engine tests: not run on this build — run_tests runs the game in Roblox's engine.");
+                    ? (last.Local ? "Engine tests: passed on this build in the local engine." : "Engine tests: passed on this build.")
+                    : StageGates.LocalEngineStandsIn(ctx, game)
+                        ? "Engine tests: not run on this build — run_tests boots it and plays it through in the local engine (no Roblox API key or experience slot yet)."
+                        : "Engine tests: not run on this build — run_tests runs the game in Roblox's engine.");
             }
-            return new BuildRun(ok, sb.ToString(), result, geometry, types, map);
+            return new BuildRun(ok, sb.ToString(), result, geometry, types, map, economy);
         }
 
         private static readonly ConcurrentDictionary<string, SemaphoreSlim> engineGates = new(StringComparer.Ordinal);
@@ -387,14 +409,22 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
 
         /// <summary>
         /// Builds (unless the caller just built clean: <paramref name="built"/>), then runs the engine tests on that
-        /// build and records the run. Null run (with the reason) when they cannot run: no key, no experience slot,
-        /// a failed build, or Roblox unreachable.
+        /// build and records the run: in Roblox's engine, or, while there is no API key or experience slot, in the
+        /// studio's local engine (<see cref="LocalEngine"/>). Null run (with the reason) when they cannot run: no key
+        /// or slot and no local engine, a failed build, or Roblox (or the local engine) unable to run it.
         /// </summary>
         public static async Task<(EngineRun? Run, string Message)> RunEngineTestsAsync(StudioContext ctx, string gameId, CancellationToken ct, BuildRun? built = null)
         {
-            if (!ctx.Cloud.HasKey) return (null, "Engine tests need the Roblox API key, which is not set yet; they run before launch. build covers the static checks meanwhile.");
-            var slot = Slots.Ensure(ctx, gameId);
-            if (slot == null) return (null, "Engine tests wait for a free experience slot (the owner has been asked for one). build covers the static checks meanwhile.");
+            var slot = ctx.Cloud.HasKey ? Slots.Ensure(ctx, gameId) : null;
+            if (slot == null)
+            {
+                string waiting = ctx.Cloud.HasKey
+                    ? "Engine tests wait for a free experience slot (the owner has been asked for one)."
+                    : "Engine tests need the Roblox API key, which is not set yet; they run before launch.";
+                if (ctx.LocalEngine is not { Available: true })
+                    return (null, waiting + " build covers the static checks meanwhile." + (ctx.LocalEngine?.Problem is { } why ? $" (The local engine cannot run here: {why}.)" : ""));
+                return await RunLocallyAsync(ctx, gameId, waiting, ct, built);
+            }
             var gate = engineGates.GetOrAdd(gameId, _ => new SemaphoreSlim(1, 1));
             await gate.WaitAsync(ct);
             try
@@ -435,14 +465,40 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
             }
         }
 
+        /// <summary>run_tests while Roblox's engine is out of reach: the same build-then-test in the local engine, recorded as a local run.</summary>
+        private static async Task<(EngineRun? Run, string Message)> RunLocallyAsync(StudioContext ctx, string gameId, string waiting, CancellationToken ct, BuildRun? built)
+        {
+            var gate = engineGates.GetOrAdd(gameId, _ => new SemaphoreSlim(1, 1));
+            await gate.WaitAsync(ct);
+            try
+            {
+                var build = built is { Ok: true } ? built : await RunBuildAsync(ctx, gameId, ct);
+                if (!build.Ok) return (null, "Fix the build first — the engine tests run on a clean build:\n" + build.Report);
+                var (run, why) = await LocalEngine.RunAsync(ctx, gameId, ct);
+                // Offline, or the stand-in itself broke: the game is simply not run locally, never failed for it.
+                if (run == null) return (null, $"{waiting} The local engine could not run it either ({why}); build covers the static checks meanwhile.");
+                ctx.Update(gameId, g => g.Build.LastEngineRun = run);
+                if (run.KitFailed) ReportKitFailure(ctx, gameId, run);
+                return (run, run.Summary);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
         /// <summary>The kit's own checks failed before any game code ran: the studio is broken, not the game. Tell the owner once.</summary>
         internal static void ReportKitFailure(StudioContext ctx, string gameId, EngineRun run)
         {
             var failures = run.Results.Where(r => !r.Ok && r.Phase == "kit").Select(r => $"{r.Name}: {r.Detail}").ToList();
-            ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.Escalation, "kit-failure", "The Game Kit's own engine checks are failing",
-                "These checks run before any game code is loaded, so this is a bug in OmniBlox's Game Kit, not in the game. The game is not blamed for it.\n- " + string.Join("\n- ", failures.Take(6)),
+            ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.Escalation, run.Local ? "kit-failure-local" : "kit-failure",
+                run.Local ? "The Game Kit's own checks are failing in the local engine" : "The Game Kit's own engine checks are failing",
+                (run.Local
+                    ? "These checks run before any game code is loaded, so this is a bug in OmniBlox's Game Kit or in the local engine's stand-ins (LocalEngine/engine.luau), not in the game."
+                    : "These checks run before any game code is loaded, so this is a bug in OmniBlox's Game Kit, not in the game.")
+                + " The game is not blamed for it.\n- " + string.Join("\n- ", failures.Take(6)),
                 gameId, ctx.Clock()));
-            ctx.Event(EventLevel.Error, "kit.failure", "The Game Kit's own engine checks failed: " + string.Join("; ", failures.Take(2)), gameId);
+            ctx.Event(EventLevel.Error, "kit.failure", $"The Game Kit's own {(run.Local ? "checks failed in the local engine" : "engine checks failed")}: " + string.Join("; ", failures.Take(2)), gameId);
         }
 
         /// <summary>What still stands between the game and "feature complete".</summary>
@@ -456,16 +512,18 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 var (added, changed, removed) = ctx.Workspace(gameId).DiffAgainst(game.Build.Revision);
                 if (added.Count + changed.Count + removed.Count > 0) problems.Add($"files changed since the last clean build (r{game.Build.Revision}): run build again");
             }
-            bool obby = string.Equals(ctx.Workspace(gameId).LoadManifest().Template, "obby", StringComparison.OrdinalIgnoreCase);
             var mapErrors = game.Build.MapFindings.Where(f => f.StartsWith("[error]", StringComparison.Ordinal)).ToList();
             if (mapErrors.Count > 0) problems.Add("the map report has blocking problems: " + string.Join(" | ", mapErrors.Take(3)));
-            if (!obby && (game.Build.MapScore ?? 0) < StageGates.MinMapScore) problems.Add($"the map scores {game.Build.MapScore ?? 0}/100; get it to {StageGates.MinMapScore}+ (map_report lists what to fix)");
+            if ((game.Build.MapScore ?? 0) < StageGates.MinMapScore) problems.Add($"the map scores {game.Build.MapScore ?? 0}/100; get it to {StageGates.MinMapScore}+ (map_report lists what to fix)");
             var open = game.Milestones.Where(m => !m.Done).Select(m => m.MilestoneId).ToList();
             if (open.Count > 0) problems.Add("milestones not done: " + string.Join(", ", open));
-            if (StageGates.EngineAvailable(ctx, game) && !StageGates.EnginePassed(game))
+            bool roblox = StageGates.EngineAvailable(ctx, game);
+            if ((roblox || StageGates.LocalEngineStandsIn(ctx, game)) && !StageGates.EnginePassed(game, local: !roblox))
             {
                 var run = game.Build.LastEngineRun;
-                problems.Add(run == null || run.Revision != game.Build.Revision ? "run_tests has not run on this build" : "run_tests failed on this build: " + run.Summary);
+                problems.Add(run == null || run.Revision != game.Build.Revision ? "run_tests has not run on this build"
+                    : roblox && run.Local ? "run_tests has not run in Roblox's engine on this build (a local engine pass counts only until the API key and a slot exist)"
+                    : "run_tests failed on this build: " + run.Summary);
             }
             return problems;
         }

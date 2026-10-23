@@ -155,6 +155,12 @@ namespace Omnipotent.Services.OmniBlox.Build
                     float x = ox + (col + 0.5f) * cell, z = oz + (row + 0.5f) * cell;
                     float d = MathF.Sqrt((x - cx) * (x - cx) + (z - cz) * (z - cz));
                     float h = 0;
+                    if (recipe.Undulation > 0)
+                    {
+                        // Gentle rolls everywhere: a perfectly flat core reads as a plate, not as land.
+                        float us = Math.Max(16, recipe.UndulationScale);
+                        h += recipe.Undulation * Fbm(x / us, z / us, seed + 31, 3);
+                    }
                     if (recipe.Hills > 0)
                     {
                         float scale = Math.Max(16, recipe.HillScale);
@@ -261,6 +267,9 @@ namespace Omnipotent.Services.OmniBlox.Build
             var points = (op.Points ?? new List<float[]>()).Where(p => p.Length >= 2).ToList();
             float level = water ?? -1f;
             if (kind is "lake" or "river" && water == null) water = level;
+            float rampLength = 0;
+            for (int p = 0; p + 1 < points.Count; p++)
+                rampLength += MathF.Sqrt((points[p + 1][0] - points[p][0]) * (points[p + 1][0] - points[p][0]) + (points[p + 1][1] - points[p][1]) * (points[p + 1][1] - points[p][1]));
 
             for (int row = 0; row < depth; row++)
             {
@@ -300,6 +309,22 @@ namespace Omnipotent.Services.OmniBlox.Build
                                 if (w <= 0) break;
                                 float bottom = (water ?? level) - Math.Max(2, Math.Abs(op.Height == 0 ? 6 : op.Height));
                                 heights[i] = Math.Min(heights[i], Lerp(heights[i], bottom, w));
+                                break;
+                            }
+                        case "ramp":
+                            {
+                                // A path that climbs evenly from Height at its first point to EndHeight at its last,
+                                // with sloped shoulders, so a raised zone is reached by a walkable road.
+                                if (points.Count < 2) break;
+                                float d = DistanceToPolyline(x, z, points, out float along);
+                                float half = Math.Max(2, op.Width / 2);
+                                float shoulder = half + Math.Max(6, Math.Abs((op.EndHeight ?? op.Height) - op.Height) * 1.2f);
+                                if (d > shoulder) break;
+                                float t = rampLength > 0 ? Math.Clamp(along / rampLength, 0, 1) : 0;
+                                float target = Lerp(op.Height, op.EndHeight ?? op.Height, SmoothStep(0, 1, t));
+                                float w = d <= half ? 1 : 1 - SmoothStep(half, shoulder, d);
+                                heights[i] = Lerp(heights[i], target, w);
+                                if (d <= half && op.Material != null) painted[i] = op.Material;
                                 break;
                             }
                         case "path":

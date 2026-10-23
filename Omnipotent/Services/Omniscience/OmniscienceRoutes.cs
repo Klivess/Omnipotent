@@ -553,6 +553,7 @@ namespace Omnipotent.Services.Omniscience
                     {
                         using var conn = service.Db.Open();
                         using var tx = conn.BeginTransaction();
+                        long mergeNow = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
                         using var c1 = conn.CreateCommand();
                         c1.Transaction = tx;
                         c1.CommandText = "UPDATE platform_identities SET person_id=$keep WHERE person_id=$drop";
@@ -565,7 +566,7 @@ namespace Omnipotent.Services.Omniscience
                         c2.CommandText = "UPDATE persons SET merged_into_person_id=$keep, updated_at=$now WHERE person_id=$drop";
                         c2.Parameters.AddWithValue("$keep", keep);
                         c2.Parameters.AddWithValue("$drop", drop);
-                        c2.Parameters.AddWithValue("$now", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+                        c2.Parameters.AddWithValue("$now", mergeNow);
                         c2.ExecuteNonQuery();
 
                         // Drop old person_statistics for the deprecated id (we'll recompute on the kept id).
@@ -574,6 +575,9 @@ namespace Omnipotent.Services.Omniscience
                         c3.CommandText = "DELETE FROM person_statistics WHERE person_id=$drop";
                         c3.Parameters.AddWithValue("$drop", drop);
                         c3.ExecuteNonQuery();
+
+                        Analytics.ActivitySummaryStore.RebuildPerson(conn, tx, keep, mergeNow);
+                        Analytics.ActivitySummaryStore.RebuildPerson(conn, tx, drop, mergeNow);
 
                         tx.Commit();
                     }
@@ -800,13 +804,9 @@ namespace Omnipotent.Services.Omniscience
                     COALESCE(p.tier, 'archive') AS tier,
                     (SELECT ps.payload_json FROM person_statistics ps WHERE ps.person_id=p.person_id AND ps.module_name='deduction_summary') AS dedu
                 FROM persons p
-                LEFT JOIN (
-                    SELECT pi.person_id, COUNT(*) AS msg_count
-                    FROM messages m JOIN platform_identities pi ON pi.identity_id = m.author_identity_id
-                    GROUP BY pi.person_id
-                ) mc ON mc.person_id = p.person_id
+                LEFT JOIN person_message_counts mc ON mc.person_id = p.person_id
                 WHERE {string.Join(" AND ", where)}
-                ORDER BY msg_count DESC
+                ORDER BY msg_count DESC, mc.last_message_at DESC, p.updated_at DESC
                 LIMIT {limit} OFFSET {offset}";
             using var r = cmd.ExecuteReader();
             while (r.Read())
@@ -846,13 +846,9 @@ namespace Omnipotent.Services.Omniscience
             cmd.CommandText = $@"SELECT c.conversation_id, c.platform, c.kind, c.guild_name, c.title, c.first_seen, c.last_seen,
                     COALESCE(mc.msg_count, 0) AS msg_count
                 FROM conversations c
-                LEFT JOIN (
-                    SELECT conversation_id, COUNT(*) AS msg_count
-                    FROM messages
-                    GROUP BY conversation_id
-                ) mc ON mc.conversation_id = c.conversation_id
+                LEFT JOIN conversation_message_counts mc ON mc.conversation_id = c.conversation_id
                 {whereSql}
-                ORDER BY msg_count DESC LIMIT {limit}";
+                ORDER BY msg_count DESC, mc.last_message_at DESC, c.last_seen DESC LIMIT {limit}";
             using var r = cmd.ExecuteReader();
             var arr = new JArray();
             while (r.Read())
@@ -944,7 +940,7 @@ namespace Omnipotent.Services.Omniscience
                 using (var cmd4 = conn.CreateCommand())
                 {
                     cmd4.CommandText = @"SELECT generated_at, model_used, profile_markdown, traits_json, biographical_markdown FROM personality_profiles
-                        WHERE person_id=$p ORDER BY generated_at DESC LIMIT 1";
+                        WHERE person_id=$p AND era IS NULL ORDER BY generated_at DESC LIMIT 1";
                     cmd4.Parameters.AddWithValue("$p", personId);
                     using var pr = cmd4.ExecuteReader();
                     if (pr.Read())

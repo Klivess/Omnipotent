@@ -21,7 +21,10 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
             public List<TestIssue> Issues { get; } = new();
         }
 
-        public static readonly string[] Looking = { "render_scene", "scene_summary", "map_report", "list_files", "read_file", "search_code", "view_asset", "get_manifest", "kit_reference", "pacing_check", "playbook_search" };
+        public static readonly string[] Looking = { "render_scene", "scene_summary", "map_report", "list_files", "read_file", "search_code", "view_asset", "get_manifest", "kit_reference", "pacing_check", "playbook_search", "design_world" };
+
+        /// <summary>What a reviewer scores (1-10) before it may pass a build.</summary>
+        public static readonly string[] Aspects = { "first_impression", "world_beauty", "world_fullness", "clear_goal", "fun_loop", "progression" };
 
         public static AgentToolbox Create(StudioContext ctx, string gameId, Verdict verdict)
         {
@@ -42,15 +45,22 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     verdict.Issues.Add(new TestIssue { Severity = severity, Area = area, Message = message });
                     return ToolResult.Ok($"Noted ({verdict.Issues.Count} so far).");
                 });
-            box.Add("verdict", "Pass or fail the build. Fail it for any error you reported.",
-                Object(Req("pass", Bool("True only if nothing is broken and a child could pick it up and have fun")), Req("summary", Str("Why, in two or three sentences"))),
+            box.Add("verdict", "Pass or fail the build, with your scores (1-10, against the anchors in your instructions) for: first_impression (the spawn's first ten seconds), world_beauty, world_fullness, clear_goal (a child knows what to do), fun_loop (the core action feels good), progression (there is always a next goal). A pass needs no reported error, every score at least 6 and an average of at least 7.",
+                Object(Req("pass", Bool("True only if nothing is broken and a child could pick it up and have fun")), Req("summary", Str("Why, in two or three sentences")),
+                    Opt("scores", Object(Aspects.Select(a => Req(a, Int("1-10"))).ToArray()))),
                 args =>
                 {
                     bool pass = Args.Bool(args, "pass");
+                    var scores = Aspects.ToDictionary(a => a, a => args["scores"] is JObject sc && sc[a] != null ? Math.Clamp(Args.Int(sc, a, 0), 0, 10) : 0);
+                    bool scored = scores.Values.All(v => v > 0);
                     if (pass && verdict.Issues.Any(i => i.Severity == "error"))
                         return ToolResult.Error("you reported errors (must-fix problems): a build with them cannot pass. Fail it, or downgrade an issue you no longer think must be fixed by reporting it again as a warning and explaining why.");
+                    if (pass && !scored)
+                        return ToolResult.Error("score all six aspects (scores: " + string.Join(", ", Aspects) + ") before passing a build.");
+                    if (pass && (scores.Values.Min() < 6 || scores.Values.Average() < 7))
+                        return ToolResult.Error($"your scores ({string.Join(", ", scores.Select(kv => $"{kv.Key} {kv.Value}"))}) are a fail: a pass needs every aspect at least 6 and an average of at least 7. Report what drags the low ones down and fail the build.");
                     verdict.Pass = pass;
-                    verdict.Summary = Args.Required(args, "summary");
+                    verdict.Summary = Args.Required(args, "summary") + (scored ? " Scores: " + string.Join(", ", scores.Select(kv => $"{kv.Key.Replace('_', ' ')} {kv.Value}")) + "." : "");
                     return ToolResult.Ok("Verdict recorded. Now call finish_cycle.");
                 });
             return box;
@@ -68,13 +78,13 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
             AddVisuals(box, ctx, gameId);
             AddProducts(box, ctx, gameId);
             AddCompliance(box, ctx, gameId);
-            box.Add("request_launch", "Hand the game to the launch sequence (publish, create products, set the store page, make it public — after the owner's approval if required). Needs the store page, icon, at least one thumbnail and a passing compliance check.",
+            box.Add("request_launch", "Hand the game to the launch sequence: a final build and engine run, then the owner's launch approval (of this build, store page and products), and only then products, the store page, thumbnails, publishing and going public. Needs the store page, icon, at least one thumbnail and a passing compliance check.",
                 Object(),
                 _ =>
                 {
                     var game = ctx.Game(gameId)!;
                     if (!StageGates.MarketingReady(game))
-                        return ToolResult.Error("not ready: " + string.Join("; ", StageGates.Checklist(game, ctx).Where(c => !c.Met && !c.Text.Contains("public")).Select(c => c.Text)));
+                        return ToolResult.Error("not ready: " + string.Join("; ", StageGates.Checklist(game, ctx).Where(c => !c.Met && !c.Text.Contains("public") && !c.Text.Contains("owner")).Select(c => c.Text)));
                     ctx.Update(gameId, g => g.Publish.LaunchRequestedUtc = ctx.Clock());
                     return ToolResult.Ok("Launch requested. Call finish_cycle with stage_complete true.");
                 });

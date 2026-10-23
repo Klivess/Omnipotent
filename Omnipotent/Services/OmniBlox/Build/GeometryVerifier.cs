@@ -73,7 +73,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             public bool FootprintContains(float x, float z) => x >= Min.X && x <= Max.X && z >= Min.Z && z <= Max.Z;
         }
 
-        public static List<GeometryIssue> Verify(IReadOnlyList<WorldPart> parts, SceneDocument scene, GameManifest manifest, TerrainMap? terrain = null)
+        public static List<GeometryIssue> Verify(IReadOnlyList<WorldPart> parts, SceneDocument scene, GameManifest manifest, TerrainMap? terrain = null, Func<long, WorldGen.CatalogEntry?>? catalog = null)
         {
             var issues = new List<GeometryIssue>();
             if (parts.Count == 0)
@@ -85,6 +85,13 @@ namespace Omnipotent.Services.OmniBlox.Build
             var boxes = parts.Select(Box.Of).ToList();
             var objects = parts.Select((p, i) => (p, i)).GroupBy(x => x.p.ObjectId)
                 .ToDictionary(g => g.Key, g => (Parts: g.Select(x => x.p).ToList(), Box: Box.Union(g.Select(x => boxes[x.i]))));
+            // Library models made mostly of meshes (trees, bushes, rocks), and plants of any make, are organic shapes whose
+            // boxes say little about where they really are: one tree's box covering another's trunk, or a bush under a
+            // canopy, is not a fault.
+            var organic = objects.Where(kv => kv.Value.Parts.Count > 0 && kv.Value.Parts[0].AssetId is long assetId
+                    && (kv.Value.Parts.Where(p => p.IsMesh).Sum(p => p.Size.X * p.Size.Y * p.Size.Z) >= 0.5f * kv.Value.Parts.Sum(p => p.Size.X * p.Size.Y * p.Size.Z)
+                        || catalog?.Invoke(assetId) is { } entry && WorldGen.Roles.Plants.Contains(entry.Role)))
+                .Select(kv => kv.Key).ToHashSet(StringComparer.Ordinal);
             // Scenery may stand outside the walled play area (it frames the map), but not outside the world.
             var bounds = new MapBounds
             {
@@ -131,8 +138,9 @@ namespace Omnipotent.Services.OmniBlox.Build
                     if (t.FootprintContains(x, z) && t.Top <= box.Bottom + 0.75f && (best == null || t.Top > best)) best = t.Top;
                 if (terrain != null && terrain.Covers(x, z))
                 {
+                    // Ground above the bottom is not "nothing under it": the object is sunk (reported below), not floating.
                     float ground = terrain.HeightAt(x, z);
-                    if (ground <= box.Bottom + 0.75f && (best == null || ground > best)) best = ground;
+                    if (best == null || ground > best) best = ground;
                 }
                 return best;
             }
@@ -161,8 +169,9 @@ namespace Omnipotent.Services.OmniBlox.Build
                 var centreProbe = new Box(new RbxVector3(o.Box.Center.X - 0.1f, o.Box.Bottom, o.Box.Center.Z - 0.1f), new RbxVector3(o.Box.Center.X + 0.1f, o.Box.Bottom + height * 0.35f, o.Box.Center.Z + 0.1f));
                 foreach (var (otherId, other) in objects)
                 {
-                    if (otherId == obj.Id || other.Box.Volume < o.Box.Volume) continue;
-                    if (other.Parts.Any(p => p.CanCollide && Box.Of(p).Intersect(centreProbe) != null && Box.Of(p).Top > o.Box.Bottom + height * 0.35f))
+                    if (otherId == obj.Id || other.Box.Volume < o.Box.Volume || organic.Contains(otherId)) continue;
+                    if (other.Parts.Any(p => p.CanCollide && Box.Of(p).Intersect(centreProbe) != null && Box.Of(p).Top > o.Box.Bottom + height * 0.35f
+                        && ProbeInside(p, o.Box.Center.X, o.Box.Center.Z, o.Box.Bottom, o.Box.Bottom + height * 0.35f)))
                     {
                         issues.Add(new("warning", obj.Id, $"\"{obj.Name}\" is sunk into \"{otherId}\" by more than a third of its height"));
                         break;
@@ -170,7 +179,8 @@ namespace Omnipotent.Services.OmniBlox.Build
                 }
             }
 
-            // Overlaps between solid objects (coarse, then by part).
+            // Overlaps between solid objects (coarse, then by part, measured in the parts' own turned frames).
+            var groups = scene.Objects.Where(o => o.Group != null).ToDictionary(o => o.Id, o => o.Group!, StringComparer.Ordinal);
             var solid = objects.Where(kv => kv.Value.Parts.Any(p => p.CanCollide && p.Transparency < 0.9f)).ToList();
             int overlapReports = 0;
             for (int a = 0; a < solid.Count && overlapReports < 25; a++)
@@ -181,16 +191,21 @@ namespace Omnipotent.Services.OmniBlox.Build
                     var B = solid[b].Value;
                     var coarse = A.Box.Intersect(B.Box);
                     if (coarse == null) continue;
-                    float smaller = MathF.Min(A.Box.Volume, B.Box.Volume);
+                    // The pieces of one prop (a sign on its post) are meant to touch.
+                    if (groups.TryGetValue(solid[a].Key, out var ga) && groups.TryGetValue(solid[b].Key, out var gb) && ga == gb) continue;
+                    bool aOrganic = organic.Contains(solid[a].Key), bOrganic = organic.Contains(solid[b].Key);
+                    if (aOrganic && bOrganic) continue;
+                    // Against an organic model, only the solid one's volume counts (a canopy box over a fence is no clash).
+                    float smaller = aOrganic ? B.Box.Volume : bOrganic ? A.Box.Volume : MathF.Min(A.Box.Volume, B.Box.Volume);
                     // A floor or base plate the other stands in is expected; ignore very flat partners.
                     if (A.Box.Extent.Y < 2.5f && A.Box.Volume > B.Box.Volume * 4 || B.Box.Extent.Y < 2.5f && B.Box.Volume > A.Box.Volume * 4) continue;
                     float overlap = 0;
                     foreach (var pa in A.Parts.Where(p => p.CanCollide))
                         foreach (var pb in B.Parts.Where(p => p.CanCollide))
-                            overlap += Box.Of(pa).Intersect(Box.Of(pb))?.Volume ?? 0;
-                    if (smaller > 0 && overlap / smaller > 0.2f)
+                            overlap += OverlapVolume(pa, pb);
+                    if (smaller > 0 && overlap / smaller > (aOrganic || bOrganic ? 0.45f : 0.2f))
                     {
-                        issues.Add(new("warning", solid[a].Key, $"overlaps \"{solid[b].Key}\" ({overlap / smaller:P0} of the smaller one) — move one of them"));
+                        issues.Add(new("warning", solid[a].Key, $"\"{A.Parts[0].Name}\" overlaps \"{solid[b].Key}\" (\"{B.Parts[0].Name}\", {overlap / smaller:P0} of the smaller one) — move one of them"));
                         overlapReports++;
                     }
                 }
@@ -299,6 +314,53 @@ namespace Omnipotent.Services.OmniBlox.Build
             foreach (var finish in scene.Objects.Where(o => o.Tags.Contains("Finish", StringComparer.OrdinalIgnoreCase)))
                 if (!reachedIds.Contains(finish.Id))
                     issues.Add(new("warning", finish.Id, "the Finish looks unreachable by jumping from the spawn"));
+        }
+
+        /// <summary>
+        /// The volume two parts share, measured in each one's own frame (the smaller estimate wins): exact for parts
+        /// turned the same way, and far closer than world-axis boxes for a long wall turned 45°.
+        /// </summary>
+        public static float OverlapVolume(WorldPart a, WorldPart b)
+        {
+            if (Box.Of(a).Intersect(Box.Of(b)) == null) return 0;
+            return MathF.Min(LocalOverlap(a, b), LocalOverlap(b, a));
+        }
+
+        private static float LocalOverlap(WorldPart frame, WorldPart other)
+        {
+            var h = frame.Size * 0.5f;
+            var min = new RbxVector3(float.MaxValue, float.MaxValue, float.MaxValue);
+            var max = new RbxVector3(float.MinValue, float.MinValue, float.MinValue);
+            foreach (var corner in AssetAnalyzer.Corners(other.CFrame, other.Size))
+            {
+                var local = frame.CFrame.PointToObjectSpace(corner);
+                min = min.Min(local);
+                max = max.Max(local);
+            }
+            float dx = MathF.Min(max.X, h.X) - MathF.Max(min.X, -h.X);
+            float dy = MathF.Min(max.Y, h.Y) - MathF.Max(min.Y, -h.Y);
+            float dz = MathF.Min(max.Z, h.Z) - MathF.Max(min.Z, -h.Z);
+            return dx > 0 && dy > 0 && dz > 0 ? dx * dy * dz : 0;
+        }
+
+        /// <summary>Whether a vertical line at (x, z) from y0 to y1 passes through a part (in its own turned frame).</summary>
+        /// <summary>Whether a vertical probe passes through the part's real shape (a ball's round canopy, not the box round it).</summary>
+        private static bool ProbeInside(WorldPart part, float x, float z, float y0, float y1)
+        {
+            var h = part.Size * 0.5f;
+            for (int i = 0; i <= 4; i++)
+            {
+                var l = part.CFrame.PointToObjectSpace(new RbxVector3(x, y0 + (y1 - y0) * i / 4f, z));
+                float ax = l.X / MathF.Max(0.01f, h.X), ay = l.Y / MathF.Max(0.01f, h.Y), az = l.Z / MathF.Max(0.01f, h.Z);
+                bool inside = part.Shape switch
+                {
+                    "Ball" => ax * ax + ay * ay + az * az <= 1,
+                    "Cylinder" => MathF.Abs(ax) <= 1 && ay * ay + az * az <= 1, // a Roblox cylinder's axis is its X
+                    _ => MathF.Abs(ax) <= 1 && MathF.Abs(ay) <= 1 && MathF.Abs(az) <= 1,
+                };
+                if (inside) return true;
+            }
+            return false;
         }
 
         private static bool TryVector(object raw, out RbxVector3 v)

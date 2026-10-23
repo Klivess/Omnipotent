@@ -87,6 +87,7 @@ namespace Omnipotent.Services.OmniBlox
                     Alert = AlertAsync,
                     Settings = settings,
                     Luau = new Build.LuauToolchain(Path.Combine(root, "tools"), message => _ = ServiceLog(message, false)),
+                    LocalEngine = new LuneEngine(new Build.LuneToolchain(Path.Combine(root, "tools"), message => _ = ServiceLog(message, false))),
                 };
                 Context = ctx;
                 await RefreshSettingsAsync();
@@ -123,6 +124,7 @@ namespace Omnipotent.Services.OmniBlox
                 Slots = (await GetStringListOmniSetting("OmniBlox_ExperienceSlots", new List<string>())).Select(ExperienceSlot.Parse).Where(x => x != null).Select(x => x!).ToList(),
                 PlaytestSlot = ExperienceSlot.Parse(await GetStringOmniSetting("OmniBlox_PlaytestSlot", "")),
                 RequireLaunchApproval = await GetBoolOmniSetting("OmniBlox_RequireLaunchApproval", defaultValue: true),
+                RequireBuildSignoff = await GetBoolOmniSetting("OmniBlox_RequireBuildSignoff", defaultValue: true),
                 MaxGamesInProduction = Math.Clamp(await GetIntOmniSetting("OmniBlox_MaxGamesInProduction", 1), 1, 3),
                 HarvesterEnabled = await GetBoolOmniSetting("OmniBlox_HarvesterEnabled", defaultValue: false),
                 TelemetryBaseUrl = (await GetStringOmniSetting("OmniBlox_TelemetryBaseUrl", "https://klive.dev")).Trim(),
@@ -143,6 +145,7 @@ namespace Omnipotent.Services.OmniBlox
             t.Slots = s.Slots;
             t.PlaytestSlot = s.PlaytestSlot;
             t.RequireLaunchApproval = s.RequireLaunchApproval;
+            t.RequireBuildSignoff = s.RequireBuildSignoff;
             t.MaxGamesInProduction = s.MaxGamesInProduction;
             t.HarvesterEnabled = s.HarvesterEnabled;
             t.TelemetryBaseUrl = string.IsNullOrWhiteSpace(s.TelemetryBaseUrl) ? "https://klive.dev" : s.TelemetryBaseUrl;

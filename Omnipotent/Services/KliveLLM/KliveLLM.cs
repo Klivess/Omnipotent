@@ -666,6 +666,7 @@ namespace Omnipotent.Services.KliveLLM
                 prompt,
                 sessionId,
                 maxTokensOverride,
+                systemPrompt: systemPrompt,
                 cancellationToken: cancellationToken,
                 onToken: onToken);
         }
@@ -3654,6 +3655,7 @@ namespace Omnipotent.Services.KliveLLM
             string prompt,
             string? sessionId = null,
             int? maxTokensOverride = null,
+            string? systemPrompt = null,
             bool resetSessionBeforeQuery = false,
             bool resetSessionAfterQuery = false,
             CancellationToken cancellationToken = default,
@@ -3679,6 +3681,7 @@ namespace Omnipotent.Services.KliveLLM
                 {
                     sessionId = Guid.NewGuid().ToString();
                     var s = new KliveLLMSession(this, true) { sessionId = sessionId };
+                    ApplyExplicitSystemPrompt(s.chatHistory, systemPrompt, ThinkingDirective);
                     lock (sessions)
                     {
                         sessions[sessionId] = s;
@@ -3691,6 +3694,7 @@ namespace Omnipotent.Services.KliveLLM
                     if (!sessions.TryGetValue(sessionId, out session))
                     {
                         session = new KliveLLMSession(this, true) { sessionId = sessionId };
+                        ApplyExplicitSystemPrompt(session.chatHistory, systemPrompt, ThinkingDirective);
                         sessions[sessionId] = session;
                     }
                 }
@@ -3778,6 +3782,17 @@ namespace Omnipotent.Services.KliveLLM
                 }
                 return new KliveLLMResponse() { Response = string.Empty, Conversation = new ChatHistory(), Success = false, ErrorMessage = fullError };
             }
+        }
+
+        /// <summary>
+        /// Applies a caller-supplied system prompt when a session is created. Local and
+        /// remote inference must receive the same persona/extraction instructions.
+        /// </summary>
+        internal static void ApplyExplicitSystemPrompt(ChatHistory history, string? systemPrompt, string thinkingDirective)
+        {
+            if (string.IsNullOrWhiteSpace(systemPrompt)) return;
+            history.Messages.Clear();
+            history.AddMessage(AuthorRole.System, systemPrompt + thinkingDirective);
         }
 
         private static string SanitizeLocalModelOutput(string raw)

@@ -60,7 +60,7 @@ namespace Omnipotent.Services.OmniBlox
                 StageCycles = g.StageCycles.GetValueOrDefault(g.Stage),
                 g.Build.MapScore,
                 g.Build.TypeChecked,
-                Engine = engine == null ? null : new { engine.Utc, engine.Revision, engine.Ok, engine.Passed, engine.Failed, engine.KitFailed, engine.Summary, Current = engine.Revision == g.Build.Revision },
+                Engine = engine == null ? null : new { engine.Utc, engine.Revision, engine.Ok, engine.Local, engine.Passed, engine.Failed, engine.KitFailed, engine.Summary, Current = engine.Revision == g.Build.Revision },
                 OpenDirectives = g.Directives.Count(d => d.Status == DirectiveStatus.Open),
                 Watchdog = new { g.Progress.Level, Name = Watchdog.LevelName(g.Progress.Level), g.Progress.StalledCycles, g.Progress.LastProgressUtc },
                 Live = live == null ? null : new { live.CycleId, live.Role, live.Running, live.Status, live.StartedUtc, live.LastUtc, live.Turns, live.ToolCalls, live.ToolErrors, live.ContextTokens },
@@ -120,6 +120,7 @@ namespace Omnipotent.Services.OmniBlox
                 CreatorSet = ctx.Creator.IsSet,
                 Slots = new { Total = ctx.Settings.Slots.Count, Free = slotsFree },
                 ctx.Settings.RequireLaunchApproval,
+                ctx.Settings.RequireBuildSignoff,
                 ctx.Settings.MaxGamesInProduction,
                 Attention = Attention(ctx, status, tasks, library, slotsFree),
                 StageCounts = Enum.GetValues<GameStage>().ToDictionary(st => st.ToString(), st => games.Count(g => g.Stage == st)),
@@ -188,7 +189,9 @@ namespace Omnipotent.Services.OmniBlox
             if (!status.ModelAvailable)
                 Add(ctx.Settings.Enabled ? "error" : "warning", "No model work right now", status.ModelReason ?? "KliveLLM is not available.", null);
             if (!ctx.Cloud.HasKey && !openTasks.Any(t => t.Kind == OwnerTaskKind.ApiKey))
-                Add("warning", "No Roblox API key", "Games are researched and built offline, but publishing, engine tests, model downloads and analytics wait for the OmniSetting OmniBlox_RobloxApiKey.", null);
+                Add("warning", "No Roblox API key", ctx.LocalEngine is { Available: true }
+                    ? "Games are researched and built offline, and their engine tests run in the studio's local engine; publishing, Roblox's own engine tests, model downloads and analytics wait for the OmniSetting OmniBlox_RobloxApiKey."
+                    : "Games are researched and built offline, but publishing, engine tests, model downloads and analytics wait for the OmniSetting OmniBlox_RobloxApiKey.", null);
             if (ctx.Settings.Slots.Count == 0 && !openTasks.Any(t => t.Kind == OwnerTaskKind.ExperienceSlot))
                 Add("warning", "No experience slots", "Roblox has no API for creating an experience. Create a few blank ones and add them as universeId:placeId to OmniBlox_ExperienceSlots.", null);
             else if (ctx.Settings.Slots.Count > 0 && slotsFree == 0 && !openTasks.Any(t => t.Kind == OwnerTaskKind.ExperienceSlot))
@@ -229,6 +232,9 @@ namespace Omnipotent.Services.OmniBlox
                 // Cycles whose full log is still on disk (the newest CycleLog.KeepLogs).
                 CycleLogs = CycleLog.Available(ctx, game.GameId),
                 EngineAvailable = StageGates.EngineAvailable(ctx, game),
+                // Roblox's engine cannot run it yet and the local engine stands in (run_tests and Run now use it).
+                LocalEngine = StageGates.LocalEngineStandsIn(ctx, game),
+                Approvals = Gates(ctx, game),
                 Watchdog = new
                 {
                     game.Progress.Level,
@@ -246,6 +252,31 @@ namespace Omnipotent.Services.OmniBlox
                         $"after {Pipeline.Watchdog.AskOwnerAt}: pause the game and ask the owner — it is never abandoned automatically",
                     },
                 },
+            };
+        }
+
+        /// <summary>
+        /// The owner's two launch gates for a game: whether each is on, whether the game is waiting at one now, and
+        /// every decision made so far. Waiting is "build" (play and sign off the build), "launch" (approve going
+        /// public) or null.
+        /// </summary>
+        public static object Gates(StudioContext ctx, GameDossier game)
+        {
+            bool atLaunch = game.Stage == GameStage.Launch;
+            bool signoff = atLaunch && Approvals.SignoffNeeded(ctx, game);
+            bool approval = atLaunch && !signoff && StageGates.MarketingReady(game) && game.Publish.LaunchRequestedUtc != null && !Approvals.LaunchApproved(ctx, game);
+            return new
+            {
+                ctx.Settings.RequireBuildSignoff,
+                ctx.Settings.RequireLaunchApproval,
+                Waiting = signoff ? Approvals.BuildGate : approval ? Approvals.LaunchGate : null,
+                Revision = game.Build.Revision,
+                game.Publish.SignoffRevision,
+                game.Publish.SignoffUtc,
+                LaunchApproved = Approvals.LaunchApproved(ctx, game),
+                game.Publish.ApprovedRevision,
+                game.Publish.LaunchApprovedUtc,
+                History = game.Publish.Approvals.OrderByDescending(a => a.Utc).Take(20).ToList(),
             };
         }
 
@@ -279,7 +310,7 @@ namespace Omnipotent.Services.OmniBlox
             if (!ws.Exists) return null;
             var result = ctx.Compile(gameId);
             var scene = ws.LoadScene();
-            var analysis = Build.MapReport.Analyze(scene, result.Parts, result.Terrain, ws.LoadManifest());
+            var analysis = Build.MapReport.Analyze(scene, result.Parts, result.Terrain, ws.LoadManifest(), catalog: ctx.Catalog().Get);
             return new
             {
                 analysis.Score,
@@ -288,6 +319,10 @@ namespace Omnipotent.Services.OmniBlox
                 analysis.Objects,
                 analysis.DistinctModels,
                 analysis.DressedShare,
+                analysis.Kind,
+                analysis.Blocked,
+                Bar = Build.MapReport.Bar,
+                Categories = analysis.Categories.Select(c => new { c.Name, c.Score, c.Max, c.Note }).ToList(),
                 Findings = analysis.Findings.Select(f => new { f.Severity, f.Area, f.Message }).ToList(),
                 analysis.Facts,
                 Zones = scene.Layout.Zones.Select(z => new { z.Id, z.Name, z.Purpose, z.Area, z.Order, z.Theme }).ToList(),

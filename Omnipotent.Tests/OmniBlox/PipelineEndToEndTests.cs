@@ -1,6 +1,7 @@
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.OmniBlox.Assets;
 using Omnipotent.Services.OmniBlox.Core;
+using Omnipotent.Services.OmniBlox.Pipeline;
 
 namespace Omnipotent.Tests.OmniBlox
 {
@@ -43,26 +44,19 @@ namespace Omnipotent.Tests.OmniBlox
                 }));
         }
 
+        /// <summary>The start platform of a generated obby (top at y 14, 38 studs square round x 0, z 120): a free corner for a hand-placed tree.</summary>
+        internal static readonly int[] StartCorner = { -14, 14, 134 };
+
         internal static void ScriptBuild(ScriptedLlm llm)
         {
             llm.Script("builder",
                 ("set_milestones", new { milestones = new[] { "Core loop playable", "Every must-have", "Polish" } }),
                 ("update_manifest", new { title = "Lava Forest Obby", currency_name = "Coins", tips = new[] { "Touch the green pads to save!" } }),
-                ("set_terrain", new { fills = new[] { new { material = "Grass", center = new[] { 60, -4, 0 }, size = new[] { 60, 8, 60 } } } }),
-                ("add_objects", new
-                {
-                    objects = new object[]
-                    {
-                        new { kind = "spawn", name = "Start", position = new[] { 0, 0.5, 0 }, size = new[] { 8, 1, 8 }, tags = new[] { "Checkpoint" }, config = new { Stage = 1 } },
-                        new { name = "Stage2", folder = "Obby", position = new[] { 0, 4, -14 }, size = new[] { 8, 1, 8 }, color = "#4CAF50", tags = new[] { "Checkpoint" }, config = new { Stage = 2 } },
-                        new { name = "Stage3", folder = "Obby", position = new[] { 0, 6, -28 }, size = new[] { 8, 1, 8 }, color = "#4CAF50", tags = new[] { "Checkpoint" }, config = new { Stage = 3 } },
-                        new { name = "Finish", folder = "Obby", position = new[] { 0, 8, -42 }, size = new[] { 8, 1, 8 }, color = "gold", tags = new[] { "Finish" } },
-                        new { name = "Lava", position = new[] { 0, -2, -20 }, size = new[] { 40, 1, 60 }, color = "red", material = "Neon", tags = new[] { "KillBrick" } },
-                    },
-                }),
+                ("design_world", new { }),
+                ("design_world", new { spec = new { course = new { stages = 16 } } }),
                 ("search_assets", new { query = "pine tree" }),
                 ("view_asset", new { asset_id = FakeRoblox.AssetId }),
-                ("place_asset", new { asset_id = FakeRoblox.AssetId, position = new[] { 20, 0, 0 }, yaw = 30 }),
+                ("place_asset", new { asset_id = FakeRoblox.AssetId, position = StartCorner, yaw = 30 }),
                 ("write_file", new { path = "src/server/Welcome.server.luau", content = "local Players = game:GetService(\"Players\")\nPlayers.PlayerAdded:Connect(function(player)\n\tprint(\"Welcome\", player.Name)\nend)\n" }),
                 ("write_file", new { path = "src/tests/Stages.luau", content = "return { [\"has stages\"] = function(t) t.ok(true) end }\n" }),
                 ("build", new { }),
@@ -70,13 +64,15 @@ namespace Omnipotent.Tests.OmniBlox
                 ("update_milestone", new { id = "m1", done = true }),
                 ("update_milestone", new { id = "m2", done = true }),
                 ("update_milestone", new { id = "m3", done = true }),
-                ("mark_feature_complete", new { notes = "three stages, lava, finish" }));
+                ("mark_feature_complete", new { notes = "sixteen stages over lava, checkpoints, a finish" }));
         }
 
         internal static void ScriptReview(ScriptedLlm llm, bool pass = true) =>
             llm.Script("tester",
                 ("render_scene", new { view = "spawn" }),
-                ("verdict", new { pass, summary = pass ? "Clear path, fair jumps, lava is obvious." : "Stage 2 is too far away." }));
+                ("verdict", pass
+                    ? new { pass, summary = "Clear path, fair jumps, lava is obvious.", scores = new { first_impression = 8, world_beauty = 8, world_fullness = 7, clear_goal = 9, fun_loop = 7, progression = 7 } }
+                    : (object)new { pass, summary = "Stage 2 is too far away." }));
 
         internal static void ScriptMarketing(ScriptedLlm llm, bool featureAsset = true) =>
             llm.Script("marketer",
@@ -118,8 +114,15 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.True(game.Build.LastBuildOk, string.Join("\n", game.Build.Errors));
             Assert.True(game.Build.FeatureComplete);
             Assert.Contains(FakeRoblox.AssetId, game.Build.AssetsUsed);
+            Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.design_world") && r.Contains("\"Layout\": \"course\""));
+            Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.design_world") && r.Contains("Regenerated"));
             Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.place_asset") && r.Contains("footprint"));
             Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.build") && r.Contains("BUILD OK"));
+            Assert.True(game.Build.MapScore >= StageGates.MinMapScore, "map " + game.Build.MapScore + ": " + string.Join(" | ", game.Build.MapFindings));
+            var scene = h.Ctx.Workspace(game.GameId).LoadScene();
+            Assert.Equal(16, scene.Objects.Count(o => o.Tags.Contains("Checkpoint")));
+            Assert.Contains(scene.Objects, o => o.Tags.Contains("Finish"));
+            Assert.Contains(scene.Objects, o => o.AssetId == FakeRoblox.AssetId && o.Source != "gen"); // the hand-placed tree survived the regeneration
 
             // Test: clean build, engine specs in "Roblox", and the playtest review.
             ScriptReview(h.Llm);
@@ -182,7 +185,7 @@ namespace Omnipotent.Tests.OmniBlox
         }
 
         [Fact]
-        public async Task LaunchWaitsForTheOwnersApproval()
+        public async Task LaunchWaitsForTheOwnersSignoff_ThenForTheOwnersApproval_BeforeAnythingHappensOnRoblox()
         {
             using var h = new StudioHarness(requireApproval: true);
             await h.Harvester.RunOnceAsync(CancellationToken.None);
@@ -190,17 +193,92 @@ namespace Omnipotent.Tests.OmniBlox
             ScriptBuild(h.Llm);
             ScriptReview(h.Llm);
             ScriptMarketing(h.Llm);
-            await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason?.Contains("approval") == true, 40);
+            List<OwnerTask> Tasks() => h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList());
+            bool NothingOnRoblox() => !h.Roblox.Requests.Any(r => r.Url.Contains("versionType=Published") || r.Method != "GET" && (r.Url.Contains("/game-passes/") || r.Url.Contains("/developer-products/") || r.Url.Contains("/cloud/v2/universes/1001?")));
+
+            // Gate 1: the tested build waits for the owner to play it, before any marketing work.
+            await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason?.Contains("sign it off") == true, 40);
             var game = h.OnlyGame();
             Assert.Equal(GameStage.Launch, game.Stage);
-            Assert.DoesNotContain(h.Roblox.Requests, r => r.Url.Contains("versionType=Published"));
-            Assert.Contains(h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList()), t => t.Kind == OwnerTaskKind.LaunchApproval && t.Status == OwnerTaskStatus.Open);
+            Assert.Contains(Tasks(), t => t.Kind == OwnerTaskKind.BuildSignoff && t.Status == OwnerTaskStatus.Open && t.Title.Contains($"r{game.Build.Revision}"));
+            Assert.DoesNotContain(h.Llm.ToolResults, r => r.StartsWith("marketer."));
+            for (int i = 0; i < 3; i++) await h.Orchestrator.StepAsync(CancellationToken.None);
+            Assert.DoesNotContain(h.Llm.ToolResults, r => r.StartsWith("marketer.")); // it really waits
+            Assert.Throws<KeyNotFoundException>(() => Approvals.Approve(h.Ctx, "nope", Approvals.BuildGate));
+            Approvals.Approve(h.Ctx, game.GameId, Approvals.BuildGate, "Plays well; the lava is scary in a good way.");
+            Assert.DoesNotContain(Tasks(), t => t.Kind == OwnerTaskKind.BuildSignoff && t.Status == OwnerTaskStatus.Open);
 
-            // The owner approves on the dashboard.
-            h.Ctx.Update(game.GameId, g => { g.Publish.LaunchApprovedUtc = h.Now; g.NextAttemptUtc = h.Now; });
+            // Gate 2: marketing, the final build and engine run, then the launch approval — nothing on Roblox yet.
+            await h.StepUntilAsync(() => h.OnlyGame().WaitingReason?.Contains("launch approval") == true, 40);
+            game = h.OnlyGame();
+            Assert.Equal(GameStage.Launch, game.Stage);
+            Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("marketer.request_launch"));
+            Assert.True(NothingOnRoblox(), "something happened on Roblox before the launch approval");
+            var approval = Assert.Single(Tasks(), t => t.Kind == OwnerTaskKind.LaunchApproval && t.Status == OwnerTaskStatus.Open);
+            Assert.Contains("Skip Stage", approval.Detail);
+            Assert.Contains("R$ 25", approval.Detail);
+            for (int i = 0; i < 3; i++) await h.Orchestrator.StepAsync(CancellationToken.None);
+            Assert.True(NothingOnRoblox());
+
+            // Approved: products, store page, publish, public.
+            Approvals.Approve(h.Ctx, game.GameId, Approvals.LaunchGate);
             await h.StepUntilAsync(() => h.OnlyGame().Stage == GameStage.Live);
+            game = h.OnlyGame();
             Assert.Contains(h.Roblox.Requests, r => r.Url.Contains("versionType=Published"));
-            Assert.DoesNotContain(h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList()), t => t.Kind == OwnerTaskKind.LaunchApproval && t.Status == OwnerTaskStatus.Open);
+            Assert.All(game.Products, p => Assert.NotNull(p.RobloxId));
+            Assert.DoesNotContain(Tasks(), t => t.Kind == OwnerTaskKind.LaunchApproval && t.Status == OwnerTaskStatus.Open);
+            Assert.Equal(new[] { "build:approved", "launch:approved" }, game.Publish.Approvals.Select(a => a.Gate + ":" + a.Decision));
+            Assert.Equal(game.Build.Revision, game.Publish.ApprovedRevision);
+        }
+
+        [Fact]
+        public async Task AnApprovalIsForWhatTheOwnerSaw_AChangedPriceNeedsApprovingAgain()
+        {
+            using var h = new StudioHarness(requireApproval: true);
+            await h.Harvester.RunOnceAsync(CancellationToken.None);
+            ScriptResearch(h.Llm);
+            ScriptBuild(h.Llm);
+            ScriptReview(h.Llm);
+            ScriptMarketing(h.Llm);
+            await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason?.Contains("sign it off") == true, 40);
+            string id = h.OnlyGame().GameId;
+            Approvals.Approve(h.Ctx, id, Approvals.BuildGate);
+            await h.StepUntilAsync(() => h.OnlyGame().WaitingReason?.Contains("launch approval") == true, 40);
+            Approvals.Approve(h.Ctx, id, Approvals.LaunchGate);
+            Assert.True(Approvals.LaunchApproved(h.Ctx, h.Game(id)));
+
+            // A price changes after the approval: the approval no longer covers the launch.
+            h.Ctx.Update(id, g => g.Products[0].PriceRobux = 49);
+            Assert.False(Approvals.LaunchApproved(h.Ctx, h.Game(id)));
+            await h.StepUntilAsync(() => h.OnlyGame().WaitingReason?.Contains("launch approval") == true, 10);
+            Assert.DoesNotContain(h.Roblox.Requests, r => r.Url.Contains("versionType=Published"));
+            Assert.Contains(h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList()), t => t.Kind == OwnerTaskKind.LaunchApproval && t.Status == OwnerTaskStatus.Open && t.Detail.Contains("R$ 49"));
+        }
+
+        [Fact]
+        public async Task ChangesAskedAtTheSignoff_GoToTheBuilder_AndTheGameGoesBackToBuild()
+        {
+            using var h = new StudioHarness(requireApproval: true);
+            await h.Harvester.RunOnceAsync(CancellationToken.None);
+            ScriptResearch(h.Llm);
+            ScriptBuild(h.Llm);
+            ScriptReview(h.Llm);
+            await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason?.Contains("sign it off") == true, 40);
+            var game = h.OnlyGame();
+            Assert.Throws<ArgumentException>(() => Approvals.RequestChanges(h.Ctx, h.Orchestrator, game.GameId, Approvals.BuildGate, " ", backToBuild: false));
+            Approvals.RequestChanges(h.Ctx, h.Orchestrator, game.GameId, Approvals.BuildGate, "Stage 7 is too hard for a first visit; make the jumps shorter.", backToBuild: false);
+
+            game = h.OnlyGame();
+            Assert.Equal(GameStage.Build, game.Stage);
+            Assert.False(game.Build.FeatureComplete);
+            Assert.Null(game.WaitingReason);
+            Assert.Contains(game.Directives, d => d.Text.Contains("Stage 7 is too hard"));
+            Assert.DoesNotContain(h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList()), t => t.Kind == OwnerTaskKind.BuildSignoff && t.Status == OwnerTaskStatus.Open);
+            Assert.Equal("changes", Assert.Single(game.Publish.Approvals).Decision);
+
+            // The builder's next cycle is told.
+            await h.Orchestrator.StepAsync(CancellationToken.None);
+            Assert.Contains(h.Llm.Briefings, b => b.Contains("Stage 7 is too hard"));
         }
 
         [Fact]
@@ -214,16 +292,8 @@ namespace Omnipotent.Tests.OmniBlox
 
             ScriptResearch(h.Llm);
             h.Llm.Script("builder",
-                ("add_objects", new
-                {
-                    objects = new object[]
-                    {
-                        new { kind = "spawn", name = "Start", position = new[] { 0, 0.5, 0 }, size = new[] { 8, 1, 8 }, tags = new[] { "Checkpoint" }, config = new { Stage = 1 } },
-                        new { name = "Stage2", position = new[] { 0, 4, -14 }, size = new[] { 8, 1, 8 }, tags = new[] { "Checkpoint" }, config = new { Stage = 2 } },
-                        new { name = "Finish", position = new[] { 0, 6, -28 }, size = new[] { 8, 1, 8 }, tags = new[] { "Finish" } },
-                    },
-                }),
-                ("place_asset", new { asset_id = FakeRoblox.AssetId, position = new[] { 20, 0, 0 } }),
+                ("design_world", new { }),
+                ("place_asset", new { asset_id = FakeRoblox.AssetId, position = StartCorner }),
                 ("build", new { }),
                 ("update_milestone", new { id = "m1", done = true }),
                 ("update_milestone", new { id = "m2", done = true }),

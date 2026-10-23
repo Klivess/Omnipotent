@@ -143,25 +143,161 @@ elseif template == "tycoon" then
 			end
 		end
 	end
-elseif template == "simulator" then
-	spec["simulator collect → sell → upgrade loop works"] = function(t)
-		local Simulator = require(Kit.Templates.Simulator) :: any
-		local collectibles = #CollectionService:GetTagged("Collectible")
-		local sellZones = #CollectionService:GetTagged("SellZone")
-		if collectibles == 0 and sellZones == 0 then
-			t.warn("no parts are tagged Collectible or SellZone: the simulator template's collect/sell loop is unused (fine when the game runs its own loop)")
-		else
-			t.ok(collectibles > 0, "parts are tagged SellZone but none Collectible")
-			t.ok(sellZones > 0, "parts are tagged Collectible but none SellZone")
+
+	-- A player claims a plot and buys it out, button by button in the order the buttons require, earning
+	-- income from what they bought and banking it at the collector.
+	spec["a tycoon plot can be bought out from start to finish"] = function(t)
+		local Tycoon = require(Kit.Templates.Tycoon) :: any
+		local plots = Tycoon.Plots()
+		if #plots == 0 then
+			t.skip("no plots")
 		end
 		local p = t.player()
-		t.ok(Simulator.Collect(p, 5) > 0, "can collect")
-		t.ok(Simulator.Sell(p) > 0, "can sell")
-		Currency.Add(p, 100000, "Test", false)
-		local first = Simulator.Upgrades[1]
-		if first then
-			t.ok(Simulator.BuyUpgrade(p, first.Key), "can buy an upgrade")
-			t.eq(Simulator.Level(p, first.Key), 1, "upgrade level")
+		local plot = Tycoon.Claim(p)
+		t.ok(plot ~= nil, "a new player gets a plot")
+		if not plot then
+			return
+		end
+		local remaining = table.clone(plot.buttons)
+		local bought = 0
+		for _ = 1, #plot.buttons + 1 do
+			local progressed = false
+			for i = #remaining, 1, -1 do
+				local button = remaining[i]
+				local requires = tostring(Util.Setting(button, "Requires", ""))
+				if requires == "" or plot.owned[requires] then
+					Currency.Add(p, Util.Number(button, "Price", 0), "Test", false)
+					t.ok(Tycoon.Buy(p, plot, button), "buying " .. tostring(Util.Setting(button, "Unlocks", "?")))
+					table.remove(remaining, i)
+					bought += 1
+					progressed = true
+				end
+			end
+			if not progressed then
+				break
+			end
+		end
+		t.eq(#remaining, 0, "every button can be reached by buying the ones before it (left over: " .. #remaining .. ")")
+		t.ok(plot.income > 0, "the bought items make an income")
+		plot.bank += 10
+		t.ok(Tycoon.Collect(p, plot) > 0, "the collector pays the bank out")
+		Tycoon.Release(p)
+		t.ok(bought > 0, "bought something")
+	end
+elseif template == "simulator" then
+	-- The whole loop a new player goes through, on the real map: harvest in the first zone, sell, buy a better
+	-- tool, then unlock every zone in order and harvest there too; a broken node grows back.
+	spec["simulator: every zone can be unlocked in order and harvested"] = function(t)
+		local Simulator = require(Kit.Templates.Simulator) :: any
+		local nodes = Simulator.Nodes()
+		if #nodes == 0 then
+			if #CollectionService:GetTagged("Collectible") > 0 then
+				t.skip("the map uses walk-over Collectibles rather than resource nodes")
+			end
+			t.fail("a simulator needs resource nodes (models tagged Resource with Zone, Hp, Value) or Collectibles; regenerate the world (design_world)")
+			return
+		end
+		t.ok(#CollectionService:GetTagged("SellZone") > 0, "there is a part tagged SellZone to sell at")
+		local p = t.player()
+		local function harvestIn(zone: string?): boolean
+			for _, node in ipairs(nodes) do
+				if node.zone == zone and node.alive then
+					for _ = 1, 2000 do
+						local _, broke = Simulator.Hit(p, node.inst, true)
+						if broke then
+							return true
+						end
+						if Simulator.Bag(p) >= Simulator.Capacity(p) then
+							Simulator.Sell(p)
+						end
+					end
+					return false
+				end
+			end
+			return false
+		end
+		-- The open zone(s): what a new player can do at once.
+		local open = nil
+		for _, node in ipairs(nodes) do
+			if Simulator.CanHarvest(p, node.zone) then
+				open = node
+				break
+			end
+		end
+		t.ok(open ~= nil, "a new player can harvest somewhere without unlocking anything")
+		if not open then
+			return
+		end
+		t.ok(harvestIn(open.zone), "a node in the first zone breaks")
+		t.ok(Simulator.Bag(p) > 0, "breaking a node fills the bag")
+		local before = Currency.Get(p)
+		t.ok(Simulator.Sell(p) > 0 and Currency.Get(p) > before, "selling the bag pays")
+		if #Simulator.Tools > 1 then
+			local power = Simulator.Power(p)
+			Currency.Add(p, tonumber(Simulator.Tools[2].Price) or 0, "Test", false)
+			t.ok(Simulator.BuyTool(p), "the second tool can be bought")
+			t.ok(Simulator.Power(p) > power, "a better tool hits harder")
+		end
+		-- Every gated zone, cheapest first (which is also the order they require each other in).
+		local gates = {}
+		for _, gate in pairs(Progression.Gates()) do
+			table.insert(gates, gate)
+		end
+		table.sort(gates, function(a, b)
+			return a.price < b.price
+		end)
+		for _, gate in ipairs(gates) do
+			local zoneNodes = 0
+			for _, node in ipairs(nodes) do
+				if node.zone == gate.zone then
+					zoneNodes += 1
+				end
+			end
+			t.ok(zoneNodes > 0, "zone " .. gate.zone .. " has resource nodes")
+			local openBefore = Simulator.CanHarvest(p, gate.zone)
+			t.ok(not openBefore, "zone " .. gate.zone .. " is locked before it is bought")
+			Currency.Add(p, gate.price, "Test", false, gate.currency)
+			t.ok(Progression.Unlock(p, gate.zone), "unlocking " .. gate.zone)
+			Simulator.Sell(p)
+			if zoneNodes > 0 then
+				t.ok(harvestIn(gate.zone), "a node in " .. gate.zone .. " breaks once it is unlocked")
+			end
+		end
+		-- Broken nodes grow back.
+		local broken = nil
+		for _, node in ipairs(nodes) do
+			if not node.alive then
+				broken = node
+				break
+			end
+		end
+		if broken then
+			Simulator.Restore(broken.inst)
+			t.ok(broken.alive and broken.hp == broken.maxHp, "a broken node grows back whole")
+		end
+		local upgradeKey = Simulator.Upgrades[1] and Simulator.Upgrades[1].Key
+		if upgradeKey then
+			Currency.Add(p, 1e9, "Test", false)
+			t.ok(Simulator.BuyUpgrade(p, upgradeKey), "an upgrade can be bought")
+		end
+	end
+
+	spec["simulator: every node belongs to a real zone and has sane values"] = function(t)
+		local Simulator = require(Kit.Templates.Simulator) :: any
+		local nodes = Simulator.Nodes()
+		if #nodes == 0 then
+			t.skip("no resource nodes")
+		end
+		local gates = Progression.Gates()
+		local zones = {}
+		for _, node in ipairs(nodes) do
+			t.ok(node.maxHp >= 1 and node.value >= 1 and node.respawn >= 1, node.inst:GetFullName() .. " needs Hp, Value and Respawn of at least 1")
+			if node.zone then
+				zones[node.zone] = (zones[node.zone] or 0) + 1
+			end
+		end
+		for zone in pairs(gates) do
+			t.ok((zones[zone] or 0) > 0, "the gated zone " .. zone .. " has no resource nodes, so unlocking it gives nothing to do")
 		end
 	end
 end
