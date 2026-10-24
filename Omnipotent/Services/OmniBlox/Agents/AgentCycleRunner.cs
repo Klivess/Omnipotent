@@ -1,3 +1,4 @@
+using System.Text;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.OmniBlox.Core;
 
@@ -13,21 +14,26 @@ namespace Omnipotent.Services.OmniBlox.Agents
         public required AgentToolbox Tools { get; init; }
         /// <summary>
         /// A guard against a runaway loop, not a work budget. A cycle normally ends when the agent reports, or hands
-        /// over when its context fills (<see cref="WrapUpAtPromptTokens"/>); the next cycle carries on from the
+        /// over when its context fills (<see cref="ContextWindowTokens"/>); the next cycle carries on from the
         /// hand-over, so work is never cut off by a count.
         /// </summary>
         public int MaxTurns { get; init; } = 300;
-        /// <summary>Prompt size at which the agent is asked to hand over (append-only history keeps growing).</summary>
-        public long WrapUpAtPromptTokens { get; init; } = 120_000;
+        /// <summary>The model's context window: a request and its reply (<see cref="LlmCallOptions.MaxTokens"/>) must fit in it together.</summary>
+        public long ContextWindowTokens { get; init; } = 260_000;
+        /// <summary>
+        /// Room kept for the hand-over. Once the next request would come within this of the window (after the reply's
+        /// share), the agent is asked to finish the step it is on and report. Within half of it, it is stopped and asked
+        /// for the report, which still leaves room for one large step (a whole file written, or several read).
+        /// </summary>
+        public long HandOverRoomTokens { get; init; } = 64_000;
         /// <summary>Turns the agent may take to finish the step it is on after being asked to hand over.</summary>
         public int HandOverGraceTurns { get; init; } = 8;
         /// <summary>
-        /// Bytes of pictures one request may carry (as sent, before base64). Not a limit on what the agent sees: every
-        /// picture is shown, and once those in the history pass this, the oldest are swapped for a one-line note.
-        /// AIRouter's front door refuses a body somewhere between 3.9 MB (the largest that got through) and 4.9 MB (the
-        /// smallest refused, HTTP 413); 2 MB is 2.7 MB as base64, leaving room for the text of a full context.
+        /// The largest request body to send. AIRouter's front door refuses one somewhere between 3.9 MB (the largest
+        /// that got through) and 4.9 MB (the smallest refused, HTTP 413). Not a limit on what the agent sees: every
+        /// picture is shown, and the oldest are swapped for a one-line note when the next request would pass this.
         /// </summary>
-        public long PictureBytesPerRequest { get; init; } = 2_000_000;
+        public long MaxRequestBytes { get; init; } = 3_500_000;
         public LlmCallOptions Options { get; init; } = new();
         /// <summary>Sees the cycle as it runs (the dashboard's live view and the cycle log). Null: nobody watches.</summary>
         public ICycleObserver? Observer { get; init; }
@@ -61,13 +67,14 @@ namespace Omnipotent.Services.OmniBlox.Agents
     ///   and the half-written call still ran. A reply that hits the output limit ("length") is now detected: a
     ///   call whose arguments were cut off is not run, and the agent is told to write in smaller pieces.
     /// - Cycles ended at a fixed turn count. They now end when the agent reports, or hand over when the context
-    ///   fills, and the next cycle continues; the turn limit only stops a runaway loop.
+    ///   fills (measured against the model's window, not a guessed size), and the next cycle continues; the turn
+    ///   limit only stops a runaway loop.
     /// - Nobody could see a cycle until it ended. An observer now sees every call, result and picture.
     /// - The owner's directions waited for the next briefing; they are now delivered into the running cycle.
     /// - Pictures went to the model as lossless PNGs and piled up until the request was too large for AIRouter (HTTP
     ///   413), losing the cycle after three or four renders. They now go as JPEG, every one is shown, and once the
-    ///   pictures in the history near the limit the oldest are swapped for a note. A refused request drops the
-    ///   pictures already sent and carries on.
+    ///   request nears the limit the oldest are swapped for a note. A refused request drops the pictures already
+    ///   sent and carries on.
     ///
     /// Every request of a cycle is the previous one plus new messages, under one unchanging tool list,
     /// so AIRouter's prefix cache can serve everything already sent (see KliveLLM/PromptPrefixStability).
@@ -121,10 +128,13 @@ namespace Omnipotent.Services.OmniBlox.Agents
             string session = $"omniblox-{request.Role}-{request.GameId}-{Guid.NewGuid():N}";
             var usage = new UsageTotals();
             int turns = 0, toolErrors = 0, toolCalls = 0, nudges = 0, truncations = 0, wrapUpTurn = 0, cutOffFailures = 0;
-            long previousPrompt = 0, pictureBudget = request.PictureBytesPerRequest;
+            long previousPrompt = 0, maxRequestBytes = request.MaxRequestBytes;
+            // The reply has to fit in the window with the request that asks for it.
+            long promptLimit = request.ContextWindowTokens - request.Options.MaxTokens;
             bool wrapUpSent = false, providerError = false, runaway = false;
-            // Bytes of each message that still carries its pictures, oldest first.
-            var pictureMessages = new List<long>();
+            var gauge = new RequestGauge();
+            // Each message that still carries its pictures, oldest first: how many, and their bytes as sent.
+            var pictureMessages = new List<(int Count, long Bytes)>();
             JObject? finish = null;
             string? error = null;
             string lastText = "";
@@ -143,16 +153,55 @@ namespace Omnipotent.Services.OmniBlox.Agents
             void Say(string text)
             {
                 llm.AppendUser(session, text);
+                gauge.AddText(text);
                 observer.Note(text);
+            }
+
+            void Result(LlmToolCall call, string text)
+            {
+                llm.AppendToolResult(session, call.Id, call.Name, text);
+                gauge.AddText(text);
+            }
+
+            void Answered(LlmTurn turn)
+            {
+                gauge.Measured(turn.PromptTokens, turn.RequestBytes);
+                // KliveLLM keeps the reply in the history: its text and its calls, not its reasoning.
+                if (turn.Success) gauge.AddText(turn.Text + string.Concat(turn.ToolCalls.Select(c => c.Name + c.ArgumentsJson)));
+            }
+
+            // Swaps the pictures of all but the newest keepNewest picture messages for a note. That rewrites history
+            // already sent, so the provider re-prefills from the first message changed.
+            int SwapOutPictures(int keepNewest)
+            {
+                int changed = llm.DropPictures(session, keepNewest);
+                var gone = pictureMessages.Take(Math.Max(0, pictureMessages.Count - keepNewest)).ToList();
+                gauge.RemovePictures(gone.Sum(m => m.Count), gone.Sum(m => m.Bytes));
+                pictureMessages.RemoveRange(0, gone.Count);
+                return changed;
+            }
+
+            void KeepUnderByteLimit()
+            {
+                if (gauge.NextBytes <= maxRequestBytes) return;
+                // The oldest pictures go first, down to a third under the limit rather than just under it: the
+                // rewrite (a re-prefill) then comes once per several renders, not on every turn.
+                long target = maxRequestBytes * 2 / 3, freed = 0;
+                int drop = 0;
+                while (drop < pictureMessages.Count - 1 && gauge.NextBytes - freed > target)
+                    freed += pictureMessages[drop++].Bytes;
+                if (drop > 0) SwapOutPictures(pictureMessages.Count - drop);
             }
 
             observer.Started(cycleId, request.Role, request.Stage);
             llm.StartSession(session, request.SystemPrompt);
+            gauge.AddText(request.SystemPrompt + string.Concat(tools.Select(t => t.Name + t.Description + t.Parameters.ToString(Newtonsoft.Json.Formatting.None))));
             try
             {
                 // The briefing closes with its own "Now:" line. A receipt stamp at its head would stop it
                 // sharing its stable sections with the previous cycle's briefing.
                 llm.AppendStableUser(session, request.Briefing);
+                gauge.AddText(request.Briefing);
                 while (finish == null)
                 {
                     ct.ThrowIfCancellationRequested();
@@ -161,6 +210,7 @@ namespace Omnipotent.Services.OmniBlox.Agents
                     turns++;
                     var turn = await QueryWithRetryAsync(session, tools, request.Options, ct);
                     Account(turn);
+                    Answered(turn);
                     if (!turn.Success && turn.Truncated && ++cutOffFailures <= 4)
                     {
                         // A reply cut off inside a tool call the provider could not even parse: nothing was kept.
@@ -168,15 +218,18 @@ namespace Omnipotent.Services.OmniBlox.Agents
                         Say("Your last reply was cut off at the output limit in the middle of a tool call, so nothing ran. Send smaller calls: a long file as write_file (first part) followed by append_file, and changes to existing files as edit_file.");
                         continue;
                     }
-                    if (!turn.Success && turn.TooLarge && llm.DropPictures(session, keepNewest: 0) > 0)
+                    if (!turn.Success && turn.TooLarge)
                     {
-                        // The pruning below should keep this from happening; if it does, the provider's limit is
-                        // lower than measured. Rewriting messages already sent re-prefills the cycle once, which beats
-                        // losing it, and requests carry half the pictures from here on.
-                        pictureMessages.Clear();
-                        pictureBudget /= 2;
-                        Say("The request had grown too large for the model provider, so the pictures shown so far were removed (their text results are still here). New pictures are still shown: look again at anything you need.");
-                        continue;
+                        // The pruning below should keep this from happening; if it does, the provider's limit is lower
+                        // than measured. Rewriting messages already sent re-prefills the cycle once, which beats losing
+                        // it, and requests stay a fifth under the size that was refused from here on.
+                        long refused = gauge.NextBytes;
+                        if (SwapOutPictures(0) > 0)
+                        {
+                            maxRequestBytes = Math.Min(maxRequestBytes, refused * 4 / 5);
+                            Say("The request had grown too large for the model provider, so the pictures shown so far were removed (their text results are still here). New pictures are still shown: look again at anything you need.");
+                            continue;
+                        }
                     }
                     if (!turn.Success)
                     {
@@ -223,38 +276,32 @@ namespace Omnipotent.Services.OmniBlox.Agents
                             int count = failureCounts[key] = failureCounts.GetValueOrDefault(key) + 1;
                             if (count >= 3) text += "\nThis exact call has now failed " + count + " times. Do something different: read the error, check your inputs, or take another approach.";
                         }
-                        llm.AppendToolResult(session, call.Id, call.Name, Clip(text, 16_000));
+                        Result(call, Clip(text, 16_000));
                         observer.ToolResult(call.Id, call.Name, text, result.IsError, result.Images);
                         if (result.Images.Count > 0) images.AddRange(result.Images);
                         if (result.Finish != null) finish = result.Finish;
                     }
                     if (images.Count > 0 && finish == null)
                     {
+                        const string caption = "Pictures returned by your last tool call(s):";
                         var shown = images.Select(ModelPictures.ForModel).ToList();
-                        llm.AppendUser(session, "Pictures returned by your last tool call(s):", shown);
-                        pictureMessages.Add(shown.Sum(p => (long)p.Length));
-                        if (pictureMessages.Sum() > pictureBudget)
-                        {
-                            // Every picture stays in the request until it is swapped out, so the oldest go once they
-                            // would carry it past the provider's limit. Pruning down to half the budget, not just under
-                            // it, rewrites the sent history (a re-prefill) once per several renders, not every turn.
-                            int keep = 1;
-                            long kept = pictureMessages[^1];
-                            while (keep < pictureMessages.Count && kept + pictureMessages[^(keep + 1)] <= pictureBudget / 2)
-                                kept += pictureMessages[^(++keep)];
-                            llm.DropPictures(session, keep);
-                            pictureMessages.RemoveRange(0, pictureMessages.Count - keep);
-                        }
+                        llm.AppendUser(session, caption, shown);
+                        gauge.AddText(caption);
+                        gauge.AddPictures(shown);
+                        pictureMessages.Add((shown.Count, shown.Sum(RequestGauge.PictureBytes)));
                     }
                     if (finish != null) break;
+                    // Every picture stays in the request until it is swapped out, and the text keeps growing too.
+                    KeepUnderByteLimit();
 
-                    if (!wrapUpSent && turn.PromptTokens >= request.WrapUpAtPromptTokens)
+                    long next = gauge.NextTokens;
+                    if (!wrapUpSent && next >= promptLimit - request.HandOverRoomTokens)
                     {
                         wrapUpSent = true;
                         wrapUpTurn = turns;
                         Say("This cycle's context is nearly full. Finish the step you are on (at most a few more calls), then call finish_cycle with a complete hand-over. Nothing is lost: the next cycle continues from your report, so put the exact next steps and facts in it.");
                     }
-                    else if (wrapUpSent && (turns - wrapUpTurn >= request.HandOverGraceTurns || turn.PromptTokens >= request.WrapUpAtPromptTokens * 135 / 100))
+                    else if (wrapUpSent && (turns - wrapUpTurn >= request.HandOverGraceTurns || next >= promptLimit - request.HandOverRoomTokens / 2))
                     {
                         break; // into the hand-over below
                     }
@@ -279,11 +326,8 @@ namespace Omnipotent.Services.OmniBlox.Agents
                         turns++;
                         var last = await QueryWithRetryAsync(session, tools, request.Options, ct);
                         Account(last);
-                        if (!last.Success && last.TooLarge && llm.DropPictures(session, keepNewest: 0) > 0)
-                        {
-                            pictureMessages.Clear();
-                            continue;
-                        }
+                        Answered(last);
+                        if (!last.Success && last.TooLarge && SwapOutPictures(0) > 0) continue;
                         if (!last.Success) break;
                         if (!string.IsNullOrWhiteSpace(last.Text)) lastText = last.Text;
                         if (last.ToolCalls.Count == 0) continue;
@@ -304,7 +348,7 @@ namespace Omnipotent.Services.OmniBlox.Agents
                                         : "ERROR: the arguments are not valid JSON. Call finish_cycle again with one JSON object.";
                                 }
                             }
-                            llm.AppendToolResult(session, call.Id, call.Name, result);
+                            Result(call, result);
                             observer.ToolResult(call.Id, call.Name, result, finish == null, Array.Empty<byte[]>());
                         }
                     }
@@ -468,5 +512,49 @@ namespace Omnipotent.Services.OmniBlox.Agents
         }
 
         internal static string Clip(string s, int max) => s.Length <= max ? s : s[..max] + $"… [{s.Length - max} more characters cut]";
+    }
+
+    /// <summary>
+    /// What the next request of a cycle will weigh: in tokens, against the model's window, and in bytes, against the
+    /// provider's body limit. Each reply carries the exact size of the request it answered, so only what was appended
+    /// since is estimated (generously), and the estimate never drifts by more than one turn.
+    /// </summary>
+    internal sealed class RequestGauge
+    {
+        /// <summary>The most a picture costs the model (a 1280×760 render is about 1,240 tokens).</summary>
+        public const int PictureTokens = 1_600;
+
+        private long tokens, bytes, addedTokens, addedBytes;
+
+        public long NextTokens => tokens + addedTokens;
+        public long NextBytes => bytes + addedBytes;
+
+        /// <summary>A picture's bytes in the request: base64 inside a data URI.</summary>
+        public static long PictureBytes(byte[] picture) => (picture.Length + 2) / 3 * 4 + 64;
+
+        public void AddText(string text)
+        {
+            addedTokens += text.Length / 3 + 8;
+            addedBytes += Encoding.UTF8.GetByteCount(text) * 11 / 10 + 64; // JSON escapes and the message's own fields
+        }
+
+        public void AddPictures(IReadOnlyList<byte[]> pictures)
+        {
+            addedTokens += (long)pictures.Count * PictureTokens;
+            addedBytes += pictures.Sum(PictureBytes);
+        }
+
+        public void RemovePictures(int count, long pictureBytes)
+        {
+            addedTokens -= (long)count * PictureTokens;
+            addedBytes -= pictureBytes;
+        }
+
+        /// <summary>The provider's count for the request just answered; a figure it did not give stays estimated.</summary>
+        public void Measured(long promptTokens, long requestBytes)
+        {
+            if (promptTokens > 0) (tokens, addedTokens) = (promptTokens, 0);
+            if (requestBytes > 0) (bytes, addedBytes) = (requestBytes, 0);
+        }
     }
 }

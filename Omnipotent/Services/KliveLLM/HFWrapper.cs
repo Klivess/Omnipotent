@@ -456,6 +456,10 @@ namespace Omnipotent.Services.KliveLLM
             [JsonIgnore]
             public string response_cache_status { get; set; }
 
+            /// <summary>UTF-8 size of the request body that got this response (providers refuse bodies past a limit).</summary>
+            [JsonIgnore]
+            public long request_bytes { get; set; }
+
             public class Choice
             {
                 [JsonProperty("finish_reason")]

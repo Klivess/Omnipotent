@@ -131,7 +131,9 @@ namespace Omnipotent.Services.OmniBlox
                 DevExRate = double.TryParse(await GetStringOmniSetting("OmniBlox_DevExRate", "0.0038"), NumberStyles.Float, CultureInfo.InvariantCulture, out double rate) ? rate : 0.0038,
                 MaintenanceIntervalDays = Math.Clamp(await GetIntOmniSetting("OmniBlox_MaintenanceIntervalDays", 7), 1, 60),
                 MaxOutputTokens = Math.Clamp(await GetIntOmniSetting("OmniBlox_MaxOutputTokens", 16_384), 4096, 65_536),
-                CycleContextTokens = Math.Clamp(await GetIntOmniSetting("OmniBlox_CycleContextTokens", 120_000), 40_000, 400_000),
+                // The model's window, not a hand-over size: the hand-over is worked out from it. (It replaced
+                // OmniBlox_CycleContextTokens, whose 120K default is already stored on the server.)
+                ModelContextTokens = Math.Clamp(await GetIntOmniSetting("OmniBlox_ModelContextTokens", 260_000), 64_000, 2_000_000),
             };
             // The playtest experience runs unfinished builds, so a game is never given it as its own.
             if (s.PlaytestSlot is { } playtest && s.Slots.RemoveAll(slot => slot.UniverseId == playtest.UniverseId) > 0 && ctx.Settings.PlaytestSlot?.UniverseId != playtest.UniverseId)
@@ -152,7 +154,7 @@ namespace Omnipotent.Services.OmniBlox
             t.DevExRate = s.DevExRate;
             t.MaintenanceIntervalDays = s.MaintenanceIntervalDays;
             t.MaxOutputTokens = s.MaxOutputTokens;
-            t.CycleContextTokens = s.CycleContextTokens;
+            t.ModelContextTokens = s.ModelContextTokens;
             try { ModelGate = await ctx.Llm.CheckAvailableAsync(CancellationToken.None); } catch { }
         }
 

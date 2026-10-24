@@ -1717,6 +1717,7 @@ namespace Omnipotent.Services.KliveLLM
                 ProviderDurationMs = response.provider_duration_ms,
                 LatencyBreakdownAvailable = response.latency_breakdown_available,
                 ResponseCacheStatus = response.response_cache_status,
+                RequestBytes = response.request_bytes,
                 ContextWindowTokens = contextWindowTokensOverride,
                 ContextWasCompacted = contextWasCompacted,
                 CacheEpochID = cacheEpochID,
@@ -2912,6 +2913,7 @@ namespace Omnipotent.Services.KliveLLM
                 queue_duration_ms = fairUse?.QueueDurationMs ?? 0,
                 provider_duration_ms = providerStopwatch.ElapsedMilliseconds,
                 latency_breakdown_available = true,
+                request_bytes = Encoding.UTF8.GetByteCount(payloadJson),
                 choices = new List<HFWrapper.HFLLMInferenceResponse.Choice>
                 {
                     new HFWrapper.HFLLMInferenceResponse.Choice
@@ -3202,6 +3204,7 @@ namespace Omnipotent.Services.KliveLLM
                     hfResponse.queue_duration_ms = totalQueueDurationMs;
                     hfResponse.provider_duration_ms = totalProviderDurationMs;
                     hfResponse.latency_breakdown_available = true;
+                    hfResponse.request_bytes = Encoding.UTF8.GetByteCount(payloadJson);
                     ReportFairUseUsage(remoteProvider.Provider, fairUse, hfResponse.usage);
                     return hfResponse;
                 }
@@ -3622,6 +3625,8 @@ namespace Omnipotent.Services.KliveLLM
             public long ProviderDurationMs { get; set; }
             public bool LatencyBreakdownAvailable { get; set; }
             public string? ResponseCacheStatus { get; set; }
+            /// <summary>UTF-8 size of the request body sent; 0 when unknown.</summary>
+            public long RequestBytes { get; set; }
 
             /// <summary>The live model-window limit applied to this request, when the caller supplied
             /// one (Projects/OpenRouter).</summary>

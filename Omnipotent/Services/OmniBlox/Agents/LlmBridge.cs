@@ -29,6 +29,8 @@ namespace Omnipotent.Services.OmniBlox.Agents
         public long PromptTokens { get; init; }
         public long CachedTokens { get; init; }
         public long CompletionTokens { get; init; }
+        /// <summary>Size of the request body that was sent, in bytes; 0 when unknown.</summary>
+        public long RequestBytes { get; init; }
         public string? Model { get; init; }
         /// <summary>The provider's finish_reason; "length" means the reply hit the output cap.</summary>
         public string? FinishReason { get; init; }
@@ -191,6 +193,7 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 PromptTokens = response.PromptTokens,
                 CachedTokens = response.CachedPromptTokens,
                 CompletionTokens = response.CompletionTokens,
+                RequestBytes = response.RequestBytes,
                 Model = response.Model,
                 FinishReason = response.FinishReason,
             };

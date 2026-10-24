@@ -345,15 +345,16 @@ namespace Omnipotent.Tests.OmniBlox
             public void EndSession(string sessionId) { }
         }
 
-        private static LlmTurn Call(string name, string args, long prompt = 1000, long cached = 0) => new()
+        private static LlmTurn Call(string name, string args, long prompt = 1000, long cached = 0, long requestBytes = 0) => new()
         {
             Success = true,
             PromptTokens = prompt,
             CachedTokens = cached,
+            RequestBytes = requestBytes,
             ToolCalls = new List<LlmToolCall> { new() { Id = Guid.NewGuid().ToString("N"), Name = name, ArgumentsJson = args } },
         };
 
-        private static CycleRequest Request(AgentToolbox tools, int maxTurns = 10, long wrapUp = 70_000) => new()
+        private static CycleRequest Request(AgentToolbox tools, int maxTurns = 10, long window = 260_000) => new()
         {
             GameId = "g1",
             Stage = GameStage.Build,
@@ -362,7 +363,7 @@ namespace Omnipotent.Tests.OmniBlox
             Briefing = "brief",
             Tools = tools,
             MaxTurns = maxTurns,
-            WrapUpAtPromptTokens = wrapUp,
+            ContextWindowTokens = window,
         };
 
         private static AgentToolbox Tools() => new AgentToolbox()
@@ -416,9 +417,32 @@ namespace Omnipotent.Tests.OmniBlox
             var llm = new OneShotLlm();
             llm.Turns.Enqueue(Call("echo", "{\"text\":\"a\"}", prompt: 80_000));
             llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"wrapped\"}"));
-            var outcome = await new AgentCycleRunner(llm).RunAsync(Request(Tools(), wrapUp: 70_000), CancellationToken.None);
+            var outcome = await new AgentCycleRunner(llm).RunAsync(Request(Tools(), window: 120_000), CancellationToken.None);
             Assert.Contains(llm.Users, u => u.Contains("context is nearly full"));
             Assert.True(outcome.Finished);
+        }
+
+        [Fact]
+        public async Task TheHandOver_IsWorkedOutFromTheModelsWindow()
+        {
+            // 260K window, 16K reply: a request may be 243.6K. The agent is asked to hand over 64K before that (179.6K),
+            // where the old fixed 120K stopped cycles long before the model needed it.
+            var early = new OneShotLlm();
+            early.Turns.Enqueue(Call("echo", "{\"text\":\"a\"}", prompt: 150_000));
+            early.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"done\"}"));
+            await new AgentCycleRunner(early).RunAsync(Request(Tools()), CancellationToken.None);
+            Assert.DoesNotContain(early.Users, u => u.Contains("context is nearly full"));
+
+            // Asked at 185K; stopped and asked for the report at 215K, 32K short of the limit, leaving room for one large step.
+            var late = new OneShotLlm();
+            late.Turns.Enqueue(Call("echo", "{\"text\":\"a\"}", prompt: 185_000));
+            late.Turns.Enqueue(Call("echo", "{\"text\":\"b\"}", prompt: 215_000));
+            late.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"handed over\"}"));
+            var outcome = await new AgentCycleRunner(late).RunAsync(Request(Tools()), CancellationToken.None);
+            Assert.Single(late.Users, u => u.Contains("context is nearly full"));
+            Assert.Contains(late.Users, u => u.StartsWith("This cycle is over"));
+            Assert.True(outcome.Finished);
+            Assert.Equal("handed over", outcome.Report.Done);
         }
 
         [Fact]
@@ -552,21 +576,39 @@ namespace Omnipotent.Tests.OmniBlox
             var llm = new OneShotLlm();
             for (int i = 0; i < 6; i++) llm.Turns.Enqueue(Call("look", "{}"));
             llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"looked around\"}"));
-            long one = ModelPictures.ForModel(Render(1)).Length;
+            long one = RequestGauge.PictureBytes(ModelPictures.ForModel(Render(1)));
             var request = new CycleRequest
             {
                 GameId = "g1", Stage = GameStage.Build, Role = "builder", SystemPrompt = "sys", Briefing = "brief", Tools = PictureTools(),
-                PictureBytesPerRequest = one * 5 / 2,
+                MaxRequestBytes = one * 5 / 2,
             };
             var outcome = await new AgentCycleRunner(llm).RunAsync(request, CancellationToken.None);
 
             Assert.True(outcome.Finished);
             Assert.Equal(6, llm.Pictures.Count);
             Assert.All(llm.Pictures.SelectMany(p => p), p => Assert.True(IsJpeg(p)));
-            Assert.All(llm.RequestPictureBytes, bytes => Assert.True(bytes <= request.PictureBytesPerRequest));
+            Assert.All(llm.RequestPictureBytes, raw => Assert.True(raw * 4 / 3 <= request.MaxRequestBytes));
             // Pruned in batches (the third and fifth pictures pushed it over), not one picture per turn.
             Assert.Equal(new[] { 1, 1 }, llm.Drops);
             Assert.DoesNotContain(llm.Users, u => u.Contains("budget") || u.Contains("hand over"));
+        }
+
+        [Fact]
+        public async Task TheTextCounts_TowardsTheRequestsSize()
+        {
+            // Near a full 260K context the text alone is about a megabyte. The provider's measured size of each request
+            // is what the next one is judged on, so small pictures on top of a large request still make room.
+            var llm = new OneShotLlm();
+            var request = new CycleRequest { GameId = "g1", Stage = GameStage.Build, Role = "builder", SystemPrompt = "sys", Briefing = "brief", Tools = PictureTools() };
+            llm.Turns.Enqueue(Call("look", "{}", requestBytes: 10_000));
+            llm.Turns.Enqueue(Call("look", "{}", requestBytes: 100_000));
+            llm.Turns.Enqueue(Call("look", "{}", requestBytes: request.MaxRequestBytes - 1_000));
+            llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"done\"}"));
+            var outcome = await new AgentCycleRunner(llm).RunAsync(request, CancellationToken.None);
+
+            Assert.True(outcome.Finished);
+            Assert.Equal(3, llm.Pictures.Count);
+            Assert.Equal(new[] { 1 }, llm.Drops); // the third picture is kept, the two before it swapped out
         }
 
         [Fact]

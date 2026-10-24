@@ -50,7 +50,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 SystemPrompt = AgentPrompts.Maintainer,
                 Briefing = Briefing.Build(game, ctx, extra),
                 Tools = tools,
-                WrapUpAtPromptTokens = ctx.Settings.CycleContextTokens,
+                ContextWindowTokens = ctx.Settings.ModelContextTokens,
                 Options = new LlmCallOptions { MaxTokens = ctx.Settings.MaxOutputTokens, Thinking = Orchestrator.Effort(game, "medium") },
                 Observer = new CycleLog(ctx, gameId),
                 OwnerMessages = () => Orchestrator.TakeNewDirectives(ctx, gameId),

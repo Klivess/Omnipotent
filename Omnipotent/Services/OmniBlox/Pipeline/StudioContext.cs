@@ -31,8 +31,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public int MaintenanceIntervalDays { get; set; } = 7;
         /// <summary>The output cap of one agent reply (reasoning included); big enough for a whole source file.</summary>
         public int MaxOutputTokens { get; set; } = 16_384;
-        /// <summary>A cycle hands over to the next one when its prompt reaches this size (the work carries on).</summary>
-        public long CycleContextTokens { get; set; } = 120_000;
+        /// <summary>The model's context window. A cycle hands over to the next one as its prompt nears it (the work carries on).</summary>
+        public long ModelContextTokens { get; set; } = 260_000;
     }
 
     /// <summary>Web research for the research loop (KliveRAG's SearXNG search and page fetch in production).</summary>
