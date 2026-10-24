@@ -1,3 +1,4 @@
+using System.Net;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveLLM;
 using KliveLlmService = Omnipotent.Services.KliveLLM.KliveLLM;
@@ -34,6 +35,9 @@ namespace Omnipotent.Services.OmniBlox.Agents
 
         /// <summary>The reply was cut off at the output limit: its last tool call may be incomplete.</summary>
         public bool Truncated => string.Equals(FinishReason, "length", StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>The provider refused the request as too large (HTTP 413): the same request can only be refused again.</summary>
+        public bool TooLarge { get; init; }
     }
 
     public sealed class LlmCallOptions
@@ -63,17 +67,24 @@ namespace Omnipotent.Services.OmniBlox.Agents
         TimeSpan PrefixLifetime { get; }
 
         void StartSession(string sessionId, string systemPrompt);
-        /// <summary>A user turn that arrived now: KliveLLM stamps its receipt time at the head.</summary>
-        void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null);
+        /// <summary>A user turn that arrived now: KliveLLM stamps its receipt time at the head. Pictures are PNG or JPEG.</summary>
+        void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? images = null);
         /// <summary>
         /// A user turn that must be byte-identical every time it is sent, so no receipt stamp at its head:
         /// a briefing that ends with its own "Now:" line, or a fixed reference example many calls share.
         /// </summary>
-        void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null);
+        void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? images = null);
         /// <summary>An answer the caller wrote itself (the label half of a reference example).</summary>
         void AppendAssistant(string sessionId, string text);
         void AppendToolResult(string sessionId, string toolCallId, string toolName, string content);
+        /// <summary>A failed call comes back as a turn with Success false (never an exception), so the caller can tell the provider's failure from its own.</summary>
         Task<LlmTurn> QueryAsync(string sessionId, IReadOnlyList<ToolDefinition> tools, LlmCallOptions options, CancellationToken ct);
+        /// <summary>
+        /// Replaces the pictures of every picture message but the newest <paramref name="keepNewest"/> with a short note,
+        /// keeping the messages' text, so a request stays under the provider's size limit. Returns how many messages
+        /// changed. It rewrites history already sent, so the provider re-prefills from the first message it changed.
+        /// </summary>
+        int DropPictures(string sessionId, int keepNewest);
         void EndSession(string sessionId);
     }
 
@@ -110,20 +121,20 @@ namespace Omnipotent.Services.OmniBlox.Agents
 
         public void StartSession(string sessionId, string systemPrompt) => Llm.StartToolSession(sessionId, systemPrompt);
 
-        public void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null)
+        public void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? images = null)
         {
-            if (pngImages is { Count: > 0 })
-                Llm.AppendUserContentToToolSession(sessionId, text, pngImages.Select(b => (b, "image/png")).ToList(),
-                    keepRecentImages: Math.Max(1, pngImages.Count), preservePromptPrefix: true);
+            if (images is { Count: > 0 })
+                Llm.AppendUserContentToToolSession(sessionId, text, images.Select(b => (b, ModelPictures.MimeType(b))).ToList(),
+                    keepRecentImages: Math.Max(1, images.Count), preservePromptPrefix: true);
             else
                 Llm.AppendUserMessageToToolSession(sessionId, text);
         }
 
-        public void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null)
+        public void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? images = null)
         {
-            if (pngImages is { Count: > 0 })
-                Llm.AppendUserContentToToolSession(sessionId, text, pngImages.Select(b => (b, "image/png")).ToList(),
-                    keepRecentImages: Math.Max(1, pngImages.Count), preservePromptPrefix: true, stampReceipt: false);
+            if (images is { Count: > 0 })
+                Llm.AppendUserContentToToolSession(sessionId, text, images.Select(b => (b, ModelPictures.MimeType(b))).ToList(),
+                    keepRecentImages: Math.Max(1, images.Count), preservePromptPrefix: true, stampReceipt: false);
             else
                 Llm.AppendCacheStableWakeSeedToToolSession(sessionId, text);
         }
@@ -139,17 +150,36 @@ namespace Omnipotent.Services.OmniBlox.Agents
             {
                 function = new HFWrapper.HFFunctionDefinition { name = t.Name, description = t.Description, parameters = t.Parameters },
             }).ToList();
-            var response = await Llm.QueryToolSessionAsync(sessionId, hfTools,
-                maxTokensOverride: options.MaxTokens,
-                cancellationToken: ct,
-                thinkingOverride: options.Thinking,
-                // Cycles are short and history is append-only; the runner enforces its own budget, so the
-                // generic compactor (which rewrites already-sent history) stays off.
-                compactAboveTokensOverride: 0,
-                workClass: options.WorkClass,
-                // The studio picks its reasoning effort per role (deeper for design and debugging), so the
-                // level is sent to AIRouter rather than left at the provider's default.
-                honourThinkingOnAIRouter: true);
+            KliveLlmService.KliveLLMResponse response;
+            try
+            {
+                response = await Llm.QueryToolSessionAsync(sessionId, hfTools,
+                    maxTokensOverride: options.MaxTokens,
+                    cancellationToken: ct,
+                    thinkingOverride: options.Thinking,
+                    // Cycles are short and history is append-only; the runner enforces its own budget, so the
+                    // generic compactor (which rewrites already-sent history) stays off.
+                    compactAboveTokensOverride: 0,
+                    workClass: options.WorkClass,
+                    // The studio picks its reasoning effort per role (deeper for design and debugging), so the
+                    // level is sent to AIRouter rather than left at the provider's default.
+                    honourThinkingOnAIRouter: true);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // KliveLLM throws once its own retries are spent. Thrown through the runner, that read as the
+                // agent's failure and counted against the game; it is the provider's.
+                return new LlmTurn
+                {
+                    Success = false,
+                    Error = ex.Message,
+                    TooLarge = ex is HttpRequestException { StatusCode: HttpStatusCode.RequestEntityTooLarge },
+                };
+            }
             return new LlmTurn
             {
                 Success = response.Success,
@@ -165,6 +195,9 @@ namespace Omnipotent.Services.OmniBlox.Agents
                 FinishReason = response.FinishReason,
             };
         }
+
+        public int DropPictures(string sessionId, int keepNewest) =>
+            Llm.StripToolSessionImages(sessionId, "[Picture removed to keep the request within the model provider's size limit. Look again if you need it.]", keepNewest);
 
         public void EndSession(string sessionId)
         {

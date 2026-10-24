@@ -10,6 +10,7 @@ using Omnipotent.Services.OmniBlox.Marketing;
 using Omnipotent.Services.OmniBlox.Pipeline;
 using Omnipotent.Services.OmniBlox.Rbx;
 using Omnipotent.Services.OmniBlox.Roblox;
+using SkiaSharp;
 
 namespace Omnipotent.Tests.OmniBlox
 {
@@ -305,19 +306,40 @@ namespace Omnipotent.Tests.OmniBlox
             public List<string> Users { get; } = new();
             public List<string> StableUsers { get; } = new();
             public List<string> Results { get; } = new();
+            /// <summary>The pictures of each picture message, as sent.</summary>
+            public List<IReadOnlyList<byte[]>> Pictures { get; } = new();
+            /// <summary>keepNewest of each DropPictures call.</summary>
+            public List<int> Drops { get; } = new();
+            /// <summary>Bytes of pictures each query carried.</summary>
+            public List<long> RequestPictureBytes { get; } = new();
+            private readonly List<long> carried = new();
             /// <summary>The tool names each query offered, in order.</summary>
             public List<string> ToolLists { get; } = new();
             public TimeSpan PrefixLifetime => TimeSpan.FromMinutes(5);
             public Task<(bool Ok, string? Reason)> CheckAvailableAsync(CancellationToken ct) => Task.FromResult((true, (string?)null));
             public bool HasSpareCapacity() => true;
             public void StartSession(string sessionId, string systemPrompt) { }
-            public void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null) => Users.Add(text);
+            public void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? images = null)
+            {
+                Users.Add(text);
+                if (images is not { Count: > 0 }) return;
+                Pictures.Add(images);
+                carried.Add(images.Sum(p => (long)p.Length));
+            }
+            public int DropPictures(string sessionId, int keepNewest)
+            {
+                Drops.Add(keepNewest);
+                int dropped = Math.Max(0, carried.Count - keepNewest);
+                carried.RemoveRange(0, dropped);
+                return dropped;
+            }
             public void AppendStableUser(string sessionId, string text, IReadOnlyList<byte[]>? pngImages = null) => StableUsers.Add(text);
             public void AppendAssistant(string sessionId, string text) { }
             public void AppendToolResult(string sessionId, string toolCallId, string toolName, string content) => Results.Add(content);
             public Task<LlmTurn> QueryAsync(string sessionId, IReadOnlyList<ToolDefinition> tools, LlmCallOptions options, CancellationToken ct)
             {
                 ToolLists.Add(string.Join(",", tools.Select(t => t.Name)));
+                RequestPictureBytes.Add(carried.Sum());
                 return Task.FromResult(Turns.Count > 0 ? Turns.Dequeue() : new LlmTurn { Success = true, Text = "done talking" });
             }
             public void EndSession(string sessionId) { }
@@ -482,6 +504,103 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Equal("map", outcome.KeyFacts.Single().Key);
             Assert.Equal("800 studs a side", outcome.KeyFacts.Single().Text);
             Assert.Contains("old map", outcome.DropFacts);
+        }
+
+        /// <summary>A PNG shaped like a world render: a gradient with grain, so it compresses as badly as a real one.</summary>
+        private static byte[] Render(int seed, bool transparent = false)
+        {
+            const int w = 640, h = 400;
+            var rng = new Random(seed);
+            using var bitmap = new SKBitmap(w, h, SKColorType.Rgba8888, SKAlphaType.Unpremul);
+            for (int y = 0; y < h; y++)
+                for (int x = 0; x < w; x++)
+                    bitmap.SetPixel(x, y, new SKColor((byte)(x * 255 / w), (byte)(y * 255 / h), (byte)(120 + rng.Next(40)), transparent && x < w / 2 ? (byte)0 : (byte)255));
+            using var image = SKImage.FromBitmap(bitmap);
+            using var data = image.Encode(SKEncodedImageFormat.Png, 100);
+            return data.ToArray();
+        }
+
+        private static AgentToolbox PictureTools()
+        {
+            int seed = 0;
+            return Tools().Add("look", "render", Schema.Object(), _ => ToolResult.WithImages("looked", new[] { Render(++seed) }));
+        }
+
+        private static bool IsJpeg(byte[] b) => b.Length > 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF;
+
+        [Fact]
+        public void OpaquePictures_BecomeJpeg_WhileTransparentOnesStayAsTheyAre()
+        {
+            var render = Render(1);
+            var sent = ModelPictures.ForModel(render);
+            Assert.True(IsJpeg(sent));
+            Assert.True(sent.Length * 3 < render.Length, $"{sent.Length} bytes as JPEG against {render.Length} as PNG");
+            Assert.Equal("image/jpeg", ModelPictures.MimeType(sent));
+
+            // A library model's thumbnail has a transparent background that a JPEG would turn black.
+            var thumbnail = Render(1, transparent: true);
+            Assert.Same(thumbnail, ModelPictures.ForModel(thumbnail));
+            Assert.Equal("image/png", ModelPictures.MimeType(thumbnail));
+            Assert.Same(sent, ModelPictures.ForModel(sent));
+        }
+
+        [Fact]
+        public async Task EveryPictureIsShownAsJpeg_AndTheOldestGoBeforeARequestOutgrowsTheLimit()
+        {
+            // Every picture stays in the request until it is swapped out; as PNGs, four renders were 6.7 MB and
+            // AIRouter refused the request (413), losing the cycle. The agent must still see every picture it asks for.
+            var llm = new OneShotLlm();
+            for (int i = 0; i < 6; i++) llm.Turns.Enqueue(Call("look", "{}"));
+            llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"looked around\"}"));
+            long one = ModelPictures.ForModel(Render(1)).Length;
+            var request = new CycleRequest
+            {
+                GameId = "g1", Stage = GameStage.Build, Role = "builder", SystemPrompt = "sys", Briefing = "brief", Tools = PictureTools(),
+                PictureBytesPerRequest = one * 5 / 2,
+            };
+            var outcome = await new AgentCycleRunner(llm).RunAsync(request, CancellationToken.None);
+
+            Assert.True(outcome.Finished);
+            Assert.Equal(6, llm.Pictures.Count);
+            Assert.All(llm.Pictures.SelectMany(p => p), p => Assert.True(IsJpeg(p)));
+            Assert.All(llm.RequestPictureBytes, bytes => Assert.True(bytes <= request.PictureBytesPerRequest));
+            // Pruned in batches (the third and fifth pictures pushed it over), not one picture per turn.
+            Assert.Equal(new[] { 1, 1 }, llm.Drops);
+            Assert.DoesNotContain(llm.Users, u => u.Contains("budget") || u.Contains("hand over"));
+        }
+
+        [Fact]
+        public async Task ARequestRefusedAsTooLarge_DropsThePictures_AndTheCycleCarriesOn()
+        {
+            var llm = new OneShotLlm();
+            llm.Turns.Enqueue(Call("look", "{}"));
+            llm.Turns.Enqueue(new LlmTurn { Success = false, TooLarge = true, Error = "AIRouter request failed with status 413 (Request Entity Too Large)." });
+            llm.Turns.Enqueue(Call("look", "{}"));
+            llm.Turns.Enqueue(Call("finish_cycle", "{\"summary\":\"carried on\"}"));
+            var request = new CycleRequest { GameId = "g1", Stage = GameStage.Build, Role = "builder", SystemPrompt = "sys", Briefing = "brief", Tools = PictureTools() };
+            var outcome = await new AgentCycleRunner(llm, delay: (_, _) => Task.CompletedTask).RunAsync(request, CancellationToken.None);
+
+            Assert.True(outcome.Finished);
+            Assert.Null(outcome.Error);
+            Assert.False(outcome.ProviderError);
+            Assert.Equal(new[] { 0 }, llm.Drops);
+            Assert.Equal(4, llm.ToolLists.Count); // the refused request is not sent again unchanged
+            Assert.Contains(llm.Users, u => u.Contains("too large for the model provider"));
+            Assert.Equal(2, llm.Pictures.Count); // pictures are still shown after the drop
+        }
+
+        [Fact]
+        public async Task ARequestTooLargeWithNoPicturesToDrop_IsTheProvidersFailure_AndIsNotRetried()
+        {
+            var llm = new OneShotLlm();
+            llm.Turns.Enqueue(new LlmTurn { Success = false, TooLarge = true, Error = "status 413" });
+            var outcome = await new AgentCycleRunner(llm, delay: (_, _) => Task.CompletedTask).RunAsync(Request(Tools()), CancellationToken.None);
+
+            Assert.False(outcome.Finished);
+            Assert.True(outcome.ProviderError);
+            Assert.Equal("status 413", outcome.Error);
+            Assert.Single(llm.ToolLists);
+            Assert.Equal(new[] { 0 }, llm.Drops);
         }
     }
 

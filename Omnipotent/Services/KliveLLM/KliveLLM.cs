@@ -1017,16 +1017,19 @@ namespace Omnipotent.Services.KliveLLM
 
         /// <summary>
         /// Removes every image from a tool session, keeping each message's text, for a caller whose model
-        /// turned out to reject image input. Returns how many image-bearing messages were rewritten.
+        /// turned out to reject image input. A caller keeping its requests under the provider's size limit
+        /// passes the <paramref name="note"/> that says so, and may keep the newest
+        /// <paramref name="keepRecent"/> image-bearing messages. Returns how many messages were rewritten.
         /// Only standalone user messages carry images, so the tool-call protocol is untouched.
         /// </summary>
-        public int StripToolSessionImages(string sessionId)
+        public int StripToolSessionImages(string sessionId, string? note = null, int keepRecent = 0)
         {
             lock (sessions)
             {
                 if (!sessions.TryGetValue(sessionId, out var s)) return 0;
                 int rewritten = 0;
-                for (int i = 0; i < s.structuredMessages.Count; i++)
+                int toStrip = s.structuredMessages.Count(m => m.role == "user" && MessageHasImage(m)) - Math.Max(0, keepRecent);
+                for (int i = 0; i < s.structuredMessages.Count && rewritten < toStrip; i++)
                 {
                     var m = s.structuredMessages[i];
                     if (m.role != "user" || !MessageHasImage(m)) continue;
@@ -1041,7 +1044,7 @@ namespace Omnipotent.Services.KliveLLM
                         };
                         if (!string.IsNullOrWhiteSpace(text)) texts.Add(text);
                     }
-                    texts.Add("[Screenshot removed: the active model does not accept images.]");
+                    texts.Add(note ?? "[Screenshot removed: the active model does not accept images.]");
                     s.structuredMessages[i] = new HFWrapper.HFMessage { role = "user", content = string.Join("\n", texts) };
                     rewritten++;
                 }

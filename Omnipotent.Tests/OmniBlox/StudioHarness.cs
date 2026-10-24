@@ -167,6 +167,8 @@ namespace Omnipotent.Tests.OmniBlox
             return Call(s, AgentCycleRunner.FinishToolName, finish);
         }
 
+        public int DropPictures(string sessionId, int keepNewest) => 0;
+
         public void EndSession(string sessionId) => sessions.TryRemove(sessionId, out _);
 
         private static Task<LlmTurn> Text(string text) => Task.FromResult(new LlmTurn { Success = true, Text = text, PromptTokens = 900, CachedTokens = 600, CompletionTokens = 120, Model = "fake" });

@@ -148,6 +148,21 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal(0, service.StripToolSessionImages("no-such-session"));
         }
 
+        [Fact]
+        public void StripToolSessionImages_CanKeepTheNewest()
+        {
+            var service = new LlmService(new HttpClient(new ScriptedHandler(_ => throw new InvalidOperationException("no calls"))));
+            const string session = "omniblox-strip-test";
+            service.StartToolSession(session, "system");
+            for (int i = 0; i < 3; i++)
+                service.AppendUserContentToToolSession(session, "Pictures " + i,
+                    new List<(byte[] data, string mimeType)> { (new byte[] { 1, 2, (byte)i }, "image/jpeg") }, preservePromptPrefix: true);
+
+            Assert.Equal(2, service.StripToolSessionImages(session, "[too large]", keepRecent: 1));
+            Assert.Equal(0, service.StripToolSessionImages(session, "[too large]", keepRecent: 1));
+            Assert.Equal(1, service.StripToolSessionImages(session, "[too large]"));
+        }
+
         private static LlmService.RemoteLLMProviderConfiguration OpenRouter() => new(
             LlmService.LLMProvider.OpenRouter, "OpenRouter", "https://provider.test/v1/chat/completions", "test-token", "test/model");
 
