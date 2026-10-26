@@ -43,7 +43,7 @@ namespace Omnipotent.Tests.OmniBlox
             h.Ctx.Settings.Slots.Clear();
 
             var titles = ((JArray)Json(OmniBloxViews.Overview(h.Ctx, Status()))["Attention"]!).Select(a => (string)a["Title"]!).ToList();
-            Assert.Equal(new[] { "No Roblox API key", "No experience slots", "The studio is switched off", "The asset harvester is off" }, titles);
+            Assert.Equal(new[] { "No Roblox API key", "OmniBlox cannot create experiences", "The studio is switched off", "The asset harvester is off" }, titles);
 
             // Once the studio files the owner task, the banner gives way to it.
             h.Ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.ApiKey, "apikey", "Add a Roblox Open Cloud API key", "", null, h.Now));

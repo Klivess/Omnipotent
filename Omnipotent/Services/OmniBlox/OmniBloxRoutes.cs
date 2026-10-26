@@ -588,7 +588,7 @@ namespace Omnipotent.Services.OmniBlox
             bool local = !StageGates.EngineAvailable(Ctx, game);
             if (local && !StageGates.LocalEngineStandsIn(Ctx, game))
                 throw new RouteException(HttpStatusCode.Conflict, Ctx.Cloud.HasKey
-                    ? "Engine tests need an experience slot, and every slot is taken."
+                    ? $"Engine tests need an experience to run in: {Pipeline.Slots.Unavailable(Ctx, ask: false)}."
                     : "Engine tests need the Roblox API key (OmniSetting OmniBlox_RobloxApiKey).");
             if (Pipeline.Tools.BuildTools.EngineRunning(id)) throw new RouteException(HttpStatusCode.Conflict, "An engine test run is already going for this game.");
             var ctx = Ctx;

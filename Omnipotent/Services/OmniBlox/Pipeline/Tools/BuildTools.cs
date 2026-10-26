@@ -415,11 +415,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
         /// </summary>
         public static async Task<(EngineRun? Run, string Message)> RunEngineTestsAsync(StudioContext ctx, string gameId, CancellationToken ct, BuildRun? built = null)
         {
-            var slot = ctx.Cloud.HasKey ? Slots.Ensure(ctx, gameId) : null;
+            var slot = ctx.Cloud.HasKey ? await Slots.EnsureAsync(ctx, gameId, ct) : null;
             if (slot == null)
             {
                 string waiting = ctx.Cloud.HasKey
-                    ? "Engine tests wait for a free experience slot (the owner has been asked for one)."
+                    ? $"Engine tests wait for an experience to run in ({Slots.Unavailable(ctx, ask: false)})."
                     : "Engine tests need the Roblox API key, which is not set yet; they run before launch.";
                 if (ctx.LocalEngine is not { Available: true })
                     return (null, waiting + " build covers the static checks meanwhile." + (ctx.LocalEngine?.Problem is { } why ? $" (The local engine cannot run here: {why}.)" : ""));

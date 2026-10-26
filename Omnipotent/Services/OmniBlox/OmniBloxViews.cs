@@ -97,8 +97,7 @@ namespace Omnipotent.Services.OmniBlox
             double revenue7 = games.Sum(g => g.Stats.Daily.Where(d => d.Date >= now.Date.AddDays(-7)).Sum(d => d.RevenueRobux ?? 0));
             double revenue30 = games.Sum(g => g.Stats.Daily.Where(d => d.Date >= now.Date.AddDays(-30)).Sum(d => d.RevenueRobux ?? 0));
             var library = ctx.Library.Stats();
-            int slotsFree = ctx.Settings.Slots.Count(sl => !studio.SlotAssignments.TryGetValue(sl.ToString(), out var holder)
-                || games.FirstOrDefault(g => g.GameId == holder)?.Stage is null or GameStage.Abandoned);
+            var (slotsTotal, slotsFree) = Slots.Count(ctx);
 
             // Studio-wide daily numbers across every game (Roblox analytics, so live games only).
             var daily = games.SelectMany(g => g.Stats.Daily)
@@ -118,7 +117,7 @@ namespace Omnipotent.Services.OmniBlox
                 Model = new { Available = status.ModelAvailable, Reason = status.ModelReason },
                 ApiKey = ctx.Cloud.HasKey,
                 CreatorSet = ctx.Creator.IsSet,
-                Slots = new { Total = ctx.Settings.Slots.Count, Free = slotsFree },
+                Slots = new { Total = slotsTotal, Free = slotsFree, Created = studio.CreatedExperiences.Count, CanCreate = Slots.CanCreate(ctx) },
                 ctx.Settings.RequireLaunchApproval,
                 ctx.Settings.RequireBuildSignoff,
                 ctx.Settings.MaxGamesInProduction,
@@ -192,10 +191,14 @@ namespace Omnipotent.Services.OmniBlox
                 Add("warning", "No Roblox API key", ctx.LocalEngine is { Available: true }
                     ? "Games are researched and built offline, and their engine tests run in the studio's local engine; publishing, Roblox's own engine tests, model downloads and analytics wait for the OmniSetting OmniBlox_RobloxApiKey."
                     : "Games are researched and built offline, but publishing, engine tests, model downloads and analytics wait for the OmniSetting OmniBlox_RobloxApiKey.", null);
-            if (ctx.Settings.Slots.Count == 0 && !openTasks.Any(t => t.Kind == OwnerTaskKind.ExperienceSlot))
-                Add("warning", "No experience slots", "Roblox has no API for creating an experience. Create a few blank ones and add them as universeId:placeId to OmniBlox_ExperienceSlots.", null);
-            else if (ctx.Settings.Slots.Count > 0 && slotsFree == 0 && !openTasks.Any(t => t.Kind == OwnerTaskKind.ExperienceSlot))
-                Add("info", "Every experience slot is taken", "The next game to reach Launch will ask for a new blank experience.", null);
+            // The studio creates the experiences its games publish to; say so only when it cannot and none is free.
+            if (slotsFree == 0 && !openTasks.Any(t => t.Kind == OwnerTaskKind.ExperienceSlot))
+            {
+                if (ctx.Session is not { HasSession: true })
+                    Add("warning", "OmniBlox cannot create experiences", "It creates the experiences its games publish to with your Roblox session (the OmniSetting OmniBlox_RobloxSessionCookie), which is not set. Set it once, or create blank experiences yourself and add them as universeId:placeId to OmniBlox_ExperienceSlots.", null);
+                else if (ctx.Cloud.HasKey && Slots.WhyNotCreating(ctx) is { } why)
+                    Add("info", "Not creating experiences right now", $"Every experience is taken, and the studio is not creating one now: {why}.", null);
+            }
             long labeled = library.ByStatus.GetValueOrDefault(AssetStatus.Labeled);
             if (!ctx.Settings.HarvesterEnabled && labeled < SmallLibrary)
                 Add("info", "The asset harvester is off", $"The Asset Library has {labeled} labelled model(s). Builders place far better worlds with a few hundred to choose from.", "harvester");

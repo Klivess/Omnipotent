@@ -10,11 +10,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
     /// <summary>
     /// Publishes a game whose marketing is ready, one idempotent step at a time so a restart (or an owner
-    /// task) can interrupt it anywhere: API key → experience slot → compliance → final build → engine tests →
+    /// task) can interrupt it anywhere: API key → experience (made now when none is free) → compliance → final build → engine tests →
     /// retire an earlier game's products left in the slot → products → the publish build (with product ids) →
-    /// store page → homepage thumbnails → owner tasks for the things with no API (icon, maturity
-    /// questionnaire) → launch approval if required → publish → public. Nothing irreversible happens on Roblox
-    /// (products) until the game has run clean in the engine.
+    /// store page → homepage thumbnails → the icon and maturity questionnaire, which no API key can do, through the
+    /// owner's Roblox session (<see cref="StorePageChores"/>; what cannot be done now is finished from housekeeping)
+    /// → publish → public. Nothing irreversible happens on Roblox (products) until the game has run clean in the
+    /// engine and the owner has approved the launch.
     /// </summary>
     public static class LaunchSequence
     {
@@ -32,15 +33,10 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 return (LaunchResult.Waiting, "waiting for the Roblox API key");
             }
 
-            // 2. Somewhere to publish.
+            // 2. Somewhere to publish: the game's experience, a free one, or one the studio creates now.
             Step("experience slot");
-            var slot = Slots.Ensure(ctx, gameId);
-            if (slot == null)
-            {
-                ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.ExperienceSlot, "slots", "Create a blank experience for OmniBlox",
-                    "Every experience OmniBlox may use is taken. Create a new blank experience in the Creator Dashboard (Roblox has no API for creating one), give the API key access to it, and add it as universeId:placeId to the OmniSetting OmniBlox_ExperienceSlots.", null, now));
-                return (LaunchResult.Waiting, "waiting for a free experience slot");
-            }
+            var slot = await Slots.EnsureAsync(ctx, gameId, ct);
+            if (slot == null) return (LaunchResult.Waiting, "waiting for an experience: " + Slots.Unavailable(ctx, ask: true));
 
             // 3. Rules (cheap re-check: text may have changed since the marketer ran it).
             Step("compliance");
@@ -92,7 +88,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
             // 6. An earlier game's products left in this experience come off sale.
             Step("retire old products");
-            await RetireStaleProductsAsync(ctx, gameId, slot, ct);
+            await StorePageChores.RetireStaleProductsAsync(ctx, slot, ct);
 
             // 7. Products exist on Roblox (ids are baked into the place's config).
             Step("products");
@@ -180,18 +176,14 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 ctx.Event(EventLevel.Info, "launch.thumbnails", "Homepage thumbnail upload was not accepted (" + ex.Message + "); left for the owner.", gameId);
             }
 
-            // 11. Things with no API: the owner does them once, with everything prepared.
-            Step("owner tasks");
-            var files = new List<string>();
-            if (game.Store.IconFile != null) files.Add(game.Store.IconFile);
-            if (!thumbsUploaded) files.AddRange(game.Store.ThumbnailFiles);
-            ctx.Store.Mutate(s =>
-            {
-                s.FileOwnerTask(OwnerTaskKind.UploadIcon, "icon:" + gameId, $"Upload the icon{(thumbsUploaded ? "" : " and thumbnails")} for \"{game.Store.Title}\"",
-                    $"Roblox has no API for an experience's icon{(thumbsUploaded ? "" : " or store thumbnails")}. Upload the prepared file(s) in the Creator Dashboard for experience {slot.UniverseId}.", gameId, now, files);
-                s.FileOwnerTask(OwnerTaskKind.Questionnaire, "questionnaire:" + gameId, $"Answer the maturity questionnaire for \"{game.Store.Title}\"",
-                    "Prepared honest answers:\n- " + string.Join("\n- ", compliance.QuestionnaireNotes), gameId, now);
-            });
+            // 11. What no API key can do — the icon (and thumbnails the API refused) and the maturity questionnaire —
+            // through the owner's session. Never blocks the launch: what is not done now is finished from housekeeping,
+            // and the owner is asked only when it needs them.
+            Step("icon and questionnaire");
+            if (!thumbsUploaded && game.Store.ThumbnailFiles.Count > 0 && !game.Publish.StoreThumbnailsPending)
+                ctx.Update(gameId, g => { g.Publish.StoreThumbnailsPending = true; g.Publish.StoreThumbnailsUploaded = 0; });
+            await StorePageChores.IconAsync(ctx, gameId, ct);
+            await StorePageChores.QuestionnaireAsync(ctx, gameId, ct);
 
             // 13. Publish and 14. go public.
             Step("publish");
@@ -239,46 +231,6 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             string.Join("; ", build.Compile.Errors
                 .Concat(build.Types?.Errors.Select(d => d.ToString()) ?? Enumerable.Empty<string>())
                 .Concat(build.Geometry.Where(g => g.IsError).Select(g => g.ToString())).Take(5));
-
-        /// <summary>
-        /// A slot is reused after its game was abandoned, and that game may have created passes and products there
-        /// before it stopped (a launch that failed late). Left alone they would sell on the new game's page and grant
-        /// nothing. Takes them off sale once, and records it on the old game.
-        /// </summary>
-        private static async Task RetireStaleProductsAsync(StudioContext ctx, string gameId, ExperienceSlot slot, CancellationToken ct)
-        {
-            var stale = ctx.Store.Read(s => s.Games.Values
-                .Where(g => g.GameId != gameId && g.Stage == GameStage.Abandoned && g.Slot?.UniverseId == slot.UniverseId)
-                .SelectMany(g => g.Products.Where(p => p.RobloxId != null && !p.Retired).Select(p => (Game: g.GameId, Product: p)))
-                .ToList());
-            foreach (var (oldGame, product) in stale)
-            {
-                // Only "not for sale": the old name and description are not sent again (Roblox's firewall refused
-                // a full update of an old product for hours and blocked the whole launch).
-                var spec = new ProductSpec { Name = Clip(product.Name, 50), Description = "", PriceRobux = Math.Max(1, product.PriceRobux), IsForSale = false, OnlySaleState = true };
-                try
-                {
-                    if (product.Kind == ProductKind.GamePass) await ctx.Cloud.UpdateGamePassAsync(slot.UniverseId, product.RobloxId!.Value, spec, ct);
-                    else await ctx.Cloud.UpdateDeveloperProductAsync(slot.UniverseId, product.RobloxId!.Value, spec, ct);
-                }
-                catch (RobloxApiException ex) when (ex.IsNotFound)
-                {
-                    // Already gone.
-                }
-                catch (RobloxApiException ex)
-                {
-                    // Never block the launch on an old game's leftovers: the owner takes it off sale by hand.
-                    ctx.Store.Mutate(st => st.FileOwnerTask(OwnerTaskKind.Other, "retire:" + product.RobloxId, $"Take \"{product.Name}\" off sale",
-                        $"An abandoned game left this {(product.Kind == ProductKind.GamePass ? "game pass" : "developer product")} (id {product.RobloxId}) on sale in experience {slot.UniverseId}, and Roblox refused to change it ({ex.Message}). Set it to not for sale in the Creator Dashboard.", gameId, ctx.Clock()));
-                    ctx.Event(EventLevel.Warning, "launch.retire", $"Could not take \"{product.Name}\" off sale ({ex.Message}); the owner was asked to.", gameId);
-                }
-                ctx.Update(oldGame, g =>
-                {
-                    if (g.Products.FirstOrDefault(p => p.Key == product.Key) is { } p) p.Retired = true;
-                });
-                ctx.Event(EventLevel.Info, "launch.retired", $"Took \"{product.Name}\" (from an abandoned game in the same experience) off sale.", gameId);
-            }
-        }
 
         /// <summary>A small product image: the game's own world behind the product name, in the bright marketing look.</summary>
         private static byte[]? ProductIcon(StudioContext ctx, string gameId, ProductRecord product)

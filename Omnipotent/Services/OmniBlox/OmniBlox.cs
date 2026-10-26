@@ -60,6 +60,7 @@ namespace Omnipotent.Services.OmniBlox
                 var http = new RobloxHttp(RobloxHttp.CreateDefaultClient(), clock);
                 var publicApi = new RobloxPublicClient(http);
                 var cloud = new RobloxCloudClient(http, () => settings.ApiKey);
+                var session = new RobloxSessionClient(http, () => settings.SessionCookie, rotated => _ = SaveRotatedSessionAsync(rotated));
                 var llm = new KliveLlmBridge(FindService<KliveLLM.KliveLLM>);
                 var runner = new AgentCycleRunner(llm, clock);
                 var playbook = new Playbook(store, clock);
@@ -74,6 +75,7 @@ namespace Omnipotent.Services.OmniBlox
                     Library = library,
                     Public = publicApi,
                     Cloud = cloud,
+                    Session = session,
                     Llm = llm,
                     Runner = runner,
                     Playbook = playbook,
@@ -119,6 +121,7 @@ namespace Omnipotent.Services.OmniBlox
             {
                 Enabled = await GetBoolOmniSetting("OmniBlox_Enabled", defaultValue: false),
                 ApiKey = NullIfBlank(await GetStringOmniSetting("OmniBlox_RobloxApiKey", "", sensitive: true)),
+                SessionCookie = NullIfBlank(await GetStringOmniSetting(SessionCookieSetting, "", sensitive: true)),
                 CreatorUserId = ParseId(await GetStringOmniSetting("OmniBlox_CreatorUserId", "")),
                 CreatorGroupId = ParseId(await GetStringOmniSetting("OmniBlox_CreatorGroupId", "")),
                 Slots = (await GetStringListOmniSetting("OmniBlox_ExperienceSlots", new List<string>())).Select(ExperienceSlot.Parse).Where(x => x != null).Select(x => x!).ToList(),
@@ -142,6 +145,7 @@ namespace Omnipotent.Services.OmniBlox
             var t = ctx.Settings;
             t.Enabled = s.Enabled;
             t.ApiKey = s.ApiKey;
+            t.SessionCookie = s.SessionCookie;
             t.CreatorUserId = s.CreatorUserId;
             t.CreatorGroupId = s.CreatorGroupId;
             t.Slots = s.Slots;
@@ -156,6 +160,23 @@ namespace Omnipotent.Services.OmniBlox
             t.MaxOutputTokens = s.MaxOutputTokens;
             t.ModelContextTokens = s.ModelContextTokens;
             try { ModelGate = await ctx.Llm.CheckAvailableAsync(CancellationToken.None); } catch { }
+        }
+
+        internal const string SessionCookieSetting = "OmniBlox_RobloxSessionCookie";
+
+        /// <summary>Roblox rotated the session cookie: save the new one, or the next restart starts with a dead session.</summary>
+        private async Task SaveRotatedSessionAsync(string cookie)
+        {
+            try
+            {
+                var manager = await GetOmniGlobalSettingsManager();
+                await manager.SetOmniSetting(SessionCookieSetting, cookie, serviceID, name, OmniSettingType.String, sensitive: true);
+                if (Context is { } ctx) ctx.Settings.SessionCookie = cookie;
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "[OmniBlox] could not save the rotated Roblox session", false);
+            }
         }
 
         internal async Task SetSwitchAsync(string setting, bool value)

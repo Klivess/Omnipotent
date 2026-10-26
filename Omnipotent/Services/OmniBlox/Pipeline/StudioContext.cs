@@ -15,6 +15,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
     {
         public bool Enabled { get; set; }
         public string? ApiKey { get; set; }
+        /// <summary>The owner's signed-in Roblox session (.ROBLOSECURITY), for the dashboard actions no API key can do.</summary>
+        public string? SessionCookie { get; set; }
         public long? CreatorUserId { get; set; }
         public long? CreatorGroupId { get; set; }
         public List<ExperienceSlot> Slots { get; set; } = new();
@@ -49,6 +51,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public required AssetLibrary Library { get; init; }
         public required RobloxPublicClient Public { get; init; }
         public required RobloxCloudClient Cloud { get; init; }
+        /// <summary>The owner's Roblox session: the icon, store thumbnails and maturity questionnaire (null where the studio runs without one).</summary>
+        public RobloxSessionClient? Session { get; init; }
         public required IOmniBloxLlm Llm { get; init; }
         public required AgentCycleRunner Runner { get; init; }
         public required Playbook Playbook { get; init; }

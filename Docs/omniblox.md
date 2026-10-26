@@ -148,12 +148,34 @@ Every game starts from `GameKit/` (embedded Luau, strict-typed and checked clean
 | Engine tests | `POST apis.roblox.com/cloud/v2/universes/{u}/places/{p}/versions/{v}/luau-execution-session-tasks` | key: `universe.place.luau-execution-session:write` |
 | Analytics | `POST apis.roblox.com/analytics-query-api/v1/universes/{u}/metrics` | key: `universe.analytics:read` |
 | Homepage thumbnails | `apis.roblox.com/thumbnail-personalization-api/v1/universes/{u}/thumbnails/uploads` (experimental) | key: `universe.thumbnail:write` |
+| Experience icon | `POST publish.roblox.com/v1/games/{u}/icon` (form field `request.files`) | session |
+| Store thumbnails | `POST publish.roblox.com/v1/games/{u}/thumbnail/image` (only when the homepage API refused them) | session |
+| Maturity & Compliance questionnaire | `apis.roblox.com/experience-questionnaire/v1/questionnaires/{u}/latest`, `/v1/questionnaires/{id}`, `/v2/questionnaires/additional/universes/{u}`, `/v1/responses/validate`, `/v1/responses/preview`, `/v2/responses/{u}/submissions`, `/v2/responses/preview`, `/v2/responses/publish` | session |
 
-Two things have no API: **creating an experience** and **setting the experience icon** (and the standard store thumbnails). OmniBlox handles them as owner tasks on the dashboard: you create blank experiences once (they become "experience slots" the bot fills), and the icon is delivered ready to upload with one click.
+**Multipart bodies** go through `RobloxForm` (`Roblox/RobloxHttp.cs`). .NET's `MultipartFormDataContent` quotes its boundary (`boundary="…"`), and Roblox's edge firewall answers that with `403 9009 "WAF Blocked Request"` on developer products before the key is even checked. That is why old products could not be taken off sale. `RobloxForm` sends a bare-token boundary and quoted part names, with no `filename*`.
+
+**The owner's session.** No API key can set an experience's icon (the API-key gateway has the badge icon only, and the localization icon route refuses the source language) or answer the questionnaire. `Roblox/RobloxSessionClient.cs` does what the Creator Dashboard does, with the owner's `.ROBLOSECURITY` cookie (`OmniBlox_RobloxSessionCookie`) and Roblox's CSRF handshake. When Roblox rotates the cookie (`Set-Cookie`), the client uses the new one at once and saves it to the setting. If the session is signed out (401), one **Sign OmniBlox in to Roblox again** task is filed, and everything waiting resumes once a session works.
+
+One thing still has no API at all: **creating an experience**. You create blank experiences once, and they become the "experience slots" the bot fills.
+
+**The questionnaire** (`Marketing/MaturityQuestionnaire.cs`, `Pipeline/StorePageChores.cs`) is answered from the content notes the compliance check prepares (the ones the owner approves with the launch), the game's design and the Game Kit's fixed behaviour (`MaturityQuestionnaire.KitFacts`). Roblox's questions change without notice, so the model maps those facts onto whatever is asked: radio, checkbox and text questions, with follow-ups under the option that reveals them. The rest is deterministic:
+- Every question shown must be answered with its own options, and answers to hidden follow-ups are dropped. Values are JSON, as the dashboard sends them.
+- Roblox's own validation must pass. Problems go back to the model, up to three rounds.
+- Nothing is saved or published unless Roblox's preview rating fits the content: below 9+ when the notes say no violence or fear, at most 9+ when they say mild. The rating must also restrict no countries.
+- Otherwise the answers stay saved for the owner, and the owner gets a task with the preview and every answer.
+- The answers and the rating are kept in `Publish.Questionnaire`. A game is answered again only when its content notes change.
 
 Places are published as XML (`.rbxlx`). The publishing API cannot carry unions (`PartOperation`), `SurfaceAppearance`, `EditableImage`, `EditableMesh` or `BaseWrap`, so the Asset Library marks models containing them as not placeable.
 
-**The launch sequence** (`Pipeline/LaunchSequence.cs`) runs nothing on Roblox until the game has run clean in the engine and the owner has approved the launch: key → slot → compliance → final build → engine tests in Roblox's engine (skipped when a passing Roblox run already covers these files; a local engine pass never does) → **the owner's launch approval** → an earlier abandoned game's products in the same experience are taken off sale → products → the publish build (the same files, with the product ids) → store page → thumbnails → owner tasks → publish → public. A step that keeps failing backs off (5 minutes doubling to 6 hours) and, at the fourth failure, becomes an owner task and an alert, instead of retrying every five minutes for hours.
+**The launch sequence** (`Pipeline/LaunchSequence.cs`) runs nothing on Roblox until the game has run clean in the engine and the owner has approved the launch: key → slot → compliance → final build → engine tests in Roblox's engine (skipped when a passing Roblox run already covers these files; a local engine pass never does) → **the owner's launch approval** → an earlier abandoned game's products in the same experience are taken off sale → products → the publish build (the same files, with the product ids) → store page → thumbnails → the icon and the maturity questionnaire, through the owner's session → publish → public. A step that keeps failing backs off (5 minutes doubling to 6 hours) and, at the fourth failure, becomes an owner task and an alert, instead of retrying every five minutes for hours.
+
+**Store-page chores** (`Pipeline/StorePageChores.cs`): taking old products off sale, the icon, store thumbnails and the questionnaire. They never block a launch. Whatever is not done at launch is retried from housekeeping (every 5 minutes, for live and sunset games), waiting 5 minutes and doubling to 6 hours (`Studio.Chores`). The owner hears only when a person is needed:
+- No session is set. The icon and questionnaire tasks say how to add one.
+- Roblox signed the session out.
+- The questionnaire's rating came out above what the content allows.
+- A chore has kept failing for 24 hours.
+
+The same sweep finishes tasks that older launches filed for the owner, and closes them.
 
 ### The owner's gates
 
@@ -168,10 +190,11 @@ Every decision is kept in the dossier (`Publish.Approvals`) and the owner's chan
 
 1. **API key.** In the Creator Dashboard → Open Cloud → API Keys, create a key with the experiences you will give OmniBlox and these permissions: `universe-places` (write), `universe` (write), `universe.place` (write), `universe.place.luau-execution-session` (read, write), `game-pass` (read, write), `developer-product` (read, write), `universe-analytics` (read), `legacy-asset` (manage), `universe.thumbnail` (write). Put it in the OmniSetting `OmniBlox_RobloxApiKey`.
 2. **Creator.** Set `OmniBlox_CreatorUserId` (or `OmniBlox_CreatorGroupId` if you publish under a group).
-3. **Experience slots.** Create a few blank experiences in the Creator Dashboard and add each as `universeId:placeId` to `OmniBlox_ExperienceSlots`.
-4. **AIRouter.** OmniBlox only runs model work while `RemoteLLMProvider` is `AIRouter`.
-5. Open **Schemery → OmniBlox** on the KM site. Switch the **harvester** on first so the Asset Library fills up, then switch the **studio** on.
-6. **Playtest experience** (optional). To play any game in Roblox at any stage, live ones included, create one more blank experience. Give the key access to it and add it as `universeId:placeId` to `OmniBlox_PlaytestSlot` (see [Playtests](#playtests-playing-a-game-at-any-stage)). Without it, unlaunched games play in their own private experience, and Open in Studio needs nothing at all.
+3. **Roblox session** (for the icon, store thumbnails and maturity questionnaire). Sign in to roblox.com as the account that owns the experiences. Copy the `.ROBLOSECURITY` cookie (dev tools → Application → Cookies → `https://www.roblox.com`) into the OmniSetting `OmniBlox_RobloxSessionCookie`. A bare value, `.ROBLOSECURITY=…` or a whole Cookie header all work. Roblox ties a session to the region it was signed in from, so sign in from the server's network if you can. If Roblox signs the session out, the dashboard asks for a new one. Without a session, these three stay owner tasks.
+4. **Experience slots.** Create a few blank experiences in the Creator Dashboard and add each as `universeId:placeId` to `OmniBlox_ExperienceSlots`.
+5. **AIRouter.** OmniBlox only runs model work while `RemoteLLMProvider` is `AIRouter`.
+6. Open **Schemery → OmniBlox** on the KM site. Switch the **harvester** on first so the Asset Library fills up, then switch the **studio** on.
+7. **Playtest experience** (optional). To play any game in Roblox at any stage, live ones included, create one more blank experience. Give the key access to it and add it as `universeId:placeId` to `OmniBlox_PlaytestSlot` (see [Playtests](#playtests-playing-a-game-at-any-stage)). Without it, unlaunched games play in their own private experience, and Open in Studio needs nothing at all.
 
 Without a key OmniBlox still researches, harvests asset metadata and thumbnails, and builds and checks games offline, running their engine tests in the [local engine](#building-a-game); publishing, Roblox's own engine tests, model downloads and analytics wait for the key (the dashboard shows an owner task saying so).
 
@@ -200,7 +223,13 @@ The owner can jump into any game from Build on, while it is being built, being t
 
 ### What only the owner does
 
-The dashboard's **Owner tasks** list is everything OmniBlox cannot or must not do itself: add the API key, add experience slots, play and sign off a tested build and approve a launch (the two [gates](#the-owners-gates)), upload the generated icon, answer the experience questionnaire, and look at escalations from the watchdog. Each task carries what is needed (the icon file, the questionnaire answers it prepared). Money never moves: no ads, no purchases, and cashing out Robux stays with you.
+The dashboard's **Owner tasks** list is everything OmniBlox cannot or must not do itself:
+- add the API key and the Roblox session;
+- add experience slots;
+- play and sign off a tested build, and approve a launch (the two [gates](#the-owners-gates));
+- look at escalations from the watchdog.
+
+With a session, the studio uploads the icon and answers the maturity questionnaire itself. Those become tasks only without a session, when a rating comes out higher than the content allows, or when Roblox keeps refusing for a day. Each task carries what is needed, such as the icon file or the prepared answers. Money never moves: no ads, no purchases, and cashing out Robux stays with you.
 
 ## Settings
 
@@ -209,6 +238,7 @@ The dashboard's **Owner tasks** list is everything OmniBlox cannot or must not d
 | `OmniBlox_Enabled` | `false` | Master switch for the production pipeline (research through maintenance) |
 | `OmniBlox_HarvesterEnabled` | `false` | Background asset harvesting; independent of the master switch so the library can fill before the first game |
 | `OmniBlox_RobloxApiKey` | — | Open Cloud API key (sensitive) |
+| `OmniBlox_RobloxSessionCookie` | — | The owner's `.ROBLOSECURITY` cookie, for the icon, store thumbnails and maturity questionnaire (sensitive; Roblox's rotations are saved back here) |
 | `OmniBlox_CreatorUserId` / `OmniBlox_CreatorGroupId` | — | Who owns uploaded assets |
 | `OmniBlox_ExperienceSlots` | — | `universeId:placeId` entries the bot may fill |
 | `OmniBlox_PlaytestSlot` | — | `universeId:placeId` of a private experience for the owner's playtests of any game at any stage (never used as an experience slot) |

@@ -6,48 +6,9 @@ using Omnipotent.Services.OmniBlox.Roblox;
 
 namespace Omnipotent.Services.OmniBlox.Pipeline
 {
-    /// <summary>Experience slots: blank experiences the owner created, which the studio fills one game each.</summary>
-    public static class Slots
-    {
-        /// <summary>The game's slot, assigning a free one if it has none. Null when every slot is taken.</summary>
-        public static ExperienceSlot? Ensure(StudioContext ctx, string gameId)
-        {
-            var existing = ctx.Game(gameId)?.Slot;
-            if (existing != null) return existing;
-            ExperienceSlot? chosen = null;
-            ctx.Store.Mutate(s =>
-            {
-                foreach (var slot in ctx.Settings.Slots)
-                {
-                    string key = slot.ToString();
-                    if (s.Studio.SlotAssignments.TryGetValue(key, out var holder) && holder != gameId && s.Game(holder) is { } h && h.Stage != GameStage.Abandoned)
-                        continue;
-                    s.Studio.SlotAssignments[key] = gameId;
-                    var game = s.Game(gameId)!;
-                    game.Slot = new ExperienceSlot { UniverseId = slot.UniverseId, PlaceId = slot.PlaceId };
-                    s.MarkStudio();
-                    s.Touch(game, ctx.Clock());
-                    chosen = game.Slot;
-                    return;
-                }
-            });
-            return chosen;
-        }
-
-        public static void Release(StudioContext ctx, string gameId) => ctx.Store.Mutate(s =>
-        {
-            foreach (var key in s.Studio.SlotAssignments.Where(kv => kv.Value == gameId).Select(kv => kv.Key).ToList())
-                s.Studio.SlotAssignments.Remove(key);
-            s.MarkStudio();
-        });
-
-        public static bool AnyFree(StudioContext ctx) => ctx.Store.Read(s => ctx.Settings.Slots.Any(slot =>
-            !s.Studio.SlotAssignments.TryGetValue(slot.ToString(), out var holder) || s.Game(holder) is not { } h || h.Stage == GameStage.Abandoned));
-    }
-
     /// <summary>
     /// The Test stage: a clean build (syntax, strict types, scene, geometry, the map report), the game in Roblox's
-    /// own engine when a key and an experience slot exist, else in the studio's local engine (a passing run on this
+    /// own engine when a key and an experience exist (<see cref="Slots"/>), else in the studio's local engine (a passing run on this
     /// very build is reused), and a playtest review by a vision-capable agent playing it as a child would. A failure
     /// sends the game back to Build with the report in its briefing.
     ///
@@ -142,7 +103,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 report.Issues.Add(new TestIssue { Severity = "info", Area = "engine", Message = $"reused the passing {(reuse.Local ? "local engine" : "engine")} run on r{reuse.Revision} ({reuse.Summary})" });
                 return reuse;
             }
-            string waiting = ctx.Cloud.HasKey ? "engine tests wait for a free experience slot (they run again before launch)" : "engine tests wait for the Roblox API key (they run again before launch)";
+            string waiting = ctx.Cloud.HasKey ? "engine tests wait for an experience to run in (they run again before launch)" : "engine tests wait for the Roblox API key (they run again before launch)";
             if (!roblox && !StageGates.LocalEngineStandsIn(ctx, game))
             {
                 report.Issues.Add(new TestIssue { Severity = "warning", Area = "engine", Message = waiting });

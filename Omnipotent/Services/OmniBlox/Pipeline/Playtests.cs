@@ -32,7 +32,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
     }
 
     /// <summary>Whether a game can be played in Roblox, and in which private experience. A null slot with
-    /// <paramref name="OwnExperience"/> means a free experience slot is assigned to the game on the first play.</summary>
+    /// <paramref name="OwnExperience"/> means the game is given an experience (a free one, or one the studio creates) on
+    /// the first play; a null slot without it, that the studio creates the playtest experience then.</summary>
     public sealed record PlaytestAccess(bool Available, bool OwnExperience, ExperienceSlot? Slot, string? Reason);
 
     public sealed record PlaytestPublishResult(PlaytestPublish Publish, bool Reused, string JoinUrl, IReadOnlyList<string> Warnings);
@@ -228,26 +229,28 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         // ─────────────── Roblox ───────────────
 
         /// <summary>
-        /// Where the game's playtests run: the studio's playtest experience (OmniBlox_PlaytestSlot) when there is
-        /// one; otherwise the game's own experience while it is still private (a free slot is borrowed on the first
-        /// play, as Test would). Public, sunset and abandoned games need the playtest experience.
+        /// Where the game's playtests run: the playtest experience (the owner's OmniBlox_PlaytestSlot, or the one the
+        /// studio made) when there is one; otherwise the game's own experience while it is still private (given on the
+        /// first play, as Test would, and created when none is free). Public, sunset and abandoned games need the
+        /// playtest experience, which the studio creates on their first play when it can.
         /// </summary>
         public PlaytestAccess Describe(GameDossier game)
         {
             if (!ctx.Cloud.HasKey)
                 return new(false, false, null, "Playing in Roblox needs the Roblox API key (OmniSetting OmniBlox_RobloxApiKey). Open in Studio works without it.");
-            if (ctx.Settings.PlaytestSlot is { } slot) return new(true, false, slot, null);
-            const string addOne = "create a blank experience (it stays private), give the API key access to it and add it as universeId:placeId to the OmniSetting OmniBlox_PlaytestSlot";
+            if (Slots.PlaytestExperience(ctx) is { } slot) return new(true, false, slot, null);
+            bool canCreate = Slots.CanCreate(ctx);
+            string addOne = ctx.Session is { HasSession: true }
+                ? $"the studio cannot create one right now ({Slots.WhyNotCreating(ctx)}); or create a blank experience (it stays private), give the API key access to it and add it as universeId:placeId to the OmniSetting OmniBlox_PlaytestSlot"
+                : "set the owner's Roblox session (OmniSetting OmniBlox_RobloxSessionCookie) so the studio creates one, or create a blank experience (it stays private), give the API key access to it and add it as universeId:placeId to the OmniSetting OmniBlox_PlaytestSlot";
             if (game.Publish.IsPublic || game.Stage is GameStage.Live or GameStage.Sunset)
-                return new(false, false, null, $"This game is public, so playing a build of it needs a private experience: {addOne}.");
+                return canCreate ? new(true, false, null, null) : new(false, false, null, $"This game is public, so playing a build of it needs a private experience: {addOne}.");
             if (game.Stage == GameStage.Abandoned)
-                return new(false, false, null, $"An abandoned game has given up its experience. To play it in Roblox, {addOne}.");
+                return canCreate ? new(true, false, null, null) : new(false, false, null, $"An abandoned game has given up its experience. To play it in Roblox, {addOne}.");
             var own = ctx.Store.Read(s => game.Slot is { } mine && s.Studio.SlotAssignments.TryGetValue(mine.ToString(), out var holder) && holder == game.GameId ? mine : null);
             if (own != null) return new(true, true, own, null);
-            if (Slots.AnyFree(ctx)) return new(true, true, null, null);
-            return new(false, false, null, ctx.Settings.Slots.Count == 0
-                ? $"Playing in Roblox needs a private experience: {addOne} (or add experience slots, which unlaunched games borrow)."
-                : $"Every experience slot is taken. To play this game in Roblox, {addOne}.");
+            if (Slots.AnyFree(ctx) || canCreate) return new(true, true, null, null);
+            return new(false, false, null, $"Every experience is taken. To play this game in Roblox, {addOne}.");
         }
 
         /// <summary>
@@ -266,9 +269,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             await publishGate.WaitAsync(ct);
             try
             {
-                var slot = access.OwnExperience ? Slots.Ensure(ctx, gameId) : access.Slot;
+                var slot = access.OwnExperience ? await Slots.EnsureAsync(ctx, gameId, ct) : access.Slot ?? await Slots.EnsurePlaytestAsync(ctx, ct);
                 if (slot == null || access.OwnExperience && !ctx.Store.Read(s => s.Studio.SlotAssignments.TryGetValue(slot.ToString(), out var holder) && holder == gameId))
-                    throw new PlaytestException(PlaytestProblem.NoRoblox, "This game has no experience of its own free to play in; add a playtest experience (OmniSetting OmniBlox_PlaytestSlot).");
+                    throw new PlaytestException(PlaytestProblem.NoRoblox, $"There is no private experience to play this game in ({Slots.WhyNotCreating(ctx) ?? "Roblox did not create one when asked"}); add a playtest experience (OmniSetting OmniBlox_PlaytestSlot).");
                 var last = ctx.Game(gameId)!.Playtest.LastPublish;
                 bool stillThere = access.OwnExperience || ctx.Store.Read(s => s.Studio.PlaytestSlot?.GameId) == gameId;
                 if (last != null && stillThere && last.UniverseId == slot.UniverseId && last.PlaceId == slot.PlaceId && last.Fingerprint == built.Fingerprint)

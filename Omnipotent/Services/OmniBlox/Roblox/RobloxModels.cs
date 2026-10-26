@@ -216,4 +216,71 @@ namespace Omnipotent.Services.OmniBlox.Roblox
         public long AssetId { get; set; }
         public string OperationPath { get; set; } = "";
     }
+
+    // ── The owner's session (the Creator Dashboard's own calls) ──
+
+    /// <summary>Roblox's Maturity &amp; Compliance questionnaire, as the Creator Dashboard receives it.</summary>
+    public sealed class Questionnaire
+    {
+        public string Id { get; set; } = "";
+        public string Name { get; set; } = "";
+        public List<QuestionnaireSection> Sections { get; set; } = new();
+    }
+
+    public sealed class QuestionnaireSection
+    {
+        public string Id { get; set; } = "";
+        public string Name { get; set; } = "";
+        public string Description { get; set; } = "";
+        public List<QuestionnaireQuestion> Questions { get; set; } = new();
+    }
+
+    public sealed class QuestionnaireQuestion
+    {
+        public const string Radio = "RadioButtonQuestion", CheckBox = "CheckBoxQuestion", TextBox = "TextBoxQuestion";
+
+        public string Id { get; set; } = "";
+        public string Text { get; set; } = "";
+        /// <summary><see cref="Radio"/> (one option), <see cref="CheckBox"/> (one or more) or <see cref="TextBox"/>.</summary>
+        public string Type { get; set; } = "";
+        public string Help { get; set; } = "";
+        public int? MaxInputLength { get; set; }
+        public List<QuestionnaireOption> Options { get; set; } = new();
+    }
+
+    /// <summary>An answer choice; choosing it reveals its child questions and sections.</summary>
+    public sealed class QuestionnaireOption
+    {
+        public string Id { get; set; } = "";
+        public string Text { get; set; } = "";
+        public string Help { get; set; } = "";
+        public List<QuestionnaireQuestion> ChildQuestions { get; set; } = new();
+        public List<QuestionnaireSection> ChildSections { get; set; } = new();
+    }
+
+    /// <summary>
+    /// One answer as the questionnaire service stores it: <see cref="Value"/> is JSON text — the chosen option's id
+    /// as a JSON string for a radio question, an array of ids for check boxes, a string for a text box.
+    /// </summary>
+    public sealed record QuestionnaireAnswer(string QuestionId, string Value);
+
+    /// <summary>Roblox's verdict on a set of answers: the age rating they produce, before or after submitting.</summary>
+    public sealed class QuestionnairePreview
+    {
+        public string? AgeRating { get; set; }
+        public int? MinimumAge { get; set; }
+        public List<string> RestrictedCountries { get; set; } = new();
+        public List<string> Descriptors { get; set; } = new();
+        public string? Error { get; set; }
+        public string? Warning { get; set; }
+        public bool SubmitDisabled { get; set; }
+    }
+
+    public sealed class QuestionnaireCheck
+    {
+        public bool Valid { get; set; }
+        public string? SubmissionId { get; set; }
+        /// <summary>Question id → why Roblox refused its answer.</summary>
+        public List<(string QuestionId, string Reason)> Failures { get; set; } = new();
+    }
 }

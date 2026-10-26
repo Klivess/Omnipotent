@@ -60,6 +60,19 @@ namespace Omnipotent.Tests.OmniBlox
             issues = Array.Empty<string>(),
         });
         public string ComplianceJson { get; set; } = "{\"ok\": true, \"problems\": [], \"suggestions\": [\"add an update log\"]}";
+
+        /// <summary>Answers to <see cref="FakeRoblox"/>'s questionnaires: honest for an all-ages obby.</summary>
+        public const string HonestQuestionnaireReply = "{\"answers\": [" +
+            "{\"question\": \"q-violence\", \"choose\": [\"o-violence-no\"], \"fact\": \"Violence: none\"}," +
+            "{\"question\": \"q-chat\", \"choose\": [\"o-chat-roblox\"], \"fact\": \"only Roblox's standard text chat\"}," +
+            "{\"question\": \"q-summary\", \"text\": \"A colourful obby: jump across lava and reach the end.\", \"fact\": \"the pitch\"}," +
+            "{\"question\": \"q-random\", \"choose\": [\"o-random-no\"], \"fact\": \"nothing paid is random\"}]}";
+
+        /// <summary>The questionnaire answerer's replies, one per call (the last one repeats).</summary>
+        public List<string> QuestionnaireReplies { get; } = new() { HonestQuestionnaireReply };
+        public int QuestionnaireCalls { get; private set; }
+        /// <summary>The message list of every questionnaire call, at the moment it was sent.</summary>
+        public List<List<string>> QuestionnairePrompts { get; } = new();
         public string PostMortemJson { get; set; } = JsonConvert.SerializeObject(new
         {
             workedWell = "Short stages kept players moving; 40% reached stage 3.",
@@ -118,7 +131,7 @@ namespace Omnipotent.Tests.OmniBlox
         {
             if (pngImages is { Count: > 0 }) ImageMessages++;
             if (!sessions.TryGetValue(sessionId, out var s)) return;
-            if (s.Turns == 0 && s.Role is not ("label" or "calibrate" or "compliance" or "postmortem")) Briefings.Add(text);
+            if (s.Turns == 0 && s.Role is not ("label" or "calibrate" or "compliance" or "postmortem" or "questionnaire")) Briefings.Add(text);
             var pictures = (pngImages ?? Array.Empty<byte[]>()).Select(p => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(p))[..12]);
             s.Messages.Add($"{role}: {text} [{string.Join(",", pictures)}]");
             s.LastPictureCount = pngImages?.Count ?? 0;
@@ -157,6 +170,9 @@ namespace Omnipotent.Tests.OmniBlox
                     return Text(CalibrationJson(s.LastPictureCount));
                 case "compliance": return Text(ComplianceJson);
                 case "postmortem": return Text(PostMortemJson);
+                case "questionnaire":
+                    lock (QuestionnairePrompts) QuestionnairePrompts.Add(s.Messages.ToList());
+                    return Text(QuestionnaireReplies[Math.Min(QuestionnaireCalls++, QuestionnaireReplies.Count - 1)]);
             }
             if (s.Next < s.Steps.Count && tools.Any(t => t.Name == s.Steps[s.Next].Tool))
             {
@@ -208,9 +224,126 @@ namespace Omnipotent.Tests.OmniBlox
             "{\"name\":\"Boot · the server starts cleanly\",\"ok\":true,\"phase\":\"boot\",\"owner\":\"kit\"}],\"errors\":[],\"warnings\":[]}]}";
         /// <summary>Answer restartServers with 403, as a key without universe:write would get.</summary>
         public bool RestartRefused { get; set; }
+        /// <summary>Roblox's edge firewall as it behaves live: a multipart body with a quoted boundary never reaches developer products (403 9009).</summary>
+        public bool Firewall { get; set; } = true;
+        /// <summary>Refuse every pass/product update with a 500, to exercise retries.</summary>
+        public bool RefuseProductUpdates { get; set; }
         private long nextVersion = 1, nextId = 7000;
 
+        // ── The owner's session (users, publish and the questionnaire service) ──
+        /// <summary>The session cookie Roblox accepts; anything else is answered 401.</summary>
+        public string AcceptedCookie { get; set; } = "cookie-1";
+        /// <summary>When set, the next session call hands back this cookie (Roblox rotating the session) and accepts only it afterwards.</summary>
+        public string? RotateTo { get; set; }
+        public const string Csrf = "csrf-token-1";
+        public int? PreviewMinimumAge { get; set; } = 0;
+        public string PreviewRating { get; set; } = "Minimal";
+        public bool HasAdditionalQuestionnaire { get; set; } = true;
+        public List<(string QuestionnaireId, JArray Answers)> Submissions { get; } = new();
+        public List<JArray> Published { get; } = new();
+        /// <summary>Create Experience calls that got past the session and CSRF checks (made or refused).</summary>
+        public int CreateCalls { get; private set; }
+        /// <summary>Answer Create Experience with a 500.</summary>
+        public bool CreateRefused { get; set; }
+        /// <summary>Whether the API key reaches experiences created from now on (false: a key restricted to the ones it was given).</summary>
+        public bool KeyReachesNew { get; set; } = true;
+        /// <summary>Experiences the API key cannot change (Open Cloud answers 403).</summary>
+        public HashSet<long> KeyUnreachable { get; } = new();
+        public const long FirstCreatedUniverse = 8001;
+        private long nextUniverse = FirstCreatedUniverse;
+
         public IEnumerable<string> Urls(string method) => Requests.Where(r => r.Method == method).Select(r => r.Url);
+
+        /// <summary>The main questionnaire: violence (with a follow-up under "Yes"), chat, and a text question.</summary>
+        public static JObject MainQuestionnaire() => JObject.Parse(@"{""id"":""main-1"",""name"":""Maturity & Compliance"",""description"":""About your experience"",""sections"":[
+            {""id"":""s-violence"",""name"":""Violence"",""description"":""Combat and harm"",""questions"":[
+              {""id"":""q-violence"",""text"":""Does your experience contain <b>violence</b>?"",""type"":""RadioButtonQuestion"",""helpInfo"":{""title"":""Violence"",""text"":""Any combat, weapons or harm."",""examples"":[{""title"":""Example"",""text"":""Sword fights""}]},""options"":[
+                {""id"":""o-violence-no"",""text"":""No""},
+                {""id"":""o-violence-yes"",""text"":""Yes"",""childQuestions"":[{""id"":""q-violence-kind"",""text"":""What kind?"",""type"":""CheckBoxQuestion"",""options"":[{""id"":""o-kind-mild"",""text"":""Mild, unrealistic""},{""id"":""o-kind-real"",""text"":""Realistic""}]}]}]}]},
+            {""id"":""s-social"",""name"":""Social"",""description"":"""",""questions"":[
+              {""id"":""q-chat"",""text"":""How can players communicate?"",""type"":""RadioButtonQuestion"",""options"":[{""id"":""o-chat-roblox"",""text"":""Only Roblox's chat""},{""id"":""o-chat-custom"",""text"":""Custom chat or voice""}]}]},
+            {""id"":""s-about"",""name"":""About"",""description"":"""",""questions"":[
+              {""id"":""q-summary"",""text"":""Describe your experience in a sentence."",""type"":""TextBoxQuestion"",""maxInputLength"":200}]}]}");
+
+        public static JObject AdditionalQuestionnaire() => JObject.Parse(@"{""id"":""add-1"",""name"":""Additional questions"",""description"":""Purchases"",""sections"":[
+            {""id"":""s-pay"",""name"":""Purchases"",""description"":"""",""questions"":[
+              {""id"":""q-random"",""text"":""Can players pay for random items?"",""type"":""RadioButtonQuestion"",""options"":[{""id"":""o-random-no"",""text"":""No""},{""id"":""o-random-yes"",""text"":""Yes""}]}]}]}");
+
+        /// <summary>What Roblox's check says about a set of answers: every question shown must be answered, with JSON values.</summary>
+        private static List<object> Failures(string questionnaireId, JArray answers)
+        {
+            var given = answers.ToDictionary(a => (string)a["questionId"]!, a => (string)a["value"]!);
+            var required = questionnaireId == "add-1" ? new List<string> { "q-random" } : new List<string> { "q-violence", "q-chat", "q-summary" };
+            if (given.TryGetValue("q-violence", out var v) && JToken.Parse(v).ToString() == "o-violence-yes") required.Add("q-violence-kind");
+            var failures = new List<object>();
+            foreach (var q in required.Where(q => !given.ContainsKey(q))) failures.Add(new { questionId = q, reasons = new[] { "Required" } });
+            foreach (var (q, value) in given)
+                try { JToken.Parse(value); } catch (JsonReaderException) { failures.Add(new { questionId = q, reasons = new[] { "Invalid value" } }); }
+            return failures;
+        }
+
+        private HttpResponseMessage? Session(HttpRequestMessage request, string path, string body)
+        {
+            string cookie = request.Headers.TryGetValues("Cookie", out var c) ? string.Join("; ", c) : "";
+            if (!cookie.Contains(".ROBLOSECURITY=" + AcceptedCookie, StringComparison.Ordinal))
+                return new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = new StringContent("{\"errors\":[{\"code\":0,\"message\":\"Authorization has been denied for this request.\"}]}", Encoding.UTF8, "application/json") };
+            if (request.Method != HttpMethod.Get && !(request.Headers.TryGetValues("X-CSRF-TOKEN", out var t) && t.Contains(Csrf)))
+            {
+                var refused = new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"errors\":[{\"code\":0,\"message\":\"XSRF token invalid\"}]}", Encoding.UTF8, "application/json") };
+                refused.Headers.Add("x-csrf-token", Csrf);
+                return refused;
+            }
+            HttpResponseMessage Rotating(HttpResponseMessage r)
+            {
+                if (RotateTo is { } next)
+                {
+                    r.Headers.Add("Set-Cookie", $".ROBLOSECURITY={next}; domain=.roblox.com; path=/; secure; HttpOnly");
+                    AcceptedCookie = next;
+                    RotateTo = null;
+                }
+                return r;
+            }
+            var uri = request.RequestUri!;
+            if (uri.Host == "users.roblox.com" && path == "/v1/users/authenticated") return Rotating(Json(new { id = 42, name = "Owner", displayName = "Owner" }));
+            if (uri.Host == "publish.roblox.com" && path.EndsWith("/icon")) return Rotating(Json(new { targetId = 1 }));
+            if (uri.Host == "publish.roblox.com" && path.EndsWith("/thumbnail/image")) return Rotating(Json(new { targetId = nextId++ }));
+            if (path == "/universes/v1/universes/create")
+            {
+                CreateCalls++;
+                if (CreateRefused) return new HttpResponseMessage(HttpStatusCode.InternalServerError) { Content = new StringContent("{\"errors\":[{\"code\":0,\"message\":\"InternalServerError\"}]}", Encoding.UTF8, "application/json") };
+                long universe = nextUniverse;
+                nextUniverse += 10;
+                if (!KeyReachesNew) KeyUnreachable.Add(universe);
+                return Rotating(Json(new { universeId = universe, rootPlaceId = universe + 1 }));
+            }
+            const string Q = "/experience-questionnaire";
+            if (path.StartsWith(Q + "/v1/questionnaires/") && path.EndsWith("/latest")) return Rotating(Json(new { questionnaireId = "main-1", isOverEighteenQuestionnaire = false }));
+            if (path == Q + "/v1/questionnaires/main-1") return Rotating(Json(new JObject { ["questionnaire"] = MainQuestionnaire(), ["localeCode"] = "en_us" }));
+            if (path.StartsWith(Q + "/v2/questionnaires/additional/universes/"))
+                return HasAdditionalQuestionnaire ? Rotating(Json(new JObject { ["questionnaire"] = AdditionalQuestionnaire() })) : new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent("{}") };
+            var j = body.Length > 0 && body.TrimStart().StartsWith("{") ? JObject.Parse(body) : new JObject();
+            var answers = j["response"]?["answers"] as JArray ?? new JArray();
+            string qid = (string?)j["questionnaireId"] ?? "";
+            if (path == Q + "/v1/responses/validate")
+            {
+                var failures = Failures(qid, answers);
+                return Json(new { isValid = failures.Count == 0, failures });
+            }
+            var preview = new { ageRecommendationDetails = new { summary = new { ageRecommendation = new { displayName = PreviewRating, minimumAge = PreviewMinimumAge } }, descriptorUsages = Array.Empty<object>() }, restrictedCountries = Array.Empty<object>(), contentDescriptorUsages = Array.Empty<object>() };
+            if (path == Q + "/v1/responses/preview" || path == Q + "/v2/responses/preview") return Json(preview);
+            if (path.StartsWith(Q + "/v2/responses/") && path.EndsWith("/submissions") || path.StartsWith(Q + "/v1/responses/") && path.EndsWith("/submissions"))
+            {
+                var failures = Failures(qid, answers);
+                if (failures.Count == 0) lock (Submissions) Submissions.Add((qid, answers));
+                return Json(new { submissionId = "sub-" + Submissions.Count, isValid = failures.Count == 0, failures });
+            }
+            if (path == Q + "/v2/responses/publish")
+            {
+                lock (Published) Published.Add((JArray)j["questionnaireIds"]!);
+                return Json(new { });
+            }
+            return null;
+        }
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken ct)
         {
@@ -219,6 +352,15 @@ namespace Omnipotent.Tests.OmniBlox
             lock (Requests) Requests.Add((request.Method.Method, url, body.Length > 4000 ? body[..4000] : body));
             var uri = request.RequestUri;
             string path = uri.AbsolutePath;
+
+            if (uri.Host is "users.roblox.com" or "publish.roblox.com" || path.StartsWith("/experience-questionnaire/") || path == "/universes/v1/universes/create")
+                return Session(request, path, body) ?? new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent("{\"error\":\"fake: no session route for " + path + "\"}", Encoding.UTF8, "application/json") };
+            if (path.StartsWith("/cloud/v2/universes/") && path.Split('/', ':') is { Length: > 4 } segments && long.TryParse(segments[4], out long target) && KeyUnreachable.Contains(target))
+                return new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"code\":\"PERMISSION_DENIED\",\"message\":\"Insufficient scope.\"}", Encoding.UTF8, "application/json") };
+            if (Firewall && path.Contains("/developer-products/") && request.Content?.Headers.ContentType?.Parameters.Any(p => p.Name == "boundary" && (p.Value ?? "").StartsWith("\"")) == true)
+                return new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{'errors':[{'code':9009,'message':'WAF Blocked Request'}]}", Encoding.UTF8, "application/json") };
+            if (RefuseProductUpdates && request.Method == HttpMethod.Patch && (path.Contains("/game-passes/v1/") || path.Contains("/developer-products/v2/")))
+                return new HttpResponseMessage(HttpStatusCode.InternalServerError) { Content = new StringContent("{\"errors\":[{\"code\":0,\"message\":\"InternalServerError\"}]}", Encoding.UTF8, "application/json") };
 
             if (uri.Host == "fake.rbxcdn.com")
                 return path.EndsWith(".rbxm") ? Bytes(ModelFile, "application/octet-stream") : Bytes(Png, "image/png");
@@ -312,9 +454,12 @@ namespace Omnipotent.Tests.OmniBlox
         public StudioContext Ctx { get; }
         public Orchestrator Orchestrator { get; }
         public AssetHarvester Harvester { get; }
+        /// <summary>Every cookie the session client handed over to be saved after Roblox rotated it.</summary>
+        public List<string> SavedCookies { get; } = new();
 
         /// <param name="localEngine">The studio's local engine (none unless given, as in a studio that cannot run one).</param>
-        public StudioHarness(bool apiKey = true, bool requireApproval = false, ILocalEngine? localEngine = null)
+        /// <param name="session">Whether the owner's Roblox session is set (the icon, thumbnails and questionnaire need it).</param>
+        public StudioHarness(bool apiKey = true, bool requireApproval = false, ILocalEngine? localEngine = null, bool session = false)
         {
             ResearchTools.ClearChartCache();
             var analysis = AssetAnalysisTests.SampleTree();
@@ -329,6 +474,7 @@ namespace Omnipotent.Tests.OmniBlox
             {
                 Enabled = true,
                 ApiKey = apiKey ? "test-key" : null,
+                SessionCookie = session ? "cookie-1" : null,
                 CreatorUserId = 42,
                 Slots = { new ExperienceSlot { UniverseId = 1001, PlaceId = 2002 } },
                 RequireLaunchApproval = requireApproval,
@@ -350,6 +496,7 @@ namespace Omnipotent.Tests.OmniBlox
                 Library = library,
                 Public = publicApi,
                 Cloud = cloud,
+                Session = new RobloxSessionClient(http, () => settings.SessionCookie, rotated => { SavedCookies.Add(rotated); settings.SessionCookie = rotated; }),
                 Llm = Llm,
                 Runner = new AgentCycleRunner(Llm, clock, Advance),
                 Playbook = new Playbook(store, clock),

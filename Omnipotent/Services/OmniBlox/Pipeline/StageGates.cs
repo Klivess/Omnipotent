@@ -17,8 +17,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         /// <summary>The map report score every world must reach (obbies are judged on their course, tycoons on their plots).</summary>
         public const int MinMapScore = MapReport.Bar;
 
-        /// <summary>Whether the game can run in Roblox's engine here: an API key, and an experience slot (its own or a free one).</summary>
-        public static bool EngineAvailable(StudioContext ctx, GameDossier game) => ctx.Cloud.HasKey && (game.Slot != null || Slots.AnyFree(ctx));
+        /// <summary>Whether the game can run in Roblox's engine here: an API key, and an experience (its own, a free one, or one the studio can create now).</summary>
+        public static bool EngineAvailable(StudioContext ctx, GameDossier game) => ctx.Cloud.HasKey && Slots.Obtainable(ctx, game);
 
         /// <summary>Roblox's engine cannot run the game here yet and the studio's local engine can, so run_tests runs it there (see <see cref="LocalEngine"/>).</summary>
         public static bool LocalEngineStandsIn(StudioContext ctx, GameDossier game) => !EngineAvailable(ctx, game) && ctx.LocalEngine is { Available: true };

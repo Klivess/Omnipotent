@@ -146,10 +146,17 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Contains(h.Roblox.Requests, r => r.Method == "PATCH" && r.Url.Contains("/places/2002?updateMask=displayName,description") && r.Body.Contains("Lava Forest Obby"));
             Assert.Contains(h.Roblox.Requests, r => r.Method == "POST" && r.Url.Contains("/game-passes/v1/universes/1001/game-passes"));
             Assert.Contains(h.Roblox.Requests, r => r.Method == "POST" && r.Url.Contains("/developer-products/v2/universes/1001/developer-products"));
+            // No Roblox session yet: the icon and questionnaire wait for the owner, who is told how to hand them over.
             var tasks = h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList());
-            Assert.Contains(tasks, t => t.Kind == OwnerTaskKind.UploadIcon && t.Files.Contains("icon.png"));
+            Assert.Contains(tasks, t => t.Kind == OwnerTaskKind.UploadIcon && t.Files.Contains("icon.png") && t.Detail.Contains("OmniBlox_RobloxSessionCookie"));
             Assert.Contains(tasks, t => t.Kind == OwnerTaskKind.Questionnaire);
             Assert.Contains(h.Ctx.Store.Read(s => s.Events.ToList()), e => e.Kind == "game.launched");
+            // The owner sets the session once: housekeeping uploads the icon, answers the questionnaire and closes both tasks.
+            h.Ctx.Settings.SessionCookie = "cookie-1";
+            await StorePageChores.SweepAsync(h.Ctx, CancellationToken.None);
+            Assert.DoesNotContain(h.Ctx.Store.Read(s => s.Studio.OwnerTasks.Where(t => t.Status == OwnerTaskStatus.Open).ToList()), t => t.Kind is OwnerTaskKind.UploadIcon or OwnerTaskKind.Questionnaire);
+            Assert.True(h.OnlyGame().Publish.Questionnaire!.Published);
+            Assert.Contains(h.Roblox.Requests, r => r.Url == "https://publish.roblox.com/v1/games/1001/icon");
             // The final place carries the real product ids.
             string config = File.ReadAllText(Path.Combine(h.Ctx.Store.BuildDirectory(game.GameId), "place.rbxlx"));
             Assert.Contains($"Id = {game.Products.First().RobloxId}", config);

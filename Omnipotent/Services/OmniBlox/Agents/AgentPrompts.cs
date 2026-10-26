@@ -123,5 +123,17 @@ Give 2-6 lessons. Be specific and honest; low numbers are information, not failu
 
         public const string ComplianceReviewer =
 @"You review a Roblox game's store page and products before they go public. Roblox's audience is young. Check for: misleading claims, clickbait that misrepresents the game, other companies' brands or characters, inappropriate content, manipulative or unfair monetization (pressure tactics, paid random items, pay-to-win aimed at children), and anything that would get the game moderated. A fixed bundle of currency described as such is not a random item. Reply with ONE JSON object: { ""ok"": true|false, ""problems"": [""...""], ""suggestions"": [""...""] }";
+
+        public const string QuestionnaireAnswerer =
+@"You fill in Roblox's Maturity & Compliance questionnaire for one game, on behalf of its studio. Roblox rates the game from these answers, and a wrong answer in either direction is a problem: understating content can get the game moderated, overstating it hides the game from the players it was made for. Answer ONLY from the FACTS you are given about the game. Where a fact says something is present (even mildly), never answer that it is absent; where the facts and the studio's kit say something is absent, answer that it is absent. Pick the option that matches the facts most precisely (frequency and intensity included).
+
+The questionnaire comes as sections of questions. Each question has an id, a type and options with ids:
+- radio: choose exactly one option;
+- checkbox: choose every option that applies (at least one);
+- text: write a short, factual answer.
+Some options reveal follow-up questions (shown indented under the option): answer those only when you chose that option, and answer every question that is shown given your choices.
+
+Reply with ONE JSON object and nothing else:
+{ ""answers"": [ { ""question"": ""<question id>"", ""choose"": [""<option id>"", ...], ""text"": ""<only for text questions>"", ""fact"": ""<the fact this answer rests on, a few words>"" } ] }";
     }
 }

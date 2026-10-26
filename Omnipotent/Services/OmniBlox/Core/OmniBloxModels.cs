@@ -10,7 +10,7 @@ namespace Omnipotent.Services.OmniBlox.Core
     public enum EventLevel { Info, Success, Warning, Error }
 
     [JsonConverter(typeof(StringEnumConverter))]
-    public enum OwnerTaskKind { ApiKey, Creator, ExperienceSlot, LaunchApproval, UploadIcon, Questionnaire, Escalation, Other, BuildSignoff }
+    public enum OwnerTaskKind { ApiKey, Creator, ExperienceSlot, LaunchApproval, UploadIcon, Questionnaire, Escalation, Other, BuildSignoff, RobloxSession }
 
     [JsonConverter(typeof(StringEnumConverter))]
     public enum OwnerTaskStatus { Open, Done, Dismissed }
@@ -414,6 +414,25 @@ namespace Omnipotent.Services.OmniBlox.Core
         }
     }
 
+    public enum ExperiencePurpose { Game, Playtest }
+
+    /// <summary>An experience the studio created itself, through the owner's Roblox session.</summary>
+    public sealed class CreatedExperience
+    {
+        public long UniverseId { get; set; }
+        public long PlaceId { get; set; }
+        public ExperiencePurpose Purpose { get; set; }
+        public DateTime CreatedUtc { get; set; }
+        /// <summary>The game it was made for (another may hold it since).</summary>
+        public string? MadeFor { get; set; }
+        /// <summary>Whether the API key can change it: null until that is known.</summary>
+        public bool? KeyReaches { get; set; }
+        /// <summary>Made private and named; false while that is still owed.</summary>
+        public bool Prepared { get; set; }
+
+        public ExperienceSlot ToSlot() => new() { UniverseId = UniverseId, PlaceId = PlaceId };
+    }
+
     public sealed class StorePage
     {
         public string Title { get; set; } = "";
@@ -440,6 +459,8 @@ namespace Omnipotent.Services.OmniBlox.Core
         public DateTime? SyncedUtc { get; set; }
         /// <summary>Taken off sale because the game was abandoned and its experience went to another game.</summary>
         public bool Retired { get; set; }
+        /// <summary>When Roblox confirmed it is off sale (null on products marked before that was checked).</summary>
+        public DateTime? RetiredUtc { get; set; }
     }
 
     /// <summary>The owner's decision at a launch gate.</summary>
@@ -480,6 +501,32 @@ namespace Omnipotent.Services.OmniBlox.Core
         public int? EngineTestedRevision { get; set; }
         public string? LastLaunchStep { get; set; }
         public string? LastLaunchError { get; set; }
+        /// <summary>The icon on Roblox now, by content hash (a new icon file is uploaded again).</summary>
+        public string? IconUploadedHash { get; set; }
+        public DateTime? IconUploadedUtc { get; set; }
+        /// <summary>The homepage-thumbnail API refused the thumbnails at launch, so they go on the store page through the owner's session.</summary>
+        public bool StoreThumbnailsPending { get; set; }
+        /// <summary>How many of those are up (a retry carries on after them instead of adding them twice).</summary>
+        public int StoreThumbnailsUploaded { get; set; }
+        /// <summary>The newest answering of Roblox's maturity questionnaire, published or stopped for the owner.</summary>
+        public QuestionnaireRecord? Questionnaire { get; set; }
+    }
+
+    /// <summary>What the studio answered in Roblox's Maturity &amp; Compliance questionnaire, and what rating came of it.</summary>
+    public sealed class QuestionnaireRecord
+    {
+        public DateTime Utc { get; set; }
+        /// <summary>The game's content facts the answers were drawn from, by hash: new facts mean answering again.</summary>
+        public string FactsHash { get; set; } = "";
+        public List<string> QuestionnaireIds { get; set; } = new();
+        /// <summary>Published to Roblox: the experience carries the rating below.</summary>
+        public bool Published { get; set; }
+        /// <summary>Why it was not published, when the studio left the decision to the owner.</summary>
+        public string? StoppedReason { get; set; }
+        public string? AgeRating { get; set; }
+        public int? MinimumAge { get; set; }
+        /// <summary>"Question → answer (because …)", in the questionnaire's order.</summary>
+        public List<string> Answers { get; set; } = new();
     }
 
     /// <summary>
@@ -749,6 +796,8 @@ namespace Omnipotent.Services.OmniBlox.Core
         public List<OwnerTask> OwnerTasks { get; set; } = new();
         /// <summary>Experience slot ("u:p") → game id it holds.</summary>
         public Dictionary<string, string> SlotAssignments { get; set; } = new();
+        /// <summary>The experiences the studio created itself (the owner's OmniBlox_ExperienceSlots are not listed here).</summary>
+        public List<CreatedExperience> CreatedExperiences { get; set; } = new();
         /// <summary>What the playtest experience runs now; null until the first playtest there.</summary>
         public PlaytestOccupant? PlaytestSlot { get; set; }
         public Dictionary<string, UsageTotals> DailyUsage { get; set; } = new();
@@ -768,6 +817,17 @@ namespace Omnipotent.Services.OmniBlox.Core
         /// A game may only use these or the kit's defaults: the first studio invented audio ids that played nothing.
         /// </summary>
         public Dictionary<long, string> LicensedAudio { get; set; } = new();
+        /// <summary>Creator Dashboard chores still to finish (by owner-task key, e.g. "icon:g_123"): their retry state.</summary>
+        public Dictionary<string, ChoreState> Chores { get; set; } = new();
+    }
+
+    /// <summary>A chore the studio keeps retrying: each failure waits longer, and the owner hears only when it stays stuck.</summary>
+    public sealed class ChoreState
+    {
+        public int Failures { get; set; }
+        public DateTime? FirstFailureUtc { get; set; }
+        public DateTime? NextAttemptUtc { get; set; }
+        public string? LastError { get; set; }
     }
 
     /// <summary>

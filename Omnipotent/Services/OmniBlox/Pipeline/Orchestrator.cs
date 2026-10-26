@@ -527,7 +527,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     if (s.Studio.SlotAssignments.TryGetValue(key, out var holder) && holder != gameId && s.Game(holder) is { Stage: not GameStage.Abandoned })
                         g.Slot = null;
                     else
+                    {
                         s.Studio.SlotAssignments[key] = gameId;
+                        // Products a later game's launch took off sale go back on sale when this one launches again.
+                        foreach (var p in g.Products.Where(p => p.Retired)) { p.SyncedUtc = null; p.Retired = false; p.RetiredUtc = null; }
+                    }
                     s.MarkStudio();
                 }
                 g.Stage = stage;
@@ -584,7 +588,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             ctx.Store.Mutate(s =>
             {
                 if (ctx.Cloud.HasKey) s.ResolveOwnerTasks("apikey", now);
-                if (Slots.AnyFree(ctx)) s.ResolveOwnerTasks("slots", now);
+                if (Slots.AnyFree(ctx) || Slots.CanCreate(ctx)) s.ResolveOwnerTasks(Slots.OwnerKey, now);
                 // A game waiting on the owner gets looked at again as soon as its task is done.
                 foreach (var g in s.Games.Values.Where(g => g.WaitingReason != null && !g.Paused))
                 {
@@ -599,6 +603,14 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
             foreach (var id in ctx.Store.Read(s => s.Games.Values.Where(g => g.Stage == GameStage.Live).Select(g => g.GameId).ToList()))
                 LiveOps.FlagUrgent(ctx, id);
+
+            // The Creator Dashboard chores launches left: old products off sale, icons, thumbnails, questionnaires.
+            try { await StorePageChores.SweepAsync(ctx, ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { ctx.Log("[OmniBlox] store-page chores: " + ex); }
+
+            // Experiences the studio created that are not ready yet (the API key could not reach them).
+            try { await Slots.SweepAsync(ctx, ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { ctx.Log("[OmniBlox] experiences: " + ex); }
 
             if (ctx.Cloud.HasKey && now - lastAnalyticsSweepUtc > TimeSpan.FromHours(12))
             {

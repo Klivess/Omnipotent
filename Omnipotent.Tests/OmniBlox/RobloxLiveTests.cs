@@ -126,6 +126,48 @@ namespace Omnipotent.Tests.OmniBlox
             });
         }
 
+        /// <summary>
+        /// Roblox's edge firewall refused .NET's default multipart body (quoted boundary) with 403 9009 before the key
+        /// was checked, so no old product could be taken off sale. With a made-up key every form must reach the key
+        /// check (401 "Invalid API Key"); nothing is changed on Roblox.
+        /// </summary>
+        [Fact]
+        public async Task EveryMultipartForm_GetsPastRobloxsFirewall_ToTheKeyCheck()
+        {
+            if (!Live) return;
+            var cloud = new RobloxCloudClient(new RobloxHttp(RobloxHttp.CreateDefaultClient()), () => "not-a-real-key");
+            const long universe = 1_000_000_001, product = 1_000_000_002;
+            byte[] png = { 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+            var calls = new (string What, Func<Task> Call)[]
+            {
+                ("take a product off sale", () => cloud.UpdateDeveloperProductAsync(universe, product, new ProductSpec { IsForSale = false, OnlySaleState = true }, CancellationToken.None)),
+                ("update a product with its image", () => cloud.UpdateDeveloperProductAsync(universe, product, new ProductSpec { Name = "Coins", Description = "500 coins", PriceRobux = 25, ImagePng = png }, CancellationToken.None)),
+                ("create a product", () => cloud.CreateDeveloperProductAsync(universe, new ProductSpec { Name = "Coins", Description = "500 coins", PriceRobux = 25, ImagePng = png }, CancellationToken.None)),
+                ("create a game pass", () => cloud.CreateGamePassAsync(universe, new ProductSpec { Name = "VIP", Description = "Double coins", PriceRobux = 99, ImagePng = png }, CancellationToken.None)),
+                ("upload homepage thumbnails", () => cloud.UploadHomepageThumbnailsAsync(universe, new[] { png }, CancellationToken.None)),
+                ("upload an image asset", () => cloud.UploadAssetAsync("Image", "icon", "", png, "image/png", "icon.png", new RobloxCreator(1, null), CancellationToken.None)),
+            };
+            foreach (var (what, call) in calls)
+            {
+                var ex = await Assert.ThrowsAsync<RobloxApiException>(call);
+                Assert.DoesNotContain("9009", ex.Body);
+                Assert.True(ex.Status == System.Net.HttpStatusCode.Unauthorized, $"{what}: {ex.Message}");
+            }
+        }
+
+        /// <summary>The Creator Dashboard routes the session client uses exist, answer the CSRF handshake, and refuse a made-up session as signed out.</summary>
+        [Fact]
+        public async Task TheSessionRoutes_AskForASignedInSession()
+        {
+            if (!Live) return;
+            var session = new RobloxSessionClient(new RobloxHttp(RobloxHttp.CreateDefaultClient()), () => "not-a-real-session");
+            var icon = await Assert.ThrowsAsync<RobloxSessionException>(() => session.UploadGameIconAsync(1_000_000_001, new byte[] { 0x89, 0x50, 0x4E, 0x47 }, CancellationToken.None));
+            Assert.False(icon.Missing);
+            Assert.Contains("publish.roblox.com", icon.Message);
+            await Assert.ThrowsAsync<RobloxSessionException>(() => session.GetLatestQuestionnaireIdAsync(1_000_000_001, CancellationToken.None));
+            await Assert.ThrowsAsync<RobloxSessionException>(() => session.GetSignedInUserAsync(CancellationToken.None));
+        }
+
         /// <summary>At least 80% of them: Roblox leaves some fields empty for a few entries.</summary>
         private static void AssertMost<T>(IReadOnlyCollection<T> items, Func<T, bool> has, string what)
         {

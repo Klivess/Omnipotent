@@ -36,6 +36,48 @@ namespace Omnipotent.Services.OmniBlox.Roblox
     }
 
     /// <summary>
+    /// A multipart body Roblox's edge firewall lets through. .NET's own MultipartFormDataContent quotes its
+    /// boundary (<c>boundary="…"</c>): valid HTTP, but the firewall in front of developer products answers that
+    /// with 403 9009 "WAF Blocked Request" before the key is even checked, so no product could be changed or taken
+    /// off sale. The boundary here is a bare token that never needs quoting, and parts carry quoted names and a
+    /// plain filename (no <c>filename*</c>, which RFC 7578 forbids in form data).
+    /// </summary>
+    public static class RobloxForm
+    {
+        public static MultipartFormDataContent Create()
+        {
+            string boundary = "omniblox" + Guid.NewGuid().ToString("N");
+            var form = new MultipartFormDataContent(boundary);
+            form.Headers.ContentType = MediaTypeHeaderValue.Parse("multipart/form-data; boundary=" + boundary);
+            return form;
+        }
+
+        public static void AddText(MultipartFormDataContent form, string name, string value)
+        {
+            var part = new StringContent(value);
+            part.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data") { Name = Quote(name) };
+            form.Add(part);
+        }
+
+        public static void AddJson(MultipartFormDataContent form, string name, string json)
+        {
+            var part = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
+            part.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data") { Name = Quote(name) };
+            form.Add(part);
+        }
+
+        public static void AddFile(MultipartFormDataContent form, string name, byte[] content, string contentType, string fileName)
+        {
+            var part = new ByteArrayContent(content);
+            part.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+            part.Headers.ContentDisposition = new ContentDispositionHeaderValue("form-data") { Name = Quote(name), FileName = Quote(fileName) };
+            form.Add(part);
+        }
+
+        private static string Quote(string s) => "\"" + s.Replace("\"", "") + "\"";
+    }
+
+    /// <summary>
     /// Shared transport for every Roblox call: per-endpoint-family rate buckets (kept well under the
     /// published limits, since one key serves the whole studio), retries with exponential backoff on
     /// 429 / 5xx / transport errors, and Retry-After when Roblox sends it.
@@ -63,6 +105,9 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             {
                 AutomaticDecompression = DecompressionMethods.GZip | DecompressionMethods.Deflate | DecompressionMethods.Brotli,
                 PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+                // No shared cookie jar: the owner's Roblox session goes only on the calls that add it themselves
+                // (RobloxSessionClient), never on public or Open Cloud requests.
+                UseCookies = false,
             };
             var client = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(100) };
             client.DefaultRequestHeaders.UserAgent.ParseAdd(UserAgent);
@@ -87,6 +132,9 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             ["luau-logs"] = 30,
             ["analytics"] = 60,
             ["thumbnail-personalization"] = 20,
+            ["session"] = 30,
+            ["session-upload"] = 6,
+            ["session-create"] = 2,
             ["cdn"] = 600,
         };
 

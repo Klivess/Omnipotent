@@ -200,24 +200,19 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             return all;
         }
 
-        private static MultipartFormDataContent ProductForm(ProductSpec spec, bool includeName)
+        internal static MultipartFormDataContent ProductForm(ProductSpec spec, bool includeName)
         {
-            var form = new MultipartFormDataContent();
+            var form = RobloxForm.Create();
             if (spec.OnlySaleState)
             {
-                form.Add(new StringContent(spec.IsForSale ? "true" : "false"), "isForSale");
+                RobloxForm.AddText(form, "isForSale", spec.IsForSale ? "true" : "false");
                 return form;
             }
-            if (includeName) form.Add(new StringContent(spec.Name), "name");
-            form.Add(new StringContent(spec.Description ?? ""), "description");
-            form.Add(new StringContent(spec.PriceRobux.ToString(CultureInfo.InvariantCulture)), "price");
-            form.Add(new StringContent(spec.IsForSale ? "true" : "false"), "isForSale");
-            if (spec.ImagePng is { Length: > 0 } png)
-            {
-                var image = new ByteArrayContent(png);
-                image.Headers.ContentType = new MediaTypeHeaderValue("image/png");
-                form.Add(image, "imageFile", "icon.png");
-            }
+            if (includeName) RobloxForm.AddText(form, "name", spec.Name);
+            RobloxForm.AddText(form, "description", spec.Description ?? "");
+            RobloxForm.AddText(form, "price", spec.PriceRobux.ToString(CultureInfo.InvariantCulture));
+            RobloxForm.AddText(form, "isForSale", spec.IsForSale ? "true" : "false");
+            if (spec.ImagePng is { Length: > 0 } png) RobloxForm.AddFile(form, "imageFile", png, "image/png", "icon.png");
             return form;
         }
 
@@ -276,11 +271,9 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             };
             var response = await SendAsync("asset-create", "asset uploads (asset:write)", HttpMethod.Post, $"{Base}/assets/v1/assets", () =>
             {
-                var form = new MultipartFormDataContent();
-                form.Add(new StringContent(request.ToString(Formatting.None), Encoding.UTF8, "application/json"), "request");
-                var file = new ByteArrayContent(content);
-                file.Headers.ContentType = new MediaTypeHeaderValue(contentType);
-                form.Add(file, "fileContent", fileName);
+                var form = RobloxForm.Create();
+                RobloxForm.AddJson(form, "request", request.ToString(Formatting.None));
+                RobloxForm.AddFile(form, "fileContent", content, contentType, fileName);
                 return form;
             }, ct);
 
@@ -410,14 +403,9 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             await SendAsync("thumbnail-personalization", "homepage thumbnails (universe.thumbnail:write)", HttpMethod.Post,
                 $"{Base}/thumbnail-personalization-api/v1/universes/{universeId}/thumbnails/uploads", () =>
                 {
-                    var form = new MultipartFormDataContent();
+                    var form = RobloxForm.Create();
                     int i = 0;
-                    foreach (var png in pngs)
-                    {
-                        var file = new ByteArrayContent(png);
-                        file.Headers.ContentType = new MediaTypeHeaderValue("image/png");
-                        form.Add(file, "files", $"thumbnail{++i}.png");
-                    }
+                    foreach (var png in pngs) RobloxForm.AddFile(form, "files", png, "image/png", $"thumbnail{++i}.png");
                     return form;
                 }, ct);
         }
