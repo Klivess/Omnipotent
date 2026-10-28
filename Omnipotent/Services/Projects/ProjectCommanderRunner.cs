@@ -60,7 +60,39 @@ namespace Omnipotent.Services.Projects
         // in-memory: losing the count on restart costs a firmer sentence, nothing more.
         private readonly ConcurrentDictionary<string, int> underStaffedWakes = new(StringComparer.Ordinal);
 
+        // The last "⚠️" closing each project sent Klives. A wake that keeps ending the same way (a provider
+        // outage, a fleet halt) used to post the identical warning to the chat and Discord on every retry.
+        private readonly ConcurrentDictionary<string, (string Text, DateTime At)> lastTroubleClosings = new(StringComparer.Ordinal);
+        internal static readonly TimeSpan TroubleClosingRepeatWindow = TimeSpan.FromMinutes(30);
+
         private object WakeGate(string projectID) => wakeGates.GetOrAdd(projectID, _ => new object());
+
+        /// <summary>True when this exact warning already went to Klives inside the repeat window.</summary>
+        internal bool RepeatsRecentTroubleClosing(string projectID, string closing, DateTime nowUtc)
+        {
+            if (lastTroubleClosings.TryGetValue(projectID, out var last)
+                && string.Equals(last.Text, closing, StringComparison.Ordinal)
+                && nowUtc - last.At < TroubleClosingRepeatWindow)
+                return true;
+            lastTroubleClosings[projectID] = (closing, nowUtc);
+            return false;
+        }
+
+        /// <summary>
+        /// Keeps a trigger in the durable inbox for a wake that cannot start yet. The inbox has no payload
+        /// dedupe, and a held trigger is usually already there (the drain replays durable payloads), so it
+        /// is only added when absent — otherwise every refused attempt would grow the inbox by one.
+        /// </summary>
+        private void HoldTrigger(string projectID, string triggerDescription)
+        {
+            try
+            {
+                if (parent.RuntimeState.ListPendingTriggers(projectID)
+                    .Any(t => string.Equals(t.Payload, triggerDescription, StringComparison.Ordinal))) return;
+                parent.RuntimeState.EnqueueTrigger(projectID, TriggerFor(triggerDescription));
+            }
+            catch { /* the inbox is best-effort here; the keepalive still wakes the project */ }
+        }
 
         public ProjectCommanderRunner(Projects parent)
         {
@@ -219,6 +251,20 @@ namespace Omnipotent.Services.Projects
                 try { parent.RuntimeState.EnqueueTrigger(project.ProjectID, TriggerFor(triggerDescription)); } catch { }
                 }
                 return null; // already awake — queued for the follow-up wake
+            }
+
+            // A halted fleet admits no model call, so a wake started now would rebuild the whole brief only
+            // to defer at its first turn — and the trigger it released would start the next one at once.
+            // That loop ran ~250 wakes an hour per project for five days (2026-10-23..28) and posted a
+            // "Wake stopped" message for each. This sits ahead of the Klives bypass below on purpose: no
+            // backoff he can override applies here, only clearing the halt does. The trigger waits in the
+            // durable inbox and the keepalive starts the wake once admission reopens.
+            if (parent.FleetAdmissionRefusal() is { } fleetRefusal)
+            {
+                if (queueIfBusy) HoldTrigger(project.ProjectID, triggerDescription);
+                parent.NoteWakeWaiting(project.ProjectID, "commander", "fleet-halt",
+                    $"The Commander is held because {fleetRefusal} It starts by itself once the halt is cleared.");
+                return null;
             }
 
             string wakeID = Guid.NewGuid().ToString("N");
@@ -1164,11 +1210,15 @@ namespace Omnipotent.Services.Projects
                         string closing = trouble
                             ? $"⚠️ {outcomeText}"
                             : $"{outcomeText} {ProjectWakeStatus.ForCommander(parent.Digests.GetDigest(projectID), parent.RuntimeState.Get(projectID))}";
-                        parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander", closing));
-                        if (parent.DiscordManager != null)
+                        // The same trouble, again, is not news: one copy per window instead of one per retry.
+                        if (!(trouble && RepeatsRecentTroubleClosing(projectID, closing, DateTime.UtcNow)))
                         {
-                            try { await parent.DiscordManager.PostCommanderReplyAsync(project, closing); }
-                            catch { }
+                            parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.CommanderMessage, "commander", closing));
+                            if (parent.DiscordManager != null)
+                            {
+                                try { await parent.DiscordManager.PostCommanderReplyAsync(project, closing); }
+                                catch { }
+                            }
                         }
                         repliedToKlives = true;
                     }
@@ -1246,7 +1296,11 @@ namespace Omnipotent.Services.Projects
                 // one re-queues turns one warm conversation into two cold ones. Only a Commander that
                 // is genuinely going to sleep gives the permit back — and that is the moment another
                 // project that has been waiting gets to start.
-                bool rollsStraightOn = DrainPendingTriggers(projectID);
+                // A wake deferred before its first model call changed nothing, and the trigger it just
+                // released is the one a drain would start next: re-waking here is a hot loop, not a retry.
+                // The keepalive restarts it once admission reopens (its queued-work check).
+                bool deferredBeforeModel = outcome == ProjectEventTypes.WakeDeferred && modelResponses == 0;
+                bool rollsStraightOn = !deferredBeforeModel && DrainPendingTriggers(projectID);
                 if (!rollsStraightOn && continueAfterSlice) rollsStraightOn = ContinueProductiveWork(projectID);
                 if (rollsStraightOn) parent.WakeAdmission.NoteTurn(projectID, ProjectWakeAdmission.CommanderAgentID);
                 else

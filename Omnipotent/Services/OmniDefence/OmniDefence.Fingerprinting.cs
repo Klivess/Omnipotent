@@ -127,7 +127,7 @@ namespace Omnipotent.Services.OmniDefence
                     LogError = (ex, msg) => _ = ServiceLogError(ex, msg),
                 };
                 intel.IntelUpdated = ip => fingerprints.Reclassify(ip);
-                intel.FeedsUpdated = () => fingerprints.ReclassifyAll();
+                intel.FeedsUpdated = membershipChanged => fingerprints.ReclassifyWhere(membershipChanged);
 
                 await fingerprints.LoadAsync();
                 ServiceQuitRequest += () =>

@@ -132,6 +132,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     if (game.Stage == GameStage.Live)
                     {
                         sb.AppendLine($"Live since {game.Publish.WentPublicUtc:yyyy-MM-dd}; published version {game.Publish.LastPublishedVersion} (r{game.Publish.LastPublishedRevision}); experience {game.Slot}.");
+                        if (PlayerReach.Describe(game) is { } reach) sb.AppendLine(reach);
                         if (game.Maintenance.Count > 0) sb.AppendLine("Recent maintenance:\n" + string.Join("\n", game.Maintenance.TakeLast(4).Select(m => $"- {m.Utc:yyyy-MM-dd}: {m.Summary}")));
                     }
                     break;

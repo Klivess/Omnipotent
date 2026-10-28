@@ -40,6 +40,21 @@ namespace Omnipotent.Services.OmniDefence
         public int Escalation2Threshold { get; set; } = 50;
         public int Escalation3Threshold { get; set; } = 200;
 
+        /// <summary>
+        /// Raised (outside the record lock) when score-based auto-escalation changes an IP's status:
+        /// (record, previous status, new status). These transitions used to leave no event behind.
+        /// </summary>
+        public Action<IpRecord, string, string>? AutoEscalated { get; set; }
+
+        /// <summary>
+        /// Classes the fingerprint engine only assigns on strong evidence that a person (or Klives)
+        /// is behind the IP: a Klives-rank profile, or trusted input events from the browser beacon.
+        /// Accumulated score never auto-escalates these; a probe or credential attack reclassifies
+        /// the IP first (hard rules), which lifts the protection.
+        /// </summary>
+        public static bool IsProvenPerson(string? classification) =>
+            classification is "Owner" or "Human";
+
         public IpThreatTracker(OmniDefenceStore store)
         {
             this.store = store;
@@ -123,8 +138,10 @@ namespace Omnipotent.Services.OmniDefence
         public IpRecord RecordOutcome(string ip, RequestOutcome outcome)
         {
             var rec = GetOrCreate(ip);
+            string? before, after;
             lock (rec)
             {
+                before = rec.Status;
                 rec.LastSeen = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
                 rec.TotalRequests++;
                 switch (outcome)
@@ -149,9 +166,12 @@ namespace Omnipotent.Services.OmniDefence
                         rec.ThreatScore += 10;
                         break;
                     case RequestOutcome.WebsiteNoProfile:
+                        // The KM website's own traffic for a visitor with no (or an expired) session:
+                        // its logged-out page guard and stale tabs. At +15 it outweighed a wrong
+                        // password and auto-blocked share-link guests after 14 calls.
                         rec.UnauthAttempts++;
                         rec.DenyCount++;
-                        rec.ThreatScore += 15;
+                        rec.ThreatScore += 3;
                         break;
                     case RequestOutcome.IncorrectMethod:
                         rec.DenyCount++;
@@ -159,6 +179,16 @@ namespace Omnipotent.Services.OmniDefence
                         break;
                     case RequestOutcome.NotFound:
                         rec.ThreatScore += 0.5;
+                        break;
+                    case RequestOutcome.Probe:
+                        // /.env, /.git/config, wp-login.php...: KliveAPI serves none of these, so each
+                        // one is an exploit probe, not a typo. With the one-off VulnScanner class delta,
+                        // about 14 reach the auto-block score (at +0.5 it took ~320).
+                        rec.ThreatScore += 12;
+                        break;
+                    case RequestOutcome.HoneypotHit:
+                        rec.DenyCount++;
+                        rec.ThreatScore += 50;
                         break;
                     case RequestOutcome.ServerError:
                     case RequestOutcome.ClientError:
@@ -171,15 +201,24 @@ namespace Omnipotent.Services.OmniDefence
                 }
                 rec.ThreatScore = Math.Clamp(rec.ThreatScore, 0, 1000);
                 ApplyAutoEscalation(rec);
+                after = rec.Status;
             }
             MarkDirty(ip);
+            ReportEscalation(rec, before, after);
             return rec;
+        }
+
+        private void ReportEscalation(IpRecord rec, string? before, string? after)
+        {
+            if (string.Equals(before, after, StringComparison.Ordinal) || after == null) return;
+            try { AutoEscalated?.Invoke(rec, before ?? nameof(IpStatus.Normal), after); } catch { /* observers never break scoring */ }
         }
 
         /// <summary>Auto-escalation of status: only escalates, never downgrades away from manual states. Caller holds lock(rec).</summary>
         private void ApplyAutoEscalation(IpRecord rec)
         {
             if (!string.IsNullOrWhiteSpace(rec.AssociatedProfileId) || rec.Status == nameof(IpStatus.Blocked) || rec.Status == nameof(IpStatus.Honeypot)) return;
+            if (IsProvenPerson(rec.Classification)) return;
             if (rec.ThreatScore >= AutoBlockScore)
             {
                 rec.Status = nameof(IpStatus.Blocked);
@@ -200,12 +239,16 @@ namespace Omnipotent.Services.OmniDefence
             if (delta == 0) return null;
             var rec = Get(ip);
             if (rec == null) return null;
+            string? before, after;
             lock (rec)
             {
+                before = rec.Status;
                 rec.ThreatScore = Math.Clamp(rec.ThreatScore + delta, 0, 1000);
                 ApplyAutoEscalation(rec);
+                after = rec.Status;
             }
             MarkDirty(ip);
+            ReportEscalation(rec, before, after);
             return rec;
         }
 
@@ -322,6 +365,10 @@ namespace Omnipotent.Services.OmniDefence
         ServerError,
         PreBlocked,
         /// <summary>A normal 4xx client error (validation, conflict, payload limit); no threat score.</summary>
-        ClientError
+        ClientError,
+        /// <summary>A non-existent route matching <see cref="Fingerprint.ProbePatterns"/> (secrets, VCS, CMS, shells).</summary>
+        Probe,
+        /// <summary>A request for a registered honeypot route (including the robots.txt trap).</summary>
+        HoneypotHit
     }
 }

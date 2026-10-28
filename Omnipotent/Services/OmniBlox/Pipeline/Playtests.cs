@@ -242,7 +242,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             bool canCreate = Slots.CanCreate(ctx);
             string addOne = ctx.Session is { HasSession: true }
                 ? $"the studio cannot create one right now ({Slots.WhyNotCreating(ctx)}); or create a blank experience (it stays private), give the API key access to it and add it as universeId:placeId to the OmniSetting OmniBlox_PlaytestSlot"
-                : "set the owner's Roblox session (OmniSetting OmniBlox_RobloxSessionCookie) so the studio creates one, or create a blank experience (it stays private), give the API key access to it and add it as universeId:placeId to the OmniSetting OmniBlox_PlaytestSlot";
+                : "connect your Roblox account (dashboard → Roblox account → Connect) so the studio creates one, or create a blank experience (it stays private), give the API key access to it and add it as universeId:placeId to the OmniSetting OmniBlox_PlaytestSlot";
             if (game.Publish.IsPublic || game.Stage is GameStage.Live or GameStage.Sunset)
                 return canCreate ? new(true, false, null, null) : new(false, false, null, $"This game is public, so playing a build of it needs a private experience: {addOne}.");
             if (game.Stage == GameStage.Abandoned)

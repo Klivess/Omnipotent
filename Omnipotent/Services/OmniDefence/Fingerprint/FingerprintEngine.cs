@@ -97,12 +97,20 @@ namespace Omnipotent.Services.OmniDefence.Fingerprint
         }
 
         /// <summary>Reclassifies everything (weights or feeds changed). Spread over pumps.</summary>
-        public void ReclassifyAll()
+        public void ReclassifyAll() => ReclassifyWhere(_ => true);
+
+        /// <summary>
+        /// Reclassifies the fingerprints whose IP matches <paramref name="affected"/> (evaluated on the
+        /// engine thread). A feed refresh passes "membership changed": the hourly Tor list used to
+        /// reclassify and rewrite all ~2,500 fingerprints when a handful of exits had moved.
+        /// </summary>
+        public void ReclassifyWhere(Func<string, bool> affected)
         {
             _commands.Writer.TryWrite(() =>
             {
                 foreach (var fp in _fps.Values)
                 {
+                    if (!affected(fp.Ip)) continue;
                     lock (fp) fp.PendingClassify = true;
                     _pending.Add(fp.Ip);
                 }
@@ -253,16 +261,23 @@ namespace Omnipotent.Services.OmniDefence.Fingerprint
                 result = IpClassifier.Classify(fp, intel, associatedRank);
                 IpClassInfo.TryParse(fp.Class, out previous);
                 long now = NowMs();
+                var evidence = result.Evidence.Take(12).ToList();
+                // A reclassification that reaches the same verdict for the same reasons has nothing
+                // new to persist; new traffic already marked the aggregate dirty when it was folded.
+                bool verdictChanged = fp.Class != result.Class.ToString()
+                    || fp.Confidence != result.Confidence
+                    || !(fp.Tags ?? new List<string>()).SequenceEqual(result.Tags ?? new List<string>())
+                    || !(fp.Evidence ?? new List<Evidence>()).Select(e => e.Reason).SequenceEqual(evidence.Select(e => e.Reason));
                 fp.Class = result.Class.ToString();
                 fp.Confidence = result.Confidence;
-                fp.Evidence = result.Evidence.Take(12).ToList();
+                fp.Evidence = evidence;
                 fp.Tags = result.Tags;
                 fp.Scores = result.Scores;
                 fp.ClassifiedMs = now;
                 if (previous != result.Class) fp.ClassChangedMs = now;
                 fp.PendingClassify = false;
                 fp.Urgent = false;
-                fp.Dirty = true;
+                if (verdictChanged) fp.Dirty = true;
             }
             Interlocked.Increment(ref _classifications);
 

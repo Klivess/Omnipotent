@@ -81,6 +81,20 @@ namespace Omnipotent.Services.Projects
                     return current.WakeID;
                 }
 
+                // A halted fleet admits no model call: starting the wake would build its brief only to
+                // defer at the first turn. The trigger is retained for the next admitted wake.
+                if (parent.FleetAdmissionRefusal() is { } fleetRefusal)
+                {
+                    if (queueIfBusy)
+                    {
+                        var held = steerQueue.GetOrAdd(key, _ => new ConcurrentQueue<string>());
+                        if (held.Count < MaxPendingTriggers && !held.Contains(trigger)) held.Enqueue(trigger);
+                    }
+                    parent.NoteWakeWaiting(project.ProjectID, agent.AgentID, "fleet-halt",
+                        $"{ProjectWakeWaiting.AgentLabel(agent.AgentID)} is held because {fleetRefusal}");
+                    return null;
+                }
+
                 // Do not start a known-doomed wake. Directed stimuli remain in their durable
                 // queue; direct steering is also retained until the next admitted wake.
                 if (ProjectWakeRecovery.BlockedUntil(parent.RuntimeState.Get(project.ProjectID),

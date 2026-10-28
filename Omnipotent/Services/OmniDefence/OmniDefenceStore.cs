@@ -448,13 +448,21 @@ namespace Omnipotent.Services.OmniDefence
             }
         }
 
+        private long readPoolTimeouts;
+
+        /// <summary>Snapshot reads refused because every read slot stayed busy past the deadline.</summary>
+        public long ReadPoolTimeouts => Interlocked.Read(ref readPoolTimeouts);
+
         /// <summary>Read for background snapshots. A saturated pool or slow scan has a firm
         /// deadline, so one search cannot monopolize readers for minutes.</summary>
         private async Task<T> WithBoundedReadAsync<T>(Func<SqliteConnection, CancellationToken, Task<T>> work,
             CancellationToken cancellationToken)
         {
             if (!await readGate.WaitAsync(TimeSpan.FromSeconds(2), cancellationToken))
+            {
+                Interlocked.Increment(ref readPoolTimeouts);
                 throw new TimeoutException("OmniDefence read pool is busy.");
+            }
             try
             {
                 using var conn = new SqliteConnection(readConnectionString);
@@ -560,6 +568,79 @@ namespace Omnipotent.Services.OmniDefence
                 await cmd.ExecuteNonQueryAsync();
             }
             await transaction.CommitAsync();
+        });
+
+        // ---------- Overview totals ----------
+        // The overview's all-time counters, carried forward from a rowid watermark. It used to recount
+        // the whole audit table on every 15 s refresh: ~17 s per pass on the 1.65M-row production
+        // table, holding one of the two read slots more than half the time. Each refresh now reads
+        // only the rows added since the last one; the full pass happens once per database.
+
+        internal const string AuditTotalsKey = "overview_totals_v1";
+        private static readonly TimeSpan AuditTotalsPersistInterval = TimeSpan.FromMinutes(5);
+        private const string DeniedRequestSql = "(deny_reason IS NOT NULL OR status_code >= 400)";
+        private readonly SemaphoreSlim auditTotalsGate = new(1, 1);
+        private AuditTotals? auditTotals;
+        private DateTime auditTotalsPersistedUtc;
+
+        /// <summary>Requests ever audited (and how many were denied or errored), through row <see cref="ThroughId"/>.</summary>
+        public sealed record AuditTotals(long ThroughId, long Requests, long Denied);
+
+        public async Task<AuditTotals> ReadAuditTotalsAsync()
+        {
+            await auditTotalsGate.WaitAsync();
+            try
+            {
+                AuditTotals totals = auditTotals ?? await LoadAuditTotalsAsync();
+                AuditTotals delta = await CountRequestsAfterAsync(totals.ThroughId);
+                if (delta.Requests > 0)
+                    totals = new AuditTotals(delta.ThroughId, totals.Requests + delta.Requests, totals.Denied + delta.Denied);
+                auditTotals = totals;
+                if (DateTime.UtcNow - auditTotalsPersistedUtc >= AuditTotalsPersistInterval)
+                {
+                    await SetSettingAsync(AuditTotalsKey, JsonConvert.SerializeObject(totals));
+                    auditTotalsPersistedUtc = DateTime.UtcNow;
+                }
+                return totals;
+            }
+            finally { auditTotalsGate.Release(); }
+        }
+
+        private async Task<AuditTotals> LoadAuditTotalsAsync()
+        {
+            var settings = await LoadSettingsAsync();
+            if (settings.TryGetValue(AuditTotalsKey, out string? json))
+            {
+                try
+                {
+                    var saved = JsonConvert.DeserializeObject<AuditTotals>(json);
+                    long maxId = await ScalarLongAsync("SELECT COALESCE(MAX(id), 0) FROM requests", new());
+                    // A watermark past the end means the log was rebuilt under a kept settings table.
+                    if (saved != null && saved.ThroughId >= 0 && saved.ThroughId <= maxId)
+                    {
+                        auditTotalsPersistedUtc = DateTime.UtcNow;
+                        return saved;
+                    }
+                }
+                catch (JsonException) { /* recount below */ }
+            }
+            AuditTotals seeded = await CountRequestsAfterAsync(0);
+            await SetSettingAsync(AuditTotalsKey, JsonConvert.SerializeObject(seeded));
+            auditTotalsPersistedUtc = DateTime.UtcNow;
+            return seeded;
+        }
+
+        /// <summary>Counts rows with id &gt; <paramref name="afterId"/> by rowid range (one statement, so consistent).</summary>
+        private Task<AuditTotals> CountRequestsAfterAsync(long afterId) => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = $@"SELECT COALESCE(MAX(id), $after), COUNT(*),
+                    COALESCE(SUM(CASE WHEN {DeniedRequestSql} THEN 1 ELSE 0 END), 0)
+                FROM requests WHERE id > $after";
+            cmd.Parameters.AddWithValue("$after", afterId);
+            using var reader = await cmd.ExecuteReaderAsync();
+            if (!await reader.ReadAsync()) return new AuditTotals(afterId, 0, 0);
+            return new AuditTotals(reader.GetInt64(0), reader.GetInt64(1), reader.GetInt64(2));
         });
 
         private const string RequestInsertSql = @"INSERT INTO requests

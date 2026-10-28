@@ -148,7 +148,7 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Contains(h.Roblox.Requests, r => r.Method == "POST" && r.Url.Contains("/developer-products/v2/universes/1001/developer-products"));
             // No Roblox session yet: the icon and questionnaire wait for the owner, who is told how to hand them over.
             var tasks = h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList());
-            Assert.Contains(tasks, t => t.Kind == OwnerTaskKind.UploadIcon && t.Files.Contains("icon.png") && t.Detail.Contains("OmniBlox_RobloxSessionCookie"));
+            Assert.Contains(tasks, t => t.Kind == OwnerTaskKind.UploadIcon && t.Files.Contains("icon.png") && t.Detail.Contains("Quick Log In"));
             Assert.Contains(tasks, t => t.Kind == OwnerTaskKind.Questionnaire);
             Assert.Contains(h.Ctx.Store.Read(s => s.Events.ToList()), e => e.Kind == "game.launched");
             // The owner sets the session once: housekeeping uploads the icon, answers the questionnaire and closes both tasks.

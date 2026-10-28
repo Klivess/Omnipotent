@@ -224,6 +224,60 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             return results;
         }
 
+        // ─────────────── Whether players can join ───────────────
+
+        /// <summary>Each experience's playability as a signed-out visitor sees it: a joinable game answers GuestProhibited (or Playable), an unrated one ContextualPlayabilityUnrated.</summary>
+        public async Task<List<Playability>> GetPlayabilityAsync(IEnumerable<long> universeIds, CancellationToken ct)
+        {
+            const string path = "/v1/games/multiget-playability-status";
+            var results = new List<Playability>();
+            foreach (var batch in universeIds.Where(i => i > 0).Distinct().Chunk(50))
+            {
+                string url = "https://games.roblox.com" + path + "?universeIds=" + string.Join(",", batch);
+                var response = await http.SendAsync("public", () => new HttpRequestMessage(HttpMethod.Get, url), ct);
+                if (!response.Ok) throw new RobloxApiException(path, response.Status, response.Body);
+                foreach (var p in JArray.Parse(response.Body))
+                    results.Add(new Playability((long?)p["universeId"] ?? 0, (string?)p["playabilityStatus"] ?? "", (bool?)p["isPlayable"] ?? false));
+            }
+            return results;
+        }
+
+        /// <summary>The experience's content maturity rating, as its Roblox page shows it; null when Roblox gives none.</summary>
+        public async Task<MaturityRating?> GetMaturityAsync(long universeId, CancellationToken ct)
+        {
+            const string path = "/experience-guidelines-api/experience-guidelines/get-age-recommendation";
+            string body = new JObject { ["universeId"] = universeId.ToString(CultureInfo.InvariantCulture) }.ToString(Newtonsoft.Json.Formatting.None);
+            var response = await http.SendAsync("public", () => new HttpRequestMessage(HttpMethod.Post, "https://apis.roblox.com" + path)
+            {
+                Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json"),
+            }, ct);
+            if (!response.Ok) throw new RobloxApiException(path, response.Status, response.Body);
+            var rating = JObject.Parse(response.Body)["ageRecommendationDetails"]?["summary"]?["ageRecommendation"];
+            if (rating == null || rating.Type == JTokenType.Null) return null;
+            return new MaturityRating(((string?)rating["contentMaturity"] ?? "").Trim().ToLowerInvariant(), (string?)rating["displayName"] ?? "", (int?)rating["minimumAge"]);
+        }
+
+        /// <summary>
+        /// Roblox's description of an Open Cloud API key: whose it is, what it may do, whether it works (from this
+        /// server's IP, too). Null when Roblox does not know the key.
+        /// </summary>
+        public async Task<ApiKeyIntrospection?> IntrospectApiKeyAsync(string apiKey, CancellationToken ct)
+        {
+            const string path = "/api-keys/v1/introspect";
+            string body = new JObject { ["apiKey"] = apiKey }.ToString(Newtonsoft.Json.Formatting.None);
+            var response = await http.SendAsync("public", () => new HttpRequestMessage(HttpMethod.Post, "https://apis.roblox.com" + path)
+            {
+                Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json"),
+            }, ct);
+            if (response.Status is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.NotFound or System.Net.HttpStatusCode.BadRequest) return null;
+            if (!response.Ok) throw new RobloxApiException(path, response.Status, response.Body);
+            var j = JObject.Parse(response.Body);
+            var scopes = (j["scopes"] as JArray ?? new JArray())
+                .Select(s => $"{(string?)s["name"]}: {string.Join(", ", (s["operations"] as JArray ?? new JArray()).Select(o => o.ToString()))}").ToList();
+            return new ApiKeyIntrospection((string?)j["name"] ?? "", (long?)j["authorizedUserId"] ?? 0, scopes,
+                (bool?)j["enabled"] ?? false, (bool?)j["expired"] ?? false, Date(j["expirationTimeUtc"]));
+        }
+
         // ─────────────── Thumbnails ───────────────
 
         public Task<List<ThumbnailResult>> GetAssetThumbnailsAsync(IEnumerable<long> assetIds, CancellationToken ct, string size = "420x420") =>

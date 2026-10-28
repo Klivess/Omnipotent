@@ -35,13 +35,20 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public static string RetireKey(long productId) => "retire:" + productId.ToString(CultureInfo.InvariantCulture);
 
         internal const string SessionHint =
-            "To have OmniBlox do this itself, now and for every later game, set the OmniSetting OmniBlox_RobloxSessionCookie once: the .ROBLOSECURITY cookie of the Roblox account that owns the experiences " +
-            "(browser dev tools → Application → Cookies → roblox.com). Roblox ties a session to the region it signed in from, so sign in from the server's network if you can.";
+            "To have OmniBlox do this itself, now and for every later game, connect the Roblox account that owns the experiences once: OmniBlox dashboard → Roblox account → Connect, " +
+            "then type the code into Roblox's Quick Log In (Account Settings → Quick Log In) on a device signed in to that account, on the same network as the server.";
 
         // ─────────────── housekeeping ───────────────
 
         /// <summary>Finishes whatever launches left: products still on sale, icons, thumbnails and questionnaires (and the owner tasks older launches filed for them).</summary>
         public static async Task SweepAsync(StudioContext ctx, CancellationToken ct)
+        {
+            await ctx.ChoreGate.WaitAsync(ct);
+            try { await SweepLockedAsync(ctx, ct); }
+            finally { ctx.ChoreGate.Release(); }
+        }
+
+        private static async Task SweepLockedAsync(StudioContext ctx, CancellationToken ct)
         {
             await RetirePendingAsync(ctx, ct);
 
@@ -243,7 +250,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         internal static string NotesHash(IEnumerable<string> notes) =>
             MaturityQuestionnaire.FactsHash(string.Join("\n", notes.Where(n => !n.StartsWith("Monetization:", StringComparison.Ordinal))));
 
-        private static bool QuestionnairePending(GameDossier game)
+        internal static bool QuestionnairePending(GameDossier game)
         {
             if (game.Slot == null) return false;
             string hash = NotesHash(ComplianceChecker.Check(game.Store, game.Products, game.Brief).QuestionnaireNotes);
@@ -273,7 +280,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
             if (ctx.Session is not { HasSession: true } session)
             {
-                ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.Questionnaire, key, title, $"{prepared}\n\nRoblox has no API key for the questionnaire; it needs a signed-in session.\n{SessionHint}", gameId, ctx.Clock()));
+                FileQuestionnaireTask(ctx, game, "Roblox has no API key for the questionnaire; it needs a signed-in session.\n" + SessionHint);
                 return false;
             }
             if (!Due(ctx, key)) return false;
@@ -363,6 +370,34 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             return record;
         }
 
+        /// <summary>
+        /// The owner's task to answer the questionnaire in the Creator Dashboard, with the prepared answers. While Roblox
+        /// shows the experience unrated it says what that costs: nobody but the owner can play the game, which the old
+        /// task never said (the first launched game sat unplayable for four days behind a routine-looking task).
+        /// </summary>
+        internal static void FileQuestionnaireTask(StudioContext ctx, GameDossier game, string how)
+        {
+            var compliance = ComplianceChecker.Check(game.Store, game.Products, game.Brief);
+            string prepared = "Prepared honest answers:\n- " + string.Join("\n- ", compliance.QuestionnaireNotes);
+            bool unrated = PlayerReach.ShowsUnrated(game);
+            string title = unrated
+                ? $"Answer the maturity questionnaire: nobody can play \"{game.Store.Title}\" until you do"
+                : $"Answer the maturity questionnaire for \"{game.Store.Title}\"";
+            string stakes = unrated
+                ? $"Roblox shows experience {game.Slot?.UniverseId} as unrated, and it lets nobody but the creator play an unrated experience: the game gets no players at all until this is answered " +
+                  "(Creator Dashboard → the experience → Maturity & Compliance questionnaire). The studio sees the rating appear by itself and closes this task.\n\n"
+                : "";
+            ctx.Store.Mutate(s =>
+            {
+                var task = s.FileOwnerTask(OwnerTaskKind.Questionnaire, QuestionnaireKey(game.GameId), title, $"{stakes}{prepared}\n\n{how}", game.GameId, ctx.Clock());
+                if (task.Title != title)
+                {
+                    task.Title = title;
+                    s.MarkStudio();
+                }
+            });
+        }
+
         private static QuestionnaireRecord Stopped(QuestionnaireRecord record, QuestionnairePreview preview, string reason)
         {
             record.StoppedReason = reason;
@@ -449,6 +484,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
         internal static bool Due(StudioContext ctx, string key) =>
             ctx.Store.Read(s => !s.Studio.Chores.TryGetValue(key, out var c) || c.NextAttemptUtc == null || c.NextAttemptUtc <= ctx.Clock());
+
+        /// <summary>A chore waiting out a failure is due now (the owner asked for it, or what it waited for arrived).</summary>
+        internal static void MakeDue(StudioContext ctx, string key) => ctx.Store.Mutate(s =>
+        {
+            if (s.Studio.Chores.TryGetValue(key, out var c) && c.NextAttemptUtc != null) { c.NextAttemptUtc = null; s.MarkStudio(); }
+        });
 
         internal static void Succeeded(StudioContext ctx, string key) => ctx.Store.Mutate(s =>
         {

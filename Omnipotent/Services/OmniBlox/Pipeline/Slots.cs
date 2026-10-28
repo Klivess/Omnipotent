@@ -41,7 +41,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             var made = s.Studio.CreatedExperiences.Where(e => e.Purpose == ExperiencePurpose.Game && e.KeyReaches == true).Select(e => e.ToSlot());
             var pool = new List<ExperienceSlot>();
             foreach (var slot in ctx.Settings.Slots.Concat(made))
-                if (slot.UniverseId != playtest && !pool.Any(p => p.UniverseId == slot.UniverseId)) pool.Add(slot);
+                if (slot.UniverseId != playtest && !s.Studio.RetiredExperiences.Contains(slot.UniverseId) && !pool.Any(p => p.UniverseId == slot.UniverseId)) pool.Add(slot);
             return pool;
         }
 
@@ -89,6 +89,31 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             return Ensure(ctx, gameId);
         }
 
+        /// <summary>
+        /// A brand-new experience for one game, made now even when another is free (the owner moving a game somewhere
+        /// fresh, e.g. onto the account they switched to), and given to that game. Null when Roblox made none.
+        /// </summary>
+        public static async Task<ExperienceSlot?> CreateForGameAsync(StudioContext ctx, string gameId, CancellationToken ct)
+        {
+            var before = ctx.Store.Read(s => s.Studio.CreatedExperiences.Select(e => e.UniverseId).ToHashSet());
+            await CreateAsync(ctx, ExperiencePurpose.Game, gameId, ct, force: true);
+            return ctx.Store.Mutate(s =>
+            {
+                var made = s.Studio.CreatedExperiences.LastOrDefault(e => !before.Contains(e.UniverseId) && e.KeyReaches == true);
+                if (made == null || s.Game(gameId) is not { } game) return null;
+                var slot = made.ToSlot();
+                foreach (var key in s.Studio.SlotAssignments.Where(kv => kv.Value == gameId).Select(kv => kv.Key).ToList()) s.Studio.SlotAssignments.Remove(key);
+                s.Studio.SlotAssignments[slot.ToString()] = gameId;
+                game.Slot = new ExperienceSlot { UniverseId = slot.UniverseId, PlaceId = slot.PlaceId };
+                s.MarkStudio();
+                s.Touch(game, ctx.Clock());
+                return slot;
+            });
+        }
+
+        /// <summary>A free experience for the next game, made now when none is (the owner's "do it yourself" on the experience task).</summary>
+        public static Task EnsureSpareAsync(StudioContext ctx, CancellationToken ct) => CreateAsync(ctx, ExperiencePurpose.Game, null, ct);
+
         public static void Release(StudioContext ctx, string gameId) => ctx.Store.Mutate(s =>
         {
             foreach (var key in s.Studio.SlotAssignments.Where(kv => kv.Value == gameId).Select(kv => kv.Key).ToList())
@@ -100,7 +125,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public static ExperienceSlot? PlaytestExperience(StudioContext ctx) => ctx.Store.Read(s => PlaytestExperience(ctx, s));
 
         private static ExperienceSlot? PlaytestExperience(StudioContext ctx, OmniBloxState s) =>
-            ctx.Settings.PlaytestSlot ?? s.Studio.CreatedExperiences.FirstOrDefault(e => e.Purpose == ExperiencePurpose.Playtest && e.KeyReaches == true)?.ToSlot();
+            ctx.Settings.PlaytestSlot ?? s.Studio.CreatedExperiences.FirstOrDefault(e => e.Purpose == ExperiencePurpose.Playtest && e.KeyReaches == true && !s.Studio.RetiredExperiences.Contains(e.UniverseId))?.ToSlot();
 
         /// <summary>The playtest experience, made now when there is none and the studio can make one.</summary>
         public static async Task<ExperienceSlot?> EnsurePlaytestAsync(StudioContext ctx, CancellationToken ct)
@@ -124,11 +149,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public static string? WhyNotCreating(StudioContext ctx)
         {
             if (!ctx.Cloud.HasKey) return "the Roblox API key is not set";
-            if (ctx.Session is not { HasSession: true }) return "the owner's Roblox session (OmniSetting OmniBlox_RobloxSessionCookie) is not set, and Roblox creates experiences only for a signed-in account";
+            if (ctx.Session is not { HasSession: true }) return "no Roblox account is connected (dashboard → Roblox account → Connect), and Roblox creates experiences only for a signed-in account";
             return ctx.Store.Read(s =>
             {
                 var now = ctx.Clock();
-                if (s.Studio.CreatedExperiences.FirstOrDefault(e => e.KeyReaches == false) is { } unreachable)
+                if (s.Studio.CreatedExperiences.FirstOrDefault(e => e.KeyReaches == false && !s.Studio.RetiredExperiences.Contains(e.UniverseId)) is { } unreachable)
                     return $"the API key cannot reach experience {unreachable.UniverseId}, which the studio made, so another would not help";
                 if (s.Studio.Chores.TryGetValue(CreateKey, out var c) && c.NextAttemptUtc > now)
                     return $"creating one failed ({c.LastError}); it tries again {StorePageChores.RetryIn(c, now)}";
@@ -159,12 +184,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         /// A failure waits 5 minutes, doubling to 6 hours, and the owner hears after <see cref="EscalateAfterFailures"/>
         /// in a row.
         /// </summary>
-        private static async Task CreateAsync(StudioContext ctx, ExperiencePurpose purpose, string? gameId, CancellationToken ct)
+        private static async Task CreateAsync(StudioContext ctx, ExperiencePurpose purpose, string? gameId, CancellationToken ct, bool force = false)
         {
             await createGate.WaitAsync(ct);
             try
             {
-                if (purpose == ExperiencePurpose.Game ? AnyFree(ctx) : PlaytestExperience(ctx) != null) return;
+                if (!force && (purpose == ExperiencePurpose.Game ? AnyFree(ctx) : PlaytestExperience(ctx) != null)) return;
                 if (!CanCreate(ctx) || ctx.Session is not { } session) return;
                 long universe, place;
                 try

@@ -45,10 +45,13 @@ internal sealed class FakeExitHost : IExitHost
         return Task.FromResult<string?>("relist-1");
     }
 
+    /// <summary>False plays CSFloat refusing the change (live: 422 "you can only modify listed contracts").</summary>
+    public bool RepriceAccepted { get; set; } = true;
+
     public Task<bool> RepriceOnCSFloatAsync(PurchasedListing position, int priceCents, CancellationToken ct)
     {
         Actions.Add(("reprice", priceCents));
-        return Task.FromResult(true);
+        return Task.FromResult(RepriceAccepted);
     }
 
     public Task DelistFromCSFloatAsync(PurchasedListing position, CancellationToken ct)
@@ -219,6 +222,24 @@ public class ExitManagerTests
             Assert.Equal(("delist", 0), host.Actions[^2]);
             Assert.Equal("steam", host.Actions[^1].Action);
         }
+    }
+
+    [Fact]
+    public async Task ARefusedRepriceBacksOffInsteadOfRetryingEveryReview()
+    {
+        // Steam pays so little that re-pricing the relist is the only sensible move.
+        var host = new FakeExitHost(CSFloat(), Steam(bid: 60));
+        var p = Position();
+        await new ExitManager(host, () => T0).RunSaleAsync(p, CancellationToken.None);
+        int listed = p.CSFloatResalePriceCents;
+        host.RepriceAccepted = false;
+
+        DateTime review = T0.AddDays(10);
+        Assert.Equal("failed", await new ExitManager(host, () => review).ReviewListingAsync(p, CancellationToken.None));
+        Assert.Equal(listed, p.CSFloatResalePriceCents);
+        Assert.Equal(0, p.RelistRepriceCount);
+        // Live, a refused change was retried by the 10-minute review loop 107 times a day.
+        Assert.Equal(review + ExitManager.FailedChangeRetry, p.NextExitReviewUtc);
     }
 
     [Fact]

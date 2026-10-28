@@ -66,6 +66,7 @@ namespace Omnipotent.Services.OmniDefence
         public OmniDefenceStore Store => store;
         public IpThreatTracker Tracker => tracker;
         internal string? OverviewJson => overviewSnapshot?.CurrentJson;
+        internal long OverviewBuildMs => overviewSnapshot?.LastBuildMs ?? 0;
         internal OmniDefenceReadSnapshotCache ReadSnapshots => readSnapshots
             ?? throw new InvalidOperationException("OmniDefence read snapshots are not running.");
         public OmniDefenceScanner Scanner => scanner;
@@ -86,7 +87,7 @@ namespace Omnipotent.Services.OmniDefence
                 // tail of the log. Commit what is queued on the way out.
                 ServiceQuitRequest += () => { try { store.ShutdownAsync().GetAwaiter().GetResult(); } catch { } };
 
-                tracker = new IpThreatTracker(store);
+                tracker = new IpThreatTracker(store) { AutoEscalated = OnAutoEscalated };
                 await LoadSettingsAsync();
                 await tracker.LoadAsync();
                 await BackfillProfileAssociationsAsync();
@@ -140,6 +141,24 @@ namespace Omnipotent.Services.OmniDefence
             {
                 await ServiceLogError(ex, "OmniDefence failed to start.");
             }
+        }
+
+        /// <summary>Score-based Watch/Block transitions get an IP event like every manual one.</summary>
+        private void OnAutoEscalated(IpRecord rec, string previous, string current)
+        {
+            string? reason;
+            double score;
+            lock (rec) { reason = rec.LastBlockReason; score = rec.ThreatScore; }
+            _ = RecordIpEventAsync(new IpEventRow
+            {
+                UtcTimestamp = DateTimeOffset.UtcNow.ToUnixTimeSeconds(),
+                Ip = rec.Ip,
+                Kind = "Auto" + current,
+                Detail = current == nameof(IpThreatTracker.IpStatus.Blocked) && reason != null
+                    ? reason
+                    : $"Threat score {score:F0} (was {previous})"
+            });
+            readSnapshots?.Invalidate(OmniDefenceReadSnapshotCache.KeyFor("ip", rec.Ip));
         }
 
         private async Task PeriodicFlushLoop()
@@ -209,9 +228,10 @@ namespace Omnipotent.Services.OmniDefence
                 if (!string.IsNullOrEmpty(row.Ip) && records is not null)
                 {
                     records.LinkProfile(records.GetOrCreate(row.Ip!), row.ProfileId, row.ProfileName, row.ProfileRank, row.UtcTimestamp);
+                    outcome = ScoringOutcome(row, outcome);
                     var rec = records.RecordOutcome(row.Ip!, outcome);
                     _ = EnrichIpRecordAsync(rec);
-                    if (string.IsNullOrWhiteSpace(rec.AssociatedProfileId)) _ = MaybeAlertAsync(rec, row);
+                    if (string.IsNullOrWhiteSpace(rec.AssociatedProfileId)) _ = MaybeAlertAsync(rec, row, outcome);
                 }
                 // Queued, not inserted: this runs in the finally of every API request, so
                 // a per-row transaction here sets the write lock's arrival rate to the
@@ -222,6 +242,18 @@ namespace Omnipotent.Services.OmniDefence
             {
                 await ServiceLogError(ex, "OmniDefence RecordRequestAsync failed.");
             }
+        }
+
+        /// <summary>
+        /// KliveAPI reports every unknown route as NotFound. For scoring, a path that only exploit
+        /// tooling asks for (<see cref="ProbePatterns"/>) is a probe: it used to score the same +0.5
+        /// as a typo, so scanners fired hundreds of /.env and /.git requests before any block.
+        /// </summary>
+        internal static RequestOutcome ScoringOutcome(RequestRow row, RequestOutcome outcome)
+        {
+            if (outcome == RequestOutcome.NotFound && !row.MatchedRoute && ProbePatterns.IsProbe(row.Route, row.Query))
+                return RequestOutcome.Probe;
+            return outcome;
         }
 
         public async Task RecordAuthEventAsync(AuthEventRow row)
@@ -462,18 +494,34 @@ namespace Omnipotent.Services.OmniDefence
         //  Discord notifier (replaces the per-request spam)
         // ------------------------------------------------------------------
 
-        private async Task MaybeAlertAsync(IpRecord rec, RequestRow row)
+        /// <summary>
+        /// Whether this request may raise "new attacker" / escalation alerts. Over 60 days, 26 of the 33
+        /// IPs that alerted were people on the KM website (17 with real-input beacon proof): its
+        /// logged-out page guard and expired sessions arrive as WebsiteNoProfile, which counted as
+        /// an unauth attempt. Scanners, meanwhile, only produce 404s and never alerted at all.
+        /// </summary>
+        internal static bool IsAlertable(IpRecord rec, RequestRow row, RequestOutcome outcome)
+        {
+            if (outcome == RequestOutcome.HoneypotHit) return true;
+            if (row.DenyReason == null && row.StatusCode < 400) return false; // only alert on suspicious activity
+            if (outcome == RequestOutcome.WebsiteNoProfile) return false;
+            string? cls;
+            lock (rec) cls = rec.Classification;
+            return !(IpThreatTracker.IsProvenPerson(cls) || cls == nameof(IpClass.LikelyHuman));
+        }
+
+        private async Task MaybeAlertAsync(IpRecord rec, RequestRow row, RequestOutcome outcome)
         {
             try
             {
                 if (rec == null) return;
-                if (row.DenyReason == null && row.StatusCode < 400) return; // only alert on suspicious activity
+                if (!IsAlertable(rec, row, outcome)) return;
 
                 bool first;
                 int? escalation = null;
                 lock (rec)
                 {
-                    first = rec.FirstAlertedUtc == null && rec.UnauthAttempts >= tracker.FirstAlertThreshold;
+                    first = rec.FirstAlertedUtc == null && (rec.UnauthAttempts >= tracker.FirstAlertThreshold || outcome == RequestOutcome.HoneypotHit);
                     if (first)
                     {
                         rec.FirstAlertedUtc = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
@@ -501,7 +549,7 @@ namespace Omnipotent.Services.OmniDefence
                 {
                     var builder = KliveBotDiscord.MakeSimpleEmbed(
                         $"OmniDefence: New attacker detected ({rec.Ip})",
-                        BuildAlertDescription(rec, row, "First detection"),
+                        BuildAlertDescription(rec, row, outcome == RequestOutcome.HoneypotHit ? "Requested a honeypot route" : "First detection"),
                         DiscordColor.Yellow);
                     await SendDiscordBuilderSafeAsync(builder);
                 }

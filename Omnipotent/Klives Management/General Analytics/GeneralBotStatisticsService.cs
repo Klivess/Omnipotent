@@ -207,12 +207,13 @@ namespace Omnipotent.Klives_Management.General_Analytics
             }
         }
 
-        // Helper to get ready drives without throwing on unavailable ones
+        // Helper to get ready drives without throwing on unavailable ones. Optical media is always "full"
+        // (the server's E:\ is a mounted CD at 100%), so it is left out of disk space reporting.
         private static class DriveInfo
         {
             public static System.IO.DriveInfo[] GetReady()
             {
-                return System.IO.DriveInfo.GetDrives().Where(d => d.IsReady).ToArray();
+                return System.IO.DriveInfo.GetDrives().Where(d => d.IsReady && d.DriveType != DriveType.CDRom).ToArray();
             }
         }
 

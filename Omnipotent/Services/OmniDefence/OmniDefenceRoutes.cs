@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
 using Omnipotent.Profiles;
 using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveAPI.Caching;
@@ -17,6 +18,10 @@ namespace Omnipotent.Services.OmniDefence
     {
         private const string DerivedRequestOriginSql = "COALESCE(NULLIF(request_origin, ''), CASE WHEN client_page IS NOT NULL AND client_page <> '' THEN CASE WHEN profile_id IS NOT NULL AND profile_id <> '' THEN 'WebsiteProfile' ELSE 'WebsiteNoProfile' END WHEN profile_id IS NOT NULL AND profile_id <> '' THEN 'DirectApiProfile' ELSE 'DirectApi' END)";
         private const string RequestSelectSql = "SELECT id, utc_ts, ip, method, route, query, status_code, duration_ms, profile_id, profile_name, profile_rank, perm_required, perm_key, matched_route, body_hash, body_length, user_agent, deny_reason, " + DerivedRequestOriginSql + " AS request_origin, client_page FROM requests";
+        private static readonly JsonSerializer CamelCase = JsonSerializer.Create(new JsonSerializerSettings
+        {
+            ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver()
+        });
 
         public static async Task RegisterAsync(OmniDefence parent)
         {
@@ -461,16 +466,15 @@ namespace Omnipotent.Services.OmniDefence
             long day = now - 86400;
             long week = now - 86400 * 7;
 
-            // The old overview traversed the ever-growing requests table five
-            // times. One conditional aggregate preserves the counters with a
-            // single scan, and all of it runs only in the snapshot worker.
+            // Windowed counts come from the utc_ts index (the last 7 days only); all-time totals are
+            // carried forward by the store. One aggregate over the whole table took ~17 s per
+            // refresh in production and ran more than half of every minute.
             var requestCountsTask = parent.Store.QueryAsync(@"
-                SELECT COUNT(*) AS totalRequests,
+                SELECT COUNT(*) AS requests7d,
                     COALESCE(SUM(CASE WHEN utc_ts >= $day THEN 1 ELSE 0 END), 0) AS requests24h,
-                    COALESCE(SUM(CASE WHEN utc_ts >= $week THEN 1 ELSE 0 END), 0) AS requests7d,
-                    COALESCE(SUM(CASE WHEN deny_reason IS NOT NULL OR status_code >= 400 THEN 1 ELSE 0 END), 0) AS totalDenied,
                     COALESCE(SUM(CASE WHEN utc_ts >= $day AND (deny_reason IS NOT NULL OR status_code >= 400) THEN 1 ELSE 0 END), 0) AS denied24h
-                FROM requests", new() { ["$day"] = day, ["$week"] = week });
+                FROM requests WHERE utc_ts >= $week", new() { ["$day"] = day, ["$week"] = week });
+            var totalsTask = parent.Store.ReadAuditTotalsAsync();
             var authCountsTask = parent.Store.QueryAsync(@"
                 SELECT COUNT(*) AS totalAuthEvents,
                     COALESCE(SUM(CASE WHEN utc_ts >= $day AND type IN
@@ -503,15 +507,15 @@ namespace Omnipotent.Services.OmniDefence
             var originBreakdownTask = parent.Store.QueryAsync(
                 $"SELECT origin, COUNT(*) AS hits FROM (SELECT {DerivedRequestOriginSql} AS origin FROM requests WHERE utc_ts >= $t) GROUP BY origin ORDER BY hits DESC",
                 new() { ["$t"] = day });
-            await Task.WhenAll(requestCountsTask, authCountsTask, topRoutesTask, originBreakdownTask);
+            await Task.WhenAll(requestCountsTask, totalsTask, authCountsTask, topRoutesTask, originBreakdownTask);
             var requestCounts = requestCountsTask.Result[0];
             var authCounts = authCountsTask.Result[0];
             long Count(Dictionary<string, object?> row, string key) => Convert.ToInt64(row[key] ?? 0);
             long reqs24h = Count(requestCounts, "requests24h");
-            long totalRequests = Count(requestCounts, "totalRequests");
+            long totalRequests = totalsTask.Result.Requests;
             long reqs7d = Count(requestCounts, "requests7d");
             long denied24h = Count(requestCounts, "denied24h");
-            long totalDenied = Count(requestCounts, "totalDenied");
+            long totalDenied = totalsTask.Result.Denied;
             long unauth24h = Count(authCounts, "unauth24h");
             long totalAuthEvents = Count(authCounts, "totalAuthEvents");
             var topRoutes = topRoutesTask.Result;
@@ -539,7 +543,17 @@ namespace Omnipotent.Services.OmniDefence
                 topRoutes,
                 originBreakdown,
                 classBreakdown = ClassBreakdown(parent),
-                tagBreakdown = TagBreakdown(parent)
+                tagBreakdown = TagBreakdown(parent),
+                review = JToken.FromObject(OmniDefenceReview.Build(ips, now), CamelCase),
+                // Engine health, so the next stall shows on the page instead of in a log dig.
+                health = new
+                {
+                    overviewBuildMs = parent.OverviewBuildMs,
+                    auditQueue = parent.Store.PendingAuditRows,
+                    auditRowsDropped = parent.Store.DroppedAuditRows,
+                    readPoolTimeouts = parent.Store.ReadPoolTimeouts,
+                    fingerprintBacklog = parent.Fingerprints?.Backlog ?? 0
+                }
             };
             return JsonConvert.SerializeObject(resp);
         }

@@ -252,6 +252,78 @@ namespace Omnipotent.Tests.OmniBlox
         public const long FirstCreatedUniverse = 8001;
         private long nextUniverse = FirstCreatedUniverse;
 
+        // ── What Roblox tells a signed-out visitor about joining ──
+        /// <summary>Every experience's playability status: GuestProhibited is a joinable game seen signed out; ContextualPlayabilityUnrated an unrated one.</summary>
+        public string Playability { get; set; } = "GuestProhibited";
+        /// <summary>Every experience's content maturity ("unrated" until its questionnaire is answered); publishing the questionnaire sets it from the preview.</summary>
+        public string Maturity { get; set; } = "minimal";
+        // ── Quick Log In (a new device signing in with a code the owner confirms) ──
+        /// <summary>The code's status: Created until entered, UserLinked, Validated once confirmed, Cancelled; "Invalid" answers 400 CodeInvalid.</summary>
+        public string QuickLoginStatus { get; set; } = "Created";
+        /// <summary>Make the sign-in ask for a check of this type (e.g. captcha) instead of handing over a session.</summary>
+        public string? QuickLoginChallenge { get; set; }
+        /// <summary>The session a confirmed code signs in as (Roblox accepts it from then on).</summary>
+        public string QuickLoginCookie { get; set; } = "cookie-quick";
+        public const string QuickLoginExpiry = "2026-10-20T12:05:00Z";
+        public int QuickLoginCodes { get; private set; }
+        /// <summary>Sessions signed out through auth/v2/logout.</summary>
+        public List<string> LoggedOut { get; } = new();
+        /// <summary>Who users/authenticated says the session belongs to.</summary>
+        public long SignedInUserId { get; set; } = 42;
+        /// <summary>Experiences archived through the owner's session (develop configuration isArchived).</summary>
+        public List<long> Archived { get; } = new();
+        /// <summary>What API-key introspection says: the key "unknown-key" is not known; every other belongs to KeyOwner.</summary>
+        public long KeyOwner { get; set; } = 42;
+        public bool KeyEnabled { get; set; } = true;
+
+        private HttpResponseMessage? QuickLogin(HttpRequestMessage request, string path)
+        {
+            if (path == "/auth-token-service/v1/login/create")
+            {
+                QuickLoginCodes++;
+                QuickLoginStatus = "Created";
+                return Json(new { code = "QK7Z2P", status = "Created", privateKey = "pk-" + QuickLoginCodes, expirationTime = QuickLoginExpiry, imagePath = "/auth-token-service/v1/login/qr" });
+            }
+            if (path == "/auth-token-service/v1/login/status")
+            {
+                if (QuickLoginStatus == "Invalid") return new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("\"CodeInvalid\"", Encoding.UTF8, "application/json") };
+                bool linked = QuickLoginStatus is "UserLinked" or "Validated";
+                return Json(new { status = QuickLoginStatus, accountName = linked ? "Ow***" : null, accountPictureUrl = (string?)null, expirationTime = QuickLoginExpiry });
+            }
+            if (path == "/auth-token-service/v1/login/cancel") { QuickLoginStatus = "Cancelled"; return Json(new { }); }
+            if (request.RequestUri!.Host != "auth.roblox.com") return null;
+            if (!(request.Headers.TryGetValues("X-CSRF-TOKEN", out var t) && t.Contains(Csrf)))
+            {
+                var refused = new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"errors\":[{\"code\":0,\"message\":\"Token Validation Failed\"}]}", Encoding.UTF8, "application/json") };
+                refused.Headers.Add("x-csrf-token", Csrf);
+                return refused;
+            }
+            if (path == "/v2/logout")
+            {
+                string cookie = request.Headers.TryGetValues("Cookie", out var c) ? string.Join("; ", c) : "";
+                lock (LoggedOut) LoggedOut.Add(cookie.Replace(".ROBLOSECURITY=", ""));
+                return Json(new { });
+            }
+            if (path != "/v2/login") return null;
+            if (QuickLoginChallenge != null)
+            {
+                var challenged = new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"errors\":[{\"code\":0,\"message\":\"Challenge is required to authorize the request\"}]}", Encoding.UTF8, "application/json") };
+                challenged.Headers.Add("rblx-challenge-id", "ch-1");
+                challenged.Headers.Add("rblx-challenge-type", QuickLoginChallenge);
+                return challenged;
+            }
+            if (QuickLoginStatus != "Validated") return new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"errors\":[{\"code\":1,\"message\":\"Incorrect username or password.\"}]}", Encoding.UTF8, "application/json") };
+            AcceptedCookie = QuickLoginCookie;
+            var signedIn = Json(new { user = new { id = SignedInUserId, name = "Owner", displayName = "Owner" }, isBanned = false });
+            signedIn.Headers.Add("Set-Cookie", $".ROBLOSECURITY={QuickLoginCookie}; domain=.roblox.com; expires=Thu, 28 Oct 2027 00:00:00 GMT; path=/; secure; HttpOnly");
+            return signedIn;
+        }
+
+        /// <summary>Answer both of those with 503, as an outage would.</summary>
+        public bool ReachDown { get; set; }
+        /// <summary>Analytics metrics answered as Roblox answers a metric it does not serve for the experience (400, code 2001).</summary>
+        public HashSet<string> UnavailableMetrics { get; } = new(StringComparer.Ordinal);
+
         public IEnumerable<string> Urls(string method) => Requests.Where(r => r.Method == method).Select(r => r.Url);
 
         /// <summary>The main questionnaire: violence (with a follow-up under "Yes"), chat, and a text question.</summary>
@@ -304,7 +376,12 @@ namespace Omnipotent.Tests.OmniBlox
                 return r;
             }
             var uri = request.RequestUri!;
-            if (uri.Host == "users.roblox.com" && path == "/v1/users/authenticated") return Rotating(Json(new { id = 42, name = "Owner", displayName = "Owner" }));
+            if (uri.Host == "users.roblox.com" && path == "/v1/users/authenticated") return Rotating(Json(new { id = SignedInUserId, name = "Owner", displayName = "Owner" }));
+            if (uri.Host == "develop.roblox.com" && path.StartsWith("/v2/universes/") && path.EndsWith("/configuration") && request.Method == HttpMethod.Patch)
+            {
+                if (JObject.Parse(body)["isArchived"]?.Value<bool>() == true) lock (Archived) Archived.Add(long.Parse(path.Split('/')[3]));
+                return Rotating(Json(new { }));
+            }
             if (uri.Host == "publish.roblox.com" && path.EndsWith("/icon")) return Rotating(Json(new { targetId = 1 }));
             if (uri.Host == "publish.roblox.com" && path.EndsWith("/thumbnail/image")) return Rotating(Json(new { targetId = nextId++ }));
             if (path == "/universes/v1/universes/create")
@@ -340,6 +417,7 @@ namespace Omnipotent.Tests.OmniBlox
             if (path == Q + "/v2/responses/publish")
             {
                 lock (Published) Published.Add((JArray)j["questionnaireIds"]!);
+                Maturity = PreviewRating.ToLowerInvariant();
                 return Json(new { });
             }
             return null;
@@ -353,7 +431,14 @@ namespace Omnipotent.Tests.OmniBlox
             var uri = request.RequestUri;
             string path = uri.AbsolutePath;
 
-            if (uri.Host is "users.roblox.com" or "publish.roblox.com" || path.StartsWith("/experience-questionnaire/") || path == "/universes/v1/universes/create")
+            if ((path.StartsWith("/auth-token-service/") || uri.Host == "auth.roblox.com") && QuickLogin(request, path) is { } quick) return quick;
+            if (path == "/api-keys/v1/introspect")
+            {
+                string key = (string?)JObject.Parse(body)["apiKey"] ?? "";
+                if (key == "unknown-key") return new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = new StringContent("{\"errors\":[{\"code\":0,\"message\":\"Invalid API Key\"}]}", Encoding.UTF8, "application/json") };
+                return Json(new { name = "OmniBlox key", authorizedUserId = KeyOwner, scopes = new[] { new { name = "universe-places", operations = new[] { "write" } }, new { name = "game-pass", operations = new[] { "read", "write" } } }, enabled = KeyEnabled, expired = false, expirationTimeUtc = "2027-10-20T00:00:00Z" });
+            }
+            if (uri.Host is "users.roblox.com" or "publish.roblox.com" or "develop.roblox.com" || path.StartsWith("/experience-questionnaire/") || path == "/universes/v1/universes/create")
                 return Session(request, path, body) ?? new HttpResponseMessage(HttpStatusCode.NotFound) { Content = new StringContent("{\"error\":\"fake: no session route for " + path + "\"}", Encoding.UTF8, "application/json") };
             if (path.StartsWith("/cloud/v2/universes/") && path.Split('/', ':') is { Length: > 4 } segments && long.TryParse(segments[4], out long target) && KeyUnreachable.Contains(target))
                 return new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"code\":\"PERMISSION_DENIED\",\"message\":\"Insufficient scope.\"}", Encoding.UTF8, "application/json") };
@@ -395,6 +480,18 @@ namespace Omnipotent.Tests.OmniBlox
                 });
             if (uri.Host == "games.roblox.com" && path == "/v1/games")
                 return Json(new { data = new[] { new { id = 111L, rootPlaceId = 222L, name = "Lava Rush Obby", description = "Escape the lava!", creator = new { name = "Studio", type = "Group" }, playing = 5400, visits = 12_000_000, favoritedCount = 80_000, maxPlayers = 30, genre_l1 = "Obby & Platformer", genre_l2 = "Tower Obby", created = "2025-09-01T00:00:00Z", updated = "2026-10-01T00:00:00Z" } } });
+            if (ReachDown && (path.EndsWith("/multiget-playability-status") || path.EndsWith("/get-age-recommendation")))
+                return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable) { Content = new StringContent("{\"errors\":[{\"code\":0,\"message\":\"Service unavailable\"}]}", Encoding.UTF8, "application/json") };
+            if (uri.Host == "games.roblox.com" && path == "/v1/games/multiget-playability-status")
+            {
+                var ids = System.Web.HttpUtility.ParseQueryString(uri.Query)["universeIds"]?.Split(',') ?? Array.Empty<string>();
+                return Json(ids.Select(id => new { playabilityStatus = Playability, isPlayable = Playability == "Playable", universeId = long.Parse(id), unplayableDisplayText = (string?)null }).ToArray());
+            }
+            if (uri.Host == "apis.roblox.com" && path == "/experience-guidelines-api/experience-guidelines/get-age-recommendation")
+            {
+                string display = Maturity == "unrated" ? "Unknown" : char.ToUpperInvariant(Maturity[0]) + Maturity[1..];
+                return Json(new { ageRecommendationDetails = new { summary = new { ageRecommendation = new { displayName = display, minimumAge = Maturity == "unrated" ? 13 : 0, contentMaturity = Maturity } }, descriptorUsages = Array.Empty<object>() }, contentLanguage = "en_us" });
+            }
             if (uri.Host == "games.roblox.com" && path == "/v1/games/votes")
                 return Json(new { data = new[] { new { id = 111L, upVotes = 9000, downVotes = 1000 } } });
             if (path.StartsWith("/universes/v1/") && path.EndsWith("/versions"))
@@ -420,6 +517,8 @@ namespace Omnipotent.Tests.OmniBlox
             if (path.Contains("/analytics-query-api/"))
             {
                 string metric = (string?)JObject.Parse(body)["metric"] ?? "";
+                if (UnavailableMetrics.Contains(metric))
+                    return new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("{\"done\":true,\"error\":{\"code\":2001,\"message\":\"Query is not available for Universe with id 1001\"}}", Encoding.UTF8, "application/json") };
                 double value = metric switch { "DailyActiveUsers" => 120, "DailyRevenue" => 340, "ForwardD1Retention" => 0.22, "Visits" => 300, _ => 5 };
                 return Json(new { done = true, response = new { values = new[] { new { breakdowns = Array.Empty<object>(), dataPoints = new[] { new { time = "2026-10-21T00:00:00Z", value } } } } } });
             }
@@ -456,6 +555,12 @@ namespace Omnipotent.Tests.OmniBlox
         public AssetHarvester Harvester { get; }
         /// <summary>Every cookie the session client handed over to be saved after Roblox rotated it.</summary>
         public List<string> SavedCookies { get; } = new();
+        /// <summary>Every Discord message the studio sent the owner.</summary>
+        public List<string> Alerts { get; } = new();
+        /// <summary>Connecting the owner's Roblox account (its saves go straight to the settings).</summary>
+        public RobloxConnection Connection { get; }
+        /// <summary>The owner's actions on games (relaunching through this harness's orchestrator).</summary>
+        public GameActions Actions { get; }
 
         /// <param name="localEngine">The studio's local engine (none unless given, as in a studio that cannot run one).</param>
         /// <param name="session">Whether the owner's Roblox session is set (the icon, thumbnails and questionnaire need it).</param>
@@ -507,10 +612,21 @@ namespace Omnipotent.Tests.OmniBlox
                 Web = new FakeWeb(),
                 Clock = clock,
                 Log = _ => { },
+                Alert = message => { lock (Alerts) Alerts.Add(message); return Task.CompletedTask; },
                 Settings = settings,
                 LocalEngine = localEngine,
             };
             Orchestrator = new Orchestrator(Ctx);
+            Connection = new RobloxConnection(Ctx, new RobloxQuickLogin(http, clock), cookie => { settings.SessionCookie = cookie; return Task.CompletedTask; });
+            Actions = new GameActions(Ctx, Orchestrator.LaunchStepAsync);
+        }
+
+        /// <summary>Runs one owner action to its end and returns how it ended.</summary>
+        public async Task<OwnerActionRecord> ActAsync(string gameId, string kind, bool archive = false, string? target = null)
+        {
+            Actions.Start(gameId, kind, archive, target);
+            await (Actions.Running(gameId) ?? Task.CompletedTask);
+            return Game(gameId).OwnerAction!;
         }
 
         public GameDossier Game(string id) => Ctx.Game(id)!;

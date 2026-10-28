@@ -433,6 +433,11 @@ namespace Omnipotent.Services.KliveLLM
         /// callers that are already on an async path and want to prime the cache.</summary>
         public async Task<bool> IsFlatFeeProviderAsync() => IsFlatFee(await GetActiveProviderAsync());
 
+        /// <summary>A model setting someone has deliberately emptied or switched off ("nothing", "none", "off"…), not a model ID.</summary>
+        internal static bool IsSwitchedOffModelID(string? modelID) =>
+            string.IsNullOrWhiteSpace(modelID)
+            || modelID.Trim().ToLowerInvariant() is "nothing" or "none" or "off" or "disabled" or "null" or "-";
+
         private async Task EnsureProviderSettingsExistAsync()
         {
             var settingsManager = await GetOmniGlobalSettingsManager();
@@ -1820,8 +1825,20 @@ namespace Omnipotent.Services.KliveLLM
             // OpenRouterLLMToken because OpenRouter requires authentication for every request.
             if (forceFreeModel)
             {
-                string freeToken = await GetOmniSetting("OpenRouterLLMToken", OmniSettingType.String, true, false);
                 string freeModel = await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, true);
+                if (IsSwitchedOffModelID(freeModel))
+                {
+                    // Free-model callers (Omniscience profiles, extraction, detective, search, replica) exist to
+                    // spend nothing. With the free route switched off they still cost nothing extra on a
+                    // flat-fee router, so they run there; on a per-token provider they would start billing, so
+                    // they stop with a reason instead. Sending the setting verbatim made every one of them a
+                    // 400 ("nothing is not a valid model ID") — 2026-10-27/28 the whole nightly failed that way.
+                    if (await IsFlatFeeProviderAsync()) return await GetRemoteProviderConfigurationAsync(forceFreeModel: false);
+                    throw new InvalidOperationException(
+                        $"The free model is switched off (FreeOpenRouterModelID = '{freeModel}') and the active provider bills per token, "
+                        + "so free-model work is not run. Set FreeOpenRouterModelID to an OpenRouter free model (e.g. openrouter/free) to resume it.");
+                }
+                string freeToken = await GetOmniSetting("OpenRouterLLMToken", OmniSettingType.String, true, false);
                 if (string.IsNullOrWhiteSpace(freeToken))
                 {
                     throw new InvalidOperationException("OpenRouterLLMToken is missing (required to use the free OpenRouter model).");

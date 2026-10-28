@@ -474,7 +474,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 evaluation = await ConfirmWithExitModelAsync(listing, evaluation, book, ct);
                 if (!evaluation.ShouldBuy)
                 {
-                    host.Log($"Skipped {listing.MarketHashName} ({listing.Id}) after the exit model: {evaluation.Reason}");
+                    // The host records the skip (once per listing): logging it here as well doubled every line.
                     await host.OnOpportunityNotBoughtAsync(listing, evaluation, evaluation.Reason);
                     return false;
                 }

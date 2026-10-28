@@ -75,7 +75,7 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             for (int attempt = 0; ; attempt++)
             {
                 string cookie = Current() ?? throw new RobloxSessionException(true,
-                    "No Roblox session is set (OmniSetting OmniBlox_RobloxSessionCookie), so OmniBlox cannot do what the Creator Dashboard does for you.");
+                    "No Roblox account is connected (OmniBlox dashboard → Roblox account → Connect), so OmniBlox cannot do what the Creator Dashboard does for you.");
                 string? token;
                 lock (sync) token = csrf;
                 var response = await http.SendAsync(bucket, () =>
@@ -95,7 +95,7 @@ namespace Omnipotent.Services.OmniBlox.Roblox
                     continue;
                 }
                 if (response.Status == HttpStatusCode.Unauthorized)
-                    throw new RobloxSessionException(false, $"Roblox signed the session out ({new Uri(url).Host}{new Uri(url).AbsolutePath} → 401). Sign in again and paste the new .ROBLOSECURITY cookie into OmniBlox_RobloxSessionCookie.");
+                    throw new RobloxSessionException(false, $"Roblox signed the session out ({new Uri(url).Host}{new Uri(url).AbsolutePath} → 401). Connect the account again from the OmniBlox dashboard (Roblox account → Connect).");
                 if (!response.Ok) throw new RobloxApiException(new Uri(url).Host + new Uri(url).AbsolutePath, response.Status, response.Body);
                 return response;
             }
@@ -124,6 +124,23 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             return ((long?)j["id"] ?? 0, (string?)j["name"] ?? "");
         }
 
+        /// <summary>Who a candidate cookie signs in as, before it is saved (nothing else is done with it). Throws <see cref="RobloxSessionException"/> when Roblox refuses it.</summary>
+        public async Task<(long UserId, string Name)> ProbeAsync(string cookie, CancellationToken ct)
+        {
+            string value = Normalize(cookie) ?? throw new RobloxSessionException(true, "No cookie was given.");
+            var r = await http.SendAsync("session", () =>
+            {
+                var req = new HttpRequestMessage(HttpMethod.Get, "https://users.roblox.com/v1/users/authenticated");
+                req.Headers.TryAddWithoutValidation("Cookie", ".ROBLOSECURITY=" + value);
+                return req;
+            }, ct);
+            if (r.Status == HttpStatusCode.Unauthorized)
+                throw new RobloxSessionException(false, "Roblox does not accept this session: it was signed out, has expired, or was not copied whole.");
+            if (!r.Ok) throw new RobloxApiException("users.roblox.com/v1/users/authenticated", r.Status, r.Body);
+            var j = JObject.Parse(r.Body);
+            return ((long?)j["id"] ?? 0, (string?)j["name"] ?? "");
+        }
+
         // ─────────────── Experiences ───────────────
 
         /// <summary>The template the Creator Dashboard's Create Experience starts from (Baseplate); the studio publishes its own place over it.</summary>
@@ -144,6 +161,17 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             long universe = (long?)j["universeId"] ?? 0, place = (long?)j["rootPlaceId"] ?? 0;
             if (universe <= 0 || place <= 0) throw new RobloxApiException("universes/create", r.Status, r.Body, "no universe or root place id in the answer");
             return (universe, place);
+        }
+
+        /// <summary>
+        /// Archives an experience, as the Creator Dashboard's Archive does (Roblox's nearest thing to deleting one: it
+        /// leaves the owner's creations and cannot be played, and can be restored from the dashboard's Archived list).
+        /// No API key can do it.
+        /// </summary>
+        public async Task ArchiveExperienceAsync(long universeId, CancellationToken ct)
+        {
+            string url = "https://develop.roblox.com/v2/universes/" + universeId.ToString(CultureInfo.InvariantCulture) + "/configuration";
+            await SendAsync("session", HttpMethod.Patch, url, () => new StringContent(new JObject { ["isArchived"] = true }.ToString(Formatting.None), Encoding.UTF8, "application/json"), ct);
         }
 
         // ─────────────── Store page images ───────────────

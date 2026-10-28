@@ -135,6 +135,7 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             ["session"] = 30,
             ["session-upload"] = 6,
             ["session-create"] = 2,
+            ["quick-login"] = 30,
             ["cdn"] = 600,
         };
 

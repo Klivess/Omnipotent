@@ -110,6 +110,18 @@ namespace Omnipotent.Services.OmniBlox.Roblox
         public bool Ready => State == "Completed" && !string.IsNullOrEmpty(ImageUrl);
     }
 
+    /// <summary>Whether an experience can be played, as Roblox answers a signed-out visitor.</summary>
+    public sealed record Playability(long UniverseId, string Status, bool IsPlayable);
+
+    /// <summary>An experience's content maturity rating ("unrated" until its Maturity &amp; Compliance questionnaire is answered).</summary>
+    public sealed record MaturityRating(string Maturity, string Label, int? MinimumAge)
+    {
+        public bool Rated => Maturity.Length > 0 && !string.Equals(Maturity, "unrated", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Roblox's answer about an API key: its name, the user who owns it, its scopes as "name: operations".</summary>
+    public sealed record ApiKeyIntrospection(string Name, long OwnerUserId, List<string> Scopes, bool Enabled, bool Expired, DateTime? ExpiresUtc);
+
     // ── Open Cloud (key) ──
 
     public sealed class PublishResult

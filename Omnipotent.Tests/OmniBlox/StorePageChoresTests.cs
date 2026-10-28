@@ -18,7 +18,7 @@ namespace Omnipotent.Tests.OmniBlox
         private const long OldProduct = 3720419015;
 
         /// <summary>A live game in experience 1001 with an icon and a thumbnail on disk.</summary>
-        private static string SeedLiveGame(StudioHarness h, string id = "g-live", string pitch = "Jump across glowing lava to reach the finish.")
+        internal static string SeedLiveGame(StudioHarness h, string id = "g-live", string pitch = "Jump across glowing lava to reach the finish.")
         {
             h.Ctx.Store.Mutate(s =>
             {
@@ -222,10 +222,10 @@ namespace Omnipotent.Tests.OmniBlox
             var tasks = Open(h);
             var icon = Assert.Single(tasks, t => t.Kind == OwnerTaskKind.UploadIcon);
             Assert.Contains("icon.png", icon.Files);
-            Assert.Contains("OmniBlox_RobloxSessionCookie", icon.Detail);
+            Assert.Contains("Quick Log In", icon.Detail);
             var questionnaire = Assert.Single(tasks, t => t.Kind == OwnerTaskKind.Questionnaire);
             Assert.Contains("Violence: none.", questionnaire.Detail);
-            Assert.Contains("OmniBlox_RobloxSessionCookie", questionnaire.Detail);
+            Assert.Contains("Quick Log In", questionnaire.Detail);
             Assert.DoesNotContain(h.Roblox.Requests, r => r.Url.Contains("publish.roblox.com") || r.Url.Contains("experience-questionnaire"));
 
             // The owner adds the session: the next sweep does both and closes the tasks.

@@ -94,6 +94,8 @@ namespace Omnipotent.Services.OmniBlox.Core
         public ProgressState Progress { get; set; } = new();
         /// <summary>Model or provider failures in a row (AIRouter down, queue full). They back off; they never count against the game.</summary>
         public int ProviderFailures { get; set; }
+        /// <summary>The newest action the owner started on this game from the dashboard (see Pipeline.GameActions).</summary>
+        public OwnerActionRecord? OwnerAction { get; set; }
 
         [JsonIgnore]
         public string DisplayTitle => !string.IsNullOrWhiteSpace(Store.Title) ? Store.Title
@@ -510,6 +512,44 @@ namespace Omnipotent.Services.OmniBlox.Core
         public int StoreThumbnailsUploaded { get; set; }
         /// <summary>The newest answering of Roblox's maturity questionnaire, published or stopped for the owner.</summary>
         public QuestionnaireRecord? Questionnaire { get; set; }
+        /// <summary>Whether players can actually join, as Roblox reports it (see Pipeline.PlayerReach); null until first checked.</summary>
+        public ReachRecord? Reach { get; set; }
+        /// <summary>The game's experience belongs to the Roblox account the studio used before the owner switched accounts (cleared by moving it).</summary>
+        public bool OnOldAccount { get; set; }
+    }
+
+    /// <summary>An action the owner started on a game from the dashboard (update on Roblox, take down, move…), step by step.</summary>
+    public sealed class OwnerActionRecord
+    {
+        /// <summary>sync, private, public, takedown, move or delegate.</summary>
+        public string Kind { get; set; } = "";
+        public string Title { get; set; } = "";
+        public DateTime StartedUtc { get; set; }
+        public DateTime? FinishedUtc { get; set; }
+        public bool Running { get; set; }
+        /// <summary>Null while it runs.</summary>
+        public bool? Ok { get; set; }
+        public List<string> Steps { get; set; } = new();
+        public string? Message { get; set; }
+    }
+
+    /// <summary>What Roblox tells a signed-out visitor about joining the game: its playability and its maturity rating.</summary>
+    public sealed class ReachRecord
+    {
+        public DateTime CheckedUtc { get; set; }
+        /// <summary>Roblox's playability status (Playable, GuestProhibited, ContextualPlayabilityUnrated…); null when Roblox could not be asked.</summary>
+        public string? Status { get; set; }
+        /// <summary>True: anyone with an account can join. False: Roblox lets nobody but the creator in. Null: not known.</summary>
+        public bool? Playable { get; set; }
+        /// <summary>Roblox's content maturity: unrated, minimal, mild, moderate or restricted.</summary>
+        public string? Maturity { get; set; }
+        public string? MaturityLabel { get; set; }
+        /// <summary>When the current status was first seen.</summary>
+        public DateTime? SinceUtc { get; set; }
+        /// <summary>The blocking status the owner was last alerted about (one alert per status, again after it reopens).</summary>
+        public string? AlertedStatus { get; set; }
+        /// <summary>Why the last check could not ask Roblox (the status above is then the one before it).</summary>
+        public string? Error { get; set; }
     }
 
     /// <summary>What the studio answered in Roblox's Maturity &amp; Compliance questionnaire, and what rating came of it.</summary>
@@ -523,6 +563,8 @@ namespace Omnipotent.Services.OmniBlox.Core
         public bool Published { get; set; }
         /// <summary>Why it was not published, when the studio left the decision to the owner.</summary>
         public string? StoppedReason { get; set; }
+        /// <summary>Answered outside the studio (the owner, in the Creator Dashboard): the game went from unrated to rated without the studio answering.</summary>
+        public bool ByOwner { get; set; }
         public string? AgeRating { get; set; }
         public int? MinimumAge { get; set; }
         /// <summary>"Question → answer (because …)", in the questionnaire's order.</summary>
@@ -640,6 +682,10 @@ namespace Omnipotent.Services.OmniBlox.Core
         public double? D1Retention { get; set; }
         public double? D7Retention { get; set; }
         public double? PeakConcurrent { get; set; }
+        /// <summary>People Roblox showed the game's tile to, and people who clicked it (Roblox's acquisition metrics).</summary>
+        public double? Impressions { get; set; }
+        public double? Clicks { get; set; }
+        /// <summary>Clicks ÷ impressions, as a fraction.</summary>
         public double? ClickThrough { get; set; }
     }
 
@@ -819,6 +865,37 @@ namespace Omnipotent.Services.OmniBlox.Core
         public Dictionary<long, string> LicensedAudio { get; set; } = new();
         /// <summary>Creator Dashboard chores still to finish (by owner-task key, e.g. "icon:g_123"): their retry state.</summary>
         public Dictionary<string, ChoreState> Chores { get; set; } = new();
+        /// <summary>The Roblox account the owner connected from the dashboard (its session is OmniBlox_RobloxSessionCookie); null when none was.</summary>
+        public RobloxAccount? RobloxAccount { get; set; }
+        /// <summary>What Roblox said about the API key the owner set from the dashboard; null when it was set elsewhere.</summary>
+        public ApiKeyInfo? ApiKey { get; set; }
+        /// <summary>
+        /// Experiences never handed to a game again: archived, moved away from, or the studio-made ones of an account the
+        /// owner switched away from (the old key may still reach them, but they are not where games should go now).
+        /// </summary>
+        public List<long> RetiredExperiences { get; set; } = new();
+    }
+
+    /// <summary>Roblox's own description of an API key (Open Cloud introspection), never the key itself.</summary>
+    public sealed class ApiKeyInfo
+    {
+        public string Name { get; set; } = "";
+        public long OwnerUserId { get; set; }
+        public List<string> Scopes { get; set; } = new();
+        public DateTime? ExpiresUtc { get; set; }
+        public DateTime CheckedUtc { get; set; }
+    }
+
+    /// <summary>The Roblox account whose session the studio holds, and how it got it.</summary>
+    public sealed class RobloxAccount
+    {
+        public long UserId { get; set; }
+        public string Name { get; set; } = "";
+        /// <summary>quick-login (a session the studio signed in itself) or pasted (a cookie copied from the owner's browser).</summary>
+        public string Method { get; set; } = "";
+        public DateTime ConnectedUtc { get; set; }
+        /// <summary>The last time Roblox confirmed the session works.</summary>
+        public DateTime? VerifiedUtc { get; set; }
     }
 
     /// <summary>A chore the studio keeps retrying: each failure waits longer, and the owner hears only when it stays stuck.</summary>

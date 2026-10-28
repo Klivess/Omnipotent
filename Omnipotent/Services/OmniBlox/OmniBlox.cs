@@ -27,6 +27,10 @@ namespace Omnipotent.Services.OmniBlox
         internal string StartupState { get; private set; } = "starting";
         internal StudioContext? Context { get; private set; }
         internal Orchestrator? Orchestrator { get; private set; }
+        /// <summary>Connecting the owner's Roblox account from the dashboard (Quick Log In or a pasted cookie).</summary>
+        internal RobloxConnection? Connection { get; private set; }
+        /// <summary>The owner's actions on games' places on Roblox (update, visibility, take down, move, "do it yourself").</summary>
+        internal GameActions? Actions { get; private set; }
         internal HarvestStepReport? LastHarvest { get; private set; }
         internal DateTime? LastHarvestUtc { get; private set; }
         internal (bool Ok, string? Reason) ModelGate { get; private set; } = (false, "not checked yet");
@@ -60,7 +64,7 @@ namespace Omnipotent.Services.OmniBlox
                 var http = new RobloxHttp(RobloxHttp.CreateDefaultClient(), clock);
                 var publicApi = new RobloxPublicClient(http);
                 var cloud = new RobloxCloudClient(http, () => settings.ApiKey);
-                var session = new RobloxSessionClient(http, () => settings.SessionCookie, rotated => _ = SaveRotatedSessionAsync(rotated));
+                var session = new RobloxSessionClient(http, () => settings.SessionCookie, rotated => _ = SaveSessionCookieAsync(rotated));
                 var llm = new KliveLlmBridge(FindService<KliveLLM.KliveLLM>);
                 var runner = new AgentCycleRunner(llm, clock);
                 var playbook = new Playbook(store, clock);
@@ -94,6 +98,11 @@ namespace Omnipotent.Services.OmniBlox
                 Context = ctx;
                 await RefreshSettingsAsync();
                 Orchestrator = new Orchestrator(ctx);
+                Connection = new RobloxConnection(ctx, new RobloxQuickLogin(http, clock), SaveSessionCookieAsync,
+                    async creator => { settings.CreatorUserId = creator; await SaveSettingAsync("OmniBlox_CreatorUserId", creator.ToString(CultureInfo.InvariantCulture), sensitive: false); },
+                    async key => { settings.ApiKey = key; await SaveSettingAsync("OmniBlox_RobloxApiKey", key, sensitive: true); });
+                var orchestrator = Orchestrator;
+                Actions = new GameActions(ctx, orchestrator.LaunchStepAsync);
                 ServiceQuitRequest += OnQuit;
                 ready.TrySetResult();
                 StartupState = "running";
@@ -101,6 +110,7 @@ namespace Omnipotent.Services.OmniBlox
                 _ = Task.Run(() => Orchestrator.RunAsync(stop.Token));
                 _ = Task.Run(HarvesterLoopAsync);
                 _ = Task.Run(SettingsLoopAsync);
+                _ = Task.Run(() => WatchLoopAsync(new LiveWatch(ctx)));
 
                 var counts = store.Read(s => (Games: s.Games.Count, Live: s.Games.Values.Count(g => g.Stage == GameStage.Live), Tasks: s.Studio.OwnerTasks.Count(t => t.Status == OwnerTaskStatus.Open)));
                 await ServiceLog($"[OmniBlox] Ready: {counts.Games} game(s), {counts.Live} live, {counts.Tasks} open owner task(s). Studio {(settings.Enabled ? "ON" : "off")}, harvester {(settings.HarvesterEnabled ? "on" : "off")}, API key {(cloud.HasKey ? "set" : "missing")}.");
@@ -164,18 +174,27 @@ namespace Omnipotent.Services.OmniBlox
 
         internal const string SessionCookieSetting = "OmniBlox_RobloxSessionCookie";
 
-        /// <summary>Roblox rotated the session cookie: save the new one, or the next restart starts with a dead session.</summary>
-        private async Task SaveRotatedSessionAsync(string cookie)
+        /// <summary>
+        /// Keeps the owner's Roblox session in its OmniSetting (null forgets it): one Roblox rotated (or the next restart
+        /// starts with a dead session), or one connected from the dashboard. Applied to the running studio at once.
+        /// </summary>
+        private async Task SaveSessionCookieAsync(string? cookie)
+        {
+            if (Context is { } ctx) ctx.Settings.SessionCookie = cookie;
+            await SaveSettingAsync(SessionCookieSetting, cookie ?? "", sensitive: true);
+        }
+
+        /// <summary>Writes one of OmniBlox's string OmniSettings (what the dashboard's Roblox account card changes).</summary>
+        private async Task SaveSettingAsync(string setting, string value, bool sensitive)
         {
             try
             {
                 var manager = await GetOmniGlobalSettingsManager();
-                await manager.SetOmniSetting(SessionCookieSetting, cookie, serviceID, name, OmniSettingType.String, sensitive: true);
-                if (Context is { } ctx) ctx.Settings.SessionCookie = cookie;
+                await manager.SetOmniSetting(setting, value, serviceID, name, OmniSettingType.String, sensitive: sensitive);
             }
             catch (Exception ex)
             {
-                await ServiceLogError(ex, "[OmniBlox] could not save the rotated Roblox session", false);
+                await ServiceLogError(ex, $"[OmniBlox] could not save {setting}", false);
             }
         }
 
@@ -221,6 +240,19 @@ namespace Omnipotent.Services.OmniBlox
                     }
                 }
                 try { await Task.Delay(ran ? TimeSpan.FromSeconds(30) : TimeSpan.FromSeconds(60), stop.Token); }
+                catch (OperationCanceledException) { return; }
+            }
+        }
+
+        /// <summary>The live games' watch (whether players can join, their analytics), on or off: see <see cref="LiveWatch"/>.</summary>
+        private async Task WatchLoopAsync(LiveWatch watch)
+        {
+            while (!stop.IsCancellationRequested)
+            {
+                try { await watch.StepAsync(stop.Token); }
+                catch (OperationCanceledException) when (stop.IsCancellationRequested) { return; }
+                catch (Exception ex) { await ServiceLogError(ex, "[OmniBlox] live watch step failed", false); }
+                try { await Task.Delay(TimeSpan.FromMinutes(1), stop.Token); }
                 catch (OperationCanceledException) { return; }
             }
         }

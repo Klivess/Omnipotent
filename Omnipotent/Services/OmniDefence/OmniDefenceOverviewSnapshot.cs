@@ -62,9 +62,14 @@ namespace Omnipotent.Services.OmniDefence
             catch (Exception ex) { reportError?.Invoke(ex); }
         }
 
+        /// <summary>How long the last build took. The overview reports it, so a slow build is visible.</summary>
+        public long LastBuildMs { get; private set; }
+
         internal async Task RefreshOnceAsync()
         {
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
             string json = await build();
+            LastBuildMs = (long)System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             JObject.Parse(json);
             var snapshot = new Snapshot { Json = json, GeneratedUtc = utcNow() };
             // Publish even if persistence fails: the running API should still be fast.

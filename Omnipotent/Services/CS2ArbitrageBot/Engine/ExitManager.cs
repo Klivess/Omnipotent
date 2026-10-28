@@ -43,6 +43,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         /// <summary>A relist that sat through this many expected sales without one gets a person's attention.</summary>
         public const double OverdueExpectedSales = 8;
         public static readonly TimeSpan MinTimeBetweenChanges = TimeSpan.FromHours(6);
+        /// <summary>
+        /// After a re-price CSFloat refused, look again this much later. A refusal is usually the listing no longer
+        /// being live (sold, or taken down), and the 10-minute review loop retried it 107 times a day with no change.
+        /// </summary>
+        public static readonly TimeSpan FailedChangeRetry = TimeSpan.FromHours(1);
 
         private readonly IExitHost host;
         private readonly Func<DateTime> utcNow;
@@ -201,7 +206,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             else if (best.Route == ExitRoute.CSFloatRelist)
             {
                 int from = p.CSFloatResalePriceCents;
-                if (!await host.RepriceOnCSFloatAsync(p, best.Price, ct)) return "failed";
+                if (!await host.RepriceOnCSFloatAsync(p, best.Price, ct))
+                {
+                    p.NextExitReviewUtc = now + FailedChangeRetry;
+                    await host.SaveAsync(p);
+                    return "failed";
+                }
                 p.RelistRepriceCount++;
                 // Only the part of the no-sale evidence that bears on the new price carries over.
                 if (anchor > 0) p.RelistModelExposure *= ExitPlanner.EvidenceWeight(demand, from / (double)anchor, best.Price / (double)anchor);

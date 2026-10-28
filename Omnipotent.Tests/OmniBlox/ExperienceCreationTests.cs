@@ -108,11 +108,11 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Equal(0, h.Roblox.CreateCalls);
 
             string why = Slots.Unavailable(h.Ctx, ask: true);
-            Assert.Contains("session", why);
+            Assert.Contains("no Roblox account is connected", why);
             Slots.Unavailable(h.Ctx, ask: true);
             var task = Assert.Single(Open(h));
             Assert.Equal((OwnerTaskKind.ExperienceSlot, Slots.OwnerKey), (task.Kind, task.DedupeKey));
-            Assert.Contains("OmniBlox_RobloxSessionCookie", task.Detail);
+            Assert.Contains("Quick Log In", task.Detail);
             Assert.Contains("OmniBlox_ExperienceSlots", task.Detail);
             var banner = ((JArray)JObject.Parse(OmniBloxViews.Serialize(OmniBloxViews.Overview(h.Ctx, new StudioStatus("idle", null, true, null, null, null))))["Attention"]!).Select(a => (string)a["Title"]!);
             Assert.DoesNotContain("OmniBlox cannot create experiences", banner); // the task says it
@@ -217,7 +217,7 @@ namespace Omnipotent.Tests.OmniBlox
             string id = SeedGame(h, "g1", stage: GameStage.Launch);
             var (result, message) = await LaunchSequence.RunAsync(h.Ctx, id, None);
             Assert.Equal(LaunchResult.Waiting, result);
-            Assert.Contains("session", message);
+            Assert.Contains("no Roblox account is connected", message);
             Assert.Equal(Slots.OwnerKey, Assert.Single(Open(h)).DedupeKey);
 
             h.Ctx.Settings.SessionCookie = "cookie-1";

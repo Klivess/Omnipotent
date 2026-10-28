@@ -69,6 +69,7 @@ namespace Omnipotent.Services.OmniBlox
                 MilestonesDone = g.Milestones.Count(m => m.Done),
                 MilestonesTotal = g.Milestones.Count,
                 g.Usage,
+                Reach = g.Publish.Reach is not { } reach ? null : new { reach.Playable, reach.Status, reach.Maturity, reach.MaturityLabel, Why = PlayerReach.Why(reach), reach.CheckedUtc, reach.SinceUtc, reach.Error },
                 HasIcon = g.Store.IconFile != null,
                 Revenue14d = g.Stats.Daily.TakeLast(14).Sum(d => d.RevenueRobux ?? 0),
                 Dau7d = g.Stats.Daily.TakeLast(7).Select(d => d.DailyActiveUsers ?? 0).DefaultIfEmpty().Average(),
@@ -121,7 +122,7 @@ namespace Omnipotent.Services.OmniBlox
                 ctx.Settings.RequireLaunchApproval,
                 ctx.Settings.RequireBuildSignoff,
                 ctx.Settings.MaxGamesInProduction,
-                Attention = Attention(ctx, status, tasks, library, slotsFree),
+                Attention = Attention(ctx, status, tasks, library, slotsFree, games),
                 StageCounts = Enum.GetValues<GameStage>().ToDictionary(st => st.ToString(), st => games.Count(g => g.Stage == st)),
                 Games = games.OrderByDescending(g => g.CreatedUtc).Select(g => GameSummary(ctx, g)).ToList(),
                 OwnerTasks = tasks.OrderByDescending(t => t.CreatedUtc).ToList(),
@@ -177,12 +178,19 @@ namespace Omnipotent.Services.OmniBlox
         }
 
         /// <summary>Why the studio cannot do its work right now, most serious first. Needs the owner files as tasks are not repeated here.</summary>
-        private static List<object> Attention(StudioContext ctx, StudioStatus status, List<OwnerTask> openTasks, LibraryStats library, int slotsFree)
+        private static List<object> Attention(StudioContext ctx, StudioStatus status, List<OwnerTask> openTasks, LibraryStats library, int slotsFree, List<GameDossier> games)
         {
             var items = new List<(int Rank, object Item)>();
             void Add(string level, string title, string detail, string? action) =>
                 items.Add((level == "error" ? 0 : level == "warning" ? 1 : 2, new { Level = level, Title = title, Detail = detail, Action = action }));
 
+            // A public game players cannot join earns nothing and teaches nothing, whatever else is going on.
+            foreach (var g in games.Where(g => g.Publish.IsPublic && g.Publish.Reach is { Playable: false }))
+            {
+                var reach = g.Publish.Reach!;
+                Add("error", $"Nobody can play \"{g.DisplayTitle}\"",
+                    $"Roblox reports {reach.Status} (since {reach.SinceUtc ?? reach.CheckedUtc:yyyy-MM-dd HH:mm} UTC): {PlayerReach.Why(reach)}. It is public, but no player can open it until that changes.", null);
+            }
             if (!ctx.Settings.Enabled)
                 Add("info", "The studio is switched off", "Nothing is researched, built or maintained until it is on. The asset harvester has its own switch.", "studio");
             if (!status.ModelAvailable)
@@ -195,7 +203,7 @@ namespace Omnipotent.Services.OmniBlox
             if (slotsFree == 0 && !openTasks.Any(t => t.Kind == OwnerTaskKind.ExperienceSlot))
             {
                 if (ctx.Session is not { HasSession: true })
-                    Add("warning", "OmniBlox cannot create experiences", "It creates the experiences its games publish to with your Roblox session (the OmniSetting OmniBlox_RobloxSessionCookie), which is not set. Set it once, or create blank experiences yourself and add them as universeId:placeId to OmniBlox_ExperienceSlots.", null);
+                    Add("warning", "OmniBlox cannot create experiences", "It creates the experiences its games publish to with your Roblox account, and none is connected. Connect it once (Roblox account → Connect, then Roblox's Quick Log In), or create blank experiences yourself and add them as universeId:placeId to OmniBlox_ExperienceSlots.", "roblox");
                 else if (ctx.Cloud.HasKey && Slots.WhyNotCreating(ctx) is { } why)
                     Add("info", "Not creating experiences right now", $"Every experience is taken, and the studio is not creating one now: {why}.", null);
             }

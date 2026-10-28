@@ -767,6 +767,12 @@ namespace Omnipotent.Services.Projects
             catch { /* a diagnostic note must never break the wake path */ }
         }
 
+        /// <summary>
+        /// Why no agent may start a model call right now (the prompt-cache halt), or null when the fleet may
+        /// run. Checked before a wake starts, not only at its first turn: by then the whole brief is built.
+        /// </summary>
+        public string? FleetAdmissionRefusal() => CacheHealth?.AdmissionRefusal();
+
         /// <summary>The agent is working again: the next refusal is news and gets its own note.</summary>
         public void ClearWakeWaiting(string projectID, string agentID) =>
             wakeWaitingNotes.TryRemove(projectID + "/" + agentID, out _);

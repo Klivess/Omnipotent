@@ -351,6 +351,15 @@ and a `note`. Routes (`system.api.telemetry.read`):
 never awaited on the request path — doing so once turned a background SQLite write into a
 ten-minute login stall.
 
+Each outcome moves the IP's threat score (`IpThreatTracker.RecordOutcome`); 50 puts it on Watch and
+200 blocks it (both settable). The weights reflect what the traffic means, not just its status code:
+an exploit probe (an unknown route matching `ProbePatterns`, e.g. `/.env`, `/.git/config`) is +12 and
+a honeypot-route hit +50, while the KM website's own calls for a visitor with no or an expired
+session (`WebsiteNoProfile`) are +3. An IP the fingerprint classifier calls `Owner` or `Human`
+(beacon-proven input) is never auto-escalated until a hard rule reclassifies it. Discord "new attacker"
+alerts skip the website's logged-out traffic and IPs classed as people. The OmniDefence page's
+"Needs review" rail lists where the classifier and the gate still disagree.
+
 ## Security posture — read this before deploying anything
 
 This is a **single-owner, self-hosted personal system**, and the threat model is "the owner's own

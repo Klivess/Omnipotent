@@ -14,8 +14,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
     /// retire an earlier game's products left in the slot → products → the publish build (with product ids) →
     /// store page → homepage thumbnails → the icon and maturity questionnaire, which no API key can do, through the
     /// owner's Roblox session (<see cref="StorePageChores"/>; what cannot be done now is finished from housekeeping)
-    /// → publish → public. Nothing irreversible happens on Roblox (products) until the game has run clean in the
-    /// engine and the owner has approved the launch.
+    /// → a maturity rating on Roblox (an unrated experience is unplayable) → publish → public. Nothing irreversible
+    /// happens on Roblox (products) until the game has run clean in the engine and the owner has approved the launch.
     /// </summary>
     public static class LaunchSequence
     {
@@ -92,47 +92,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
             // 7. Products exist on Roblox (ids are baked into the place's config).
             Step("products");
-            game = ctx.Game(gameId)!;
-            bool productsChanged = false;
-            foreach (var product in game.Products.Where(p => p.RobloxId == null || p.SyncedUtc == null))
-            {
-                var spec = new ProductSpec
-                {
-                    Name = Clip(product.Name, 50),
-                    Description = Clip(product.Description, 900),
-                    PriceRobux = product.PriceRobux,
-                    IsForSale = true,
-                    ImagePng = ProductIcon(ctx, gameId, product),
-                };
-                try
-                {
-                    long id;
-                    if (product.Kind == ProductKind.GamePass)
-                    {
-                        if (product.RobloxId is long existing) { await ctx.Cloud.UpdateGamePassAsync(slot.UniverseId, existing, spec, ct); id = existing; }
-                        else id = (await ctx.Cloud.CreateGamePassAsync(slot.UniverseId, spec, ct)).GamePassId;
-                    }
-                    else
-                    {
-                        if (product.RobloxId is long existing) { await ctx.Cloud.UpdateDeveloperProductAsync(slot.UniverseId, existing, spec, ct); id = existing; }
-                        else id = (await ctx.Cloud.CreateDeveloperProductAsync(slot.UniverseId, spec, ct)).ProductId;
-                    }
-                    if (id <= 0) throw new InvalidOperationException($"Roblox returned no id for {product.Name}");
-                    ctx.Update(gameId, g =>
-                    {
-                        var p = g.Products.First(x => x.Key == product.Key);
-                        p.RobloxId = id;
-                        p.SyncedUtc = ctx.Clock();
-                    });
-                    productsChanged = true;
-                }
-                catch (RobloxApiException ex) when (ex.IsAuth)
-                {
-                    ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.ApiKey, "apikey-products", "Give the API key game-pass and developer-product permissions",
-                        $"Creating \"{product.Name}\" was refused: {ex.Message}", gameId, now));
-                    return (LaunchResult.Waiting, "the API key cannot create products");
-                }
-            }
+            var (productsChanged, refused) = await SyncProductsAsync(ctx, gameId, slot, all: false, ct);
+            if (refused != null) return (LaunchResult.Waiting, refused);
 
             // 8. The publish build: the same files (so the same revision, which the engine run above covers) with the
             // new product ids in its config.
@@ -185,6 +146,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             await StorePageChores.IconAsync(ctx, gameId, ct);
             await StorePageChores.QuestionnaireAsync(ctx, gameId, ct);
 
+            // 12. A maturity rating. Roblox lets nobody but the creator play an unrated experience, so going public
+            // without one launches a game no player can open (the first launch did, and nothing noticed for four days).
+            Step("maturity rating");
+            if (await PlayerReach.RatingGateAsync(ctx, gameId, slot, ct) is string unrated) return (LaunchResult.Waiting, unrated);
+
             // 13. Publish and 14. go public.
             Step("publish");
             game = ctx.Game(gameId)!;
@@ -224,7 +190,61 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 s.Touch(g, ctx.Clock());
                 s.AddEvent(EventLevel.Success, "game.launched", $"\"{g.Store.Title}\" is live (experience {slot.UniverseId}).", gameId, ctx.Clock());
             });
+            // Public is not playable: ask Roblox now rather than at the next watch.
+            try { await PlayerReach.CheckAsync(ctx, gameId, ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException) { ctx.Log($"[OmniBlox] {gameId}: reach check after launch: {ex.Message}"); }
             return (LaunchResult.Done, $"\"{game.Store.Title}\" is live");
+        }
+
+        /// <summary>
+        /// Puts the game's products on Roblox: those not created or synced yet, or every one still on sale with
+        /// <paramref name="all"/> (the owner's "update on Roblox"). Refused is set, and an owner task filed, when the API
+        /// key may not.
+        /// </summary>
+        internal static async Task<(bool Changed, string? Refused)> SyncProductsAsync(StudioContext ctx, string gameId, ExperienceSlot slot, bool all, CancellationToken ct)
+        {
+            var game = ctx.Game(gameId)!;
+            bool changed = false;
+            foreach (var product in game.Products.Where(p => all ? !p.Retired : p.RobloxId == null || p.SyncedUtc == null))
+            {
+                var spec = new ProductSpec
+                {
+                    Name = Clip(product.Name, 50),
+                    Description = Clip(product.Description, 900),
+                    PriceRobux = product.PriceRobux,
+                    IsForSale = true,
+                    ImagePng = ProductIcon(ctx, gameId, product),
+                };
+                try
+                {
+                    long id;
+                    if (product.Kind == ProductKind.GamePass)
+                    {
+                        if (product.RobloxId is long existing) { await ctx.Cloud.UpdateGamePassAsync(slot.UniverseId, existing, spec, ct); id = existing; }
+                        else id = (await ctx.Cloud.CreateGamePassAsync(slot.UniverseId, spec, ct)).GamePassId;
+                    }
+                    else
+                    {
+                        if (product.RobloxId is long existing) { await ctx.Cloud.UpdateDeveloperProductAsync(slot.UniverseId, existing, spec, ct); id = existing; }
+                        else id = (await ctx.Cloud.CreateDeveloperProductAsync(slot.UniverseId, spec, ct)).ProductId;
+                    }
+                    if (id <= 0) throw new InvalidOperationException($"Roblox returned no id for {product.Name}");
+                    ctx.Update(gameId, g =>
+                    {
+                        var p = g.Products.First(x => x.Key == product.Key);
+                        p.RobloxId = id;
+                        p.SyncedUtc = ctx.Clock();
+                    });
+                    changed = true;
+                }
+                catch (RobloxApiException ex) when (ex.IsAuth)
+                {
+                    ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.ApiKey, "apikey-products", "Give the API key game-pass and developer-product permissions",
+                        $"Creating \"{product.Name}\" was refused: {ex.Message}", gameId, ctx.Clock()));
+                    return (changed, "the API key cannot create products");
+                }
+            }
+            return (changed, null);
         }
 
         private static string BuildErrors(BuildTools.BuildRun build) =>

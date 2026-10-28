@@ -74,6 +74,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         /// <summary>The cycles running now, for the dashboard's live view.</summary>
         public LiveBoard Live { get; } = new();
 
+        /// <summary>One store-page chore sweep at a time (housekeeping and a fresh Roblox connection could both start one; a questionnaire must not be answered twice).</summary>
+        public SemaphoreSlim ChoreGate { get; } = new(1, 1);
+
         /// <summary>The Luau type checker (luau-lsp); null where the studio runs without it (unit tests).</summary>
         public LuauToolchain? Luau { get; init; }
 

@@ -21,7 +21,6 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
     {
         private readonly StudioContext ctx;
         private DateTime lastHousekeepingUtc = DateTime.MinValue;
-        private DateTime lastAnalyticsSweepUtc = DateTime.MinValue;
 
         public Orchestrator(StudioContext ctx) => this.ctx = ctx;
 
@@ -266,7 +265,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             }
         }
 
-        private async Task LaunchStepAsync(string gameId, CancellationToken ct)
+        internal async Task LaunchStepAsync(string gameId, CancellationToken ct)
         {
             (LaunchResult result, string message) outcome;
             try
@@ -612,16 +611,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             try { await Slots.SweepAsync(ctx, ct); }
             catch (Exception ex) when (ex is not OperationCanceledException) { ctx.Log("[OmniBlox] experiences: " + ex); }
 
-            if (ctx.Cloud.HasKey && now - lastAnalyticsSweepUtc > TimeSpan.FromHours(12))
-            {
-                lastAnalyticsSweepUtc = now;
-                foreach (var id in ctx.Store.Read(s => s.Games.Values.Where(g => g.Stage is GameStage.Live or GameStage.Sunset && g.Slot != null).Select(g => g.GameId).ToList()))
-                {
-                    try { await ctx.Analytics.SyncAsync(id, ct, 3); }
-                    catch (Exception ex) when (ex is not OperationCanceledException) { ctx.Log($"[OmniBlox] analytics sync {id}: {ex.Message}"); }
-                }
-                try { ctx.Telemetry.Prune(now); } catch (Exception ex) { ctx.Log("[OmniBlox] telemetry prune: " + ex.Message); }
-            }
+            // Analytics and whether players can join are LiveWatch's: they run with the studio off too.
         }
 
         private static string Clip(string s, int max) => s.Length <= max ? s : s[..max];

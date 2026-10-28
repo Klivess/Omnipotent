@@ -150,8 +150,11 @@ namespace Omnipotent.Services.OmniDefence.Fingerprint
         public Func<string, Task<string?>> GetApiKey { get; set; } = _ => Task.FromResult<string?>(null);
         /// <summary>Called when new intel for an IP is available (engine reclassifies it).</summary>
         public Action<string>? IntelUpdated { get; set; }
-        /// <summary>Called when a feed set changes (engine reclassifies everything).</summary>
-        public Action? FeedsUpdated { get; set; }
+        /// <summary>
+        /// Called when a feed set changes, with a test for "this IP's datacenter / crawler / Tor
+        /// membership changed" so the engine reclassifies only those IPs.
+        /// </summary>
+        public Action<Func<string, bool>>? FeedsUpdated { get; set; }
         public Action<Exception, string>? LogError { get; set; }
         public Action<string>? Log { get; set; }
 
@@ -475,8 +478,7 @@ namespace Omnipotent.Services.OmniDefence.Fingerprint
                 }
                 if (changed)
                 {
-                    RebuildSets();
-                    FeedsUpdated?.Invoke();
+                    FeedsUpdated?.Invoke(RebuildSetsAndDiff());
                 }
                 try { await Task.Delay(TimeSpan.FromMinutes(5), ct); } catch (OperationCanceledException) { return; }
             }
@@ -544,6 +546,20 @@ namespace Omnipotent.Services.OmniDefence.Fingerprint
             if (!fromCache) _feedLoadedUtc[feed.Name] = DateTime.UtcNow;
             else _feedLoadedUtc.TryAdd(feed.Name, DateTime.MinValue);
             return builder.Count;
+        }
+
+        /// <summary>
+        /// Rebuilds the merged sets and returns whether a given IP now looks up differently. The old
+        /// sets are captured by the closure, so the test stays valid however late the engine runs it.
+        /// </summary>
+        internal Func<string, bool> RebuildSetsAndDiff()
+        {
+            CidrSet oldDatacenter = _datacenter, oldCrawlers = _crawlers, oldTor = _tor;
+            RebuildSets();
+            CidrSet newDatacenter = _datacenter, newCrawlers = _crawlers, newTor = _tor;
+            return ip => oldDatacenter.Lookup(ip) != newDatacenter.Lookup(ip)
+                || oldCrawlers.Lookup(ip) != newCrawlers.Lookup(ip)
+                || (oldTor.Lookup(ip) != null) != (newTor.Lookup(ip) != null);
         }
 
         private void RebuildSets()

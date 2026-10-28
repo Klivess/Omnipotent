@@ -36,9 +36,12 @@ namespace Omnipotent.Services.OmniBlox
         // Compiling a place costs ~1-2 s, and the game page asks for several views and a map report of
         // the same world. Results are kept per workspace state (every file's path, size and write time);
         // the time bound only covers library relabels, which change placements without touching the files.
+        // Requests for the same result share one computation, and at most two run at once: during a build
+        // cycle the server is already busy, and each request computing its own copy took minutes.
         private static readonly TimeSpan WorldCacheFor = TimeSpan.FromMinutes(10);
         private const int WorldCacheEntries = 48;
-        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime BuiltUtc, object Value)> worldCache = new(StringComparer.Ordinal);
+        private const int WorldComputations = 2;
+        private readonly SingleFlightCache worldCache = new(WorldCacheFor, WorldCacheEntries, WorldComputations);
 
         private readonly OmniBlox service;
         private KliveApi? api;
@@ -100,7 +103,23 @@ namespace Omnipotent.Services.OmniBlox
                 ("/omniblox/games/abandon", AbandonGame, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/games/revive", ReviveGame, post, OmniBloxPerms.StudioManage),
                 ("/omniblox/studio/toggle", Toggle, post, OmniBloxPerms.StudioManage),
+
+                // The owner's Roblox account (its session acts as the owner on Roblox, so all of it is studio.manage).
+                ("/omniblox/roblox", RobloxView, get, OmniBloxPerms.StudioManage),
+                ("/omniblox/roblox/quicklogin", RobloxQuickLoginStart, post, OmniBloxPerms.StudioManage),
+                ("/omniblox/roblox/quicklogin/poll", RobloxQuickLoginPoll, post, OmniBloxPerms.StudioManage),
+                ("/omniblox/roblox/quicklogin/cancel", RobloxQuickLoginCancel, post, OmniBloxPerms.StudioManage),
+                (CookieRoute, RobloxCookie, post, OmniBloxPerms.StudioManage),
+                ("/omniblox/roblox/verify", RobloxVerify, post, OmniBloxPerms.StudioManage),
+                ("/omniblox/roblox/disconnect", RobloxDisconnect, post, OmniBloxPerms.StudioManage),
+                (ApiKeyRoute, RobloxApiKey, post, OmniBloxPerms.StudioManage),
+
+                // The owner's actions on a game's place on Roblox, and "do it yourself" on their tasks.
+                ("/omniblox/games/action", GameAction, post, OmniBloxPerms.StudioManage),
+                ("/omniblox/tasks/delegate", DelegateTask, post, OmniBloxPerms.StudioAct),
             };
+
+            MarkSecretRoutes();
 
             int registered = 0;
             foreach (var (path, handler, method, permission) in routes)
@@ -128,6 +147,16 @@ namespace Omnipotent.Services.OmniBlox
                 await service.ServiceLogError(ex, "[OmniBlox] failed to register the telemetry route");
             }
             await service.ServiceLog($"[OmniBlox] {registered}/{routes.Count + 1} HTTP routes registered.", false);
+        }
+
+        internal const string CookieRoute = "/omniblox/roblox/cookie";
+        internal const string ApiKeyRoute = "/omniblox/roblox/apikey";
+
+        /// <summary>A pasted Roblox session or API key must never land in OmniDefence's stored request bodies.</summary>
+        internal static void MarkSecretRoutes()
+        {
+            KliveApi.MarkSecretBodyRoute(CookieRoute);
+            KliveApi.MarkSecretBodyRoute(ApiKeyRoute);
         }
 
         private async Task<KliveApi> ResolveApiAsync()
@@ -205,20 +234,6 @@ namespace Omnipotent.Services.OmniBlox
             return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(sb.ToString())), 0, 12);
         }
 
-        private T WorldCached<T>(string key, Func<T> build) where T : class
-        {
-            DateTime now = DateTime.UtcNow;
-            if (worldCache.TryGetValue(key, out var hit) && now - hit.BuiltUtc < WorldCacheFor && hit.Value is T cached) return cached;
-            T value = build();
-            if (worldCache.Count >= WorldCacheEntries)
-            {
-                foreach (var stale in worldCache.OrderBy(kv => kv.Value.BuiltUtc).Take(worldCache.Count - WorldCacheEntries + 1).ToList())
-                    worldCache.TryRemove(stale.Key, out _);
-            }
-            worldCache[key] = (now, value);
-            return value;
-        }
-
         private static string WeakETag(string key) =>
             "W/\"" + Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(key)), 0, 12) + "\"";
 
@@ -274,13 +289,13 @@ namespace Omnipotent.Services.OmniBlox
             long bucket = DateTime.UtcNow.Ticks / WorldCacheFor.Ticks;
             string key = $"render|{game.GameId}|{WorldStamp(workspace)}|{bucket}|{view}|{width}x{height}|{labels}|{marketing}";
             // Revalidated on every view: an unchanged world costs a 304 and no compile.
-            await req.ReturnValidatedBinaryResponse(WeakETag(key), () => Task.FromResult(WorldCached(key, () =>
+            await req.ReturnValidatedBinaryResponse(WeakETag(key), () => worldCache.GetAsync(key, () =>
             {
                 var result = Ctx.Compile(game.GameId);
                 if (result.Parts.Count == 0 && result.Terrain == null) throw NotFound("The world is empty.");
                 try { return Ctx.RenderCompiled(game.GameId, result, view, width, height, labels: labels, caption: false, marketing: marketing); }
                 catch (Exception ex) when (ex is ArgumentException or InvalidOperationException or FormatException) { throw Bad(ex.Message); }
-            })), "image/png", RevalidateCaching);
+            }), "image/png", RevalidateCaching);
         }
 
         /// <summary>The cycle the game is running now (or ran last), step by step; null when none has run since the server started.</summary>
@@ -313,7 +328,7 @@ namespace Omnipotent.Services.OmniBlox
             var game = RequireGame(RequiredQuery(req, "id"));
             var workspace = Ctx.Workspace(game.GameId);
             if (!workspace.Exists) throw NotFound("This game has no world yet.");
-            var map = WorldCached($"map|{game.GameId}|{WorldStamp(workspace)}",
+            var map = await worldCache.GetAsync($"map|{game.GameId}|{WorldStamp(workspace)}",
                 () => OmniBloxViews.Map(Ctx, game.GameId) ?? throw NotFound("This game has no world yet."));
             await Respond(req, map);
         }
@@ -512,32 +527,7 @@ namespace Omnipotent.Services.OmniBlox
             string note = Required(body, "note");
             if (note.Length > 2000) throw Bad("Keep the direction under 2000 characters.");
             RequireGame(id);
-            var now = Ctx.Clock();
-            string directiveId = "";
-            bool resumed = false;
-            Ctx.Store.Mutate(s =>
-            {
-                var g = s.Game(id)!;
-                int n = 1;
-                while (g.Directives.Any(d => d.DirectiveId == "d" + n)) n++;
-                directiveId = "d" + n;
-                g.Directives.Add(new OwnerDirective { DirectiveId = directiveId, Utc = now, Text = note });
-                // Keep the history bounded: the oldest closed directives go first; open ones always stay.
-                int excess = g.Directives.Count - 60;
-                if (excess > 0)
-                    foreach (var old in g.Directives.Where(d => d.Status != DirectiveStatus.Open).Take(excess).ToList()) g.Directives.Remove(old);
-                g.NextAttemptUtc = null;
-                if (g.Paused && g.Progress.Level >= 3)
-                {
-                    g.Paused = false;
-                    g.WaitingReason = null;
-                    Watchdog.Reset(g, now, "the owner gave a direction");
-                    s.ResolveOwnerTasks("stuck:" + id, now);
-                    resumed = true;
-                }
-                s.Touch(g, now);
-                s.AddEvent(EventLevel.Info, "owner.steer", $"Owner's direction ({directiveId}): " + (note.Length > 300 ? note[..300] + "…" : note), id, now);
-            });
+            var (directiveId, resumed) = GameActions.AddDirective(Ctx, id, note);
             await Respond(req, new { ok = true, directiveId, resumed });
         }
 
@@ -696,6 +686,67 @@ namespace Omnipotent.Services.OmniBlox
             if (body["harvester"] is JValue h && h.Type == JTokenType.Boolean) await service.SetSwitchAsync("OmniBlox_HarvesterEnabled", (bool)h);
             await Respond(req, new { ok = true, enabled = Ctx.Settings.Enabled, harvester = Ctx.Settings.HarvesterEnabled });
         }
+
+        // ─────────────── the owner's Roblox account ───────────────
+
+        private RobloxConnection Connection => service.Connection ?? throw new RouteException(HttpStatusCode.ServiceUnavailable, "The Roblox connection is not ready.");
+
+        private Task RobloxView(UserRequest req) => Respond(req, Connection.View());
+
+        /// <summary>{switchAccount?}: a new Quick Log In code; with switchAccount, whoever confirms it becomes the studio's account.</summary>
+        private async Task RobloxQuickLoginStart(UserRequest req)
+        {
+            var body = Body(req);
+            await Respond(req, await Connection.StartAsync(CancellationToken.None, switchAccount: body["switchAccount"]?.Type == JTokenType.Boolean && (bool)body["switchAccount"]!));
+        }
+
+        private async Task RobloxQuickLoginPoll(UserRequest req) => await Respond(req, await Connection.PollAsync(CancellationToken.None));
+
+        private async Task RobloxQuickLoginCancel(UserRequest req) => await Respond(req, await Connection.CancelAsync(CancellationToken.None));
+
+        /// <summary>A pasted .ROBLOSECURITY cookie (bare, as a name=value pair or a whole Cookie header). Never echoed back.</summary>
+        private async Task RobloxCookie(UserRequest req)
+        {
+            var body = Body(req);
+            await Respond(req, await Connection.UseCookieAsync(Required(body, "cookie"), CancellationToken.None, switchAccount: body["switchAccount"]?.Type == JTokenType.Boolean && (bool)body["switchAccount"]!));
+        }
+
+        /// <summary>A new Open Cloud API key, checked with Roblox before it is kept. Never echoed back.</summary>
+        private async Task RobloxApiKey(UserRequest req) => await Respond(req, await Connection.SetApiKeyAsync(Required(Body(req), "apiKey"), CancellationToken.None));
+
+        private GameActions Actions => service.Actions ?? throw new RouteException(HttpStatusCode.ServiceUnavailable, "Game actions are not ready.");
+
+        /// <summary>
+        /// {gameId, action: sync|private|public|takedown|move, archive?, target?}: starts the action in the background
+        /// (its steps land in the game's OwnerAction); 409 with the reason when it cannot start.
+        /// </summary>
+        private async Task GameAction(UserRequest req)
+        {
+            var body = Body(req);
+            string id = Required(body, "gameId");
+            RequireGame(id);
+            string action = Required(body, "action");
+            bool archive = body["archive"]?.Type == JTokenType.Boolean && (bool)body["archive"]!;
+            string? target = body["target"]?.Type == JTokenType.String ? (string?)body["target"] : null;
+            try
+            {
+                string title = Actions.Start(id, action, archive, target);
+                await Respond(req, new { ok = true, started = title });
+            }
+            catch (GameActionRefused ex) { throw new RouteException(HttpStatusCode.Conflict, ex.Message); }
+        }
+
+        /// <summary>{taskId}: the studio does the owner's task itself when it can, or hands it to the game's agent; 409 with why not.</summary>
+        private async Task DelegateTask(UserRequest req)
+        {
+            string taskId = Required(Body(req), "taskId");
+            try { await Respond(req, new { ok = true, message = Actions.Delegate(taskId) }); }
+            catch (GameActionRefused ex) { throw new RouteException(HttpStatusCode.Conflict, ex.Message); }
+        }
+
+        private async Task RobloxVerify(UserRequest req) => await Respond(req, await Connection.VerifyAsync(CancellationToken.None));
+
+        private async Task RobloxDisconnect(UserRequest req) => await Respond(req, await Connection.DisconnectAsync(CancellationToken.None));
 
         // ─────────────── telemetry (public) ───────────────
 

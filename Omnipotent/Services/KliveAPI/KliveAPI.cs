@@ -1687,13 +1687,24 @@ namespace Omnipotent.Services.KliveAPI
             return (method ?? string.Empty).Trim().ToUpperInvariant();
         }
 
+        /// <summary>Routes outside OmniGlobalSettings whose request bodies carry a secret (registered by their module).</summary>
+        private static readonly System.Collections.Concurrent.ConcurrentDictionary<string, byte> SecretBodyRoutes = new(StringComparer.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Treats a route like the settings routes: its request body (a password, a session cookie) is never stored by
+        /// OmniDefence, its headers and user agent are not captured, errors are logged without the URL's details, and the
+        /// response is no-store. Every POST body is otherwise kept (up to 64 KB) in OmniDefence's request log.
+        /// </summary>
+        public static void MarkSecretBodyRoute(string route) => SecretBodyRoutes[NormalizeRoute(route)] = 0;
+
         internal static bool IsSensitiveSettingsRoute(string? route)
         {
             const string prefix = "/OmniGlobalSettings";
             if (string.IsNullOrWhiteSpace(route)) return false;
             string normalized = NormalizeRoute(route);
             return normalized.Equals(prefix, StringComparison.OrdinalIgnoreCase)
-                || normalized.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase);
+                || normalized.StartsWith(prefix + "/", StringComparison.OrdinalIgnoreCase)
+                || SecretBodyRoutes.ContainsKey(normalized);
         }
 
         private static void ApplySensitiveSettingsResponseHeaders(NameValueCollection headers)
@@ -2499,6 +2510,9 @@ namespace Omnipotent.Services.KliveAPI
                     else if (decision == IpThreatTracker.GateDecision.Honeypot)
                     {
                         defenceDenyReason = "Honeypot";
+                        // A trap route is the IP's own doing; a Honeypot-status IP is served junk on
+                        // every route. Either way it is not a Success, which used to lower the score.
+                        defenceOutcome = defence.IsHoneypotRoute(route) ? RequestOutcome.HoneypotHit : RequestOutcome.PreBlocked;
                         string junk = defence.GenerateHoneypotResponse(defenceIp);
                         await request.ReturnResponse(junk, "application/json");
                         return;

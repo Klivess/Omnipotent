@@ -64,6 +64,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private long legacyFilesOnDisk = -1;
         private DateTime? lastTradePollUtc;
         private string? lastTradePollError;
+        // The poll in progress, so one that never returns is reported (and not stacked on) instead of silently
+        // ending trade tracking: on the live server the monitor's last poll was 2026-10-26 21:46, with no error,
+        // two days before anyone looked — while a relist it should have been following sat unsettled.
+        private Task? tradePollInFlight;
+        private DateTime tradePollStartedUtc;
+        internal static readonly TimeSpan TradePollTimeout = TimeSpan.FromMinutes(3);
+        internal static readonly TimeSpan TradePollStuckAlertAfter = TimeSpan.FromMinutes(30);
         private bool automationEnabled;
         private ExitSignalsProvider exitSignals = null!;
         private MarketDriftModel marketModel = new();
@@ -413,6 +420,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     await ServiceLogError($"CSFloat re-priced {position.ItemMarketHashName} to {c}c instead of {priceCents}c.", false);
                 return true;
             }
+            catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.UnprocessableEntity)
+            {
+                // CSFloat only re-prices a live listing ("you can only modify listed contracts"), so the listing has
+                // sold or been taken down. A sale is settled by the trade monitor; a listing removed by hand needs a
+                // person. One alert a day, not an error every review.
+                await ServiceLog($"CSFloat refused to re-price {position.ItemMarketHashName}: {ex.Message}", false);
+                await AlertKlivesAsync("relist-not-live:" + position.CSFloatListingID, "CS2 Arbitrage — relist is no longer live",
+                    $"CSFloat refused to re-price **{position.ItemMarketHashName}** because the listing is no longer live. " +
+                    $"If it sold, the trade monitor records the sale; if it was taken down, relist or sell it by hand: https://csfloat.com/item/{position.CSFloatResaleListingID}",
+                    TimeSpan.FromHours(24));
+                return false;
+            }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
                 await ServiceLogError(ex, $"Couldn't re-price the CSFloat listing for {position.ItemMarketHashName}.", false);
@@ -516,7 +535,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         async Task ISnipeHost.OnOpportunityNotBoughtAsync(CSFloatListing listing, OpportunityEvaluation evaluation, string why)
         {
-            await ServiceLog($"Opportunity not bought — {listing.MarketHashName} ({listing.Id}): {why}");
+            // A listing that stays up is re-screened every sweep with the same verdict. Logged every time, one
+            // listing filled 386 of the 4000-line log buffer in a day and pushed everything else out of it.
+            if (TryTakeCooldown("unbought-log:" + listing.Id, TimeSpan.FromHours(6)))
+                await ServiceLog($"Opportunity not bought — {listing.MarketHashName} ({listing.Id}): {why}");
             if (!engineSettings.AlertOnUnboughtOpportunities) return;
             // At most one alert per item per hour and ten per hour overall.
             if (!TryTakeCooldown("unbought:" + listing.MarketHashName, TimeSpan.FromHours(1))) return;
@@ -600,12 +622,34 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 {
                     var purchases = scanalytics.PurchasesSnapshot();
                     bool active = purchases.Any(p => p.CurrentStrategicStage < StrategicStages.JustRetrieved || p.CurrentStrategicStage == StrategicStages.WaitingForCSFloatResale);
-                    if (DateTime.UtcNow >= nextPoll && (active || lastTradePollUtc == null || DateTime.UtcNow - lastTradePollUtc > TimeSpan.FromMinutes(15)))
+                    if (tradePollInFlight is { IsCompleted: false })
+                    {
+                        // Never start a second poll behind one that has not returned: it would hang the same way.
+                        TimeSpan stuck = DateTime.UtcNow - tradePollStartedUtc;
+                        lastTradePollError = $"the trade poll started {tradePollStartedUtc:u} has not returned ({FormatAgo(stuck)})";
+                        if (stuck > TradePollStuckAlertAfter)
+                            await AlertKlivesAsync("trade-poll-stuck", "CS2 Arbitrage — trade tracking is stuck",
+                                $"The CSFloat trade monitor's poll has not returned for {FormatAgo(stuck).Replace(" ago", "")}. Sales, deliveries and resales are not being followed until it does (a restart clears it).",
+                                TimeSpan.FromHours(12));
+                    }
+                    else if (DateTime.UtcNow >= nextPoll && (active || lastTradePollUtc == null || DateTime.UtcNow - lastTradePollUtc > TimeSpan.FromMinutes(15)))
                     {
                         nextPoll = DateTime.UtcNow + (active ? TimeSpan.FromSeconds(90) : TimeSpan.FromMinutes(15));
-                        await PollTradesOnceAsync(purchases, ct);
-                        lastTradePollUtc = DateTime.UtcNow;
-                        lastTradePollError = null;
+                        tradePollStartedUtc = DateTime.UtcNow;
+                        tradePollInFlight = PollTradesOnceAsync(purchases, ct);
+                        bool returned = true;
+                        try { await tradePollInFlight.WaitAsync(TradePollTimeout, ct); }
+                        catch (TimeoutException)
+                        {
+                            returned = false;
+                            lastTradePollError = $"the trade poll did not return within {TradePollTimeout.TotalMinutes:0} minutes";
+                            await ServiceLogError(new TimeoutException(lastTradePollError), "CS2 trade monitor poll is hanging.", false);
+                        }
+                        if (returned)
+                        {
+                            lastTradePollUtc = DateTime.UtcNow;
+                            lastTradePollError = null;
+                        }
                     }
                 }
                 catch (CSFloatRateLimitedException ex)
@@ -1163,7 +1207,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     pacerPausedUntilUtc = market.Pacer.PausedUntilUtc > DateTime.UtcNow ? market.Pacer.PausedUntilUtc : (DateTime?)null,
                 },
                 bulkSteamPrices = new { referencePrices.Count, referencePrices.LoadedAtUtc, referencePrices.LastError },
-                trades = new { lastPollUtc = lastTradePollUtc, lastError = lastTradePollError },
+                trades = new
+                {
+                    lastPollUtc = lastTradePollUtc,
+                    lastError = lastTradePollError,
+                    pollRunningSinceUtc = tradePollInFlight is { IsCompleted: false } ? tradePollStartedUtc : (DateTime?)null,
+                },
                 exitModel = !ready ? null : new
                 {
                     settings = engineSettings.Exit,
