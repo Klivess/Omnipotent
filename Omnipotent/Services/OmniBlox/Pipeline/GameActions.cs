@@ -303,7 +303,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 pub.EngineTestedRevision = null;
                 pub.IconUploadedHash = null;
                 pub.IconUploadedUtc = null;
-                pub.StoreThumbnailsPending = false;
+                pub.StoreThumbnails.Clear();
                 pub.StoreThumbnailsUploaded = 0;
                 pub.Questionnaire = null;
                 pub.Reach = null;

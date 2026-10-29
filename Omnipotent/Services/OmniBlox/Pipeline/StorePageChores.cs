@@ -168,17 +168,24 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             game.Store.IconFile is { } file && File.Exists(Path.Combine(ctx.Store.MediaDirectory(game.GameId), file)) ? Path.Combine(ctx.Store.MediaDirectory(game.GameId), file) : null;
 
         private static bool IconPending(StudioContext ctx, GameDossier game) =>
-            game.Slot != null && (IconPath(ctx, game) is { } path && Hash(File.ReadAllBytes(path)) != game.Publish.IconUploadedHash || ThumbnailsPending(ctx, game).Count > game.Publish.StoreThumbnailsUploaded);
+            game.Slot != null && (IconPath(ctx, game) is { } path && Hash(File.ReadAllBytes(path)) != game.Publish.IconUploadedHash || StoreThumbnails(ctx, game).Owed.Count > 0);
 
-        /// <summary>The store thumbnails to add through the session: the ones the homepage-thumbnail API refused at launch (or an older launch left in its icon task).</summary>
-        private static List<string> ThumbnailsPending(StudioContext ctx, GameDossier game)
+        /// <summary>
+        /// The game's thumbnails, and those not on the store page yet: new ones and remade ones (by content), in file
+        /// order. Only the session's upload puts them on the store page; the homepage-thumbnail API an older launch used
+        /// does not (its images are homepage candidates, shown nowhere until a personalization is set up).
+        /// </summary>
+        private static (List<(string Name, string Hash)> All, List<(string Name, string Hash)> Owed) StoreThumbnails(StudioContext ctx, GameDossier game)
         {
-            bool wanted = game.Publish.StoreThumbnailsPending || ctx.Store.Read(s => s.Studio.OwnerTasks.Any(t =>
-                t.Status == OwnerTaskStatus.Open && t.DedupeKey == IconKey(game.GameId) && t.Files.Any(f => game.Store.ThumbnailFiles.Contains(f))));
-            return wanted ? game.Store.ThumbnailFiles.Where(f => File.Exists(Path.Combine(ctx.Store.MediaDirectory(game.GameId), f))).ToList() : new List<string>();
+            string dir = ctx.Store.MediaDirectory(game.GameId);
+            var all = game.Store.ThumbnailFiles.Where(f => File.Exists(Path.Combine(dir, f))).Select(f => (Name: f, Hash: Hash(File.ReadAllBytes(Path.Combine(dir, f))))).ToList();
+            var up = game.Publish.StoreThumbnails.Count > 0
+                ? game.Publish.StoreThumbnails.Select(t => t.Hash).ToHashSet()
+                : all.Take(game.Publish.StoreThumbnailsUploaded).Select(t => t.Hash).ToHashSet();
+            return (all, all.Where(t => !up.Contains(t.Hash)).ToList());
         }
 
-        /// <summary>Uploads the game's icon (and any store thumbnails still owed) through the owner's session. True when nothing is left to upload.</summary>
+        /// <summary>Uploads the game's icon and the store thumbnails not on its store page yet through the owner's session. True when nothing is left to upload.</summary>
         public static async Task<bool> IconAsync(StudioContext ctx, string gameId, CancellationToken ct)
         {
             string key = IconKey(gameId);
@@ -187,9 +194,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             string? iconPath = IconPath(ctx, game);
             byte[]? icon = iconPath == null ? null : File.ReadAllBytes(iconPath);
             bool iconOwed = icon != null && Hash(icon) != game.Publish.IconUploadedHash;
-            var thumbnails = ThumbnailsPending(ctx, game);
-            int thumbnailsUp = Math.Min(game.Publish.StoreThumbnailsUploaded, thumbnails.Count);
-            if (!iconOwed && thumbnailsUp >= thumbnails.Count)
+            var (thumbnails, owed) = StoreThumbnails(ctx, game);
+            if (!iconOwed && owed.Count == 0)
             {
                 Succeeded(ctx, key);
                 return true;
@@ -197,8 +203,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
             var files = new List<string>();
             if (iconOwed) files.Add(game.Store.IconFile!);
-            files.AddRange(thumbnails.Skip(thumbnailsUp));
-            string title = $"Upload the {(iconOwed ? "icon" : "")}{(iconOwed && thumbnails.Count > thumbnailsUp ? " and " : "")}{(thumbnails.Count > thumbnailsUp ? "thumbnails" : "")} for \"{game.Store.Title}\"";
+            files.AddRange(owed.Select(t => t.Name));
+            string what = (iconOwed, owed.Count) switch { (true, 0) => "icon", (true, _) => "icon and thumbnails", _ => "thumbnails" };
+            string title = $"Upload the {what} for \"{game.Store.Title}\"";
             string manual = $"Upload the prepared file(s) in the Creator Dashboard for experience {slot.UniverseId}.";
 
             if (ctx.Session is not { HasSession: true } session)
@@ -208,6 +215,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 return false;
             }
             if (!Due(ctx, key)) return false;
+            string doing = "icon";
             try
             {
                 if (iconOwed)
@@ -216,13 +224,19 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     string hash = Hash(icon!);
                     ctx.Update(gameId, g => { g.Publish.IconUploadedHash = hash; g.Publish.IconUploadedUtc = ctx.Clock(); });
                 }
-                for (int i = thumbnailsUp; i < thumbnails.Count; i++)
+                foreach (var (name, hash) in owed)
                 {
-                    await session.UploadGameThumbnailAsync(slot.UniverseId, File.ReadAllBytes(Path.Combine(ctx.Store.MediaDirectory(gameId), thumbnails[i])), ct);
-                    int done = i + 1;
-                    ctx.Update(gameId, g => g.Publish.StoreThumbnailsUploaded = done);
+                    doing = "thumbnail " + name;
+                    long imageId = await session.UploadGameThumbnailAsync(slot.UniverseId, File.ReadAllBytes(Path.Combine(ctx.Store.MediaDirectory(gameId), name)), ct);
+                    ctx.Update(gameId, g =>
+                    {
+                        // What an older studio only counted becomes a record first, so it is not uploaded again.
+                        if (g.Publish.StoreThumbnails.Count == 0)
+                            g.Publish.StoreThumbnails.AddRange(thumbnails.Take(g.Publish.StoreThumbnailsUploaded).Select(t => new StoreThumbnailRecord { File = t.Name, Hash = t.Hash, UploadedUtc = g.Publish.IconUploadedUtc ?? ctx.Clock() }));
+                        g.Publish.StoreThumbnailsUploaded = 0;
+                        g.Publish.StoreThumbnails.Add(new StoreThumbnailRecord { File = name, Hash = hash, ImageId = imageId, UploadedUtc = ctx.Clock() });
+                    });
                 }
-                if (thumbnails.Count > 0) ctx.Update(gameId, g => g.Publish.StoreThumbnailsPending = false);
             }
             catch (RobloxSessionException ex)
             {
@@ -232,7 +246,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             catch (Exception ex) when (ex is RobloxApiException or HttpRequestException or TimeoutException or IOException or Newtonsoft.Json.JsonException)
             {
                 var state = Failed(ctx, key, ex.Message);
-                ctx.Event(EventLevel.Warning, "store.icon", $"The icon upload was not accepted yet ({ex.Message}); retrying {RetryIn(state, ctx.Clock())}.", gameId);
+                ctx.Event(EventLevel.Warning, "store.icon", $"Roblox did not accept the {doing} yet ({ex.Message}); retrying {RetryIn(state, ctx.Clock())}.", gameId);
                 if (Stuck(state, ctx.Clock()))
                     ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.UploadIcon, key, title,
                         $"Roblox has refused the upload since {state.FirstFailureUtc:yyyy-MM-dd HH:mm} UTC: {ex.Message}\nThe studio keeps trying. {manual}", gameId, ctx.Clock(), files));
@@ -240,7 +254,13 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             }
             Succeeded(ctx, key);
             Succeeded(ctx, SessionKey);
-            ctx.Event(EventLevel.Success, "store.icon", $"Uploaded {(iconOwed ? "the icon" : "")}{(iconOwed && thumbnails.Count > thumbnailsUp ? " and " : "")}{(thumbnails.Count > thumbnailsUp ? $"{thumbnails.Count - thumbnailsUp} store thumbnail(s)" : "")} for \"{game.Store.Title}\" to experience {slot.UniverseId}.", gameId);
+            string uploaded = (iconOwed, owed.Count) switch
+            {
+                (true, 0) => "the icon",
+                (true, var n) => $"the icon and {n} store thumbnail{(n == 1 ? "" : "s")}",
+                (_, var n) => $"{n} store thumbnail{(n == 1 ? "" : "s")}",
+            };
+            ctx.Event(EventLevel.Success, "store.icon", $"Uploaded {uploaded} for \"{game.Store.Title}\" to experience {slot.UniverseId}; Roblox shows images once its moderation passes them.", gameId);
             return true;
         }
 

@@ -506,9 +506,9 @@ namespace Omnipotent.Services.OmniBlox.Core
         /// <summary>The icon on Roblox now, by content hash (a new icon file is uploaded again).</summary>
         public string? IconUploadedHash { get; set; }
         public DateTime? IconUploadedUtc { get; set; }
-        /// <summary>The homepage-thumbnail API refused the thumbnails at launch, so they go on the store page through the owner's session.</summary>
-        public bool StoreThumbnailsPending { get; set; }
-        /// <summary>How many of those are up (a retry carries on after them instead of adding them twice).</summary>
+        /// <summary>The thumbnails the studio put on the experience's store page, oldest first (a new or remade thumbnail goes up; none goes up twice).</summary>
+        public List<StoreThumbnailRecord> StoreThumbnails { get; set; } = new();
+        /// <summary>Before Oct 29 2026 the studio counted the store thumbnails it put up instead of recording which: the first this many files.</summary>
         public int StoreThumbnailsUploaded { get; set; }
         /// <summary>The newest answering of Roblox's maturity questionnaire, published or stopped for the owner.</summary>
         public QuestionnaireRecord? Questionnaire { get; set; }
@@ -516,6 +516,17 @@ namespace Omnipotent.Services.OmniBlox.Core
         public ReachRecord? Reach { get; set; }
         /// <summary>The game's experience belongs to the Roblox account the studio used before the owner switched accounts (cleared by moving it).</summary>
         public bool OnOldAccount { get; set; }
+    }
+
+    /// <summary>A thumbnail on the experience's store page, put there through the owner's session.</summary>
+    public sealed class StoreThumbnailRecord
+    {
+        public string File { get; set; } = "";
+        /// <summary>By content: a remade thumbnail is a new one.</summary>
+        public string Hash { get; set; } = "";
+        /// <summary>Roblox's id for the image (0 when Roblox did not say, or an older studio did not record it).</summary>
+        public long ImageId { get; set; }
+        public DateTime UploadedUtc { get; set; }
     }
 
     /// <summary>An action the owner started on a game from the dashboard (update on Roblox, take down, move…), step by step.</summary>

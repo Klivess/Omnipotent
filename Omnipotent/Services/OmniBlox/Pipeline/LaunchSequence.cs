@@ -12,7 +12,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
     /// Publishes a game whose marketing is ready, one idempotent step at a time so a restart (or an owner
     /// task) can interrupt it anywhere: API key → experience (made now when none is free) → compliance → final build → engine tests →
     /// retire an earlier game's products left in the slot → products → the publish build (with product ids) →
-    /// store page → homepage thumbnails → the icon and maturity questionnaire, which no API key can do, through the
+    /// store page → the icon, store thumbnails and maturity questionnaire, which no API key can do, through the
     /// owner's Roblox session (<see cref="StorePageChores"/>; what cannot be done now is finished from housekeeping)
     /// → a maturity rating on Roblox (an unrated experience is unplayable) → publish → public. Nothing irreversible
     /// happens on Roblox (products) until the game has run clean in the engine and the owner has approved the launch.
@@ -120,38 +120,20 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 ctx.Update(gameId, g => g.Store.Applied = true);
             }
 
-            // 10. Homepage thumbnails (experimental API; the owner task below covers it if this fails).
-            Step("thumbnails");
-            bool thumbsUploaded = false;
-            try
-            {
-                var pngs = game.Store.ThumbnailFiles.Select(f => Path.Combine(ctx.Store.MediaDirectory(gameId), f)).Where(File.Exists).Select(File.ReadAllBytes).ToList();
-                if (pngs.Count > 0)
-                {
-                    await ctx.Cloud.UploadHomepageThumbnailsAsync(slot.UniverseId, pngs, ct);
-                    thumbsUploaded = true;
-                }
-            }
-            catch (Exception ex) when (ex is RobloxApiException or HttpRequestException)
-            {
-                ctx.Event(EventLevel.Info, "launch.thumbnails", "Homepage thumbnail upload was not accepted (" + ex.Message + "); left for the owner.", gameId);
-            }
-
-            // 11. What no API key can do — the icon (and thumbnails the API refused) and the maturity questionnaire —
-            // through the owner's session. Never blocks the launch: what is not done now is finished from housekeeping,
-            // and the owner is asked only when it needs them.
-            Step("icon and questionnaire");
-            if (!thumbsUploaded && game.Store.ThumbnailFiles.Count > 0 && !game.Publish.StoreThumbnailsPending)
-                ctx.Update(gameId, g => { g.Publish.StoreThumbnailsPending = true; g.Publish.StoreThumbnailsUploaded = 0; });
+            // 10. What no API key can do — the icon, the store thumbnails and the maturity questionnaire — through the
+            // owner's session. (Roblox's homepage-thumbnail API looks like it but is not: its images are homepage
+            // candidates, shown nowhere until a personalization is set up, and never on the store page.) Never blocks
+            // the launch: what is not done now is finished from housekeeping, and the owner is asked only when it needs them.
+            Step("icon, thumbnails and questionnaire");
             await StorePageChores.IconAsync(ctx, gameId, ct);
             await StorePageChores.QuestionnaireAsync(ctx, gameId, ct);
 
-            // 12. A maturity rating. Roblox lets nobody but the creator play an unrated experience, so going public
+            // 11. A maturity rating. Roblox lets nobody but the creator play an unrated experience, so going public
             // without one launches a game no player can open (the first launch did, and nothing noticed for four days).
             Step("maturity rating");
             if (await PlayerReach.RatingGateAsync(ctx, gameId, slot, ct) is string unrated) return (LaunchResult.Waiting, unrated);
 
-            // 13. Publish and 14. go public.
+            // 12. Publish and 13. go public.
             Step("publish");
             game = ctx.Game(gameId)!;
             if (game.Publish.LastPublishedRevision != revision)

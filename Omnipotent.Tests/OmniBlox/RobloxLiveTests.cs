@@ -144,7 +144,6 @@ namespace Omnipotent.Tests.OmniBlox
                 ("update a product with its image", () => cloud.UpdateDeveloperProductAsync(universe, product, new ProductSpec { Name = "Coins", Description = "500 coins", PriceRobux = 25, ImagePng = png }, CancellationToken.None)),
                 ("create a product", () => cloud.CreateDeveloperProductAsync(universe, new ProductSpec { Name = "Coins", Description = "500 coins", PriceRobux = 25, ImagePng = png }, CancellationToken.None)),
                 ("create a game pass", () => cloud.CreateGamePassAsync(universe, new ProductSpec { Name = "VIP", Description = "Double coins", PriceRobux = 99, ImagePng = png }, CancellationToken.None)),
-                ("upload homepage thumbnails", () => cloud.UploadHomepageThumbnailsAsync(universe, new[] { png }, CancellationToken.None)),
                 ("upload an image asset", () => cloud.UploadAssetAsync("Image", "icon", "", png, "image/png", "icon.png", new RobloxCreator(1, null), CancellationToken.None)),
             };
             foreach (var (what, call) in calls)
@@ -164,6 +163,8 @@ namespace Omnipotent.Tests.OmniBlox
             var icon = await Assert.ThrowsAsync<RobloxSessionException>(() => session.UploadGameIconAsync(1_000_000_001, new byte[] { 0x89, 0x50, 0x4E, 0x47 }, CancellationToken.None));
             Assert.False(icon.Missing);
             Assert.Contains("publish.roblox.com", icon.Message);
+            var thumbnail = await Assert.ThrowsAsync<RobloxSessionException>(() => session.UploadGameThumbnailAsync(1_000_000_001, new byte[] { 0x89, 0x50, 0x4E, 0x47 }, CancellationToken.None));
+            Assert.Contains("/thumbnail/image", thumbnail.Message);
             await Assert.ThrowsAsync<RobloxSessionException>(() => session.GetLatestQuestionnaireIdAsync(1_000_000_001, CancellationToken.None));
             await Assert.ThrowsAsync<RobloxSessionException>(() => session.GetSignedInUserAsync(CancellationToken.None));
         }

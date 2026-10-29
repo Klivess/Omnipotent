@@ -245,6 +245,8 @@ namespace Omnipotent.Tests.OmniBlox
         public int CreateCalls { get; private set; }
         /// <summary>Answer Create Experience with a 500.</summary>
         public bool CreateRefused { get; set; }
+        /// <summary>When set, accept only this many more store-thumbnail uploads and refuse the rest (400).</summary>
+        public int? ThumbnailsAccepted { get; set; }
         /// <summary>Whether the API key reaches experiences created from now on (false: a key restricted to the ones it was given).</summary>
         public bool KeyReachesNew { get; set; } = true;
         /// <summary>Experiences the API key cannot change (Open Cloud answers 403).</summary>
@@ -383,7 +385,12 @@ namespace Omnipotent.Tests.OmniBlox
                 return Rotating(Json(new { }));
             }
             if (uri.Host == "publish.roblox.com" && path.EndsWith("/icon")) return Rotating(Json(new { targetId = 1 }));
-            if (uri.Host == "publish.roblox.com" && path.EndsWith("/thumbnail/image")) return Rotating(Json(new { targetId = nextId++ }));
+            if (uri.Host == "publish.roblox.com" && path.EndsWith("/thumbnail/image"))
+            {
+                if (ThumbnailsAccepted is <= 0) return new HttpResponseMessage(HttpStatusCode.BadRequest) { Content = new StringContent("{\"errors\":[{\"code\":1,\"message\":\"The file does not match a known image format.\"}]}", Encoding.UTF8, "application/json") };
+                ThumbnailsAccepted--;
+                return Rotating(Json(new { targetId = nextId++ }));
+            }
             if (path == "/universes/v1/universes/create")
             {
                 CreateCalls++;
@@ -512,8 +519,6 @@ namespace Omnipotent.Tests.OmniBlox
                 return RestartRefused
                     ? new HttpResponseMessage(HttpStatusCode.Forbidden) { Content = new StringContent("{\"message\":\"insufficient scope\"}", Encoding.UTF8, "application/json") }
                     : Json(new { });
-            if (path.Contains("/thumbnail-personalization-api/"))
-                return Json(new { operationIds = new[] { "op1" } });
             if (path.Contains("/analytics-query-api/"))
             {
                 string metric = (string?)JObject.Parse(body)["metric"] ?? "";

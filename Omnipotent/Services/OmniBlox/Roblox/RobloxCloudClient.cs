@@ -396,20 +396,6 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             return series;
         }
 
-        // ─────────────── Homepage thumbnails (experimental API) ───────────────
-
-        public async Task UploadHomepageThumbnailsAsync(long universeId, IReadOnlyList<byte[]> pngs, CancellationToken ct)
-        {
-            await SendAsync("thumbnail-personalization", "homepage thumbnails (universe.thumbnail:write)", HttpMethod.Post,
-                $"{Base}/thumbnail-personalization-api/v1/universes/{universeId}/thumbnails/uploads", () =>
-                {
-                    var form = RobloxForm.Create();
-                    int i = 0;
-                    foreach (var png in pngs) RobloxForm.AddFile(form, "files", png, "image/png", $"thumbnail{++i}.png");
-                    return form;
-                }, ct);
-        }
-
         private static long? ParseTrailingId(string? path) =>
             path != null && long.TryParse(path.Split('/').Last(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var id) ? id : null;
 

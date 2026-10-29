@@ -131,7 +131,6 @@ namespace Omnipotent.Services.OmniBlox.Roblox
             ["luau-read"] = 120,
             ["luau-logs"] = 30,
             ["analytics"] = 60,
-            ["thumbnail-personalization"] = 20,
             ["session"] = 30,
             ["session-upload"] = 6,
             ["session-create"] = 2,

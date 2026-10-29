@@ -181,7 +181,7 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Equal(2, icon.Count); // refused once for the token, then accepted
             Assert.Contains("name=\"request.files\"; filename=\"icon.png\"", icon[^1].Body);
             Assert.NotNull(h.Game(id).Publish.IconUploadedHash);
-            Assert.DoesNotContain(h.Roblox.Requests, r => r.Url.EndsWith("/thumbnail/image")); // the homepage API took the thumbnails
+            Assert.Single(h.Roblox.Requests, r => r.Url == "https://publish.roblox.com/v1/games/1001/thumbnail/image" && r.Body.Contains("filename=\"thumbnail.png\""));
 
             // Both questionnaires answered from the facts, submitted, then published together.
             Assert.Equal(new[] { "main-1", "add-1" }, h.Roblox.Submissions.Select(x => x.QuestionnaireId));
@@ -235,19 +235,128 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.True(h.Game(id).Publish.Questionnaire!.Published);
         }
 
+        // ─────────────── store thumbnails ───────────────
+
+        private const string ThumbnailUpload = "https://publish.roblox.com/v1/games/1001/thumbnail/image";
+
+        /// <summary>A second and third thumbnail on disk, each its own picture.</summary>
+        private static void AddThumbnails(StudioHarness h, string id)
+        {
+            string media = h.Ctx.Store.MediaDirectory(id);
+            File.WriteAllBytes(Path.Combine(media, "thumb2.png"), h.Roblox.Png.Append((byte)2).ToArray());
+            File.WriteAllBytes(Path.Combine(media, "thumb3.png"), h.Roblox.Png.Append((byte)3).ToArray());
+            h.Ctx.Update(id, g => g.Store.ThumbnailFiles = new List<string> { "thumb1.png", "thumb2.png", "thumb3.png" });
+        }
+
+        /// <summary>
+        /// The live bug: a launch sent the thumbnails to Roblox's homepage-thumbnail API, which accepted them, took
+        /// that for done, and never put them on the store page (the icon went up; the page kept Roblox's placeholder).
+        /// That game's state — icon up, nothing recorded for thumbnails — gets them on the store page at the next sweep.
+        /// </summary>
         [Fact]
-        public async Task ThumbnailsTheHomepageApiRefused_GoOnTheStorePage_OnceEach()
+        public async Task ALiveGameWhoseThumbnailsNeverReachedTheStorePage_GetsThemAtTheNextSweep_AndOnlyThem()
         {
             using var h = new StudioHarness(session: true);
             string id = SeedLiveGame(h);
-            h.Ctx.Update(id, g => g.Publish.StoreThumbnailsPending = true);
+            AddThumbnails(h, id);
+            await StorePageChores.IconAsync(h.Ctx, id, CancellationToken.None); // the icon's own upload
+            h.Ctx.Update(id, g => { g.Publish.StoreThumbnails.Clear(); g.Publish.StoreThumbnailsUploaded = 0; }); // what that launch left
+            h.Roblox.Requests.Clear();
 
-            await StorePageChores.IconAsync(h.Ctx, id, CancellationToken.None);
+            await StorePageChores.SweepAsync(h.Ctx, CancellationToken.None);
 
-            Assert.Single(h.Roblox.Requests, r => r.Url == "https://publish.roblox.com/v1/games/1001/thumbnail/image" && r.Body.Contains("filename=\"thumbnail.png\""));
-            Assert.False(h.Game(id).Publish.StoreThumbnailsPending);
+            var uploads = h.Roblox.Requests.Where(r => r.Url == ThumbnailUpload).ToList();
+            Assert.Equal(3, uploads.Count(r => r.Body.Contains("name=\"request.files\"; filename=\"thumbnail.png\"")));
+            Assert.DoesNotContain(h.Roblox.Requests, r => r.Url.EndsWith("/icon")); // the icon was already up
+            Assert.DoesNotContain(h.Roblox.Requests, r => r.Url.Contains("thumbnail-personalization"));
+            var up = h.Game(id).Publish.StoreThumbnails;
+            Assert.Equal(new[] { "thumb1.png", "thumb2.png", "thumb3.png" }, up.Select(t => t.File));
+            Assert.All(up, t => Assert.True(t.ImageId > 0));
+            Assert.Contains(h.Ctx.Store.Read(s => s.Events.ToList()), e => e.Kind == "store.icon" && e.Message.Contains("Uploaded 3 store thumbnails"));
+
+            // Done is done.
+            h.Roblox.Requests.Clear();
+            await StorePageChores.SweepAsync(h.Ctx, CancellationToken.None);
+            Assert.DoesNotContain(h.Roblox.Requests, r => r.Url.StartsWith("https://publish.roblox.com/"));
+        }
+
+        [Fact]
+        public async Task ARemadeThumbnail_GoesUpAgain_TheUnchangedOnesDoNot()
+        {
+            using var h = new StudioHarness(session: true);
+            string id = SeedLiveGame(h);
+            AddThumbnails(h, id);
+            Assert.True(await StorePageChores.IconAsync(h.Ctx, id, CancellationToken.None));
+            h.Roblox.Requests.Clear();
+
+            File.WriteAllBytes(Path.Combine(h.Ctx.Store.MediaDirectory(id), "thumb2.png"), h.Roblox.Png.Append((byte)22).ToArray());
+            await StorePageChores.SweepAsync(h.Ctx, CancellationToken.None);
+
+            Assert.Single(h.Roblox.Requests, r => r.Url == ThumbnailUpload);
+            Assert.Equal(new[] { "thumb1.png", "thumb2.png", "thumb3.png", "thumb2.png" }, h.Game(id).Publish.StoreThumbnails.Select(t => t.File));
+        }
+
+        [Fact]
+        public async Task ThumbnailsAnOlderStudioCounted_AreNotUploadedTwice()
+        {
+            using var h = new StudioHarness(session: true);
+            string id = SeedLiveGame(h);
+            AddThumbnails(h, id);
             await StorePageChores.IconAsync(h.Ctx, id, CancellationToken.None);
-            Assert.Single(h.Roblox.Requests, r => r.Url.EndsWith("/thumbnail/image"));
+            // An older studio put the first one up through the session and only counted it.
+            h.Ctx.Update(id, g => { g.Publish.StoreThumbnails.Clear(); g.Publish.StoreThumbnailsUploaded = 1; });
+            h.Roblox.Requests.Clear();
+
+            await StorePageChores.SweepAsync(h.Ctx, CancellationToken.None);
+
+            Assert.Equal(2, h.Roblox.Requests.Count(r => r.Url == ThumbnailUpload));
+            var publish = h.Game(id).Publish;
+            Assert.Equal(new[] { "thumb1.png", "thumb2.png", "thumb3.png" }, publish.StoreThumbnails.Select(t => t.File));
+            Assert.Equal(0, publish.StoreThumbnails[0].ImageId); // recorded, not re-uploaded
+            Assert.Equal(0, publish.StoreThumbnailsUploaded);
+
+            h.Roblox.Requests.Clear();
+            await StorePageChores.SweepAsync(h.Ctx, CancellationToken.None);
+            Assert.DoesNotContain(h.Roblox.Requests, r => r.Url == ThumbnailUpload);
+        }
+
+        [Fact]
+        public async Task AThumbnailRobloxRefuses_IsRetriedLater_AfterTheOnesThatWentUp()
+        {
+            using var h = new StudioHarness(session: true);
+            string id = SeedLiveGame(h);
+            AddThumbnails(h, id);
+            h.Roblox.ThumbnailsAccepted = 1;
+
+            Assert.False(await StorePageChores.IconAsync(h.Ctx, id, CancellationToken.None));
+
+            Assert.NotNull(h.Game(id).Publish.IconUploadedHash);
+            Assert.Equal(new[] { "thumb1.png" }, h.Game(id).Publish.StoreThumbnails.Select(t => t.File));
+            var chore = h.Ctx.Store.Read(s => s.Studio.Chores[StorePageChores.IconKey(id)]);
+            Assert.Equal(1, chore.Failures);
+            Assert.Contains(h.Ctx.Store.Read(s => s.Events.ToList()), e => e.Kind == "store.icon" && e.Message.StartsWith("Roblox did not accept the thumbnail thumb2.png yet"));
+
+            // Roblox takes them on the retry: the two left, not the first again.
+            h.Roblox.ThumbnailsAccepted = null;
+            h.Roblox.Requests.Clear();
+            h.Now = chore.NextAttemptUtc!.Value.AddSeconds(1);
+            await StorePageChores.SweepAsync(h.Ctx, CancellationToken.None);
+            Assert.Equal(2, h.Roblox.Requests.Count(r => r.Url == ThumbnailUpload));
+            Assert.Equal(new[] { "thumb1.png", "thumb2.png", "thumb3.png" }, h.Game(id).Publish.StoreThumbnails.Select(t => t.File));
+            Assert.False(h.Ctx.Store.Read(s => s.Studio.Chores.ContainsKey(StorePageChores.IconKey(id))));
+        }
+
+        [Fact]
+        public async Task WithoutASession_TheThumbnailsAreInTheOwnersTask()
+        {
+            using var h = new StudioHarness(session: false);
+            string id = SeedLiveGame(h);
+
+            await StorePageChores.SweepAsync(h.Ctx, CancellationToken.None);
+
+            var task = Assert.Single(Open(h), t => t.Kind == OwnerTaskKind.UploadIcon);
+            Assert.Equal("Upload the icon and thumbnails for \"Lava Forest Obby\"", task.Title);
+            Assert.Equal(new[] { "icon.png", "thumb1.png" }, task.Files);
         }
 
         [Fact]
