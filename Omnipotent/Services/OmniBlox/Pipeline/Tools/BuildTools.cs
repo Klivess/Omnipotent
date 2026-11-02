@@ -39,11 +39,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
 
             // ─────────────── game.json ───────────────
 
-            box.Add("get_manifest", "Show game.json: title, template, currencies, movement, tips, theme, sounds, quests, rebirth, template settings.", Object(), _ =>
+            box.Add("get_manifest", "Show game.json: title, currencies, movement, tips, theme, sounds, quests, rebirth, settings.", Object(), _ =>
                 ToolResult.Ok(JsonConvert.SerializeObject(ws.LoadManifest(), Formatting.Indented)));
 
             box.Add("update_manifest", "Change game.json. Only the fields you give change. Lists you give replace the old list. Sounds and music must be ids from search_sounds (licensed) or the kit's defaults.",
-                Object(Opt("title", Str("Game title")), Opt("template", Str("Template", GameKit.Templates.Keys.ToArray())), Opt("currency_name", Str("e.g. Coins, Gems")), Opt("currency_icon", Str("An emoji, e.g. 🪙")),
+                Object(Opt("title", Str("Game title")), Opt("currency_name", Str("e.g. Coins, Gems")), Opt("currency_icon", Str("An emoji, e.g. 🪙")),
                     Opt("starting_currency", Int("Main currency for new players")), Opt("currencies", Arr(Object(Req("name", Str("e.g. Gems")), Opt("icon", Str("Emoji")), Opt("start", Int("Starting amount")), Opt("leaderstat", Bool("Show on the leaderboard"))), "Extra currencies")),
                     Opt("walk_speed", Num("Default 16")), Opt("jump_power", Num("Default 50")), Opt("tips", StrList("Up to 3 short tips for the welcome card")),
                     Opt("music_id", Str("A licensed music id from search_sounds (APM or Roblox), or empty")), Opt("daily_rewards", Bool("Daily login rewards")), Opt("daily_reward", Int("Day-one reward (0 turns them off)")),
@@ -53,17 +53,13 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     Opt("quests", Arr(Object(Req("text", Str("What to do, e.g. 'Chop 5 trees'")), Req("event", Str("Event that counts: collect, sell, upgrade, stage, finish, unlock, zone, rebirth, coin, or your own")),
                         Opt("count", Int("How many (default 1)")), Opt("reward", Int("Main-currency reward")), Opt("reward_currency", Str("Pay in an extra currency instead")), Opt("target", Str("Part/model name or tag the guide line points at")), Opt("id", Str("Id"))), "The quest chain (replaces it)")),
                     Opt("rebirth", Object(Opt("enabled", Bool("On")), Opt("cost", Int("First rebirth's cost")), Opt("growth", Num("Cost multiplier per rebirth (2-3)")), Opt("bonus", Num("Earnings bonus per rebirth (0.5 = +50%)")), Opt("keep_upgrades", Bool("Keep upgrades on rebirth")))),
-                    Opt("template_settings", Free("Template settings to merge (simulator: BaseCapacity, Upgrades [{Key, Name, Icon, Costs:[...], Step}]; obby: StageReward, FinishReward; any: LeaderboardStat)"))),
+                    Opt("settings", Free("Values to merge that your systems read as Config.Settings (prices, tiers, tuning); the kit reads LeaderboardStat and DailyReward")),
+                    Opt("template_settings", Free("The same as settings (older games' name for it)"))),
                 args =>
                 {
                     var m = ws.LoadManifest();
                     var problems = new List<string>();
                     if (Args.Str(args, "title") is { Length: > 0 } title) m.Title = Clip(title, 60);
-                    if (Args.Str(args, "template") is { Length: > 0 } template)
-                    {
-                        if (!GameKit.Templates.ContainsKey(template)) return ToolResult.Error("unknown template");
-                        m.Template = template.ToLowerInvariant();
-                    }
                     if (Args.Str(args, "currency_name") is { Length: > 0 } cur) m.CurrencyName = Clip(cur, 20);
                     if (Args.Str(args, "currency_icon") is { Length: > 0 } icon) m.CurrencyIcon = Clip(icon, 8);
                     if (Args.Num(args, "starting_currency") is double sc) m.StartingCurrency = (int)Math.Clamp(sc, 0, 1_000_000);
@@ -118,8 +114,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                         if (rebirth["keep_upgrades"] != null) r.KeepUpgrades = Args.Bool(rebirth, "keep_upgrades");
                         m.Rebirth = r;
                     }
-                    if (args["template_settings"] is JObject ts)
-                        foreach (var p in ts.Properties()) m.TemplateSettings[p.Name] = p.Value;
+                    foreach (string key in new[] { "settings", "template_settings" })
+                        if (args[key] is JObject ts)
+                            foreach (var p in ts.Properties()) m.TemplateSettings[p.Name] = p.Value;
                     m.Save(ws.ManifestPath);
                     return problems.Count == 0 ? ToolResult.Ok("game.json updated.") : ToolResult.Ok("game.json updated, except:\n- " + string.Join("\n- ", problems));
                 });
@@ -205,7 +202,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 Object(),
                 async (_, ct) => ToolResult.Ok((await RunBuildAsync(ctx, gameId, ct)).Report));
 
-            box.Add("run_tests", "Run the game in Roblox's real engine — or, until the studio has the Roblox API key and an experience slot, in its local engine (a stand-in without physics, replication or clients): the kit's own checks, every module loading, the whole server booting for 8 s (every runtime error with its file and line), the world checks with the template's playthrough, and your specs. Takes about a minute. Run it after each meaningful change; the Build stage needs it to pass on the current build.",
+            box.Add("run_tests", "Run the game in Roblox's real engine — or, until the studio has the Roblox API key and an experience slot, in its local engine (a stand-in without physics, replication or clients): the kit's own checks, every module loading, the whole server booting for 8 s (every runtime error with its file and line), the world checks (spawn, products, quests, gates), and your specs — which are how your game's own loop is proven. Takes about a minute. Run it after each meaningful change; the Build stage needs it to pass on the current build.",
                 Object(),
                 async (_, ct) =>
                 {
@@ -247,7 +244,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 Object(Req("steps", Arr(Object(Req("name", Str("e.g. 'Iron axe'")), Req("cost", Num("Price")), Req("income_per_minute", Num("Earnings per minute while saving for it"))), "In order"))),
                 args => ToolResult.Ok(Pacing((args["steps"] as JArray ?? new JArray()).OfType<JObject>().Select(s => (Args.Str(s, "name"), Args.Num(s, "cost") ?? 0, Args.Num(s, "income_per_minute") ?? 0)).ToList())));
 
-            box.Add("kit_reference", "Game Kit documentation: 'overview' (how a game is put together), 'modules' (every server/shared API with exact signatures), 'client' (the HUD API for your controllers, UI style), 'tags', 'templates', 'progression' (zones, rebirth, quests), 'world' (how to build a great map), 'luau' (conventions with examples), 'juice' (effects and sounds), 'testing' (run_tests and writing specs).",
+            box.Add("kit_reference", "Game Kit documentation: 'overview' (how a game is put together), 'modules' (every server/shared API with exact signatures), 'client' (the HUD API for your controllers, UI style), 'tags', 'progression' (zones, gates, rebirth, quests), 'world' (how to design and build a great map), 'luau' (conventions with examples), 'juice' (effects and sounds), 'testing' (run_tests and writing specs).",
                 Object(Req("topic", Str("Topic", KitDocs.Topics))),
                 args => ToolResult.Ok(KitDocs.For(Args.Required(args, "topic"))));
 
@@ -304,7 +301,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
 
         public sealed record BuildRun(bool Ok, string Report, CompileResult Compile, List<GeometryIssue> Geometry, LuauAnalysis? Types, MapAnalysis Map, EconomyReport? Economy = null);
 
-        /// <summary>The economy check for a simulator (null for other templates): a bot plays the game's own numbers on its map.</summary>
+        /// <summary>The economy check for a game made from the old simulator template (null for every other game): a bot plays its numbers on its map.</summary>
         public static EconomyReport? EconomyOf(GameManifest manifest, SceneDocument scene) =>
             string.Equals(manifest.Template, "simulator", StringComparison.OrdinalIgnoreCase) && scene.Objects.Any(o => o.Tags.Contains("Resource", StringComparer.OrdinalIgnoreCase))
                 ? Economy.Simulate(SimulatorEconomy.FromGame(manifest, scene))

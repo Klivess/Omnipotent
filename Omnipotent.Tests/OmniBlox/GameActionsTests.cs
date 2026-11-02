@@ -23,7 +23,7 @@ namespace Omnipotent.Tests.OmniBlox
         {
             await h.Harvester.RunOnceAsync(None);
             PipelineEndToEndTests.ScriptResearch(h.Llm);
-            PipelineEndToEndTests.ScriptBuild(h.Llm);
+            PipelineEndToEndTests.ScriptBuild(h);
             PipelineEndToEndTests.ScriptReview(h.Llm);
             PipelineEndToEndTests.ScriptMarketing(h.Llm);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason?.Contains("sign it off") == true, 40);

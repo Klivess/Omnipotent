@@ -40,10 +40,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 args =>
                 {
                     string path = Args.Required(args, "path");
+                    // The kit as this game has it (only games made from an old template have its module).
+                    var kit = GameKit.FilesFor(ws.LoadManifest().Template).ToList();
                     string? text = path.StartsWith("GameKit/", StringComparison.OrdinalIgnoreCase)
-                        ? GameKit.Files.FirstOrDefault(k => ("GameKit/" + k.Path).Equals(path, StringComparison.OrdinalIgnoreCase))?.Source
+                        ? kit.FirstOrDefault(k => ("GameKit/" + k.Path).Equals(path, StringComparison.OrdinalIgnoreCase))?.Source
                         : ws.ReadFile(path);
-                    if (text == null) return ToolResult.Error("no such file" + (path.StartsWith("GameKit/", StringComparison.OrdinalIgnoreCase) ? " (kit files: " + string.Join(", ", GameKit.Files.Select(k => "GameKit/" + k.Path)) + ")" : ""));
+                    if (text == null) return ToolResult.Error("no such file" + (path.StartsWith("GameKit/", StringComparison.OrdinalIgnoreCase) ? " (kit files: " + string.Join(", ", kit.Select(k => "GameKit/" + k.Path)) + ")" : ""));
                     var lines = text.Split('\n');
                     int start = Math.Max(1, Args.Int(args, "start_line", 1));
                     int end = Math.Min(lines.Length, Args.Int(args, "end_line", Math.Min(lines.Length, start + MaxReadLines - 1)));
@@ -128,7 +130,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     }
                     int limit = Math.Clamp(Args.Int(args, "limit", 40), 1, 200);
                     var sources = ws.ListFiles().Select(f => (f.Path, Text: ws.ReadFile(f.Path) ?? "")).ToList();
-                    if (Args.Bool(args, "include_kit")) sources.AddRange(GameKit.Files.Select(k => ("GameKit/" + k.Path, k.Source)));
+                    if (Args.Bool(args, "include_kit")) sources.AddRange(GameKit.FilesFor(ws.LoadManifest().Template).Select(k => ("GameKit/" + k.Path, k.Source)));
                     var sb = new StringBuilder();
                     int found = 0;
                     foreach (var (path, text) in sources)
@@ -151,7 +153,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
         {
             why = null;
             if (path.Equals("game.json", StringComparison.OrdinalIgnoreCase)) { why = "edit game.json with update_manifest"; return false; }
-            if (path.Equals("scene.json", StringComparison.OrdinalIgnoreCase)) { why = "change the world with the world tools (design_world, place_asset, scatter_assets, add_objects, update_objects, terrain_sculpt…)"; return false; }
+            if (path.Equals("scene.json", StringComparison.OrdinalIgnoreCase)) { why = "change the world with the world tools (terrain_generate, terrain_sculpt, plan_map, dress_area, build_prop, place_asset, scatter_assets, add_objects, update_objects…)"; return false; }
             if (path.StartsWith("src/", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".md", StringComparison.OrdinalIgnoreCase) || path.EndsWith(".txt", StringComparison.OrdinalIgnoreCase)) return true;
             why = "scripts live under src/ (server/, server/systems/, client/, client/controllers/, shared/, character/, gui/ or tests/); notes go in design.md";
             return false;

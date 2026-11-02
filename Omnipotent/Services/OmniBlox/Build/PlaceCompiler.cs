@@ -106,13 +106,13 @@ namespace Omnipotent.Services.OmniBlox.Build
                 if (s.Container == "server" && s.ClassName == "ModuleScript" && (s.FolderPath.Length == 0 || !KnownFolders.ContainsKey(s.FolderPath[0])))
                     result.Warnings.Add($"{s.RelativePath}: a module in src/server only runs when something requires it; put game systems in src/server/systems/ with a Start() function so the kit starts them (and the engine tests can).");
             }
-            foreach (var k in GameKit.Files)
+            var kitFiles = GameKit.FilesFor(manifest.Template).ToList();
+            foreach (var k in kitFiles)
                 foreach (var issue in LuauSyntax.Check(k.Source).Where(i => i.IsError))
                     result.Errors.Add($"GameKit/{k.Path}:{issue.Line}:{issue.Column}: {issue.Message}");
 
+            // Only a game made from one of the old templates still runs it; every other game runs its own systems.
             string templateModule = GameKit.TemplateModule(manifest.Template);
-            if (!GameKit.Templates.ContainsKey(manifest.Template ?? ""))
-                result.Warnings.Add($"game.json template '{manifest.Template}' is unknown; using sandbox (no template). Known: {string.Join(", ", GameKit.Templates.Keys)}.");
 
             if (scene.Land != null)
             {
@@ -146,9 +146,9 @@ namespace Omnipotent.Services.OmniBlox.Build
             // 3. Kit + generated config.
             var kitShared = replicated.AddChild(new RbxInstance("Folder", "OmniKit"));
             var kitServer = serverScripts.AddChild(new RbxInstance("Folder", "OmniKitServer"));
-            var kitTemplates = kitServer.AddChild(new RbxInstance("Folder", "Templates"));
+            var kitTemplates = templateModule.Length > 0 ? kitServer.AddChild(new RbxInstance("Folder", "Templates")) : null;
             var kitSpecs = kitServer.AddChild(new RbxInstance("Folder", "Specs"));
-            foreach (var k in GameKit.Files)
+            foreach (var k in kitFiles)
             {
                 string stem = StripScriptSuffix(k.FileName, out string cls);
                 var parts = k.Path.Split('/');
@@ -156,7 +156,7 @@ namespace Omnipotent.Services.OmniBlox.Build
                 {
                     "Shared" => kitShared,
                     "Client" => playerScripts,
-                    "Server" when parts.Length > 2 && parts[1] == "Templates" => kitTemplates,
+                    "Server" when parts.Length > 2 && parts[1] == "Templates" => kitTemplates!,
                     "Server" when parts.Length > 2 && parts[1] == "Specs" => kitSpecs,
                     "Server" when cls == "Script" => serverScripts,
                     _ => kitServer,
@@ -330,6 +330,8 @@ namespace Omnipotent.Services.OmniBlox.Build
                 {
                     ["Enabled"] = r.Enabled, ["Cost"] = r.Cost, ["Growth"] = r.Growth, ["Bonus"] = r.Bonus, ["KeepUpgrades"] = r.KeepUpgrades,
                 } : null,
+                // The game's own settings (game.json settings); "Template" is the name older games' code reads them by.
+                ["Settings"] = template,
                 ["Template"] = template,
                 ["Terrain"] = terrainConfig,
                 ["Water"] = terrain?.WaterLevel != null ? new Dictionary<string, object?> { ["Color"] = WaterColor(scene), ["Transparency"] = 0.3 } : null,

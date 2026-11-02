@@ -28,8 +28,10 @@ namespace Omnipotent.Services.OmniBlox.Build
         public Dictionary<string, FolderSpec> Folders { get; set; } = new(StringComparer.OrdinalIgnoreCase);
         /// <summary>The map plan: zones, the paths between them and the landmarks a player navigates by.</summary>
         public LayoutPlan Layout { get; set; } = new();
-        /// <summary>The design the world was generated from (<see cref="WorldGen.WorldGenerator"/>); null for a hand-built world.</summary>
-        public WorldGen.WorldSpec? Spec { get; set; }
+        /// <summary>The map's art-style family (stylized, voxel or realistic); empty: the one the library covers best for its biome.</summary>
+        public string Style { get; set; } = "";
+        /// <summary>Models the builder chose for a role everywhere on this map (role → asset ids): what dress_area and role placement use first.</summary>
+        public Dictionary<string, List<long>> Palette { get; set; } = new(StringComparer.OrdinalIgnoreCase);
 
         public SceneObject? Find(string id) => Objects.FirstOrDefault(o => o.Id == id);
 
@@ -128,8 +130,10 @@ namespace Omnipotent.Services.OmniBlox.Build
 
     /// <summary>
     /// Generated terrain, as a recipe the agent edits and <see cref="TerrainBuilder"/> bakes into a heightmap.
-    /// Ground level is y = 0 over the flat core; hills rise outside it; a border of mountains (or water) frames
-    /// the map; the operations then sculpt it in order (flatten a plaza, raise a hill, dig a lake, lay a path).
+    /// The landform (<see cref="Shape"/>) gives the map its character — a basin ringed by mountains, an island, an
+    /// archipelago, a coast, a valley, a canyon, a mountain, terraced highlands, a crater, open plains — with a
+    /// flat core at y = 0 for building where the shape has one; the edge (<see cref="Edge"/>) frames it; the
+    /// operations then sculpt it in order (flatten a plaza, raise a ridge, dig a lake, cut a canyon, lay a path).
     /// </summary>
     public sealed class TerrainRecipe
     {
@@ -141,8 +145,18 @@ namespace Omnipotent.Services.OmniBlox.Build
         public float Cell { get; set; } = 4;
         /// <summary>The ground's material; null means the biome's own (grass for a meadow, sand for a desert, snow…).</summary>
         public string? Material { get; set; }
-        /// <summary>meadow, forest, desert, snow, beach, volcanic, candy: picks the materials of slopes, peaks and shores.</summary>
+        /// <summary>The look of ground, slopes, peaks and shores (see <see cref="TerrainBuilder.BiomeNames"/>); paint steps can give areas another biome.</summary>
         public string Biome { get; set; } = "meadow";
+        /// <summary>The landform: basin (default), plains, island, archipelago, coast, valley, canyon, mountain, highlands, crater.</summary>
+        public string Shape { get; set; } = "basin";
+        /// <summary>What frames the map at its edges: mountains, sea, cliffs or none; empty: what suits the shape (sea round islands and coasts, mountains elsewhere).</summary>
+        public string Edge { get; set; } = "";
+        /// <summary>The direction a valley, canyon or coast runs, in degrees (0 = along Z; for a coast, where the sea lies: 0 = −Z, 90 = +X).</summary>
+        public float Direction { get; set; }
+        /// <summary>Islands in an archipelago (2-8, the first in the middle).</summary>
+        public int Islands { get; set; } = 4;
+        /// <summary>Height of the shape's big feature in studs (a mountain's peak, valley walls, a canyon's rim, a crater's rim); 0: the shape's default.</summary>
+        public float Relief { get; set; }
         /// <summary>Rolling hills outside the flat core: height in studs (0 = flat everywhere).</summary>
         public float Hills { get; set; } = 10;
         /// <summary>How wide hills are (studs between bumps).</summary>
@@ -163,23 +177,30 @@ namespace Omnipotent.Services.OmniBlox.Build
         public List<TerrainOp> Ops { get; set; } = new();
     }
 
-    /// <summary>One sculpting step: flatten, raise, lower, lake, path, ramp, paint or plateau.</summary>
+    /// <summary>
+    /// One sculpting step: flatten, plateau, raise, lower, mesa, mountain, crater, island, lake, ridge, canyon,
+    /// river, path, ramp, terrace, roughen, smooth or paint (see <see cref="TerrainBuilder"/>).
+    /// </summary>
     public sealed class TerrainOp
     {
         public string Kind { get; set; } = "flatten";
         /// <summary>Centre (x, z) for round operations.</summary>
         public float[]? Center { get; set; }
         public float Radius { get; set; } = 30;
-        /// <summary>Points (x, z) of a path or polygon.</summary>
+        /// <summary>Points (x, z) of a path, ridge, canyon or river, or of a polygon an area step covers instead of a circle.</summary>
         public List<float[]>? Points { get; set; }
         public float Width { get; set; } = 12;
-        /// <summary>Target height for flatten/plateau, amount for raise/lower, depth for a lake; a ramp's height at its first point.</summary>
+        /// <summary>Target height for flatten/plateau/mesa/island, amount for raise/lower/mountain/ridge/roughen, depth for a lake/canyon/crater; a ramp's height at its first point; a terrace's step.</summary>
         public float Height { get; set; }
         /// <summary>A ramp's height at its last point (it climbs evenly between).</summary>
         public float? EndHeight { get; set; }
         public string? Material { get; set; }
+        /// <summary>Paint a biome's look (ground, slopes, peaks, shores) over the area instead of one material.</summary>
+        public string? Biome { get; set; }
         /// <summary>How soft the edge is (0 = hard, 1 = very soft).</summary>
         public float Falloff { get; set; } = 0.5f;
+        /// <summary>How ragged a round area's outline is (0 = a circle … 0.5 = a wandering blob), so places do not look stamped.</summary>
+        public float Rough { get; set; }
     }
 
     /// <summary>A folder's own properties: a Model instead of a Folder, and tags and values the kit reads (TycoonPlot…).</summary>
@@ -331,8 +352,12 @@ namespace Omnipotent.Services.OmniBlox.Build
     public sealed class GameManifest
     {
         public string Title { get; set; } = "";
-        /// <summary>Game Kit template: obby, tycoon, simulator or sandbox (a game that runs its own core loop).</summary>
-        public string Template { get; set; } = "sandbox";
+        /// <summary>
+        /// Empty for every game the studio makes now: each runs its own core loop (its systems). A game made before the
+        /// templates were abolished keeps the name of the one it was made from (obby, tycoon or simulator), and the
+        /// compiler keeps that kit module in it (<see cref="GameKit.LegacyTemplates"/>) so it goes on working.
+        /// </summary>
+        public string Template { get; set; } = "";
         public float WalkSpeed { get; set; } = 16;
         public float JumpPower { get; set; } = 50;
         public string CurrencyName { get; set; } = "Coins";
@@ -342,7 +367,7 @@ namespace Omnipotent.Services.OmniBlox.Build
         /// <summary>Extra currencies (gems, candy…) beside the main one.</summary>
         public List<CurrencySpec> Currencies { get; set; } = new();
         public bool DailyRewards { get; set; } = true;
-        /// <summary>The day-one daily reward (each streak day pays this times the streak). Null: the template's default.</summary>
+        /// <summary>The day-one daily reward (each streak day pays this times the streak). Null: the kit's default.</summary>
         public int? DailyReward { get; set; }
         public bool Leaderboard { get; set; } = true;
         public bool Feedback { get; set; } = true;
@@ -356,7 +381,10 @@ namespace Omnipotent.Services.OmniBlox.Build
         /// <summary>The onboarding quest chain.</summary>
         public List<QuestSpec> Quests { get; set; } = new();
         public RebirthSpec? Rebirth { get; set; }
-        /// <summary>Free-form values the template reads (e.g. obby stage count, tycoon income rate).</summary>
+        /// <summary>
+        /// Free-form values the game's own systems read (Config.Settings; the kit reads LeaderboardStat and DailyReward).
+        /// The name is kept so older games' game.json still loads.
+        /// </summary>
         public Dictionary<string, object> TemplateSettings { get; set; } = new();
 
         public static GameManifest Load(string path)

@@ -1,13 +1,14 @@
 -- OmniKit · Client
 -- The HUD every game gets, in one consistent, kid-friendly style: animated currency counters, a side menu
--- of big icon buttons (shop, upgrades, rebirth, settings, feedback), the template's widget (obby stage bar,
--- tycoon bank, simulator bag), a quest tracker with a glowing guide line to the next goal, a welcome card,
--- toasts and effects (sparkle bursts, floating "+25 🪙", sounds) sent by the server.
+-- of big icon buttons (shop, rebirth, settings, feedback), a quest tracker with a glowing guide line to the
+-- next goal, a welcome card, toasts and effects (sparkle bursts, floating "+25 🪙", sounds) sent by the server.
+-- Games made before the templates were abolished also get their template's widget (obby stage bar, tycoon
+-- bank, simulator bag and action button).
 --
 -- The game's own client code lives in ModuleScripts in StarterPlayerScripts.Controllers
 -- (src/client/controllers/*.luau). Each returns a table with Start(hud); the hud gives them this same
--- look: hud.Toast, hud.Floating, hud.AddMenuButton, hud.Modal, hud.Card, hud.Button, hud.ProgressBar,
--- hud.Counter, hud.Root, hud.Theme, hud.Sounds.
+-- look: hud.Toast, hud.Floating, hud.AddMenuButton, hud.AddPanel, hud.Modal, hud.Card, hud.Button,
+-- hud.ProgressBar, hud.Counter, hud.TopBar, hud.Root, hud.Theme, hud.Sounds.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -256,7 +257,7 @@ task.spawn(function()
 	end)
 end)
 
--- ─────────────────────────────── template widgets ───────────────────────────────
+-- ─────────────── the top bar, and a legacy template's widget (games made from one) ───────────────
 
 local top = UI.ProgressBar(root, UDim2.fromOffset(420, 46), UDim2.new(0.5, 0, 0, 20), Theme.Accent, Vector2.new(0.5, 0))
 top.Frame.Visible = false
@@ -819,6 +820,10 @@ local hud = {
 		UI.Floating(root, text, color)
 	end,
 	AddMenuButton = addMenuButton,
+	-- A panel a stand in the world opens (a stand tagged Stand with config Panel = name).
+	AddPanel = function(name: string, open: () -> ())
+		panels[name] = open
+	end,
 	Modal = function(title: string, icon: string?)
 		return UI.Modal(root, title, icon)
 	end,

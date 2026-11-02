@@ -387,6 +387,34 @@ namespace Omnipotent.Services.OmniTumblr.Models
         public DateTime? CreatedUtc { get; set; }
     }
 
+    /// <summary>
+    /// What a piece of media looks like, compactly, so the same clip is recognised under another content key
+    /// (Instagram meme accounts repost each other's videos, so one clip arrives as several reels).
+    /// See <c>OmniTumblrFingerprintMath</c>.
+    /// </summary>
+    public sealed class MediaFingerprint
+    {
+        /// <summary>2: whole-frame and moving-region hashes with informative-bit masks (v1: whole frame only, plus a loudness envelope).</summary>
+        public const int CurrentVersion = 2;
+        public int Version { get; set; } = CurrentVersion;
+        public double? DurationSeconds { get; set; }
+        /// <summary>Base64 of (hash, mask) pairs of 64-bit words, one per half second of video (one for an image), for the whole frame.</summary>
+        public string Frames { get; set; } = "";
+        /// <summary>The same for the part of the frame that moves (static caption bars and borders cut away).</summary>
+        public string Region { get; set; } = "";
+        public DateTime ComputedUtc { get; set; }
+
+        [JsonIgnore] private Engine.FrameHash[]? whole, region, mirroredWhole, mirroredRegion;
+        [JsonIgnore] private bool? still;
+        /// <summary>A picture held still (or a photo): matched strictly, since it rests on one frame.</summary>
+        [JsonIgnore] internal bool IsStill => still ??= Engine.OmniTumblrFingerprintMath.DistinctFrames(WholeHashes) <= Engine.OmniTumblrFingerprintMath.StillDistinctFrames;
+        [JsonIgnore] internal Engine.FrameHash[] WholeHashes => whole ??= Engine.OmniTumblrFingerprintMath.Decode(Frames);
+        [JsonIgnore] internal Engine.FrameHash[] RegionHashes => region ??= Engine.OmniTumblrFingerprintMath.Decode(Region);
+        /// <summary>The hashes the clip would have flipped left to right (reposts sometimes mirror a clip).</summary>
+        [JsonIgnore] internal Engine.FrameHash[] MirroredWhole => mirroredWhole ??= Array.ConvertAll(WholeHashes, Engine.OmniTumblrFingerprintMath.Mirror);
+        [JsonIgnore] internal Engine.FrameHash[] MirroredRegion => mirroredRegion ??= Array.ConvertAll(RegionHashes, Engine.OmniTumblrFingerprintMath.Mirror);
+    }
+
     public sealed class CaptionInfo
     {
         public CaptionMode Mode { get; set; }

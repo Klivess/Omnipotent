@@ -51,9 +51,9 @@ namespace Omnipotent.Services.OmniBlox.Build
                 {
                     var e = catalog(id);
                     float scale = o.Scale <= 0 ? 1 : o.Scale;
-                    float oldSeat = e != null ? WorldGen.Generation.SeatOn(Old, e, x, z, o.Yaw, scale).Y : Old(x, z) - 0.3f;
+                    float oldSeat = e != null ? WorldGen.Landscaper.SeatOn(Old, e, x, z, o.Yaw, scale).Y : Old(x, z) - 0.3f;
                     if (MathF.Abs(o.Position[1] - oldSeat) > 1.5f && MathF.Abs(o.Position[1] - Old(x, z)) > 1.5f) continue;
-                    float y = e != null ? WorldGen.Generation.SeatOn(New, e, x, z, o.Yaw, scale).Y : New(x, z) - 0.3f;
+                    float y = e != null ? WorldGen.Landscaper.SeatOn(New, e, x, z, o.Yaw, scale).Y : New(x, z) - 0.3f;
                     if (MathF.Abs(y - o.Position[1]) < 0.05f) continue;
                     o.Position[1] = MathF.Round(y, 2);
                     moved++;
@@ -273,6 +273,47 @@ namespace Omnipotent.Services.OmniBlox.Build
                 spots.Add(new Spot(x, GroundAt(scene, terrain, x, z), z, yaw));
             }
             return spots;
+        }
+
+        /// <summary>The yaw (degrees, 0 = facing −Z) that turns something at one point to face another.</summary>
+        public static float YawToward(float fromX, float fromZ, float toX, float toZ)
+        {
+            float dx = toX - fromX, dz = toZ - fromZ;
+            if (dx * dx + dz * dz < 1e-6f) return 0;
+            float len = MathF.Sqrt(dx * dx + dz * dz);
+            return WorldGen.PropBuilder.Norm(MathF.Atan2(-dx / len, -dz / len) * 180 / MathF.PI);
+        }
+
+        /// <summary>Direction for a yaw in degrees (0 = −Z, 90 = −X… as Roblox turns): where something with this yaw faces.</summary>
+        public static (float X, float Z) Facing(float yaw)
+        {
+            float r = yaw * MathF.PI / 180;
+            return (-MathF.Sin(r), -MathF.Cos(r));
+        }
+
+        public static float PathLength(List<float[]> pts)
+        {
+            float len = 0;
+            for (int i = 0; i + 1 < pts.Count; i++) len += MathF.Sqrt((pts[i + 1][0] - pts[i][0]) * (pts[i + 1][0] - pts[i][0]) + (pts[i + 1][1] - pts[i][1]) * (pts[i + 1][1] - pts[i][1]));
+            return len;
+        }
+
+        /// <summary>The point <paramref name="t"/> studs along a polyline, with the unit direction of travel there.</summary>
+        public static (float X, float Z, float Ux, float Uz) PointAlong(List<float[]> pts, float t)
+        {
+            for (int i = 0; i + 1 < pts.Count; i++)
+            {
+                float dx = pts[i + 1][0] - pts[i][0], dz = pts[i + 1][1] - pts[i][1];
+                float len = MathF.Sqrt(dx * dx + dz * dz);
+                if (len < 1e-4f) continue;
+                if (t <= len || i + 2 == pts.Count)
+                {
+                    float k = Math.Clamp(t / len, 0, 1);
+                    return (pts[i][0] + dx * k, pts[i][1] + dz * k, dx / len, dz / len);
+                }
+                t -= len;
+            }
+            return (pts[0][0], pts[0][1], 0, -1);
         }
     }
 }

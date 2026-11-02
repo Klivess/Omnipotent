@@ -227,7 +227,10 @@ namespace Omnipotent.Services.OmniBlox.Core
         public string ConceptId { get; set; } = "";
         public string Pitch { get; set; } = "";
         public string Genre { get; set; } = "";
+        /// <summary>Only on concepts from before the templates were abolished (obby, tycoon, simulator).</summary>
         public string Template { get; set; } = "";
+        /// <summary>The world it would be set in, in a sentence.</summary>
+        public string World { get; set; } = "";
         public string CoreLoop { get; set; } = "";
         public string Twist { get; set; } = "";
         public List<string> Evidence { get; set; } = new();
@@ -253,9 +256,17 @@ namespace Omnipotent.Services.OmniBlox.Core
     {
         public string Title { get; set; } = "";
         public string Genre { get; set; } = "";
-        /// <summary>The Game Kit template this game starts from (obby, tycoon, simulator, …).</summary>
+        /// <summary>
+        /// Empty for every brief now. A game researched before the templates were abolished keeps the one it was made
+        /// from (obby, tycoon or simulator); nothing new is made from one.
+        /// </summary>
         public string Template { get; set; } = "";
         public string Pitch { get; set; } = "";
+        /// <summary>
+        /// The map, as a designer would pitch it: its shape and landforms, the places in it, how players move through
+        /// them, what they see from the spawn, and what makes it unlike the studio's earlier maps.
+        /// </summary>
+        public string World { get; set; } = "";
         public string TargetPlayers { get; set; } = "";
         public string CoreLoop { get; set; } = "";
         public List<string> MustHave { get; set; } = new();

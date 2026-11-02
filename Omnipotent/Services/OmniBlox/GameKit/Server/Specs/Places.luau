@@ -1,6 +1,6 @@
 -- Kit spec: the world is playable, after the server has started — a spawn exists, nothing sits below the
 -- fall height, tagged parts are configured, every product's grant has a handler, quest targets and zone
--- gates make sense, and the template's own loop works for a stand-in player when the game uses it.
+-- gates make sense, and, for a game made from one of the old templates, that template's loop works for a stand-in player.
 
 local CollectionService = game:GetService("CollectionService")
 
@@ -13,6 +13,8 @@ local Progression = require(Kit.Progression)
 local Util = require(game:GetService("ReplicatedStorage"):WaitForChild("OmniKit"):WaitForChild("Util"))
 
 local template = string.lower(Config.TemplateName or "")
+-- Only a game made from one of the old templates has the Templates folder (and these checks of its loop).
+local Templates: any = Kit:FindFirstChild("Templates")
 
 local function targetExists(target: string): boolean
 	return workspace:FindFirstChild(target, true) ~= nil or #CollectionService:GetTagged(target) > 0
@@ -107,7 +109,7 @@ local spec = {
 
 if template == "obby" then
 	spec["obby stages run 1..N with a finish"] = function(t)
-		local Obby = require(Kit.Templates.Obby) :: any
+		local Obby = require(Templates.Obby) :: any
 		local checkpoints = Obby.Index()
 		t.ok(Obby.StageCount >= 2, "an obby needs at least two stages")
 		for stage = 1, Obby.StageCount do
@@ -117,7 +119,7 @@ if template == "obby" then
 	end
 
 	spec["obby advances one stage at a time"] = function(t)
-		local Obby = require(Kit.Templates.Obby) :: any
+		local Obby = require(Templates.Obby) :: any
 		Obby.Index()
 		if Obby.StageCount < 3 then
 			t.skip("fewer than three stages")
@@ -131,7 +133,7 @@ if template == "obby" then
 	end
 elseif template == "tycoon" then
 	spec["tycoon buttons unlock real items"] = function(t)
-		local Tycoon = require(Kit.Templates.Tycoon) :: any
+		local Tycoon = require(Templates.Tycoon) :: any
 		local plots = Tycoon.Plots()
 		t.ok(#plots > 0, "a tycoon needs at least one folder or model tagged TycoonPlot (use set_folder to tag one)")
 		for _, plot in ipairs(plots) do
@@ -147,7 +149,7 @@ elseif template == "tycoon" then
 	-- A player claims a plot and buys it out, button by button in the order the buttons require, earning
 	-- income from what they bought and banking it at the collector.
 	spec["a tycoon plot can be bought out from start to finish"] = function(t)
-		local Tycoon = require(Kit.Templates.Tycoon) :: any
+		local Tycoon = require(Templates.Tycoon) :: any
 		local plots = Tycoon.Plots()
 		if #plots == 0 then
 			t.skip("no plots")
@@ -188,13 +190,13 @@ elseif template == "simulator" then
 	-- The whole loop a new player goes through, on the real map: harvest in the first zone, sell, buy a better
 	-- tool, then unlock every zone in order and harvest there too; a broken node grows back.
 	spec["simulator: every zone can be unlocked in order and harvested"] = function(t)
-		local Simulator = require(Kit.Templates.Simulator) :: any
+		local Simulator = require(Templates.Simulator) :: any
 		local nodes = Simulator.Nodes()
 		if #nodes == 0 then
 			if #CollectionService:GetTagged("Collectible") > 0 then
 				t.skip("the map uses walk-over Collectibles rather than resource nodes")
 			end
-			t.fail("a simulator needs resource nodes (models tagged Resource with Zone, Hp, Value) or Collectibles; regenerate the world (design_world)")
+			t.fail("a simulator needs resource nodes (models tagged Resource with Zone, Hp, Value) or Collectibles in its zones")
 			return
 		end
 		t.ok(#CollectionService:GetTagged("SellZone") > 0, "there is a part tagged SellZone to sell at")
@@ -283,7 +285,7 @@ elseif template == "simulator" then
 	end
 
 	spec["simulator: every node belongs to a real zone and has sane values"] = function(t)
-		local Simulator = require(Kit.Templates.Simulator) :: any
+		local Simulator = require(Templates.Simulator) :: any
 		local nodes = Simulator.Nodes()
 		if #nodes == 0 then
 			t.skip("no resource nodes")

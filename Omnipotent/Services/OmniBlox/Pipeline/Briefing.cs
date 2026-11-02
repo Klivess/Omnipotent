@@ -1,4 +1,5 @@
 using System.Text;
+using Omnipotent.Services.OmniBlox.Build;
 using Omnipotent.Services.OmniBlox.Core;
 using Omnipotent.Services.OmniBlox.Insights;
 
@@ -44,8 +45,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             if (game.Brief is { } b)
             {
                 sb.AppendLine("## The brief");
-                sb.AppendLine($"Title: {b.Title} · Genre: {b.Genre} · Template: {b.Template} · Players: {b.TargetPlayers}");
+                sb.AppendLine($"Title: {b.Title} · Genre: {b.Genre} · Players: {b.TargetPlayers}" + (b.Template.Length > 0 ? $" · Made from the old {b.Template} template (its kit module still runs this game)" : ""));
                 sb.AppendLine($"Pitch: {b.Pitch}");
+                if (b.World.Length > 0) sb.AppendLine($"World: {b.World}");
                 sb.AppendLine($"Core loop: {b.CoreLoop}");
                 if (b.MustHave.Count > 0) sb.AppendLine("Must have:\n" + string.Join("\n", b.MustHave.Select(m => "- " + m)));
                 if (b.NiceToHave.Count > 0) sb.AppendLine("Nice to have: " + string.Join("; ", b.NiceToHave));
@@ -65,7 +67,15 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 sb.AppendLine();
             }
 
-            var lessons = ctx.Playbook.ForStage(game.Stage, game.Brief?.Template ?? game.Brief?.Genre, 6);
+            // The studio's other games: what not to repeat (the studio's games used to all come out alike).
+            if (game.Stage is GameStage.Research or GameStage.Build && EarlierGames(ctx, game.GameId) is { Length: > 0 } earlier)
+            {
+                sb.AppendLine("## The studio's other games (make this one different: another genre, loop and map shape)");
+                sb.Append(earlier);
+                sb.AppendLine();
+            }
+
+            var lessons = ctx.Playbook.ForStage(game.Stage, game.Brief?.Genre is { Length: > 0 } genre ? genre : game.Brief?.Template, 6);
             if (lessons.Count > 0)
             {
                 sb.AppendLine("## Lessons from the studio's Playbook");
@@ -123,7 +133,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 case GameStage.Research:
                     if (game.Research.Findings.Count > 0) sb.AppendLine("Findings so far:\n" + string.Join("\n", game.Research.Findings.TakeLast(20).Select(f => "- " + f)));
                     if (game.Concepts.Count > 0)
-                        sb.AppendLine("Concepts:\n" + string.Join("\n", game.Concepts.Select(c => $"- {c.ConceptId}{(c.Chosen ? " (CHOSEN)" : "")}: {c.Pitch} [{c.Genre}/{c.Template}] score {c.Scores.Total:0.##}")));
+                        sb.AppendLine("Concepts:\n" + string.Join("\n", game.Concepts.Select(c => $"- {c.ConceptId}{(c.Chosen ? " (CHOSEN)" : "")}: {c.Pitch} [{c.Genre}]" + (c.World.Length > 0 ? $" world: {c.World}" : "") + $" score {c.Scores.Total:0.##}")));
                     break;
                 case GameStage.Build:
                 case GameStage.Test:
@@ -227,6 +237,27 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             {
                 return null;
             }
+        }
+
+        /// <summary>
+        /// One line per other game of the studio: its stage, genre, world and the map it got (landform, edge, biome,
+        /// how many places) — what research and the builder must not repeat. Empty when this is the first game.
+        /// </summary>
+        public static string EarlierGames(StudioContext ctx, string? exceptGameId)
+        {
+            var games = ctx.Store.Read(s => s.Games.Values.Where(g => g.GameId != exceptGameId && g.Brief != null).OrderBy(g => g.CreatedUtc).Select(OmniBloxStore.Clone).ToList());
+            var sb = new StringBuilder();
+            foreach (var g in games.TakeLast(12))
+            {
+                var b = g.Brief!;
+                sb.Append($"- \"{g.DisplayTitle}\" ({g.Stage}): {(b.Genre.Length > 0 ? b.Genre : "?")}" + (b.Template.Length > 0 ? $", made from the old {b.Template} template" : ""));
+                if (b.World.Length > 0) sb.Append("; world: " + Clip(b.World, 160));
+                var ws = ctx.Workspace(g.GameId);
+                if (ws.Exists && ws.LoadScene() is { Land: { } land } scene)
+                    sb.Append($"; map: {TerrainBuilder.ShapeOf(land)}, {TerrainBuilder.EdgeOf(land)} edge, {land.Biome}" + (scene.Layout.Zones.Count > 0 ? $", {scene.Layout.Zones.Count} places" : ""));
+                sb.AppendLine();
+            }
+            return sb.ToString();
         }
 
         private static string Clip(string s, int max) => s.Length <= max ? s : s[..max] + "…";

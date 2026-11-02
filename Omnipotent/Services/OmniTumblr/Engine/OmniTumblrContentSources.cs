@@ -136,9 +136,11 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         /// <summary>
         /// Up to <paramref name="needed"/> candidates in the strategy's preferred order, excluding
         /// <paramref name="excluded"/> keys. Probes durations lazily, only for the candidates it returns.
+        /// <paramref name="accept"/>, if given, has the last word on each candidate (the planner's repeat check).
         /// </summary>
         public async Task<List<ContentCandidate>> FindCandidatesAsync(OmniTumblrStrategy strategy, string blogId,
-            IReadOnlySet<string> excluded, int needed, DateTime nowUtc, CancellationToken ct)
+            IReadOnlySet<string> excluded, int needed, DateTime nowUtc, CancellationToken ct,
+            Func<ContentCandidate, CancellationToken, Task<bool>>? accept = null)
         {
             var ordered = Enumerate(strategy, blogId, excluded, nowUtc);
             var picked = new List<ContentCandidate>();
@@ -160,6 +162,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     if (maxDuration > 0 && duration is double d && d > maxDuration) continue;
                 }
                 try { candidate.Bytes = new FileInfo(candidate.FilePath).Length; } catch { }
+                if (accept != null && !await accept(candidate, ct)) continue;
                 picked.Add(candidate);
             }
             return picked;

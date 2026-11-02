@@ -21,7 +21,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
             public List<TestIssue> Issues { get; } = new();
         }
 
-        public static readonly string[] Looking = { "render_scene", "scene_summary", "map_report", "list_files", "read_file", "search_code", "view_asset", "get_manifest", "kit_reference", "pacing_check", "playbook_search", "design_world" };
+        public static readonly string[] Looking = { "render_scene", "scene_summary", "map_report", "list_files", "read_file", "search_code", "view_asset", "get_manifest", "kit_reference", "pacing_check", "playbook_search" };
 
         /// <summary>What a reviewer scores (1-10) before it may pass a build.</summary>
         public static readonly string[] Aspects = { "first_impression", "world_beauty", "world_fullness", "clear_goal", "fun_loop", "progression" };
@@ -200,10 +200,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
         internal static void AddProducts(AgentToolbox box, StudioContext ctx, string gameId) =>
             box.Add("set_products", "Set the game's products (passes and developer products) with fair prices and clear descriptions. Existing products keep their Roblox ids by key.",
                 Object(Req("products", Arr(Object(Req("key", Str("code id")), Req("kind", Str("GamePass or DeveloperProduct", "GamePass", "DeveloperProduct")), Req("name", Str("Shop name, max 50")),
-                    Req("description", Str("Exactly what the player gets")), Req("price", Int("Robux")), Req("grant", Str("currency:N, multiplier:N, speed:N, flag:NAME, item:NAME or skipstage"))), "Products"))),
+                    Req("description", Str("Exactly what the player gets")), Req("price", Int("Robux")), Req("grant", Str("currency:N, multiplier:N, speed:N, flag:NAME, item:NAME, or a grant the game's code registers"))), "Products"))),
                 args =>
                 {
-                    var template = ctx.Game(gameId)!.Brief?.Template ?? "";
                     var problems = new List<string>();
                     var list = new List<ProductRecord>();
                     foreach (var p in (args["products"] as JArray ?? new JArray()).OfType<JObject>().Take(10))
@@ -214,8 +213,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                         string kind = Args.Str(p, "kind");
                         int price = Args.Int(p, "price", 0);
                         if (key.Length == 0 || !key.All(c => char.IsLetterOrDigit(c) || c == '_')) problems.Add($"bad key '{key}'");
-                        if (!ResearchTools.Grants.Contains(grantKind)) problems.Add($"{key}: unknown grant '{grant}'");
-                        if (grantKind == "skipstage" && template != "obby") problems.Add("skipstage only works in an obby");
+                        if (!ResearchTools.ValidGrant(grantKind)) problems.Add($"{key}: grant '{grant}' must be a kit grant or a lowercase name the game's code registers");
                         if (grantKind is "multiplier" or "speed" or "flag" && kind != "GamePass") problems.Add($"{key}: permanent perks must be game passes");
                         if (price < 1 || price > 10000) problems.Add($"{key}: price must be 1-10000");
                         list.Add(new ProductRecord

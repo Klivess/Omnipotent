@@ -14,7 +14,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
     public static class StageGates
     {
         public const double MinConceptScore = 5.0;
-        /// <summary>The map report score every world must reach (obbies are judged on their course, tycoons on their plots).</summary>
+        /// <summary>The map report score every world must reach.</summary>
         public const int MinMapScore = MapReport.Bar;
 
         /// <summary>Whether the game can run in Roblox's engine here: an API key, and an experience (its own, a free one, or one the studio can create now).</summary>
@@ -42,20 +42,20 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                         var b = game.Brief;
                         list.Add(new("At least three concepts proposed and scored", game.Concepts.Count >= 3));
                         list.Add(new($"A concept chosen with a total score of at least {MinConceptScore}", chosen != null && chosen.Scores.Total >= MinConceptScore));
-                        list.Add(new("A brief is written for one of the studio's game engines (obby, tycoon or simulator)", b != null && b.Template is "obby" or "tycoon" or "simulator"));
                         list.Add(new("The brief has a core loop, at least 3 must-haves and at least 2 'done when' checks", b != null && b.CoreLoop.Length > 10 && b.MustHave.Count >= 3 && b.DoneWhen.Count >= 2));
+                        // A game made before the templates were abolished has its template instead of a world description.
+                        list.Add(new("The brief describes its world: the map's shape, its places and how players move through them", b != null && (b.World.Length >= 60 || b.Template.Length > 0)));
                         list.Add(new("The brief plans at least one fair product", b != null && b.Monetization.Count >= 1));
                         break;
                     }
                 case GameStage.Build:
                     {
-                        bool obby = string.Equals(game.Brief?.Template, "obby", StringComparison.OrdinalIgnoreCase);
                         bool mapBlocked = game.Build.MapFindings.Any(f => f.StartsWith("[error]", StringComparison.Ordinal));
                         list.Add(new("The game has been built at least once", game.Build.Revision >= 1));
                         list.Add(new("The latest build compiles with no errors (syntax, strict types, scene)", game.Build.LastBuildOk));
                         list.Add(new("The geometry verifier reports no errors", game.Build.LastBuildOk && !game.Build.Errors.Any(e => e.StartsWith("[geometry]", StringComparison.Ordinal))));
                         list.Add(new($"The map scores at least {MinMapScore}/100 with no blocking problems (map_report)", game.Build.Revision >= 1 && !mapBlocked && (game.Build.MapScore ?? 0) >= MinMapScore));
-                        _ = obby;
+                        // Only a game made from the old simulator template has the economy bot's check.
                         if (string.Equals(game.Brief?.Template, "simulator", StringComparison.OrdinalIgnoreCase))
                             list.Add(new("The economy check finds no wall (a bot playing the game's numbers reaches every zone)", game.Build.Revision >= 1 && !game.Build.EconomyFindings.Any(f => f.StartsWith("[error]", StringComparison.Ordinal))));
                         if (EngineAvailable(ctx, game))
@@ -95,7 +95,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public static string Goal(GameStage stage) => stage switch
         {
             GameStage.Research => "Decide what to build next, with evidence: study what is popular and rising on Roblox right now, find a gap this studio can fill well, and write a buildable brief that will sell.",
-            GameStage.Build => "Make the generated baseline special and finished: it already plays (the template's loop in a generated world). Tune the world with design_world until every render looks great, configure and balance the template for this brief, add only what the template lacks (systems with specs), then polish. build after every change and fix every error; run_tests to play it through in Roblox's engine; look at it with render_scene and map_report.",
+            GameStage.Build => "Build this game from the brief, world and all: design a map no earlier studio game had (its landform, places, paths and landmarks), raise it with the terrain tools, furnish it with props and dress it with landscaping until every render looks great and map_report passes; write the core loop as systems with specs and its UI as controllers on the kit HUD; then every must-have and the polish. build after every change and fix every error; run_tests to play it in Roblox's engine; look at it with render_scene and map_report.",
             GameStage.Test => "Make sure nothing goes public broken: play the game as a child would — from the spawn, through the loop, the shop and the UI — and pass or fail the build with specific issues.",
             GameStage.Launch => "Get the game in front of players, with the owner's say: the owner plays and signs off the tested build; then an honest, catchy store page, a bright icon and thumbnails made from the real game, fair products and a passing compliance check; request the launch, and the owner approves exactly that before anything happens on Roblox.",
             GameStage.Live => "Keep the game healthy and growing: read its numbers and feedback, fix what is broken, tune what is weak, refresh what is not clicking, add content, and record what was learned.",

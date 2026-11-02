@@ -15,7 +15,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
         private static readonly object chartLock = new();
         private static (DateTime At, List<ChartSort> Sorts)? chartCache;
 
-        public static readonly string[] Grants = { "currency", "multiplier", "speed", "flag", "item", "skipstage" };
+        /// <summary>The grants the kit gives itself; a game's own code can register any other (Shop.RegisterGrant), and the engine test checks every product's grant has a handler.</summary>
+        public static readonly string[] Grants = { "currency", "multiplier", "speed", "flag", "item" };
+
+        /// <summary>A kit grant, or a name a game's own code can register (a game made from the old obby template has skipstage).</summary>
+        public static bool ValidGrant(string kind) => Grants.Contains(kind) || System.Text.RegularExpressions.Regex.IsMatch(kind, "^[a-z][a-z0-9_]{1,30}$");
 
         public static AgentToolbox Create(StudioContext ctx, string gameId)
         {
@@ -102,21 +106,19 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 });
 
             box.Add("propose_concept", "Add a game concept with its evidence and 0-10 scores (demand, competition where 10 = little competition, monetization, feasibility, lessons).",
-                Object(Req("pitch", Str("One-sentence pitch")), Req("genre", Str("Genre, e.g. obby, tycoon, simulator, hangout")),
-                    Req("template", Str("Game Kit template", GameKit.Templates.Keys.ToArray())), Req("core_loop", Str("What the player does over and over")),
+                Object(Req("pitch", Str("One-sentence pitch")), Req("genre", Str("Genre in your own words (adventure, racing, hide and seek, pet collecting, parkour, survival, building, fishing…)")),
+                    Req("world", Str("The world it is set in, in a sentence: its shape and its places")), Req("core_loop", Str("What the player does over and over")),
                     Opt("twist", Str("What makes it fresh")), Opt("evidence", StrList("Facts that support it (with numbers)")),
                     Req("demand", Num("0-10")), Req("competition", Num("0-10, 10 = little competition")), Req("monetization", Num("0-10")),
                     Req("feasibility", Num("0-10: can the studio build this well with its kit and models?")), Opt("lessons", Num("0-10: fit with Playbook lessons"))),
                 args =>
                 {
-                    string template = Args.Required(args, "template").ToLowerInvariant();
-                    if (!GameKit.Templates.ContainsKey(template)) return ToolResult.Error($"template must be one of {string.Join(", ", GameKit.Templates.Keys)}");
                     double S(string k) => Math.Clamp(Args.Num(args, k) ?? 5, 0, 10);
                     var concept = new GameConcept
                     {
                         Pitch = Clip(Args.Required(args, "pitch"), 300),
                         Genre = Clip(Args.Required(args, "genre"), 60),
-                        Template = template,
+                        World = Clip(Args.Required(args, "world"), 400),
                         CoreLoop = Clip(Args.Required(args, "core_loop"), 400),
                         Twist = Clip(Args.Str(args, "twist"), 300),
                         Evidence = Args.List(args, "evidence").Take(10).Select(e => Clip(e, 300)).ToList(),
@@ -150,18 +152,17 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 });
 
             box.Add("write_brief", "Write (or rewrite) the brief Build will work from. The asset needs are sent to the asset harvester right away.",
-                Object(Req("title", Str("Working title")), Req("genre", Str("Genre")), Req("template", Str("Game Kit template", GameKit.Templates.Keys.ToArray())),
+                Object(Req("title", Str("Working title")), Req("genre", Str("Genre in your own words")),
                     Req("pitch", Str("One or two sentences")), Opt("target_players", Str("Who it is for")), Req("core_loop", Str("The core loop")),
+                    Req("world", Str("The map as a designer would pitch it: its shape and landforms (an island chain, a canyon, a mountain to climb, a sunken city…), the places in it and what happens in each, how players move between them, what they see from the spawn, and how it differs from the studio's earlier maps")),
                     Req("must_have", StrList("3-8 things the game must have to be complete")), Opt("nice_to_have", StrList("Extras if time allows")),
                     Opt("art_style", Str("Visual style")), Opt("asset_needs", StrList("Models to find, in plain words")),
                     Req("monetization", Arr(Object(Req("key", Str("code id, lowercase, e.g. vip or coins_500")), Req("kind", Str("GamePass or DeveloperProduct", "GamePass", "DeveloperProduct")),
-                        Req("name", Str("Shown in the shop")), Req("description", Str("What the player gets")), Req("price", Int("Robux")), Req("grant", Str("currency:N, multiplier:N, speed:N, flag:NAME, item:NAME or skipstage"))), "2-5 fair products")),
+                        Req("name", Str("Shown in the shop")), Req("description", Str("What the player gets")), Req("price", Int("Robux")), Req("grant", Str("currency:N, multiplier:N, speed:N, flag:NAME, item:NAME, or a grant of the game's own (e.g. skipstage:1) its code registers"))), "2-5 fair products")),
                     Opt("marketing", Object(Opt("hook", Str("The one-line reason to play")), Opt("title_ideas", StrList("Title ideas")), Opt("thumbnail_ideas", StrList("Thumbnail ideas")), Opt("keywords", StrList("Search keywords")))),
                     Req("done_when", StrList("Checks the builder can verify, e.g. '30 stages, each reachable'")), Opt("evidence", StrList("Why this will work"))),
                 args =>
                 {
-                    string template = Args.Required(args, "template").ToLowerInvariant();
-                    if (!GameKit.Templates.ContainsKey(template)) return ToolResult.Error($"template must be one of {string.Join(", ", GameKit.Templates.Keys)}");
                     var products = new List<ProductIdea>();
                     var problems = new List<string>();
                     foreach (var p in (args["monetization"] as JArray ?? new JArray()).OfType<JObject>())
@@ -172,8 +173,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                         int price = Args.Int(p, "price", 0);
                         string grantKind = grant.Split(':')[0].Trim().ToLowerInvariant();
                         if (key.Length == 0 || !key.All(c => char.IsLetterOrDigit(c) || c == '_')) problems.Add($"product key '{key}' must be lowercase letters, digits and _");
-                        if (!Grants.Contains(grantKind)) problems.Add($"product {key}: grant '{grant}' is not one the kit knows ({string.Join(", ", Grants)})");
-                        if (grantKind == "skipstage" && template != "obby") problems.Add("skipstage only works in an obby");
+                        if (!ValidGrant(grantKind)) problems.Add($"product {key}: grant '{grant}' must be one the kit knows ({string.Join(", ", Grants)}) or a lowercase name the game's own code registers");
                         if (kind is not ("GamePass" or "DeveloperProduct")) problems.Add($"product {key}: kind must be GamePass or DeveloperProduct");
                         if (grantKind is "multiplier" or "speed" or "flag" && kind == "DeveloperProduct") problems.Add($"product {key}: permanent perks ({grantKind}) must be game passes");
                         if (price < 1 || price > 10000) problems.Add($"product {key}: price {price} must be 1-10000 Robux");
@@ -195,8 +195,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     {
                         Title = Clip(Args.Required(args, "title"), 60),
                         Genre = Clip(Args.Required(args, "genre"), 60),
-                        Template = template,
                         Pitch = Clip(Args.Required(args, "pitch"), 500),
+                        World = Clip(Args.Required(args, "world"), 1200),
                         TargetPlayers = Clip(Args.Str(args, "target_players"), 200),
                         CoreLoop = Clip(Args.Required(args, "core_loop"), 500),
                         MustHave = Args.List(args, "must_have").Take(12).Select(x => Clip(x, 200)).ToList(),

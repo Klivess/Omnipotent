@@ -13,8 +13,7 @@ namespace Omnipotent.Tests.OmniBlox
 {
     /// <summary>
     /// The local engine (Pipeline/LocalEngine.cs): the Game Kit's own engine test — the kit's checks, every module
-    /// loading, the server booting and running, then the playthroughs (a stand-in player harvests, sells, buys a
-    /// tool and unlocks every zone; buys out a tycoon plot; reaches every obby stage) — run outside Roblox in Lune,
+    /// loading, the server booting and running, the world checks and the game's own specs — run outside Roblox in Lune,
     /// and the studio standing it in for Roblox's engine while there is no API key or experience slot. The Lune
     /// tests opt in with OMNIBLOX_LUNE (lune's executable); with OMNIBLOX_LIVE_DIR their worlds are made of the live
     /// studio's models, else of <see cref="TestModels"/>. The rest run on <see cref="FakeLocalEngine"/>.
@@ -26,7 +25,7 @@ namespace Omnipotent.Tests.OmniBlox
 
         private static string? Lune() => Environment.GetEnvironmentVariable("OMNIBLOX_LUNE") is { Length: > 0 } lune && File.Exists(lune) ? lune : null;
 
-        /// <summary>A game in Build on its generated baseline (a simulator unless another brief is given).</summary>
+        /// <summary>A new game in Build (the kit alone and an empty world; the test models in the library).</summary>
         private static string GameInBuild(StudioHarness h, GameBrief? brief = null)
         {
             TestModels.Seed(h.Ctx.Library);
@@ -66,7 +65,7 @@ namespace Omnipotent.Tests.OmniBlox
 
         [Theory]
         [MemberData(nameof(LiveMapTests.Briefs), MemberType = typeof(LiveMapTests))]
-        public async Task TheBaseline_BootsAndPlaysThrough_InTheKitsOwnEngineTest(string name, GameBrief brief)
+        public async Task ANewGame_BootsAndPassesTheKitsOwnEngineTest(string name, GameBrief brief)
         {
             if (Lune() is not { } lune) return;
             using var h = new StudioHarness(apiKey: false);
@@ -388,17 +387,20 @@ return {
             using var h = new StudioHarness(apiKey: false, localEngine: engine);
             await h.Harvester.RunOnceAsync(CancellationToken.None);
             PipelineEndToEndTests.ScriptResearch(h.Llm);
-            h.Llm.Script("builder",
-                ("design_world", new { }),
+            TestModels.Seed(h.Ctx.Library);
+            h.Llm.Script("builder", WorldToolTests.MapSteps().Concat(new (string, object)[]
+            {
                 ("build", new { }),
                 ("update_milestone", new { id = "m1", done = true }),
                 ("update_milestone", new { id = "m2", done = true }),
                 ("update_milestone", new { id = "m3", done = true }),
                 ("update_milestone", new { id = "m4", done = true }),
                 ("update_milestone", new { id = "m5", done = true }),
+                ("update_milestone", new { id = "m6", done = true }),
                 ("mark_feature_complete", new { notes = "not yet: the engine has not run" }),
                 ("run_tests", new { }),
-                ("mark_feature_complete", new { notes = "the generated course, checkpoints and the finish" }));
+                ("mark_feature_complete", new { notes = "the island, its places and the loop's objects" }),
+            }).ToArray());
             PipelineEndToEndTests.ScriptReview(h.Llm);
             PipelineEndToEndTests.ScriptMarketing(h.Llm, featureAsset: false);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason != null, 40);

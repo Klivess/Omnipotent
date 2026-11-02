@@ -1,4 +1,5 @@
 using Newtonsoft.Json.Linq;
+using Omnipotent.Services.OmniTumblr.Models;
 using System.Diagnostics;
 using System.Globalization;
 
@@ -19,7 +20,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
     /// thumbnails for the website, and frames for vision captions. Uses the bundled FFmpeg directory,
     /// then PATH. Every process run is bounded by a timeout and killed (with its tree) when it overruns.
     /// </summary>
-    internal sealed class OmniTumblrMediaTools
+    internal sealed class OmniTumblrMediaTools : IMediaFingerprinter
     {
         public static readonly HashSet<string> ImageExtensions = new(StringComparer.OrdinalIgnoreCase) { ".jpg", ".jpeg", ".png", ".gif", ".webp" };
         public static readonly HashSet<string> VideoExtensions = new(StringComparer.OrdinalIgnoreCase) { ".mp4", ".mov", ".m4v" };
@@ -141,6 +142,28 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 if (bytes is { Length: > 100 }) frames.Add(bytes);
             }
             return frames;
+        }
+
+        /// <summary>
+        /// Hashes of the whole frame and of its moving region, every half second over the first
+        /// <see cref="OmniTumblrFingerprintMath.MaxSeconds"/> seconds (one frame for an image), from a single
+        /// decode at <see cref="OmniTumblrFingerprintMath.GridWidth"/>×<see cref="OmniTumblrFingerprintMath.GridHeight"/>
+        /// greyscale. Null when ffmpeg can't read it.
+        /// </summary>
+        public async Task<MediaFingerprint?> FingerprintAsync(string path, CancellationToken ct)
+        {
+            if (!File.Exists(path)) return null;
+            bool image = IsImage(path);
+            string scale = $"scale={OmniTumblrFingerprintMath.GridWidth}:{OmniTumblrFingerprintMath.GridHeight}:flags=area,format=gray";
+            var args = new List<string> { "-hide_banner", "-loglevel", "error" };
+            if (!image) args.AddRange(new[] { "-t", OmniTumblrFingerprintMath.MaxSeconds.ToString(CultureInfo.InvariantCulture) });
+            args.AddRange(new[] { "-i", path, "-map", "0:v:0", "-an" });
+            args.AddRange(image ? new[] { "-frames:v", "1", "-vf", scale } : new[] { "-vf", $"fps={OmniTumblrFingerprintMath.FramesPerSecond},{scale}" });
+            args.AddRange(new[] { "-f", "rawvideo", "pipe:1" });
+            var raw = await RunBinaryAsync(ffmpeg, args, TimeSpan.FromSeconds(90), ct);
+            if (raw == null || raw.Length < OmniTumblrFingerprintMath.GridWidth * OmniTumblrFingerprintMath.GridHeight) return null;
+            var (whole, region) = OmniTumblrFingerprintMath.HashFrames(raw);
+            return OmniTumblrFingerprintMath.Create(image ? null : (double)whole.Length / OmniTumblrFingerprintMath.FramesPerSecond, whole, region);
         }
 
         // ─────────────────────────────── Process plumbing ───────────────────────────────

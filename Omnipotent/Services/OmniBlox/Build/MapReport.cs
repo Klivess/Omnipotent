@@ -17,7 +17,7 @@ namespace Omnipotent.Services.OmniBlox.Build
     public sealed class MapAnalysis
     {
         public int Score { get; set; }
-        /// <summary>open (zones round a hub, a free world), obby or tycoon: each is judged on what matters for it.</summary>
+        /// <summary>open (every game's own world); obby or tycoon only for a game made from those old templates.</summary>
         public string Kind { get; set; } = "open";
         public float AreaWidth { get; set; }
         public float AreaDepth { get; set; }
@@ -57,15 +57,15 @@ namespace Omnipotent.Services.OmniBlox.Build
     /// deductions. This one is strict:
     /// <list type="bullet">
     /// <item>Blockers cap the score at 45: no real terrain, a visible edge of the world, no walls, a play area
-    /// too small or a corridor, a spawn that sees nothing, geometry errors, gameplay missing from the map
-    /// (simulator nodes, the sell pad, a gated zone with nothing in it; tycoon plots; obby stages, the finish,
-    /// unreachable stages).</item>
+    /// too small or a thin corridor, a spawn that sees nothing, geometry errors, a place in the plan that is
+    /// meant to be unlocked but has no gate, a barren field; and for a game made from an old template, its
+    /// gameplay missing (simulator nodes and sell pad, tycoon plots, obby stages).</item>
     /// <item>The rest is scored in categories, each with what it measured: ground and world edge, coverage on
     /// an 8-stud grid with real footprints, density and composition (per zone, clustering, height variety),
     /// gameplay layout, landmarks visible from the hub and signposts, variety and one art style, and
     /// correctness (floating, sunk, overlapping, signs and stands facing the wrong way).</item>
     /// </list>
-    /// Obbies are judged on their course and tycoons on their plots.
+    /// Every map is judged against its own plan (its places, paths and landmarks), whatever its shape.
     /// </summary>
     public static class MapReport
     {
@@ -92,6 +92,11 @@ namespace Omnipotent.Services.OmniBlox.Build
             "Mover", "Spinner", "Disappearing", "Bounce", "Coin",
         };
 
+        /// <summary>Tags that only decorate (a lamp's glow): anything tagged otherwise is part of the game — the kit's tags or the game's own.</summary>
+        private static readonly HashSet<string> DecorativeTags = new(StringComparer.OrdinalIgnoreCase) { "Glow", "Sparkle", "Spin", "Bob" };
+
+        private static bool IsGameplay(IReadOnlyList<string> tags) => tags.Any(t => GameplayTags.Contains(t) || !DecorativeTags.Contains(t));
+
         public static MapAnalysis Analyze(SceneDocument scene, IReadOnlyList<WorldPart> parts, TerrainMap? terrain, GameManifest manifest,
             IReadOnlyList<GeometryIssue>? geometry = null, Func<long, CatalogEntry?>? catalog = null)
         {
@@ -99,7 +104,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             var report = new MapAnalysis { Kind = template == "obby" ? "obby" : template == "tycoon" ? "tycoon" : "open" };
             var byId = scene.Objects.ToDictionary(o => o.Id, o => o, StringComparer.Ordinal);
             var objects = parts.GroupBy(p => p.ObjectId).Select(g => Summarize(g.Key, g.ToList(), byId.GetValueOrDefault(g.Key))).ToList();
-            var scenery = objects.Where(o => !o.Plate && o.Kind != SceneKinds.Spawn && !o.Tags.Any(GameplayTags.Contains)).ToList();
+            var scenery = objects.Where(o => !o.Plate && o.Kind != SceneKinds.Spawn && !IsGameplay(o.Tags)).ToList();
             report.Objects = objects.Count(o => !o.Plate);
             report.DistinctModels = scene.Objects.Where(o => o.AssetId != null).Select(o => o.AssetId).Distinct().Count();
             geometry ??= parts.Count > 0 ? GeometryVerifier.Verify(parts, scene, manifest, terrain, catalog) : new List<GeometryIssue>();
@@ -152,16 +157,18 @@ namespace Omnipotent.Services.OmniBlox.Build
 
             // ── blockers ──
             if (!scene.Bounds.HasArea)
-                c.Error("edges", "No play area is set, so the map has no edges: players can walk or fall off it. Generate the world (design_world) or call set_map_area.");
+                c.Error("edges", "No play area is set, so the map has no edges: players can walk or fall off it. Set it with set_map_area.");
             if (c.Terrain == null)
                 c.Error("ground", scene.Terrain.Count > 0 || c.Objects.Any(o => o.Plate)
-                    ? "The ground is a flat slab (a terrain fill or a big part) floating in the void: from anywhere on the map players see where the world ends. Generate real terrain with hills and border mountains (design_world, or terrain_generate)."
-                    : "There is no ground. Generate the world (design_world) or terrain (terrain_generate).");
+                    ? "The ground is a flat slab (a terrain fill or a big part) floating in the void: from anywhere on the map players see where the world ends. Generate real terrain (terrain_generate: a landform with its edge of mountains, sea or cliffs)."
+                    : "There is no ground. Generate the land (terrain_generate).");
             if (c.Width < MinSide || c.Depth < MinSide)
-                c.Error("size", $"The play area is only {c.Width:0}×{c.Depth:0} studs. A {(tycoon ? "tycoon" : "simulator")} needs room: at least {MinSide:0}×{MinSide:0}, typically 400-600 a side with zones round a hub.");
+                c.Error("size", $"The play area is only {c.Width:0}×{c.Depth:0} studs. A game needs room to explore: at least {MinSide:0}×{MinSide:0}, typically 400-900 a side.");
             float aspect = MathF.Max(c.Width, c.Depth) / MathF.Max(1, MathF.Min(c.Width, c.Depth));
-            if (aspect > 2.2f)
-                c.Error("shape", $"The play area is a corridor ({c.Width:0}×{c.Depth:0}, {aspect:0.#}:1): players walk one line and see two walls. Lay zones round a hub instead (design_world layout hub).");
+            if (aspect > 3.5f)
+                c.Error("shape", $"The play area is a corridor ({c.Width:0}×{c.Depth:0}, {aspect:0.#}:1): players walk one line and see two walls. Widen it: places side by side, a loop of paths, land worth exploring on both sides of the route.");
+            else if (aspect > 2.2f)
+                c.Warn("shape", $"The play area is long and thin ({c.Width:0}×{c.Depth:0}, {aspect:0.#}:1): make sure the route branches and both sides hold something worth a detour.");
 
             // ── ground and the world's edge ──
             double relief = 0, framed = 0;
@@ -193,7 +200,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             if (c.Terrain != null && relief < 1.2)
                 c.Warn("ground", $"The land is almost perfectly flat (heights vary by {relief:0.#} studs): rolling ground, raised zones and hills between them read as a place, a flat field as a plate.");
             if (c.Terrain != null && framed < 0.75)
-                c.Warn("edges", $"Only {framed:P0} of the play area's edge is framed by hills, mountains or trees: the rest shows open land ending at an invisible wall.");
+                c.Warn("edges", $"Only {framed:P0} of the play area's edge is framed by hills, mountains, sea or trees: the rest shows open land ending at an invisible wall (dress_area kind treeline).");
             c.Category("Ground & edge", (Math.Min(relief / 3.0, 1) * 0.35 + Math.Min(materials / 3.0, 1) * 0.25 + framed * 0.4) * (c.Terrain == null ? 0 : 1), 12,
                 c.Terrain == null ? "no terrain" : $"relief {relief:0.#}, {materials} materials, {framed:P0} of the edge framed");
 
@@ -201,15 +208,16 @@ namespace Omnipotent.Services.OmniBlox.Build
             var (covered, hole) = Coverage(c);
             c.Report.DressedShare = covered;
             if (covered < 0.4)
-                c.Error("emptiness", $"Only {covered:P0} of the play area has anything in it or near it: it is a barren field. Regenerate the world with more density (design_world density) or dress it (scatter_assets).");
+                c.Error("emptiness", $"Only {covered:P0} of the play area has anything in it or near it: it is a barren field. Dress it (dress_area forest, meadow, rocks, accents) or give the empty land a purpose.");
             else if (covered < 0.65)
-                c.Warn("emptiness", $"{covered:P0} of the play area has something in it or near it; aim for 80%+ (groves, rocks and flowers between the zones, props by every path).");
+                c.Warn("emptiness", $"{covered:P0} of the play area has something in it or near it; aim for 80%+ (woods, rocks and flowers between the places, props by every path).");
             if (hole.Area > 0)
             {
                 float share = hole.Area * Cell * Cell / MathF.Max(1, c.Width * c.Depth);
                 string at = $"x {hole.X0:0}…{hole.X1:0}, z {hole.Z0:0}…{hole.Z1:0}";
-                if (share > 0.15f) c.Error("emptiness", $"A barren patch of {hole.X1 - hole.X0:0}×{hole.Z1 - hole.Z0:0} studs ({share:P0} of the map) at {at}. Give it a purpose or dress it (scatter_assets area [[{hole.X0:0},{hole.Z0:0}],[{hole.X1:0},{hole.Z1:0}]]).");
-                else if (share > 0.05f) c.Warn("emptiness", $"Empty patch of {hole.X1 - hole.X0:0}×{hole.Z1 - hole.Z0:0} studs at {at}. Dress it (scatter_assets area [[{hole.X0:0},{hole.Z0:0}],[{hole.X1:0},{hole.Z1:0}]]).");
+                string poly = $"[[{hole.X0:0},{hole.Z0:0}],[{hole.X1:0},{hole.Z0:0}],[{hole.X1:0},{hole.Z1:0}],[{hole.X0:0},{hole.Z1:0}]]";
+                if (share > 0.15f) c.Error("emptiness", $"A barren patch of {hole.X1 - hole.X0:0}×{hole.Z1 - hole.Z0:0} studs ({share:P0} of the map) at {at}. Give it a purpose or dress it (dress_area kind forest polygon {poly}).");
+                else if (share > 0.05f) c.Warn("emptiness", $"Empty patch of {hole.X1 - hole.X0:0}×{hole.Z1 - hole.Z0:0} studs at {at}. Dress it (dress_area kind meadow or forest, polygon {poly}).");
             }
             c.Category("Coverage", (covered - 0.45) / (0.85 - 0.45), 18, $"{covered:P0} of the area dressed");
 
@@ -227,8 +235,8 @@ namespace Omnipotent.Services.OmniBlox.Build
                     double per1000 = count / (MathF.PI * ring * ring / 1000);
                     densities.Add(per1000);
                     c.Report.Facts.Add($"zone {z.Id} \"{z.Name}\": {count} scenery objects in and round it ({per1000:0.0} per 1000 sq studs)");
-                    if (count == 0) c.Error("zone " + z.Id, $"Zone {z.Name} has no scenery at all: nothing frames it or tells its theme ({z.Theme}).");
-                    else if (per1000 < 0.9) c.Warn("zone " + z.Id, $"Zone {z.Name} is sparse ({per1000:0.0} scenery objects per 1000 sq studs in and round it; aim for 2+): ring it with trees and add its biome's touches.");
+                    if (count == 0) c.Error("zone " + z.Id, $"Zone {z.Name} has no scenery at all: nothing frames it or tells its theme ({z.Theme}). dress_area kind rim and accents, zone {z.Id}.");
+                    else if (per1000 < 0.9) c.Warn("zone " + z.Id, $"Zone {z.Name} is sparse ({per1000:0.0} scenery objects per 1000 sq studs in and round it; aim for 2+): ring it with trees and add its biome's touches (dress_area rim / accents, zone {z.Id}).");
                 }
                 zoneDensity = densities.Average(d => Math.Min(d / 2.0, 1));
             }
@@ -241,7 +249,7 @@ namespace Omnipotent.Services.OmniBlox.Build
 
             // ── gameplay layout ──
             var spawn = scene.Objects.FirstOrDefault(o => o.Kind == SceneKinds.Spawn);
-            double gameplay = tycoon ? Tycoon(c, spawn) : simulator ? Simulator(c, spawn, zones) : Sandbox(c, zones);
+            double gameplay = tycoon ? Tycoon(c, spawn) : simulator ? Simulator(c, spawn, zones) : Sandbox(c, zones, spawn);
             Spawn(c, spawn, required: true);
 
             // ── landmarks and navigation ──
@@ -266,7 +274,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             int nodeCount = nodes.Count + nodeFolders.Count;
             double score = 0;
             if (nodeCount == 0 && collectibles == 0)
-                c.Error("gameplay", "There is nothing to harvest in the map: a simulator needs resource nodes (models tagged Resource with Zone, Hp, Value) in every zone. Generate the world (design_world) — it places them.");
+                c.Error("gameplay", "There is nothing to harvest in the map: this simulator needs resource nodes (models tagged Resource with Zone, Hp, Value) in every zone (scatter_assets with those tags and config).");
             else score += 0.25;
             if (sells.Count == 0) c.Error("gameplay", "There is no sell pad (a part tagged SellZone): players can fill their bag but never cash it in.");
             else if (spawn != null && sells.Min(s => Dist(s.X, s.Z, spawn.Position[0], spawn.Position[2])) > 80)
@@ -313,7 +321,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             double score = 0;
             if (plots.Count == 0)
             {
-                c.Error("gameplay", "There are no tycoon plots (a folder tagged TycoonPlot with an Items folder, buttons and a collector). Generate the world (design_world layout plots).");
+                c.Error("gameplay", "There are no tycoon plots (a folder tagged TycoonPlot with an Items folder, buttons and a collector): build them with set_folder and add_objects.");
                 c.Category("Gameplay layout", 0, 20, "no plots");
                 return 0;
             }
@@ -337,15 +345,44 @@ namespace Omnipotent.Services.OmniBlox.Build
             return score;
         }
 
-        private static double Sandbox(Context c, List<MapZone> zones)
+        /// <summary>
+        /// A game's own world, against its plan: every place has something to do (objects carrying the game's tags,
+        /// the kit's or its own), every place meant to be unlocked has a gate, paths reach the places, and the
+        /// first thing to do is close to the spawn.
+        /// </summary>
+        private static double Sandbox(Context c, List<MapZone> zones, SceneObject? spawn)
         {
-            double score = zones.Count == 0 ? 0.4 : 0.4 + 0.6 * zones.Count(z =>
+            var gameplay = c.Objects.Where(o => !o.Plate && IsGameplay(o.Tags)).ToList();
+            var gates = c.Scene.Objects.Where(o => o.Tags.Contains("ZoneGate", StringComparer.OrdinalIgnoreCase)).ToList();
+            if (zones.Count == 0)
+            {
+                c.Warn("layout", "There is no map plan: plan_map gives the map the places players move through (and the report something to check them against).");
+                c.Category("Gameplay layout", gameplay.Count > 0 ? 0.35 : 0.15, 20, $"no plan, {gameplay.Count} gameplay object(s)");
+                return 0;
+            }
+            int busy = 0, reached = 0;
+            foreach (var z in zones)
             {
                 var (zx, zz, zr) = Circle(z);
-                return c.Objects.Any(o => o.Tags.Any(GameplayTags.Contains) && Dist(o.X, o.Z, zx, zz) < zr);
-            }) / zones.Count;
-            if (zones.Count == 0) c.Warn("layout", "There is no layout plan: plan_map (or design_world) gives the map zones players move through.");
-            c.Category("Gameplay layout", score, 20, $"{zones.Count} zone(s)");
+                bool hasPlay = gameplay.Any(o => Dist(o.X, o.Z, zx, zz) < zr + 6);
+                if (hasPlay) busy++;
+                else c.Warn("zone " + z.Id, $"Nothing to do in {z.Name} yet: no object there carries a tag of the game (its pickups, its stations, its goals). Place what its purpose needs ({(z.Purpose.Length > 0 ? z.Purpose : "say what happens there in plan_map")}).");
+                bool gated = gates.Any(g => g.Config.TryGetValue("Zone", out var v) && string.Equals(Convert.ToString(v is Newtonsoft.Json.Linq.JValue jv ? jv.Value : v, CultureInfo.InvariantCulture), z.Name, StringComparison.OrdinalIgnoreCase));
+                if (z.Gated && !gated) c.Error("zone " + z.Id, $"{z.Name} is meant to be unlocked but no gate guards it (build_prop gate zone \"{z.Name}\" at its entrance).");
+                if (zones.Count == 1 || c.Scene.Layout.Paths.Any(p => p.To.Equals(z.Id, StringComparison.OrdinalIgnoreCase) || p.From.Equals(z.Id, StringComparison.OrdinalIgnoreCase))) reached++;
+                else c.Warn("zone " + z.Id, $"No path leads to {z.Name}: players will not find it (plan_map paths, carve true).");
+            }
+            double first = 0;
+            if (spawn != null && gameplay.Count > 0)
+            {
+                float nearest = gameplay.Min(o => Dist(o.X, o.Z, spawn.Position[0], spawn.Position[2]));
+                if (nearest > 150) c.Warn("gameplay", $"The nearest thing to do is {nearest:0} studs from the spawn: the first reward should be in sight, under a minute's walk.");
+                else first = 1;
+            }
+            else if (gameplay.Count == 0) c.Warn("gameplay", "Nothing in the world carries a gameplay tag yet: the loop's objects (pickups, stations, goals, gates) are what players come for.");
+            double score = 0.45 * busy / zones.Count + 0.25 * reached / zones.Count + 0.15 * first + 0.15;
+            c.Report.Facts.Add($"{gameplay.Count} gameplay object(s), {gates.Count} gate(s); {busy}/{zones.Count} places with something to do");
+            c.Category("Gameplay layout", score, 20, $"{busy}/{zones.Count} places busy, {reached}/{zones.Count} reached by paths");
             return score;
         }
 
@@ -368,7 +405,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             c.Report.Facts.Add($"spawn {spawn.Id} at ({spawn.Position[0]:0}, {spawn.Position[2]:0}) faces yaw {spawn.Yaw:0}; ahead within 90 studs: " +
                 (ahead.Count == 0 ? "nothing" : string.Join(", ", ahead.Take(5).Select(a => $"{a.o.Name} ({a.dist:0} studs)"))));
             if (ahead.Count == 0)
-                c.Error("spawn", "A player spawning here looks at nothing: turn the spawn towards the hub's centre and the first zone (update_objects yaw), or build the first goal in front of it.");
+                c.Error("spawn", "A player spawning here looks at nothing: turn the spawn towards the first goal (build_prop spawn with face, or update_objects yaw), or build the first goal in front of it.");
         }
 
         private static double Landmarks(Context c, List<MapZone> zones)
@@ -380,25 +417,28 @@ namespace Omnipotent.Services.OmniBlox.Build
                 return 0;
             }
             int marked = 0, seen = 0;
+            // Seen from the hub, or else from the spawn (where every player stands first).
             var hub = c.Scene.Layout.Zones.FirstOrDefault(z => z.Id.Equals("hub", StringComparison.OrdinalIgnoreCase) || z.Id.Equals("plaza", StringComparison.OrdinalIgnoreCase));
-            var (hx, hz, _) = hub != null ? Circle(hub) : (0, 0, 0);
+            var spawnAt = c.Scene.Objects.FirstOrDefault(o => o.Kind == SceneKinds.Spawn);
+            var (hx, hz, _) = hub != null ? Circle(hub) : spawnAt != null ? (spawnAt.Position[0], spawnAt.Position[2], 0f) : (0f, 0f, 0f);
+            bool viewpoint = hub != null || spawnAt != null;
             foreach (var z in zones)
             {
                 var (zx, zz, zr) = Circle(z);
                 var tallest = c.Objects.Where(o => !o.Plate && Dist(o.X, o.Z, zx, zz) < zr + 18).OrderByDescending(o => o.MaxY).FirstOrDefault();
                 if (tallest == null || tallest.Height < 25)
                 {
-                    c.Warn("landmarks", $"Zone {z.Name} has nothing taller than 25 studs: give it a landmark (a giant tree, a tower, a crystal) players can head for.");
+                    c.Warn("landmarks", $"Zone {z.Name} has nothing taller than 25 studs: give it a landmark (place_asset role landmark or statue, a giant tree, build_prop crystal) players can head for.");
                     continue;
                 }
                 marked++;
-                if (hub == null || Visible(c, hx, hz, tallest)) seen++;
-                else c.Info("landmarks", $"Zone {z.Name}'s landmark ({tallest.Name}) is hidden from the hub by the land.");
+                if (!viewpoint || Visible(c, hx, hz, tallest)) seen++;
+                else c.Info("landmarks", $"Zone {z.Name}'s landmark ({tallest.Name}) is hidden from the {(hub != null ? "hub" : "spawn")} by the land.");
             }
             int signs = c.Scene.Objects.Count(o => o.Kind == SceneKinds.Text);
-            if (signs < zones.Count) c.Warn("navigation", $"{signs} sign(s) for {zones.Count} zones: a signpost where each road leaves the hub tells players where it goes.");
+            if (signs < zones.Count) c.Warn("navigation", $"{signs} sign(s) for {zones.Count} places: a signpost where paths fork (build_prop signpost) tells players where each goes.");
             double score = 0.5 * marked / zones.Count + 0.3 * seen / zones.Count + 0.2 * Math.Min(1, signs / (double)zones.Count);
-            c.Category("Landmarks & navigation", score, 10, $"{marked}/{zones.Count} zones marked, {seen} seen from the hub, {signs} signs");
+            c.Category("Landmarks & navigation", score, 10, $"{marked}/{zones.Count} zones marked, {seen} seen from the {(hub != null ? "hub" : "spawn")}, {signs} signs");
             return score;
         }
 
@@ -443,7 +483,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             int overlaps = issues.Count(i => i.Message.Contains("overlaps", StringComparison.Ordinal));
             foreach (var i in issues.Where(i => i.Message.Contains("floats", StringComparison.Ordinal) || i.Message.Contains("sunk", StringComparison.Ordinal)).Take(6))
                 c.Warn("placement", $"{i.ObjectId}: {i.Message}");
-            if (floating + sunk > 6) c.Error("placement", $"{floating} object(s) float and {sunk} are sunk into the ground or each other: everything must stand on the ground (give positions as [x, z], or regenerate the world).");
+            if (floating + sunk > 6) c.Error("placement", $"{floating} object(s) float and {sunk} are sunk into the ground or each other: everything must stand on the ground (give positions as [x, z]).");
             if (overlaps > 0) c.Info("placement", $"{overlaps} overlapping pair(s) (geometry check lists them).");
             // Signs and stands face where people are.
             int facingAway = 0;
@@ -473,7 +513,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             var checkpoints = scene.Objects.Where(o => o.Tags.Contains("Checkpoint", StringComparer.OrdinalIgnoreCase)).ToList();
             var finish = scene.Objects.Where(o => o.Tags.Contains("Finish", StringComparer.OrdinalIgnoreCase)).ToList();
             var unreachable = c.Geometry.Where(g => g.Message.Contains("unreachable", StringComparison.Ordinal)).ToList();
-            if (checkpoints.Count < 2) c.Error("course", "An obby needs checkpoints (parts tagged Checkpoint with Stage = 1, 2, 3…): generate the course (design_world layout course).");
+            if (checkpoints.Count < 2) c.Error("course", "An obby needs checkpoints (parts tagged Checkpoint with Stage = 1, 2, 3…).");
             if (finish.Count == 0) c.Error("course", "There is no finish (a part tagged Finish).");
             foreach (var u in unreachable.Take(5)) c.Error("course", $"{u.ObjectId}: {u.Message}");
             if (checkpoints.Count is > 1 and < 10) c.Warn("course", $"Only {checkpoints.Count} stages: 25-50 give an obby an hour of play.");
@@ -486,7 +526,7 @@ namespace Omnipotent.Services.OmniBlox.Build
             // Under and round the course.
             bool ground = c.Terrain != null;
             bool killFloor = scene.Objects.Any(o => o.Tags.Contains("KillBrick", StringComparer.OrdinalIgnoreCase) && o.Size is { Length: 3 } s && s[0] > 100 && s[2] > 100);
-            if (!ground) c.Error("scenery", "The course floats in a void with nothing below or round it: generate the land (design_world layout course) so it runs over a lava valley between hills.");
+            if (!ground) c.Error("scenery", "The course floats in a void with nothing below or round it: generate the land (terrain_generate) so it runs over a valley between hills.");
             if (!killFloor && !ground) c.Warn("scenery", "Nothing below the course stops a fall: a kill floor (a big part tagged KillBrick) sends fallers back to their checkpoint at once.");
             int around = c.Scenery.Count(o => o.IsAsset);
             double framed = ground ? Framing(c) : 0;
@@ -585,7 +625,9 @@ namespace Omnipotent.Services.OmniBlox.Build
                 total++;
                 float edge = c.Ground(x, z);
                 float rise = MathF.Max(c.Ground(x + nx * 35, z + nz * 35), c.Ground(x + nx * 70, z + nz * 70)) - edge;
-                if (rise >= 10 || tall.Any(o => Dist(o.X, o.Z, x + nx * 12, z + nz * 12) < 26)) framed++;
+                // Open sea beyond the edge frames a map as well as mountains do: the world ends at a horizon.
+                bool sea = c.Terrain.InWater(x + nx * 35, z + nz * 35) && c.Terrain.InWater(x + nx * 70, z + nz * 70);
+                if (rise >= 10 || sea || tall.Any(o => Dist(o.X, o.Z, x + nx * 12, z + nz * 12) < 26)) framed++;
             }
             return total == 0 ? 0 : framed / (double)total;
         }

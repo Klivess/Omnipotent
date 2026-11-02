@@ -1,5 +1,6 @@
 using Omnipotent.Services.OmniTumblr.Api;
 using Omnipotent.Services.OmniTumblr.Models;
+using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.OmniTumblr.Engine
 {
@@ -8,6 +9,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public int Planned { get; set; }
         public int FreeSlots { get; set; }
         public string? Warning { get; set; }
+        /// <summary>Slots were left free only because candidates are still being fingerprinted: plan again soon.</summary>
+        public bool CheckingRepeats { get; set; }
     }
 
     /// <summary>
@@ -16,10 +19,16 @@ namespace Omnipotent.Services.OmniTumblr.Engine
     /// each planned post ready: probes the media, renders a preview thumbnail and writes the caption.
     /// Long work (ffprobe, LLM calls) happens outside the store lock on cloned data, and results are
     /// applied only if the post is still in the state it was read in.
+    /// With <see cref="OmniTumblrFingerprints"/>, content is also compared by what it shows, not only by
+    /// key: Instagram meme accounts repost each other's clips, so one video arrives as several reels, and
+    /// before Oct 29 2026 three blogs posted the same clip within a day.
     /// </summary>
     internal sealed class OmniTumblrPlanner
     {
         private const int MaxPlannedPerTick = 14;
+        /// <summary>New fingerprints (two ffmpeg runs each) one pick or one repeat sweep may compute.</summary>
+        private const int MaxFingerprintsPerPass = 12;
+        private const int MaxRepeatSwapsPerPass = 3;
         private static readonly TimeSpan[] CaptionBackoff =
         {
             TimeSpan.FromMinutes(3), TimeSpan.FromMinutes(10), TimeSpan.FromMinutes(30), TimeSpan.FromHours(1), TimeSpan.FromHours(2),
@@ -30,15 +39,19 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private readonly OmniTumblrCaptioner captioner;
         private readonly OmniTumblrMediaTools media;
         private readonly Func<DateTime> clock;
+        private readonly OmniTumblrFingerprints? fingerprints;
+        /// <summary>"postId|contentKey" of pending posts already checked for repeats.</summary>
+        private readonly ConcurrentDictionary<string, byte> repeatChecked = new(StringComparer.Ordinal);
 
         public OmniTumblrPlanner(OmniTumblrStore store, OmniTumblrContentSources content, OmniTumblrCaptioner captioner,
-            OmniTumblrMediaTools media, Func<DateTime> clock)
+            OmniTumblrMediaTools media, Func<DateTime> clock, OmniTumblrFingerprints? fingerprints = null)
         {
             this.store = store;
             this.content = content;
             this.captioner = captioner;
             this.media = media;
             this.clock = clock;
+            this.fingerprints = fingerprints;
         }
 
         // ─────────────────────────────── Planning ───────────────────────────────
@@ -76,7 +89,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 return outcome;
             }
 
-            var candidates = await content.FindCandidatesAsync(snapshot.Strategy, blogId, snapshot.Excluded, snapshot.Free.Count, now, ct);
+            var (candidates, stillChecking) = await FindFreshCandidatesAsync(blogId, snapshot.Strategy, snapshot.Excluded, snapshot.Free.Count, now, ct);
 
             store.Mutate(s =>
             {
@@ -92,6 +105,11 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     while (next < candidates.Count && excludedNow.Contains(candidates[next].Key)) next++;
                     if (next >= candidates.Count)
                     {
+                        if (stillChecking)
+                        {
+                            outcome.CheckingRepeats = true; // more candidates are still being checked for repeats: next tick
+                            break;
+                        }
                         string warning = DescribeShortage(blog.Strategy);
                         outcome.Warning = warning;
                         if (blog.Health.ContentWarning != warning || blog.Health.ContentWarningUtc is not DateTime at || now - at > TimeSpan.FromHours(12))
@@ -208,6 +226,165 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             _ => "No content source is configured.",
         };
 
+        // ─────────────────────────────── Repeats ───────────────────────────────
+
+        /// <summary>A post holding a clip that a blog must not post again, with that clip's fingerprint.</summary>
+        private sealed record TakenMedia(string PostId, string BlogName, PostStatus Status, DateTime ScheduledUtc, string? Origin, MediaFingerprint Fingerprint)
+        {
+            /// <summary>Already out, so it keeps the clip whatever was planned before it.</summary>
+            public bool Out => Status is PostStatus.Published or PostStatus.Removed or PostStatus.Publishing;
+        }
+
+        private sealed class FingerprintBudget
+        {
+            public int Left = MaxFingerprintsPerPass;
+            public bool RanOut;
+
+            /// <summary>The fingerprint, computed if the budget allows. Null when unreadable, or over budget (then <see cref="RanOut"/>).</summary>
+            public async Task<MediaFingerprint?> GetAsync(OmniTumblrFingerprints fingerprints, string key, string? path, CancellationToken ct)
+            {
+                if (fingerprints.Cached(key) is MediaFingerprint cached) return cached;
+                if (fingerprints.Settled(key, path)) return null;
+                if (Left <= 0)
+                {
+                    RanOut = true;
+                    return null;
+                }
+                Left--;
+                return await fingerprints.GetAsync(key, path, ct);
+            }
+        }
+
+        /// <summary>
+        /// Candidates not used before (by key) that, with fingerprints on, also don't show the same clip as
+        /// anything <paramref name="blogId"/> must not repeat, nor as each other. <c>Unchecked</c> means some
+        /// were passed over only because this call's fingerprint budget ran out, so try again next tick.
+        /// </summary>
+        private async Task<(List<ContentCandidate> Picked, bool Unchecked)> FindFreshCandidatesAsync(string blogId, OmniTumblrStrategy strategy,
+            IReadOnlySet<string> excluded, int needed, DateTime now, CancellationToken ct)
+        {
+            var fingerprints = this.fingerprints;
+            if (fingerprints == null) return (await content.FindCandidatesAsync(strategy, blogId, excluded, needed, now, ct), false);
+            var budget = new FingerprintBudget();
+            var taken = await TakenMediaAsync(blogId, null, budget, ct);
+            if (budget.RanOut) return (new List<ContentCandidate>(), true); // not every post is fingerprinted yet
+            var accepted = new List<MediaFingerprint>();
+            var picked = await content.FindCandidatesAsync(strategy, blogId, excluded, needed, now, ct, async (candidate, token) =>
+            {
+                if (budget.RanOut) return false;
+                var fingerprint = await budget.GetAsync(fingerprints, candidate.Key, candidate.FilePath, token);
+                if (fingerprint == null) return !budget.RanOut; // unreadable: judged by its key alone, as before
+                if (accepted.Any(a => OmniTumblrFingerprintMath.IsSameMedia(a, fingerprint)) || FindOriginal(fingerprint, taken) != null) return false;
+                accepted.Add(fingerprint);
+                return true;
+            });
+            return (picked, budget.RanOut);
+        }
+
+        /// <summary>
+        /// The posts whose clip <paramref name="blogId"/> must not post again (published, removed or still to
+        /// come): its own, and every other blog's unless it allows reuse across blogs. Posts whose media can't
+        /// be read are left out; ones not fingerprinted yet are, within the budget.
+        /// </summary>
+        private async Task<List<TakenMedia>> TakenMediaAsync(string blogId, string? exceptPostId, FingerprintBudget budget, CancellationToken ct)
+        {
+            var holders = store.Read(s =>
+            {
+                bool reuse = s.Blog(blogId)?.Strategy.MemeScraper.AllowReuseAcrossBlogs == true;
+                return s.Blogs.Values.Where(b => b.BlogId == blogId || !reuse)
+                    .SelectMany(b => s.PostsOf(b.BlogId)
+                        .Where(p => p.PostId != exceptPostId && (p.IsPending || p.Status is PostStatus.Published or PostStatus.Removed))
+                        .Select(p => (p.PostId, BlogName: b.Name, p.Status, p.ScheduledUtc, Origin: p.Content?.Origin,
+                            Key: OmniTumblrFingerprints.KeyOf(p), Path: p.Media.FirstOrDefault()?.Path)))
+                    .ToList();
+            });
+            var taken = new List<TakenMedia>();
+            foreach (var h in holders)
+            {
+                var fingerprint = await budget.GetAsync(fingerprints!, h.Key, h.Path, ct);
+                if (fingerprint != null) taken.Add(new TakenMedia(h.PostId, h.BlogName, h.Status, h.ScheduledUtc, h.Origin, fingerprint));
+            }
+            return taken;
+        }
+
+        private static TakenMedia? FindOriginal(MediaFingerprint fingerprint, IEnumerable<TakenMedia> taken) =>
+            taken.FirstOrDefault(t => OmniTumblrFingerprintMath.IsSameMedia(t.Fingerprint, fingerprint));
+
+        /// <summary>
+        /// Swaps out planned autopilot posts whose clip was already posted, or is planned earlier, on a blog
+        /// they must not repeat: the same video under another key (reposted by another Instagram account), or
+        /// one planned before fingerprints existed. The earlier post keeps the clip. With no different content
+        /// left, the repeat is cancelled and its slot refilled once content turns up. Each post is checked once
+        /// per content. Returns how many posts were replaced or cancelled.
+        /// </summary>
+        public async Task<int> SwapRepeatsAsync(CancellationToken ct)
+        {
+            var fingerprints = this.fingerprints;
+            if (fingerprints == null) return 0;
+            var queue = store.Read(s => s.AllPosts()
+                .Where(p => p.Origin == PostOrigin.Autopilot && !p.ManualOverride && p.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval)
+                .OrderBy(p => p.ScheduledUtc).ThenBy(p => p.PostId, StringComparer.Ordinal)
+                .Select(p => (p.PostId, p.BlogId, p.ScheduledUtc, Key: OmniTumblrFingerprints.KeyOf(p), Path: p.Media.FirstOrDefault()?.Path))
+                .ToList());
+            var current = queue.Select(p => p.PostId + "|" + p.Key).ToHashSet(StringComparer.Ordinal);
+            foreach (string stale in repeatChecked.Keys.Where(k => !current.Contains(k)).ToList()) repeatChecked.TryRemove(stale, out _);
+
+            var budget = new FingerprintBudget();
+            int handled = 0;
+            foreach (var post in queue)
+            {
+                string mark = post.PostId + "|" + post.Key;
+                if (repeatChecked.ContainsKey(mark)) continue;
+                if (ct.IsCancellationRequested || handled >= MaxRepeatSwapsPerPass) break;
+                var fingerprint = await budget.GetAsync(fingerprints, post.Key, post.Path, ct);
+                if (budget.RanOut) break;
+                if (fingerprint == null)
+                {
+                    repeatChecked[mark] = 0; // unreadable: nothing to compare
+                    continue;
+                }
+                var taken = await TakenMediaAsync(post.BlogId, post.PostId, budget, ct);
+                if (budget.RanOut) break; // some posts aren't fingerprinted yet: next tick
+                var original = FindOriginal(fingerprint, taken.Where(t => t.Out || t.ScheduledUtc < post.ScheduledUtc
+                    || (t.ScheduledUtc == post.ScheduledUtc && string.CompareOrdinal(t.PostId, post.PostId) < 0)));
+                if (original == null)
+                {
+                    repeatChecked[mark] = 0;
+                    continue;
+                }
+                if (await ReplaceRepeatAsync(post.PostId, original, ct)) handled++;
+                else break; // candidates are still being checked: next tick
+            }
+            return handled;
+        }
+
+        /// <summary>Swaps a repeat's content, or cancels it when nothing different is left. False when it has to wait for the next tick.</summary>
+        private async Task<bool> ReplaceRepeatAsync(string postId, TakenMedia original, CancellationToken ct)
+        {
+            var (ok, message, stillChecking) = await SwapContentCoreAsync(postId, ct);
+            if (!ok && stillChecking) return false;
+            DateTime now = clock();
+            string where = original.Out ? $"@{original.BlogName} already posted" : $"@{original.BlogName} has planned for {original.ScheduledUtc:ddd HH:mm} UTC";
+            store.Mutate(s =>
+            {
+                var post = s.FindPost(postId);
+                var blog = post == null ? null : s.Blog(post.BlogId);
+                if (post == null || blog == null) return;
+                if (ok)
+                {
+                    s.AddEvent(EventLevel.Warning, "post.repeat", $"@{blog.Name}: a planned video was the same clip {where} (another Instagram account's repost); swapped it for different content.", blog.BlogId, postId, now);
+                    return;
+                }
+                if (!(post.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval)) return;
+                post.Status = PostStatus.Cancelled;
+                post.LastError = $"The same clip {where}, and no different content was available.";
+                post.NextAttemptUtc = null;
+                s.Touch(post, now);
+                s.AddEvent(EventLevel.Warning, "post.repeat", $"@{blog.Name}: cancelled a planned video that was the same clip {where}; no different content was available. {message}", blog.BlogId, postId, now);
+            });
+            return true;
+        }
+
         /// <summary>
         /// After a schedule change, moves pending autopilot posts off slots that no longer exist onto free new
         /// slots (keeping their content and captions). Posts with nowhere to go are cancelled and their content
@@ -290,7 +467,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 };
             });
             if (snap == null) return null;
-            var candidates = await content.FindCandidatesAsync(snap.Strategy, snap.BlogId, snap.Excluded, 3, now, ct);
+            var (candidates, _) = await FindFreshCandidatesAsync(snap.BlogId, snap.Strategy, snap.Excluded, 3, now, ct);
 
             return store.Mutate(s =>
             {
@@ -320,6 +497,13 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         /// </summary>
         public async Task<(bool Ok, string Message)> SwapContentAsync(string postId, CancellationToken ct)
         {
+            var (ok, message, _) = await SwapContentCoreAsync(postId, ct);
+            return (ok, message);
+        }
+
+        /// <summary><c>Unchecked</c>: nothing was found only because candidates are still being checked for repeats.</summary>
+        private async Task<(bool Ok, string Message, bool Unchecked)> SwapContentCoreAsync(string postId, CancellationToken ct)
+        {
             DateTime now = clock();
             var snap = store.Read(s =>
             {
@@ -334,18 +518,21 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     Excluded = ExcludedKeys(s, blog, blog.Strategy) as IReadOnlySet<string>,
                 };
             });
-            if (snap == null) return (false, "Only a pending post on a blog with a content source can have its content swapped.");
-            var candidates = await content.FindCandidatesAsync(snap.Strategy, snap.BlogId, snap.Excluded, 2, now, ct);
+            if (snap == null) return (false, "Only a pending post on a blog with a content source can have its content swapped.", false);
+            var (candidates, stillChecking) = await FindFreshCandidatesAsync(snap.BlogId, snap.Strategy, snap.Excluded, 2, now, ct);
 
             return store.Mutate(s =>
             {
                 var post = s.FindPost(postId);
                 var blog = post == null ? null : s.Blog(post.BlogId);
                 if (post == null || blog == null || !(post.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval))
-                    return (false, "The post changed while new content was being found.");
+                    return (false, "The post changed while new content was being found.", false);
                 var excludedNow = ExcludedKeys(s, blog, blog.Strategy);
                 var candidate = candidates.FirstOrDefault(c => !excludedNow.Contains(c.Key));
-                if (candidate == null) return (false, DescribeShortage(blog.Strategy));
+                if (candidate == null)
+                    return stillChecking
+                        ? (false, "Still checking the next videos in line for repeats of what the blogs already posted; try again in a minute.", true)
+                        : (false, DescribeShortage(blog.Strategy), false);
 
                 var fresh = CreateAutopilotPost(blog, candidate, post.SlotUtc ?? post.ScheduledUtc, now);
                 post.Kind = fresh.Kind;
@@ -366,7 +553,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 s.MarkBlog(blog.BlogId);
                 s.Touch(post, now);
                 s.AddEvent(EventLevel.Info, "post.swapped", $"@{blog.Name}: swapped a planned post's content.", blog.BlogId, post.PostId, now);
-                return (true, "Swapped; a new caption is being written.");
+                return (true, "Swapped; a new caption is being written.", false);
             });
         }
 

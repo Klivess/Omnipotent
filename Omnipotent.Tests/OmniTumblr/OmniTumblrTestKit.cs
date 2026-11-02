@@ -190,6 +190,33 @@ namespace Omnipotent.Tests.OmniTumblr
         public IReadOnlyDictionary<string, IReadOnlyList<string>> GetSourceNiches() => Niches;
     }
 
+    /// <summary>
+    /// Every file is its own clip unless <see cref="SameClip"/> says otherwise, as when an Instagram account
+    /// reposts another's video: then they share one fingerprint.
+    /// </summary>
+    internal sealed class FakeFingerprinter : IMediaFingerprinter
+    {
+        private readonly ConcurrentDictionary<string, string> clipOf = new(StringComparer.OrdinalIgnoreCase);
+        public int Calls;
+        /// <summary>Files ffmpeg can't read.</summary>
+        public Func<string, bool> Unreadable { get; set; } = _ => false;
+
+        public void SameClip(params string[] paths)
+        {
+            foreach (string path in paths) clipOf[path] = paths[0];
+        }
+
+        public Task<MediaFingerprint?> FingerprintAsync(string path, CancellationToken ct)
+        {
+            Interlocked.Increment(ref Calls);
+            if (Unreadable(path)) return Task.FromResult<MediaFingerprint?>(null);
+            string clip = clipOf.TryGetValue(path, out var c) ? c : path;
+            var rng = new Random((int)OmniTumblrScheduleMath.Fnv1a(clip.ToLowerInvariant()));
+            var frames = Enumerable.Range(0, 30).Select(_ => new FrameHash((ulong)rng.NextInt64() | 1UL, ulong.MaxValue)).ToArray();
+            return Task.FromResult<MediaFingerprint?>(OmniTumblrFingerprintMath.Create(15, frames, frames));
+        }
+    }
+
     /// <summary>The real engine components wired to fakes, on a temp directory and a controllable clock.</summary>
     internal sealed class Harness : IDisposable
     {
@@ -204,6 +231,8 @@ namespace Omnipotent.Tests.OmniTumblr
         public OmniTumblrMediaTools Media { get; }
         public OmniTumblrContentSources Content { get; }
         public OmniTumblrCaptioner Captioner { get; }
+        public FakeFingerprinter Fingerprinter { get; } = new();
+        public OmniTumblrFingerprints Fingerprints { get; }
         public OmniTumblrPlanner Planner { get; }
         public OmniTumblrPublisher Publisher { get; }
         public OmniTumblrApiBudget Budget { get; }
@@ -221,7 +250,8 @@ namespace Omnipotent.Tests.OmniTumblr
             Content = new OmniTumblrContentSources(Catalog, Media, Store.LibraryDirectory);
             Captioner = new OmniTumblrCaptioner(Model);
             Auth = new OmniTumblrAuth(Store, Api, Clock.Func);
-            Planner = new OmniTumblrPlanner(Store, Content, Captioner, Media, Clock.Func);
+            Fingerprints = new OmniTumblrFingerprints(Store, Fingerprinter, Clock.Func);
+            Planner = new OmniTumblrPlanner(Store, Content, Captioner, Media, Clock.Func, Fingerprints);
             Gate = new TumblrEdgeGate(Clock.Func);
             Publisher = new OmniTumblrPublisher(Store, Api, Auth, Clock.Func, message => { lock (Alerts) Alerts.Add(message); return Task.CompletedTask; }, Gate)
             {

@@ -429,7 +429,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     Level = "error",
                     Title = "Tumblr is refusing this server's requests",
                     Detail = $"Since {since:HH:mm} UTC every call gets an HTML 403 from Tumblr's edge (nginx) before it reaches the API — the server's network or IP, not the accounts or posts. " +
-                        $"{(waiting > 0 ? $"{waiting} due post(s) are waiting and" : "Posts")} will go out when it lifts; next check {edge.NextCheckUtc:HH:mm} UTC. " +
+                        $"{(waiting > 0 ? $"{waiting} due post(s) are waiting and" : "Posts")} will go out one at a time, spaced across the blogs, when it lifts; next check {edge.NextCheckUtc:HH:mm} UTC. " +
                         "If it keeps happening, route Tumblr traffic through a proxy with the OmniSetting OmniTumblr_Proxy.",
                     Action = "settings",
                 });

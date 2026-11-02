@@ -232,7 +232,7 @@ namespace Omnipotent.Tests.OmniBlox
             using var h = Studio();
             await h.Harvester.RunOnceAsync(None);
             PipelineEndToEndTests.ScriptResearch(h.Llm);
-            PipelineEndToEndTests.ScriptBuild(h.Llm);
+            PipelineEndToEndTests.ScriptBuild(h);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().Stage == GameStage.Test);
 
             var game = h.OnlyGame();

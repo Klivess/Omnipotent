@@ -20,16 +20,16 @@ namespace Omnipotent.Tests.OmniBlox
                 ("web_search", new { query = "roblox obby trends", time_range = "month" }),
                 ("asset_coverage", new { themes = new[] { "pine tree", "lava" } }),
                 ("save_finding", new { finding = "Lava Rush Obby has 5,400 players and a 90% like ratio." }),
-                ("propose_concept", new { pitch = "A lava obby through a pine forest", genre = "obby", template = "obby", core_loop = "Jump across platforms over lava to reach the next checkpoint", twist = "forest setting", evidence = new[] { "lava obbies trend" }, demand = 8, competition = 6, monetization = 7, feasibility = 9, lessons = 5 }),
-                ("propose_concept", new { pitch = "A candy tycoon", genre = "tycoon", template = "tycoon", core_loop = "Buy droppers, collect cash, expand", demand = 6, competition = 4, monetization = 7, feasibility = 6 }),
-                ("propose_concept", new { pitch = "A gem simulator", genre = "simulator", template = "simulator", core_loop = "Collect gems, sell, upgrade", demand = 6, competition = 5, monetization = 6, feasibility = 7 }),
+                ("propose_concept", new { pitch = "A lava obby through a pine forest", genre = "obby", world = "A pine-forest island in a lava sea, a course of platforms round it", core_loop = "Jump across platforms over lava to reach the next checkpoint", twist = "forest setting", evidence = new[] { "lava obbies trend" }, demand = 8, competition = 6, monetization = 7, feasibility = 9, lessons = 5 }),
+                ("propose_concept", new { pitch = "A candy tycoon", genre = "tycoon", world = "A candy factory town", core_loop = "Buy droppers, collect cash, expand", demand = 6, competition = 4, monetization = 7, feasibility = 6 }),
+                ("propose_concept", new { pitch = "A gem simulator", genre = "simulator", world = "Crystal caves under a mountain", core_loop = "Collect gems, sell, upgrade", demand = 6, competition = 5, monetization = 6, feasibility = 7 }),
                 ("choose_concept", new { concept_id = "c1" }),
                 ("write_brief", new
                 {
                     title = "Lava Forest Obby",
                     genre = "obby",
-                    template = "obby",
                     pitch = "Leap over glowing lava through a pine forest.",
+                    world = "A pine-forest island: docks where players arrive, a beach, an old grove behind a gate and a crystal cliff, the course of lava jumps running between them.",
                     target_players = "8-14 year olds who like quick challenges",
                     core_loop = "Jump from platform to platform over lava, touching each checkpoint to save progress.",
                     must_have = new[] { "Three stages with checkpoints", "A lava floor that resets players", "A finish with a reward" },
@@ -44,16 +44,19 @@ namespace Omnipotent.Tests.OmniBlox
                 }));
         }
 
-        /// <summary>The start platform of a generated obby (top at y 14, 38 studs square round x 0, z 120): a free corner for a hand-placed tree.</summary>
-        internal static readonly int[] StartCorner = { -14, 14, 134 };
+        /// <summary>A free spot by the docks of the scripted map for a hand-placed tree.</summary>
+        internal static readonly int[] StartCorner = { -62, 150 };
 
-        internal static void ScriptBuild(ScriptedLlm llm)
+        /// <summary>The scripted builder: the map of <see cref="WorldToolTests.MapSteps"/> (so the test models go into the library), a little code, a build and a run.</summary>
+        internal static void ScriptBuild(StudioHarness h)
         {
-            llm.Script("builder",
+            TestModels.Seed(h.Ctx.Library);
+            h.Llm.Script("builder", new (string, object)[]
+            {
                 ("set_milestones", new { milestones = new[] { "Core loop playable", "Every must-have", "Polish" } }),
                 ("update_manifest", new { title = "Lava Forest Obby", currency_name = "Coins", tips = new[] { "Touch the green pads to save!" } }),
-                ("design_world", new { }),
-                ("design_world", new { spec = new { course = new { stages = 16 } } }),
+            }.Concat(WorldToolTests.MapSteps()).Concat(new (string, object)[]
+            {
                 ("search_assets", new { query = "pine tree" }),
                 ("view_asset", new { asset_id = FakeRoblox.AssetId }),
                 ("place_asset", new { asset_id = FakeRoblox.AssetId, position = StartCorner, yaw = 30 }),
@@ -64,7 +67,8 @@ namespace Omnipotent.Tests.OmniBlox
                 ("update_milestone", new { id = "m1", done = true }),
                 ("update_milestone", new { id = "m2", done = true }),
                 ("update_milestone", new { id = "m3", done = true }),
-                ("mark_feature_complete", new { notes = "sixteen stages over lava, checkpoints, a finish" }));
+                ("mark_feature_complete", new { notes = "four places on an island, the loop's objects, a gate" }),
+            }).ToArray());
         }
 
         internal static void ScriptReview(ScriptedLlm llm, bool pass = true) =>
@@ -108,21 +112,22 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("researcher.roblox_charts") && r.Contains("Lava Rush Obby"));
 
             // Build.
-            ScriptBuild(h.Llm);
+            ScriptBuild(h);
             await h.StepUntilAsync(() => h.OnlyGame().Stage == GameStage.Test);
             game = h.OnlyGame();
             Assert.True(game.Build.LastBuildOk, string.Join("\n", game.Build.Errors));
             Assert.True(game.Build.FeatureComplete);
             Assert.Contains(FakeRoblox.AssetId, game.Build.AssetsUsed);
-            Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.design_world") && r.Contains("\"Layout\": \"course\""));
-            Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.design_world") && r.Contains("Regenerated"));
+            Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.terrain_generate") && r.Contains("island landform"));
+            Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.dress_area") && r.Contains("Dressed forest"));
             Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.place_asset") && r.Contains("footprint"));
             Assert.Contains(h.Llm.ToolResults, r => r.StartsWith("builder.build") && r.Contains("BUILD OK"));
             Assert.True(game.Build.MapScore >= StageGates.MinMapScore, "map " + game.Build.MapScore + ": " + string.Join(" | ", game.Build.MapFindings));
             var scene = h.Ctx.Workspace(game.GameId).LoadScene();
-            Assert.Equal(16, scene.Objects.Count(o => o.Tags.Contains("Checkpoint")));
-            Assert.Contains(scene.Objects, o => o.Tags.Contains("Finish"));
-            Assert.Contains(scene.Objects, o => o.AssetId == FakeRoblox.AssetId && o.Source != "gen"); // the hand-placed tree survived the regeneration
+            Assert.Equal("", h.Ctx.Workspace(game.GameId).LoadManifest().Template); // no template: the game is the builder's own
+            Assert.Equal(4, scene.Layout.Zones.Count);
+            Assert.Contains(scene.Objects, o => o.Tags.Contains("Crab"));
+            Assert.Contains(scene.Objects, o => o.AssetId == FakeRoblox.AssetId);
 
             // Test: clean build, engine specs in "Roblox", and the playtest review.
             ScriptReview(h.Llm);
@@ -197,7 +202,7 @@ namespace Omnipotent.Tests.OmniBlox
             using var h = new StudioHarness(requireApproval: true);
             await h.Harvester.RunOnceAsync(CancellationToken.None);
             ScriptResearch(h.Llm);
-            ScriptBuild(h.Llm);
+            ScriptBuild(h);
             ScriptReview(h.Llm);
             ScriptMarketing(h.Llm);
             List<OwnerTask> Tasks() => h.Ctx.Store.Read(s => s.Studio.OwnerTasks.ToList());
@@ -244,7 +249,7 @@ namespace Omnipotent.Tests.OmniBlox
             using var h = new StudioHarness(requireApproval: true);
             await h.Harvester.RunOnceAsync(CancellationToken.None);
             ScriptResearch(h.Llm);
-            ScriptBuild(h.Llm);
+            ScriptBuild(h);
             ScriptReview(h.Llm);
             ScriptMarketing(h.Llm);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason?.Contains("sign it off") == true, 40);
@@ -268,7 +273,7 @@ namespace Omnipotent.Tests.OmniBlox
             using var h = new StudioHarness(requireApproval: true);
             await h.Harvester.RunOnceAsync(CancellationToken.None);
             ScriptResearch(h.Llm);
-            ScriptBuild(h.Llm);
+            ScriptBuild(h);
             ScriptReview(h.Llm);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason?.Contains("sign it off") == true, 40);
             var game = h.OnlyGame();
@@ -298,8 +303,9 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Equal(AssetStatus.Previewed, h.Ctx.Library.Get(FakeRoblox.AssetId)!.Status);
 
             ScriptResearch(h.Llm);
-            h.Llm.Script("builder",
-                ("design_world", new { }),
+            TestModels.Seed(h.Ctx.Library);
+            h.Llm.Script("builder", WorldToolTests.MapSteps().Concat(new (string, object)[]
+            {
                 ("place_asset", new { asset_id = FakeRoblox.AssetId, position = StartCorner }),
                 ("build", new { }),
                 ("update_milestone", new { id = "m1", done = true }),
@@ -307,7 +313,9 @@ namespace Omnipotent.Tests.OmniBlox
                 ("update_milestone", new { id = "m3", done = true }),
                 ("update_milestone", new { id = "m4", done = true }),
                 ("update_milestone", new { id = "m5", done = true }),
-                ("mark_feature_complete", new { notes = "core loop done" }));
+                ("update_milestone", new { id = "m6", done = true }),
+                ("mark_feature_complete", new { notes = "core loop done" }),
+            }).ToArray());
             ScriptReview(h.Llm);
             ScriptMarketing(h.Llm, featureAsset: false);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().WaitingReason != null, 40);
@@ -326,7 +334,7 @@ namespace Omnipotent.Tests.OmniBlox
             using var h = new StudioHarness();
             await h.Harvester.RunOnceAsync(CancellationToken.None);
             ScriptResearch(h.Llm);
-            ScriptBuild(h.Llm);
+            ScriptBuild(h);
             ScriptReview(h.Llm, pass: false);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().LastTest != null);
             var game = h.OnlyGame();

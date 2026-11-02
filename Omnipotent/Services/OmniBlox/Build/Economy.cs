@@ -33,7 +33,10 @@ namespace Omnipotent.Services.OmniBlox.Build
         public double Step { get; set; }
     }
 
-    /// <summary>A simulator's economy as numbers: what the map holds, what the tools do, what everything costs.</summary>
+    /// <summary>
+    /// A simulator's economy as numbers: what the map holds, what the tools do, what everything costs. Only games made
+    /// from the old simulator template have one (the economy check runs on their builds); new games run their own loops.
+    /// </summary>
     public sealed class SimulatorEconomy
     {
         public List<EconZone> Zones { get; set; } = new();
@@ -97,7 +100,6 @@ namespace Omnipotent.Services.OmniBlox.Build
                 });
             }
             var order = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var z in scene.Spec?.Zones ?? new List<WorldGen.ZoneSpec>()) order.TryAdd(z.Name, z.Order);
             foreach (var z in scene.Layout.Zones) order.TryAdd(z.Name, z.Order);
             e.Zones = e.Zones.OrderBy(z => order.TryGetValue(z.Name, out int o) ? o : int.MaxValue).ThenBy(z => z.Price).ThenBy(z => z.Name, StringComparer.Ordinal).ToList();
             return e;

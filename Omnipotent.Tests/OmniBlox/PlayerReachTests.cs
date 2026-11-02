@@ -146,7 +146,7 @@ namespace Omnipotent.Tests.OmniBlox
             using var h = new StudioHarness();
             await h.Harvester.RunOnceAsync(None);
             PipelineEndToEndTests.ScriptResearch(h.Llm);
-            PipelineEndToEndTests.ScriptBuild(h.Llm);
+            PipelineEndToEndTests.ScriptBuild(h);
             PipelineEndToEndTests.ScriptReview(h.Llm);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().Stage == GameStage.Launch, 60);
 

@@ -11,22 +11,38 @@ namespace Omnipotent.Services.OmniBlox.Build
     }
 
     /// <summary>
-    /// The Luau every generated game starts from (Services/OmniBlox/GameKit, embedded at build time):
-    /// saving, currency, shop and purchases, analytics, daily rewards, leaderboard, feedback, world
-    /// behaviours for tagged parts, genre templates, an in-engine test runner and the client HUD.
+    /// The Luau every game is built on (Services/OmniBlox/GameKit, embedded at build time): saving, currency, shop
+    /// and purchases, analytics, daily rewards, leaderboard, feedback, zones and gates, rebirth, quests, world
+    /// behaviours for tagged parts, an in-engine test runner and the client HUD. A game's own loop is its own code.
+    ///
+    /// The kit used to carry three genre templates (obby, tycoon, simulator) that every game was made from, and the
+    /// studio's games all came out alike. No game is made from one any more; the modules stay only for the games
+    /// that were (<see cref="LegacyTemplates"/>), and only those games get them.
     /// </summary>
     public static class GameKit
     {
         public const string ResourcePrefix = "OmniBloxKit/";
 
-        /// <summary>Template id → the module name in ServerScriptService.OmniKitServer.Templates.</summary>
-        public static readonly IReadOnlyDictionary<string, string> Templates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        /// <summary>
+        /// The templates games were made from before they were abolished (id → the module in
+        /// ServerScriptService.OmniKitServer.Templates). A game whose game.json names one keeps it so it goes on working;
+        /// nothing new is ever made from one.
+        /// </summary>
+        public static readonly IReadOnlyDictionary<string, string> LegacyTemplates = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
         {
             ["obby"] = "Obby",
             ["tycoon"] = "Tycoon",
             ["simulator"] = "Simulator",
-            ["sandbox"] = "",
         };
+
+        /// <summary>Whether a game was made from one of the old templates (its game.json names one).</summary>
+        public static bool IsLegacy(string? template) => template != null && LegacyTemplates.ContainsKey(template.Trim());
+
+        /// <summary>A kit file that belongs to an old template (only games made from one get it).</summary>
+        public static bool IsTemplateFile(KitFile file) => file.Path.StartsWith("Server/Templates/", StringComparison.Ordinal);
+
+        /// <summary>The kit files a game gets: all of them for a game made from an old template, the rest without the templates.</summary>
+        public static IEnumerable<KitFile> FilesFor(string? template) => IsLegacy(template) ? Files : Files.Where(f => !IsTemplateFile(f));
 
         /// <summary>The CollectionService tags the kit gives behaviour to, with what each does — told to the builder.</summary>
         public static readonly IReadOnlyDictionary<string, string> Tags = new Dictionary<string, string>
@@ -41,14 +57,14 @@ namespace Omnipotent.Services.OmniBlox.Build
             ["Mover"] = "slides back and forth by Offset (\"x,y,z\") over Period seconds",
             ["Disappearing"] = "vanishes for Hidden seconds every Visible seconds",
             ["Leaderboard"] = "shows the global top-10 on its front face",
-            ["Checkpoint"] = "obby: stage marker with Stage = 1..N (1 is the start)",
-            ["Finish"] = "obby: the end; touching it after the last stage completes the obby",
-            ["TycoonPlot"] = "tycoon: one player's plot (Items folder + buttons + collector inside)",
-            ["TycoonButton"] = "tycoon: Price, Unlocks (item name), optional Requires",
-            ["TycoonCollector"] = "tycoon: touch to bank the plot's income",
-            ["Dropper"] = "tycoon: cosmetic dropper inside an item",
-            ["Collectible"] = "simulator: worth Value, respawns after Respawn seconds",
-            ["SellZone"] = "simulator: touch to sell the bag",
+            ["Checkpoint"] = "games made from the old obby template: stage marker with Stage = 1..N (an obby of your own keeps its stages in its own system)",
+            ["Finish"] = "games made from the old obby template: the end of the course",
+            ["TycoonPlot"] = "games made from the old tycoon template: one player's plot",
+            ["TycoonButton"] = "games made from the old tycoon template: Price, Unlocks, optional Requires",
+            ["TycoonCollector"] = "games made from the old tycoon template: touch to bank the plot's income",
+            ["Dropper"] = "games made from the old tycoon template: cosmetic dropper inside an item",
+            ["Collectible"] = "games made from the old simulator template: worth Value, respawns after Respawn seconds (use Coin, or your own tag and system)",
+            ["SellZone"] = "games made from the old simulator template: touch to sell the bag",
             ["ZoneGate"] = "blocks a zone until bought: Zone (name), Price, optional Currency (an extra currency) and Requires (another zone); shows a lock sign and an Unlock prompt, then turns see-through for that player",
             ["Spin"] = "turns in place about Y at Speed degrees/second (default 90): coins, gems, rewards",
             ["Bob"] = "floats gently up and down by Height (default 1) every Period seconds (1.6): pickups, signs",
@@ -90,7 +106,7 @@ namespace Omnipotent.Services.OmniBlox.Build
         }
 
         public static string TemplateModule(string? template) =>
-            template != null && Templates.TryGetValue(template.Trim(), out var module) ? module : "";
+            template != null && LegacyTemplates.TryGetValue(template.Trim(), out var module) ? module : "";
     }
 
     /// <summary>Writes C# values as Luau literals (for the generated Config modules).</summary>

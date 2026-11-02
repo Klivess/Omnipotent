@@ -12,7 +12,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
     /// attempt, a revoked token parks the connection for reauthorization, bad media fails the post and
     /// refills its slot, and anything ambiguous (timeout, 5xx) is reconciled by slug before retrying —
     /// the post may already exist. While Tumblr's edge refuses this server (<see cref="TumblrEdgeGate"/>),
-    /// posts wait without spending attempts and go out when it answers again.
+    /// posts wait without spending attempts and go out when it answers again — autopilot posts one at a time,
+    /// <see cref="FleetSpacing"/> apart across all blogs, so the blogs never post in the same minute.
     /// </summary>
     internal sealed class OmniTumblrPublisher
     {
@@ -37,6 +38,13 @@ namespace Omnipotent.Services.OmniTumblr.Engine
 
         /// <summary>Kill switch (OmniSetting OmniTumblrV2_PublishingEnabled).</summary>
         public Func<bool> PublishingEnabled { get; set; } = () => true;
+        public static readonly TimeSpan DefaultFleetSpacing = TimeSpan.FromMinutes(20);
+        /// <summary>
+        /// Minimum time between two autopilot posts on any of the managed blogs (OmniSetting
+        /// OmniTumblr_FleetSpacingMinutes; zero turns it off). Without it, every blog's backlog went out in the
+        /// same minute when Tumblr's edge answered again.
+        /// </summary>
+        public Func<TimeSpan> FleetSpacing { get; set; } = () => DefaultFleetSpacing;
         /// <summary>Called after an autopilot post failed because of its content, to refill its slot.</summary>
         public Func<string, Task>? OnContentFailure { get; set; }
         public TimeSpan ReconcileDelay { get; set; } = TimeSpan.FromSeconds(8);
@@ -254,6 +262,11 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 int gap = Math.Clamp(blog.Strategy.MinGapMinutes, 0, 24 * 60);
                 if (gap > 0 && blog.Stats.LastPublishedUtc is DateTime last && now - last < TimeSpan.FromMinutes(gap))
                     return ($"Spacing posts at least {gap} min apart.", last.AddMinutes(gap), false);
+
+                // Across blogs too: posts that come due together (a backlog released when Tumblr's edge answers
+                // again, or two blogs' slots landing close) go out one at a time, not on every blog at once.
+                if (FleetSpacingUntil(s, now) is var (clearAt, lastBlog, lastAt))
+                    return ($"Spacing posts across blogs: @{lastBlog} posted at {lastAt:HH:mm} UTC, so the next post on any blog goes at {clearAt:HH:mm} UTC.", clearAt, false);
             }
 
             foreach (var (key, limit) in RelevantLimits(conn, post))
@@ -265,6 +278,30 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             // Last, so the probe slot is only taken by a post that will really be sent.
             if (!edgeGate.TryEnter(out var probeAt)) return (EdgeWaitReason(probeAt), probeAt, true);
             return (null, null, false);
+        }
+
+        /// <summary>When the fleet spacing lets the next autopilot post out, or null when it already may.</summary>
+        private (DateTime ClearAt, string LastBlog, DateTime LastAt)? FleetSpacingUntil(OmniTumblrState s, DateTime now)
+        {
+            var minimum = FleetSpacing();
+            if (minimum <= TimeSpan.Zero) return null;
+            OmniTumblrBlog? latest = null;
+            foreach (var b in s.Blogs.Values)
+                if (b.Stats.LastPublishedUtc > (latest?.Stats.LastPublishedUtc ?? DateTime.MinValue)) latest = b;
+            if (latest?.Stats.LastPublishedUtc is not DateTime last) return null;
+            DateTime clearAt = last + FleetGapAfter(minimum, last);
+            return clearAt > now ? (clearAt, latest.Name, last) : null;
+        }
+
+        /// <summary>
+        /// The gap after a post published at <paramref name="lastUtc"/>: the minimum plus a stable 0–50% extra,
+        /// so a released backlog doesn't go out on a metronome. Stable, so every waiting post sees the same time.
+        /// </summary>
+        internal static TimeSpan FleetGapAfter(TimeSpan minimum, DateTime lastUtc)
+        {
+            if (minimum <= TimeSpan.Zero) return TimeSpan.Zero;
+            uint h = OmniTumblrScheduleMath.Fnv1a("fleet:" + lastUtc.Ticks);
+            return minimum + TimeSpan.FromSeconds(h % (uint)(minimum.TotalSeconds / 2 + 1));
         }
 
         private string EdgeWaitReason(DateTime retryAt)

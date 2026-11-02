@@ -30,6 +30,7 @@ namespace Omnipotent.Services.OmniTumblr
         internal OmniTumblrContentSources? ContentSources { get; private set; }
         internal OmniTumblrCaptioner? Captioner { get; private set; }
         internal OmniTumblrMediaTools? MediaTools { get; private set; }
+        internal OmniTumblrFingerprints? Fingerprints { get; private set; }
         internal OmniTumblrApiBudget? ApiBudget { get; private set; }
         internal TumblrApiClient? TumblrApi { get; private set; }
         internal TumblrEdgeGate? EdgeGate { get; private set; }
@@ -37,6 +38,7 @@ namespace Omnipotent.Services.OmniTumblr
         internal Task Ready => ready.Task;
         internal bool Enabled { get; private set; } = true;
         internal bool PublishingEnabled { get; private set; } = true;
+        internal TimeSpan FleetSpacing { get; private set; } = OmniTumblrPublisher.DefaultFleetSpacing;
         internal DateTime StartedUtc { get; private set; }
         internal string StartupState { get; private set; } = "starting";
 
@@ -74,8 +76,13 @@ namespace Omnipotent.Services.OmniTumblr
                 ContentSources = new OmniTumblrContentSources(new MemeScraperReelCatalog(FindService<MemeScraper.MemeScraper>), MediaTools, store.LibraryDirectory);
                 Captioner = new OmniTumblrCaptioner(new KliveLlmCaptionModel(FindService<KliveLLM.KliveLLM>));
                 Auth = new OmniTumblrAuth(store, TumblrApi, clock);
-                Planner = new OmniTumblrPlanner(store, ContentSources, Captioner, MediaTools, clock);
-                Publisher = new OmniTumblrPublisher(store, TumblrApi, Auth, clock, AlertAsync, EdgeGate) { PublishingEnabled = () => PublishingEnabled };
+                Fingerprints = new OmniTumblrFingerprints(store, MediaTools, clock);
+                Planner = new OmniTumblrPlanner(store, ContentSources, Captioner, MediaTools, clock, Fingerprints);
+                Publisher = new OmniTumblrPublisher(store, TumblrApi, Auth, clock, AlertAsync, EdgeGate)
+                {
+                    PublishingEnabled = () => PublishingEnabled,
+                    FleetSpacing = () => FleetSpacing,
+                };
                 Sync = new OmniTumblrAnalyticsSync(store, TumblrApi, Auth, ApiBudget, clock, message => _ = ServiceLog(message, false), EdgeGate);
                 Engine = new OmniTumblrEngine(store, Planner, Publisher, Sync, clock, (ex, message) => _ = ServiceLogError(ex, message));
                 var planner = Planner;
@@ -124,6 +131,8 @@ namespace Omnipotent.Services.OmniTumblr
         {
             Enabled = await GetBoolOmniSetting("OmniTumblr_Enabled", defaultValue: true);
             PublishingEnabled = await GetBoolOmniSetting("OmniTumblrV2_PublishingEnabled", defaultValue: true);
+            int spacing = await GetIntOmniSetting("OmniTumblr_FleetSpacingMinutes", (int)OmniTumblrPublisher.DefaultFleetSpacing.TotalMinutes);
+            FleetSpacing = TimeSpan.FromMinutes(Math.Clamp(spacing, 0, 6 * 60));
 
             string proxy = (await GetStringOmniSetting("OmniTumblr_Proxy", "") ?? "").Trim();
             if (TumblrApi != null && proxy != TumblrApi.Proxy)
@@ -149,7 +158,7 @@ namespace Omnipotent.Services.OmniTumblr
         {
             string message = status.Blocked
                 ? $"Tumblr's edge is refusing this server's requests (an HTML 403 from nginx, before the API) — the server's network, not the accounts or posts. Posts and sync wait; next check {status.NextCheckUtc:HH:mm} UTC."
-                : $"Tumblr is answering this server again after {OmniTumblrPublisher.Describe(TimeSpan.FromMinutes(status.LastBlockMinutes ?? 0))}; waiting posts are going out.";
+                : $"Tumblr is answering this server again after {OmniTumblrPublisher.Describe(TimeSpan.FromMinutes(status.LastBlockMinutes ?? 0))}; waiting posts are going out one at a time, spaced across the blogs.";
             try { Store?.Mutate(s => s.AddEvent(status.Blocked ? EventLevel.Warning : EventLevel.Success, status.Blocked ? "tumblr.edge-blocked" : "tumblr.edge-cleared", message)); } catch { }
             _ = ServiceLog("[OmniTumblr] " + message, false);
             if (!status.Blocked)

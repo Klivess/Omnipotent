@@ -21,7 +21,7 @@ namespace Omnipotent.Tests.OmniBlox
             var h = new StudioHarness();
             await h.Harvester.RunOnceAsync(CancellationToken.None);
             PipelineEndToEndTests.ScriptResearch(h.Llm);
-            PipelineEndToEndTests.ScriptBuild(h.Llm);
+            PipelineEndToEndTests.ScriptBuild(h);
             await h.StepUntilAsync(() => h.Ctx.Store.Read(s => s.Games.Count) == 1 && h.OnlyGame().Stage == GameStage.Test);
             return (h, h.OnlyGame().GameId);
         }

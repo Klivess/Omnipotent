@@ -313,6 +313,91 @@ namespace Omnipotent.Tests.OmniTumblr
         }
 
         [Fact]
+        public async Task WhenTheEdgeLifts_EveryBlogsBacklog_GoesOutOneAtATime_NotInTheSameMinute()
+        {
+            var h = new Harness(Start);
+            using var _h = h;
+            string conn = h.Connect();
+            bool refusing = true;
+            h.Api.OnCreate = (_, _) =>
+            {
+                if (refusing) throw h.EdgeRefusal();
+                h.Gate.RecordAnswered();
+                return Task.FromResult(new TumblrCreatedPost { Id = Guid.NewGuid().ToString("N") });
+            };
+            // What happened Oct 27–28: three blogs' autopilot posts all waiting out the same block.
+            var posts = new[] { "alpha", "bravo", "charlie" }
+                .Select((name, i) => h.AddReadyPost(h.AddBlog(conn, name: name), p =>
+                {
+                    p.Origin = PostOrigin.Autopilot;
+                    p.ScheduledUtc = Start.AddMinutes(-10 + i);
+                    p.SlotUtc = p.ScheduledUtc;
+                }))
+                .ToList();
+
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            Assert.Equal(1, h.Api.CreateCalls);
+
+            refusing = false;
+            h.Clock.Now = h.Gate.RetryAtUtc!.Value;
+            Assert.Equal(1, await h.Publisher.PublishDueAsync(CancellationToken.None)); // not all three
+            var spacingReason = h.Post(posts[1]).BlockedReason;
+            Assert.StartsWith("Spacing posts across blogs", spacingReason);
+
+            for (int i = 0; i < 6 && posts.Any(id => h.Post(id).Status != PostStatus.Published); i++)
+            {
+                h.Clock.Now = h.Publisher.NextDueUtc()!.Value;
+                Assert.True(await h.Publisher.PublishDueAsync(CancellationToken.None) <= 1);
+            }
+
+            var published = posts.Select(h.Post).OrderBy(p => p.PublishedUtc).ToList();
+            Assert.All(published, p => Assert.Equal(PostStatus.Published, p.Status));
+            Assert.Equal(posts, published.Select(p => p.PostId)); // oldest slot first
+            for (int i = 1; i < published.Count; i++)
+            {
+                var gap = published[i].PublishedUtc!.Value - published[i - 1].PublishedUtc!.Value;
+                Assert.InRange(gap, OmniTumblrPublisher.DefaultFleetSpacing, OmniTumblrPublisher.DefaultFleetSpacing * 1.5);
+            }
+            Assert.All(published, p => Assert.Equal(1, p.Attempts)); // waiting on the spacing spends no attempts
+        }
+
+        [Fact]
+        public async Task BlogsWhoseSlotsLandClose_PostApart_ButPublishNowAndZeroSpacingDoNot()
+        {
+            var h = new Harness(Start);
+            using var _h = h;
+            string conn = h.Connect();
+            void Autopilot(OmniTumblrPost p) { p.Origin = PostOrigin.Autopilot; p.SlotUtc = p.ScheduledUtc; }
+            string first = h.AddReadyPost(h.AddBlog(conn, name: "alpha"), Autopilot);
+            string second = h.AddReadyPost(h.AddBlog(conn, name: "bravo"), p => { p.ScheduledUtc = Start.AddMinutes(3); Autopilot(p); });
+
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            Assert.Equal(PostStatus.Published, h.Post(first).Status);
+
+            h.Clock.Advance(TimeSpan.FromMinutes(3));
+            Assert.Equal(0, await h.Publisher.PublishDueAsync(CancellationToken.None));
+            var held = h.Post(second);
+            Assert.Equal(PostStatus.Ready, held.Status);
+            Assert.Equal(Start + OmniTumblrPublisher.FleetGapAfter(OmniTumblrPublisher.DefaultFleetSpacing, Start), held.NextAttemptUtc);
+            Assert.Contains("@alpha posted at 12:00 UTC", held.BlockedReason);
+
+            // The gap is stable (every waiting post sees the same time) and never below the minimum.
+            Assert.InRange(OmniTumblrPublisher.FleetGapAfter(TimeSpan.FromMinutes(20), Start), TimeSpan.FromMinutes(20), TimeSpan.FromMinutes(30));
+            Assert.Equal(TimeSpan.Zero, OmniTumblrPublisher.FleetGapAfter(TimeSpan.Zero, Start));
+
+            // Publish now skips autopilot's spacing, as it does the per-blog rules.
+            h.Store.Mutate(s => { var p = s.FindPost(second)!; p.ManualOverride = true; p.NextAttemptUtc = null; });
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            Assert.Equal(PostStatus.Published, h.Post(second).Status);
+
+            // Zero spacing (OmniTumblr_FleetSpacingMinutes = 0) turns it off.
+            h.Publisher.FleetSpacing = () => TimeSpan.Zero;
+            string third = h.AddReadyPost(h.AddBlog(conn, name: "charlie"), Autopilot);
+            await h.Publisher.PublishDueAsync(CancellationToken.None);
+            Assert.Equal(PostStatus.Published, h.Post(third).Status);
+        }
+
+        [Fact]
         public async Task AnAutopilotPost_WaitingOutAnEdgeBlock_IsStillSkippedOnceItsSlotIsStale()
         {
             var (h, _, blogId) = Setup();

@@ -21,7 +21,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 });
 
         public static void AddPortfolio(AgentToolbox box, StudioContext ctx) =>
-            box.Add("portfolio", "The studio's games so far: stage, template, launch date and headline numbers.",
+            box.Add("portfolio", "The studio's games so far: stage, genre, world and map shape, launch date and headline numbers.",
                 Object(),
                 _ =>
                 {
@@ -33,9 +33,11 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                         var days = g.Stats.Daily.TakeLast(14).ToList();
                         string numbers = days.Count == 0 ? "no analytics yet"
                             : $"avg DAU {days.Average(d => d.DailyActiveUsers ?? 0):0.#}, revenue {days.Sum(d => d.RevenueRobux ?? 0):0} R$ (14 d), D1 {days.Where(d => d.D1Retention != null).Select(d => d.D1Retention!.Value).DefaultIfEmpty().Average():0.##}";
-                        sb.AppendLine($"- {g.GameId} \"{g.DisplayTitle}\" — {g.Stage}, {g.Brief?.Template ?? "?"} ({g.Brief?.Genre ?? "?"})" +
+                        sb.AppendLine($"- {g.GameId} \"{g.DisplayTitle}\" — {g.Stage}, {g.Brief?.Genre ?? "?"}" + (g.Brief?.Template is { Length: > 0 } t ? $" (made from the old {t} template)" : "") +
                                       (g.Publish.WentPublicUtc is DateTime live ? $", live since {live:yyyy-MM-dd}" : "") + $"; {numbers}");
                     }
+                    string worlds = Briefing.EarlierGames(ctx, null);
+                    if (worlds.Length > 0) sb.AppendLine("Their worlds and maps:").Append(worlds);
                     return ToolResult.Ok(sb.ToString());
                 });
 

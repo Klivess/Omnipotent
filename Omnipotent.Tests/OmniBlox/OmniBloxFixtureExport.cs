@@ -40,8 +40,8 @@ namespace Omnipotent.Tests.OmniBlox
             ctx.Update(abandoned, g =>
             {
                 g.WorkingTitle = "Space Station Simulator";
-                g.Concepts.Add(new GameConcept { ConceptId = "c1", Pitch = "Mine asteroids and upgrade a space station", Genre = "simulator", Template = "simulator", CoreLoop = "Mine, sell, upgrade the drill", Scores = new ConceptScores { Demand = 5, Competition = 3, Monetization = 6, Feasibility = 4, Lessons = 5 } });
-                g.Concepts.Add(new GameConcept { ConceptId = "c2", Pitch = "Zero-gravity obby between satellites", Genre = "obby", Template = "obby", CoreLoop = "Float between platforms", Scores = new ConceptScores { Demand = 4, Competition = 4, Monetization = 4, Feasibility = 3, Lessons = 5 } });
+                g.Concepts.Add(new GameConcept { ConceptId = "c1", Pitch = "Mine asteroids and upgrade a space station", Genre = "simulator", World = "An asteroid belt round a space station", CoreLoop = "Mine, sell, upgrade the drill", Scores = new ConceptScores { Demand = 5, Competition = 3, Monetization = 6, Feasibility = 4, Lessons = 5 } });
+                g.Concepts.Add(new GameConcept { ConceptId = "c2", Pitch = "Zero-gravity obby between satellites", Genre = "obby", World = "Satellites in orbit", CoreLoop = "Float between platforms", Scores = new ConceptScores { Demand = 4, Competition = 4, Monetization = 4, Feasibility = 3, Lessons = 5 } });
                 g.StageCycles[GameStage.Research] = 12;
                 g.StageFailures[GameStage.Research] = 2;
                 g.Escalations = 2;
@@ -64,7 +64,7 @@ namespace Omnipotent.Tests.OmniBlox
             ctx.Settings.RequireBuildSignoff = true;
             ctx.Settings.RequireLaunchApproval = true;
             PipelineEndToEndTests.ScriptResearch(h.Llm);
-            PipelineEndToEndTests.ScriptBuild(h.Llm);
+            PipelineEndToEndTests.ScriptBuild(h);
             PipelineEndToEndTests.ScriptReview(h.Llm);
             PipelineEndToEndTests.ScriptMarketing(h.Llm);
             await h.StepUntilAsync(() => ctx.Store.Read(s => s.Games.Values.Any(g => g.WaitingReason?.Contains("sign it off") == true)), 40);
@@ -302,23 +302,23 @@ namespace Omnipotent.Tests.OmniBlox
                 new
                 {
                     summary = "Tycoons with a food theme are rising on the charts and the library has enough factory and candy models. Chose a candy factory tycoon with a rebirth loop.",
-                    decisions = new[] { new { what = "Build Candy Factory Tycoon", why = "highest total score (7.4); the tycoon template fits and the theme has free models" } },
+                    decisions = new[] { new { what = "Build Candy Factory Tycoon", why = "highest total score (7.4); food tycoons are rising and the theme has free models" } },
                     next_steps = new[] { "Builder: droppers, conveyor and collector first" },
-                    key_facts = new[] { "Template: tycoon", "Currency: Candy" },
+                    key_facts = new[] { "Genre: tycoon", "Currency: Candy" },
                     stage_complete = true,
                 },
                 ("roblox_charts", new { top = 10 }),
                 ("save_finding", new { finding = "Three food-themed tycoons entered the top 50 this month." }),
-                ("propose_concept", new { pitch = "A candy factory tycoon with a rebirth loop", genre = "tycoon", template = "tycoon", core_loop = "Buy droppers that make candy, sell it at the collector, buy upgrades, rebirth for a multiplier", twist = "every upgrade changes the factory's colours", evidence = new[] { "food tycoons rising" }, demand = 8, competition = 5, monetization = 8, feasibility = 8, lessons = 6 }),
-                ("propose_concept", new { pitch = "A pizza delivery simulator", genre = "simulator", template = "simulator", core_loop = "Collect pizzas, deliver, upgrade the scooter", demand = 6, competition = 5, monetization = 6, feasibility = 5 }),
-                ("propose_concept", new { pitch = "A candy-cane obby", genre = "obby", template = "obby", core_loop = "Jump across giant sweets", demand = 5, competition = 3, monetization = 5, feasibility = 9 }),
+                ("propose_concept", new { pitch = "A candy factory tycoon with a rebirth loop", genre = "tycoon", world = "Candy plains round a factory plaza, a plot per player", core_loop = "Buy droppers that make candy, sell it at the collector, buy upgrades, rebirth for a multiplier", twist = "every upgrade changes the factory's colours", evidence = new[] { "food tycoons rising" }, demand = 8, competition = 5, monetization = 8, feasibility = 8, lessons = 6 }),
+                ("propose_concept", new { pitch = "A pizza delivery simulator", genre = "simulator", world = "A seaside town of streets and houses", core_loop = "Collect pizzas, deliver, upgrade the scooter", demand = 6, competition = 5, monetization = 6, feasibility = 5 }),
+                ("propose_concept", new { pitch = "A candy-cane obby", genre = "obby", world = "Floating sweets over a chocolate river", core_loop = "Jump across giant sweets", demand = 5, competition = 3, monetization = 5, feasibility = 9 }),
                 ("choose_concept", new { concept_id = "c1" }),
                 ("write_brief", new
                 {
                     title = "Candy Factory Tycoon",
                     genre = "tycoon",
-                    template = "tycoon",
                     pitch = "Build the sweetest factory on the server: droppers, conveyors and a giant candy machine.",
+                    world = "Rolling candy plains round a factory plaza: four player plots face the plaza, a candy-cane avenue leads to the giant candy machine on a hill.",
                     target_players = "8-13 year olds who like building and numbers going up",
                     core_loop = "Buy droppers that make candy, collect the cash, buy upgrades, then rebirth for a permanent multiplier.",
                     must_have = new[] { "A plot per player with droppers, a conveyor and a collector", "At least 12 buttons in a sensible order", "A rebirth with a multiplier", "A leaderboard" },
@@ -338,8 +338,8 @@ namespace Omnipotent.Tests.OmniBlox
             llm.Script("builder",
                 new
                 {
-                    summary = "Read the generated baseline (four plots round a plaza, twelve buttons each in price order) and gave it the candy look. The build compiles; the first dropper's price is next.",
-                    decisions = new[] { new { what = "Kept the generated plots and gave them the candy theme", why = "every plot already has its line of twelve buttons in price order, a collector and a spawn" } },
+                    summary = "Raised candy plains round a factory plaza and planned four plots facing it. The build compiles; the plots' buttons and the first dropper's price are next.",
+                    decisions = new[] { new { what = "Plains with a plaza in the middle", why = "four plots facing one plaza keep every player in sight of the others" } },
                     problems = new[] { "Players start with 50 candy but the first dropper costs 60" },
                     next_steps = new[] { "Lower the first dropper or raise the starting candy", "Line the plaza with candy canes" },
                     key_facts = new[] { "Four candy plots face the plaza; the shop and the leaderboard are by the spawn" },
@@ -347,8 +347,21 @@ namespace Omnipotent.Tests.OmniBlox
                 },
                 ("set_milestones", new { milestones = new[] { "Core loop: droppers, conveyor and collector", "Twelve buttons and a rebirth", "Polish: decoration, leaderboard and sounds" } }),
                 ("update_manifest", new { title = "Candy Factory Tycoon", currency_name = "Candy", starting_currency = 50, tips = new[] { "Step on the green buttons to buy!" } }),
-                ("design_world", new { }),
-                ("design_world", new { spec = new { biome = "candy", lighting = "candy", plots = new { count = 4, theme = "candy" } } }),
+                ("terrain_generate", new { shape = "plains", biome = "candy", size = new[] { 700, 700 }, hills = 12 }),
+                ("set_map_area", new { area = new[] { -220, -220, 220, 220 } }),
+                ("plan_map", new
+                {
+                    concept = "Four plots round a factory plaza",
+                    zones = new object[]
+                    {
+                        new { id = "plaza", name = "Factory Plaza", circle = new[] { 0, 0, 55 }, order = 1, theme = "candy plaza" },
+                        new { id = "plot1", name = "Plot 1", circle = new[] { -110, -110, 40 }, order = 2, theme = "candy" },
+                        new { id = "plot2", name = "Plot 2", circle = new[] { 110, -110, 40 }, order = 2, theme = "candy" },
+                        new { id = "plot3", name = "Plot 3", circle = new[] { -110, 110, 40 }, order = 2, theme = "candy" },
+                        new { id = "plot4", name = "Plot 4", circle = new[] { 110, 110, 40 }, order = 2, theme = "candy" },
+                    },
+                }),
+                ("build_prop", new { kind = "spawn", position = new[] { 0, 30 }, face = new[] { 0, 0 } }),
                 ("build", new { }),
                 ("update_milestone", new { id = "m1", done = false, notes = "the plots work; the first dropper is too dear" }));
             llm.Script("builder",

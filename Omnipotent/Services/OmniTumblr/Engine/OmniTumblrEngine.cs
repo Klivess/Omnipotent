@@ -18,7 +18,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
     /// The heartbeat: three independent loops, each woken early by a signal and otherwise polling.
     /// <list type="bullet">
     /// <item>publish — sleeps until the next post is due (≤20 s) and publishes it;</item>
-    /// <item>plan — fills schedule slots and prepares posts (media info, thumbnails, captions);</item>
+    /// <item>plan — fills schedule slots, swaps out planned clips another post already has, and prepares posts (media info, thumbnails, captions);</item>
     /// <item>sync — analytics jobs on their own cadence, within the API budget.</item>
     /// </list>
     /// This replaces the TimeManager task chains v1 used, which double-fired after every restart (a
@@ -180,6 +180,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 {
                     var outcome = await planner.PlanBlogAsync(blogId, token);
                     planned += outcome.Planned;
+                    if (outcome.CheckingRepeats) forcedPlans[blogId] = 0; // fingerprinting in batches: carry on next tick
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
                 catch (Exception ex)
@@ -189,10 +190,11 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             }
             foreach (string stale in forcedPlans.Keys.Except(blogIds).ToList()) forcedPlans.TryRemove(stale, out _);
 
+            int repeats = await planner.SwapRepeatsAsync(token);
             int prepared = await planner.PrepareDueAsync(4, token);
             if (prepared > 0) WakePublisher();
-            if (planned == 0 && prepared == 0) return null;
-            return $"planned {planned}, prepared {prepared}";
+            if (planned == 0 && prepared == 0 && repeats == 0) return null;
+            return repeats == 0 ? $"planned {planned}, prepared {prepared}" : $"planned {planned}, prepared {prepared}, replaced {repeats} repeated clip(s)";
         }
 
         private async Task<string?> SyncTickAsync(CancellationToken token)

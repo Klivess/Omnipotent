@@ -290,10 +290,15 @@ namespace Omnipotent.Services.OmniBlox.Build.WorldGen
             return biomes;
         }
 
+        /// <summary>Themes that show on a model (snow on its branches, candy colours, a haunted look, lava): wrong anywhere else.</summary>
+        private static readonly string[] Clashing = { "snow", "candy", "spooky", "volcanic" };
+
         /// <summary>How well a model suits a biome: 1 for an explicit match, a little for a colour hint, a little for neutral nature.</summary>
         public static double Affinity(CatalogEntry e, string biome)
         {
             biome = (biome ?? "").ToLowerInvariant();
+            // A snow-covered pine also says "pine", which reads as forest: it still does not belong in a green forest.
+            if (e.Biomes.Any(b => Clashing.Contains(b) && b != biome && !BiomeCompatible(b, biome))) return -0.5;
             if (e.Biomes.Contains(biome)) return 1.0;
             if (e.Biomes.Contains(biome + "~")) return 0.45;
             // Plain nature suits the temperate biomes; clearly themed models clash with the other biomes.

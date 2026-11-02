@@ -192,8 +192,6 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     await RunCycleAsync(gameId, "researcher", AgentPrompts.Researcher, ResearchTools.Create(ctx, gameId), "high", ct);
                     break;
                 case GameStage.Build:
-                    // A game that reached Build before the world generator existed gets its generated baseline first.
-                    TryScaffold(gameId);
                     Status = $"building \"{game.DisplayTitle}\" (revision {game.Build.Revision})";
                     await RunCycleAsync(gameId, "builder", AgentPrompts.Builder, BuildTools.Create(ctx, gameId), "medium", ct);
                     break;
@@ -250,20 +248,6 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         }
 
         private static bool LaunchReady(GameDossier g) => StageGates.MarketingReady(g) && g.Publish.LaunchRequestedUtc != null;
-
-        /// <summary>Makes the game's generated baseline when it has none (never fatal: the builder can design_world itself).</summary>
-        private void TryScaffold(string gameId)
-        {
-            try
-            {
-                if (GameScaffold.Ensure(ctx, gameId) is { } done) ctx.Log($"[OmniBlox] {gameId}: {done}");
-            }
-            catch (Exception ex) when (ex is IOException or InvalidOperationException or ArgumentException or Newtonsoft.Json.JsonException or KeyNotFoundException)
-            {
-                ctx.Log($"[OmniBlox] {gameId}: the baseline could not be generated: {ex}");
-                ctx.Event(EventLevel.Warning, "build.scaffold", "The baseline world could not be generated: " + ex.Message, gameId);
-            }
-        }
 
         internal async Task LaunchStepAsync(string gameId, CancellationToken ct)
         {
@@ -438,15 +422,10 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 var ws = ctx.Workspace(gameId);
                 if (!ws.Exists && game.Brief is { } brief)
                 {
-                    ws.EnsureCreated(new GameManifest
-                    {
-                        Title = brief.Title,
-                        Template = GameScaffold.TemplateFor(brief, new GameManifest()),
-                        TemplateSettings = new Dictionary<string, object>(),
-                    });
+                    // A game made from an old template keeps it; every other game starts from the kit alone and builds its own loop and world.
+                    ws.EnsureCreated(new GameManifest { Title = brief.Title, Template = GameKit.IsLegacy(brief.Template) ? brief.Template.ToLowerInvariant() : "" });
                     ctx.Harvester.RequestAssets(brief.AssetNeeds);
                 }
-                TryScaffold(gameId);
             }
             ctx.Store.Mutate(s =>
             {
@@ -458,11 +437,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                     if (g.Milestones.Count == 0)
                         g.Milestones = new List<Milestone>
                         {
-                            new() { MilestoneId = "m1", Title = "Know the baseline: read design.md, look at the renders (spawn, aerial, every zone), map_report and the economy timeline; write in design.md what will make this game special" },
-                            new() { MilestoneId = "m2", Title = "The world: tune the world spec (zone names and biomes, the models, density, lighting) with design_world until every render looks great and the map scores 85+" },
-                            new() { MilestoneId = "m3", Title = "The loop for this brief: the template configured (tool, items, tiers, prices with balance_economy); custom systems only for what the template lacks, each with specs; run_tests green" },
-                            new() { MilestoneId = "m4", Title = "Every must-have from the brief built, with its UI and quests" },
-                            new() { MilestoneId = "m5", Title = "Polish: the tutorial quests, juice (effects, sounds, music), theme colours, and every test green on the final build" },
+                            new() { MilestoneId = "m1", Title = "The design: design.md with the game and its map — the landform, the places in the order players reach them, the paths, the landmarks, what the spawn looks at, and why it is unlike the studio's earlier maps; plan_map with it" },
+                            new() { MilestoneId = "m2", Title = "The land: terrain_generate with the landform the world calls for, terrain_sculpt for every place (plateaus, mesas, ridges, canyons, water, ramps), paths carved, the play area and lighting set; render map and aerial" },
+                            new() { MilestoneId = "m3", Title = "The places: the spawn facing the first goal, the props the loop needs (build_prop: gates, stands, pads, bridges, signposts), a landmark per place, then dressing (dress_area: woods, rims, meadows, rocks, roadsides, accents, tree line); map_report 85+ with no [error]" },
+                            new() { MilestoneId = "m4", Title = "The core loop as systems with specs (src/server/systems, src/tests) and its UI as client controllers on the kit HUD; run_tests green" },
+                            new() { MilestoneId = "m5", Title = "Every must-have from the brief built, with its UI, its progression and the tutorial quests (each guide line pointing at a real thing)" },
+                            new() { MilestoneId = "m6", Title = "Polish: juice (effects, sounds, music), theme colours, tips, and every test green on the final build" },
                         };
                     if (string.IsNullOrEmpty(g.TelemetrySecret)) g.TelemetrySecret = StudioContext.NewSecret();
                 }

@@ -39,7 +39,8 @@ Every action is written to the event log (`events.jsonl`), which feeds the activ
 
 - Slots are weekly (`day + minute`) in the blog's IANA time zone and stay correct across DST changes.
 - Each post lands a deterministic few minutes either side of its slot (`JitterMinutes`, default ±7), never exactly on the hour.
-- `MaxPostsPerDay` (8) and `MinGapMinutes` (30) cap bursts.
+- `MaxPostsPerDay` (8) and `MinGapMinutes` (30) cap bursts on one blog.
+- Across all blogs, autopilot posts go out at least `OmniTumblr_FleetSpacingMinutes` (20) apart, plus a random 0–50% on each gap. Posts that come due together, such as a backlog released when Tumblr answers again or two blogs with slots close together, go out one at a time, oldest first. Before this, every blog's backlog went out in the same minute (Oct 27–28 2026). **Publish now** skips the spacing.
 - A missed slot (for example after downtime) is published late within `MissedSlotGraceHours` (6), or skipped if the policy is Skip. Older slots are skipped rather than flooding the blog.
 - Posts you edit in the queue (time, caption, tags) are marked as manual overrides, so autopilot leaves them alone.
 
@@ -53,6 +54,18 @@ Every action is written to the event log (`events.jsonl`), which feeds the activ
 | Manual only | Nothing is planned; compose posts yourself |
 
 The blog page shows the **content runway**: how many unused items match the filters, and how many weeks that lasts at the current schedule. A warning appears when it runs low.
+
+### Repeats of the same clip
+
+Instagram meme accounts repost each other's videos, so one clip often arrives as several reels with different keys. On Oct 27–28 2026, three blogs posted the same video within a day. Content keys alone can't catch this, so the planner also compares what each video shows (`OmniTumblrFingerprints`):
+
+- **Fingerprint.** ffmpeg decodes the first two minutes once, at 72×128 greyscale, two frames a second. Each frame gets two 64-bit difference hashes of 9×8 cells. One covers the whole frame. The other covers the *moving region*: the part of the frame that changes over the clip, so a static caption bar, border or padding is cut away. Each hash comes with a mask of the bits that mean something: neighbouring cells at least 4 grey levels apart. Bits from flat areas, such as black bars or white caption space, are not compared. Images get one frame. Fingerprints are stored by content key in `fingerprints.json`.
+- **Same clip.** Two videos count as the same clip when their lengths are within 30% (or 3 s) and most frames agree. A pair of frames agrees when at most 16% of the bits meaningful to either differ. Pairs with fewer than 8 meaningful bits are skipped. The frames are compared on the whole frame or on the moving region, as is or mirrored, allowing up to 2 s trimmed from either clip. A still clip (a picture held over music, or a photo) rests on one frame, so it must agree within 5% of at least 16 meaningful bits.
+- **Calibration.** The rule was tuned on 733 real MemeScraper reels (Oct–Nov 2026), and the C# hashes were checked bit for bit against the calibration scripts. Copies of 16 sample reels were all recognised when re-encoded at 480p, trimmed by 1 s, made quieter or mirrored. Captioned copies were recognised for all 10 moving reels and none of the 6 still pictures. A repost that re-crops or zooms the clip is not recognised. Across all 261,726 pairs, the only matches were genuine: one clip that one account posted 51 times.
+- **Sound is not used.** Matching on loudness was tried and dropped. It flagged 748 pairs of different memes that use the same trending sound. Their cuts land on the beat, so even their motion agreed.
+- **When picking.** A candidate is skipped if it is the same clip as anything the blog must not repeat: its own posts, and every other blog's posts unless "reuse across blogs" is on. Published, removed and planned posts all count. Two slots filled in one pass never get the same clip either.
+- **Sweep.** Every plan tick, planned autopilot posts that repeat an earlier post are found. This covers posts planned before fingerprints existed. The earlier post keeps the clip: one already out, or the one scheduled first. The later one gets different content and a new caption. If nothing different is left, it is cancelled, and its slot is refilled once content turns up. Posts you edited by hand are left alone. The event log records each case as `post.repeat`.
+- **Limits.** Each pass computes at most 12 new fingerprints, so after a deploy it takes a few ticks to fingerprint existing posts. Planning waits until they are done. Media ffmpeg can't read is judged by its key alone, as before. After 5 failures in a row, a `content.fingerprint` warning is logged.
 
 ### Captions
 
@@ -87,7 +100,7 @@ The edge gate (`TumblrEdgeGate`) now handles it:
 
 - The client reports every response to the gate. An HTML 403 closes the gate, and any JSON answer, even an error, opens it again.
 - While the gate is closed, posts wait without using an attempt, and sync jobs are postponed. Every 5, 10, 20, then 30 minutes, one call goes out to test whether Tumblr is answering again. **Publish now** and **Retry** try at once.
-- When the gate opens, the waiting posts go out and sync catches up, spread over three minutes. An autopilot post still follows the missed-slot policy, so after the grace period it is skipped rather than posted many hours late.
+- When the gate opens, the waiting autopilot posts go out one at a time, spaced across blogs (see Scheduling), and sync catches up, spread over three minutes. An autopilot post still follows the missed-slot policy, so after the grace period it is skipped rather than posted many hours late.
 - The overview shows "Tumblr is refusing this server's requests". The event log records when the block starts and when it lifts. If it lasts over 2 hours, a Discord alert is sent.
 
 If the blocks keep coming back, the cause is the server's IP or network, not OmniTumblr. Send Tumblr traffic another way with `OmniTumblr_Proxy`.
@@ -117,6 +130,8 @@ Both are OmniSettings and take effect without a restart:
 | `OmniTumblrV2_PublishingEnabled` | true | Nothing is posted. Planning, captions and analytics carry on |
 
 The second has a v2 name on purpose: OmniSettings writes a default on first read, so a renamed setting is the only way to ship a new default.
+
+`OmniTumblr_FleetSpacingMinutes` (default 20, 0 turns it off, at most 360) is the minimum gap between autopilot posts on any two blogs. It takes effect within a minute.
 
 `OmniTumblr_Proxy` (default empty, which means direct) sends every Tumblr call through a proxy: `http://host:port`, `https://…` or `socks5://host:port`, optionally with `user:pass@`. It takes effect within a minute. A value that cannot be parsed is ignored and logged once.
 
