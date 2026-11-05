@@ -273,7 +273,7 @@ public sealed class KliveLinkV2Store : IDisposable
             using var conn = Open();
         CacheDeps.NoteRead(CacheKey);
             using var cmd = conn.CreateCommand();
-            cmd.CommandText = "UPDATE agents SET last_seen=$last WHERE agent_id=$id";
+            cmd.CommandText = "UPDATE agents SET last_seen=$last, is_connected=1 WHERE agent_id=$id";
             cmd.Parameters.AddWithValue("$last", DateTimeOffset.UtcNow.ToString("O"));
             cmd.Parameters.AddWithValue("$id", agentId);
             cmd.ExecuteNonQuery();

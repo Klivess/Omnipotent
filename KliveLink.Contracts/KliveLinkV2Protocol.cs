@@ -376,7 +376,7 @@ public sealed class V2CollectionRequest
     public string Profile { get; set; } = "t0-fast";
     public string[] Categories { get; set; } = Array.Empty<string>();
     public V2CollectionTier Tier { get; set; } = V2CollectionTier.T0;
-    public int MaxBytes { get; set; } = 50 * 1024 * 1024;
+    public long MaxBytes { get; set; } = 50 * 1024 * 1024;
 }
 
 public sealed class V2CollectionManifest

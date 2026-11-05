@@ -22,6 +22,7 @@ public sealed class KliveLinkV2Client : IDisposable
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
     private Task? _heartbeatTask;
+    private long _lastActivityUtcTicks;
 
     public bool IsConnected => _socket?.State == WebSocketState.Open;
     public event Action<string>? OnLog;
@@ -63,10 +64,14 @@ public sealed class KliveLinkV2Client : IDisposable
                 await _socket.ConnectAsync(new Uri(_serverUri), _cts.Token);
                 await HandshakeAsync(_cts.Token);
                 Log("Connected and authenticated to KliveLink v2.");
+                Interlocked.Exchange(ref _lastActivityUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
                 attempt = 0;
                 _receiveTask = ReceiveLoopAsync(_cts.Token);
                 _heartbeatTask = HeartbeatLoopAsync(_cts.Token);
-                await Task.WhenAny(_receiveTask, _heartbeatTask);
+                Task completed = await Task.WhenAny(_receiveTask, _heartbeatTask);
+                Log(completed == _receiveTask
+                    ? $"Receive loop ended ({_socket?.State})."
+                    : $"Heartbeat loop ended ({_socket?.State}).");
             }
             catch (OperationCanceledException) { break; }
             catch (Exception ex)
@@ -128,6 +133,7 @@ public sealed class KliveLinkV2Client : IDisposable
             try
             {
                 V2Frame frame = await V2FrameCodec.ReadFrameAsync(_socket, ct);
+                Interlocked.Exchange(ref _lastActivityUtcTicks, DateTimeOffset.UtcNow.UtcTicks);
                 switch (frame.Type)
                 {
                     case V2FrameType.Ping:
@@ -155,7 +161,11 @@ public sealed class KliveLinkV2Client : IDisposable
                 }
             }
             catch (OperationCanceledException) { break; }
-            catch (WebSocketException) { break; }
+            catch (WebSocketException ex)
+            {
+                Log("WebSocket closed: " + ex.Message);
+                break;
+            }
             catch (Exception ex)
             {
                 Log("Receive error: " + ex.Message);
@@ -171,10 +181,20 @@ public sealed class KliveLinkV2Client : IDisposable
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(20), ct);
+                long last = Interlocked.Read(ref _lastActivityUtcTicks);
+                if (last != 0 && DateTimeOffset.UtcNow - new DateTimeOffset(last, TimeSpan.Zero) > TimeSpan.FromSeconds(75))
+                {
+                    Log("Heartbeat timed out; reconnecting.");
+                    break;
+                }
                 await SendFrameAsync(V2FrameType.Ping, new V2Ping(), ct);
             }
             catch (OperationCanceledException) { break; }
-            catch { break; }
+            catch (Exception ex)
+            {
+                Log("Heartbeat error: " + ex.Message);
+                break;
+            }
         }
     }
 
