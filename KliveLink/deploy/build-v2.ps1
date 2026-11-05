@@ -16,7 +16,7 @@ $outPath = Join-Path $repo $Output
 
 Write-Host "Publishing $AssemblyName to $outPath" -ForegroundColor Cyan
 dotnet publish $project -c Release -r win-x64 --self-contained true `
-    /p:PublishSingleFile=true /p:CopyOutputSymbolsToPublishDirectory=false `
+    /p:PublishSingleFile=true /p:IncludeNativeLibrariesForSelfExtract=true /p:CopyOutputSymbolsToPublishDirectory=false `
     /p:KliveLinkAssemblyName=$AssemblyName /p:DebugType=None -o $outPath
 
 $exe = Join-Path $outPath "$AssemblyName.exe"
