@@ -15,13 +15,20 @@ public sealed class KliveLinkV2Service : OmniService
     public KliveLinkV2Server Server { get; private set; } = null!;
     public KliveLinkV2UpdateStore Updates { get; } = new();
 
+    public KliveAPI.KliveAPI? InjectedApi { get; }
+
     public KliveLinkV2Service()
     {
         name = "KliveLinkV2Service";
         threadAnteriority = ThreadAnteriority.Standard;
     }
 
-    internal KliveLinkV2Service(KliveLinkV2Store store, KliveLinkV2Options options) : this()
+    public KliveLinkV2Service(KliveAPI.KliveAPI? api) : this()
+    {
+        InjectedApi = api;
+    }
+
+    internal KliveLinkV2Service(KliveLinkV2Store store, KliveLinkV2Options options, KliveAPI.KliveAPI? api = null) : this(api)
     {
         Store = store;
         Options = options;
@@ -41,22 +48,19 @@ public sealed class KliveLinkV2Service : OmniService
                 try { Server.Start(); }
                 catch (Exception ex) { _ = ServiceLogError(ex, "KliveLink v2 dedicated listener unavailable; using the KliveAPI 443 route"); }
             }
-            var routes = new KliveLinkV2Routes(this);
+            var routes = new KliveLinkV2Routes(this, InjectedApi);
             _ = Task.Run(async () =>
             {
-                for (int attempt = 1; attempt <= 10; attempt++)
+                try
                 {
-                    try
-                    {
-                        await routes.CreateRoutes();
-                        return;
-                    }
-                    catch (Exception ex)
-                    {
-                        LastStartupError = ex.ToString();
-                        await ServiceLogError(ex, $"KliveLink v2 route registration failed (attempt {attempt}/10)");
-                        await Task.Delay(TimeSpan.FromSeconds(2));
-                    }
+                    await routes.CreateRoutes();
+                    LastStartupError = null;
+                    await ServiceLog("KliveLink v2 routes registered successfully.");
+                }
+                catch (Exception ex)
+                {
+                    LastStartupError = ex.ToString();
+                    await ServiceLogError(ex, "KliveLink v2 route registration failed");
                 }
             });
             _ = ServiceLog($"KliveLink v2 routes registering on KliveAPI 443; dedicated listener {(string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("KLIVELINK_V2_LISTEN")) ? "disabled" : Options.ListenPrefix)}; db={Options.DbPath}");

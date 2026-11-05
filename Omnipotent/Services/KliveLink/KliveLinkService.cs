@@ -46,10 +46,17 @@ namespace Omnipotent.Services.KliveLink
             public ConcurrentDictionary<string, TaskCompletionSource<KliveLinkMessage>> PendingResponses { get; } = new();
         }
 
+        public KliveAPI.KliveAPI? InjectedApi { get; }
+
         public KliveLinkService()
         {
             name = "KliveLinkService";
             threadAnteriority = ThreadAnteriority.Standard;
+        }
+
+        public KliveLinkService(KliveAPI.KliveAPI? api) : this()
+        {
+            InjectedApi = api;
         }
 
         protected override async void ServiceMain()
@@ -60,8 +67,19 @@ namespace Omnipotent.Services.KliveLink
             ServiceQuitRequest += () => _server.Stop();
 
             // Register HTTP API routes on KliveAPI for controlling agents
-            var routes = new KliveLinkRoutes(this);
-            routes.CreateRoutes();
+            var routes = new KliveLinkRoutes(this, InjectedApi);
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await routes.CreateRoutes();
+                    _ = ServiceLog("KliveLink v1 routes registered successfully.");
+                }
+                catch (Exception ex)
+                {
+                    _ = ServiceLogError(ex, "KliveLink v1 route registration failed");
+                }
+            });
             ServiceLog($"KliveLinkService started. WebSocket server on port {KliveLinkServer.Port}. Waiting for agent connections.");
         }
 

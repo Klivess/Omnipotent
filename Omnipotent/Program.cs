@@ -62,9 +62,10 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.SeleniumManager.SeleniumManager());
                 var kliveApi = new KliveAPI();
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(kliveApi);
-                // Start the v2 KliveLink plane explicitly as well; KliveAPI also starts it
-                // after its listener is ready. The service manager de-duplicates by name.
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveLink.KliveLinkV2Service());
+                // Start the KliveLink planes explicitly with the typed API instance so routes register instantly.
+                // KliveAPI also starts them after its listener is ready; the service manager de-duplicates by name.
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveLink.KliveLinkService(kliveApi));
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveLink.KliveLinkV2Service(kliveApi));
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.OmniDefence.OmniDefence());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new OmniGlobalSettingsManager());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveBotDiscord());

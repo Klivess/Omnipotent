@@ -146,4 +146,45 @@ public sealed class KliveLinkV2Tests
         Assert.False(options.IsTokenValid("wrong"));
         Assert.False(options.IsTokenValid(""));
     }
+
+    [Fact]
+    public void SecretBox_LoadsHexBase64AndRecoversCorruptKey()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "klive-secretbox-tests", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            // 1. Raw 32 bytes
+            string rawKeyPath = Path.Combine(root, "raw.key");
+            File.WriteAllBytes(rawKeyPath, new byte[32] { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32 });
+            var box1 = new KliveLinkV2SecretBox(rawKeyPath);
+            string cipher1 = box1.Protect("hello-raw");
+            Assert.Equal("hello-raw", box1.Unprotect(cipher1));
+
+            // 2. 64-char hex with trailing newline
+            string hexKeyPath = Path.Combine(root, "hex.key");
+            File.WriteAllText(hexKeyPath, "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\r\n");
+            var box2 = new KliveLinkV2SecretBox(hexKeyPath);
+            Assert.Equal("hello-raw", box2.Unprotect(cipher1));
+
+            // 3. 44-char Base64 with trailing spaces
+            string b64KeyPath = Path.Combine(root, "b64.key");
+            File.WriteAllText(b64KeyPath, "AQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyA= \n");
+            var box3 = new KliveLinkV2SecretBox(b64KeyPath);
+            Assert.Equal("hello-raw", box3.Unprotect(cipher1));
+
+            // 4. 0-byte corrupt file recovery
+            string corruptKeyPath = Path.Combine(root, "empty.key");
+            File.WriteAllBytes(corruptKeyPath, Array.Empty<byte>());
+            var box4 = new KliveLinkV2SecretBox(corruptKeyPath);
+            string cipher4 = box4.Protect("survived-corrupt-file");
+            Assert.Equal("survived-corrupt-file", box4.Unprotect(cipher4));
+            Assert.True(File.Exists(corruptKeyPath));
+            Assert.Equal(32, File.ReadAllBytes(corruptKeyPath).Length);
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
 }

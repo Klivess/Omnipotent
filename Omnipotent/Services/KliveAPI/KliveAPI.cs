@@ -805,8 +805,8 @@ namespace Omnipotent.Services.KliveAPI
                 profileManager = (KMProfileManager)(await GetServicesByType<KMProfileManager>())[0];
 
                 //Create KliveLink remote administration service
-                CreateAndStartService(new KliveLink.KliveLinkService());
-                CreateAndStartService(new KliveLink.KliveLinkV2Service());
+                CreateAndStartService(new KliveLink.KliveLinkService(this));
+                CreateAndStartService(new KliveLink.KliveLinkV2Service(this));
 
                 CreateMetaKLIVEAPIRoutes();
 

@@ -91,18 +91,74 @@ public sealed class KliveLinkV2SecretBox
 
     public KliveLinkV2SecretBox(string keyPath)
     {
+        key = LoadOrCreateKey(keyPath);
+    }
+
+    private static byte[] LoadOrCreateKey(string keyPath)
+    {
         string? dir = Path.GetDirectoryName(keyPath);
         if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+
         if (File.Exists(keyPath))
         {
-            key = File.ReadAllBytes(keyPath);
-            if (key.Length != 32) throw new InvalidDataException("KliveLink v2 key must be 32 bytes.");
+            try
+            {
+                byte[] raw = File.ReadAllBytes(keyPath);
+                if (raw.Length == 32)
+                {
+                    return raw;
+                }
+
+                // Check text encodings: hex, base64, trimmed ASCII/UTF-8, or passphrase
+                string text = Encoding.UTF8.GetString(raw).Trim();
+
+                // 64-character hex string (32 bytes in hex)
+                if (text.Length == 64 && text.All(Uri.IsHexDigit))
+                {
+                    return Convert.FromHexString(text);
+                }
+
+                // Base64 encoded 32-byte key (standard base64 length is 44 characters)
+                if (text.Length == 44)
+                {
+                    try
+                    {
+                        byte[] decoded = Convert.FromBase64String(text);
+                        if (decoded.Length == 32) return decoded;
+                    }
+                    catch { }
+                }
+
+                // If trimmed text bytes are exactly 32 bytes (e.g. 32-char string with stripped newlines)
+                byte[] textBytes = Encoding.UTF8.GetBytes(text);
+                if (textBytes.Length == 32)
+                {
+                    return textBytes;
+                }
+
+                // If non-empty passphrase / text, hash with SHA256 to derive a stable 32-byte key
+                if (!string.IsNullOrWhiteSpace(text))
+                {
+                    return SHA256.HashData(textBytes);
+                }
+
+                // 0-byte or whitespace-only file: quarantine unusable file and regenerate
+                string quarantine = keyPath + $".corrupt-{DateTime.UtcNow:yyyyMMddHHmmss}";
+                try { File.Move(keyPath, quarantine, overwrite: true); } catch { }
+            }
+            catch
+            {
+                // Fall through to fresh key generation
+            }
         }
-        else
+
+        byte[] freshKey = RandomNumberGenerator.GetBytes(32);
+        try
         {
-            key = RandomNumberGenerator.GetBytes(32);
-            File.WriteAllBytes(keyPath, key);
+            File.WriteAllBytes(keyPath, freshKey);
         }
+        catch { }
+        return freshKey;
     }
 
     public string Protect(string plaintext)
