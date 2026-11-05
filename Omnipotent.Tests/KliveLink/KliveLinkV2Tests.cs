@@ -1,4 +1,5 @@
 using KliveLink.Contracts;
+using Omnipotent.Profiles.Permissions;
 using Omnipotent.Services.KliveLink;
 
 namespace Omnipotent.Tests.KliveLink;
@@ -123,6 +124,14 @@ public sealed class KliveLinkV2Tests
         {
             try { Directory.Delete(root, true); } catch { }
         }
+    }
+
+    [Fact]
+    public void KliveLinkPerms_AllKeysAreCatalogValid()
+    {
+        Assert.Equal("klivelink.agents.infect", KliveLinkPerms.Infect.Key);
+        Assert.Equal("klivelink.collection.view", KliveLinkPerms.CollectionView.Key);
+        Assert.Equal("klivelink.agents.purge", KliveLinkPerms.AgentsPurge.Key);
     }
 
     [Fact]
