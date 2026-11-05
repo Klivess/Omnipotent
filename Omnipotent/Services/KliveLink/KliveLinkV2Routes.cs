@@ -428,14 +428,14 @@ public sealed class KliveLinkV2Routes
             }
         }, HttpMethod.Post, KliveLinkPerms.AgentsDestroy);
 
-        await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
+        await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateAgentWebSocketRoute",
             "/klivelink/v2/ws",
             (Func<HttpListenerContext, WebSocket, System.Collections.Specialized.NameValueCollection, KMProfileManager.KMProfile?, Task>)(async (context, socket, query, user) =>
             {
                 string agentId = context.Request.Headers["X-Agent-Id"] ?? "";
                 string token = context.Request.Headers["X-Enrollment-Token"] ?? "";
                 await _parent.Server.HandleAgentSocketAsync(socket, agentId, token);
-            }), Perms.Public, true);
+            }));
 
         await _parent.ExecuteServiceMethod<Omnipotent.Services.KliveAPI.KliveAPI>("CreateWebSocketRoute",
             "/klivelink/v2/events",

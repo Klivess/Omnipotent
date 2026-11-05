@@ -1642,7 +1642,7 @@ namespace Omnipotent.Services.KliveAPI
             return maxBodyBytes;
         }
 
-        public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, PermissionDef permission, bool agentAuth = false)
+        public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, PermissionDef permission)
         {
             ArgumentNullException.ThrowIfNull(permission);
             route = NormalizeRoute(route);
@@ -1650,11 +1650,30 @@ namespace Omnipotent.Services.KliveAPI
             {
                 handler = handler,
                 permission = permission,
-                agentAuth = agentAuth
+                agentAuth = false
             };
             if (WebSocketRouteLookup.TryAdd(route, info))
             {
                 ServiceLog($"New WebSocket route created: {route}");
+            }
+        }
+
+        /// <summary>
+        /// A WebSocket route for machine agents. The agent token is validated inside the
+        /// handler, not by the browser profile/session evaluator.
+        /// </summary>
+        public async Task CreateAgentWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler)
+        {
+            route = NormalizeRoute(route);
+            var info = new WebSocketRouteInfo
+            {
+                handler = handler,
+                permission = Perms.Public,
+                agentAuth = true
+            };
+            if (WebSocketRouteLookup.TryAdd(route, info))
+            {
+                ServiceLog($"New agent WebSocket route created: {route}");
             }
         }
 
