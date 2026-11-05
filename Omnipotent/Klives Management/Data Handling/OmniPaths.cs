@@ -139,6 +139,13 @@ namespace Omnipotent.Data_Handling
             public static string TripwireDbFile = $"{TripwireDirectory}/tripwires.db";
             public static string TripwireVisitorKeyFile = $"{TripwireDirectory}/visitor.key";
 
+            //KliveLink (v2 control plane, collections and purge jobs)
+            public static string KliveLinkDirectory = $"{SavedDataDirectory}/KliveLink";
+            public static string KliveLinkV2DbFile = $"{KliveLinkDirectory}/v2.db";
+            public static string KliveLinkV2KeyFile = $"{KliveLinkDirectory}/v2.key";
+            public static string KliveLinkV2TokenFile = $"{KliveLinkDirectory}/v2-tokens.json";
+            public static string KliveLinkCollectionDirectory = $"{KliveLinkDirectory}/Collections";
+
             //KliveAgent
             public static string KliveAgentDirectory = $"{SavedDataDirectory}/KliveAgent";
             public static string KliveAgentMemoriesDirectory = $"{KliveAgentDirectory}/Memories";

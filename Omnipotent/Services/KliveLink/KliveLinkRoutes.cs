@@ -387,10 +387,12 @@ namespace Omnipotent.Services.KliveLink
             {
                 try
                 {
-                    string exePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "KliveLink.exe");
+                    string setupPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WindowsCacheHostSetup.exe");
+                    string legacyPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "KliveLink.exe");
+                    string exePath = File.Exists(setupPath) ? setupPath : legacyPath;
                     if (!File.Exists(exePath))
                     {
-                        await req.ReturnResponse("KL executable not found on server", code: HttpStatusCode.NotFound);
+                        await req.ReturnResponse("Agent installer not found on server", code: HttpStatusCode.NotFound);
                         return;
                     }
 

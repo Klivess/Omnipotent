@@ -131,6 +131,7 @@ namespace Omnipotent.Services.KliveAPI
         {
             public Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler;
             public PermissionDef permission;
+            public bool agentAuth;
         }
 
         /// <summary>A registered route as the permission catalog shows it.</summary>
@@ -805,6 +806,7 @@ namespace Omnipotent.Services.KliveAPI
 
                 //Create KliveLink remote administration service
                 CreateAndStartService(new KliveLink.KliveLinkService());
+                CreateAndStartService(new KliveLink.KliveLinkV2Service());
 
                 CreateMetaKLIVEAPIRoutes();
 
@@ -1640,14 +1642,15 @@ namespace Omnipotent.Services.KliveAPI
             return maxBodyBytes;
         }
 
-        public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, PermissionDef permission)
+        public async Task CreateWebSocketRoute(string route, Func<HttpListenerContext, WebSocket, NameValueCollection, KMProfileManager.KMProfile?, Task> handler, PermissionDef permission, bool agentAuth = false)
         {
             ArgumentNullException.ThrowIfNull(permission);
             route = NormalizeRoute(route);
             var info = new WebSocketRouteInfo
             {
                 handler = handler,
-                permission = permission
+                permission = permission,
+                agentAuth = agentAuth
             };
             if (WebSocketRouteLookup.TryAdd(route, info))
             {
@@ -2532,7 +2535,16 @@ namespace Omnipotent.Services.KliveAPI
                     request.session = preResolvedSession;
                     request.permission = wsRouteData.permission;
 
-                    // Same decision as HTTP routes — including CanLogin, suspension and read-only,
+                    // Agent-token sockets authenticate inside the handler; they do not have a
+                    // browser profile. Everything else goes through the normal access evaluator.
+                    if (wsRouteData.agentAuth)
+                    {
+                        var agentContext = await context.AcceptWebSocketAsync(subProtocol: null);
+                        await wsRouteData.handler(context, agentContext.WebSocket, nameValueCollection, preResolvedUser);
+                        return;
+                    }
+
+                    // Same decision as HTTP routes - including CanLogin, suspension and read-only,
                     // which the old rank gate never checked for sockets.
                     var wsDecision = AccessEvaluator.Evaluate(preResolvedUser, wsRouteData.permission, credentialFailure);
                     if (wsDecision.Allowed)

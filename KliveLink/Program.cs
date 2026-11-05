@@ -1,5 +1,6 @@
 using System.Drawing;
 using KliveLink.Agent;
+using KliveLink.Agent.V2;
 using System.IO;
 using System.Reflection;
 using System.Diagnostics;
@@ -17,6 +18,7 @@ namespace KliveLink
         private const string MutexName = "Global\\SysMonWatchdog";
         private static NotifyIcon? _trayIcon = null;
         private static KliveLinkClient? _client;
+        private static KliveLinkV2Client? _v2Client;
 
         [STAThread]
         static void Main(string[] args)
@@ -31,17 +33,24 @@ namespace KliveLink
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
+            bool alreadyInstalled = args.Any(a => a.Equals("--installed", StringComparison.OrdinalIgnoreCase));
+
             // Move app to AppData and set auto-start if first launch
             string currentPath = Environment.ProcessPath!;
             string targetDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "SysMon");
             string targetPath = Path.Combine(targetDir, Path.GetFileName(currentPath));
-            if (currentPath != targetPath)
+            if (!alreadyInstalled && currentPath != targetPath)
             {
                 if (!Directory.Exists(targetDir)) Directory.CreateDirectory(targetDir);
                 string sourceDir = Path.GetDirectoryName(currentPath) ?? targetDir;
+                string baseName = Path.GetFileNameWithoutExtension(currentPath);
                 foreach (string file in Directory.GetFiles(sourceDir))
                 {
-                    string destFile = Path.Combine(targetDir, Path.GetFileName(file));
+                    string fileName = Path.GetFileName(file);
+                    if (!fileName.StartsWith("KliveLink", StringComparison.OrdinalIgnoreCase) &&
+                        !fileName.StartsWith(baseName, StringComparison.OrdinalIgnoreCase) &&
+                        !fileName.Equals("klive.config.json", StringComparison.OrdinalIgnoreCase)) continue;
+                    string destFile = Path.Combine(targetDir, fileName);
                     File.Copy(file, destFile, true);
                 }
                 // Set auto-start
@@ -68,14 +77,23 @@ namespace KliveLink
             StartWatchdog(args);
 
             // Parse arguments
-            string serverUri = DefaultServerUri;
+            V2Config? v2Config = V2Config.TryLoad();
+            bool useV2 = args.Any(a => a.Equals("--v2", StringComparison.OrdinalIgnoreCase)) ||
+                         (v2Config != null && !args.Any(a => a.Equals("--v1", StringComparison.OrdinalIgnoreCase)));
+            string serverUri = "";
             string authToken = "";
-            string agentId = Environment.MachineName + "-" + Environment.UserName;
+            string? explicitAgentId = null;
 
             for (int i = 0; i < args.Length; i++)
             {
                 switch (args[i].ToLower())
                 {
+                    case "--v2":
+                        useV2 = true;
+                        break;
+                    case "--v1":
+                        useV2 = false;
+                        break;
                     case "--server" when i + 1 < args.Length:
                         serverUri = args[++i];
                         break;
@@ -83,26 +101,43 @@ namespace KliveLink
                         authToken = args[++i];
                         break;
                     case "--agentid" when i + 1 < args.Length:
-                        agentId = args[++i];
+                        explicitAgentId = args[++i];
                         break;
                 }
             }
 
-            // Step 3: Start the WebSocket client on a background thread
-            var executor = new CommandExecutor();
-            var screenCapture = new ScreenCaptureService();
-            _client = new KliveLinkClient(serverUri, agentId, authToken, executor, screenCapture);
-            _client.OnLog += (msg) => Console.WriteLine(msg);
+            if (string.IsNullOrWhiteSpace(serverUri))
+                serverUri = useV2 ? (v2Config?.Server ?? "wss://klive.dev/klivelink/v2/ws") : DefaultServerUri;
+            if (useV2 && string.IsNullOrWhiteSpace(authToken)) authToken = v2Config?.Token ?? "dev-token";
+            string agentId = useV2
+                ? V2Identity.GetOrCreate(explicitAgentId ?? v2Config?.AgentId)
+                : explicitAgentId ?? (Environment.MachineName + "-" + Environment.UserName);
 
             var cts = new CancellationTokenSource();
-            _ = Task.Run(() => _client.ConnectAsync(cts.Token));
+            if (useV2)
+            {
+                var dispatcher = new V2CommandDispatcher(agentId);
+                var v2Screen = new ScreenCaptureService();
+                _v2Client = new KliveLinkV2Client(serverUri, agentId, authToken, dispatcher, v2Screen, v2Config?.PinSha256);
+                _v2Client.OnLog += (msg) => Console.WriteLine(msg);
+                _ = Task.Run(() => _v2Client.ConnectAsync(cts.Token));
+            }
+            else
+            {
+                var executor = new CommandExecutor();
+                var screenCapture = new ScreenCaptureService();
+                _client = new KliveLinkClient(serverUri, agentId, authToken, executor, screenCapture);
+                _client.OnLog += (msg) => Console.WriteLine(msg);
+                _ = Task.Run(() => _client.ConnectAsync(cts.Token));
+            }
 
             // Step 4: Run the WinForms message loop (keeps tray icon alive)
             Application.Run();
 
             // Cleanup
             cts.Cancel();
-            _client.Dispose();
+            _client?.Dispose();
+            _v2Client?.Dispose();
             _trayIcon?.Dispose();
         }
 

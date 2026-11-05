@@ -7,10 +7,18 @@
     <Nullable>enable</Nullable>
     <UseWindowsForms>true</UseWindowsForms>
     <PublishTrimmed>false</PublishTrimmed>
+    <AssemblyName Condition="'$(KliveLinkAssemblyName)' != ''">$(KliveLinkAssemblyName)</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
+    <PackageReference Include="System.Management" Version="9.0.0" />
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="9.0.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\KliveLink.Contracts\KliveLink.Contracts.csproj" />
   </ItemGroup>
 
 </Project>

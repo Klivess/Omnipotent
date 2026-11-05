@@ -106,4 +106,8 @@
 		<EmbeddedResource Include="Services\OmniBlox\LocalEngine\engine.luau" LogicalName="OmniBloxLocalEngine/engine.luau" />
 	</ItemGroup>
 
+	<ItemGroup>
+	  <ProjectReference Include="..\KliveLink.Contracts\KliveLink.Contracts.csproj" />
+	</ItemGroup>
+
 </Project>

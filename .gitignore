@@ -424,3 +424,7 @@ work/
 Docs/cache-recovery-2026-09-18.md
 # local Codex cache-recovery tool artifact, not source
 .codex-cache-recovery/
+Docs/KliveLinkDeploymentRunbook.md
+Docs/KliveLinkAVMatrix.md
+Docs/KliveLink-Audit-and-Rebuild-Plan-2026-11.md
+KliveLink.Native/README.md

