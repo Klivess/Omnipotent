@@ -421,6 +421,7 @@ namespace Omnipotent.Services.KliveLink
                         v2Active = v2?.Any(s => s.IsServiceActive()) ?? false,
                         v2RouteCount = routes,
                         lastStartupError = KliveLinkV2Service.LastStartupError,
+                        provisioningError = KliveLinkAssetProvisioner.LastError,
                     }), "application/json");
                 }
                 catch (Exception ex)

@@ -14,6 +14,7 @@ public static class KliveLinkAssetProvisioner
 {
     private const string GeneratedFolder = "generated";
     private static readonly object Gate = new();
+    public static string? LastError { get; private set; }
 
     public static string GeneratedDirectory(KliveLinkV2Options options)
         => Path.Combine(options.DataDirectory, GeneratedFolder);
@@ -59,9 +60,10 @@ public static class KliveLinkAssetProvisioner
                 BuildSetup(setupStub, agentPath, configPath, setupPath);
                 try { File.Delete(setupStub); } catch { }
             }
-            catch
+            catch (Exception ex)
             {
-                // The dashboard routes will report "installer not found" if provisioning fails.
+                LastError = ex.ToString();
+                try { File.WriteAllText(Path.Combine(GeneratedDirectory(options), "provision-error.txt"), ex.ToString()); } catch { }
             }
         }
     }
