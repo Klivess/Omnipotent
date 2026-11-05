@@ -1,4 +1,4 @@
-using Newtonsoft.Json;
+﻿using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using System.Net;
 using System.Net.WebSockets;
@@ -434,10 +434,10 @@ namespace Omnipotent.Services.KliveLink
             {
                 try
                 {
-                    string setupPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WindowsCacheHostSetup.exe");
-                    string legacyPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "KliveLink.exe");
-                    string exePath = File.Exists(setupPath) ? setupPath : legacyPath;
-                    if (!File.Exists(exePath))
+                    string? setupPath = KliveLinkAssetLocator.Find("WindowsCacheHostSetup.exe");
+                    string? legacyPath = KliveLinkAssetLocator.Find("KliveLink.exe");
+                    string? exePath = !string.IsNullOrWhiteSpace(setupPath) ? setupPath : legacyPath;
+                    if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath))
                     {
                         await req.ReturnResponse("Agent installer not found on server", code: HttpStatusCode.NotFound);
                         return;
@@ -501,3 +501,4 @@ namespace Omnipotent.Services.KliveLink
         }
     }
 }
+

