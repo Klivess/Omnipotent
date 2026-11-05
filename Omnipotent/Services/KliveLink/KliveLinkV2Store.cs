@@ -50,6 +50,7 @@ public sealed class KliveLinkV2RecordView
     public string Name { get; set; } = "";
     public string? Username { get; set; }
     public string? Secret { get; set; }
+    public bool HasSecret { get; set; }
     public string? Url { get; set; }
     public DateTimeOffset? ExpiresAt { get; set; }
     public string MetadataJson { get; set; } = "{}";
@@ -530,6 +531,7 @@ public sealed class KliveLinkV2Store : IDisposable
                 Name = reader.GetString(6),
                 Username = reader.IsDBNull(7) ? null : reader.GetString(7),
                 Secret = null,
+                HasSecret = !reader.IsDBNull(8),
                 Url = reader.IsDBNull(9) ? null : reader.GetString(9),
                 ExpiresAt = reader.IsDBNull(10) ? null : DateTimeOffset.Parse(reader.GetString(10)),
                 MetadataJson = reader.GetString(11),
@@ -559,6 +561,7 @@ public sealed class KliveLinkV2Store : IDisposable
             Name = reader.GetString(6),
             Username = reader.IsDBNull(7) ? null : reader.GetString(7),
             Secret = revealSecret && !reader.IsDBNull(8) ? secretBox.Unprotect(reader.GetString(8)) : null,
+            HasSecret = !reader.IsDBNull(8),
             Url = reader.IsDBNull(9) ? null : reader.GetString(9),
             ExpiresAt = reader.IsDBNull(10) ? null : DateTimeOffset.Parse(reader.GetString(10)),
             MetadataJson = reader.GetString(11),

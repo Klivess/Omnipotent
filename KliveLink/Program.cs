@@ -23,6 +23,14 @@ namespace KliveLink
         [STAThread]
         static void Main(string[] args)
         {
+            // App-bound browser keys must be decrypted from inside the browser's
+            // installation path. The agent invokes itself through a hard link there.
+            if (args.Contains("--abe-helper"))
+            {
+                Environment.ExitCode = AbeHelper.Run(args);
+                return;
+            }
+
             // If launched with --watchdog, run as a watchdog that restarts the main process
             if (args.Contains("--watchdog"))
             {

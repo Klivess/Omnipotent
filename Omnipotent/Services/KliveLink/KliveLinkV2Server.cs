@@ -36,7 +36,10 @@ public sealed class KliveLinkV2Server : IDisposable
         _listener = new HttpListener();
     }
 
-    public int SessionCount => _sessions.Count;
+    public int SessionCount => _sessions.Values
+        .Select(s => s.AgentId)
+        .Distinct(StringComparer.OrdinalIgnoreCase)
+        .Count();
 
     public void Start()
     {
@@ -114,6 +117,11 @@ public sealed class KliveLinkV2Server : IDisposable
         await session.RunAsync();
     }
 
+    private KliveLinkV2Session? FindSession(string agentId) => _sessions.Values
+        .Where(s => string.Equals(s.AgentId, agentId, StringComparison.OrdinalIgnoreCase) && s.IsOpen)
+        .OrderByDescending(s => s.ConnectedAt)
+        .FirstOrDefault();
+
     internal async Task RegisterSessionAsync(KliveLinkV2Session session, V2Hello hello, string token)
     {
         try
@@ -137,14 +145,7 @@ public sealed class KliveLinkV2Server : IDisposable
                 TokenHash = KliveLinkV2Options.NormalizeHash(token),
                 IsConnected = true,
             });
-            _sessions.TryGetValue(session.AgentId, out var previous);
-            _sessions[session.AgentId] = session;
-            if (previous != null && !ReferenceEquals(previous, session))
-            {
-                // Drop the older socket so duplicate copies of the agent cannot fight over
-                // the same identity and make the fleet view flap between online and offline.
-                previous.Abort();
-            }
+            _sessions[session.SessionId] = session;
             _service.Store.Audit(session.AgentId, "agent.connect", session.AgentId, new { hello.MachineName, hello.OsVersion, hello.AgentVersion });
             await BroadcastEventAsync(new { type = "agent.connected", agentId = session.AgentId, at = now });
         }
@@ -157,17 +158,15 @@ public sealed class KliveLinkV2Server : IDisposable
 
     internal async Task UnregisterSessionAsync(KliveLinkV2Session session)
     {
-        if (_sessions.TryGetValue(session.AgentId, out var current) && ReferenceEquals(current, session))
+        _sessions.TryRemove(session.SessionId, out _);
+        if (!_sessions.Values.Any(s =>
+                string.Equals(s.AgentId, session.AgentId, StringComparison.OrdinalIgnoreCase) && s.IsOpen))
         {
-            _sessions.TryRemove(session.AgentId, out _);
-            if (!_sessions.ContainsKey(session.AgentId))
-            {
-                _service.Store.SetConnected(session.AgentId, false);
-                _service.Store.Audit(session.AgentId, "agent.disconnect", session.AgentId, new { });
-                await CloseScreenViewersAsync(session.AgentId);
-                await CloseShellViewersAsync(session.AgentId);
-                await BroadcastEventAsync(new { type = "agent.disconnected", agentId = session.AgentId, at = DateTimeOffset.UtcNow });
-            }
+            _service.Store.SetConnected(session.AgentId, false);
+            _service.Store.Audit(session.AgentId, "agent.disconnect", session.AgentId, new { });
+            await CloseScreenViewersAsync(session.AgentId);
+            await CloseShellViewersAsync(session.AgentId);
+            await BroadcastEventAsync(new { type = "agent.disconnected", agentId = session.AgentId, at = DateTimeOffset.UtcNow });
         }
     }
 
@@ -192,7 +191,8 @@ public sealed class KliveLinkV2Server : IDisposable
 
     public async Task<V2Result> SendCommandAsync(string agentId, V2CommandOperation operation, object? payload, int timeoutMs, string actor = "")
     {
-        if (!_sessions.TryGetValue(agentId, out var session) || !session.IsOpen)
+        KliveLinkV2Session? session = FindSession(agentId);
+        if (session == null || !session.IsOpen)
         {
             return new V2Result
             {
@@ -317,7 +317,8 @@ public sealed class KliveLinkV2Server : IDisposable
 
     public async Task SendShellInputAsync(string agentId, string text)
     {
-        if (_sessions.TryGetValue(agentId, out var session))
+        KliveLinkV2Session? session = FindSession(agentId);
+        if (session != null)
             await session.SendAsync(V2FrameType.ShellInput, new V2ShellInput { Text = text }, CancellationToken.None);
     }
 
@@ -420,6 +421,8 @@ public sealed class KliveLinkV2Session
     private DateTimeOffset _lastTouch = DateTimeOffset.MinValue;
 
     public string AgentId { get; }
+    public string SessionId { get; } = Guid.NewGuid().ToString("N");
+    public DateTimeOffset ConnectedAt { get; } = DateTimeOffset.UtcNow;
     public ConcurrentDictionary<string, TaskCompletionSource<V2Result>> Pending { get; } = new();
     public bool IsOpen => _socket.State == WebSocketState.Open;
 
@@ -477,7 +480,7 @@ public sealed class KliveLinkV2Session
         await _server.RegisterSessionAsync(this, hello, _token);
         await SendAsync(V2FrameType.Welcome, new V2Welcome
         {
-            SessionId = Guid.NewGuid().ToString("N"),
+            SessionId = SessionId,
             ServerTime = DateTimeOffset.UtcNow.ToString("O"),
             HeartbeatSeconds = 30,
             MaxPayload = V2Frame.MaxPayload,
