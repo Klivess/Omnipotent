@@ -91,8 +91,8 @@ public sealed class KliveLinkV2Client : IDisposable
 
             if (_cts.Token.IsCancellationRequested) break;
             attempt++;
-            int seconds = Math.Min(300, (int)Math.Pow(2, Math.Min(attempt, 8)));
-            seconds += Random.Shared.Next(0, Math.Max(1, seconds / 3));
+            int seconds = Math.Min(30, (int)Math.Pow(2, Math.Min(attempt, 5)));
+            seconds += Random.Shared.Next(0, Math.Max(1, seconds / 4));
             Log($"Reconnecting in {seconds}s...");
             try { await Task.Delay(TimeSpan.FromSeconds(seconds), _cts.Token); } catch { break; }
         }
