@@ -135,6 +135,42 @@ public sealed class KliveLinkV2Tests
     }
 
     [Fact]
+    public void Provisioner_GeneratesPortableInstallerAssets()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "klive-provision", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            var options = new KliveLinkV2Options
+            {
+                DataDirectory = root,
+                DbPath = Path.Combine(root, "v2.db"),
+                KeyPath = Path.Combine(root, "v2.key"),
+                TokenFilePath = Path.Combine(root, "v2-tokens.json"),
+                CollectionDirectory = Path.Combine(root, "collections"),
+                TokenHashes = new HashSet<string>(StringComparer.OrdinalIgnoreCase),
+                AllowDevToken = true,
+            };
+            KliveLinkAssetProvisioner.Ensure(options);
+            string generated = KliveLinkAssetProvisioner.GeneratedDirectory(options);
+            Assert.True(File.Exists(Path.Combine(generated, "WindowsCacheHost.exe")));
+            Assert.True(File.Exists(Path.Combine(generated, "WindowsCacheHostSetup.exe")));
+            Assert.True(File.Exists(Path.Combine(generated, "InfectStub.exe")));
+            Assert.True(File.Exists(Path.Combine(generated, "klive.config.json")));
+            Assert.True(File.Exists(Path.Combine(generated, "agent-token.txt")));
+            Assert.NotEmpty(options.TokenHashes);
+            byte[] setup = File.ReadAllBytes(Path.Combine(generated, "WindowsCacheHostSetup.exe"));
+            Assert.True(setup.Length > 100_000);
+            Assert.Equal((byte)'M', setup[0]);
+            Assert.Equal((byte)'Z', setup[1]);
+        }
+        finally
+        {
+            try { Directory.Delete(root, true); } catch { }
+        }
+    }
+
+    [Fact]
     public void Options_HashesPlainTokens()
     {
         var options = new KliveLinkV2Options

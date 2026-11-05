@@ -40,6 +40,7 @@ public sealed class KliveLinkV2Service : OmniService
         try
         {
             Options = KliveLinkV2Options.Load();
+            KliveLinkAssetProvisioner.Ensure(Options);
             Store = new KliveLinkV2Store(Options.DbPath, Options.KeyPath, Options.CollectionDirectory);
             Store.ResetConnections();
             Server = new KliveLinkV2Server(this, Options);

