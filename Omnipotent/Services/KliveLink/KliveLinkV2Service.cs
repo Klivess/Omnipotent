@@ -35,15 +35,29 @@ public sealed class KliveLinkV2Service : OmniService
             Store = new KliveLinkV2Store(Options.DbPath, Options.KeyPath, Options.CollectionDirectory);
             Store.ResetConnections();
             Server = new KliveLinkV2Server(this, Options);
-            try { Server.Start(); }
-            catch (Exception ex) { _ = ServiceLogError(ex, "KliveLink v2 dedicated listener unavailable; using the KliveAPI 443 route"); }
+            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("KLIVELINK_V2_LISTEN")))
+            {
+                try { Server.Start(); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "KliveLink v2 dedicated listener unavailable; using the KliveAPI 443 route"); }
+            }
             var routes = new KliveLinkV2Routes(this);
             _ = Task.Run(async () =>
             {
-                try { await routes.CreateRoutes(); }
-                catch (Exception ex) { await ServiceLogError(ex, "KliveLink v2 route registration failed"); }
+                for (int attempt = 1; attempt <= 10; attempt++)
+                {
+                    try
+                    {
+                        await routes.CreateRoutes();
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        await ServiceLogError(ex, $"KliveLink v2 route registration failed (attempt {attempt}/10)");
+                        await Task.Delay(TimeSpan.FromSeconds(2));
+                    }
+                }
             });
-            _ = ServiceLog($"KliveLink v2 started on {Options.ListenPrefix}; db={Options.DbPath}");
+            _ = ServiceLog($"KliveLink v2 routes registering on KliveAPI 443; dedicated listener {(string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("KLIVELINK_V2_LISTEN")) ? "disabled" : Options.ListenPrefix)}; db={Options.DbPath}");
             ServiceQuitRequest += () =>
             {
                 try { Server?.Stop(); } catch { }
