@@ -382,6 +382,30 @@ namespace Omnipotent.Services.KliveLink
                 }
             }, HttpMethod.Post, KliveLinkPerms.AgentsDestroy);
 
+            // --- Diagnostic: is the v2 plane active and are its routes registered? ---
+            await _parent.CreateAPIRoute("/klivelink/v2-status", async req =>
+            {
+                try
+                {
+                    var v2 = await _parent.GetServicesByType<KliveLinkV2Service>();
+                    var apis = await _parent.GetServicesByType<Omnipotent.Services.KliveAPI.KliveAPI>();
+                    var api = apis?.FirstOrDefault() as Omnipotent.Services.KliveAPI.KliveAPI;
+                    int routes = api?.DescribeRoutes()
+                        .Count(r => r.Path.StartsWith("/klivelink/v2", StringComparison.OrdinalIgnoreCase)) ?? 0;
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new
+                    {
+                        v2ServiceCount = v2?.Length ?? 0,
+                        v2Active = v2?.Any(s => s.IsServiceActive()) ?? false,
+                        v2RouteCount = routes,
+                        lastStartupError = KliveLinkV2Service.LastStartupError,
+                    }), "application/json");
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, Perms.Public);
+
             // --- Download the KliveLink agent executable ---
             await _parent.CreateAPIRoute("/klivelink/download", async (req) =>
             {

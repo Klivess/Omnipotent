@@ -9,6 +9,7 @@ namespace Omnipotent.Services.KliveLink;
 /// </summary>
 public sealed class KliveLinkV2Service : OmniService
 {
+    public static string? LastStartupError { get; private set; }
     public KliveLinkV2Options Options { get; private set; } = null!;
     public KliveLinkV2Store Store { get; private set; } = null!;
     public KliveLinkV2Server Server { get; private set; } = null!;
@@ -52,6 +53,7 @@ public sealed class KliveLinkV2Service : OmniService
                     }
                     catch (Exception ex)
                     {
+                        LastStartupError = ex.ToString();
                         await ServiceLogError(ex, $"KliveLink v2 route registration failed (attempt {attempt}/10)");
                         await Task.Delay(TimeSpan.FromSeconds(2));
                     }
@@ -66,6 +68,7 @@ public sealed class KliveLinkV2Service : OmniService
         }
         catch (Exception ex)
         {
+            LastStartupError = ex.ToString();
             _ = ServiceLogError(ex, "KliveLink v2 failed to start");
         }
     }
