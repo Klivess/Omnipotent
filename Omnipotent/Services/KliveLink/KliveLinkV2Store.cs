@@ -175,6 +175,8 @@ public sealed class KliveLinkV2Store : IDisposable
             );
             CREATE INDEX IF NOT EXISTS ix_records_agent ON records(agent_id, category, name);
             CREATE INDEX IF NOT EXISTS ix_records_snapshot ON records(snapshot_id);
+            CREATE INDEX IF NOT EXISTS ix_records_agent_name ON records(agent_id, name COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS ix_records_name ON records(name COLLATE NOCASE);
             CREATE TABLE IF NOT EXISTS purge_jobs (
                 id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
