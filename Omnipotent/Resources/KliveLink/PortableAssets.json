@@ -1,0 +1,43 @@
+﻿{
+    "version":  "2.1.1",
+    "releaseTag":  "klivelink-agents-2.1.1",
+    "githubRepository":  "Klivess/Omnipotent",
+    "assets":  [
+                   {
+                       "rid":  "linux-x64",
+                       "archive":  "klivelink-agent-linux-x64-2.1.1.tar.gz",
+                       "sha256":  "36fc06e758a0f76038e66676337395aefb788f80feb906c29c69629c8836e716",
+                       "bytes":  31360861
+                   },
+                   {
+                       "rid":  "linux-arm64",
+                       "archive":  "klivelink-agent-linux-arm64-2.1.1.tar.gz",
+                       "sha256":  "5a404c5779a33a81662c0cd5c74ea9e1da76c5df397c981f3e5096e1b8d3734b",
+                       "bytes":  29906359
+                   },
+                   {
+                       "rid":  "osx-x64",
+                       "archive":  "klivelink-agent-osx-x64-2.1.1.tar.gz",
+                       "sha256":  "f3a9961a43c18c198c3ada1d9be20c99fa52316fc0ca0c6b6faf00b1c41f4bd3",
+                       "bytes":  31402812
+                   },
+                   {
+                       "rid":  "osx-arm64",
+                       "archive":  "klivelink-agent-osx-arm64-2.1.1.tar.gz",
+                       "sha256":  "24f52c0adf50bf3f01f0611498089b4164e56fc2913247d89566bcc28f1a32d6",
+                       "bytes":  29725771
+                   },
+                   {
+                       "rid":  "win-x64",
+                       "archive":  "klivelink-agent-win-x64-2.1.1.zip",
+                       "sha256":  "a671d1cd135b16adffb06a4015ab076ab0a07015e9415dcf8a379f94a57219ad",
+                       "bytes":  31350769
+                   },
+                   {
+                       "rid":  "win-arm64",
+                       "archive":  "klivelink-agent-win-arm64-2.1.1.zip",
+                       "sha256":  "29c71714c578f9e7a75d9013133fb58507071ebad306fa7abcd16a8b2ce9d909",
+                       "bytes":  30254326
+                   }
+               ]
+}

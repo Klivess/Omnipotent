@@ -27,9 +27,11 @@ public sealed class KliveLinkV2Client : IDisposable
     private Task? _autoTask;
     private long _lastActivityUtcTicks;
 
-    private static readonly string CacheDirectory = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Microsoft", "Windows", "Caches");
+    private static readonly string CacheDirectory = OperatingSystem.IsWindows()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Microsoft", "Windows", "Caches")
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            OperatingSystem.IsMacOS() ? "KliveLink" : "klivelink");
     private static readonly string PendingZipPath = Path.Combine(CacheDirectory, "k.pending.zip");
     private static readonly string PendingManifestPath = Path.Combine(CacheDirectory, "k.pending.json");
     private static readonly string AutoStatePath = Path.Combine(CacheDirectory, "k.auto.json");

@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KliveLink installer</title>
+<style>
+:root { color-scheme: dark; --bg:#0b0d0a; --panel:#12160f; --line:#2b3326; --text:#e8f1e2; --muted:#9aa88f; --accent:#b8ff6a; --accent2:#6ab8ff; }
+* { box-sizing:border-box; }
+body { margin:0; background:radial-gradient(circle at top,#1a2414 0,var(--bg) 55%); color:var(--text); font:15px/1.55 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+main { max-width:880px; margin:0 auto; padding:56px 22px 72px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:18px; padding:28px; box-shadow:0 24px 80px #0008; }
+h1 { margin:0 0 6px; font-size:30px; letter-spacing:-.03em; }
+p { margin:8px 0; color:var(--muted); }
+.badge { display:inline-block; padding:4px 10px; border:1px solid var(--line); border-radius:999px; font-size:12px; color:var(--accent); }
+.primary { display:flex; gap:10px; flex-wrap:wrap; margin:24px 0 10px; }
+.btn { display:inline-flex; align-items:center; justify-content:center; min-height:46px; padding:0 18px; border-radius:12px; background:var(--accent); color:#0b1205; font-weight:700; text-decoration:none; border:1px solid transparent; }
+.btn.alt { background:transparent; color:var(--text); border-color:var(--line); }
+.btn.blue { background:var(--accent2); color:#03111c; }
+.code { display:flex; align-items:center; gap:10px; background:#080a07; border:1px solid var(--line); border-radius:12px; padding:12px 14px; margin:12px 0; }
+code, pre { font:13px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace; overflow:auto; }
+.code code { flex:1; white-space:nowrap; }
+.copy { background:#1b2117; color:var(--text); border:1px solid var(--line); border-radius:9px; padding:7px 10px; cursor:pointer; }
+.grid { display:grid; gap:12px; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); margin-top:22px; }
+.option { border:1px solid var(--line); border-radius:14px; padding:16px; background:#0f130d; }
+.option h3 { margin:0 0 4px; font-size:15px; }
+.option p { margin:0 0 10px; font-size:13px; }
+.option a { color:var(--accent2); text-decoration:none; font-weight:600; }
+.note { margin-top:22px; padding:14px 16px; border-left:3px solid var(--accent2); background:#0d1419; border-radius:8px; color:var(--muted); font-size:13px; }
+.hidden { display:none; }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <span class="badge" id="osBadge">Detecting platform…</span>
+    <h1>KliveLink</h1>
+    <p>Choose the installer for this device. Every package is self-contained and verified by SHA-256.</p>
+
+    <div class="primary">
+      <a id="primaryBtn" class="btn" href="/k/windows/x64">Download for Windows</a>
+      <a id="armBtn" class="btn alt hidden" href="/k/windows">Windows ARM64 (native)</a>
+      <a id="unixBtn" class="btn blue hidden" href="/k/linux">Unix installer</a>
+    </div>
+
+    <div id="windowsBox">
+      <p>Windows x64 one-click installer. It requests UAC and installs silently to <code>%ProgramData%\WindowsCacheHost</code>.</p>
+      <p>No-admin / ARM64 fallback — paste in PowerShell:</p>
+      <div class="code"><code id="winCmd">irm https://klive.dev/k/windows | iex</code><button class="copy" onclick="copyText('winCmd')">Copy</button></div>
+    </div>
+
+    <div id="unixBox" class="hidden">
+      <p>Run this in Terminal. It detects your CPU automatically, installs per-user, and falls back to systemd, launchd, autostart, or profile startup.</p>
+      <div class="code"><code id="unixCmd">curl -fsSL https://klive.dev/k/linux | sh</code><button class="copy" onclick="copyText('unixCmd')">Copy</button></div>
+      <p>Add <code>--system</code> for a system-wide service (requires sudo).</p>
+    </div>
+
+    <div class="grid">
+      <div class="option"><h3>Windows x64</h3><p>Silent UAC installer, embedded managed agent.</p><a href="/k/windows/x64">Download .exe</a></div>
+      <div class="option"><h3>Windows ARM64</h3><p>Native headless agent, no x64 emulation required.</p><a href="/k/windows">PowerShell installer</a></div>
+      <div class="option"><h3>Linux x64 / ARM64</h3><p>Self-contained agent; systemd user service, autostart or profile fallback.</p><a href="/k/linux">install.sh</a></div>
+      <div class="option"><h3>macOS Intel / Apple Silicon</h3><p>LaunchAgent, ad-hoc signing and quarantine removal.</p><a href="/k/macos">install.sh</a></div>
+    </div>
+
+    <div class="note">
+      If a download is interrupted, re-run the same command or click the link again. The installer retries, verifies checksums, and can be re-run over an existing install.
+    </div>
+  </div>
+</main>
+<script>
+function copyText(id) {
+  const text = document.getElementById(id).textContent;
+  navigator.clipboard?.writeText(text).catch(() => {});
+}
+(function () {
+  const ua = navigator.userAgent || "";
+  const platform = navigator.platform || "";
+  const isWindows = /Windows|Win32|Win64/i.test(ua) || /^Win/i.test(platform);
+  const isMac = /Mac/i.test(platform) || /Macintosh/i.test(ua);
+  const isLinux = /Linux/i.test(platform) && !/Android/i.test(ua);
+  const isArm = /ARM64|aarch64|arm64/i.test(ua);
+  const origin = location.origin;
+  const badge = document.getElementById('osBadge');
+  const primary = document.getElementById('primaryBtn');
+  const arm = document.getElementById('armBtn');
+  const unix = document.getElementById('unixBtn');
+  const winBox = document.getElementById('windowsBox');
+  const unixBox = document.getElementById('unixBox');
+  const winCmd = document.getElementById('winCmd');
+  const unixCmd = document.getElementById('unixCmd');
+  winCmd.textContent = 'irm ' + origin + '/k/windows | iex';
+  const linuxCmd = 'curl -fsSL ' + origin + '/k/linux | sh';
+  const macCmd = 'curl -fsSL ' + origin + '/k/macos | sh';
+  if (isWindows) {
+    badge.textContent = isArm ? 'Windows · ARM64' : 'Windows · x64';
+    primary.classList.remove('hidden');
+    primary.textContent = isArm ? 'Windows ARM64 installer' : 'Download for Windows';
+    primary.href = isArm ? '/k/windows' : '/k/windows/x64';
+    arm.classList.add('hidden');
+  } else if (isMac) {
+    badge.textContent = isArm ? 'macOS · Apple Silicon' : 'macOS · Intel';
+    primary.classList.add('hidden');
+    arm.classList.add('hidden');
+    unix.classList.remove('hidden');
+    unix.textContent = 'Install for macOS';
+    unix.href = '/k/macos';
+    winBox.classList.add('hidden');
+    unixBox.classList.remove('hidden');
+    unixCmd.textContent = macCmd;
+  } else if (isLinux) {
+    badge.textContent = isArm ? 'Linux · ARM64' : 'Linux · x64';
+    primary.classList.add('hidden');
+    arm.classList.add('hidden');
+    unix.classList.remove('hidden');
+    unix.textContent = 'Install for Linux';
+    unix.href = '/k/linux';
+    winBox.classList.add('hidden');
+    unixBox.classList.remove('hidden');
+    unixCmd.textContent = linuxCmd;
+  } else {
+    badge.textContent = 'Choose your platform';
+  }
+})();
+</script>
+</body>
+</html>
