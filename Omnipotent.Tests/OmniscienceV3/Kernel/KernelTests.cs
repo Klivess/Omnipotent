@@ -355,8 +355,9 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
             Assert.Equal(new[] { "first", "second" }, order.Select(m => m.Manifest.Id));
         }
 
+        // No background loop: tests drive pump/plan passes explicitly so results are deterministic.
         private ModuleHost Host(bool workers = false) =>
-            new(stores, clock, new KernelOptions { StartWorkers = workers, LoopInterval = TimeSpan.FromHours(1) }, m => logs.Enqueue(m), Log);
+            new(stores, clock, new KernelOptions { StartWorkers = workers, StartLoop = false }, m => logs.Enqueue(m), Log);
 
         private Task<long> AppendChange(string person, string kind = ChangeKinds.MessageInsert) =>
             stores.Corpus.WriteAsync((c, tx) => ChangeLog.Append(c, tx, clock.NowMs, kind, "m:" + Guid.NewGuid().ToString("N"), person, "conv", SourceKinds.Live));

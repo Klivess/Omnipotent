@@ -20,6 +20,12 @@
         /// it like Interactive, it takes a fraction of a second, and it has no prompt prefix at all — so
         /// it is never parked, never granted a residency, and never counted as a cold prefill.</summary>
         Audio = 4,
+        /// <summary>Work nobody is waiting for (Omniscience extraction, tagging, evaluation). Lowest band:
+        /// it yields to every other class. Its cold starts are serialised with one-shots and admitted only
+        /// when no warm resident would lose its prefix; its continuations (several passes over one large
+        /// prefix) are never parked, like any continuation; it takes a residency only from a free seat and
+        /// never evicts Projects or KliveAgent residents.</summary>
+        Background = 5,
     }
 
     /// <summary>How much of the scheduler is actually allowed to affect dispatch.</summary>
@@ -74,6 +80,9 @@
             const StringComparison ord = StringComparison.Ordinal;
 
             if (sessionId.StartsWith("kliveagent-", ord)) return AIRouterWorkClass.Interactive;
+            // Omniscience v3 gateway sessions (it also passes the class explicitly; this is the fallback).
+            if (sessionId.StartsWith("omniscience-bg-", ord)) return AIRouterWorkClass.Background;
+            if (sessionId.StartsWith("omniscience-ia-", ord)) return AIRouterWorkClass.Interactive;
             if (sessionId.StartsWith("projects-council-", ord)) return AIRouterWorkClass.Burst;
             // Ahead of the general stratum- arm: a summary is one query, then the session is dropped.
             if (sessionId.StartsWith("stratum-engineer-summary-", ord)) return AIRouterWorkClass.OneShot;
@@ -314,8 +323,14 @@
             AIRouterWorkClass.Interactive => 0,
             AIRouterWorkClass.Audio => 0,
             AIRouterWorkClass.OneShot => 2,
+            AIRouterWorkClass.Background => 3,
             _ => 1,
         };
+
+        /// <summary>Classes whose cold admissions share the single "slack" permit: they cannot reuse a
+        /// warm prefix of anyone else's and must never cost a resident its cache.</summary>
+        internal static bool IsSlackOnly(AIRouterWorkClass cls)
+            => cls is AIRouterWorkClass.OneShot or AIRouterWorkClass.Background;
 
         /// <summary>Work a human is actively waiting on: first in line, never parked, and allowed to
         /// use the slot a live conversation keeps reserved.</summary>
@@ -362,7 +377,7 @@
                 return false;
             }
 
-            if (info.Class == AIRouterWorkClass.OneShot)
+            if (IsSlackOnly(info.Class))
             {
                 if (oneShotInFlight >= 1) { reason = "oneshot-serialised"; return false; }
                 // Only genuine slack. A one-shot that lands just before a resident's prefix expires
@@ -415,6 +430,10 @@
             // One-shots never take cohort space: they cannot reuse a prefix, so a residency would only
             // displace something that can.
             if (info.Class == AIRouterWorkClass.OneShot) return false;
+
+            // Background work reuses its own prefix across passes, so a FREE seat is worth taking; but it
+            // never evicts a Projects/KliveAgent resident to get one (Klives: background yields).
+            if (info.Class == AIRouterWorkClass.Background && residents.Count >= currentK) return false;
 
             // Admission and residency are the SAME decision, and this is the single most important
             // line in the class after the cold stagger.

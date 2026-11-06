@@ -31,6 +31,8 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
         public string? OwnerPrefix { get; init; }
         /// <summary>When false, no worker pools start (tests drive the queue directly; shadow startup).</summary>
         public bool StartWorkers { get; init; } = true;
+        /// <summary>When false, the pump/plan/maintenance loop does not run (tests call the *OnceAsync steps).</summary>
+        public bool StartLoop { get; init; } = true;
     }
 
     /// <summary>Per-module health for the Modules page.</summary>
@@ -56,6 +58,9 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
         private readonly Dictionary<string, IIntelModule> modules = new(StringComparer.Ordinal);
         private List<IIntelModule> ordered = new();
         private readonly SemaphoreSlim kick = new(0, int.MaxValue);
+        /// <summary>Serialises pump and plan passes: two concurrent passes could both read the same dirty rows
+        /// or version flag and plan twice.</summary>
+        private readonly SemaphoreSlim passGate = new(1, 1);
         private readonly CancellationTokenSource stopping = new();
         private LaneWorkers? workers;
         private Task? loop;
@@ -150,7 +155,8 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
                 workers = new LaneWorkers(Jobs, this, clock, options.Lanes, logError, gate, options.OwnerPrefix);
                 workers.Start();
             }
-            loop = Task.Factory.StartNew(RunLoopAsync, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
+            if (options.StartLoop)
+                loop = Task.Factory.StartNew(RunLoopAsync, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
             log($"[OmniscienceV3] kernel online with {ordered.Count} module(s).");
         }
 
@@ -242,6 +248,13 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
         /// <summary>Moves every subscribed module's watermark forward by up to one batch. Returns rows consumed.</summary>
         public async Task<int> PumpChangesOnceAsync(CancellationToken ct = default)
         {
+            await passGate.WaitAsync(ct).ConfigureAwait(false);
+            try { return await PumpChangesCoreAsync(ct).ConfigureAwait(false); }
+            finally { passGate.Release(); }
+        }
+
+        private async Task<int> PumpChangesCoreAsync(CancellationToken ct)
+        {
             long maxSeq;
             using (var cr = stores.Corpus.OpenRead()) maxSeq = ChangeLog.MaxSeq(cr);
             var states = ReadModuleStates();
@@ -300,6 +313,13 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
 
         /// <summary>One planning pass over every enabled module. Returns jobs enqueued (including deduped).</summary>
         public async Task<int> PlanOnceAsync(CancellationToken ct = default)
+        {
+            await passGate.WaitAsync(ct).ConfigureAwait(false);
+            try { return await PlanCoreAsync(ct).ConfigureAwait(false); }
+            finally { passGate.Release(); }
+        }
+
+        private async Task<int> PlanCoreAsync(CancellationToken ct)
         {
             var states = ReadModuleStates();
             var tz = Settings.KlivesZone;
@@ -458,6 +478,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             if (workers != null) await workers.DisposeAsync().ConfigureAwait(false);
             stopping.Dispose();
             kick.Dispose();
+            passGate.Dispose();
         }
     }
 }

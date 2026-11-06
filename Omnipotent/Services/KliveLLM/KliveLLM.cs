@@ -1508,7 +1508,7 @@ namespace Omnipotent.Services.KliveLLM
         /// Off by default so every existing AIRouter caller keeps the provider's default reasoning;
         /// KliveAgent opts in, which is what makes its adaptive low/medium/high real on AIRouter.
         /// </param>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0, AIRouterWorkClass? workClass = null, bool honourThinkingOnAIRouter = false)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0, AIRouterWorkClass? workClass = null, bool honourThinkingOnAIRouter = false, object? toolChoice = null, object? responseFormat = null)
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -1631,7 +1631,9 @@ namespace Omnipotent.Services.KliveLLM
                 // read as a genuinely new prefix rather than a continuation of one that no longer exists.
                 cachePrefixHint: $"{sessionId}#{cacheEpochID}",
                 workClass: workClass,
-                honourThinkingOnAIRouter: honourThinkingOnAIRouter);
+                honourThinkingOnAIRouter: honourThinkingOnAIRouter,
+                toolChoice: toolChoice,
+                responseFormat: responseFormat);
             var msg = response.choices[0].message;
             var rawContent = HFWrapper.ContentToText(msg?.content);
             var nativeToolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -2232,7 +2234,9 @@ namespace Omnipotent.Services.KliveLLM
             ModelSamplingParameters? samplingParameters = null,
             string? cachePrefixHint = null,
             AIRouterWorkClass? workClass = null,
-            bool honourThinkingOnAIRouter = false)
+            bool honourThinkingOnAIRouter = false,
+            object? toolChoice = null,
+            object? responseFormat = null)
         {
             RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
 
@@ -2256,7 +2260,11 @@ namespace Omnipotent.Services.KliveLLM
                 model = primaryModel,
                 stream = false,
                 max_tokens = maxTokensOverride,
-                tools = tools,
+                // An empty array is rejected by OpenAI-compatible APIs ("tools: [] is too short");
+                // omitting the key is the same request semantically.
+                tools = tools is { Count: > 0 } ? tools : null,
+                tool_choice = toolChoice,
+                response_format = responseFormat,
             };
             ApplyOpenRouterSession(ref payload, remoteProvider, cacheSessionId);
             ApplyModelFallback(ref payload, remoteProvider, modelRoutes);

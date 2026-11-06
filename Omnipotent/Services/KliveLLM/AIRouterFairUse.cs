@@ -463,7 +463,7 @@
             residency.OnDispatch(self.Info, now, pastDeadline);
             // A speech call has no prefill, so it must not hold the one cold-prefill permit.
             if (!wasResident && self.Info.Class != AIRouterWorkClass.Audio) coldInFlight++;
-            if (self.Info.Class == AIRouterWorkClass.OneShot) oneShotInFlight++;
+            if (AIRouterResidencyScheduler.IsSlackOnly(self.Info.Class)) oneShotInFlight++;
             if (AIRouterResidencyScheduler.IsLive(self.Info.Class)) liveInFlight++;
 
             ConsumeGraceLocked(self.Info.PrefixKey);
@@ -685,7 +685,7 @@
                 inFlight--;
                 if (inFlight < 0) inFlight = 0;
                 if (!lease.WasResident && lease.Info.Class != AIRouterWorkClass.Audio && coldInFlight > 0) coldInFlight--;
-                if (lease.Info.Class == AIRouterWorkClass.OneShot && oneShotInFlight > 0) oneShotInFlight--;
+                if (AIRouterResidencyScheduler.IsSlackOnly(lease.Info.Class) && oneShotInFlight > 0) oneShotInFlight--;
                 if (AIRouterResidencyScheduler.IsLive(lease.Info.Class) && liveInFlight > 0) liveInFlight--;
                 residency.OnRelease(lease.Info.PrefixKey, now);
                 OfferGraceLocked(lease, now);

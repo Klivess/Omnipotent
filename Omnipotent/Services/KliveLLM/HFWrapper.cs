@@ -315,6 +315,12 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("tool_choice", NullValueHandling = NullValueHandling.Ignore)]
             public object tool_choice;
 
+            // OpenAI-compatible structured output, e.g. { "type": "json_schema", "json_schema": {...} }.
+            // Only set by callers that ask for it (Omniscience v3's gateway); null keeps every existing
+            // request byte-identical.
+            [JsonProperty("response_format", NullValueHandling = NullValueHandling.Ignore)]
+            public object response_format;
+
             // Provider-side stop sequences. Only ever set for a model that speaks Gemma's TEXTUAL
             // tool-call protocol (see KliveLLM.ApplyTextualToolProtocolStops): those control tokens are
             // the model's real end-of-turn, and without them the provider has nothing to halt on and
