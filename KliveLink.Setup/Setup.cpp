@@ -27,6 +27,29 @@ struct Footer {
 
 static std::wstring g_agentArch = L"x64";
 
+static bool IsNativeArm64() {
+    typedef BOOL (WINAPI *PFN_IsWow64Process2)(HANDLE, USHORT*, USHORT*);
+    HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
+    if (kernel != nullptr) {
+        auto isWow64Process2 = reinterpret_cast<PFN_IsWow64Process2>(
+            GetProcAddress(kernel, "IsWow64Process2"));
+        if (isWow64Process2 != nullptr) {
+            USHORT processMachine = 0;
+            USHORT nativeMachine = 0;
+            if (isWow64Process2(GetCurrentProcess(), &processMachine, &nativeMachine))
+                return nativeMachine == IMAGE_FILE_MACHINE_ARM64;
+        }
+    }
+
+    SYSTEM_INFO systemInfo{};
+    GetNativeSystemInfo(&systemInfo);
+    if (systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64) return true;
+
+    wchar_t nativeArch[MAX_PATH]{};
+    GetEnvironmentVariableW(L"PROCESSOR_ARCHITEW6432", nativeArch, MAX_PATH);
+    return nativeArch[0] != L'\0' && _wcsicmp(nativeArch, L"ARM64") == 0;
+}
+
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "user32.lib")
@@ -94,9 +117,7 @@ static bool ExtractBundled(std::wstring& agentPath, std::wstring& configPath) {
         footer.configOffset + footer.configLength > file.size()) return false;
     if (hasArm64 && footer.arm64AgentOffset + footer.arm64AgentLength > file.size()) return false;
 
-    SYSTEM_INFO systemInfo{};
-    GetNativeSystemInfo(&systemInfo);
-    bool isArm64 = systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64;
+    bool isArm64 = IsNativeArm64();
     uint64_t agentOffset = footer.agentOffset;
     uint64_t agentLength = footer.agentLength;
     if (isArm64 && hasArm64 && footer.arm64AgentLength > 0) {
