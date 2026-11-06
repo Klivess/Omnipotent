@@ -1,0 +1,570 @@
+# Omniscience v3 — fix traceability
+
+Every defect catalogued in the v3 plan (F001–F560), the v3 component that fixes it, and the test
+that proves it. Status: `planned` → `in-progress` → `fixed` (code + test landed) → `verified`
+(checked live after deploy). Reviewed in full before cutover (plan R6/R8).
+
+Items: 560
+
+| ID | Area | Tags | Defect → fix | v3 home | Test | Status |
+|---|---|---|---|---|---|---|
+| F001 | Architecture & performance | PERF | `Analytics/TemporalWeighting.cs:71-101`: `AnalyticSplits.Apply` recomputes each module's full payload for 3 windows + up to 8 facets, about 12 full passes × 32 modules per person. This is the 1–2 h/person cause. → incremental per-day rollups; modules run in O(days). |  |  | planned |
+| F002 | Architecture & performance | PERF | `Omnipotent/Program.cs:47-55`: the thread-pool floor was raised to 128 because Omniscience routes block on synchronous SQLite. → async read pool + read models. |  |  | planned |
+| F003 | Architecture & performance | PERF | `/omniscience/stats/overview` p95 6.0 s (max 12.7 s, Sep 27 baseline). → overview read model < 150 ms. |  |  | planned |
+| F004 | Architecture & performance | PERF | `/omniscience/briefing/preview` 5.7 s. → precomputed digest read model. |  |  | planned |
+| F005 | Architecture & performance | PERF | `/omniscience/persons` 2.9 s. → directory read model + keyset pagination. |  |  | planned |
+| F006 | Architecture & performance | PERF | `OmniscienceRoutes.cs:467,637,810`: OFFSET pagination over messages, with LIMIT/OFFSET string-interpolated at 467/810. → keyset on (sent_at, id), parameterised. |  |  | planned |
+| F007 | Architecture & performance |  | Synchronous `WriteLock.Wait()` blocks pool threads, some on request paths: |  |  | planned |
+| F008 | Architecture & performance | RELIABILITY | 66 empty `catch {}` blocks across 31 files: IngestPipeline ×6, DailyBriefing ×8, ReplicaRoutes ×6, PersonalityProfiler ×4, ReplicaFidelity ×4, OmniscienceRoutes ×4, …. → classified errors, logged and surfaced on the Modules page; nothing swallowed silently. |  |  | planned |
+| F009 | Architecture & performance | RELIABILITY | 28 fire-and-forget `Task.Run`/`async void` sites across 18 files (Omniscience.cs ×3, OmniscienceRoutes ×4, DeductionRoutes ×2, Radar ×2, …). → durable leased jobs. |  |  | planned |
+| F010 | Architecture & performance | TEMPORAL | 42 `DateTime.UtcNow/Now` calls inside computations across 21 files. → `IClock`/`AsOf`. |  |  | planned |
+| F011 | Replica: "sometimes doesn't train at all" | RELIABILITY | `ReplicaRoutes.cs:60,743-750`: `HasRunningJob` treats any `queued`/`running` row as live. A job killed by a crash or restart **wedges that person forever** ("Training already in progress"). → leases + heartbeat + expiry. |  |  | planned |
+| F012 | Replica: "sometimes doesn't train at all" | RELIABILITY | `ReplicaRoutes.cs:64-68`: training is a fire-and-forget `Task.Run` with `CancellationToken.None`. A crash leaves the row `running`. → durable job, cancelled on service stop. |  |  | planned |
+| F013 | Replica: "sometimes doesn't train at all" | CORRECTNESS | `ReplicaRoutes.cs:70,752-768`: `WaitForJobIdAsync` polls for 5 s, opening a new connection every 50 ms. If `TrainAsync` throws before inserting its row (`Replica/ReplicaTrainer.cs:80,86,106`: unknown person / no messages / KliveLLM missing), the UI gets `ok:true, job_id:0` and the error only reaches the log. → preconditions validated synchronously and returned; the job row is created before work starts. |  |  | planned |
+| F014 | Replica: "sometimes doesn't train at all" | CORRECTNESS | `ReplicaRoutes.cs:760-762`: picks the person's newest job by `started_at`, so it can return an **old finished job** when the new row is late. → the enqueue call returns its own job id. |  |  | planned |
+| F015 | Replica: "sometimes doesn't train at all" | CORRECTNESS | `ReplicaRoutes.cs:57`: training is refused unless the person is in the legacy `person_profile_targets` allow-list, which tiers superseded. → readiness = data sufficiency + MinorGuard, shown with numbers. |  |  | planned |
+| F016 | Replica: "sometimes doesn't train at all" | RELIABILITY | `Replica/ReplicaTrainer.cs:518,525`: empty catches inside training stages. → stage errors recorded and surfaced. |  |  | planned |
+| F017 | Replica: "sometimes doesn't train at all" | HEURISTIC | `Replica/ReplicaTrainer.cs:42`: assistant voice detected by a regex `DefaultForbiddenPatterns` list. → assistant-voice classifier (A2). |  |  | planned |
+| F018 | Replica: "sometimes doesn't train at all" | HEURISTIC | Four copies of an English laugh-token regex: `Replica/ReplicaStylePostProcessor.cs:30`, `Replica/ReplicaTemporalAnalyzer.cs:91`, `Replica/ReplicaFidelity.cs:20`, `Analytics/Modules/FacetDivergenceModule.cs:22`. → style embeddings + per-person learned laughter tokens. |  |  | planned |
+| F019 | Replica: "sometimes doesn't train at all" | HEURISTIC | `Replica/ReplicaTemporalAnalyzer.cs:90,93`: era vocabulary uses ASCII tokens + an English stop list. → multilingual tokenisation + c-TF-IDF. |  |  | planned |
+| F020 | Deduction: "deduces incorrect things" | CORRECTNESS | `Deduction/ExtractionJob.cs:25-28`: 40-message windows, overlap 10, min partial 15. → person-centric slices that fill the context window. |  |  | planned |
+| F021 | Deduction: "deduces incorrect things" | CORRECTNESS | `Deduction/ExtractionJob.cs:316`: `maxTokensOverride: 1800` + `useFreeModel: true`. → output budget from the registry, AIRouter Background class, cache-shaped session. |  |  | planned |
+| F022 | Deduction: "deduces incorrect things" | HEURISTIC | `Deduction/ExtractionJob.cs:275-287`: an English keyword regex density pre-filter decides which windows get LLM budget. Non-English or implicit information is skipped, and `\bmy\s+\w` matches nearly everything. → A2 information-density model. |  |  | planned |
+| F023 | Deduction: "deduces incorrect things" | HEURISTIC | `Deduction/ExtractionJob.cs:141-145` + `Omniscience.cs:139`: `IsSelfDisclosure` = ≥3 regex hits. → NLI + distilled classifier. |  |  | planned |
+| F024 | Deduction: "deduces incorrect things" | TEMPORAL | `Omniscience.cs:140`: the fast-track "live" test is `UtcNow − SentAt > 30 min`. → `source_kind=live` + arrival freshness. |  |  | planned |
+| F025 | Deduction: "deduces incorrect things" | TEMPORAL | `Deduction/ExtractionPromptBuilder.cs:66`: timestamps rendered `yyyy-MM-dd HH:mm` with no zone, weekday or author-local time, so "tomorrow"/"tonight" resolve wrongly. → T3 stamps. |  |  | planned |
+| F026 | Deduction: "deduces incorrect things" | TEMPORAL | `Deduction/GraphAssembler.cs:22-23`: "age" (and "misc") are immutable categories, so **ages never age** and "17" stays 17 forever. → age stored as a birth-interval anchor, computed at query time. |  |  | planned |
+| F027 | Deduction: "deduces incorrect things" | TEMPORAL,CORRECTNESS | `Deduction/GraphAssembler.cs:415-436`: decay multiplies the *stored* confidence by 0.93 **per run**. It's destructive, depends on how often the job ran (not elapsed time), loses the original confidence and can't answer as-of. → decay computed at read time from last corroboration and `AsOf`. |  |  | planned |
+| F028 | Deduction: "deduces incorrect things" | TEMPORAL | `Deduction/GraphAssembler.cs:417`: decay horizon from `DateTimeOffset.UtcNow`. → `AsOf`. |  |  | planned |
+| F029 | Deduction: "deduces incorrect things" | CORRECTNESS | `Deduction/GraphAssembler.cs:418,426-435`: SQL built by interpolating the category list and constants. → parameterised. |  |  | planned |
+| F030 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/SentimentModule.cs:28`: ASCII-only tokens + lexicon. → sentiment ensemble. |  |  | planned |
+| F031 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/ProfanityModule.cs:28`: ASCII word list. → toxicity ensemble. |  |  | planned |
+| F032 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/SwearComfortModule.cs:22`: word list. → toxicity ensemble + person baseline. |  |  | planned |
+| F033 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/ConflictModule.cs:21,26`: `Insults`/`Profanity` string lists. → conflict + dialogue-act ensemble with context. |  |  | planned |
+| F034 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/PolitenessModule.cs:19-22`: please/thanks/sorry/greeting regexes. → politeness/formality models. |  |  | planned |
+| F035 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/HumorModule.cs` (10 regex/contains sites). → humour/irony ensemble. |  |  | planned |
+| F036 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/QuestionRateModule.cs` (5 sites, "?" checks). → dialogue-act model. |  |  | planned |
+| F037 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/TopicModule.cs:17-20`: ASCII tokens + stop list. → BERTopic-style topics. |  |  | planned |
+| F038 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/VocabularyModule.cs:17,24`: stop list + ASCII tokeniser. → multilingual tokenisation. |  |  | planned |
+| F039 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/StylometryFingerprintModule.cs:21`: ASCII word regex (7 sites). → style embeddings + Unicode features. |  |  | planned |
+| F040 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/MoodTrajectoryModule.cs:21`: ASCII lexicon mood. → emotion-ensemble trajectories. |  |  | planned |
+| F041 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/InterestInferenceModule.cs` (12 keyword lists). → NER/entity linking + presence + LLM. |  |  | planned |
+| F042 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/LanguageDetectionModule.cs` (6 stop-word lists). → language-ID model. |  |  | planned |
+| F043 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/LinkTaxonomyModule.cs:21` (10 domain lists). → unfurl + LLM categorisation. |  |  | planned |
+| F044 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC,TEMPORAL | `Analytics/Modules/TimezoneInferenceModule.cs:78`: location-lead regex. → T4 zone inference + NER. |  |  | planned |
+| F045 | Analytics: keyword heuristics to replace with A2 ensembles | HEURISTIC | `Analytics/Modules/FacetDivergenceModule.cs:23`: ASCII word regex. → Unicode-aware tokenisation. |  |  | planned |
+| F046 | Scheduler & radar |  | `Scheduling/OmniscienceScheduler.cs:39,56`: `DateTime.Today.AddDays(1).AddHours(3).AddMinutes(30)`. Problems: |  |  | planned |
+| F047 | Scheduler & radar | TEMPORAL | `Radar/KlivesRadar.cs:39,205`: "live" = `UtcNow − SentAt ≤ 10 min`. It depends on clock skew, drops delayed live deliveries after a reconnect, and fires on fresh backfill. → `source_kind` + arrival freshness. |  |  | planned |
+| F048 | Scheduler & radar | HEURISTIC | `Radar/KlivesRadar.cs:127,192`: ASCII word-boundary alias regexes. → A4 radar ensemble. |  |  | planned |
+| F049 | Scheduler & radar | CORRECTNESS | `Radar/KlivesRadar.cs:231`: mentions detected by a raw `<@id>` substring. → structured mentions (users/roles/reply pings). |  |  | planned |
+| F050 | Scheduler & radar | PERF | `Radar/KlivesRadar.cs:247`: the watchlist refresh (DB query + regex compile) runs inside the per-message ingest path. → kernel-scheduled refresh, off the hot path. |  |  | planned |
+| F051 | Integration | CORRECTNESS | `Omnipotent/Services/KliveAgent/KliveAgentServiceTools.cs:23` pins `omniscience_*`, but Omniscience declares no `[OmniTool]` ops. → B1. |  |  | planned |
+| F052 | Integration | CORRECTNESS | `Omnipotent/Services/KliveLLM/KliveLLM.cs:700`: `ModelCapabilities` has no context window. → ModelContextRegistry. |  |  | planned |
+| F053 | Integration | CORRECTNESS | `Omnipotent/Services/OmniBlox/OmniBlox.cs:149`: hard-coded `OmniBlox_ModelContextTokens=260000`. → registry (platform-wide). |  |  | planned |
+| F054 | Client & infrastructure | UI,PERF | `composables/useOmniscienceApi.ts:49-69` + `scripts/APIInterface.ts:404-406`: two stacked retry layers. One GET can block ~80 s across 12 fetches, and the DOMException branch is dead. → one retry layer that tells timeouts apart from 5xx. |  |  | planned |
+| F055 | Client & infrastructure | UI | `useOmniscienceApi.ts:68`: Retry-After is ignored. → honour it. |  |  | planned |
+| F056 | Client & infrastructure | UI | `useOmniscienceApi.ts:15-19`: it supports a signal but no caller passes one, so nothing can be cancelled. → abort on filter change and unmount. |  |  | planned |
+| F057 | Client & infrastructure | UI | `useOmniscienceApi.ts:30-38,98-100`: 401/403 are flattened into error text. → a typed no-permission state (`OmniTraderStateBlock kind="nopermission"`). |  |  | planned |
+| F058 | Client & infrastructure | TEMPORAL,UI | `useOmniscienceApi.ts:109-116`: `formatDate` uses the browser locale with no zone label or lens. → one timezone-lens formatter with an ISO tooltip. |  |  | planned |
+| F059 | Client & infrastructure | TEMPORAL | `useOmniscienceApi.ts:118-123`: date pickers produce UTC `T00:00Z`/`T23:59:59.999Z` instead of the viewer's day. → boundaries computed in the chosen zone; exclusive `to` + `tz` sent. |  |  | planned |
+| F060 | Client & infrastructure | UI | `useOmniscienceApi.ts:102,109,118`: generic helpers are auto-imported site-wide (`.nuxt/imports.d.ts:42`). → moved to `scripts/` or prefixed. |  |  | planned |
+| F061 | Client & infrastructure | PERF | `useOmniscienceApi.ts:83-94` + BE `Workspace/WorkspaceRoutes.cs:29-33,97-98`: exports are JSON-wrapped strings, double-buffered and capped by the 25 s GET timeout. → streamed file responses (`downloadFile` pattern). |  |  | planned |
+| F062 | Client & infrastructure | UI | `nuxt.config.ts:11-26`: no `ssr:false` rule for `/omniscience*`. → add it. |  |  | planned |
+| F063 | Client & infrastructure | UI | `nuxt.config.ts:54-55`: `main.scss` is listed twice. → dedupe. |  |  | planned |
+| F064 | Client & infrastructure | UI | `nuxt.config.ts:60` + `assets/scss/omniscience.scss`: a separate global `--os-*` design system loads on every page. → `.ot-os`. |  |  | planned |
+| F065 | Client & infrastructure | UI | `omniscience.scss:35-36`: no scope reset, so the global button styles leak in. → the ot-os reset (`omnitrader-os.scss:145-171`). |  |  | planned |
+| F066 | Client & infrastructure | UI | `components/Omniscience/CommandPalette.vue:2`: teleported outside the shell, so it misses its styles. → `.ot-palette`. |  |  | planned |
+| F067 | Client & infrastructure | UI | All Omniscience files: zero client permission gating against 11 backend keys, so partial profiles see actions that 403. → gate every panel and action (`useAccess`/`AccessGate`). |  |  | planned |
+| F068 | Overview (`pages/omniscience.vue`) | UI | :263-266: bootstrap is awaited first, so any non-404 error (e.g. a 403) blanks every panel. → parallel loads with a state per panel. |  |  | planned |
+| F069 | Overview (`pages/omniscience.vue`) | PERF | :263-264: a two-stage waterfall of 9 requests per load and per poll. → parallel or one `/batch`, then one read model. |  |  | planned |
+| F070 | Overview (`pages/omniscience.vue`) | TEMPORAL | :11,265: "Synced" is set even after failures, never ages and ignores `generated_at`. → per-panel as-of with a ticking `.ot-fresh`. |  |  | planned |
+| F071 | Overview (`pages/omniscience.vue`) | PERF | :310: a full refresh every 90 s even in a hidden tab. → `usePolling` + the live stream. |  |  | planned |
+| F072 | Overview (`pages/omniscience.vue`) | UI | :258 + BE `Omniscience.cs:181`: `briefing/preview` needs analysis.run, so read-only profiles get a 403 toast on every poll. → gated. |  |  | planned |
+| F073 | Overview (`pages/omniscience.vue`) | RELIABILITY | :143,286 + BE `Omniscience.cs:183-196`: "DM me" sends synchronously with no confirmation or disabled state, so a double click sends twice. → confirm + job. |  |  | planned |
+| F074 | Overview (`pages/omniscience.vue`) | UI | :162,231: schedule status is fetched but never shown. → shown on the Modules/Jobs page. |  |  | planned |
+| F075 | Overview (`pages/omniscience.vue`) | RELIABILITY | :284-285 + BE `DeductionRoutes.cs:434-446`, `OmniscienceRoutes.cs:695`: deduction/profiler runs are fire-and-forget with no job id. → job ids + jobs tray. |  |  | planned |
+| F076 | Overview (`pages/omniscience.vue`) | UI | :287-302: promote/dismiss/backfill/remove have no error handling, and backfill always "succeeds". → errors + rollback. |  |  | planned |
+| F077 | Overview (`pages/omniscience.vue`) | UI | :298,303: confirmations and toasts are SweetAlert modals. → design-system toasts and dialogs. |  |  | planned |
+| F078 | Overview (`pages/omniscience.vue`) | UI | :235-256,304-307: debounced but not aborted, so a stale response can overwrite a newer one. → abort/sequence guard. |  |  | planned |
+| F079 | Overview (`pages/omniscience.vue`) | UI | :178-182: directory filters/sort/offset aren't in the URL. → URL state. |  |  | planned |
+| F080 | Overview (`pages/omniscience.vue`) | CONTEXT | :56-57: no platform filter or "pinned" sort, though the backend supports both. → full D5 filter bar. |  |  | planned |
+| F081 | Overview (`pages/omniscience.vue`) | CORRECTNESS | :249-252: the legacy fallback filters tier after paging and invents a total. → removed. |  |  | planned |
+| F082 | Overview (`pages/omniscience.vue`) | UI | :76: shows "1–0 of 0" when empty. → guarded. |  |  | planned |
+| F083 | Overview (`pages/omniscience.vue`) | CONTEXT,TEMPORAL | :24-28: all-time tiles with no window, baseline or as-of, linking to unrelated views. → `OmniTraderKpi` with a window + drill-down. |  |  | planned |
+| F084 | Overview (`pages/omniscience.vue`) | CONTEXT | :63-71: card counts aren't clickable; no bulk tier/pin. → multi-select table + tactics. |  |  | planned |
+| F085 | Overview (`pages/omniscience.vue`) | TEMPORAL | :43,69,119: dates only, no zone, no relative age. → T8 formatting. |  |  | planned |
+| F086 | Overview (`pages/omniscience.vue`) | CONTEXT,TEMPORAL | :127: radar items are keyed by index, not clickable, unfiltered, with zoneless times. → alerts dataset view. |  |  | planned |
+| F087 | Overview (`pages/omniscience.vue`) | UI | :172,195: `unread` and `directoryTotalLabel` are unused. → removed or rendered. |  |  | planned |
+| F088 | Overview (`pages/omniscience.vue`) | UI | :7: the greeting hard-codes "Klives". → profile name. |  |  | planned |
+| F089 | Dossier (`pages/omniscience-person.vue`) | CORRECTNESS | :485-491: `personId`/tab are read once from `window.location`, so person-to-person links show the old dossier. → `useRoute()` + watch. |  |  | planned |
+| F090 | Dossier (`pages/omniscience-person.vue`) | UI | :37: tab changes aren't written to the URL. → URL state. |  |  | planned |
+| F091 | Dossier (`pages/omniscience-person.vue`) | CORRECTNESS | :405-409,426: every 403/500/timeout becomes `null`, showing false "No facts yet". → per-panel error/no-permission states. |  |  | planned |
+| F092 | Dossier (`pages/omniscience-person.vue`) | UI | :410-447: no loading state; empty text shows during load. → skeletons. |  |  | planned |
+| F093 | Dossier (`pages/omniscience-person.vue`) | PERF | :413-424,444: 10 GETs on mount (a full bootstrap just for `pinned`), all tabs eagerly. → one dossier read model + per-tab lazy loads. |  |  | planned |
+| F094 | Dossier (`pages/omniscience-person.vue`) | RELIABILITY | :465-468 + BE `OmniscienceRoutes.cs:499-505`: recompute ignores the 409 and `run_id`. → tracked job. |  |  | planned |
+| F095 | Dossier (`pages/omniscience-person.vue`) | UI | :448-482: pin/tier/observe/era/fidelity failures are ignored. → surfaced. |  |  | planned |
+| F096 | Dossier (`pages/omniscience-person.vue`) | RELIABILITY | :475-478 + BE `DeductionRoutes.cs:231-240`: era build is fire-and-forget. → job. |  |  | planned |
+| F097 | Dossier (`pages/omniscience-person.vue`) | UI | :13-23,112-121,262,282: recompute/tier/HUMINT/era/benchmark controls aren't gated. → gated. |  |  | planned |
+| F098 | Dossier (`pages/omniscience-person.vue`) | TEMPORAL,CONTEXT | :61,362: "Mood (90d)" actually shows the last 60 *data* days from a sparse UTC-day series, with no axis. → dense calendar in the lens zone. |  |  | planned |
+| F099 | Dossier (`pages/omniscience-person.vue`) | UI | :64,402: sentiment bars assume −2..2 and have no zero line. → diverging chart. |  |  | planned |
+| F100 | Dossier (`pages/omniscience-person.vue`) | TEMPORAL | :70-73 + BE `ActivityPatternModule.cs:33`: the hour histogram is UTC and unlabelled. → zone lens. |  |  | planned |
+| F101 | Dossier (`pages/omniscience-person.vue`) | TEMPORAL | :74,369 + BE `ChronotypeModule.cs:25-37`: "sleeps X–Y local" uses an inferred fixed UTC offset (default 0, no DST). → T4. |  |  | planned |
+| F102 | Dossier (`pages/omniscience-person.vue`) | CONTEXT,TEMPORAL | :76-81: taste chips have no window or as-of and aren't clickable. → filterable. |  |  | planned |
+| F103 | Dossier (`pages/omniscience-person.vue`) | CONTEXT | :46-53,129-136: facts show an evidence count only; no drill-down, filters, confirm/reject or `updated_at`. → evidence drawer + review actions. |  |  | planned |
+| F104 | Dossier (`pages/omniscience-person.vue`) | CORRECTNESS | :52,130,190: `confidence*100` gives NaN when confidence is null. → null-safe. |  |  | planned |
+| F105 | Dossier (`pages/omniscience-person.vue`) | UI | :156: confirmed and open hypotheses look identical. → status styling. |  |  | planned |
+| F106 | Dossier (`pages/omniscience-person.vue`) | CONTEXT | :173-179,383: the relationship graph shows the first 10 edges only, stretches, and nodes aren't clickable. → network library + drill. |  |  | planned |
+| F107 | Dossier (`pages/omniscience-person.vue`) | CONTEXT | :199,217-227: entity and context bars can't filter messages. → cross-filter. |  |  | planned |
+| F108 | Dossier (`pages/omniscience-person.vue`) | UI | :237,241,250,268: markdown shown raw in `<pre>`. → `scripts/agentMarkdown.ts`. |  |  | planned |
+| F109 | Dossier (`pages/omniscience-person.vue`) | TEMPORAL | :236,249,267,288,397 + BE: mixed ISO strings and epoch ms, with zoneless dates. → one epoch-ms contract + T8. |  |  | planned |
+| F110 | Dossier (`pages/omniscience-person.vue`) | TEMPORAL | :343,379 + BE `DeductionRoutes.cs:229`: era years come from the browser's local year, but the backend validates in UTC. → zone-aware eras. |  |  | planned |
+| F111 | Dossier (`pages/omniscience-person.vue`) | UI | :4,17: `<a href>` full reloads; `personId` isn't encoded. → `NuxtLink` + encoding. |  |  | planned |
+| F112 | Dossier (`pages/omniscience-person.vue`) | PERF | :99-107,278: tab components refetch on every switch. → cache/`KeepAlive`. |  |  | planned |
+| F113 | Dossier (`pages/omniscience-person.vue`) | UI | :311-493: untyped Options API bypassing the shared client (no timeout/abort). → rewritten. |  |  | planned |
+| F114 | Search & Review | CONTEXT | `pages/omniscience-search.vue:75,79`: no filters (not even `personId`, which BE accepts); fixed 30 results, no paging. → D5 filters + keyset. |  |  | planned |
+| F115 | Search & Review | UI | `omniscience-search.vue:75`: Ask isn't gated, has no timeout and can't be cancelled. → tactic run with cancel. |  |  | planned |
+| F116 | Search & Review | UI | `omniscience-search.vue:77,81`: the raw response body is shown as the error. → typed errors. |  |  | planned |
+| F117 | Search & Review | UI | `omniscience-search.vue:87-92`: mode/query read once and never written back; the palette's "Ask" is dead while on the page. → URL state. |  |  | planned |
+| F118 | Search & Review | TEMPORAL,CONTEXT | `omniscience-search.vue:46,69`: zoneless times; no "open in conversation"; " #" printed when the channel is missing. → context links. |  |  | planned |
+| F119 | Search & Review | CONTEXT | `omniscience-search.vue:32`: raw markdown answer; citations not linked. → rendered + linked. |  |  | planned |
+| F120 | Search & Review | UI | `omniscience-search.vue:22-23`: the mode switch is an `<a>` without href, so it isn't keyboard-reachable. → `.ot-segment`. |  |  | planned |
+| F121 | Search & Review | TEMPORAL | `pages/omniscience-review.vue:149-166`: failures look empty; no loading state or as-of despite 30–60 s backend caches. → states + as-of. |  |  | planned |
+| F122 | Search & Review | CORRECTNESS | `omniscience-review.vue:57,76`: irreversible "Same"/"Merge" with no confirmation, evidence or undo. → evidence + confirm + unmerge. |  |  | planned |
+| F123 | Search & Review | UI | `omniscience-review.vue:33-82`: no bulk select, sort by score or filters. → review DataTable. |  |  | planned |
+| F124 | Search & Review | RELIABILITY | `omniscience-review.vue:192-193`: always shows success; sends the DM without confirmation. → confirm + job. |  |  | planned |
+| F125 | Search & Review | CONTEXT,TEMPORAL | `omniscience-review.vue:109-116`: radar history keyed by index, unbounded, unfiltered, no drill-down. → alerts dataset. |  |  | planned |
+| F126 | Search & Review | CORRECTNESS | `omniscience-review.vue:10`: promises fact confirmation that doesn't exist. → real confirm/reject (gold). |  |  | planned |
+| F127 | Explore & components | CORRECTNESS | `pages/omniscience-explore.vue:50-51`: a missing `tab` is ignored, so `?scope=` links stay on the wrong tab and clear `personId`. "Open conversation" empties the timeline instead of opening anything. → explicit routing. |  |  | planned |
+| F128 | Explore & components | UI | `omniscience-explore.vue:21,29,31`: the selected person is never written to the URL. → URL state. |  |  | planned |
+| F129 | Explore & components | PERF | `omniscience-explore.vue:18`: Investigate remounts on any query change. → stable key. |  |  | planned |
+| F130 | Explore & components | CORRECTNESS | `components/Omniscience/Graph.vue:78-80`: `getCurrentInstance()` inside a click handler is null, so it always navigates. → resolved in setup. |  |  | planned |
+| F131 | Explore & components | CONTEXT | `Graph.vue:55-66,88`: one ring for 90 nodes; no zoom/pan/force layout or filters. → network library + filters. |  |  | planned |
+| F132 | Explore & components | UI | `Graph.vue:19`: duplicate SVG marker id when two graphs render. → `useId()`. |  |  | planned |
+| F133 | Explore & components | CORRECTNESS,HEURISTIC | `Graph.vue:74`: the regex `/ex/i` colours "next"/"text" as hostile. → explicit relation-type map. |  |  | planned |
+| F134 | Explore & components | CONTEXT | `Graph.vue:34-37,81-84`: edges show a count only; clicking outgoing edges does nothing. → edge drill-down. |  |  | planned |
+| F135 | Explore & components | TEMPORAL | `components/Omniscience/Activity.vue:23-27` + BE `WorkspaceExplorer.cs:283`: a sparse UTC daily series with no axis. → dense calendar in the lens zone. |  |  | planned |
+| F136 | Explore & components | TEMPORAL | `Activity.vue:31-36`: hours hard-coded to UTC; no weekday×hour view. → lens + heatmap. |  |  | planned |
+| F137 | Explore & components | CONTEXT | `Activity.vue:24,33,72-74`: bars and cells aren't clickable; top-conversation links drop the person/window. → cross-filter + context-preserving links. |  |  | planned |
+| F138 | Explore & components | UI | `Activity.vue:83`: no abort on person/period change. → abort. |  |  | planned |
+| F139 | Explore & components | TEMPORAL | `Activity.vue:9,18`: period not in the URL; the "vs previous" window has no dates. → URL + labelled baseline. |  |  | planned |
+| F140 | Explore & components | TEMPORAL,CORRECTNESS | `components/Omniscience/Timeline.vue:76` + BE `WorkspaceExplorer.cs:265`: capped at 100 events with no "load older", so older events silently vanish. → keyset paging. |  |  | planned |
+| F141 | Explore & components | TEMPORAL | `Timeline.vue:12-17,77-86`: UTC day filters, an Apply button, nothing in the URL. → lens + URL + live filtering. |  |  | planned |
+| F142 | Explore & components | TEMPORAL,CONTEXT | `Timeline.vue:28,36`: zoneless times; evidence ids are raw `<code>`. → linked evidence. |  |  | planned |
+| F143 | Explore & components | TEMPORAL | `components/Omniscience/Investigate.vue:106,166-167`: UTC day boundaries round-tripped through `toISOString`. → zone-aware. |  |  | planned |
+| F144 | Explore & components | UI | `Investigate.vue:89,182-190`: filters never written to the URL. → URL state. |  |  | planned |
+| F145 | Explore & components | CONTEXT | `Investigate.vue:20,24`: the conversation filter is a free-text internal id; platforms are hard-coded. → pickers from facets. |  |  | planned |
+| F146 | Explore & components | UI | `Investigate.vue:35,49-53`: no total, sort, or page-size choice. → DataTable. |  |  | planned |
+| F147 | Explore & components | CONTEXT,TEMPORAL | `Investigate.vue:37-46`: no "open in context" (though `conversations/messages` exists), nothing click-to-filter, zoneless times. → context drawer. |  |  | planned |
+| F148 | Explore & components | CORRECTNESS | `Investigate.vue:172-177`: CSV exports the current form state, not the query behind the results. → export by query fingerprint. |  |  | planned |
+| F149 | Explore & components | UI | `Investigate.vue:124`: the save name keeps the first query's name. → fixed. |  |  | planned |
+| F150 | Explore & components | CORRECTNESS | `CommandPalette.vue:94` + `Investigate.vue:125,159` + BE `Workspace/WorkspaceStore.cs:62-69`: one palette run adds 2 to `use_count` and writes 3 history rows. → single accounting path. |  |  | planned |
+| F151 | Explore & components | UI | `CommandPalette.vue:67-72`: only four navigation actions; no commands. → tactics palette. |  |  | planned |
+| F152 | Explore & components | TEMPORAL | `CommandPalette.vue:103,108`: bootstrap is loaded once and never refreshed. → live. |  |  | planned |
+| F153 | Explore & components | UI | `CommandPalette.vue:24-40`: no focus trap; the listbox has no option roles. → accessible palette (`OtCommand`). |  |  | planned |
+| F154 | Explore & components | PERF | `components/Omniscience/PersonPicker.vue:131`: fetches the whole dossier (under the backend `ReadGate`) just for a name. → a lightweight people lookup. |  |  | planned |
+| F155 | Explore & components | CORRECTNESS | `PersonPicker.vue:128`: an external value change (including Compare's Swap) keeps the old name. → reactive. |  |  | planned |
+| F156 | Explore & components | TEMPORAL | `components/Omniscience/Compare.vue:27,48,64-65`: left/right aren't in the URL; zoneless dates. → URL + T8. |  |  | planned |
+| F157 | Explore & components | TEMPORAL | `components/Omniscience/Health.vue:52-56`: loads once; "Checked" never ages; no per-source staleness. → live health + thresholds. |  |  | planned |
+| F158 | Explore & components | PERF | `components/Omniscience/Notifications.vue:39-43`: 60 s poll even in a hidden tab. → live stream. |  |  | planned |
+| F159 | Explore & components | CORRECTNESS | `Notifications.vue:7,23`: `item.kind.includes` throws on null. → null-safe. |  |  | planned |
+| F160 | Explore & components | PERF | `Notifications.vue:33-38`: dismiss has no error handling; "Dismiss all" sends N POSTs. → bulk endpoint. |  |  | planned |
+| F161 | Explore & components | CONTEXT | `Notifications.vue:24`: "Person <id>" is plain text. → dossier link. |  |  | planned |
+| F162 | Replica panel (`components/ReplicaChatPanel.vue`) | CORRECTNESS | :205-207,228: chats load before eras, so era chats show as "custom". → eras first. |  |  | planned |
+| F163 | Replica panel (`components/ReplicaChatPanel.vue`) | RELIABILITY | :25-27,201-210: training started elsewhere is never polled; the bar sticks at 0%. → job stream. |  |  | planned |
+| F164 | Replica panel (`components/ReplicaChatPanel.vue`) | PERF | :333-343: a 1.6 s `setInterval` overlaps slow requests and ignores visibility. → stream. |  |  | planned |
+| F165 | Replica panel (`components/ReplicaChatPanel.vue`) | UI,PERF | :283-287,313-316: generations block for 180–240 s with no streaming or cancel. → streamed, cancellable. |  |  | planned |
+| F166 | Replica panel (`components/ReplicaChatPanel.vue`) | TEMPORAL | :35,186-187: a custom as-of date becomes UTC end-of-day. → zone-aware cutoff. |  |  | planned |
+| F167 | Replica panel (`components/ReplicaChatPanel.vue`) | TEMPORAL | :54,228: the era comes from `getUTCFullYear`. → the person's zone. |  |  | planned |
+| F168 | Replica panel (`components/ReplicaChatPanel.vue`) | TEMPORAL | :29,194: the training log shows time only. → full stamp. |  |  | planned |
+| F169 | Replica panel (`components/ReplicaChatPanel.vue`) | CONTEXT | :80-82: evidence ids aren't links. → linked. |  |  | planned |
+| F170 | Replica panel (`components/ReplicaChatPanel.vue`) | CORRECTNESS | :137 + BE `OmniscienceRoutes.cs:519-537`: tells the user to "add to profile targets", but no UI control can. → removed (F015 readiness). |  |  | planned |
+| F171 | Replica panel (`components/ReplicaChatPanel.vue`) | UI | :222-231,264-275,328: no error handling; native `prompt`/`confirm`/`alert`. → design-system dialogs. |  |  | planned |
+| F172 | Replica panel (`components/ReplicaChatPanel.vue`) | UI | :11,50,94: train/chat controls aren't gated. → gated. |  |  | planned |
+| F173 | Tests | CORRECTNESS | `tests/e2e/fixtures/omniscience-api.ts:120`: unknown routes answer `{ok:true}`, so wrong paths pass. → fail on unknown routes. |  |  | planned |
+| F174 | Tests | CORRECTNESS | `omniscience-api.ts:62` vs BE `WorkspaceRoutes.cs:32`: the fixture's CSV filename differs from the backend's, and the spec asserts the fixture. → fixtures generated from the C# DTO contracts. |  |  | planned |
+| F175 | Tests | UI | `tests/e2e/omniscience.spec.ts:32-121`: no coverage of review/search, the Overview/Knowledge tabs, 403/error states, person-to-person navigation, graph clicks or partial permissions. → full page-by-page e2e. |  |  | planned |
+| F176 | `Deduction/ExtractionJob.cs` | RELIABILITY | :97-99: the watermark advances past failed/unparseable windows, and failed rows are never retried. → advance on success only + retry queue. |  |  | planned |
+| F177 | `Deduction/ExtractionJob.cs` | HEURISTIC | :286-287: `?` and reply links score as "information". → removed (model triage). |  |  | planned |
+| F178 | `Deduction/ExtractionJob.cs` | TEMPORAL | :176-198: a per-conversation `sent_at` watermark means history backfilled later is never extracted. → per-message coverage on `ingest_seq`. |  |  | planned |
+| F179 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :176-183,493: people promoted to tracked in already-cursored conversations are never extracted. → per-person coverage + enqueue on promotion. |  |  | planned |
+| F180 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :196: `length(content)>0` drops attachment-only, forwarded and sticker messages; OCR is ignored. → include attachments/OCR/transcripts as typed evidence. |  |  | planned |
+| F181 | `Deduction/ExtractionJob.cs` | TEMPORAL | :197: sorted by `sent_at` with no tiebreak, so minute-precision imports scramble. → order by (sent_at, seq). |  |  | planned |
+| F182 | `Deduction/ExtractionJob.cs` | TEMPORAL | :196: a strict `> $w` skips messages on the boundary timestamp. → (sent_at, id) cursor. |  |  | planned |
+| F183 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :198: LIMIT 4000 per conversation per pass. → full pagination. |  |  | planned |
+| F184 | `Deduction/ExtractionJob.cs` | PERF | :54,61,130: a 150-calls/night budget lets active conversations hog it; backlogs take months. → throughput scheduling with fair rotation. |  |  | planned |
+| F185 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :61,67: the deterministic stimulus harvest is skipped once the LLM budget is spent. → decoupled. |  |  | planned |
+| F186 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :79,99,102: no context across passes; 1–14-message leftover windows processed alone. → prior context always prepended (read-only). |  |  | planned |
+| F187 | `Deduction/ExtractionJob.cs` | RELIABILITY | :105-106: `LastPassAt` lives in memory only. → persisted run records. |  |  | planned |
+| F188 | `Deduction/ExtractionJob.cs` | PERF | :123-130: a full GROUP BY over messages on every pass. → tracked-conversation index. |  |  | planned |
+| F189 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :167-169,474: priority is cleared after any partial pass. → cleared when the flagged message is covered. |  |  | planned |
+| F190 | `Deduction/ExtractionJob.cs` | CORRECTNESS,TEMPORAL | :192,239-240: speaker label = Klives-side display name from the first message. → usernames + per-message names + aliases (time-scoped). |  |  | planned |
+| F191 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :245-260: letters reassigned every window. → stable per-conversation person ids. |  |  | planned |
+| F192 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :268-272: speakers past Z become "P26". → unambiguous ids. |  |  | planned |
+| F193 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :298-305: mentioned/absent people and raw `<@id>` mentions are unresolved. → roster includes resolved mentions. |  |  | planned |
+| F194 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :263: replies to out-of-window messages show nothing. → parent quoted inline with its author. |  |  | planned |
+| F195 | `Deduction/ExtractionJob.cs` | RELIABILITY | :334-338: brace-slice parsing with no schema, repair or retry. → structured output + validation. |  |  | planned |
+| F196 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :367: evidence given as `"4"` (a string) is dropped. → coerced. |  |  | planned |
+| F197 | `Deduction/ExtractionJob.cs` | TEMPORAL | :400,427: `occurred_at` falls back to now. → the window's time span. |  |  | planned |
+| F198 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :385-398: no asker≠answerer or sincerity checks on Q&A pairs. → model-validated fields. |  |  | planned |
+| F199 | `Deduction/ExtractionJob.cs` | HEURISTIC | :411-413: "bro"/"mate" pass as names; only the first evidence is kept. → model name classification + all evidence. |  |  | planned |
+| F200 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :454: `model_used` is hard-coded "KliveLLM-free". → the actual served model. |  |  | planned |
+| F201 | `Deduction/ExtractionJob.cs` | RELIABILITY | :455: error text packed into the status column. → separate error column. |  |  | planned |
+| F202 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :498-502: a reply's parent is looked up only among this pass's messages. → DB lookup. |  |  | planned |
+| F203 | `Deduction/ExtractionJob.cs` | HEURISTIC | :503-508: the 3-minute adjacency stimulus rule is noisy in groups. → model turn/addressee linking. |  |  | planned |
+| F204 | `Deduction/ExtractionJob.cs` | CORRECTNESS | :511-513: stimulus/reply permanently truncated to 500 chars. → store ids, render at use. |  |  | planned |
+| F205 | `Deduction/ExtractionJob.cs` | TEMPORAL | (+ `Ingest/Discord/DiscordEventRecorder.cs:275`): edits never re-extracted; deletes never retract facts. → re-extract on edit, retract on delete (T5). |  |  | planned |
+| F206 | `Deduction/ExtractionPromptBuilder.cs` | TEMPORAL | :47-48 + `KliveLLM.cs:1774`: "resolve against message dates" while today's stamp tops the prompt. → no stamp; each resolution cites its anchor. |  |  | planned |
+| F207 | `Deduction/ExtractionPromptBuilder.cs` | TEMPORAL | :47: the example uses the stale year "2025-04". → placeholders. |  |  | planned |
+| F208 | `Deduction/ExtractionPromptBuilder.cs` | TEMPORAL | :33: the example teaches static "A is in year 11". → `as_of`/`valid_from`/`valid_to` required. |  |  | planned |
+| F209 | `Deduction/ExtractionPromptBuilder.cs` | CORRECTNESS | :31: no speech-act, sincerity, polarity, attribution or modality fields. → added, model-judged. |  |  | planned |
+| F210 | `Deduction/ExtractionPromptBuilder.cs` | CORRECTNESS | :32: hearsay isn't downgraded. → reported vs self-disclosed. |  |  | planned |
+| F211 | `Deduction/ExtractionPromptBuilder.cs` | CORRECTNESS | :63-64: newline flattening merges quotes into replies; 500-char cap. → structure kept, quotes marked. |  |  | planned |
+| F212 | `Deduction/ExtractionPromptBuilder.cs` | CORRECTNESS | :52-71: no person-level context. → roster dossiers + prior context + tracked marker. |  |  | planned |
+| F213 | `Deduction/ExtractionPromptBuilder.cs` | CORRECTNESS | :55 (`ExtractionJob.cs:233-235`): trust asserted inside the context label ("high-trust", "public-facing persona"). → neutral metadata. |  |  | planned |
+| F214 | `Deduction/ExtractionPromptBuilder.cs` | CORRECTNESS | :31 + `GraphAssembler.cs:229-234`: uncalibrated 3-level confidence. → probability + rationale, calibrated on reviews. |  |  | planned |
+| F215 | `Deduction/ExtractionPromptBuilder.cs` | TEMPORAL | :45: interaction tone mixed with relationship type and not time-scoped. → split + validity. |  |  | planned |
+| F216 | `Deduction/GraphAssembler.cs` | TEMPORAL | :417: the decay horizon is measured from message time, so fresh backfill decays immediately and historical truth is erased. → current vs historical separated. |  |  | planned |
+| F217 | `Deduction/GraphAssembler.cs` | TEMPORAL | :434-435: decayed facts become invisible to as-of grounding (`ReplicaChatOrchestrator.cs:430`). → validity evaluated at as-of. |  |  | planned |
+| F218 | `Deduction/GraphAssembler.cs` | TEMPORAL | :154: `evidenceAt` falls back to now. → window time + "unevidenced" flag. |  |  | planned |
+| F219 | `Deduction/GraphAssembler.cs` | HEURISTIC | :253-264: exact-text reconciliation. → model dedupe/contradiction/state-change classification. |  |  | planned |
+| F220 | `Deduction/GraphAssembler.cs` | CORRECTNESS | :280: +0.07 per repeat counts window overlap and re-derivation. → distinct independent evidence only. |  |  | planned |
+| F221 | `Deduction/GraphAssembler.cs` | CORRECTNESS | :128-133,300: `source_context` stored but never weighed. → the model judges context. |  |  | planned |
+| F222 | `Deduction/GraphAssembler.cs` | HEURISTIC | :186-187: temporal category chosen by `Contains("birthday"/"born")`. → classifier. |  |  | planned |
+| F223 | `Deduction/GraphAssembler.cs` | TEMPORAL | :188: fixed 0.55 confidence with free-text dates. → structured date + precision. |  |  | planned |
+| F224 | `Deduction/GraphAssembler.cs` | CORRECTNESS | :170: subjects must be window participants. → entity-linked subjects. |  |  | planned |
+| F225 | `Deduction/GraphAssembler.cs` | CORRECTNESS | :198-203: entity owner = speaker. → owner derived from the subject. |  |  | planned |
+| F226 | `Deduction/GraphAssembler.cs` | CORRECTNESS | :319,329-331: `kind` splits duplicates; descriptors are concatenated strings. → model entity resolution + structured attributes. |  |  | planned |
+| F227 | `Deduction/GraphAssembler.cs` | CORRECTNESS | :364,388-390: relationship rows keep the model's arbitrary a/b order. → canonical pairs. |  |  | planned |
+| F228 | `Deduction/GraphAssembler.cs` | TEMPORAL | :376: `valid_to` is reset to NULL and never closed. → model-judged start/end. |  |  | planned |
+| F229 | `Deduction/GraphAssembler.cs` | CORRECTNESS | :379: confidence grows with volume. → evidence-quality scoring. |  |  | planned |
+| F230 | `Deduction/GraphAssembler.cs` | RELIABILITY | :56-60: a window is marked applied even when applying throws. → marked on commit only. |  |  | planned |
+| F231 | `Deduction/GraphAssembler.cs` | RELIABILITY | :102: unparseable payloads never marked; 100 of them stall assembly forever. → poison marking. |  |  | planned |
+| F232 | `Deduction/GraphAssembler.cs` | TEMPORAL | :276-279: `first_evidence_at` never moves earlier. → min(). |  |  | planned |
+| F233 | `Deduction/GraphAssembler.cs` | HEURISTIC | :464-466: merge suggestions by substring/first token. → model coreference. |  |  | planned |
+| F234 | `Deduction/GraphAssembler.cs` | PERF | :478,496: inserts 100 suggestions but reports all and recomputes the rest. → paginated. |  |  | planned |
+| F235 | `Deduction/DetectivePass.cs` | TEMPORAL | :107: anchors on today; derived facts carry no as-of. → derivation + as-of stored. |  |  | planned |
+| F236 | `Deduction/DetectivePass.cs` | CORRECTNESS | :115-117: LIMIT 120 ordered by category silently drops later categories. → token budgeting. |  |  | planned |
+| F237 | `Deduction/DetectivePass.cs` | TEMPORAL | :125,143: month-precision evidence with no validity. → full timeline with quotes. |  |  | planned |
+| F238 | `Deduction/DetectivePass.cs` | TEMPORAL,CORRECTNESS | :233-235: derived facts have empty evidence, now-timestamps and 0.85 confidence. → source evidence + dependencies. |  |  | planned |
+| F239 | `Deduction/DetectivePass.cs` | CORRECTNESS | :233: nightly re-derivation inflates confidence. → derived facts never self-corroborate. |  |  | planned |
+| F240 | `Deduction/DetectivePass.cs` | CORRECTNESS | :110-129: derived facts are fed back as "Established facts". → separate tier, never evidence. |  |  | planned |
+| F241 | `Deduction/DetectivePass.cs` | TEMPORAL | :240-258: LLM-chosen contradiction losers auto-superseded; state changes counted as contradictions. → conflict classification + interval closing + review. |  |  | planned |
+| F242 | `Deduction/DetectivePass.cs` | CORRECTNESS | :261-287: hypotheses never confirmed, refuted or expired. → resolution outputs. |  |  | planned |
+| F243 | `Deduction/DetectivePass.cs` | CORRECTNESS | :202: hypothesis evidence is never shown back. → included. |  |  | planned |
+| F244 | `Deduction/DetectivePass.cs` | RELIABILITY | :67-68: free model, 2200 tokens, no repair. → gateway. |  |  | planned |
+| F245 | `Deduction/DetectivePass.cs` | HEURISTIC | :32-35: the "DM outranks public" rule is baked into the prompt. → the model weighs context. |  |  | planned |
+| F246 | `Deduction/DetectivePass.cs` | CORRECTNESS | :290-299: open questions bulk-marked "answered". → superseded state. |  |  | planned |
+| F247 | `Deduction/DetectivePass.cs` | CORRECTNESS | :319-343: completeness is self-assessed by the LLM. → derived from structured facts. |  |  | planned |
+| F248 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `Deduction/AliasResolver.cs:131-136`: counts embedded in the fact text create a new immutable name fact every run. → stable keys, counts in metadata. |  |  | planned |
+| F249 | Aliases / hypotheses / identity / targets / DeductionRoutes | HEURISTIC | `AliasResolver.cs:113-117`: "called this by ≥3 people" means "real name". → model name vs epithet. |  |  | planned |
+| F250 | Aliases / hypotheses / identity / targets / DeductionRoutes | HEURISTIC | `AliasResolver.cs:113`: one self-identification gives 0.9 confidence ("I'm Batman"). → sincerity check. |  |  | planned |
+| F251 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `AliasResolver.cs:101`: distinct speakers = max across types, not the union. → COUNT DISTINCT. |  |  | planned |
+| F252 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `AliasResolver.cs:109`: echo filter covers `platform_username` only. → all handles and display names. |  |  | planned |
+| F253 | Aliases / hypotheses / identity / targets / DeductionRoutes | TEMPORAL | `AliasResolver.cs:43-44,129`: context hard-coded "server"; timestamp falls back to now. → real context and time. |  |  | planned |
+| F254 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `AliasResolver.cs:158-163`: aliases at 0.45 confidence feed the Klives radar. → threshold + confirmation. |  |  | planned |
+| F255 | Aliases / hypotheses / identity / targets / DeductionRoutes | TEMPORAL | `AliasResolver.cs`: aliases have no validity period. → intervals. |  |  | planned |
+| F256 | Aliases / hypotheses / identity / targets / DeductionRoutes | HEURISTIC | `Deduction/HypothesisWatcher.cs:41-46,71-74`: keyword substring matching ("age" ⊂ "message"). → semantic NLI/LLM watcher. |  |  | planned |
+| F257 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `HypothesisWatcher.cs:42-46`: not scoped to the hypothesis's person. → scoped. |  |  | planned |
+| F258 | Aliases / hypotheses / identity / targets / DeductionRoutes | HEURISTIC | `Deduction/IdentityLinkEngine.cs:72-91,191-192,235-262`: Dice similarity, URL Contains, stylometry thresholds. → model-assisted linking. |  |  | planned |
+| F259 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `IdentityLinkEngine.cs:52`: never links same-platform identities (alts). → allowed (still review-only). |  |  | planned |
+| F260 | Aliases / hypotheses / identity / targets / DeductionRoutes | TEMPORAL | `Deduction/TargetSuggestionEngine.cs:56-115`: lifetime counts with no recency. → time-decayed signals. |  |  | planned |
+| F261 | Aliases / hypotheses / identity / targets / DeductionRoutes | TEMPORAL | `Deduction/DeductionRoutes.cs:229`: the current, incomplete year accepted as an era. → completed periods or explicit partial label. |  |  | planned |
+| F262 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `DeductionRoutes.cs:430-449`: manual run skips the detective but still decays. → one consistent pipeline. |  |  | planned |
+| F263 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `DeductionRoutes.cs:322-329`: manual facts accept free-text categories with no validity. → validated schema. |  |  | planned |
+| F264 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `DeductionRoutes.cs:722-750`: merges move identities only, orphaning facts/entities/hypotheses/replicas. → all person-keyed data re-attributed. |  |  | planned |
+| F265 | Aliases / hypotheses / identity / targets / DeductionRoutes | CORRECTNESS | `DeductionRoutes.cs:861-862`: the comment claims promotion enqueues extraction; it doesn't. → implemented. |  |  | planned |
+| F266 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | RELIABILITY | `ReplicaTrainer.cs:72`: status set outside the try. → wrapped. |  |  | planned |
+| F267 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | RELIABILITY | `ReplicaTrainer.cs:169-177`: failure handlers can throw and leave rows stuck. → independent best-effort writes. |  |  | planned |
+| F268 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | RELIABILITY | `ReplicaTrainer.cs:152`: the dossier is persisted before embedding finishes. → versioned staging + atomic swap. |  |  | planned |
+| F269 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | RELIABILITY | `ReplicaTrainer.cs:72` + `ReplicaChatOrchestrator.cs:568`: retraining disables chat. → keep serving the previous version. |  |  | planned |
+| F270 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | RELIABILITY | `ReplicaTrainer.cs:776-784`: one empty reply aborts the run (even optional stages). → per-stage retry + degraded success. |  |  | planned |
+| F271 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | CORRECTNESS | `ReplicaTrainer.cs:111,119`: 140 samples × ≤800 chars for voice/opinions. → full context, stratified by era/context. |  |  | planned |
+| F272 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | CORRECTNESS | `ReplicaTrainer.cs:111`: samples include links, bot commands and pastes. → model-filtered authored text. |  |  | planned |
+| F273 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | CORRECTNESS | `ReplicaTrainer.cs:124`: one generic opinions call. → dated per-topic opinions. |  |  | planned |
+| F274 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | RELIABILITY | `ReplicaTrainer.cs:222-230`: a 32-token free-model reflex classifier that fails silently (zero reflexes when the free model is off). → batched structured classification. |  |  | planned |
+| F275 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | CORRECTNESS | `ReplicaTrainer.cs:203-213,247-258`: explicit replies only, ≤100, unknown → "casual". → all pairs, "unknown" kept. |  |  | planned |
+| F276 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | HEURISTIC | `ReplicaTrainer.cs:308-320`: exemplar scoring favours long punctuated messages. → typicality sampling. |  |  | planned |
+| F277 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | CORRECTNESS | `ReplicaTrainer.cs:336-348`: "relations" = co-posters. → reply/mention/DM edges. |  |  | planned |
+| F278 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | CORRECTNESS | `ReplicaTrainer.cs:372-376`: relational samples aren't addressed to that person. → only messages to/replying to them. |  |  | planned |
+| F279 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | RELIABILITY | `ReplicaTrainer.cs:426-427`: a new ONNX session + download per training (racing the shared `.part` file). → shared embedding service. |  |  | planned |
+| F280 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | CORRECTNESS | `ReplicaTrainer.cs:396-467`: stimuli aren't embedded. → embedded. |  |  | planned |
+| F281 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | UI | `ReplicaTrainer.cs:174`: the failure DM uses personId as the name. → display name. |  |  | planned |
+| F282 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | TEMPORAL | `ReplicaTrainer.cs:722-745`: eras are UTC calendar years. → local-time change-point eras. |  |  | planned |
+| F283 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | TEMPORAL | `ReplicaTrainer.cs:92`: dossier not versioned per era. → per-era dossiers. |  |  | planned |
+| F284 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | TEMPORAL | `ReplicaRoutes.cs:412` + `ReplicaJobs.cs:14`: "stale" computed but never written. → stale marking + auto-retrain. |  |  | planned |
+| F285 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | RELIABILITY | `ReplicaRoutes.cs:179`: chat isn't cancelled on client disconnect. → request token. |  |  | planned |
+| F286 | Replica training (`Replica/ReplicaTrainer.cs`, `ReplicaRoutes.cs`) | CORRECTNESS | `Deduction/DeductionRoutes.cs:854`: `watch`-tier people have their profile target zeroed, so they can never train. → readiness decoupled from tiers (F015). |  |  | planned |
+| F287 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | TEMPORAL | :216: the lifetime voice rulebook is used for historical as-of. → era-scoped. |  |  | planned |
+| F288 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | TEMPORAL | :143,218-221: the 45-day "live" window leaks post-cutoff opinions/relational notes. → exact evidence-date comparison. |  |  | planned |
+| F289 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | TEMPORAL | :485-486: the era profile leaks up to 45 days of future. → profiles ending ≤ as-of only. |  |  | planned |
+| F290 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | TEMPORAL | :430,450: `created_at <= asOf` removes nearly all facts for historical dates. → evidence/validity time. |  |  | planned |
+| F291 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | TEMPORAL | :429-432: current status applied to a historical scope. → validity at as-of. |  |  | planned |
+| F292 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | TEMPORAL | :657-658: undated exemplars always visible. → excluded. |  |  | planned |
+| F293 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | TEMPORAL | :160 + `KliveLLM.cs:1774`: today's stamp on every turn. → Stamp=AsOf. |  |  | planned |
+| F294 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :628-635: the current message goes last and is cut at MiniLM's 256 tokens. → embedded separately + fused. |  |  | planned |
+| F295 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | PERF | :286-291,336-339: brute-force scan of all embeddings every turn. → partitioned SIMD/ANN + cache. |  |  | planned |
+| F296 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | HEURISTIC | :305,350: fixed cosine floors 0.14/0.16. → relative/learned thresholds. |  |  | planned |
+| F297 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :226-228: reflexes ignore the class of the incoming message. → classified + matched. |  |  | planned |
+| F298 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :261-268: bulleted, truncated exemplars. → real multi-turn few-shot transcripts. |  |  | planned |
+| F299 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :637-652: history flattened into one user message. → native multi-turn. |  |  | planned |
+| F300 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | PERF | :160-161: no sampling/reasoning control; OneShot (parkable 45 min). → Interactive + explicit sampling. |  |  | planned |
+| F301 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :17-18: 520 max tokens, no `finish_reason` check. → window-sized output + truncation detection. |  |  | planned |
+| F302 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :170-171: Model/Provider always null. → gateway metadata. |  |  | planned |
+| F303 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | HEURISTIC | :231-232: the "AI" substring filter drops "Certainly!" from the forbidden list. → assistant-voice classifier (F017). |  |  | planned |
+| F304 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :654-655: the critique sees no history. → included. |  |  | planned |
+| F305 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | HEURISTIC | :676-681: legitimate surrounding quotes stripped. → structured output. |  |  | planned |
+| F306 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | RELIABILITY | :76: the user turn is persisted before generation and orphaned on failure. → failure marking. |  |  | planned |
+| F307 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :199-239: ~3% of the context window used. → full-window composition. |  |  | planned |
+| F308 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | :205 + `ReplicaPromptBuilder.cs:39-45`: the assistant-framed "You are an AI simulation" preamble leads. → transcript-continuation framing. The UI labels every replica message as a simulation (Guardrails). |  |  | planned |
+| F309 | Replica chat (`Replica/ReplicaChatOrchestrator.cs`) | CORRECTNESS | (design): the replica isn't told who it's talking to. → addressee + relational register. |  |  | planned |
+| F310 | Temporal / style / fidelity / memory | TEMPORAL | `Replica/ReplicaTemporalAnalyzer.cs:195-196`: a historical as-of uses Jan 1 → as-of (5 days of data on Jan 5). → trailing window. |  |  | planned |
+| F311 | Temporal / style / fidelity / memory | TEMPORAL | `ReplicaTemporalAnalyzer.cs:195`: live/historical switch relative to UtcNow, so behaviour drifts. → deterministic. |  |  | planned |
+| F312 | Temporal / style / fidelity / memory | TEMPORAL | `ReplicaTemporalAnalyzer.cs:240`: UTC calendar-year eras. → local change-points. |  |  | planned |
+| F313 | Temporal / style / fidelity / memory | HEURISTIC | `ReplicaTemporalAnalyzer.cs:382`: emoji = U+1F300–1FAFF only (misses ❤, flags, ZWJ, custom). → Unicode properties + grapheme clusters. |  |  | planned |
+| F314 | Temporal / style / fidelity / memory | HEURISTIC | `ReplicaTemporalAnalyzer.cs:91-101,263`: English laugh/stop lists; link messages dropped. → model-based. |  |  | planned |
+| F315 | Temporal / style / fidelity / memory | PERF | `ReplicaTemporalAnalyzer.cs:129-139`: loads every message into memory. → streamed. |  |  | planned |
+| F316 | Temporal / style / fidelity / memory | TEMPORAL | `ReplicaTemporalAnalyzer.cs:319-320`: UTC active hour computed but unused. → local-zone hours. |  |  | planned |
+| F317 | Temporal / style / fidelity / memory | HEURISTIC | `Replica/ReplicaStylePostProcessor.cs:64-73`: forced lowercasing ("OK" → "oK"). → removed. |  |  | planned |
+| F318 | Temporal / style / fidelity / memory | HEURISTIC | `ReplicaStylePostProcessor.cs:76-77`: final period stripped by rate. → removed. |  |  | planned |
+| F319 | Temporal / style / fidelity / memory | HEURISTIC | `ReplicaStylePostProcessor.cs:80-96`: laugh-family swapping. → removed. |  |  | planned |
+| F320 | Temporal / style / fidelity / memory | TEMPORAL | `ReplicaStylePostProcessor.cs:113-137`: a lifetime fingerprint not scoped to as-of. → deleted. |  |  | planned |
+| F321 | Temporal / style / fidelity / memory | CORRECTNESS | `Replica/ReplicaFidelity.cs:136`: the "full exclusion" claim is false (dossier, personality, recent-live material include held-out data). → retrain with the holdout excluded everywhere. |  |  | planned |
+| F322 | Temporal / style / fidelity / memory | CORRECTNESS | `ReplicaFidelity.cs:61-62`: exclusion by id only. → near-duplicates excluded too. |  |  | planned |
+| F323 | Temporal / style / fidelity / memory | CORRECTNESS | `ReplicaFidelity.cs:49-53`: the holdout is the 30 most recent pairs. → stratified by era and context. |  |  | planned |
+| F324 | Temporal / style / fidelity / memory | HEURISTIC | `ReplicaFidelity.cs:182-198`: heuristic style score + MiniLM cosine. → judge discrimination + style embeddings. |  |  | planned |
+| F325 | Temporal / style / fidelity / memory | CORRECTNESS | `Replica/ReplicaChatMemory.cs:98,116-123`: the watermark passes turns the summary budget dropped. → advance through included rows only. |  |  | planned |
+| F326 | Temporal / style / fidelity / memory | CORRECTNESS | `ReplicaChatMemory.cs:77`: rows 13–24 lost until a summary exists. → everything within budget. |  |  | planned |
+| F327 | Embedding / OCR / profiler / scheduler | RELIABILITY | `Replica/ReplicaEmbedder.cs:30-33,73`: the SHA is a placeholder that's never compared; URLs aren't pinned. → pinned revision + enforced SHA-256 (ModelHub). |  |  | planned |
+| F328 | Embedding / OCR / profiler / scheduler | RELIABILITY | `ReplicaEmbedder.cs:240-252`: download lock per instance, and three instances race. → process-wide lock. |  |  | planned |
+| F329 | Embedding / OCR / profiler / scheduler | SEP,CORRECTNESS | `ReplicaEmbedder.cs:36,133`: head truncation drops  and the tail. → chunk + pool. |  |  | planned |
+| F330 | Embedding / OCR / profiler / scheduler | PERF | `ReplicaEmbedder.cs:87-92`: multiple CPU sessions, each with cores/2 threads. → one shared session; DirectML optional. |  |  | planned |
+| F331 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `Search/MessageEmbeddingIndex.cs:29,90-95`: messages under 8 chars are never embedded. → everything embedded. |  |  | planned |
+| F332 | Embedding / OCR / profiler / scheduler | PERF | `MessageEmbeddingIndex.cs:48,55`: 3-minute start delay + 10-minute polling. → event-driven by `ingest_seq`. |  |  | planned |
+| F333 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `OmniscienceDb.cs:479-483`: no embedding model/version column. → added. |  |  | planned |
+| F334 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `Ingest/OcrService.cs:24`: no WebP/GIF (Discord's defaults). → decoded via SkiaSharp/ffmpeg. |  |  | planned |
+| F335 | Embedding / OCR / profiler / scheduler | RELIABILITY | `OcrService.cs:145-150,157`: unhashed, non-atomic download; one init failure disables OCR until restart. → atomic + hashed + retried. |  |  | planned |
+| F336 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `Profiling/PersonalityProfiler.cs:87` + `ProfilePromptBuilder.cs:128`: limits above 200 drop the *newest* messages. → token budgeting. |  |  | planned |
+| F337 | Embedding / OCR / profiler / scheduler | TEMPORAL | `Profiling/ProfilePromptBuilder.cs:120-129`: messages shown without dates. → T3 stamps. |  |  | planned |
+| F338 | Embedding / OCR / profiler / scheduler | TEMPORAL | `PersonalityProfiler.cs:359-362`: strata relative to UtcNow. → relative to as-of/last message. |  |  | planned |
+| F339 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `ProfilePromptBuilder.cs:106-110`: derived facts labelled "verified", undated. → tier + provenance + dates. |  |  | planned |
+| F340 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `ProfilePromptBuilder.cs:113-115`: unbounded analytics dump. → selected + budgeted. |  |  | planned |
+| F341 | Embedding / OCR / profiler / scheduler | RELIABILITY | `PersonalityProfiler.cs:133,166,232`: free model, no cancellation, small caps. → gateway. |  |  | planned |
+| F342 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `PersonalityProfiler.cs:143-158`: traits silently become `{}`; Big Five unvalidated. → structured output + validation. |  |  | planned |
+| F343 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `PersonalityProfiler.cs:165`: the biographical pass ignores the fact graph and its output is unused. → merged or removed. |  |  | planned |
+| F344 | Embedding / OCR / profiler / scheduler | TEMPORAL | `PersonalityProfiler.cs:275-276,301-303`: UTC-year eras + a prompt hack inside the display name. → dedicated era prompt + local change-points. |  |  | planned |
+| F345 | Embedding / OCR / profiler / scheduler | CORRECTNESS | `Scheduling/OmniscienceScheduler.cs:77-117` vs `126-157`: dossiers are built *before* deduction runs. → dependency-ordered kernel DAG. |  |  | planned |
+| F346 | LLM layer & ingest time handling | RELIABILITY | `KliveLLM/KliveLLM.cs:1745-1758`: a session leaks on every `QueryLLM` with null sessionId. → stateless `QueryAsync` + reset in finally. |  |  | planned |
+| F347 | LLM layer & ingest time handling | CORRECTNESS | `KliveLLM.cs:1785-1797`: no FinishReason/Model/Provider/bytes on the QueryLLM path. → populated. |  |  | planned |
+| F348 | LLM layer & ingest time handling | CORRECTNESS | `KliveLLM.cs:630-639,2189-2211`: QueryLLM can't take work class, cache hint, sampling, window or reasoning. → `QueryAsync(LlmRequest)`. |  |  | planned |
+| F349 | LLM layer & ingest time handling | PERF | `KliveLLM.cs:2037-2038`: all QueryLLM traffic is anonymous OneShot (serialised, parked). → classified (Background/Burst/Interactive). |  |  | planned |
+| F350 | LLM layer & ingest time handling | TEMPORAL,PERF | `KliveLLM.cs:896,1774`: the receipt stamp at byte 0 breaks prefixes and injects "now" into historical tasks. → optional stamp. |  |  | planned |
+| F351 | LLM layer & ingest time handling | RELIABILITY | `KliveLLM/HFWrapper.cs:243-351,316`: no `response_format`; `tool_choice` never set. → structured outputs. |  |  | planned |
+| F352 | LLM layer & ingest time handling | CORRECTNESS | `KliveLLM.cs:1250-1262`: chars/3 estimation only. → calibrated estimator / real tokenizer where budget-critical. |  |  | planned |
+| F353 | LLM layer & ingest time handling | CORRECTNESS | `KliveLLM.cs:1247`: tool sessions compact at 70K by default. → resolved window passed. |  |  | planned |
+| F354 | LLM layer & ingest time handling | CORRECTNESS | `KliveLLM.cs:780-835,2099-2135`: context length discarded; the AIRouter catalog keeps ids only. → full entries kept (registry). |  |  | planned |
+| F355 | LLM layer & ingest time handling | RELIABILITY | `KliveLLM.cs:300`: 5-minute timeout for max-context calls. → streaming with stall detection. |  |  | planned |
+| F356 | LLM layer & ingest time handling | CORRECTNESS | `KliveLLM.cs:1826-1854`: `openrouter/free` varies model and quality nightly and sends private DMs to free providers. → pinned private-safe model. |  |  | planned |
+| F357 | LLM layer & ingest time handling | HEURISTIC | `KliveLLM.cs:741,749-773`: capabilities guessed from model-id substrings. → catalog-driven. |  |  | planned |
+| F358 | LLM layer & ingest time handling | RELIABILITY | `KliveLLM/PromptPrefixStability.cs:146-172`: the meter only logs, and Omniscience one-shots drag down the fleet rate (suspension risk). → per-class metering + cache-stable sessions + background pause. |  |  | planned |
+| F359 | LLM layer & ingest time handling | TEMPORAL | `Ingest/Imports/WhatsAppExportImporter.cs:119-120`: local times parsed as UTC. → per-import zone (T1). |  |  | planned |
+| F360 | LLM layer & ingest time handling | TEMPORAL | `WhatsAppExportImporter.cs:33-36`: day/month formats only, so US exports misparse. → format detection + preview choice. |  |  | planned |
+| F361 | LLM layer & ingest time handling | CORRECTNESS | `Ingest/Discord/DiscordNormaliser.cs:23-25`: embeds and forward snapshots lost; forwards stored as replies. → captured with attribution. |  |  | planned |
+| F362 | Core, storage & lifecycle | RELIABILITY | `Omniscience.cs:63,80`: `cts` is never cancelled, only snapshots are disposed, the event queue is never flushed. → ordered async shutdown of every component. |  |  | planned |
+| F363 | Core, storage & lifecycle | RELIABILITY | `Omniscience.cs:71`: async-void ServiceMain; one route-registration exception aborts startup half-registered. → staged, supervised boot. |  |  | planned |
+| F364 | Core, storage & lifecycle | RELIABILITY | `Omniscience.cs:153-196`: all 84 routes registered by reflection (`OmniService.cs:185-188`). → typed registration (OmniTrader `RegisterRouteAsync` pattern). |  |  | planned |
+| F365 | Core, storage & lifecycle | RELIABILITY | `Omniscience.cs:95`: one HttpClient (2-min timeout) for REST, attachments, models and OCR. → per-purpose clients. |  |  | planned |
+| F366 | Core, storage & lifecycle | PERF,TEMPORAL | `Omniscience.cs:105,133,137`: radar, hypotheses and fast-track run inline on the ingest path, including backfill and imports. → async event bus tagged live/history. |  |  | planned |
+| F367 | Core, storage & lifecycle | CORRECTNESS | `Omniscience.cs:179,194`: error JSON built by string concatenation (invalid on `\`/newlines). → serialized. |  |  | planned |
+| F368 | Core, storage & lifecycle | PERF | `Omniscience.cs:183-196`: briefing compose + DM synchronous on request. → job. |  |  | planned |
+| F369 | Core, storage & lifecycle | RELIABILITY | `Omniscience.cs:201-208`: count-rebuild failure swallowed; ingest starts anyway. → status + retry. |  |  | planned |
+| F370 | Core, storage & lifecycle | TEMPORAL | `Omniscience.cs:229` + `Service Manager/TimeManager.cs:202-219`: an overdue nightly fires before Omniscience subscribes, so the run is lost. → kernel scheduler with a persisted last-run watermark. |  |  | planned |
+| F371 | Core, storage & lifecycle | PERF | `OmniscienceDb.cs:18`: one global write lock for every writer. → per-DB batched writer queues. |  |  | planned |
+| F372 | Core, storage & lifecycle | PERF | `OmniscienceDb.cs:52-66`: pragmas on every open; busy_timeout 5 s vs a 30 s default; no cache/mmap/checkpoint tuning. → configured once. |  |  | planned |
+| F373 | Core, storage & lifecycle | PERF | `OmniscienceDb.cs:75` + `AnalyticsEngine.cs:71`: minutes-long readers starve WAL checkpoints. → short transactions + WAL monitoring. |  |  | planned |
+| F374 | Core, storage & lifecycle | RELIABILITY | `OmniscienceDb.cs:91-122`: ALTER-based, non-idempotent migrations with no verification. → checked per-module migrations. |  |  | planned |
+| F375 | Core, storage & lifecycle | CONTEXT | `OmniscienceDb.cs:760-776`: messages lack guild_id, type, flags, bot/webhook, thread parent, source, deleted_at, mentions. → first-class columns (D3). |  |  | planned |
+| F376 | Core, storage & lifecycle | PERF | `OmniscienceDb.cs:774-776`: no index on sent_at alone, captured_at or reply_to. → covering indexes. |  |  | planned |
+| F377 | Core, storage & lifecycle | PERF | `OmniscienceDb.cs:712-720`: no index on `persons.merged_into`/`tier` despite constant subqueries. → canonical-id map + indexes. |  |  | planned |
+| F378 | Core, storage & lifecycle | CONTEXT,TEMPORAL | `OmniscienceDb.cs:739-751`: conversations lack thread parent, channel type and category; the title is kept from first sighting. → structure + name history. |  |  | planned |
+| F379 | Core, storage & lifecycle | CONTEXT | `OmniscienceDb.cs:753-758`: participants table holds authors only. → recipients, mentions, membership spans. |  |  | planned |
+| F380 | Core, storage & lifecycle | CONTEXT | `OmniscienceDb.cs:778-789`: attachments lack filename, dimensions, alt text, created_at, a natural key and an OCR index. → D3 columns. |  |  | planned |
+| F381 | Core, storage & lifecycle | TEMPORAL | `OmniscienceDb.cs:805-813`: `latest_message_id` never written; no forward watermark. → bidirectional cursors. |  |  | planned |
+| F382 | Core, storage & lifecycle | TEMPORAL,CONTEXT | `OmniscienceDb.cs:815-822`: stats kept as latest only, with no as-of or history. → versioned results keyed by as-of. |  |  | planned |
+| F383 | Core, storage & lifecycle | CONTEXT | `OmniscienceDb.cs:523-535`: reactions have no unique key, mixed channel-id formats, no guild or emoji id. → keyed and typed. |  |  | planned |
+| F384 | Core, storage & lifecycle | CONTEXT | `OmniscienceDb.cs:503-512`: presence has no guild, client_status or source. → D3. |  |  | planned |
+| F385 | Core, storage & lifecycle | CONTEXT | `OmniscienceDb.cs:549-566`: edits/deletes lack author, conversation, guild, source and dedupe key. → typed event tables. |  |  | planned |
+| F386 | Core, storage & lifecycle | TEMPORAL,CONTEXT | `OmniscienceDb.cs:568-576,697-707`: name history dated by capture time; guild name stored instead of id. → valid_from/to + guild_id. |  |  | planned |
+| F387 | Core, storage & lifecycle | CONTEXT | `OmniscienceDb.cs:578-588`: radar alerts store display strings only. → ids + dimensions. |  |  | planned |
+| F388 | Core, storage & lifecycle | TEMPORAL | `OmniscienceDb.cs:479-483`: embeddings have no model, version or content hash. → added (with F333). |  |  | planned |
+| F389 | Core, storage & lifecycle | TEMPORAL | `OmniscienceBackgroundSnapshots.cs:91-96,75`: snapshot stamped at build start; builds slower than MaxAge are never served. → separate data-as-of stamp. |  |  | planned |
+| F390 | Core, storage & lifecycle | PERF | `OmniscienceBackgroundSnapshots.cs:93,119`: uncancellable full rebuilds on a timer forever. → event-driven counters/read models. |  |  | planned |
+| F391 | Core, storage & lifecycle | CORRECTNESS | `Workspace/WorkspaceRoutes.cs:47,56`: writes gated by persons.read. → correct permissions. |  |  | planned |
+| F392 | Core, storage & lifecycle | CONTEXT | `OmnisciencePerms.cs:8-46`: no data scoping by platform/server. → scoped permission option. |  |  | planned |
+| F393 | Core, storage & lifecycle | PERF | `Omnipotent/Services/KliveAPI/Caching/ResponseCache.cs:128`: no Omniscience route calls `CacheDeps.NoteRead`, so the response cache never stores anything. → read models note/bump their version keys. |  |  | planned |
+| F394 | Ingest pipeline | CORRECTNESS | `IngestPipeline.cs:50`: first-writer-wins dedupe, so thin KliveBot/import copies block rich data forever. → field-level merge ranked by source quality. |  |  | planned |
+| F395 | Ingest pipeline | PERF | `IngestPipeline.cs:43-105`: one transaction + lock per message. → batched per page. |  |  | planned |
+| F396 | Ingest pipeline | TEMPORAL | `IngestPipeline.cs:76-77,91`: `DateTimeOffset(DateTime)` treats Unspecified as server-local. → UTC end to end / snowflake time. |  |  | planned |
+| F397 | Ingest pipeline | CONTEXT | `IngestPipeline.cs:166-197`: a Person for every identity (mentions, bots, webhooks, Deleted User). → identity-first; bots/webhooks flagged. |  |  | planned |
+| F398 | Ingest pipeline | TEMPORAL | `IngestPipeline.cs:144-161,207`: names overwritten; history only when both values are non-empty. → time-scoped names (T5). |  |  | planned |
+| F399 | Ingest pipeline | TEMPORAL | `IngestPipeline.cs:174-179`: person display name never refreshed. → derived from current identity. |  |  | planned |
+| F400 | Ingest pipeline | CONTEXT | `IngestPipeline.cs:120-200`: avatar URL computed but never stored; avatars never downloaded. → stored + downloaded (faces N1). |  |  | planned |
+| F401 | Ingest pipeline | CONTEXT | `IngestPipeline.cs:94`: `language` always NULL. → language-ID model (A2). |  |  | planned |
+| F402 | Ingest pipeline | TEMPORAL,CONTEXT | `IngestPipeline.cs:267-275`: dm never upgraded to group_dm; first-seen title/guild kept forever. → reconciled conversation metadata. |  |  | planned |
+| F403 | Ingest pipeline | RELIABILITY | `IngestPipeline.cs:108-113`: serial attachment downloads after commit, no retry or size cap; a crash between commit and download loses the file forever. → durable download queue + refresh-urls. |  |  | planned |
+| F404 | Ingest pipeline | PERF | `IngestPipeline.cs:325`: large downloads block the backfill loop. → separate Io lane. |  |  | planned |
+| F405 | Ingest pipeline | RELIABILITY | `IngestPipeline.cs:348-351`: an Exists/Move race loses the attachment row. → CAS write-then-rename. |  |  | planned |
+| F406 | Ingest pipeline | CORRECTNESS | `IngestPipeline.cs:357,363`: random attachment ids, no idempotency key. → natural key (message, index, hash). |  |  | planned |
+| F407 | Ingest pipeline | CORRECTNESS | `IngestPipeline.cs:381`: only kind "image" goes to OCR. → all decodable media. |  |  | planned |
+| F408 | Ingest pipeline | TEMPORAL | `IngestPipeline.cs:115`: hooks fire only on first insert. → edits/merges publish events too. |  |  | planned |
+| F409 | Ingest pipeline | CONTEXT | `IngestPipeline.cs:56-73`: mention and recipient edges not stored. → stored (D2 people dims). |  |  | planned |
+| F410 | Gateway, REST, normaliser | TEMPORAL,RELIABILITY | `Ingest/Discord/DiscordGateway.cs:40-45,87-91`: no RESUME; every gap's events are lost. → RESUME with session_id/seq. |  |  | planned |
+| F411 | Gateway, REST, normaliser | RELIABILITY | `DiscordGateway.cs:97`: `Dispose()` on a running heartbeat task throws, so IDENTIFY is likely skipped after the first reconnect. → per-connection cancellation. |  |  | planned |
+| F412 | Gateway, REST, normaliser | RELIABILITY | `DiscordGateway.cs:79-80,36`: ACKs ignored; zombie detection is 2 min of inbound silence. → ACK tracking. |  |  | planned |
+| F413 | Gateway, REST, normaliser | RELIABILITY | `DiscordGateway.cs:72-92`: op 1/7/9 and fatal close codes mishandled, so it reconnects forever while showing "active". → full op handling + fatal stop. |  |  | planned |
+| F414 | Gateway, REST, normaliser | RELIABILITY | `DiscordGateway.cs:98-111`: the heartbeat loop outlives reconnects; no jitter. → scoped loop + jitter. |  |  | planned |
+| F415 | Gateway, REST, normaliser | CONTEXT | `DiscordGateway.cs:121-141`: no guild subscription, so presence/typing coverage is partial (unverified). → measured coverage reported. |  |  | planned |
+| F416 | Gateway, REST, normaliser | RELIABILITY | `Ingest/Discord/DiscordRestClient.cs:51-72`: only body `retry_after`; no buckets, global limit or 5xx retry. → bucketed limiter. |  |  | planned |
+| F417 | Gateway, REST, normaliser | RELIABILITY | `DiscordRestClient.cs:20-24`: a hard-coded 2024 client fingerprint. → recorded as risk. No new evasion work (Guardrails). |  |  | planned |
+| F418 | Gateway, REST, normaliser | TEMPORAL | `DiscordRestClient.cs:90-94`: "after" pagination never used. → forward gap-fill. |  |  | planned |
+| F419 | Gateway, REST, normaliser | TEMPORAL | `Ingest/Discord/DiscordNormaliser.cs:21`: a missing timestamp becomes UtcNow. → snowflake time. |  |  | planned |
+| F420 | Gateway, REST, normaliser | CONTEXT | `DiscordNormaliser.cs:14-68`: type, flags, embeds, stickers, poll, thread and role mentions not extracted. → D3. |  |  | planned |
+| F421 | Gateway, REST, normaliser | CONTEXT | `DiscordNormaliser.cs:37-41,84`: nick keyed by guild name; display uses global_name only. → guild_id + full name set. |  |  | planned |
+| F422 | Gateway, REST, normaliser | CORRECTNESS | `DiscordNormaliser.cs:103-119`: gif/webp classed as images but OCR rejects them; voice notes not distinguished. → media typing (I-Media). |  |  | planned |
+| F423 | Backfill & Discord ingester | TEMPORAL | `Ingest/Discord/DiscordHistoryBackfiller.cs:145-199`: backward-only; finished channels never revisited, so downtime gaps are permanent. → bidirectional backfill. |  |  | planned |
+| F424 | Backfill & Discord ingester | RELIABILITY | `DiscordHistoryBackfiller.cs:38-50`: one failing DM aborts all remaining DMs. → per-channel isolation. |  |  | planned |
+| F425 | Backfill & Discord ingester | CORRECTNESS | `DiscordHistoryBackfiller.cs:157-162`: a 401 marks the channel done. → marks the source unauthorised. |  |  | planned |
+| F426 | Backfill & Discord ingester | CONTEXT | `DiscordHistoryBackfiller.cs:76`: threads, forums, voice-text and archived threads skipped. → covered. |  |  | planned |
+| F427 | Backfill & Discord ingester | CONTEXT | `DiscordHistoryBackfiller.cs:40`: closed DMs never enumerated. → data-package guidance + coverage report. |  |  | planned |
+| F428 | Backfill & Discord ingester | CORRECTNESS | `DiscordHistoryBackfiller.cs:87-98`: `last_full_sync_at` stamped despite failures. → truthful completeness. |  |  | planned |
+| F429 | Backfill & Discord ingester | CONTEXT | `DiscordHistoryBackfiller.cs:114-118`: DM title = first recipient only. → full recipient set. |  |  | planned |
+| F430 | Backfill & Discord ingester | PERF | `DiscordHistoryBackfiller.cs:198,218`: fixed 550 ms pacing; synchronous lock wait. → header-driven pacing + writer queue. |  |  | planned |
+| F431 | Backfill & Discord ingester | RELIABILITY | `Ingest/Discord/DiscordIngester.cs:63-77`: concurrent backfills on one source. → single-flight job. |  |  | planned |
+| F432 | Backfill & Discord ingester | CORRECTNESS | `DiscordIngester.cs:79-122`: the same account can be added twice, duplicating events. → unique by self-id. |  |  | planned |
+| F433 | Backfill & Discord ingester | RELIABILITY | `DiscordIngester.cs:124-140`: removing a source doesn't stop its backfill; cursors orphaned. → cancellation + cleanup. |  |  | planned |
+| F434 | Backfill & Discord ingester | RELIABILITY | `DiscordIngester.cs:179-184`: a network blip marks the source unauthorised permanently. → error classification. |  |  | planned |
+| F435 | Backfill & Discord ingester | CORRECTNESS | `DiscordIngester.cs:191-194`: fire-and-forget dispatch reorders events (UPDATE before CREATE). → ordered per-channel queue. |  |  | planned |
+| F436 | Backfill & Discord ingester | CONTEXT | `DiscordIngester.cs:225-228`: live messages lack guild/title; group DMs labelled "dm". → GUILD/CHANNEL state cache. |  |  | planned |
+| F437 | Backfill & Discord ingester | PERF | `DiscordIngester.cs:231,253`: one DB write per message for `last_event_at`. → batched heartbeat. |  |  | planned |
+| F438 | Backfill & Discord ingester | CORRECTNESS | `DiscordIngester.cs:241-245` + `DiscordEventRecorder.cs:260-279`: an embed-only MESSAGE_UPDATE likely wipes content and fakes an edit. → partial-update merge. |  |  | planned |
+| F439 | Backfill & Discord ingester | CORRECTNESS | `DiscordIngester.cs:248-251`: unseen partial updates are ingested as new messages. → fetch-then-merge. |  |  | planned |
+| F440 | Backfill & Discord ingester | CORRECTNESS | `DiscordIngester.cs:256-263`: `OnIdentityObserved` has no subscribers. → event bus. |  |  | planned |
+| F441 | Backfill & Discord ingester | CONTEXT | `DiscordIngester.cs:264-271`: bulk delete, reaction-clear, GUILD/CHANNEL/THREAD, member add/remove, USER_UPDATE, relationship, call, poll and READY all unhandled. → handled (D3). |  |  | planned |
+| F442 | Event recorder | RELIABILITY | `DiscordEventRecorder.cs:21,326-357`: in-memory queue never flushed on shutdown. → durable writer queue. |  |  | planned |
+| F443 | Event recorder | PERF | `DiscordEventRecorder.cs:83-86`: the presence fingerprint includes volatile fields; dictionaries unbounded. → stable diff + bounded state. |  |  | planned |
+| F444 | Event recorder | TEMPORAL | `DiscordEventRecorder.cs:104-109,293-296`: custom-status/avatar diffs rely on memory, so changes during downtime are lost. → persisted last-known state. |  |  | planned |
+| F445 | Event recorder | TEMPORAL,CONTEXT | `DiscordEventRecorder.cs:117,140`: capture-time stamps, duplicated per source. → event time + dedupe. |  |  | planned |
+| F446 | Event recorder | CONTEXT | `DiscordEventRecorder.cs:137-139`: custom emoji id dropped. → kept. |  |  | planned |
+| F447 | Event recorder | TEMPORAL | `DiscordEventRecorder.cs:157-201`: voice sessions never reconciled (open forever after restart); mute/deaf/stream dropped. → reconciliation + D3. |  |  | planned |
+| F448 | Event recorder | CONTEXT | `DiscordEventRecorder.cs:203-238`: deletes never flag the message; duplicated per source. → `deleted_at` + dedupe. |  |  | planned |
+| F449 | Event recorder | TEMPORAL | `DiscordEventRecorder.cs:275`: edits overwrite content without versioning. → `message_versions` (T5). |  |  | planned |
+| F450 | Event recorder | TEMPORAL | `DiscordEventRecorder.cs:246-247`: a missing edit time becomes capture time. → platform time or flagged. |  |  | planned |
+| F451 | Event recorder | CONTEXT | `DiscordEventRecorder.cs:284-297`: nick, roles and timeouts ignored. → member history. |  |  | planned |
+| F452 | KliveBot | CONTEXT | `Ingest/KliveBot/KliveBotIngester.cs:151-179`: thin rebuilt JSON, so rows are impoverished whenever the bot wins dedupe. → full payload + field merge (F394). |  |  | planned |
+| F453 | KliveBot | TEMPORAL | `KliveBotIngester.cs:153-157`: no global_name, so display names flip-flop and spam identity history. → full name set. |  |  | planned |
+| F454 | KliveBot | CORRECTNESS | `KliveBotIngester.cs:68-78`: edits with empty content probably wipe content (unverified). → partial merge. |  |  | planned |
+| F455 | KliveBot | RELIABILITY | `KliveBotIngester.cs:51-63`: waits only 120 s for the bot; handlers bound to one client instance (unverified). → resilient attach. |  |  | planned |
+| F456 | KliveBot | CONTEXT | `KliveBotIngester.cs:193-194`: Text/News channels only. → all text-capable types. |  |  | planned |
+| F457 | KliveBot | TEMPORAL | `KliveBotIngester.cs:214,250-251`: once done, never revisited. → forward gap-fill. |  |  | planned |
+| F458 | KliveBot | CORRECTNESS | `Services/KliveBot Discord/KliveBotDiscord.cs:40-49`: unprivileged intents give empty content that permanently shadows real content. → empty-content rows never win the merge. |  |  | planned |
+| F459 | KliveBot | CONTEXT | `KliveBotIngester.cs:138-147`: the bot's own pings become a person's corpus. → excluded from person analytics. |  |  | planned |
+| F460 | Imports | CONTEXT | `Ingest/Imports/WhatsAppExportImporter.cs:49-53`: chat id from the file name, so every iOS `_chat.txt` merges into one conversation. → content-derived chat identity + preview. |  |  | planned |
+| F461 | Imports | CONTEXT | `WhatsAppExportImporter.cs:99`: identity = a name slug across all chats. → per-chat identity until linked. |  |  | planned |
+| F462 | Imports | CORRECTNESS | `WhatsAppExportImporter.cs:130-136`: id collisions within a minute drop messages. → ordinal-aware ids. |  |  | planned |
+| F463 | Imports | HEURISTIC | `WhatsAppExportImporter.cs:85`: literal placeholder filters; system/deleted lines ingested as speech. → system-line classification. |  |  | planned |
+| F464 | Imports | CORRECTNESS | `WhatsAppExportImporter.cs:77-78`: dm vs group decided by sender count. → explicit metadata + preview. |  |  | planned |
+| F465 | Imports | RELIABILITY | `WhatsAppExportImporter.cs:104-111` + `ImportWatcher.cs:75`: failed messages dropped, but the file is still marked processed. → per-message results. |  |  | planned |
+| F466 | Imports | CORRECTNESS | `Ingest/Imports/ImportWatcher.cs:69-74`: every zip assumed to be a Discord package. → format detection. |  |  | planned |
+| F467 | Imports | CORRECTNESS | `Ingest/Imports/DiscordDataPackageImporter.cs:50-52`: older package layouts likely import 0 messages. → both layouts (JSON + CSV). |  |  | planned |
+| F468 | Imports | CONTEXT | `DiscordDataPackageImporter.cs:69-70`: the DM partner is never created. → recipients from `channel.json`. |  |  | planned |
+| F469 | Imports | CORRECTNESS | `DiscordDataPackageImporter.cs:104-114`: expired CDN links tagged kind "file". → recorded as unavailable media. |  |  | planned |
+| F470 | Imports | CONTEXT | `DiscordDataPackageImporter.cs:91-103`: no raw/reply/edit data, and these rows block richer copies. → lowest source rank (F394). |  |  | planned |
+| F471 | Imports | TEMPORAL | `IngestPipeline.cs:115` + importers: imports trigger "live" hooks. → source_kind=import (T5). |  |  | planned |
+| F472 | OCR & vault | RELIABILITY | `Ingest/OcrService.cs:30,42,90-109`: in-memory polling queue, lost on restart. → durable jobs. |  |  | planned |
+| F473 | OCR & vault | RELIABILITY | `OcrService.cs:125-128`: errors stored as processed (''), never retried. → classified retry. |  |  | planned |
+| F474 | OCR & vault | PERF | `OcrService.cs:64-88`: unindexed backfill, 300/day. → indexed Io-lane backfill. |  |  | planned |
+| F475 | OCR & vault | RELIABILITY | `OcrService.cs:58,157`: init failure is permanent; enqueues silently dropped. → health + retry. |  |  | planned |
+| F476 | OCR & vault | CONTEXT | `OcrService.cs:142-151`: English only; OCR text unused downstream. → language-aware; `image_text` evidence. |  |  | planned |
+| F477 | OCR & vault | RELIABILITY | `Ingest/TokenVault.cs:20,30,34`: DPAPI LocalMachine scope; decrypt errors swallowed. → surfaced, with a re-add prompt. |  |  | planned |
+| F478 | Analytics engine | PERF | `Analytics/AnalyticsEngine.cs:27-98`: serial modules with repeated full loads (21 full-history loads + 5 whole-conversation scans per person). → shared rollups. |  |  | planned |
+| F479 | Analytics engine | PERF | `AnalyticsEngine.cs:71`: synchronous work wrapped in `Task.FromResult`. → real async CPU-lane jobs. |  |  | planned |
+| F480 | Analytics engine | TEMPORAL | `AnalyticsEngine.cs:92`: no as-of or watermark on results. → stamped (T6). |  |  | planned |
+| F481 | Analytics engine | CORRECTNESS | `AnalyticsEngine.cs:100-109`: non-target persons are never analysed. → rollups for everyone; tier gates only LLM work. |  |  | planned |
+| F482 | Analytics engine | CORRECTNESS | `Analytics/IPersonAnalyticModule.cs:19-20`: a version bump triggers nothing. → module-version re-plan. |  |  | planned |
+| F483 | Analytics engine | CORRECTNESS | `AnalyticsEngine.cs:44-46`: dependencies by list order; possibly a stale timezone row. → DAG. |  |  | planned |
+| F484 | Analytics engine | TEMPORAL | `Analytics/AnalyticHelpers.cs:81-85`: loads deleted, bot and system messages; no sort tiebreak. → filtered views + (sent_at, seq). |  |  | planned |
+| F485 | Analytics engine | CONTEXT | `Analytics/TemporalWeighting.cs:61`: facets keyed by guild *name*; no per-partner facet. → guild_id + partner dims. |  |  | planned |
+| F486 | Analytics engine | CONTEXT | `TemporalWeighting.cs:89-92,105-114`: top-8 facets only; compaction drops arrays. → Explore over all dims. |  |  | planned |
+| F487 | Analytics engine | TEMPORAL | `TemporalWeighting.cs:18-25`: static config read once. → per-run parameters. |  |  | planned |
+| F488 | Analytics engine | PERF | `Analytics/ActivitySummaryStore.cs:49-90`: full rebuild inside the lock; Ready flag never re-checked. → incremental rollups. |  |  | planned |
+| F489 | Analytics engine | CONTEXT | `ActivitySummaryStore.cs:106-145`: counts include deletes; no per-day/hour/server summaries. → rollups by D2 dims. |  |  | planned |
+| F490 | Analytics modules not already covered | TEMPORAL | `ActivityPatternModule.cs:33-38`: UTC hour/weekday; per-day average over the whole span. → zone lens, active-day averages. |  |  | planned |
+| F491 | Analytics modules not already covered | TEMPORAL,HEURISTIC | `ChronotypeModule.cs:26-41,70-73`: one fixed offset, no DST, 0 if missing; magic thresholds. → T4 + model. |  |  | planned |
+| F492 | Analytics modules not already covered | TEMPORAL,PERF | `ConversationKillerModule.cs:20,54,76-81`: a channel's last message counts as a "kill" even if minutes old; full channel scans; fixed 2 h. → event-time-aware with a horizon. |  |  | planned |
+| F493 | Analytics modules not already covered | TEMPORAL | `EditingBehaviourModule.cs:41-63`: counts fake embed edits and per-source duplicate deletes; lifetime only. → deduped versioned events. |  |  | planned |
+| F494 | Analytics modules not already covered | HEURISTIC | `EmojiUsageModule.cs:47`: code-point ranges miss ⭐/⌚/flags and split ZWJ/skin tones; ignores reactions. → grapheme clusters + reactions. |  |  | planned |
+| F495 | Analytics modules not already covered | HEURISTIC,TEMPORAL | `FriendshipStrengthModule.cs:28-48`: shared server = friend; per identity not person; UtcNow windows. → interaction-based dynamics (N12). |  |  | planned |
+| F496 | Analytics modules not already covered | TEMPORAL | `GamingProfileModule.cs:35-37,54,62`: NULL-activity rows excluded, so "stopped playing" is never seen; 30-min cap; UTC hours. → session reconstruction. |  |  | planned |
+| F497 | Analytics modules not already covered | HEURISTIC,TEMPORAL,PERF | `MentionAffinityModule.cs:38-63`: every name × every message substring check; duplicate names resolve arbitrarily; current names only. → structured mentions + NER/coref (time-scoped). |  |  | planned |
+| F498 | Analytics modules not already covered | PERF,HEURISTIC | `MessageBurstModule.cs:20,41-78`: full channel scans; fixed 60 s gap. → per-person learned gaps from rollups. |  |  | planned |
+| F499 | Analytics modules not already covered | TEMPORAL | `MusicTasteModule.cs:51,60,66`: 10-min caps; UTC hours. → session reconstruction + lens. |  |  | planned |
+| F500 | Analytics modules not already covered | CONTEXT,TEMPORAL | `ReactionAffinityModule.cs:34-38,62,107`: removals not subtracted; snapshot + live rows double-count; 'discord' hard-coded. → deduped reaction state. |  |  | planned |
+| F501 | Analytics modules not already covered | HEURISTIC,TEMPORAL | `ResponseBehaviourModule.cs:67-68,93-95`: any next message counts as a reply in groups; gaps uncapped; UtcNow windows. → dialogue-act/addressee models + sleep-aware latency. |  |  | planned |
+| F502 | Analytics modules not already covered | HEURISTIC,TEMPORAL | `ResponseObligationModule.cs:35,59`: DMs only, including mislabelled group DMs; fixed 1 h. → Reply Inbox model (N9). |  |  | planned |
+| F503 | Analytics modules not already covered | TEMPORAL | `SleepScheduleModule.cs:26-37,79-84,114`: fixed TZ; service downtime reads as sleep; all-nighter rule. → coverage-aware inference (excluded for minors). |  |  | planned |
+| F504 | Analytics modules not already covered | PERF | `SocialGraphModule.cs:29,38-43`: co-presence counts duplicate FriendshipStrength. → merged into N12. |  |  | planned |
+| F505 | Analytics modules not already covered | TEMPORAL,HEURISTIC | `TopicEvolutionModule.cs:28,40`: UTC years + lexicon. → dynamic topics over local time. |  |  | planned |
+| F506 | Analytics modules not already covered | CORRECTNESS | `VocabularyModule.cs:78`: length-dependent type-token ratio; Latin-only tokeniser. → length-normalised (MATTR) + Unicode. |  |  | planned |
+| F507 | Scheduler, maintenance, briefing | TEMPORAL | `Service Manager/TimeManager.cs:34-45,257-263`: local wall-clock delays, so DST shifts runs ±1 h. → zone-aware kernel scheduler. |  |  | planned |
+| F508 | Scheduler, maintenance, briefing | RELIABILITY | `Scheduling/OmniscienceScheduler.cs:44,51`: async void; can't be cancelled. → leased jobs. |  |  | planned |
+| F509 | Scheduler, maintenance, briefing | PERF | `OmniscienceScheduler.cs:63,200`: a shared run lock lets the nightly and UI recomputes starve each other. → per-subject single-flight. |  |  | planned |
+| F510 | Scheduler, maintenance, briefing | PERF | `OmniscienceScheduler.cs:77-181`: serial, unbudgeted pipeline that exceeds 24 h. → incremental DAG. |  |  | planned |
+| F511 | Scheduler, maintenance, briefing | CORRECTNESS | `OmniscienceScheduler.cs:286`: merged-away persons still processed. → canonical ids. |  |  | planned |
+| F512 | Scheduler, maintenance, briefing | RELIABILITY | `OmniscienceScheduler.cs:25-27,193`: run state is memory-only. → persisted. |  |  | planned |
+| F513 | Scheduler, maintenance, briefing | RELIABILITY | `OmniscienceScheduler.cs:292,303,390-403`: swallowed errors; one write bypasses the lock. → writer queue + surfaced errors. |  |  | planned |
+| F514 | Scheduler, maintenance, briefing | PERF | `OmniscienceScheduler.cs:330-335`: a correlated COUNT per target, warmed every 30 s. → rollups. |  |  | planned |
+| F515 | Scheduler, maintenance, briefing | TEMPORAL | `Scheduling/MaintenanceJobs.cs:37-47`: cadence relative to process start (and 5 min after every restart). → zone-anchored schedule. |  |  | planned |
+| F516 | Scheduler, maintenance, briefing | TEMPORAL | `MaintenanceJobs.cs:68`: reaction backfill is one-shot. → incremental. |  |  | planned |
+| F517 | Scheduler, maintenance, briefing | PERF | `MaintenanceJobs.cs:78-81`: lexical id cursor + LIKE scan. → numeric seq cursor. |  |  | planned |
+| F518 | Scheduler, maintenance, briefing | TEMPORAL | `MaintenanceJobs.cs:133`: snapshot reactions dated at message time. → flagged as snapshot-dated. |  |  | planned |
+| F519 | Scheduler, maintenance, briefing | TEMPORAL | `MaintenanceJobs.cs:150-168`: retention silently shrinks lifetime metrics. → rollups computed before pruning; retention disclosed. |  |  | planned |
+| F520 | Scheduler, maintenance, briefing | TEMPORAL | `Scheduling/DailyBriefing.cs:53`: last 24 h by UtcNow rather than "since the last briefing". → watermark (T6). |  |  | planned |
+| F521 | Scheduler, maintenance, briefing | TEMPORAL | `DailyBriefing.cs:85-89`: hypotheses not filtered by time; they repeat daily. → change-only. |  |  | planned |
+| F522 | Scheduler, maintenance, briefing | HEURISTIC,TEMPORAL | `DailyBriefing.cs:114-139`: mood alerts on a stale lexicon z-score. → N14 ensemble baselines. |  |  | planned |
+| F523 | Scheduler, maintenance, briefing | TEMPORAL | `DailyBriefing.cs:147-175`: friendship trends re-reported daily. → change detection. |  |  | planned |
+| F524 | Scheduler, maintenance, briefing | PERF | `DailyBriefing.cs:189-190`: unindexed scans every 2 min. → read model. |  |  | planned |
+| F525 | Scheduler, maintenance, briefing | RELIABILITY | `DailyBriefing.cs:59-195`: `catch {}` around every section. → section-level errors shown. |  |  | planned |
+| F526 | Scheduler, maintenance, briefing | CONTEXT | `DailyBriefing.cs:62-71`: facts shown without evidence time or source. → cited + dated. |  |  | planned |
+| F527 | Radar (beyond F047–F050) | RELIABILITY | `Radar/KlivesRadar.cs:157,170-178`: learned aliases memory-only. → persisted with review. |  |  | planned |
+| F528 | Radar (beyond F047–F050) | RELIABILITY | `KlivesRadar.cs:30,267-291`: pending alerts memory-only, lost on restart. → durable alerts. |  |  | planned |
+| F529 | Radar (beyond F047–F050) | CORRECTNESS | `KlivesRadar.cs:200`: edits not inspected. → edit events (T5). |  |  | planned |
+| F530 | Radar (beyond F047–F050) | TEMPORAL | `KlivesRadar.cs:346`: DateTime Kind conversion error. → UTC epoch. |  |  | planned |
+| F531 | Radar (beyond F047–F050) | CONTEXT | `KlivesRadar.cs:206-208`: self-suppression by Discord id only. → all Klives identities. |  |  | planned |
+| F532 | Search | PERF | `Search/MessageEmbeddingIndex.cs:71-78`: an anti-join rescans every batch; no ORDER BY. → `ingest_seq` cursor. |  |  | planned |
+| F533 | Search | TEMPORAL | `MessageEmbeddingIndex.cs:140-172`: stale after edits/deletes. → re-embed by message version. |  |  | planned |
+| F534 | Search | PERF | `MessageEmbeddingIndex.cs:185-229`: brute-force synchronous scan per query. → partitioned SIMD/ANN off the request thread. |  |  | planned |
+| F535 | Search | CONTEXT | `MessageEmbeddingIndex.cs:185` + `Search/SearchRoutes.cs:30-49`: no time/server/channel filters. → D2 filters. |  |  | planned |
+| F536 | Search | CONTEXT | `MessageEmbeddingIndex.cs:66-100`: OCR and embeds not indexed. → indexed as typed text. |  |  | planned |
+| F537 | Search | TEMPORAL | `SearchRoutes.cs:121-151`: inline LLM call with no cache or cancellation; evidence shows only a UTC date. → Ask tactic (X15). |  |  | planned |
+| F538 | Routes | PERF | `OmniscienceRoutes.cs:84`: unbounded static cache. → read models. |  |  | planned |
+| F539 | Routes | TEMPORAL | `OmniscienceRoutes.cs:145-169`: no max staleness. → staleness targets. |  |  | planned |
+| F540 | Routes | PERF | `OmniscienceRoutes.cs:279-320`: warmers never cancelled; duplicated on restart. → kernel projections. |  |  | planned |
+| F541 | Routes | PERF | `OmniscienceRoutes.cs:433`: unbounded gate wait on a synchronous dossier. → dossier read model. |  |  | planned |
+| F542 | Routes | PERF | `OmniscienceRoutes.cs:919-937`: the whole analytics bundle per request. → shaped read models. |  |  | planned |
+| F543 | Routes | PERF | `OmniscienceRoutes.cs:992-996`: COUNT despite the counts table. → rollups. |  |  | planned |
+| F544 | Routes | PERF | `OmniscienceRoutes.cs:779,790-794`: LIKE over stats JSON. → FTS/structured filters. |  |  | planned |
+| F545 | Routes | PERF | `OmniscienceRoutes.cs:799-810`: per-row correlated subqueries before the sort. → directory read model. |  |  | planned |
+| F546 | Routes | CORRECTNESS | `OmniscienceRoutes.cs:851`: /conversations has no offset. → keyset. |  |  | planned |
+| F547 | Routes | CORRECTNESS | `OmniscienceRoutes.cs:539-592`: merge incomplete; no audit or unmerge. → full re-attribution + undo log (X68). |  |  | planned |
+| F548 | Routes | CORRECTNESS | `OmniscienceRoutes.cs:1005`: full exception details returned to clients. → classified error codes. |  |  | planned |
+| F549 | Routes | CORRECTNESS | `OmniscienceRoutes.cs:587`: the invalidation call is a no-op. → versioned read models. |  |  | planned |
+| F550 | Routes | CORRECTNESS | `Deduction/DeductionRoutes.cs:705-763`: link-merge skips the count rebuild and keeps an arbitrary id. → canonical survivor rules. |  |  | planned |
+| F551 | Routes | PERF | `DeductionRoutes.cs:61-79`: alias conclusions computed per request. → projection. |  |  | planned |
+| F552 | Routes | PERF | `Workspace/WorkspaceRoutes.cs:129-134`: synchronous, ungated routes. → async read pool. |  |  | planned |
+| F553 | Routes | PERF | `Workspace/WorkspaceExplorer.cs:173-175,186-187`: date-only scopes do full scans. → Explore engine. |  |  | planned |
+| F554 | Routes | TEMPORAL | `WorkspaceExplorer.cs:237-241`: facts on the timeline at extraction time. → valid/asserted time (T2). |  |  | planned |
+| F555 | Routes | TEMPORAL | `WorkspaceExplorer.cs:283,294`: UTC strftime buckets. → zone lens. |  |  | planned |
+| F556 | Routes | PERF | `WorkspaceExplorer.cs:459-462`: heavy health counts per request. → health read model. |  |  | planned |
+| F557 | Routes | CORRECTNESS | `WorkspaceExplorer.cs:501`: CSV silently capped at 200 rows. → streamed full export. |  |  | planned |
+| F558 | Routes | PERF | `ReplicaRoutes.cs:160,199,241`: LLM generation and era rebuilds on request. → jobs/streams. |  |  | planned |
+| F559 | Routes | TEMPORAL | All route files: mixed epoch-ms and ISO times. → one epoch-ms contract (T1). |  |  | planned |
+| F560 | Routes | RELIABILITY | `KliveAPI.cs:1595-1603`: `SameHandler` ignores re-registration, so old closures may answer after an in-process restart (unverified). → test service restart. |  |  | planned |
