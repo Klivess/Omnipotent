@@ -31,10 +31,10 @@ jobs:
           $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
           "machine=0x{0:X4}" -f $machine
           if ($machine -ne 0xAA64) { throw "Installed agent is not native ARM64." }
-          $logs = @(
+          $logs = @(@(
             "$env:LOCALAPPDATA\KliveLink\agent.log",
             "$env:LOCALAPPDATA\Microsoft\Windows\Caches\k.log"
-          ) | Where-Object { Test-Path $_ }
+          ) | Where-Object { Test-Path $_ })
           if (-not $logs) { throw "Agent log not found." }
           Get-Content $logs[0] -Tail 30
           $text = Get-Content $logs[0] -Raw
