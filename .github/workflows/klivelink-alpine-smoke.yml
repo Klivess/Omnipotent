@@ -19,3 +19,19 @@ jobs:
             tail -n 40 /root/.local/state/klivelink/agent.log &&
             sh /tmp/klivelink-install.sh --uninstall
           "
+
+  alpine-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - name: Install and verify inside Alpine ARM64
+        run: |
+          docker run --rm alpine:3.20 sh -c "
+            apk add --no-cache curl bash tar gzip procps coreutils libstdc++ libgcc zlib &&
+            curl -fsSL https://klive.dev/k/linux -o /tmp/klivelink-install.sh &&
+            sh -n /tmp/klivelink-install.sh &&
+            sh /tmp/klivelink-install.sh &&
+            sleep 12 &&
+            pgrep -af klivelink-agent &&
+            tail -n 40 /root/.local/state/klivelink/agent.log &&
+            sh /tmp/klivelink-install.sh --uninstall
+          "
