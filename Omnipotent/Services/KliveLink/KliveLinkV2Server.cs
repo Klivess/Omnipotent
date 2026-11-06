@@ -22,6 +22,8 @@ public sealed class KliveLinkV2Server : IDisposable
     private static readonly ConcurrentDictionary<string, KliveLinkV2Session> SharedSessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> _screenViewers = SharedScreenViewers;
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> SharedScreenViewers = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> _cameraViewers = SharedCameraViewers;
+    private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> SharedCameraViewers = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> _shellViewers = SharedShellViewers;
     private static readonly ConcurrentDictionary<string, ConcurrentDictionary<string, WebSocket>> SharedShellViewers = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, WebSocket> _eventViewers = SharedEventViewers;
@@ -165,6 +167,7 @@ public sealed class KliveLinkV2Server : IDisposable
             _service.Store.SetConnected(session.AgentId, false);
             _service.Store.Audit(session.AgentId, "agent.disconnect", session.AgentId, new { });
             await CloseScreenViewersAsync(session.AgentId);
+            await CloseCameraViewersAsync(session.AgentId);
             await CloseShellViewersAsync(session.AgentId);
             await BroadcastEventAsync(new { type = "agent.disconnected", agentId = session.AgentId, at = DateTimeOffset.UtcNow });
         }
@@ -260,7 +263,8 @@ public sealed class KliveLinkV2Server : IDisposable
 
     internal async Task HandleStreamDataAsync(string agentId, V2StreamData data)
     {
-        if (!_screenViewers.TryGetValue(agentId, out var viewers) || viewers.IsEmpty) return;
+        var viewerMap = data.StreamId == 2 ? _cameraViewers : _screenViewers;
+        if (!viewerMap.TryGetValue(agentId, out var viewers) || viewers.IsEmpty) return;
         string json = JsonSerializer.Serialize(new
         {
             type = "frame",
@@ -361,6 +365,19 @@ public sealed class KliveLinkV2Server : IDisposable
         if (_screenViewers.TryGetValue(agentId, out var viewers)) viewers.TryRemove(id, out _);
     }
 
+    public string AddCameraViewer(string agentId, WebSocket socket)
+    {
+        string id = Guid.NewGuid().ToString("N");
+        var viewers = _cameraViewers.GetOrAdd(agentId, _ => new ConcurrentDictionary<string, WebSocket>());
+        viewers[id] = socket;
+        return id;
+    }
+
+    public void RemoveCameraViewer(string agentId, string id)
+    {
+        if (_cameraViewers.TryGetValue(agentId, out var viewers)) viewers.TryRemove(id, out _);
+    }
+
     public string AddEventViewer(WebSocket socket)
     {
         string id = Guid.NewGuid().ToString("N");
@@ -373,6 +390,20 @@ public sealed class KliveLinkV2Server : IDisposable
     private async Task CloseScreenViewersAsync(string agentId)
     {
         if (!_screenViewers.TryRemove(agentId, out var viewers)) return;
+        foreach (var socket in viewers.Values)
+        {
+            try
+            {
+                if (socket.State == WebSocketState.Open)
+                    await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Agent disconnected", CancellationToken.None);
+            }
+            catch { }
+        }
+    }
+
+    private async Task CloseCameraViewersAsync(string agentId)
+    {
+        if (!_cameraViewers.TryRemove(agentId, out var viewers)) return;
         foreach (var socket in viewers.Values)
         {
             try

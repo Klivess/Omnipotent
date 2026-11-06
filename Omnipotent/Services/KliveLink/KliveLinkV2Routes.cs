@@ -621,6 +621,44 @@ public sealed class KliveLinkV2Routes
             }, KliveLinkPerms.AgentsControl);
 
         await api.CreateWebSocketRoute(
+            "/klivelink/v2/agents/camera/stream",
+            async (context, socket, query, user) =>
+            {
+                string? agentId = query.Get("agentId");
+                if (string.IsNullOrWhiteSpace(agentId) || socket.State != WebSocketState.Open)
+                {
+                    if (socket.State == WebSocketState.Open)
+                        await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "agentId required", CancellationToken.None);
+                    return;
+                }
+                if (_parent.Store.GetAgent(agentId) is not { IsConnected: true })
+                {
+                    await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Agent not connected", CancellationToken.None);
+                    return;
+                }
+                string viewerId = _parent.Server.AddCameraViewer(agentId, socket);
+                try
+                {
+                    await socket.SendAsync(Encoding.UTF8.GetBytes("{\"type\":\"ready\"}"), WebSocketMessageType.Text, true, CancellationToken.None);
+                    var buffer = new byte[1024];
+                    while (socket.State == WebSocketState.Open)
+                    {
+                        var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+                        if (result.MessageType == WebSocketMessageType.Close) break;
+                    }
+                }
+                catch { }
+                finally
+                {
+                    _parent.Server.RemoveCameraViewer(agentId, viewerId);
+                    if (socket.State == WebSocketState.Open)
+                    {
+                        try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "stream ended", CancellationToken.None); } catch { }
+                    }
+                }
+            }, KliveLinkPerms.AgentsControl);
+
+        await api.CreateWebSocketRoute(
             "/klivelink/v2/agents/shell/stream",
             async (context, socket, query, user) =>
             {
