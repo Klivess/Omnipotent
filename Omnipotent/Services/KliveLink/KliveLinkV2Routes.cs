@@ -793,6 +793,11 @@ public sealed class KliveLinkV2Routes
         await req.ReturnResponse(text, contentType, headers);
     }
 
+    private static readonly object SetupCacheGate = new();
+    private static string SetupCachePath = "";
+    private static DateTime SetupCacheModified;
+    private static byte[]? SetupCacheGzip;
+
     private static async Task ServeWindowsSetup(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req)
     {
         string? path = KliveLinkAssetLocator.Find("WindowsCacheHostSetup.exe");
@@ -801,12 +806,43 @@ public sealed class KliveLinkV2Routes
             await req.ReturnResponse("Installer not found", code: HttpStatusCode.NotFound);
             return;
         }
-        byte[] bytes = await File.ReadAllBytesAsync(path);
+        string? accept = req.req?.Headers["Accept-Encoding"];
+        if (string.IsNullOrWhiteSpace(accept) || !accept.Contains("gzip", StringComparison.OrdinalIgnoreCase))
+        {
+            byte[] raw = await File.ReadAllBytesAsync(path);
+            var rawHeaders = new System.Collections.Specialized.NameValueCollection
+            {
+                { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" }
+            };
+            await req.ReturnBinaryResponse(raw, "application/octet-stream", headers: rawHeaders);
+            return;
+        }
+
+        byte[] gzipBytes;
+        DateTime modified = File.GetLastWriteTimeUtc(path);
+        lock (SetupCacheGate)
+        {
+            if (SetupCacheGzip == null ||
+                !string.Equals(SetupCachePath, path, StringComparison.OrdinalIgnoreCase) ||
+                SetupCacheModified != modified)
+            {
+                byte[] bytes = File.ReadAllBytes(path);
+                using var memory = new MemoryStream();
+                using (var gzip = new GZipStream(memory, CompressionLevel.Optimal, leaveOpen: true))
+                    gzip.Write(bytes, 0, bytes.Length);
+                SetupCacheGzip = memory.ToArray();
+                SetupCachePath = path;
+                SetupCacheModified = modified;
+            }
+            gzipBytes = SetupCacheGzip;
+        }
+
         var headers = new System.Collections.Specialized.NameValueCollection
         {
-            { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" }
+            { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" },
+            { "Content-Encoding", "gzip" }
         };
-        await req.ReturnBinaryResponse(MaybeGzip(req, bytes, headers), "application/octet-stream", headers: headers);
+        await req.ReturnBinaryResponse(gzipBytes, "application/octet-stream", headers: headers);
     }
 
     private async Task ServePortableAgent(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string rid)
