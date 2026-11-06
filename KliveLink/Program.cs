@@ -1,6 +1,7 @@
 using System.Drawing;
 using KliveLink.Agent;
 using KliveLink.Agent.V2;
+using KliveLink.Contracts;
 using System.IO;
 using System.Reflection;
 using System.Diagnostics;
@@ -128,7 +129,11 @@ namespace KliveLink
             {
                 var dispatcher = new V2CommandDispatcher(agentId);
                 var v2Screen = new ScreenCaptureService();
-                _v2Client = new KliveLinkV2Client(serverUri, agentId, authToken, dispatcher, v2Screen, v2Config?.PinSha256);
+                V2CollectionTier autoTier = V2CollectionTier.T1;
+                if (!string.IsNullOrWhiteSpace(v2Config?.AutoTier) &&
+                    Enum.TryParse(v2Config.AutoTier, true, out V2CollectionTier configuredTier))
+                    autoTier = configuredTier;
+                _v2Client = new KliveLinkV2Client(serverUri, agentId, authToken, dispatcher, v2Screen, v2Config?.PinSha256, autoTier);
                 _v2Client.OnLog += (msg) => Console.WriteLine(msg);
                 _ = Task.Run(() => _v2Client.ConnectAsync(cts.Token));
             }

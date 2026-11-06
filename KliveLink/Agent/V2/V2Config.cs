@@ -8,6 +8,7 @@ public sealed class V2Config
     public string? Token { get; set; }
     public string? AgentId { get; set; }
     public string? PinSha256 { get; set; }
+    public string? AutoTier { get; set; }
 
     public static V2Config? TryLoad()
     {

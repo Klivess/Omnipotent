@@ -37,6 +37,7 @@ public static class KliveLinkAssetProvisioner
                     server,
                     token,
                     agentId = "",
+                    autoTier = "T1",
                 }, new JsonSerializerOptions { WriteIndented = true });
                 File.WriteAllText(configPath, config);
 

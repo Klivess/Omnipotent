@@ -27,6 +27,7 @@ $config = [ordered]@{
     token    = $Token
     agentId  = $AgentId
     pinSha256 = $PinSha256
+    autoTier = "T1"
 }
 $config | ConvertTo-Json | Set-Content (Join-Path $outPath "klive.config.json") -Encoding UTF8
 

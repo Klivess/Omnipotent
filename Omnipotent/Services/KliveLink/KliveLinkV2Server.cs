@@ -453,6 +453,12 @@ public sealed class KliveLinkV2Session
             foreach (var pending in Pending.Values)
                 pending.TrySetResult(new V2Result { Status = V2CommandStatus.Failed, Error = "Agent disconnected." });
             Pending.Clear();
+            foreach (var upload in _uploads.Values)
+            {
+                try { upload.File.Dispose(); } catch { }
+                try { File.Delete(upload.Path); } catch { }
+            }
+            _uploads.Clear();
             await _server.UnregisterSessionAsync(this);
             _socket.Dispose();
         }
