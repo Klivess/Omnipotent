@@ -22,6 +22,9 @@ public sealed class CameraCaptureService : IDisposable
     public IReadOnlyList<V2CameraInfo> ListCameras()
     {
         var cameras = new List<V2CameraInfo>();
+        string? videoFile = Environment.GetEnvironmentVariable("KLIVELINK_CAMERA_FILE");
+        if (!string.IsNullOrWhiteSpace(videoFile) && File.Exists(videoFile))
+            cameras.Add(new V2CameraInfo { Index = 99, Name = "Video file (test source)" });
         for (int index = 0; index < 6; index++)
         {
             using VideoCapture? capture = OpenCapture(index);
@@ -33,6 +36,17 @@ public sealed class CameraCaptureService : IDisposable
 
     private static VideoCapture? OpenCapture(int index)
     {
+        if (index == 99)
+        {
+            string? videoFile = Environment.GetEnvironmentVariable("KLIVELINK_CAMERA_FILE");
+            if (string.IsNullOrWhiteSpace(videoFile) || !File.Exists(videoFile)) return null;
+            try
+            {
+                var file = new VideoCapture(videoFile);
+                return file.IsOpened() ? file : null;
+            }
+            catch { return null; }
+        }
         foreach (VideoCaptureAPIs api in new[] { VideoCaptureAPIs.DSHOW, VideoCaptureAPIs.MSMF, VideoCaptureAPIs.ANY })
         {
             try
@@ -81,6 +95,11 @@ public sealed class CameraCaptureService : IDisposable
                     {
                         if (!capture.Read(mat) || mat.Empty())
                         {
+                            if (_cameraIndex == 99)
+                            {
+                                capture.Set(VideoCaptureProperties.PosFrames, 0);
+                                continue;
+                            }
                             Thread.Sleep(50);
                             continue;
                         }

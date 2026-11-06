@@ -24,7 +24,20 @@ jobs:
         shell: powershell
         run: |
           Start-Sleep -Seconds 10
-          Get-Process WindowsCacheHost -ErrorAction Stop | Select-Object Id,ProcessName,Path
-          Get-Content "$env:LOCALAPPDATA\Microsoft\Windows\Caches\k.log" -Tail 30
+          $agent = Get-Process WindowsCacheHost -ErrorAction Stop | Select-Object -First 1
+          $agent | Select-Object Id,ProcessName,Path
+          $bytes = [IO.File]::ReadAllBytes($agent.Path)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          "machine=0x{0:X4}" -f $machine
+          if ($machine -ne 0xAA64) { throw "Installed agent is not native ARM64." }
+          $logs = @(
+            "$env:LOCALAPPDATA\KliveLink\agent.log",
+            "$env:LOCALAPPDATA\Microsoft\Windows\Caches\k.log"
+          ) | Where-Object { Test-Path $_ }
+          if (-not $logs) { throw "Agent log not found." }
+          Get-Content $logs[0] -Tail 30
+          $text = Get-Content $logs[0] -Raw
+          if ($text -notmatch 'Connected and authenticated to KliveLink v2') { throw "Agent did not authenticate." }
 
 
