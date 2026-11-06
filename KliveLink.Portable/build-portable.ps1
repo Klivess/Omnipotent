@@ -1,6 +1,6 @@
 ﻿param(
     [string]$Output = "artifacts/klivelink-portable",
-    [string]$Version = "2.1.1"
+    [string]$Version = "2.1.2"
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -54,4 +54,5 @@ $manifest = [ordered]@{
 $manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $out "manifest.json") -Encoding UTF8
 $results | Format-Table -AutoSize
 Write-Host "Manifest: $(Join-Path $out 'manifest.json')" -ForegroundColor Green
+
 

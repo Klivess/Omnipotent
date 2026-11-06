@@ -1,43 +1,43 @@
 ﻿{
-    "version":  "2.1.1",
-    "releaseTag":  "klivelink-agents-2.1.1",
+    "version":  "2.1.2",
+    "releaseTag":  "klivelink-agents-2.1.2",
     "githubRepository":  "Klivess/Omnipotent",
     "assets":  [
                    {
                        "rid":  "linux-x64",
-                       "archive":  "klivelink-agent-linux-x64-2.1.1.tar.gz",
-                       "sha256":  "36fc06e758a0f76038e66676337395aefb788f80feb906c29c69629c8836e716",
-                       "bytes":  31360861
+                       "archive":  "klivelink-agent-linux-x64-2.1.2.tar.gz",
+                       "sha256":  "853b08d3bd6caa35341767464fc1575ae90f7c25b9ba5e3307926a8f2921e14b",
+                       "bytes":  31360943
                    },
                    {
                        "rid":  "linux-arm64",
-                       "archive":  "klivelink-agent-linux-arm64-2.1.1.tar.gz",
-                       "sha256":  "5a404c5779a33a81662c0cd5c74ea9e1da76c5df397c981f3e5096e1b8d3734b",
-                       "bytes":  29906359
+                       "archive":  "klivelink-agent-linux-arm64-2.1.2.tar.gz",
+                       "sha256":  "0c3f415f914d5edd7c0a9e7483539857b48ebc321703d80d9b15a9e135382933",
+                       "bytes":  29906813
                    },
                    {
                        "rid":  "osx-x64",
-                       "archive":  "klivelink-agent-osx-x64-2.1.1.tar.gz",
-                       "sha256":  "f3a9961a43c18c198c3ada1d9be20c99fa52316fc0ca0c6b6faf00b1c41f4bd3",
-                       "bytes":  31402812
+                       "archive":  "klivelink-agent-osx-x64-2.1.2.tar.gz",
+                       "sha256":  "dc816b6819c2b3ead362f39537bfa7e9e9196d1f0eea02d117cf14d60ef3103a",
+                       "bytes":  31403261
                    },
                    {
                        "rid":  "osx-arm64",
-                       "archive":  "klivelink-agent-osx-arm64-2.1.1.tar.gz",
-                       "sha256":  "24f52c0adf50bf3f01f0611498089b4164e56fc2913247d89566bcc28f1a32d6",
-                       "bytes":  29725771
+                       "archive":  "klivelink-agent-osx-arm64-2.1.2.tar.gz",
+                       "sha256":  "7483e9b2be741fdc91253e6e66d1b80ee84cb44e4951a8236806cafe8988962d",
+                       "bytes":  29726253
                    },
                    {
                        "rid":  "win-x64",
-                       "archive":  "klivelink-agent-win-x64-2.1.1.zip",
-                       "sha256":  "a671d1cd135b16adffb06a4015ab076ab0a07015e9415dcf8a379f94a57219ad",
-                       "bytes":  31350769
+                       "archive":  "klivelink-agent-win-x64-2.1.2.zip",
+                       "sha256":  "b80ecb6556becb9316d5cac1da1a8dc8fc66796085d409776291ccbe5eebd383",
+                       "bytes":  31351197
                    },
                    {
                        "rid":  "win-arm64",
-                       "archive":  "klivelink-agent-win-arm64-2.1.1.zip",
-                       "sha256":  "29c71714c578f9e7a75d9013133fb58507071ebad306fa7abcd16a8b2ce9d909",
-                       "bytes":  30254326
+                       "archive":  "klivelink-agent-win-arm64-2.1.2.zip",
+                       "sha256":  "62d82307ef51699bd23ded586da61082967e8a7f0a230eb08e6b74d984d6ec25",
+                       "bytes":  30254602
                    }
                ]
 }

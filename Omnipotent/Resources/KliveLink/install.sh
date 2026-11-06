@@ -4,8 +4,8 @@ set -eu
 umask 077
 
 BASE_URL="__BASE_URL__"
-VERSION="2.1.1"
-RELEASE_TAG="klivelink-agents-2.1.1"
+VERSION="2.1.2"
+RELEASE_TAG="klivelink-agents-2.1.2"
 GITHUB_URL="https://github.com/Klivess/Omnipotent/releases/download/${RELEASE_TAG}"
 SYSTEM=0
 UNINSTALL=0
@@ -326,5 +326,6 @@ fi
 log "Agent is not running. Last log lines:"
 tail -n 40 "$LOG" 2>/dev/null || true
 fail "Installation completed but the agent did not start."
+
 
 

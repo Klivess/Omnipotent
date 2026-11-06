@@ -32,9 +32,11 @@ public sealed class KliveLinkV2Client : IDisposable
             "Microsoft", "Windows", "Caches")
         : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             OperatingSystem.IsMacOS() ? "KliveLink" : "klivelink");
-    private static readonly string PendingZipPath = Path.Combine(CacheDirectory, "k.pending.zip");
-    private static readonly string PendingManifestPath = Path.Combine(CacheDirectory, "k.pending.json");
-    private static readonly string AutoStatePath = Path.Combine(CacheDirectory, "k.auto.json");
+
+    private string AgentFileSuffix => string.Concat(_agentId.Where(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.'));
+    private string PendingZipPath => Path.Combine(CacheDirectory, $"k.{AgentFileSuffix}.pending.zip");
+    private string PendingManifestPath => Path.Combine(CacheDirectory, $"k.{AgentFileSuffix}.pending.json");
+    private string AutoStatePath => Path.Combine(CacheDirectory, $"k.{AgentFileSuffix}.auto.json");
 
     public bool IsConnected => _socket?.State == WebSocketState.Open;
     public event Action<string>? OnLog;
@@ -450,7 +452,7 @@ public sealed class KliveLinkV2Client : IDisposable
         _ => 50L * 1024 * 1024,
     };
 
-    private static bool ShouldAutoCollect()
+    private bool ShouldAutoCollect()
     {
         if (File.Exists(PendingZipPath) || File.Exists(PendingManifestPath)) return true;
         try
@@ -465,7 +467,7 @@ public sealed class KliveLinkV2Client : IDisposable
         return true;
     }
 
-    private static void WriteAutoState()
+    private void WriteAutoState()
     {
         try
         {
@@ -475,7 +477,7 @@ public sealed class KliveLinkV2Client : IDisposable
         catch { }
     }
 
-    private static void SavePending(V2CollectionBundle bundle)
+    private void SavePending(V2CollectionBundle bundle)
     {
         try
         {
@@ -488,7 +490,7 @@ public sealed class KliveLinkV2Client : IDisposable
         catch { }
     }
 
-    private static V2CollectionBundle? LoadPendingBundle()
+    private V2CollectionBundle? LoadPendingBundle()
     {
         try
         {
@@ -507,7 +509,7 @@ public sealed class KliveLinkV2Client : IDisposable
         catch { return null; }
     }
 
-    private static void ClearPending()
+    private void ClearPending()
     {
         try { File.Delete(PendingZipPath); } catch { }
         try { File.Delete(PendingManifestPath); } catch { }
