@@ -80,7 +80,7 @@ fi
 mkdir -p "$INSTALL_DIR" "$CONFIG_DIR" "$LOG_DIR" 2>/dev/null || true
 touch "$INSTALL_LOG" 2>/dev/null || true
 
-log() { printf '%s\n' "$*" | tee -a "$INSTALL_LOG" >&2; }
+log() { printf '%s\n' "$*" | tee -a "$INSTALL_LOG" >&2 || true; }
 fail() { log "ERROR: $*"; exit 1; }
 
 fetch() {
@@ -239,6 +239,13 @@ EOF
 chmod 600 "$CONFIG"
 
 log "Running self-test..."
+if [ "$LIBC_KEY" = "-musl" ]; then
+    if [ "$(id -u)" = "0" ] && command -v apk >/dev/null 2>&1; then
+        apk add --no-cache libstdc++ libgcc zlib >/dev/null 2>&1 || true
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo -n apk add --no-cache libstdc++ libgcc zlib >/dev/null 2>&1 || true
+    fi
+fi
 if ! "$BIN" --self-test >>"$INSTALL_LOG" 2>&1; then
     fail "Agent failed its self-test. See $INSTALL_LOG"
 fi
