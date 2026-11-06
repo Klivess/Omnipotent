@@ -382,6 +382,11 @@ CREATE TRIGGER messages_fts_au AFTER UPDATE OF content ON messages BEGIN
   INSERT INTO messages_fts(rowid, content) VALUES (new.rowid, new.content);
 END;
 """),
+            // A row that fails the same way twice (a re-scanned v2 table, a retried import) is quarantined once.
+            new Migration(ModuleId, 2, "quarantine dedupe", """
+CREATE UNIQUE INDEX ux_quarantine_origin_reason ON quarantine(origin, reason);
+CREATE INDEX ix_quarantine_time ON quarantine(at_ms);
+"""),
         };
     }
 }

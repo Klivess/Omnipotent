@@ -28,7 +28,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         public async Task Migrations_AreRecordedAndIdempotentAcrossReopen()
         {
             using (var c = stores.Corpus.OpenRead())
-                Assert.Equal(1, SchemaMigrator.AppliedVersion(c, CorpusSchema.ModuleId));
+                Assert.Equal(CorpusSchema.Migrations.Max(m => m.Version), SchemaMigrator.AppliedVersion(c, CorpusSchema.ModuleId));
 
             await stores.DisposeAsync();
             stores = await OmniscienceStores.OpenAsync(new StorePaths(root), clock);

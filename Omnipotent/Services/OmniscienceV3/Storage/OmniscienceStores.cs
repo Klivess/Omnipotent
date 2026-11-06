@@ -23,6 +23,10 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
         public string Models => Path.Combine(Root, "models");
         /// <summary>Encrypted snapshot backups (N20).</summary>
         public string Backups => Path.Combine(Root, "backups");
+        /// <summary>Snapshots of the v2 database taken for the migration (deleted once imported).</summary>
+        public string LegacySnapshots => Path.Combine(Root, "legacy-snapshots");
+        /// <summary>The folder that contains v3: v2's data folder, where its database and media stay in place.</summary>
+        public string LegacyRoot => Path.GetFullPath(Path.Combine(Root, ".."));
 
         public static StorePaths Default() =>
             new(Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniscienceDirectory), "v3"));

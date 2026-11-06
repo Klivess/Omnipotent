@@ -114,7 +114,11 @@ namespace Omnipotent.Services.OmniscienceV3
         }
 
         /// <summary>The modules this build runs. Workstreams add theirs here.</summary>
-        private static IReadOnlyList<IIntelModule> BuildModules() => Array.Empty<IIntelModule>();
+        private static IReadOnlyList<IIntelModule> BuildModules() => new IIntelModule[]
+        {
+            // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
+            new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
+        };
 
         private Task<KliveLLM.KliveLLM?> ResolveKliveLlmAsync() =>
             Task.FromResult(GetActiveServices().OfType<KliveLLM.KliveLLM>().FirstOrDefault(s => s.IsServiceActive()));
