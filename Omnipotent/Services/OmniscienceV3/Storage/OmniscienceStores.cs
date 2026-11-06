@@ -35,9 +35,15 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
     /// </summary>
     public sealed class OmniscienceStores : IAsyncDisposable
     {
-        private OmniscienceStores(StorePaths paths, SqliteStore corpus, SqliteStore intel, SqliteStore op, SqliteStore vectors)
+        /// <summary>How long opening waits for a previous owner of the directory (an overlapping restart) to let go.</summary>
+        public static TimeSpan DefaultLockWait { get; set; } = TimeSpan.FromSeconds(60);
+
+        private readonly InstanceLock instanceLock;
+
+        private OmniscienceStores(StorePaths paths, InstanceLock instanceLock, SqliteStore corpus, SqliteStore intel, SqliteStore op, SqliteStore vectors)
         {
             Paths = paths;
+            this.instanceLock = instanceLock;
             Corpus = corpus;
             Intel = intel;
             Operator = op;
@@ -52,12 +58,14 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
 
         public IEnumerable<SqliteStore> All => new[] { Corpus, Intel, Operator, Vectors };
 
-        public static async Task<OmniscienceStores> OpenAsync(StorePaths paths, IClock clock, CancellationToken ct = default)
+        public static async Task<OmniscienceStores> OpenAsync(StorePaths paths, IClock clock, CancellationToken ct = default, TimeSpan? lockWait = null)
         {
             Directory.CreateDirectory(paths.Root);
             Directory.CreateDirectory(paths.Media);
             Directory.CreateDirectory(paths.Models);
 
+            // Ownership first: nothing below may touch the files while another kernel works them.
+            var instanceLock = await InstanceLock.AcquireAsync(paths.Root, lockWait ?? DefaultLockWait, ct).ConfigureAwait(false);
             var corpus = new SqliteStore("corpus", paths.Corpus, clock);
             var intel = new SqliteStore("intel", paths.Intel, clock);
             var op = new SqliteStore("operator", paths.Operator, clock);
@@ -69,22 +77,31 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
                 await intel.InitializeAsync(IntelSchema.Migrations, ct).ConfigureAwait(false); opened.Add(intel);
                 await op.InitializeAsync(OperatorSchema.Migrations, ct).ConfigureAwait(false); opened.Add(op);
                 await vectors.InitializeAsync(VectorSchema.Migrations, ct).ConfigureAwait(false); opened.Add(vectors);
-                return new OmniscienceStores(paths, corpus, intel, op, vectors);
+                return new OmniscienceStores(paths, instanceLock, corpus, intel, op, vectors);
             }
             catch
             {
                 foreach (var s in opened) await s.DisposeAsync().ConfigureAwait(false);
+                instanceLock.Dispose();
                 throw;
             }
         }
 
         public async ValueTask DisposeAsync()
         {
-            // Reverse of the dependency order: derived stores first, the source of truth last.
-            await Vectors.DisposeAsync().ConfigureAwait(false);
-            await Operator.DisposeAsync().ConfigureAwait(false);
-            await Intel.DisposeAsync().ConfigureAwait(false);
-            await Corpus.DisposeAsync().ConfigureAwait(false);
+            try
+            {
+                // Reverse of the dependency order: derived stores first, the source of truth last.
+                await Vectors.DisposeAsync().ConfigureAwait(false);
+                await Operator.DisposeAsync().ConfigureAwait(false);
+                await Intel.DisposeAsync().ConfigureAwait(false);
+                await Corpus.DisposeAsync().ConfigureAwait(false);
+            }
+            finally
+            {
+                // Released last, after every writer has drained.
+                instanceLock.Dispose();
+            }
         }
     }
 }

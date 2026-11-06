@@ -96,6 +96,24 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             if (!modules.TryAdd(m.Id, module)) throw new InvalidOperationException($"Module '{m.Id}' is registered twice.");
             foreach (var s in m.Schedules) s.Validate();
             foreach (var d in m.Datasets) d.Validate();
+            foreach (var s in m.Settings)
+            {
+                // Namespaced keys: two modules can never collide, and the Settings page can group by owner.
+                if (!s.Key.StartsWith(m.Id + ".", StringComparison.Ordinal))
+                    throw new InvalidOperationException($"Module '{m.Id}' setting '{s.Key}' must start with '{m.Id}.'.");
+                string? problem;
+                try
+                {
+                    using var parsed = JsonDocument.Parse(s.DefaultJson);
+                    problem = KernelSettings.Validate(s, parsed.RootElement);
+                }
+                catch (JsonException)
+                {
+                    problem = "is not valid JSON";
+                }
+                if (problem != null)
+                    throw new InvalidOperationException($"Module '{m.Id}' setting '{s.Key}' default {s.DefaultJson} {problem}.");
+            }
             foreach (var mig in module.IntelMigrations)
                 if (mig.ModuleId != m.Id) throw new InvalidOperationException($"Module '{m.Id}' ships a migration for '{mig.ModuleId}'.");
         }
@@ -146,9 +164,10 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             };
             foreach (var m in ordered) await m.InitializeAsync(context, ct).ConfigureAwait(false);
 
-            // Crash recovery first: anything leased by a previous process is reclaimed before workers start.
-            int reclaimed = await Jobs.ReclaimExpiredAsync(ct).ConfigureAwait(false);
-            if (reclaimed > 0) log($"[OmniscienceV3] reclaimed {reclaimed} job(s) whose leases expired while the service was down.");
+            // Crash recovery first: the instance lock means anything still leased belongs to a previous process,
+            // so it is reclaimed before workers start instead of waiting for its lease to run out.
+            int reclaimed = await Jobs.ReclaimOrphanedAsync(ct).ConfigureAwait(false);
+            if (reclaimed > 0) log($"[OmniscienceV3] reclaimed {reclaimed} job(s) left leased by a previous run.");
 
             if (options.StartWorkers)
             {

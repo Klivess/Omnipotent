@@ -79,6 +79,9 @@ namespace Omnipotent
                 });
 
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omniscience());
+                // Omniscience v3 (the rewrite) registers its routes always but stays idle unless
+                // OmniscienceV3_ShadowEnabled is true; it then runs in shadow mode beside v2 until cutover.
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.OmniscienceV3.OmniscienceV3(kliveApi));
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new NotificationsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new GeneralBotStatisticsService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveCloud());

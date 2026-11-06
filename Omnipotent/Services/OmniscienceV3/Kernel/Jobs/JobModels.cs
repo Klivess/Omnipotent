@@ -93,4 +93,27 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
 
     /// <summary>Counts per (lane, state) for health pages.</summary>
     public sealed record JobCount(Lane Lane, string State, long Count);
+
+    /// <summary>Filters for <see cref="JobQueue.Query"/>; all optional, combined with AND. Times are UTC epoch ms;
+    /// <see cref="CreatedToMs"/> is exclusive.</summary>
+    public sealed record JobQuery
+    {
+        public string? State { get; init; }
+        public string? ModuleId { get; init; }
+        public Lane? Lane { get; init; }
+        public string? Kind { get; init; }
+        public string? SubjectKind { get; init; }
+        public string? SubjectId { get; init; }
+        public string? RunId { get; init; }
+        public long? ParentJobId { get; init; }
+        public string? ErrorClass { get; init; }
+        public long? CreatedFromMs { get; init; }
+        public long? CreatedToMs { get; init; }
+        /// <summary>Keyset cursor: only jobs with a smaller id (the previous page's <see cref="JobPage.NextCursor"/>).</summary>
+        public long? BeforeJobId { get; init; }
+        public int Limit { get; init; } = 100;
+    }
+
+    /// <summary>One page of jobs, newest first. <see cref="NextCursor"/> is null on the last page.</summary>
+    public sealed record JobPage(IReadOnlyList<JobRecord> Items, long? NextCursor);
 }

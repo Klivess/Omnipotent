@@ -166,6 +166,29 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                 return dead + requeued;
             }, ct);
 
+        /// <summary>
+        /// Startup recovery. The store's <see cref="Storage.InstanceLock"/> guarantees no other kernel works this queue,
+        /// so every job still marked leased belongs to a process that is gone, however much of its lease is left.
+        /// Requeue them now rather than waiting out the lease (up to the lane's lease duration). The interrupted run
+        /// counts as an attempt (the job may be what crashed the process), so a poison job still dead-letters.
+        /// </summary>
+        public Task<int> ReclaimOrphanedAsync(CancellationToken ct = default) =>
+            intel.WriteAsync((c, tx) =>
+            {
+                long now = clock.NowMs;
+                int dead = c.Exec(tx, """
+                    UPDATE jobs SET state='dead', finished_at_ms=$now, lease_owner=NULL, lease_expires_ms=NULL,
+                                    error_class='Transient', error_message='The service stopped during the final attempt.'
+                    WHERE state='leased' AND attempts >= max_attempts
+                    """, ("$now", now));
+                int requeued = c.Exec(tx, """
+                    UPDATE jobs SET state='queued', not_before_ms=$now, lease_owner=NULL, lease_expires_ms=NULL,
+                                    error_class='Transient', error_message='The service stopped while this job ran; requeued.'
+                    WHERE state='leased'
+                    """, ("$now", now));
+                return dead + requeued;
+            }, ct);
+
         public Task<bool> CancelAsync(long jobId, CancellationToken ct = default) =>
             intel.WriteAsync((c, tx) => c.Exec(tx, """
                 UPDATE jobs SET state='cancelled', finished_at_ms=$now, lease_owner=NULL, lease_expires_ms=NULL
@@ -207,14 +230,44 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                 r => new JobCount(Enum.Parse<Lane>(r.GetString(0)), r.GetString(1), r.GetInt64(2)));
         }
 
-        public IReadOnlyList<JobRecord> List(string? state, string? moduleId, int limit)
+        public IReadOnlyList<JobRecord> List(string? state, string? moduleId, int limit) =>
+            Query(new JobQuery { State = state, ModuleId = moduleId, Limit = limit }).Items;
+
+        /// <summary>
+        /// Filtered, keyset-paged job listing, newest first. Every filter is optional and they combine with AND;
+        /// <see cref="JobQuery.BeforeJobId"/> is the cursor returned as <c>NextCursor</c> by the previous page.
+        /// </summary>
+        public JobPage Query(JobQuery q)
         {
+            int limit = Math.Clamp(q.Limit, 1, 1000);
+            var where = new List<string>();
+            var p = new List<(string, object?)>();
+            void Eq(string column, string name, object? value)
+            {
+                if (value == null) return;
+                where.Add($"{column}={name}");
+                p.Add((name, value));
+            }
+            Eq("state", "$state", q.State);
+            Eq("module_id", "$module", q.ModuleId);
+            Eq("lane", "$lane", q.Lane?.ToString());
+            Eq("kind", "$kind", q.Kind);
+            Eq("subject_kind", "$sk", q.SubjectKind);
+            Eq("subject_id", "$si", q.SubjectId);
+            Eq("run_id", "$run", q.RunId);
+            Eq("parent_job_id", "$parent", q.ParentJobId);
+            Eq("error_class", "$ec", q.ErrorClass);
+            if (q.CreatedFromMs is long from) { where.Add("created_at_ms >= $from"); p.Add(("$from", from)); }
+            if (q.CreatedToMs is long to) { where.Add("created_at_ms < $to"); p.Add(("$to", to)); }
+            if (q.BeforeJobId is long before) { where.Add("job_id < $before"); p.Add(("$before", before)); }
+            p.Add(("$lim", limit + 1));
+            string sql = $"SELECT {Columns} FROM jobs {(where.Count == 0 ? "" : "WHERE " + string.Join(" AND ", where))} ORDER BY job_id DESC LIMIT $lim";
+
             using var c = intel.OpenRead();
-            return c.Query(null, $"""
-                SELECT {Columns} FROM jobs
-                WHERE ($s IS NULL OR state=$s) AND ($m IS NULL OR module_id=$m)
-                ORDER BY job_id DESC LIMIT $lim
-                """, Map, ("$s", state), ("$m", moduleId), ("$lim", Math.Clamp(limit, 1, 1000)));
+            var rows = c.Query(null, sql, Map, p.ToArray());
+            if (rows.Count <= limit) return new JobPage(rows, null);
+            var page = rows.Take(limit).ToList();
+            return new JobPage(page, page[^1].JobId);
         }
 
         /// <summary>Exponential backoff: 2 s, 4 s, 8 s … capped at 15 min, with ±20% jitter.</summary>
