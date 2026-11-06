@@ -7,8 +7,8 @@ $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
 $BaseUrl = "__BASE_URL__"
-$Version = "2.1.2"
-$ReleaseTag = "klivelink-agents-2.1.2"
+$Version = "2.1.3"
+$ReleaseTag = "klivelink-agents-2.1.3"
 $GitHub = "https://github.com/Klivess/Omnipotent/releases/download/$ReleaseTag"
 
 function Write-Log([string]$Message) {
@@ -150,6 +150,7 @@ try {
 finally {
     Remove-Item -Recurse -Force $Temp -ErrorAction SilentlyContinue
 }
+
 
 
 

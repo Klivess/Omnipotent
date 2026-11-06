@@ -4,8 +4,8 @@ set -eu
 umask 077
 
 BASE_URL="__BASE_URL__"
-VERSION="2.1.2"
-RELEASE_TAG="klivelink-agents-2.1.2"
+VERSION="2.1.3"
+RELEASE_TAG="klivelink-agents-2.1.3"
 GITHUB_URL="https://github.com/Klivess/Omnipotent/releases/download/${RELEASE_TAG}"
 SYSTEM=0
 UNINSTALL=0
@@ -30,7 +30,13 @@ case "$ARCH_NAME" in
     aarch64|arm64) ARCH_KEY=arm64 ;;
     *) echo "Unsupported architecture: $ARCH_NAME (supported: x86_64, aarch64/arm64)" >&2; exit 2 ;;
 esac
-RID="${OS_KEY}-${ARCH_KEY}"
+LIBC_KEY=""
+if [ "$OS_KEY" = "linux" ]; then
+    if ls /lib/ld-musl-*.so.1 >/dev/null 2>&1 || (ldd --version 2>&1 | grep -qi musl); then
+        LIBC_KEY="-musl"
+    fi
+fi
+RID="${OS_KEY}${LIBC_KEY}-${ARCH_KEY}"
 ASSET="klivelink-agent-${RID}-${VERSION}"
 if [ "$OS_KEY" = "linux" ]; then
     ARCHIVE_NAME="${ASSET}.tar.gz"
@@ -102,6 +108,22 @@ fetch_text() {
     return 1
 }
 
+agent_running() {
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$BIN" >/dev/null 2>&1
+    else
+        ps -ef 2>/dev/null | grep -F "$BIN" | grep -v grep >/dev/null 2>&1
+    fi
+}
+
+kill_agent() {
+    if command -v pkill >/dev/null 2>&1; then
+        pkill -f "$BIN" 2>/dev/null || true
+    else
+        ps -ef 2>/dev/null | grep -F "$BIN" | grep -v grep | awk '{print $2}' | xargs -r kill -9 2>/dev/null || true
+    fi
+}
+
 stop_agent() {
     if [ "$OS_KEY" = "linux" ]; then
         if [ "$SYSTEM" = "1" ]; then
@@ -109,11 +131,11 @@ stop_agent() {
         else
             systemctl --user stop "$SERVICE_NAME" 2>/dev/null || true
         fi
-        pkill -f "$BIN" 2>/dev/null || true
+        kill_agent
     else
         launchctl bootout "gui/$(id -u)/${PLIST_LABEL}" 2>/dev/null || true
         launchctl bootout "system/${PLIST_LABEL}" 2>/dev/null || true
-        pkill -f "$BIN" 2>/dev/null || true
+        kill_agent
     fi
 }
 
@@ -259,7 +281,12 @@ RestartSec=10
 WantedBy=default.target
 EOF
             if systemctl --user daemon-reload 2>/dev/null && systemctl --user enable --now "$SERVICE_NAME" 2>/dev/null; then started=1; fi
+            loginctl enable-linger "$(id -un)" 2>/dev/null || true
         fi
+    fi
+    if [ "$started" = "0" ] && command -v crontab >/dev/null 2>&1; then
+        CRON_LINE="@reboot \"$BIN\" --config \"$CONFIG\" >>\"$LOG\" 2>&1"
+        (crontab -l 2>/dev/null | grep -v "klivelink-agent" || true; printf '%s\n' "$CRON_LINE") | crontab - 2>/dev/null && started=1 || true
     fi
     if [ "$started" = "0" ] && [ -n "${XDG_CURRENT_DESKTOP:-}" ]; then
         mkdir -p "$HOME/.config/autostart"
@@ -275,7 +302,7 @@ EOF
     if [ "$started" = "0" ]; then
         PROFILE="$HOME/.profile"
         if ! grep -q "klivelink-agent" "$PROFILE" 2>/dev/null; then
-            printf '\n# KliveLink agent\nif ! pgrep -f "%s" >/dev/null 2>&1; then nohup "%s" --config "%s" >>"%s" 2>&1 & fi\n' "$BIN" "$BIN" "$CONFIG" "$LOG" >> "$PROFILE"
+            printf '\n# KliveLink agent\nif ! ps -ef 2>/dev/null | grep -F "%s" | grep -v grep >/dev/null 2>&1; then nohup "%s" --config "%s" >>"%s" 2>&1 & fi\n' "$BIN" "$BIN" "$CONFIG" "$LOG" >> "$PROFILE"
         fi
     fi
 else
@@ -309,13 +336,13 @@ EOF
     fi
 fi
 
-if [ "$started" = "0" ] || ! pgrep -f "$BIN" >/dev/null 2>&1; then
+if [ "$started" = "0" ] || ! agent_running; then
     log "Service manager did not start the agent; using nohup fallback."
     nohup "$BIN" --config "$CONFIG" >>"$LOG" 2>&1 &
 fi
 
 sleep 3
-if pgrep -f "$BIN" >/dev/null 2>&1; then
+if agent_running; then
     log "KliveLink installed and running."
     log "Binary: $BIN"
     log "Config: $CONFIG"
@@ -326,6 +353,7 @@ fi
 log "Agent is not running. Last log lines:"
 tail -n 40 "$LOG" 2>/dev/null || true
 fail "Installation completed but the agent did not start."
+
 
 
 

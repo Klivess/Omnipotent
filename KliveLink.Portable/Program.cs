@@ -15,7 +15,7 @@ internal static class Program
             Console.WriteLine(JsonSerializer.Serialize(new
             {
                 product = "KliveLink portable agent",
-                version = "2.1.2",
+                version = "2.1.3",
                 os = RuntimeInformation.OSDescription,
                 architecture = RuntimeInformation.ProcessArchitecture.ToString(),
                 rid = RuntimeInformation.RuntimeIdentifier,
@@ -91,5 +91,6 @@ internal static class Program
         return null;
     }
 }
+
 
 

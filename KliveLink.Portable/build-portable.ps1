@@ -1,13 +1,13 @@
 ﻿param(
     [string]$Output = "artifacts/klivelink-portable",
-    [string]$Version = "2.1.2"
+    [string]$Version = "2.1.3"
 )
 $ErrorActionPreference = "Stop"
 $repo = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $out = Join-Path $repo $Output
 New-Item -ItemType Directory -Force $out | Out-Null
 $project = Join-Path $repo "KliveLink.Portable\KliveLink.Portable.csproj"
-$rids = @("linux-x64", "linux-arm64", "osx-x64", "osx-arm64", "win-x64", "win-arm64")
+$rids = @("linux-x64", "linux-arm64", "linux-musl-x64", "linux-musl-arm64", "osx-x64", "osx-arm64", "win-x64", "win-arm64")
 $results = @()
 
 foreach ($rid in $rids) {
@@ -54,5 +54,7 @@ $manifest = [ordered]@{
 $manifest | ConvertTo-Json -Depth 5 | Set-Content (Join-Path $out "manifest.json") -Encoding UTF8
 $results | Format-Table -AutoSize
 Write-Host "Manifest: $(Join-Path $out 'manifest.json')" -ForegroundColor Green
+
+
 
 

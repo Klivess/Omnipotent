@@ -1,43 +1,55 @@
 ﻿{
-    "version":  "2.1.2",
-    "releaseTag":  "klivelink-agents-2.1.2",
+    "version":  "2.1.3",
+    "releaseTag":  "klivelink-agents-2.1.3",
     "githubRepository":  "Klivess/Omnipotent",
     "assets":  [
                    {
                        "rid":  "linux-x64",
-                       "archive":  "klivelink-agent-linux-x64-2.1.2.tar.gz",
-                       "sha256":  "853b08d3bd6caa35341767464fc1575ae90f7c25b9ba5e3307926a8f2921e14b",
-                       "bytes":  31360943
+                       "archive":  "klivelink-agent-linux-x64-2.1.3.tar.gz",
+                       "sha256":  "fb5a80b3269a0493dcd39b6645d83394cea319854fd780cf92406bab596f5715",
+                       "bytes":  31360941
                    },
                    {
                        "rid":  "linux-arm64",
-                       "archive":  "klivelink-agent-linux-arm64-2.1.2.tar.gz",
-                       "sha256":  "0c3f415f914d5edd7c0a9e7483539857b48ebc321703d80d9b15a9e135382933",
-                       "bytes":  29906813
+                       "archive":  "klivelink-agent-linux-arm64-2.1.3.tar.gz",
+                       "sha256":  "8bd7266abd2773c56c0437c31a626a812b74acd74005602a2121632db1cefceb",
+                       "bytes":  29906825
+                   },
+                   {
+                       "rid":  "linux-musl-x64",
+                       "archive":  "klivelink-agent-linux-musl-x64-2.1.3.tar.gz",
+                       "sha256":  "975a63c6d4902038bab70b1b902eeb9d0fefbdffc60328f7276c1bf01480c178",
+                       "bytes":  31371033
+                   },
+                   {
+                       "rid":  "linux-musl-arm64",
+                       "archive":  "klivelink-agent-linux-musl-arm64-2.1.3.tar.gz",
+                       "sha256":  "4c0a37d15dd021f9f0ab817d597afa1ba560c5202eb23c8a99955edbf109d780",
+                       "bytes":  29916968
                    },
                    {
                        "rid":  "osx-x64",
-                       "archive":  "klivelink-agent-osx-x64-2.1.2.tar.gz",
-                       "sha256":  "dc816b6819c2b3ead362f39537bfa7e9e9196d1f0eea02d117cf14d60ef3103a",
-                       "bytes":  31403261
+                       "archive":  "klivelink-agent-osx-x64-2.1.3.tar.gz",
+                       "sha256":  "3c2796f715439a8ab74e1c98f0e555639647fe1ab88c55cf3865aba2c70a4025",
+                       "bytes":  31403299
                    },
                    {
                        "rid":  "osx-arm64",
-                       "archive":  "klivelink-agent-osx-arm64-2.1.2.tar.gz",
-                       "sha256":  "7483e9b2be741fdc91253e6e66d1b80ee84cb44e4951a8236806cafe8988962d",
-                       "bytes":  29726253
+                       "archive":  "klivelink-agent-osx-arm64-2.1.3.tar.gz",
+                       "sha256":  "bfb8287f672052fee0b8f1363a7fb5349867aef15e64144b6e6420ccf534937c",
+                       "bytes":  29726264
                    },
                    {
                        "rid":  "win-x64",
-                       "archive":  "klivelink-agent-win-x64-2.1.2.zip",
-                       "sha256":  "b80ecb6556becb9316d5cac1da1a8dc8fc66796085d409776291ccbe5eebd383",
-                       "bytes":  31351197
+                       "archive":  "klivelink-agent-win-x64-2.1.3.zip",
+                       "sha256":  "be021135066c4f5351f87597febfa5d327669a0c86e1bd1e0ebc4d664a2d5c6f",
+                       "bytes":  31351194
                    },
                    {
                        "rid":  "win-arm64",
-                       "archive":  "klivelink-agent-win-arm64-2.1.2.zip",
-                       "sha256":  "62d82307ef51699bd23ded586da61082967e8a7f0a230eb08e6b74d984d6ec25",
-                       "bytes":  30254602
+                       "archive":  "klivelink-agent-win-arm64-2.1.3.zip",
+                       "sha256":  "c38e7c6f62b1bf838536910b437d4497869aac0bc7380a5d9b67f61006768476",
+                       "bytes":  30254638
                    }
                ]
 }
