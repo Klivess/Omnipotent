@@ -387,6 +387,12 @@ END;
 CREATE UNIQUE INDEX ux_quarantine_origin_reason ON quarantine(origin, reason);
 CREATE INDEX ix_quarantine_time ON quarantine(at_ms);
 """),
+            // "Has anything about this person changed since seq N?" (stale tactic runs, incremental projections).
+            new Migration(ModuleId, 3, "change log by person", """
+CREATE INDEX ix_change_log_person_seq ON change_log(person_id, seq) WHERE person_id IS NOT NULL;
+CREATE INDEX ix_change_log_entity_seq ON change_log(entity_id, seq);
+DROP INDEX ix_change_log_entity;
+"""),
         };
     }
 }

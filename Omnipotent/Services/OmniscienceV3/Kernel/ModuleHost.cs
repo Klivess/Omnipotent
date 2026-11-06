@@ -18,6 +18,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             new LaneOptions(Lane.Io, 4, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2)),
             new LaneOptions(Lane.LlmBackground, 1, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(5)),
             new LaneOptions(Lane.LlmInteractive, 2, TimeSpan.FromMinutes(5), TimeSpan.FromMilliseconds(500)),
+            new LaneOptions(Lane.Coordinator, 4, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(1)),
         };
         public TimeSpan LoopInterval { get; init; } = TimeSpan.FromSeconds(1);
         public int ChangeBatch { get; init; } = 5_000;
@@ -70,7 +71,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
         private int started;
 
         public ModuleHost(OmniscienceStores stores, IClock clock, KernelOptions options, Action<string> log,
-            Action<string, Exception?> logError, ILaneGate? gate = null)
+            Action<string, Exception?> logError, ILaneGate? gate = null, KernelServices? services = null)
         {
             this.stores = stores;
             this.clock = clock;
@@ -81,12 +82,21 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             Jobs = new JobQueue(stores.Intel, clock);
             Events = new EventHub(stores.Intel, clock, logError);
             Settings = new KernelSettings(stores.Operator, clock);
+            ReadModels = new ReadModels.ReadModelStore(stores.Intel, clock, Events);
+            Policy = services?.Policy ?? new Knowledge.Policy.OperatorPolicyOracle(stores);
+            Services = services ?? new KernelServices();
         }
 
         public JobQueue Jobs { get; }
         public EventHub Events { get; }
         public KernelSettings Settings { get; }
-        public IReadOnlyList<IIntelModule> Modules => ordered;
+        public ReadModels.ReadModelStore ReadModels { get; }
+        public Knowledge.Policy.IPolicyOracle Policy { get; }
+        public KernelServices Services { get; }
+        public IReadOnlyList<IIntelModule> Modules => ordered.Count > 0 ? ordered : modules.Values.ToList();
+
+        /// <summary>The context modules receive (also used by the tactic runner to run tactics).</summary>
+        public ModuleContext Context { get; private set; } = null!;
 
         public void Register(IIntelModule module)
         {
@@ -161,7 +171,9 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             var context = new ModuleContext
             {
                 Stores = stores, Clock = clock, Jobs = Jobs, Events = Events, Settings = Settings, Log = log, LogError = logError,
+                ReadModels = ReadModels, Policy = Policy, Llm = Services.Llm, Models = Services.Models,
             };
+            Context = context;
             foreach (var m in ordered) await m.InitializeAsync(context, ct).ConfigureAwait(false);
 
             // Crash recovery first: the instance lock means anything still leased belongs to a previous process,
@@ -171,6 +183,8 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
 
             if (options.StartWorkers)
             {
+                foreach (var lane in Enum.GetValues<Lane>().Where(l => !options.Lanes.Any(o => o.Lane == l && o.Concurrency > 0)))
+                    logError($"[OmniscienceV3] no workers are configured for the {lane} lane: its jobs will wait until some are.", null);
                 workers = new LaneWorkers(Jobs, this, clock, options.Lanes, logError, gate, options.OwnerPrefix);
                 workers.Start();
             }

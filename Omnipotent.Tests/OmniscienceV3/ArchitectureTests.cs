@@ -15,9 +15,10 @@ namespace Omnipotent.Tests.OmniscienceV3
         private static readonly Regex FireAndForget = new(@"_\s*=\s*Task\.Run\s*\(", RegexOptions.Compiled);
         private static readonly Regex BareTaskRun = new(@"^\s*Task\.Run\s*\(", RegexOptions.Compiled | RegexOptions.Multiline);
 
-        private static string V3Root()
+        /// <summary>Found from this source file's location, so the rules run from any build output folder.</summary>
+        private static string V3Root([System.Runtime.CompilerServices.CallerFilePath] string source = "")
         {
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            var dir = new DirectoryInfo(Path.GetDirectoryName(source)!);
             while (dir != null && !File.Exists(Path.Combine(dir.FullName, "Omnipotent.sln"))) dir = dir.Parent;
             Assert.NotNull(dir);
             return Path.Combine(dir!.FullName, "Omnipotent", "Services", "OmniscienceV3");

@@ -64,12 +64,9 @@ namespace Omnipotent.Services.OmniscienceV3.Api
     {
         public static readonly JsonSerializerOptions Options = Create();
 
-        private static JsonSerializerOptions Create()
-        {
-            var o = new JsonSerializerOptions(KernelJson.Options) { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
-            o.Converters.Add(new JsonStringEnumConverter());
-            return o;
-        }
+        // KernelJson already writes enums by name.
+        private static JsonSerializerOptions Create() =>
+            new(KernelJson.Options) { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull };
     }
 
     /// <summary>JSON responses for v3 routes.</summary>

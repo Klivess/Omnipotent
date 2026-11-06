@@ -45,6 +45,8 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Modules
         public bool MinorRestricted { get; init; }
         public IReadOnlyList<DatasetDescriptor> Datasets { get; init; } = Array.Empty<DatasetDescriptor>();
         public IReadOnlyList<SettingDescriptor> Settings { get; init; } = Array.Empty<SettingDescriptor>();
+        /// <summary>Read models this module's projections maintain (served by <c>GET /omniscience/v3/rm</c>).</summary>
+        public IReadOnlyList<ReadModels.ReadModelDescriptor> ReadModels { get; init; } = Array.Empty<ReadModels.ReadModelDescriptor>();
     }
 
     /// <summary>Services a module receives at initialisation.</summary>
@@ -57,6 +59,22 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Modules
         public required KernelSettings Settings { get; init; }
         public required Action<string> Log { get; init; }
         public required Action<string, Exception?> LogError { get; init; }
+        /// <summary>Where projections write the views routes serve.</summary>
+        public required ReadModels.ReadModelStore ReadModels { get; init; }
+        /// <summary>MinorGuard bands and canonical person ids.</summary>
+        public required Knowledge.Policy.IPolicyOracle Policy { get; init; }
+        /// <summary>The audited LLM gateway (null in kernels started without one, e.g. some tests).</summary>
+        public Llm.OmniLlm? Llm { get; init; }
+        /// <summary>Pinned ONNX models and tokenizers (null in kernels started without one).</summary>
+        public Ml.ModelHub? Models { get; init; }
+    }
+
+    /// <summary>Shared services the kernel hands every module (built by the runtime).</summary>
+    public sealed record KernelServices
+    {
+        public Llm.OmniLlm? Llm { get; init; }
+        public Ml.ModelHub? Models { get; init; }
+        public Knowledge.Policy.IPolicyOracle? Policy { get; init; }
     }
 
     /// <summary>Input to a planning pass.</summary>
@@ -94,6 +112,9 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Modules
 
         /// <summary>Executes one of this module's jobs; returns result JSON or null.</summary>
         Task<string?> ExecuteAsync(JobContext job);
+
+        /// <summary>Tactics this module contributes to the catalogue (run by the kernel's tactic runner).</summary>
+        IReadOnlyList<Tactics.ITactic> Tactics { get; }
     }
 
     /// <summary>Convenience base: no-op mapping/planning so small modules only override what they use.</summary>
@@ -113,6 +134,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Modules
         public virtual IEnumerable<DirtySubject> MapChanges(IReadOnlyList<ChangeRecord> changes) => Array.Empty<DirtySubject>();
         public virtual IEnumerable<JobRequest> Plan(PlanContext context) => Array.Empty<JobRequest>();
         public abstract Task<string?> ExecuteAsync(JobContext job);
+        public virtual IReadOnlyList<Tactics.ITactic> Tactics => Array.Empty<Tactics.ITactic>();
 
         /// <summary>A job request pre-filled with this module's id, default lane and a single-flight key.</summary>
         protected JobRequest Job(string kind, string? subjectKind = null, string? subjectId = null, int priority = 100, string? payloadJson = null, Lane? lane = null) =>

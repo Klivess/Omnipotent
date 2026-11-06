@@ -1,7 +1,10 @@
 using Omnipotent.Services.OmniscienceV3.Api;
 using Omnipotent.Services.OmniscienceV3.Kernel;
+using Omnipotent.Services.OmniscienceV3.Kernel.Explore;
 using Omnipotent.Services.OmniscienceV3.Kernel.Modules;
+using Omnipotent.Services.OmniscienceV3.Kernel.Tactics;
 using Omnipotent.Services.OmniscienceV3.Llm;
+using Omnipotent.Services.OmniscienceV3.Ml;
 using Omnipotent.Services.OmniscienceV3.Storage;
 using Omnipotent.Services.OmniscienceV3.Temporal;
 
@@ -26,15 +29,19 @@ namespace Omnipotent.Services.OmniscienceV3
     /// </summary>
     public sealed class V3Runtime : IAsyncDisposable
     {
+        private readonly HttpClient modelDownloads;
         private int disposed;
 
-        private V3Runtime(OmniscienceStores stores, ModuleHost host, OmniLlm llm, LlmBackgroundGate gate, LiveStreamHub stream, IClock clock, long startedAtMs)
+        private V3Runtime(OmniscienceStores stores, ModuleHost host, OmniLlm llm, LlmBackgroundGate gate, LiveStreamHub stream, TacticRunner tactics,
+            HttpClient modelDownloads, IClock clock, long startedAtMs)
         {
             Stores = stores;
             Host = host;
             Llm = llm;
             BackgroundGate = gate;
             Stream = stream;
+            Tactics = tactics;
+            this.modelDownloads = modelDownloads;
             Clock = clock;
             StartedAtMs = startedAtMs;
         }
@@ -44,8 +51,13 @@ namespace Omnipotent.Services.OmniscienceV3
         public OmniLlm Llm { get; }
         public LlmBackgroundGate BackgroundGate { get; }
         public LiveStreamHub Stream { get; }
+        /// <summary>The X-engine: the tactic catalogue, runs and playbooks.</summary>
+        public TacticRunner Tactics { get; }
         public IClock Clock { get; }
         public long StartedAtMs { get; }
+
+        /// <summary>The Explore engine, when a module provides one (the analytics workstream).</summary>
+        public IExploreEngine? Explore => Host.Modules.OfType<IExploreEngine>().FirstOrDefault();
 
         public static async Task<V3Runtime> StartAsync(V3RuntimeOptions options, Action<string>? stage = null, CancellationToken ct = default)
         {
@@ -53,21 +65,29 @@ namespace Omnipotent.Services.OmniscienceV3
             stage?.Invoke("Opening stores");
             var stores = await OmniscienceStores.OpenAsync(options.Paths, options.Clock, ct, options.LockWait).ConfigureAwait(false);
             ModuleHost? host = null;
+            var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
             try
             {
                 var llm = new OmniLlm(options.LlmClient, stores.Intel, options.Clock, new TokenEstimator());
                 var gate = new LlmBackgroundGate(llm);
-                host = new ModuleHost(stores, options.Clock, options.Kernel, options.Log, options.LogError, gate);
+                var models = new ModelHub(options.Paths.Models, http, options.Clock, options.Log);
+                host = new ModuleHost(stores, options.Clock, options.Kernel, options.Log, options.LogError, gate, new KernelServices { Llm = llm, Models = models });
+                var registered = host;
+                // The tactic runner is a core module: its catalogue is the kernel's tactics plus every module's.
+                var tactics = new TacticRunner(() => BuiltinTactics.All.Concat(registered.Modules.Where(m => m is not TacticRunner).SelectMany(m => m.Tactics)));
+                host.Register(tactics);
                 foreach (var module in options.Modules) host.Register(module);
                 stage?.Invoke($"Starting the kernel ({options.Modules.Count} module(s))");
                 await host.StartAsync(ct).ConfigureAwait(false);
+                _ = tactics.Catalog(); // fail fast on duplicate tactic keys
                 var stream = new LiveStreamHub(host.Events, options.Clock, options.LogError);
-                return new V3Runtime(stores, host, llm, gate, stream, options.Clock, started);
+                return new V3Runtime(stores, host, llm, gate, stream, tactics, http, options.Clock, started);
             }
             catch
             {
                 if (host != null) await host.DisposeAsync().ConfigureAwait(false);
                 await stores.DisposeAsync().ConfigureAwait(false);
+                http.Dispose();
                 throw;
             }
         }
@@ -83,6 +103,7 @@ namespace Omnipotent.Services.OmniscienceV3
             finally
             {
                 await Stores.DisposeAsync().ConfigureAwait(false);
+                modelDownloads.Dispose();
             }
         }
     }

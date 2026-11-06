@@ -586,9 +586,10 @@ namespace Omnipotent.Tests.OmniscienceV3.Api
 
         // ── contract generation ──────────────────────────────────────────────────
 
-        private static string RepoRoot()
+        /// <summary>Found from this source file's location, so the test works from any build output folder.</summary>
+        private static string RepoRoot([System.Runtime.CompilerServices.CallerFilePath] string source = "")
         {
-            var dir = new DirectoryInfo(AppContext.BaseDirectory);
+            var dir = new DirectoryInfo(Path.GetDirectoryName(source)!);
             while (dir != null && !File.Exists(Path.Combine(dir.FullName, "Omnipotent.sln"))) dir = dir.Parent;
             return dir?.FullName ?? throw new InvalidOperationException("Repository root not found.");
         }
@@ -598,7 +599,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Api
         {
             string ts = TypeScriptContracts.Generate(TypeScriptContracts.Roots(typeof(TypeScriptContracts).Assembly));
             Assert.Contains("export interface V3StatusDto {", ts);
-            Assert.Contains("export type Lane = \"Cpu\" | \"Io\" | \"LlmBackground\" | \"LlmInteractive\";", ts);
+            Assert.Contains("export type Lane = \"Cpu\" | \"Io\" | \"LlmBackground\" | \"LlmInteractive\" | \"Coordinator\";", ts);
             Assert.Contains("  nextCursor?: number | null;", ts);
             string path = Path.Combine(RepoRoot(), "Docs", "omniscience-v3", "api-contracts.ts");
             string existing = File.Exists(path) ? File.ReadAllText(path).ReplaceLineEndings("\n") : "";

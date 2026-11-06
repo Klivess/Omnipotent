@@ -244,12 +244,14 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         }
     }
 
-    /// <summary>Shared JSON settings for kernel payloads and results.</summary>
+    /// <summary>Shared JSON settings for kernel payloads, results and stored documents. Enums are written by name, so
+    /// stored data survives enum reordering and reads the same as the API (numbers are still accepted on read).</summary>
     public static class KernelJson
     {
         public static readonly JsonSerializerOptions Options = new(JsonSerializerDefaults.Web)
         {
             WriteIndented = false,
+            Converters = { new System.Text.Json.Serialization.JsonStringEnumConverter() },
         };
     }
 }

@@ -22,6 +22,7 @@ namespace Omnipotent.Services.OmniscienceV3
     /// </summary>
     [OmniServiceTools("omniscience_v3", "Omniscience v3 (shadow mode beside v2): the rebuilt personal-intelligence engine. Engine state, jobs, modules and LLM usage.")]
     [OmniToolGroup("engine", "Omniscience v3 engine: status, background jobs (list, inspect, retry, cancel), modules and LLM usage with cache efficiency.")]
+    [OmniToolGroup("tactics", "Omniscience v3 tactics: list what can be run on a selection of people, messages or other data, start runs and read their results.")]
     public sealed class OmniscienceV3 : OmniService
     {
         public const string ShadowEnabledSetting = "OmniscienceV3_ShadowEnabled";

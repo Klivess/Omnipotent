@@ -137,6 +137,9 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             }, ct).ConfigureAwait(false);
 
             await registrar.WebSocketAsync(Prefix + "/stream", OmnisciencePerms.OverviewView, StreamAsync, ct).ConfigureAwait(false);
+
+            await new TacticsRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
+            await new DataRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
         }
 
         private async Task StreamAsync(HttpListenerContext context, WebSocket socket, NameValueCollection query, KMProfileManager.KMProfile? user)

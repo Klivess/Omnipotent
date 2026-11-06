@@ -64,6 +64,43 @@ namespace Omnipotent.Services.OmniscienceV3.Agent
             return await queries.CancelJobAsync(jobId, Actor, linked.Token).ConfigureAwait(false);
         }
 
+        // ── tactics ──────────────────────────────────────────────────────────────
+
+        [OmniTool("catalog", "Every tactic Omniscience can run, with what it accepts (selection kinds), its parameters (JSON Schema) and what it outputs. Optionally only tactics that accept the given kinds.", Group = "tactics")]
+        public IReadOnlyList<Kernel.Tactics.TacticDescriptor> TacticCatalog(
+            [OmniParam("Comma-separated selection kinds the tactic must accept, e.g. Person or Person,Message.")] string? accepts = null)
+        {
+            var kinds = (accepts ?? "").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Select(k => Enum.TryParse<Kernel.Tactics.SelectionKind>(k, true, out var kind) ? kind : throw new ArgumentException($"Unknown selection kind '{k}'."))
+                .ToList();
+            return host.Require().Tactics.Catalog(kinds);
+        }
+
+        [OmniTool("run", "Start a tactic run. selectionsJson is a JSON array of selections ({\"kind\":\"Person\",\"items\":[{\"id\":\"discord:123\"}]}); parametersJson follows the tactic's schema. Returns the run id; poll run_get for the result. Outbound tactics cannot be run from here.", Group = "tactics", Mutating = true)]
+        public async Task<string> TacticRunAsync(
+            [OmniParam("Tactic key from the catalog, e.g. x27.set_algebra.")] string tactic,
+            [OmniParam("JSON array of selections.")] string selectionsJson = "[]",
+            [OmniParam("JSON object of parameters.")] string parametersJson = "{}",
+            [OmniParam("Reason as of this instant (UTC epoch ms), or 0 for now.")] long asOfMs = 0,
+            CancellationToken ct = default)
+        {
+            var runner = host.Require().Tactics;
+            var descriptor = runner.Find(tactic)?.Descriptor ?? throw new KeyNotFoundException($"No tactic '{tactic}'.");
+            if (descriptor.Outbound) throw new InvalidOperationException($"{descriptor.Title} acts on the outside world and needs Klives's confirmation in the Omniscience UI.");
+            var selections = System.Text.Json.JsonSerializer.Deserialize<List<Kernel.Tactics.Selection>>(selectionsJson, ApiJson.Options) ?? new();
+            using var parameters = System.Text.Json.JsonDocument.Parse(string.IsNullOrWhiteSpace(parametersJson) ? "{}" : parametersJson);
+            using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, host.Stopping);
+            return await runner.StartAsync(tactic, new Kernel.Tactics.TacticInput(selections, parameters.RootElement.Clone(), asOfMs > 0 ? asOfMs : null), Actor, ct: linked.Token).ConfigureAwait(false);
+        }
+
+        [OmniTool("run_get", "A tactic run: state, current stage, progress, outputs (selections and data) and whether it is stale (its subjects changed since it ran).", Group = "tactics")]
+        public TacticRunDto TacticRunGet([OmniParam("Run id from run.")] string runId)
+        {
+            var runner = host.Require().Tactics;
+            var run = runner.Get(runId) ?? throw new KeyNotFoundException($"No run '{runId}'.");
+            return TacticsRoutes.ToDto(run, runner.IsStale(run));
+        }
+
         [OmniTool("llm_usage", "LLM usage by Omniscience v3 over a recent window: calls, failures, prompt/cached/completion tokens, cache hit rate and p50/p95 latency, grouped as asked.", Group = "engine")]
         public LlmSummaryDto LlmUsage(
             [OmniParam("Grouping.", Values = new[] { "WorkClass", "Module", "Purpose", "Model", "Outcome" })] string groupBy = "WorkClass",

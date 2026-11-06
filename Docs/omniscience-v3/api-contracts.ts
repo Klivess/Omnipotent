@@ -6,6 +6,24 @@ export interface ApiError {
   message: string;
 }
 
+export interface CohortDto {
+  cohortId: string;
+  name: string;
+  members: number;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface CohortSelectionDto {
+  cohort: CohortDto;
+  selection: Selection;
+}
+
+export interface DatasetCatalogDto {
+  datasets: DatasetDescriptor[];
+  dimensions: DimensionDefinition[];
+}
+
 export interface DatasetDescriptor {
   id: string;
   title: string;
@@ -16,10 +34,82 @@ export interface DatasetDescriptor {
   minorFiltered: boolean;
 }
 
+export type DayOfWeek = "Sunday" | "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday";
+
 export interface DimensionBinding {
   dimensionId: string;
   column: string;
 }
+
+export interface DimensionDefinition {
+  id: string;
+  title: string;
+  kind: DimensionKind;
+  group: string;
+  entityType?: string | null;
+}
+
+export type DimensionKind = "Time" | "Entity" | "Category" | "Number" | "Flag";
+
+export interface ExploreColumn {
+  id: string;
+  title: string;
+  kind: string;
+}
+
+export interface ExploreCoverage {
+  sources: string[];
+  fromMs?: number | null;
+  toMs?: number | null;
+  records: number;
+  sampled: boolean;
+}
+
+export interface ExploreFilter {
+  dimension: string;
+  op: FilterOp;
+  values: unknown[];
+}
+
+export interface ExploreQuery {
+  dataset: string;
+  filters: ExploreFilter[];
+  groupBy: string[];
+  measures: string[];
+  bucket: TimeBucket;
+  timeDimension?: string | null;
+  lens: TimeLens;
+  zone?: string | null;
+  asOfMs?: number | null;
+  limit: number;
+  cursor?: string | null;
+}
+
+export interface ExploreRecordsPage {
+  recordKind: string;
+  records: unknown[];
+  nextCursor?: string | null;
+  total: number;
+}
+
+export interface ExploreRecordsRequest {
+  drillToken: string;
+  narrow?: ExploreFilter[] | null;
+  limit: number;
+  cursor?: string | null;
+}
+
+export interface ExploreResult {
+  columns: ExploreColumn[];
+  rows: unknown[][];
+  asOfMs: number;
+  coverage: ExploreCoverage;
+  nextCursor?: string | null;
+  drillToken?: string | null;
+  explain: string;
+}
+
+export type FilterOp = "Eq" | "NotEq" | "In" | "NotIn" | "Between" | "Gte" | "Lte" | "Contains" | "IsNull" | "IsNotNull";
 
 export interface JobActionRequest {
   jobId: number;
@@ -63,7 +153,7 @@ export interface JobRecord {
   runId?: string | null;
 }
 
-export type Lane = "Cpu" | "Io" | "LlmBackground" | "LlmInteractive";
+export type Lane = "Cpu" | "Io" | "LlmBackground" | "LlmInteractive" | "Coordinator";
 
 export interface LaneJobsDto {
   lane: Lane;
@@ -174,11 +264,151 @@ export interface ModuleHealth {
   lastError?: string | null;
 }
 
+export interface Playbook {
+  id: string;
+  name: string;
+  definition: PlaybookDefinition;
+  trigger: PlaybookTrigger;
+  enabled: boolean;
+  lastRunMs?: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface PlaybookDefinition {
+  steps: PlaybookStep[];
+}
+
+export interface PlaybookListDto {
+  playbooks: Playbook[];
+}
+
+export interface PlaybookRunRecord {
+  playbookRunId: string;
+  playbookId: string;
+  triggerJson?: string | null;
+  state: string;
+  stepsJson?: string | null;
+  error?: string | null;
+  createdAtMs: number;
+  startedAtMs?: number | null;
+  finishedAtMs?: number | null;
+}
+
+export interface PlaybookRunRequest {
+  playbookId: string;
+}
+
+export interface PlaybookSaveRequest {
+  id?: string | null;
+  name: string;
+  definition: PlaybookDefinition;
+  trigger: PlaybookTrigger;
+  enabled: boolean;
+}
+
+export interface PlaybookStep {
+  tactic: string;
+  parameters?: unknown | null;
+  input?: PlaybookStepInput | null;
+}
+
+export interface PlaybookStepInput {
+  from: string;
+  step?: number | null;
+  output?: number | null;
+  selections?: Selection[] | null;
+}
+
+export interface PlaybookTrigger {
+  kind: PlaybookTriggerKind;
+  at?: string | null;
+  days?: DayOfWeek[] | null;
+  everyMs?: number | null;
+  topic?: string | null;
+  match?: Record<string, string> | null;
+  minIntervalMs?: number | null;
+}
+
+export type PlaybookTriggerKind = "Manual" | "Daily" | "Weekly" | "Every" | "Event";
+
+export interface PlaybookValidationDto {
+  problems: string[];
+  nextDueMs?: number | null;
+}
+
+export interface ReadModelCatalogDto {
+  models: ReadModelDescriptor[];
+}
+
+export interface ReadModelDescriptor {
+  id: string;
+  title: string;
+  requiredPermission: string;
+  schemaVersion: number;
+  stalenessTargetMs: number;
+  description: string;
+}
+
+export interface ReadModelDto {
+  model: string;
+  key: string;
+  version: number;
+  schemaVersion: number;
+  asOfMs: number;
+  sourceSeq: number;
+  computedAtMs: number;
+  body: unknown;
+}
+
+export interface RerunRequest {
+  runId: string;
+  parameters?: unknown | null;
+  asOfMs?: number | null;
+  clearAsOf: boolean;
+}
+
+export type RestrictedCapability = "FaceLabelling" | "Replica" | "PersonTargetedAlert" | "RoutineInference" | "IdentityFacts" | "TrackingSuggestion" | "ReplicaBasedTactic";
+
+export interface RunActionRequest {
+  runId: string;
+}
+
+export interface RunActionResultDto {
+  runId: string;
+  changed: boolean;
+  state: string;
+}
+
 export interface ScheduleDto {
   name: string;
   dailyAtLocal?: string | null;
   everyMs?: number | null;
 }
+
+export interface Selection {
+  kind: SelectionKind;
+  items: SelectionItem[];
+  origin?: string | null;
+  sampled: boolean;
+  totalBeforeSampling?: number | null;
+}
+
+export interface SelectionCombineRequest {
+  op: string;
+  a: Selection;
+  b?: Selection | null;
+  k?: number | null;
+  order?: SortOrder | null;
+}
+
+export interface SelectionItem {
+  id: string;
+  score?: number | null;
+  label?: string | null;
+}
+
+export type SelectionKind = "Person" | "Message" | "Conversation" | "Guild" | "Attachment" | "Face" | "FaceCluster" | "Assertion" | "TimeRange" | "ExploreDrill" | "Dataset" | "Question";
 
 export interface SetSettingRequest {
   key: string;
@@ -205,6 +435,8 @@ export interface SettingDto {
   max?: number | null;
   updatedAtMs?: number | null;
 }
+
+export type SortOrder = "ScoreDescending" | "ScoreAscending" | "Label" | "Id";
 
 export interface StoreHealthDto {
   name: string;
@@ -234,6 +466,90 @@ export interface StreamStatusDto {
   oldestEventId: number;
   newestEventId: number;
 }
+
+export interface TacticCatalogDto {
+  tactics: TacticDescriptor[];
+}
+
+export type TacticCategory = "Inquiry" | "Transform" | "Monitor" | "Social" | "Investigation" | "Outward";
+
+export interface TacticDescriptor {
+  key: string;
+  code: string;
+  title: string;
+  category: TacticCategory;
+  description: string;
+  accepts: SelectionKind[];
+  minSelections: number;
+  maxSelections: number;
+  parameterSchemaJson: string;
+  outputs: TacticOutputKind[];
+  lane: Lane;
+  requiredPermission: string;
+  outbound: boolean;
+  minorRestriction?: RestrictedCapability | null;
+  version: number;
+  typicalDurationMs: number;
+  typicalLlmCalls: number;
+}
+
+export interface TacticEstimate {
+  durationMs: number;
+  llmCalls: number;
+  items: number;
+  willSample: boolean;
+  note?: string | null;
+}
+
+export interface TacticOutput {
+  kind: TacticOutputKind;
+  selection?: Selection | null;
+  data?: unknown | null;
+  summary?: string | null;
+}
+
+export type TacticOutputKind = "Answer" | "Cohort" | "MessageSet" | "ImageSet" | "FactSet" | "Dataset" | "Timeline" | "Report" | "AlertRule" | "Reminder" | "ActionProposal";
+
+export interface TacticRunDto {
+  runId: string;
+  tactic: string;
+  tacticVersion: number;
+  actor: string;
+  state: string;
+  input: unknown;
+  asOfMs?: number | null;
+  currentStage?: string | null;
+  progress?: unknown | null;
+  outputs?: unknown | null;
+  error?: string | null;
+  parentRunId?: string | null;
+  playbookRunId?: string | null;
+  createdAtMs: number;
+  startedAtMs?: number | null;
+  finishedAtMs?: number | null;
+  stale: boolean;
+}
+
+export interface TacticRunPageDto {
+  items: TacticRunDto[];
+  nextCursor?: string | null;
+}
+
+export interface TacticRunRequest {
+  tactic: string;
+  selections: Selection[];
+  parameters?: unknown | null;
+  asOfMs?: number | null;
+  confirmationToken?: string | null;
+}
+
+export interface TacticRunStartedDto {
+  runId: string;
+}
+
+export type TimeBucket = "None" | "Hour" | "Day" | "Week" | "Month" | "Quarter" | "Year" | "HourOfDay" | "DayOfWeek";
+
+export type TimeLens = "Klives" | "Subject" | "Utc";
 
 export type V3Phase = "Disabled" | "Starting" | "Ready" | "Failed" | "Stopping";
 

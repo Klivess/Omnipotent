@@ -11,6 +11,9 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         LlmBackground,
         /// <summary>LLM work Klives is waiting for (Ask, inquiries, replica replies, tactics).</summary>
         LlmInteractive,
+        /// <summary>Jobs that only orchestrate other jobs and wait for them (playbook runs). They get their own workers,
+        /// so a coordinator waiting for a step can never hold the worker that step needs (starvation deadlock).</summary>
+        Coordinator,
     }
 
     /// <summary>Job lifecycle states as stored in intel.db.</summary>

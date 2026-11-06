@@ -143,4 +143,81 @@ namespace Omnipotent.Services.OmniscienceV3.Api
 
     [ApiContract]
     public sealed record SetSettingRequest(string Key, JsonElement Value);
+
+    // ── tactics, playbooks, selections ───────────────────────────────────────────
+
+    [ApiContract]
+    public sealed record TacticCatalogDto(IReadOnlyList<Kernel.Tactics.TacticDescriptor> Tactics);
+
+    [ApiContract]
+    public sealed record TacticRunRequest(string Tactic, IReadOnlyList<Kernel.Tactics.Selection> Selections, JsonElement? Parameters = null, long? AsOfMs = null, string? ConfirmationToken = null);
+
+    [ApiContract]
+    public sealed record TacticRunStartedDto(string RunId);
+
+    [ApiContract]
+    public sealed record TacticRunDto(
+        string RunId,
+        string Tactic,
+        int TacticVersion,
+        string Actor,
+        string State,
+        JsonElement Input,
+        long? AsOfMs,
+        string? CurrentStage,
+        JsonElement? Progress,
+        JsonElement? Outputs,
+        string? Error,
+        string? ParentRunId,
+        string? PlaybookRunId,
+        long CreatedAtMs,
+        long? StartedAtMs,
+        long? FinishedAtMs,
+        bool Stale);
+
+    [ApiContract]
+    public sealed record TacticRunPageDto(IReadOnlyList<TacticRunDto> Items, string? NextCursor);
+
+    [ApiContract]
+    public sealed record RunActionRequest(string RunId);
+
+    [ApiContract]
+    public sealed record RerunRequest(string RunId, JsonElement? Parameters = null, long? AsOfMs = null, bool ClearAsOf = false);
+
+    [ApiContract]
+    public sealed record RunActionResultDto(string RunId, bool Changed, string State);
+
+    [ApiContract]
+    public sealed record SelectionCombineRequest(string Op, Kernel.Tactics.Selection A, Kernel.Tactics.Selection? B = null, int? K = null, Kernel.Tactics.SortOrder? Order = null);
+
+    [ApiContract]
+    public sealed record PlaybookSaveRequest(string? Id, string Name, Kernel.Tactics.PlaybookDefinition Definition, Kernel.Tactics.PlaybookTrigger Trigger, bool Enabled);
+
+    [ApiContract]
+    public sealed record PlaybookValidationDto(IReadOnlyList<string> Problems, long? NextDueMs);
+
+    [ApiContract]
+    public sealed record PlaybookRunRequest(string PlaybookId);
+
+    [ApiContract]
+    public sealed record PlaybookListDto(IReadOnlyList<Kernel.Tactics.Playbook> Playbooks);
+
+    [ApiContract]
+    public sealed record CohortDto(string CohortId, string Name, int Members, long CreatedAtMs, long UpdatedAtMs);
+
+    [ApiContract]
+    public sealed record CohortSelectionDto(CohortDto Cohort, Kernel.Tactics.Selection Selection);
+
+    // ── read models, Explore ─────────────────────────────────────────────────────
+
+    /// <summary>A served read model. Freshness is <see cref="ComputedAtMs"/> against the model's staleness target in
+    /// the catalogue (computed by the client, so the response itself never goes stale in a cache).</summary>
+    [ApiContract]
+    public sealed record ReadModelDto(string Model, string Key, long Version, int SchemaVersion, long AsOfMs, long SourceSeq, long ComputedAtMs, JsonElement Body);
+
+    [ApiContract]
+    public sealed record ReadModelCatalogDto(IReadOnlyList<ReadModels.ReadModelDescriptor> Models);
+
+    [ApiContract]
+    public sealed record DatasetCatalogDto(IReadOnlyList<DatasetDescriptor> Datasets, IReadOnlyList<DimensionDefinition> Dimensions);
 }

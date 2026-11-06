@@ -44,7 +44,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
 
         // ── synthetic v2 data ────────────────────────────────────────────────────
 
-        private static string Snowflake(long ms, int seq = 0) => ((((ulong)(ms - Instant.DiscordEpochMs)) << 22) | (ulong)seq).ToString();
+        private static string Snowflake(long ms, int seq = 0) => ((((ulong)(ms - Instant.DiscordEpochMs)) << 22) | (uint)seq).ToString();
 
         private static readonly string M1 = Snowflake(T0, 1), M2 = Snowflake(T0 + Minute, 2), M3 = Snowflake(T0 + 2 * Minute, 3),
             M4 = Snowflake(T0 + 3 * Minute, 4), M7 = Snowflake(T0 + 4 * Minute, 7), M6 = Snowflake(T0 + 5 * Minute, 6);

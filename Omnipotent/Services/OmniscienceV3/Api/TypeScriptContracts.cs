@@ -19,7 +19,12 @@ namespace Omnipotent.Services.OmniscienceV3.Api
     public static class TypeScriptContracts
     {
         /// <summary>Contract types that live outside the Api namespace (kernel records returned as-is).</summary>
-        public static readonly IReadOnlyList<Type> ExtraRoots = new[] { typeof(JobPage), typeof(JobRecord) };
+        public static readonly IReadOnlyList<Type> ExtraRoots = new[]
+        {
+            typeof(JobPage), typeof(JobRecord),
+            typeof(Kernel.Tactics.TacticEstimate), typeof(Kernel.Tactics.PlaybookRunRecord), typeof(Kernel.Tactics.TacticOutput),
+            typeof(Kernel.Explore.ExploreQuery), typeof(Kernel.Explore.ExploreResult), typeof(Kernel.Explore.ExploreRecordsRequest), typeof(Kernel.Explore.ExploreRecordsPage),
+        };
 
         private static readonly JsonNamingPolicy Naming = JsonNamingPolicy.CamelCase;
         private static readonly NullabilityInfoContext Nullability = new();
