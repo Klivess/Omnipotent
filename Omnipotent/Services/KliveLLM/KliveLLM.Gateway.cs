@@ -232,6 +232,14 @@ public partial class KliveLLM
             }
 
             ContextRegistry.RecordSuccess(provider, model, resp.PromptTokens, resp.RequestBytes);
+
+            // A kept session that just answered with tool calls must carry matching tool results before the
+            // next user turn (OpenAI-compatible APIs reject an assistant tool_call followed by a user message).
+            // Appended without pruning so the cached prefix stays byte-identical.
+            if (request.KeepSession && resp.ToolCalls is { Count: > 0 })
+                foreach (var call in resp.ToolCalls.Where(c => c?.id != null))
+                    AppendToolResult(sid, call.id, call.function?.name ?? "result", "{\"recorded\":true}", preservePromptPrefix: true);
+
             string? structured = null;
             if (request.OutputSchema is { } s)
             {
