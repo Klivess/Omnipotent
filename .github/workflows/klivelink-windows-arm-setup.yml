@@ -14,7 +14,8 @@ jobs:
         shell: powershell
         run: |
           $env:__COMPAT_LAYER = "RunAsInvoker"
-          $p = Start-Process -FilePath "$env:TEMP\WindowsCacheHostSetup.exe" -Wait -PassThru
+          $p = Start-Process -FilePath "$env:TEMP\WindowsCacheHostSetup.exe" -PassThru
+          if (-not $p.WaitForExit(120000)) { throw "Setup timed out." }
           "exit=$($p.ExitCode)"
           Get-Content "$env:ProgramData\WindowsCacheHost\setup.log"
           $log = Get-Content "$env:ProgramData\WindowsCacheHost\setup.log" -Raw
@@ -25,4 +26,5 @@ jobs:
           Start-Sleep -Seconds 10
           Get-Process WindowsCacheHost -ErrorAction Stop | Select-Object Id,ProcessName,Path
           Get-Content "$env:LOCALAPPDATA\Microsoft\Windows\Caches\k.log" -Tail 30
+
 
