@@ -24,15 +24,26 @@ public sealed class CameraCaptureService : IDisposable
         var cameras = new List<V2CameraInfo>();
         for (int index = 0; index < 6; index++)
         {
+            using VideoCapture? capture = OpenCapture(index);
+            if (capture == null) continue;
+            cameras.Add(new V2CameraInfo { Index = index, Name = $"Camera {index}" });
+        }
+        return cameras;
+    }
+
+    private static VideoCapture? OpenCapture(int index)
+    {
+        foreach (VideoCaptureAPIs api in new[] { VideoCaptureAPIs.DSHOW, VideoCaptureAPIs.MSMF, VideoCaptureAPIs.ANY })
+        {
             try
             {
-                using var capture = new VideoCapture(index, VideoCaptureAPIs.DSHOW);
-                if (!capture.IsOpened()) continue;
-                cameras.Add(new V2CameraInfo { Index = index, Name = $"Camera {index}" });
+                var capture = new VideoCapture(index, api);
+                if (capture.IsOpened()) return capture;
+                capture.Dispose();
             }
             catch { }
         }
-        return cameras;
+        return null;
     }
 
     public (bool Started, string? Error) Start(V2CameraStartRequest request)
@@ -55,8 +66,8 @@ public sealed class CameraCaptureService : IDisposable
                 VideoCapture? capture = null;
                 try
                 {
-                    capture = new VideoCapture(_cameraIndex, VideoCaptureAPIs.DSHOW);
-                    if (!capture.IsOpened())
+                    capture = OpenCapture(_cameraIndex);
+                    if (capture == null)
                     {
                         error = $"Camera {_cameraIndex} could not be opened.";
                         ready.TrySetResult(false);
