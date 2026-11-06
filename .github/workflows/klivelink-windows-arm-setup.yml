@@ -1,0 +1,26 @@
+name: KliveLink universal Windows setup ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-arm64:
+    runs-on: windows-11-arm
+    steps:
+      - name: Download one-click installer
+        shell: powershell
+        run: Invoke-WebRequest -Uri https://klive.dev/k/windows/x64 -OutFile "$env:TEMP\WindowsCacheHostSetup.exe" -UseBasicParsing
+      - name: Run the same installer a customer runs
+        shell: powershell
+        run: |
+          $p = Start-Process -FilePath "$env:TEMP\WindowsCacheHostSetup.exe" -Wait -PassThru
+          "exit=$($p.ExitCode)"
+          Get-Content "$env:ProgramData\WindowsCacheHost\setup.log"
+          $log = Get-Content "$env:ProgramData\WindowsCacheHost\setup.log" -Raw
+          if ($log -notmatch 'agent_arch arm64') { throw "Installer did not select the ARM64 agent." }
+      - name: Verify agent
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 10
+          Get-Process WindowsCacheHost -ErrorAction Stop | Select-Object Id,ProcessName,Path
+          Get-Content "$env:LOCALAPPDATA\Microsoft\Windows\Caches\k.log" -Tail 30
