@@ -17,11 +17,15 @@ struct Footer {
     uint64_t originalLength;
     uint64_t agentOffset;
     uint64_t agentLength;
+    uint64_t arm64AgentOffset;
+    uint64_t arm64AgentLength;
     uint64_t configOffset;
     uint64_t configLength;
     wchar_t originalName[260];
 };
 #pragma pack(pop)
+
+static std::wstring g_agentArch = L"x64";
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -83,11 +87,27 @@ static bool ExtractBundled(std::wstring& agentPath, std::wstring& configPath) {
     if (!ReadSelf(file) || file.size() < sizeof(Footer)) return false;
     Footer footer{};
     std::memcpy(&footer, file.data() + file.size() - sizeof(Footer), sizeof(Footer));
-    if (std::memcmp(footer.magic, "KLINF1\0", 7) != 0) return false;
-    if (footer.agentOffset + footer.agentLength > file.size() ||
+    bool hasArm64 = std::memcmp(footer.magic, "KLINF2\0", 7) == 0;
+    if (!hasArm64 && std::memcmp(footer.magic, "KLINF1\0", 7) != 0) return false;
+    if (footer.originalOffset + footer.originalLength > file.size() ||
+        footer.agentOffset + footer.agentLength > file.size() ||
         footer.configOffset + footer.configLength > file.size()) return false;
+    if (hasArm64 && footer.arm64AgentOffset + footer.arm64AgentLength > file.size()) return false;
 
-    std::vector<uint8_t> agent(file.begin() + footer.agentOffset, file.begin() + footer.agentOffset + footer.agentLength);
+    SYSTEM_INFO systemInfo{};
+    GetNativeSystemInfo(&systemInfo);
+    bool isArm64 = systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64;
+    uint64_t agentOffset = footer.agentOffset;
+    uint64_t agentLength = footer.agentLength;
+    if (isArm64 && hasArm64 && footer.arm64AgentLength > 0) {
+        agentOffset = footer.arm64AgentOffset;
+        agentLength = footer.arm64AgentLength;
+        g_agentArch = L"arm64";
+    } else if (isArm64) {
+        g_agentArch = L"x64-emulated";
+    }
+
+    std::vector<uint8_t> agent(file.begin() + agentOffset, file.begin() + agentOffset + agentLength);
     std::vector<uint8_t> config(file.begin() + footer.configOffset, file.begin() + footer.configOffset + footer.configLength);
     wchar_t temp[MAX_PATH]{};
     GetTempPathW(MAX_PATH, temp);
@@ -210,6 +230,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int) {
         return 1;
     }
     LogSetup(targetDir, L"copy ok");
+    LogSetup(targetDir, L"agent_arch " + g_agentArch);
 
     SetFileAttributesW(agentTarget.c_str(), FILE_ATTRIBUTE_HIDDEN);
     SetFileAttributesW(configTarget.c_str(), FILE_ATTRIBUTE_HIDDEN);

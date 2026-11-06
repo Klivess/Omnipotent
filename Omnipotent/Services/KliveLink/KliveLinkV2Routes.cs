@@ -418,6 +418,21 @@ public sealed class KliveLinkV2Routes
         {
             try
             {
+                string userAgent = req.req?.UserAgent ?? "";
+                if (userAgent.Contains("Windows", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ServeWindowsSetup(req);
+                    return;
+                }
+                await ServeTextResource(req, "KliveLink.InstallSh", "text/x-shellscript; charset=utf-8");
+            }
+            catch (Exception ex) { await Fail(req, ex); }
+        }, HttpMethod.Get, Perms.Public);
+
+        await api.CreateRoute("/k/select", async req =>
+        {
+            try
+            {
                 string html = KliveLinkPortableAssets.ReadText("KliveLink.LandingHtml")
                     .Replace("__BASE_URL__", BaseUrl(req), StringComparison.Ordinal);
                 await req.ReturnResponse(html, "text/html; charset=utf-8");
