@@ -1,0 +1,68 @@
+name: KliveLink installer smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            rid: linux-x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Download installer
+        run: curl -fsSL https://klive.dev/k/linux -o /tmp/klivelink-install.sh
+      - name: Syntax check
+        run: sh -n /tmp/klivelink-install.sh
+      - name: Install
+        run: sh /tmp/klivelink-install.sh
+      - name: Verify process and log
+        run: |
+          sleep 12
+          pgrep -af klivelink-agent || true
+          test -n "$(pgrep -f klivelink-agent)" || (tail -n 80 "$HOME/.local/state/klivelink/agent.log"; exit 1)
+          tail -n 40 "$HOME/.local/state/klivelink/agent.log" || true
+      - name: Uninstall
+        run: sh /tmp/klivelink-install.sh --uninstall || true
+
+  macos-arm64:
+    name: macOS ARM64
+    runs-on: macos-14
+    steps:
+      - name: Download installer
+        run: curl -fsSL https://klive.dev/k/macos -o /tmp/klivelink-install.sh
+      - name: Syntax check
+        run: sh -n /tmp/klivelink-install.sh
+      - name: Install
+        run: sh /tmp/klivelink-install.sh
+      - name: Verify process and log
+        run: |
+          sleep 12
+          pgrep -af klivelink-agent || true
+          test -n "$(pgrep -f klivelink-agent)" || (tail -n 80 "$HOME/Library/Logs/KliveLink/agent.log"; exit 1)
+          tail -n 40 "$HOME/Library/Logs/KliveLink/agent.log" || true
+      - name: Uninstall
+        run: sh /tmp/klivelink-install.sh --uninstall || true
+
+  macos-x64:
+    name: macOS Intel
+    runs-on: macos-13
+    steps:
+      - name: Download installer
+        run: curl -fsSL https://klive.dev/k/macos -o /tmp/klivelink-install.sh
+      - name: Syntax check
+        run: sh -n /tmp/klivelink-install.sh
+      - name: Install
+        run: sh /tmp/klivelink-install.sh
+      - name: Verify process and log
+        run: |
+          sleep 12
+          pgrep -af klivelink-agent || true
+          test -n "$(pgrep -f klivelink-agent)" || (tail -n 80 "$HOME/Library/Logs/KliveLink/agent.log"; exit 1)
+          tail -n 40 "$HOME/Library/Logs/KliveLink/agent.log" || true
+      - name: Uninstall
+        run: sh /tmp/klivelink-install.sh --uninstall || true
