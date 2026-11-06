@@ -29,7 +29,7 @@ Another live session commits and pushes on master from the main folder, so never
 |---|---|---|
 | 0 | Branch, docs, contracts | done |
 | 1 | Foundations: temporal ✓, storage ✓, kernel ✓, LLM gateway ✓, ML runtime ✓, policy ✓, API skeleton ✓, legacy importer ✓, synthetic corpus + perf harness ✓ | done (contracts to freeze) |
-| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | not started |
+| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | running: WS-A to WS-D started 2026-11-06; WS-E not started |
 | 3 | Integration, shadow run, parity gates, cutover | not started |
 
 ## Log
@@ -86,4 +86,17 @@ Another live session commits and pushes on master from the main folder, so never
    - **WS-B** knowledge, deduction, inquiries and tactics.
    - **WS-D** replica.
    - **WS-E** the website UI on `api-contracts.ts`.
+
+   WS-A to WS-D were started on 2026-11-06, each in its own session and worktree, all cut from 3dc87df:
+
+   | Workstream | Branch | Report |
+   |---|---|---|
+   | WS-A | `claude/omniscience-v3-ws-a-878bce` | `Docs/omniscience-v3/ws-a.md` |
+   | WS-B | `claude/omniscience-v3-ws-b-49da68` | `Docs/omniscience-v3/ws-b.md` |
+   | WS-C | `claude/omniscience-v3-ws-c-99fa83` | `Docs/omniscience-v3/ws-c.md` |
+   | WS-D | `claude/omniscience-v3-ws-d-21c7c3` | `Docs/omniscience-v3/ws-d.md` |
+
+   Each worktree is `.claude/worktrees/<branch name without the claude/ prefix>`.
+
+   Workstreams commit only on their own branch. The coordinating session merges them into `omniscience-v3` in the R7 order, and only when Klives says to. WS-E (in the website repo) has not started.
 2. Phase 3: shadow run on live data, parity gates, Quality Lab gates, cutover.
