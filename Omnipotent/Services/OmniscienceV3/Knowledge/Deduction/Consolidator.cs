@@ -97,7 +97,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             foreach (var group in live.GroupBy(c => c.Attribute, StringComparer.Ordinal))
             {
                 var def = Attributes.Get(group.Key);
-                if (group.Key == "age") continue; // policy evidence only (kn_age_evidence): never an assertion
+                // Time-derived statements (an age, a school year) are anchors for the birth interval (kn_age_evidence, policy only):
+                // the current value is computed at query time, never stored as a static fact (plan T2, F026/F208).
+                if (group.Key is "age" or "school_year" or "birth_interval") continue;
                 if (Attributes.IsBlockedFor(group.Key, band)) { blocked.Add(group.Key); continue; }
                 var episodes = BuildEpisodes(def, group.ToList());
                 foreach (var ep in episodes)
@@ -416,6 +418,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             JsonElement? detail = JsonSerializer.SerializeToElement(new
             {
                 nameKind = top.NameKind,
+                age = def.Id == "birthday" ? top.Age : null,
                 plan = top.Plan,
                 planUpdates = statusChange.Count == 0 ? null : statusChange,
                 promiser = top.PromiserPersonId,
