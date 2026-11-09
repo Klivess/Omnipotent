@@ -136,6 +136,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
             }
 
             await MaybeScheduleIvfAsync(ct).ConfigureAwait(false);
+            // The outbox is a short-lived queue: a consumer more than a week behind rebuilds from the label sets instead.
+            await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "DELETE FROM classify_outbox WHERE at_ms < $cut",
+                ("$cut", Context.Clock.NowMs - 7 * 86_400_000L)), ct).ConfigureAwait(false);
             await RefreshHealthAsync(ct).ConfigureAwait(false);
             return System.Text.Json.JsonSerializer.Serialize(new { cursor, maxSeq, processed, embedded, labelled, caughtUp = cursor >= maxSeq });
         }
@@ -373,6 +376,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                     ON CONFLICT(item_kind, item_id, task, model_version) DO UPDATE SET item_version=excluded.item_version, label=excluded.label, probability=excluded.probability,
                         abstained=excluded.abstained, signals_json=excluded.signals_json, as_of_ms=excluded.as_of_ms, source_seq=excluded.source_seq
                     """, "$i", "$v", "$t", "$l", "$p", "$ab", "$sj", "$mv", "$a", "$s");
+                using var outbox = new PreparedStatement(c, tx, "INSERT INTO classify_outbox(message_id, labelset, at_ms) VALUES($m,$l,$t)", "$m", "$l", "$t");
                 using var lang = new PreparedStatement(c, tx, """
                     INSERT INTO classify_author_lang(author_identity_id, lang, n) VALUES($a,$g,$d)
                     ON CONFLICT(author_identity_id, lang) DO UPDATE SET n=MAX(0, n + excluded.n)
@@ -392,6 +396,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                         }
                     }
                     put.Run(w.Id, w.Labelset, w.Version, w.Hash, w.Codes, w.Gate, now, w.Seq);
+                    if (w.Labelset == priorSet) outbox.Run(w.Id, w.Labelset, now);
                     foreach (var f in w.Details)
                         detail.Run(w.Id, w.Version, f.Task, f.Label ?? f.TopLabel, f.Probability, f.Abstained ? 1 : 0, LabelCodec.SignalsJson(f.Votes), $"a2.ls{w.Labelset}", now, w.Seq);
                 }

@@ -6,6 +6,20 @@ export interface ApiError {
   message: string;
 }
 
+export interface ClassifyCorrectRequest {
+  messageId: string;
+  task: string;
+  label: string;
+  note?: string | null;
+}
+
+export interface ClassifyCorrectResultDto {
+  messageId: string;
+  task: string;
+  label: string;
+  queued: boolean;
+}
+
 export interface CohortDto {
   cohortId: string;
   name: string;
@@ -17,6 +31,31 @@ export interface CohortDto {
 export interface CohortSelectionDto {
   cohort: CohortDto;
   selection: Selection;
+}
+
+export interface ConceptDto {
+  conceptId: string;
+  name: string;
+  description?: string | null;
+  state: string;
+  headVersion?: number | null;
+  threshold?: number | null;
+  hits: number;
+  updatedAtMs: number;
+}
+
+export interface ConceptListDto {
+  concepts: ConceptDto[];
+}
+
+export interface CorpusTotalsDto {
+  messages: number;
+  people: number;
+  identities: number;
+  conversations: number;
+  guilds: number;
+  attachments: number;
+  sources: number;
 }
 
 export interface DatasetCatalogDto {
@@ -32,6 +71,12 @@ export interface DatasetDescriptor {
   recordKind: string;
   requiredPermission: string;
   minorFiltered: boolean;
+}
+
+export interface DayCountDto {
+  day: string;
+  msgs: number;
+  authored: number;
 }
 
 export type DayOfWeek = "Sunday" | "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday";
@@ -50,6 +95,80 @@ export interface DimensionDefinition {
 }
 
 export type DimensionKind = "Time" | "Entity" | "Category" | "Number" | "Flag";
+
+export interface DirectoryPageDto {
+  items: PersonCardDto[];
+  nextCursor?: string | null;
+  asOfMs?: number | null;
+}
+
+export type DirectorySort = "LastSeen" | "Messages" | "Recent" | "Name";
+
+export interface DossierCoverageDto {
+  platforms: string[];
+  conversations: number;
+  guilds: number;
+  firstMs?: number | null;
+  lastMs?: number | null;
+}
+
+export interface DossierDto {
+  personId: string;
+  displayName: string;
+  isSelf: boolean;
+  tier: string;
+  pinned: boolean;
+  ageBand: string;
+  restricted: boolean;
+  names: NameSpanDto[];
+  identities: IdentitySummaryDto[];
+  activity: PersonActivityDto;
+  series: DayCountDto[];
+  hours?: number[] | null;
+  weekdays?: number[] | null;
+  zone?: ZoneReadingDto | null;
+  zoneHistory?: ZoneReadingDto[] | null;
+  labels: LabelMixDto;
+  languages: RankedCountDto[];
+  conversations: RankedCountDto[];
+  guilds: RankedCountDto[];
+  partners: PartnerSummaryDto[];
+  facts: DossierFactDto[];
+  coverage: DossierCoverageDto;
+  today: string;
+  newestEvidenceMs: number;
+  staleEvidence: boolean;
+}
+
+export interface DossierFactDto {
+  assertionId: string;
+  attribute: string;
+  value?: string | null;
+  status: string;
+  probability?: number | null;
+  validFromEarliestMs?: number | null;
+  validFromLatestMs?: number | null;
+  validToEarliestMs?: number | null;
+  validToLatestMs?: number | null;
+  assertedAtMs?: number | null;
+  recordedAtMs: number;
+  modality?: string | null;
+  sourceKind?: string | null;
+}
+
+export interface EngineHealthDto {
+  modules: ModuleBacklogDto[];
+  stores: StoreSizeDto[];
+  jobsByState: Record<string, number>;
+  llmCallsHour: number;
+  llmFailuresHour: number;
+  llmCacheEfficiencyHour: number;
+  encoder?: unknown | null;
+  messageVectors: number;
+  rollupDirty: number;
+  corpusSeq: number;
+  problems: string[];
+}
 
 export interface ExploreColumn {
   id: string;
@@ -111,6 +230,14 @@ export interface ExploreResult {
 
 export type FilterOp = "Eq" | "NotEq" | "In" | "NotIn" | "Between" | "Gte" | "Lte" | "Contains" | "IsNull" | "IsNotNull";
 
+export interface IdentitySummaryDto {
+  identityId: string;
+  platform: string;
+  kind: string;
+  firstSeenMs: number;
+  lastSeenMs: number;
+}
+
 export interface JobActionRequest {
   jobId: number;
 }
@@ -151,6 +278,13 @@ export interface JobRecord {
   finishedAtMs?: number | null;
   parentJobId?: number | null;
   runId?: string | null;
+}
+
+export interface LabelMixDto {
+  recent: Record<string, Record<string, number>>;
+  baseline: Record<string, Record<string, number>>;
+  recentAnswered: Record<string, number>;
+  labelset?: number | null;
 }
 
 export type Lane = "Cpu" | "Io" | "LlmBackground" | "LlmInteractive" | "Coordinator";
@@ -227,6 +361,33 @@ export interface MeasureDescriptor {
   unit: string;
 }
 
+export interface MessageLabelsDto {
+  messageId: string;
+  labelset: number;
+  itemVersion: number;
+  gate?: string | null;
+  labels: PackedLabelDto[];
+  asOfMs: number;
+}
+
+export interface MessageLabelsPageDto {
+  items: MessageLabelsDto[];
+  activeLabelset?: number | null;
+}
+
+export interface ModuleBacklogDto {
+  moduleId: string;
+  enabled: boolean;
+  watermark: number;
+  backlog: number;
+  dirty: number;
+  queued: number;
+  leased: number;
+  dead: number;
+  lastSucceededMs?: number | null;
+  lastError?: string | null;
+}
+
 export interface ModuleDto {
   id: string;
   version: number;
@@ -262,6 +423,97 @@ export interface ModuleHealth {
   lastSucceededMs?: number | null;
   lastFailedMs?: number | null;
   lastError?: string | null;
+}
+
+export interface NameSpanDto {
+  kind: string;
+  value: string;
+  platform: string;
+  fromMs: number;
+  toMs?: number | null;
+}
+
+export interface OverviewDayDto {
+  day: string;
+  msgs: number;
+  people: number;
+}
+
+export interface OverviewDto {
+  totals: CorpusTotalsDto;
+  series: OverviewDayDto[];
+  labels30: Record<string, Record<string, number>>;
+  topPeople30: RankedCountDto[];
+  topGuilds30: RankedCountDto[];
+  topConversations30: RankedCountDto[];
+  sources: SourceStatusDto[];
+  platforms: Record<string, number>;
+  firstMs?: number | null;
+  lastMs?: number | null;
+  labelset?: number | null;
+  today: string;
+  corpusSeq: number;
+}
+
+export interface PackedLabelDto {
+  task: string;
+  label: string;
+  probability: number;
+  abstained: boolean;
+}
+
+export interface PartnerSummaryDto {
+  personId: string;
+  name: string;
+  repliesOut: number;
+  repliesIn: number;
+  mentionsOut: number;
+  mentionsIn: number;
+  dmOut: number;
+  dmIn: number;
+  reactionsOut: number;
+  reactionsIn: number;
+  activeDays: number;
+  reciprocity: number;
+  medianReplyBucketOut?: number | null;
+  medianReplyBucketIn?: number | null;
+}
+
+export interface PersonActivityDto {
+  firstMs?: number | null;
+  lastMs?: number | null;
+  msgs: number;
+  msgs30: number;
+  msgs90: number;
+  msgs365: number;
+  activeDays: number;
+  activeDays30: number;
+  perActiveDay: number;
+  deleted: number;
+  edited: number;
+  replies: number;
+  attachments: number;
+  links: number;
+  dmShare: number;
+  reactionsGiven: number;
+  mentionsMade: number;
+}
+
+export interface PersonCardDto {
+  personId: string;
+  displayName: string;
+  isSelf: boolean;
+  tier: string;
+  pinned: boolean;
+  ageBand: string;
+  platforms: string[];
+  firstSeenMs?: number | null;
+  lastSeenMs?: number | null;
+  msgs: number;
+  msgs30: number;
+  msgs90: number;
+  topGuild?: string | null;
+  sentiment90?: Record<string, number> | null;
 }
 
 export interface Playbook {
@@ -337,6 +589,12 @@ export interface PlaybookValidationDto {
   nextDueMs?: number | null;
 }
 
+export interface RankedCountDto {
+  id: string;
+  name: string;
+  count: number;
+}
+
 export interface ReadModelCatalogDto {
   models: ReadModelDescriptor[];
 }
@@ -384,6 +642,28 @@ export interface ScheduleDto {
   name: string;
   dailyAtLocal?: string | null;
   everyMs?: number | null;
+}
+
+export interface ScopeCardDto {
+  id: string;
+  kind: string;
+  title: string;
+  platform?: string | null;
+  guildId?: string | null;
+  guildName?: string | null;
+  nameHistory: NameSpanDto[];
+  msgs: number;
+  msgs30: number;
+  msgs90: number;
+  firstMs?: number | null;
+  lastMs?: number | null;
+  series: DayCountDto[];
+  topPeople90: RankedCountDto[];
+  people90: number;
+  labels90: Record<string, Record<string, number>>;
+  channels?: RankedCountDto[] | null;
+  labelset?: number | null;
+  today: string;
 }
 
 export interface Selection {
@@ -438,6 +718,16 @@ export interface SettingDto {
 
 export type SortOrder = "ScoreDescending" | "ScoreAscending" | "Label" | "Id";
 
+export interface SourceStatusDto {
+  sourceId: string;
+  platform: string;
+  kind: string;
+  label?: string | null;
+  status: string;
+  detail?: string | null;
+  updatedAtMs: number;
+}
+
 export interface StoreHealthDto {
   name: string;
   fileBytes: number;
@@ -445,6 +735,13 @@ export interface StoreHealthDto {
   pendingWrites: number;
   committedBatches: number;
   lastCommitMs: number;
+}
+
+export interface StoreSizeDto {
+  name: string;
+  fileBytes: number;
+  walBytes: number;
+  pendingWrites: number;
 }
 
 export interface StreamEventDto {
@@ -547,6 +844,20 @@ export interface TacticRunStartedDto {
   runId: string;
 }
 
+export interface TaskCatalogDto {
+  tasks: TaskCatalogEntryDto[];
+}
+
+export interface TaskCatalogEntryDto {
+  id: string;
+  title: string;
+  question: string;
+  labels: string[];
+  defaultLabel?: string | null;
+  dimensionId?: string | null;
+  contextMatters: boolean;
+}
+
 export type TimeBucket = "None" | "Hour" | "Day" | "Week" | "Month" | "Quarter" | "Year" | "HourOfDay" | "DayOfWeek";
 
 export type TimeLens = "Klives" | "Subject" | "Utc";
@@ -567,4 +878,13 @@ export interface V3StatusDto {
   llm?: LlmStatusDto | null;
   stream?: StreamStatusDto | null;
   routes: string[];
+}
+
+export interface ZoneReadingDto {
+  zone?: string | null;
+  offsetMinutes?: number | null;
+  confidence: number;
+  method: string;
+  month: string;
+  alternatives: string[];
 }

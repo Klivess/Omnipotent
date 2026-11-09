@@ -40,6 +40,9 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                 var rt = host.Require();
                 var row = rt.Host.ReadModels.Get(model, key)
                           ?? throw new ApiException(HttpStatusCode.NotFound, "not_built", $"'{descriptor.Title}' has not been built for '{key}' yet; it is computed in the background.");
+                // Defence in depth: a model whose body depends on policy is re-filtered with the current policy when served.
+                foreach (var filter in rt.Host.Modules.OfType<IReadModelServingFilter>().Where(f => f.Handles(model)))
+                    row = row with { BodyJson = filter.Filter(row, rt.Host.Policy, rt.Clock.NowMs) };
                 return ServeAsync(req, row);
             }, ct).ConfigureAwait(false);
 

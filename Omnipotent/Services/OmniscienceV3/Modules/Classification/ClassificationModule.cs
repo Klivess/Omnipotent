@@ -195,6 +195,16 @@ CREATE TABLE classify_concepts(
   updated_at_ms INTEGER NOT NULL
 );
 """),
+            // Label changes of the active label set, for consumers that aggregate labels (rollups): written with the labels.
+            new Migration(ModuleId, 2, "label outbox", """
+CREATE TABLE classify_outbox(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  message_id TEXT NOT NULL,
+  labelset INTEGER NOT NULL,
+  at_ms INTEGER NOT NULL
+);
+CREATE INDEX ix_classify_outbox_time ON classify_outbox(at_ms);
+"""),
         };
 
         // ── kernel hooks ─────────────────────────────────────────────────────────

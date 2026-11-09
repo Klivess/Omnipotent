@@ -122,6 +122,8 @@ namespace Omnipotent.Services.OmniscienceV3
             new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
             // WS-C: classification, rollups, projections, Explore and signals.
             new Modules.Classification.ClassificationModule(),
+            new Modules.Rollups.RollupModule(),
+            new Modules.Projections.ProjectionModule(),
         };
 
         private Task<KliveLLM.KliveLLM?> ResolveKliveLlmAsync() =>
