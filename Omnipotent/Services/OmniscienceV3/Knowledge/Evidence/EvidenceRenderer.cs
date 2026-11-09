@@ -24,7 +24,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         bool Deleted,
         bool NonAuthored,
         string? AuthorZoneId,
-        long IngestSeq);
+        long IngestSeq,
+        string? AttachmentText = null);
 
     /// <summary>
     /// Renders corpus messages for an LLM (plan T3 and the F-LLM injection rule). Every line carries its slice-local reference

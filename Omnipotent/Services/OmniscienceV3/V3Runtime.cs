@@ -71,7 +71,7 @@ namespace Omnipotent.Services.OmniscienceV3
                 var llm = new OmniLlm(options.LlmClient, stores.Intel, options.Clock, new TokenEstimator());
                 var gate = new LlmBackgroundGate(llm);
                 var models = new ModelHub(options.Paths.Models, http, options.Clock, options.Log);
-                host = new ModuleHost(stores, options.Clock, options.Kernel, options.Log, options.LogError, gate, new KernelServices { Llm = llm, Models = models });
+                host = new ModuleHost(stores, options.Clock, options.Kernel, options.Log, options.LogError, gate, new KernelServices { Llm = llm, Models = models, Policy = new Knowledge.Policy.EvidencePolicyOracle(new Knowledge.Policy.OperatorPolicyOracle(stores), stores, options.Clock) });
                 var registered = host;
                 // The tactic runner is a core module: its catalogue is the kernel's tactics plus every module's.
                 var tactics = new TacticRunner(() => BuiltinTactics.All.Concat(registered.Modules.Where(m => m is not TacticRunner).SelectMany(m => m.Tactics)));

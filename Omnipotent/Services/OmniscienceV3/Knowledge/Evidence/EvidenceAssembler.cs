@@ -348,8 +348,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                     }
                     sb.Append(line).Append('\n');
                     var conv = segment.Conversation;
+                    string? fileText = files == null ? null : string.Join("\n", files.Where(f => !string.IsNullOrWhiteSpace(f.Text)).Select(f => f.Text));
                     sliceMessages.Add(new SliceMessage(reference, m.MessageId, m.Version, m.AuthorPersonId, handle, m.SentAtMs, m.Quality, m.ConversationId, m.GuildId,
-                        m.Platform, conv?.Kind, m.FirstSourceKind, m.BestSourceId, m.Content ?? "", m.DeletedAtMs != null, nonAuthored, zone?.Id, m.IngestSeq));
+                        m.Platform, conv?.Kind, m.FirstSourceKind, m.BestSourceId, m.Content ?? "", m.DeletedAtMs != null, nonAuthored, zone?.Id, m.IngestSeq,
+                        string.IsNullOrWhiteSpace(fileText) ? null : fileText));
                 }
                 sb.Append('\n');
             }

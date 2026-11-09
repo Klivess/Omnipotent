@@ -83,6 +83,7 @@ CREATE TABLE kn_coverage(
   message_version INTEGER NOT NULL,
   prompt_version TEXT NOT NULL,
   run_id TEXT NOT NULL,
+  outcome TEXT NOT NULL DEFAULT 'ok',
   covered_at_ms INTEGER NOT NULL,
   PRIMARY KEY(person_id, message_id)
 );
@@ -158,8 +159,11 @@ CREATE TABLE kn_age_evidence(
   evidence_id TEXT PRIMARY KEY,
   person_id TEXT NOT NULL,
   kind TEXT NOT NULL,
-  birth_earliest_ms INTEGER NOT NULL,
-  birth_latest_ms INTEGER NOT NULL,
+  birth_earliest_ms INTEGER,
+  birth_latest_ms INTEGER,
+  month INTEGER,
+  day INTEGER,
+  source_kind TEXT NOT NULL,
   asserted_at_ms INTEGER NOT NULL,
   message_id TEXT NOT NULL,
   message_version INTEGER NOT NULL,

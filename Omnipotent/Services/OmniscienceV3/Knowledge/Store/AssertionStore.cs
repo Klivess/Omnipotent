@@ -178,7 +178,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
                 """,
                 ("$id", id), ("$key", key), ("$sk", d.SubjectKind), ("$si", d.SubjectId), ("$attr", d.Attribute), ("$cls", def.Class.ToString()),
                 ("$vj", JsonSerializer.Serialize(d.Value, KernelJson.Options)), ("$vt", d.Value.Text), ("$ok", d.ObjectKind), ("$oi", d.ObjectId),
-                ("$vfe", d.ValidFrom?.EarliestMs), ("$vfl", d.ValidFrom?.LatestMs), ("$vte", d.ValidTo?.EarliestMs), ("$vtl", d.ValidTo?.LatestMs),
+                ("$vfe", Bound(d.ValidFrom?.EarliestMs)), ("$vfl", Bound(d.ValidFrom?.LatestMs)), ("$vte", Bound(d.ValidTo?.EarliestMs)), ("$vtl", Bound(d.ValidTo?.LatestMs)),
                 ("$as", d.AssertedAtMs), ("$rec", now), ("$st", d.Status), ("$mod", d.Modality), ("$src", d.SourceKind), ("$p", Math.Round(d.Probability, 6)),
                 ("$cal", d.Calibrated ? 1 : 0), ("$sens", d.Sensitivity), ("$m", moduleId), ("$mv", d.ModuleVersion), ("$pv", d.PromptVersion), ("$model", d.Model),
                 ("$job", d.JobId), ("$seq", d.SourceSeq), ("$der", d.Derivation == null ? null : JsonSerializer.Serialize(d.Derivation, KernelJson.Options)));
@@ -195,7 +195,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
                 """,
                 ("$id", id), ("$key", key), ("$prod", d.Producer), ("$cat", def.Category), ("$attr", d.Attribute), ("$si", d.SubjectId), ("$oi", d.ObjectId),
                 ("$au", dims.AuthorPersonId), ("$occ", dims.OccurredAtMs), ("$first", dims.FirstEvidenceAtMs), ("$rec", now),
-                ("$vf", d.ValidFrom?.MidpointMs), ("$vt", d.ValidTo?.MidpointMs), ("$pl", dims.Platform), ("$src", dims.SourceId), ("$g", dims.GuildId),
+                ("$vf", Mid(d.ValidFrom)), ("$vt", Mid(d.ValidTo)), ("$pl", dims.Platform), ("$src", dims.SourceId), ("$g", dims.GuildId),
                 ("$conv", dims.ConversationId), ("$ck", dims.ConversationKind), ("$st", d.Status), ("$mod", d.Modality), ("$sk", d.SourceKind),
                 ("$p", Math.Round(d.Probability, 6)), ("$ec", dims.EvidenceCount), ("$ic", dims.IndependentCount), ("$m", moduleId), ("$model", d.Model),
                 ("$pv", d.PromptVersion), ("$run", dims.RunId), ("$job", d.JobId), ("$hash", hash), ("$seq", d.SourceSeq));
@@ -219,6 +219,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
         }
 
         private static string Ms(long? v) => v?.ToString(CultureInfo.InvariantCulture) ?? "";
+
+        /// <summary>Open interval ends are stored as NULL (unknown), never as sentinel numbers.</summary>
+        private static long? Bound(long? v) => v is long.MinValue or long.MaxValue ? null : v;
+
+        /// <summary>The filterable midpoint of an interval; for a half-open one the known end.</summary>
+        private static long? Mid(Temporal.TimeInterval? i)
+        {
+            if (i is not { } iv || iv.IsUnknown) return null;
+            if (iv.EarliestMs == long.MinValue) return iv.LatestMs;
+            if (iv.LatestMs == long.MaxValue) return iv.EarliestMs;
+            return iv.MidpointMs;
+        }
 
         // ── reading ──────────────────────────────────────────────────────────────
 

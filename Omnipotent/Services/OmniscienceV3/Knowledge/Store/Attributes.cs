@@ -97,6 +97,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
             D("surname", "Surname", Identity, AttributeClass.Immutable, null, R, isPrivate: true),
             D("nickname", "Nickname", Identity, AttributeClass.State, 730, multi: true),
             D("pronouns", "Pronouns", Identity, AttributeClass.State, 730),
+            D("age", "Age statement (policy evidence only)", Identity, AttributeClass.TimeDerived, null, R, isPrivate: true),
             D("birth_date", "Birth date", Identity, AttributeClass.Immutable, null, R, isPrivate: true),
             D("birthday", "Birthday (day and month)", Identity, AttributeClass.Immutable, null, R, isPrivate: true, planKind: "birthday"),
             D("birthplace", "Birthplace", Identity, AttributeClass.Immutable, null, R, isPrivate: true),

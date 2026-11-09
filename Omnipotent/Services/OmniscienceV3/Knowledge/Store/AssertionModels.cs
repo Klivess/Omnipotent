@@ -190,9 +190,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
     {
         public AssertionValue Value => JsonSerializer.Deserialize<AssertionValue>(ValueJson, Kernel.Jobs.KernelJson.Options)!;
 
-        public TimeInterval? ValidFrom => ValidFromEarliestMs is long e && ValidFromLatestMs is long l ? new TimeInterval(e, l) : null;
+        /// <summary>Null when nothing is known; an open end (unknown earliest or latest) is long.MinValue / long.MaxValue.</summary>
+        public TimeInterval? ValidFrom => ValidFromEarliestMs == null && ValidFromLatestMs == null ? null
+            : new TimeInterval(ValidFromEarliestMs ?? long.MinValue, ValidFromLatestMs ?? long.MaxValue);
 
-        public TimeInterval? ValidTo => ValidToEarliestMs is long e && ValidToLatestMs is long l ? new TimeInterval(e, l) : null;
+        public TimeInterval? ValidTo => ValidToEarliestMs == null && ValidToLatestMs == null ? null
+            : new TimeInterval(ValidToEarliestMs ?? long.MinValue, ValidToLatestMs ?? long.MaxValue);
 
         public bool IsLiveRecord => SupersededAtMs == null && RetractedAtMs == null;
 
