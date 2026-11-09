@@ -87,6 +87,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge
         public IAttachmentTextSource Media { get; set; }
         public IPersonZoneOracle Zones { get; set; }
         public IFictionOracle Fiction { get; set; }
+        /// <summary>WS-C's Explore engine (X11 explains a chart point from its drill records). Null until wired.</summary>
+        public Kernel.Explore.IExploreEngine? Explore { get; set; }
     }
 
     /// <summary>Reads WS-C's per-message labels (intel.db <c>labels</c>, contract R7 #5) for the modality and dialogue-act tasks.</summary>

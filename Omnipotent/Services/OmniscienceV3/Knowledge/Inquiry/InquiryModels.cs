@@ -184,6 +184,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
     [ApiContract]
     public sealed record ChoiceDto(string Option, double Probability);
 
+    /// <summary>The Ask bar's proposal: which tactic to run with which parameters (Klives confirms before anything runs).</summary>
+    [ApiContract]
+    public sealed record AskPlanDto(string Tactic, System.Text.Json.JsonElement? Parameters, string Restatement, IReadOnlyList<PersonCandidateDto> People, string? Reason);
+
     [ApiContract]
     public sealed record RankedPersonDto(string PersonId, string Label, double Score, string? Reason, IReadOnlyList<string> EvidenceIds);
 

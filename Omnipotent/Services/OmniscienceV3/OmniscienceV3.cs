@@ -119,6 +119,8 @@ namespace Omnipotent.Services.OmniscienceV3
         {
             // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
             new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
+            new Knowledge.Deduction.DeductionModule(), new Knowledge.Entities.IdentityModule(), new Knowledge.Timeline.TimelineModule(),
+            new Knowledge.Plans.PlansModule(), new Knowledge.Quality.QualityModule(), new Knowledge.Inquiry.InquiryModule(),
         };
 
         private Task<KliveLLM.KliveLLM?> ResolveKliveLlmAsync() =>

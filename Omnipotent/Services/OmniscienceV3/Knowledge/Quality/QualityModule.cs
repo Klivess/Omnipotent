@@ -151,22 +151,24 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
         /// <summary>Inquiry calibration from Klives's feedback; refits the inquiry curve the engine applies to new answers.</summary>
         private async Task<IReadOnlyList<QualityMetric>> InquiryCalibrationAsync(CancellationToken ct)
         {
-            List<(double P, bool Correct, string Prompt)> rows;
+            List<(double P, string Feedback, string Prompt)> rows;
             using (var c = Context.Stores.Intel.OpenRead())
             {
                 bool hasTable = c.Scalar<long>(null, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kn_inquiries'") > 0;
                 rows = !hasTable ? new() : c.Query(null, """
                     SELECT probability_raw, feedback, COALESCE(prompt_version,'') FROM kn_inquiries
-                    WHERE feedback IN ('correct','incorrect') AND probability_raw IS NOT NULL
-                    """, r => (r.GetDouble(0), r.GetString(1) == "correct", r.GetString(2)));
+                    WHERE feedback IN ('yes','no','correct','incorrect') AND probability_raw IS NOT NULL AND answer_type IN ('Binary','Prediction')
+                    """, r => (r.GetDouble(0), r.GetString(1), r.GetString(2)));
             }
             var metrics = new List<QualityMetric>();
             if (rows.Count == 0) return metrics;
-            // The raw probability is the inquiry's probability of "yes"; feedback says whether the verdict was right.
-            var samples = rows.Select(r => (r.P, r.Correct)).ToList();
+            // The raw probability is P(yes). Feedback either states the truth ("yes"/"no") or judges the verdict
+            // ("correct"/"incorrect"), which gives the truth through the verdict's side of 0.5.
+            var samples = rows.Select(r => (r.P, Truth: r.Feedback switch { "yes" => true, "no" => false, "correct" => r.P >= 0.5, _ => r.P < 0.5 })).ToList();
+            var verdictRight = rows.Select(r => r.Feedback switch { "yes" => r.P >= 0.5, "no" => r.P < 0.5, "correct" => true, _ => false }).ToList();
             metrics.Add(new QualityMetric("inquiry", "ece_raw", Metrics.ExpectedCalibrationError(samples), null, null, samples.Count));
             metrics.Add(new QualityMetric("inquiry", "brier_raw", Metrics.Brier(samples), null, null, samples.Count));
-            var accuracy = Proportion.Of(rows.Count(r => r.Correct), rows.Count);
+            var accuracy = Proportion.Of(verdictRight.Count(x => x), verdictRight.Count);
             metrics.Add(new QualityMetric("inquiry", "accuracy", accuracy.Value, accuracy.Low, accuracy.High, accuracy.Trials));
             if (rows.Count >= Isotonic.MinimumGold)
                 await kit.Calibration.FitAsync(CalibrationStore.InquiryScope, samples, ct).ConfigureAwait(false);
