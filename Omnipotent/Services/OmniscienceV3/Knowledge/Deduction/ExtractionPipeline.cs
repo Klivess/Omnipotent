@@ -228,7 +228,11 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             }
 
             // Age evidence first (policy only), then MinorGuard on everything else before a single value is written.
-            var ages = verified.Select(v => AgeEvidenceBuilder.FromClaim(v, options.DefaultEducationSystem)).OfType<AgeEvidenceRow>().ToList();
+            // A corrected statement ("I'm 32" → "actually 23, typo") never stays age evidence; the correction is the evidence.
+            var correctedMessages = verified.Where(v => v.CorrectsMessageId != null).Select(v => v.CorrectsMessageId!).ToHashSet(StringComparer.Ordinal);
+            var ages = verified.Where(v => !v.Evidence.All(e => correctedMessages.Contains(e.MessageId)))
+                .Select(v => AgeEvidenceBuilder.FromClaim(v, options.DefaultEducationSystem)).OfType<AgeEvidenceRow>().ToList();
+            if (correctedMessages.Count > 0) await claims.RetractAgeEvidenceAsync(correctedMessages, ct).ConfigureAwait(false);
             var kept = new List<VerifiedClaim>();
             foreach (var group in verified.GroupBy(v => v.SubjectPersonId, StringComparer.Ordinal))
             {

@@ -222,6 +222,14 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 return n;
             }, ct);
 
+        /// <summary>Age statements in messages that a later message corrected stop counting (their natural keys stay for audit).</summary>
+        public Task RetractAgeEvidenceAsync(IReadOnlyCollection<string> messageIds, CancellationToken ct) =>
+            stores.Intel.WriteAsync((c, tx) =>
+            {
+                foreach (var m in messageIds)
+                    c.Exec(tx, "UPDATE kn_age_evidence SET status='corrected' WHERE message_id=$m AND status IN ('active','inconsistent','retracted')", ("$m", m));
+            }, ct);
+
         public Task UpdateAgeStatusAsync(IReadOnlyCollection<string> evidenceIds, string status, CancellationToken ct) =>
             stores.Intel.WriteAsync((c, tx) =>
             {

@@ -23,7 +23,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
         /// <summary>Outside the largest consistent set: a joke or misread candidate, raised for review (still counted for protection).</summary>
         public const string Inconsistent = "inconsistent";
         public const string Rejected = "rejected";
+        /// <summary>The message was edited or erased: reactivated if the new version still says it.</summary>
         public const string Retracted = "retracted";
+        /// <summary>A later message corrected it ("typo"): never counts again.</summary>
+        public const string Corrected = "corrected";
     }
 
     /// <summary>One age statement as a birth-date constraint (policy evidence: never shown as a fact, only the band it implies).</summary>
@@ -137,7 +140,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
     {
         public static (TimeInterval? Birth, IReadOnlyList<AgeEvidenceRow> Consistent, IReadOnlyList<AgeEvidenceRow> Inconsistent) Combine(IReadOnlyList<AgeEvidenceRow> rows)
         {
-            var intervals = rows.Where(r => r.Birth != null && r.Status != AgeEvidenceStatus.Rejected && r.Status != AgeEvidenceStatus.Retracted)
+            var intervals = rows.Where(r => r.Birth != null && r.Status is AgeEvidenceStatus.Active or AgeEvidenceStatus.Inconsistent)
                 .OrderByDescending(r => r.Probability * (r.SourceKind == ClaimSource.SelfDisclosure ? 1.0 : 0.6)).ThenBy(r => r.AssertedAtMs).ToList();
             TimeInterval acc = TimeInterval.Unknown;
             var consistent = new List<AgeEvidenceRow>();

@@ -202,6 +202,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         {
             string person = kit.Corpus.Canonical(Subject(job));
             if (!kit.Corpus.PersonExists(person)) return Result(new { person, outcome = "unknown_person" });
+            // The Quality Lab's regression gate: a prompt version it blocked never extracts (N18).
+            if (Quality.QualityModule.LatestGate(Context.Stores, "deduction.extract", ExtractionPrompt.Version) is { Decision: "block" } gate)
+                throw new JobFailureException(ErrorClass.Permanent, $"Prompt {ExtractionPrompt.Version} is blocked by the Quality Lab gate: {string.Join(" ", gate.Reasons)}");
             var pipeline = new ExtractionPipeline(kit, claims, ExtractionSettings());
             var stats = await pipeline.RunAsync(person, job).ConfigureAwait(false);
             long seq = kit.Corpus.MaxSeq();
