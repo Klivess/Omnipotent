@@ -104,6 +104,7 @@ namespace Omnipotent.Services.OmniscienceV3
                 Log = LogSync,
                 LogError = LogErrorSync,
                 Modules = BuildModules(),
+                EncoderFactory = Ml.Encoders.SharedEncoder.Production(LogSync),
             }, host.SetStage, stopping).ConfigureAwait(false);
 
             if (!host.SetReady(runtime, clock.NowMs))
@@ -119,6 +120,8 @@ namespace Omnipotent.Services.OmniscienceV3
         {
             // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
             new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
+            // WS-C: classification, rollups, projections, Explore and signals.
+            new Modules.Classification.ClassificationModule(),
         };
 
         private Task<KliveLLM.KliveLLM?> ResolveKliveLlmAsync() =>

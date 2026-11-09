@@ -386,6 +386,42 @@ CREATE TABLE vector_ivf(
             return 0;
         }
 
+        /// <summary>
+        /// A seeded random sample of stored items (ids drawn through the covering primary-key index, then their vectors):
+        /// background sets for taught concepts, uncertainty pools, evaluation samples.
+        /// </summary>
+        public IReadOnlyList<StoredVector> RandomSample(string space, string model, int size, int seed)
+        {
+            if (size <= 0) return Array.Empty<StoredVector>();
+            var ids = new List<string>();
+            long total = Count(space, model);
+            using (var c = store.OpenRead())
+            {
+                if (total > 100_000 && size < total / 10)
+                {
+                    // Large space: seeded random rowid probes (each an index seek), duplicates folded.
+                    long maxRowId = c.Scalar<long?>(null, "SELECT MAX(rowid) FROM vectors") ?? 0;
+                    var rng = new Random(seed);
+                    var seen = new HashSet<string>(StringComparer.Ordinal);
+                    for (int attempt = 0; attempt < size * 4 && seen.Count < size; attempt++)
+                    {
+                        long r = 1 + (long)(rng.NextDouble() * maxRowId);
+                        string? id = c.Scalar<string>(null, "SELECT item_id FROM vectors WHERE rowid >= $r AND space=$s AND model=$m ORDER BY rowid LIMIT 1",
+                            ("$r", r), ("$s", space), ("$m", model));
+                        if (id != null && seen.Add(id)) ids.Add(id);
+                    }
+                }
+                else
+                {
+                    ids = c.Query(null, """
+                        SELECT item_id FROM vectors WHERE space=$s AND model=$m ORDER BY ((rowid * 2654435761 + $seed) % 4294967291) LIMIT $n
+                        """, r => r.GetString(0), ("$s", space), ("$m", model), ("$seed", (long)(seed & 0x7fffffff)), ("$n", size));
+                }
+            }
+            var got = Get(space, model, ids);
+            return ids.Where(got.ContainsKey).Select(id => got[id]).ToList();
+        }
+
         /// <summary>A deterministic sample (every n-th row in id order, seeded offset) for index training.</summary>
         private List<float[]> Sample(string space, string model, int size, int seed)
         {
