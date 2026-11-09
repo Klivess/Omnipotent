@@ -29,7 +29,7 @@ Another live session commits and pushes on master from the main folder, so never
 |---|---|---|
 | 0 | Branch, docs, contracts | done |
 | 1 | Foundations: temporal ✓, storage ✓, kernel ✓, LLM gateway ✓, ML runtime ✓, policy ✓, API skeleton ✓, legacy importer ✓, synthetic corpus + perf harness ✓ | done (contracts to freeze) |
-| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | running: WS-A to WS-D started 2026-11-06; WS-E not started |
+| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | running: WS-A to WS-D started 2026-11-06; WS-E first slice (foundation + engine pages) committed 2026-11-09, domain pages wait for DTOs |
 | 3 | Integration, shadow run, parity gates, cutover | not started |
 
 ## Log
@@ -98,5 +98,16 @@ Another live session commits and pushes on master from the main folder, so never
 
    Each worktree is `.claude/worktrees/<branch name without the claude/ prefix>`.
 
-   Workstreams commit only on their own branch. The coordinating session merges them into `omniscience-v3` in the R7 order, and only when Klives says to. WS-E (in the website repo) has not started.
+   Workstreams commit only on their own branch. The coordinating session merges them into `omniscience-v3` in the R7 order, and only when Klives says to.
+
+   **WS-E** (website repository, branch `omniscience-v3`, worktree
+   `C:\Projects\Websites\klives-management-website\.claude\worktrees\omniscience-v3`) is done by the coordinating session.
+   Its first slice landed on 2026-11-09: the data client, time lens, live stream, shell and the ten pages the frozen
+   contract can drive (overview, modules, jobs, LLM, settings, tactics, playbooks, cohorts, Explore, live), with e2e.
+   Report and the list of contract gaps it found for the other workstreams: [ws-e.md](ws-e.md). The domain pages
+   (people, conversations, search, faces, replicas, radar, digests, review, graph, sources) start when their DTOs exist.
+
+   State of the other workstreams on 2026-11-09 (all four sessions running): WS-A no commits yet; WS-B two commits
+   (knowledge store, evidence assembly, retrieval); WS-C two commits (encoder, vector store); WS-D no commits yet,
+   `Replica/` uncommitted.
 2. Phase 3: shadow run on live data, parity gates, Quality Lab gates, cutover.
