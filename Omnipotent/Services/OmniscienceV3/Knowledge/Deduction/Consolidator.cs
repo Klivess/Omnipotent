@@ -49,6 +49,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         private readonly ReviewQueue review;
         private readonly ConsolidationOptions options;
         private readonly int moduleVersion;
+        private readonly ValueResolver values;
 
         public Consolidator(KnowledgeKit kit, ClaimStore claims, ReviewQueue review, ConsolidationOptions options, int moduleVersion)
         {
@@ -57,6 +58,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             this.review = review;
             this.options = options;
             this.moduleVersion = moduleVersion;
+            values = new ValueResolver(kit);
         }
 
         private sealed record Episode(string Attribute, string ValueText, string ValueNorm, string Polarity, string? ObjectPersonId, List<VerifiedClaim> Claims)
@@ -85,6 +87,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             // Corrections supersede the statement they correct (same attribute).
             var corrected = all.Where(c => c.CorrectsMessageId != null).Select(c => (c.CorrectsMessageId!, c.Attribute)).ToHashSet();
             var live = all.Where(c => c.CorrectsMessageId != null || !c.Evidence.All(e => corrected.Contains((e.MessageId, c.Attribute)))).ToList();
+            // Different wordings of one value become one canonical value before any reasoning about change or contradiction.
+            live = await values.CanonicalizeAsync(live, jobId, ct).ConfigureAwait(false);
 
             var drafts = new List<AssertionDraft>();
             var blocked = new List<string>();

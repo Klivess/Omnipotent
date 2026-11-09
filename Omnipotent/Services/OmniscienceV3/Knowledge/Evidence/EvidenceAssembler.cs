@@ -35,6 +35,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         private Dictionary<string, SliceMessage>? byRef;
         private Dictionary<string, SliceMessage>? byId;
 
+        /// <summary>The segments the slice was rendered from (re-packed smaller when the model overflows or truncates).</summary>
+        public IReadOnlyList<Segment> Segments { get; init; } = Array.Empty<Segment>();
+
         public SliceMessage? ByRef(string reference)
         {
             byRef ??= Messages.ToDictionary(m => m.Ref, StringComparer.OrdinalIgnoreCase);
@@ -358,7 +361,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
             string evidence = EvidenceRenderer.FenceOpen + "\n" + sb.ToString().TrimEnd() + "\n" + EvidenceRenderer.FenceClose;
             string rosterText = roster.Render();
             var anchors = segments.SelectMany(s => s.AnchorIds).Distinct(StringComparer.Ordinal).ToList();
-            return new EvidenceSlice(index, evidence, rosterText, sliceMessages, anchors, from, to, estimator.Estimate(evidence) + estimator.Estimate(rosterText), roster);
+            return new EvidenceSlice(index, evidence, rosterText, sliceMessages, anchors, from, to, estimator.Estimate(evidence) + estimator.Estimate(rosterText), roster)
+            {
+                Segments = segments,
+            };
         }
 
         private string SegmentHeader(Segment segment, Roster roster)

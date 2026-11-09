@@ -270,6 +270,17 @@ CREATE TABLE kn_entities(
   source_seq INTEGER NOT NULL
 );
 CREATE INDEX ix_kn_entities_owner ON kn_entities(owner_person_id, status);
+
+CREATE TABLE kn_value_groups(
+  attribute TEXT NOT NULL,
+  value_norm TEXT NOT NULL,
+  canonical_norm TEXT NOT NULL,
+  canonical_text TEXT NOT NULL,
+  decided_at_ms INTEGER NOT NULL,
+  model TEXT,
+  prompt_version TEXT,
+  PRIMARY KEY(attribute, value_norm)
+);
 """),
         };
 
