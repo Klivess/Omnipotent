@@ -14,6 +14,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
         public IReadOnlyCollection<string>? AuthorIdentityIds { get; init; }
         /// <summary>Only messages in these conversations.</summary>
         public IReadOnlyCollection<string>? ConversationIds { get; init; }
+        /// <summary>Only these messages (e.g. everything the subject reacted to). At most 800 are honoured per search.</summary>
+        public IReadOnlyCollection<string>? MessageIds { get; init; }
         public long? FromMs { get; init; }
         /// <summary>Upper bound on sent time (an inquiry's as-of: nothing after it is evidence).</summary>
         public long? ToMs { get; init; }
@@ -129,6 +131,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             if (scope.ToMs is long t) { where.Add("m.sent_at_ms <= $t"); args.Add(("$t", t)); }
             AddIn(where, args, "m.author_identity_id", "$a", scope.AuthorIdentityIds);
             AddIn(where, args, "m.conversation_id", "$c", scope.ConversationIds);
+            AddIn(where, args, "m.message_id", "$mi", scope.MessageIds);
             string sql = $"SELECT m.message_id FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid WHERE {string.Join(" AND ", where)} ORDER BY bm25(messages_fts) LIMIT $l";
             using var c = stores.Corpus.OpenRead();
             try
@@ -146,7 +149,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
         {
             if (values == null) return;
             if (values.Count == 0) { where.Add("0"); return; }
-            var names = values.Take(400).Select((v, i) => (Name: prefix + i, Value: v)).ToList();
+            var names = values.Take(prefix == "$mi" ? 800 : 200).Select((v, i) => (Name: prefix + i, Value: v)).ToList();
             where.Add($"{column} IN ({string.Join(",", names.Select(n => n.Name))})");
             foreach (var (name, value) in names) args.Add((name, value));
         }
@@ -162,7 +165,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
                 if (scope.ToMs is long t) { where.Add("m.sent_at_ms <= $t"); args.Add(("$t", t)); }
                 AddIn(where, args, "m.author_identity_id", "$a", scope.AuthorIdentityIds);
                 AddIn(where, args, "m.conversation_id", "$c", scope.ConversationIds);
-                if (scope.AuthorIdentityIds == null && scope.ConversationIds == null) return (ids, new List<float[]>()); // never scan the whole corpus per query
+                AddIn(where, args, "m.message_id", "$mi", scope.MessageIds);
+                if (scope.AuthorIdentityIds == null && scope.ConversationIds == null && scope.MessageIds == null) return (ids, new List<float[]>()); // never scan the whole corpus per query
                 ids = c.Query(null, $"SELECT m.message_id FROM messages m WHERE {string.Join(" AND ", where)} ORDER BY m.sent_at_ms DESC LIMIT $l", r => r.GetString(0), args.ToArray());
             }
             var vectors = new Dictionary<string, float[]>(StringComparer.Ordinal);
