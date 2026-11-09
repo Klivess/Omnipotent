@@ -172,6 +172,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             {
                 Stores = stores, Clock = clock, Jobs = Jobs, Events = Events, Settings = Settings, Log = log, LogError = logError,
                 ReadModels = ReadModels, Policy = Policy, Llm = Services.Llm, Models = Services.Models,
+                Encoder = Services.Encoder, Vectors = Services.Vectors,
             };
             Context = context;
             foreach (var m in ordered) await m.InitializeAsync(context, ct).ConfigureAwait(false);

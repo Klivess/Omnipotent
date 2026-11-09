@@ -67,6 +67,10 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Modules
         public Llm.OmniLlm? Llm { get; init; }
         /// <summary>Pinned ONNX models and tokenizers (null in kernels started without one).</summary>
         public Ml.ModelHub? Models { get; init; }
+        /// <summary>The shared text encoder (plan R2: one pass per message; null in kernels started without one).</summary>
+        public Ml.IEmbeddingEncoder? Encoder { get; init; }
+        /// <summary>vectors.db: int8 vectors with partitioned and IVF search (null in kernels started without one).</summary>
+        public Ml.Vectors.VectorStore? Vectors { get; init; }
     }
 
     /// <summary>Shared services the kernel hands every module (built by the runtime).</summary>
@@ -75,6 +79,8 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Modules
         public Llm.OmniLlm? Llm { get; init; }
         public Ml.ModelHub? Models { get; init; }
         public Knowledge.Policy.IPolicyOracle? Policy { get; init; }
+        public Ml.IEmbeddingEncoder? Encoder { get; init; }
+        public Ml.Vectors.VectorStore? Vectors { get; init; }
     }
 
     /// <summary>Input to a planning pass.</summary>
