@@ -63,6 +63,9 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
         /// carried as of the cutoff (plan T5; a later rename never appears in an earlier as-of prompt).</summary>
         public const string SelfToken = "{{SELF}}";
 
+        /// <summary>How long after a command a bot's answer still marks it as a bot command.</summary>
+        public const long BotAnswerWindowMs = 15_000;
+
         private readonly SqliteConnection corpus;
         private readonly Func<string, long, (TimeZoneInfo? Zone, string Source)> zoneOf;
 
@@ -224,7 +227,8 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
         private List<Msg> Timeline(string conversationId, List<Msg> cluster, HashSet<string> mine, IndexOptions o)
         {
             long from = cluster[0].SentAt - (long)o.StimulusWindow.TotalMilliseconds;
-            long to = cluster[^1].SentAt;
+            // A little past the last own message, so a bot's answer to a command is seen (it marks the command non-authored).
+            long to = cluster[^1].SentAt + BotAnswerWindowMs;
             var rows = corpus.Query(null, $"SELECT {MsgColumns} FROM messages WHERE conversation_id=$c AND sent_at_ms >= $f AND sent_at_ms <= $t ORDER BY sent_at_ms, order_key LIMIT 5000",
                 MapMsg, ("$c", conversationId), ("$f", from), ("$t", to));
             var ownById = cluster.ToDictionary(m => m.Id, StringComparer.Ordinal);

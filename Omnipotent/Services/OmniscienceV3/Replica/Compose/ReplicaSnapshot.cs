@@ -226,7 +226,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
         public const string Columns =
             "pair_id, person_id, conversation_id, guild_id, platform, context_kind, partner_person_id, partner_is_self, addressee_source, is_initiation, explicit_reply, " +
             "reply_at_ms, reply_end_ms, stimulus_at_ms, latency_ms, reply_ids, stimulus_ids, context_ids, reply_text, stimulus_plain, rendered, text_hash, stimulus_hash, " +
-            "time_quality, flags, split, era_index, slice_index, reflex_class, source_seq";
+            "time_quality, flags, split, era_index, slice_index, reflex_class, source_seq, reply_count, reply_chars";
 
         public static ReplicaPair Map(SqliteDataReader r) => new()
         {
@@ -266,13 +266,13 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
         {
             using var stmt = new PreparedStatement(c, tx, $"""
                 INSERT OR REPLACE INTO replica_pairs(version_id, {Columns})
-                VALUES($v,$a0,$a1,$a2,$a3,$a4,$a5,$a6,$a7,$a8,$a9,$a10,$a11,$a12,$a13,$a14,$a15,$a16,$a17,$a18,$a19,$a20,$a21,$a22,$a23,$a24,$a25,$a26,$a27,$a28,$a29)
-                """, new[] { "$v" }.Concat(Enumerable.Range(0, 30).Select(i => "$a" + i)).ToArray());
+                VALUES($v,$a0,$a1,$a2,$a3,$a4,$a5,$a6,$a7,$a8,$a9,$a10,$a11,$a12,$a13,$a14,$a15,$a16,$a17,$a18,$a19,$a20,$a21,$a22,$a23,$a24,$a25,$a26,$a27,$a28,$a29,$a30,$a31)
+                """, new[] { "$v" }.Concat(Enumerable.Range(0, 32).Select(i => "$a" + i)).ToArray());
             foreach (var p in pairs)
                 stmt.Run(versionId, p.PairId, p.PersonId, p.ConversationId, p.GuildId, p.Platform, p.ContextKind, p.PartnerPersonId, p.PartnerIsSelf ? 1 : 0,
                     p.AddresseeSource, p.IsInitiation ? 1 : 0, p.ExplicitReply ? 1 : 0, p.ReplyAtMs, p.ReplyEndMs, p.StimulusAtMs, p.LatencyMs,
                     RJson.Write(p.ReplyIds), RJson.Write(p.StimulusIds), RJson.Write(p.ContextIds), p.ReplyText, p.StimulusPlain, p.Rendered, p.TextHash,
-                    p.StimulusHash, p.TimeQuality, (int)p.Flags, p.Split, p.EraIndex, p.SliceIndex, p.ReflexClass, p.SourceSeq);
+                    p.StimulusHash, p.TimeQuality, (int)p.Flags, p.Split, p.EraIndex, p.SliceIndex, p.ReflexClass, p.SourceSeq, p.ReplyCount, p.ReplyText.Length);
         }
     }
 

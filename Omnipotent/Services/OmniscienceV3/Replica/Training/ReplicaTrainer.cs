@@ -163,11 +163,12 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             return ended;
         }
 
-        public async Task CancelJobsAsync(string versionId, CancellationToken ct)
+        /// <summary>Cancels a build's queued and running jobs (except the caller's own, which records its outcome itself).</summary>
+        public async Task CancelJobsAsync(string versionId, CancellationToken ct, long? exceptJobId = null)
         {
             foreach (var state in new[] { JobStates.Queued, JobStates.Leased })
                 foreach (var job in s.Kernel.Jobs.Query(new JobQuery { ModuleId = ReplicaSchema.ModuleId, RunId = versionId, State = state, Limit = 1000 }).Items)
-                    await s.Kernel.Jobs.CancelAsync(job.JobId, ct).ConfigureAwait(false);
+                    if (job.JobId != exceptJobId) await s.Kernel.Jobs.CancelAsync(job.JobId, ct).ConfigureAwait(false);
         }
 
         // ── stage jobs ───────────────────────────────────────────────────────────
@@ -227,15 +228,15 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             catch (Exception ex) when (LastAttempt(job) || ex is JobFailureException { Class: ErrorClass.Permanent } || LaneWorkers.Classify(ex) == ErrorClass.Permanent)
             {
                 string error = ex is JobFailureException ? ex.Message : $"{ex.GetType().Name}: {ex.Message}";
-                await FinishStageAsync(v, stage, Stages.Required(stage) ? StageResult.Fail(error) : StageResult.Degraded($"{stage} failed: {error}", error), ct).ConfigureAwait(false);
+                await FinishStageAsync(v, stage, Stages.Required(stage) ? StageResult.Fail(error) : StageResult.Degraded($"{stage} failed: {error}", error), ct, job.Job.JobId).ConfigureAwait(false);
                 throw;
             }
             if (result.State == StageStates.Running) return RJson.Write(new { versionId, stage, result.State, result.Detail });
-            await FinishStageAsync(v, stage, result, ct).ConfigureAwait(false);
+            await FinishStageAsync(v, stage, result, ct, job.Job.JobId).ConfigureAwait(false);
             return RJson.Write(new { versionId, stage, result.State, result.Detail });
         }
 
-        private async Task FinishStageAsync(VersionRecord v, string stage, StageResult result, CancellationToken ct)
+        private async Task FinishStageAsync(VersionRecord v, string stage, StageResult result, CancellationToken ct, long? currentJobId = null)
         {
             if (result.Block)
             {
@@ -246,7 +247,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             {
                 await s.Versions.UpdateStageAsync(v.VersionId, stage, st => st with { State = StageStates.Failed, Error = result.Error, FinishedAtMs = s.Clock.NowMs }, ct).ConfigureAwait(false);
                 await s.Versions.EndAsync(v.VersionId, VersionStates.Failed, $"{stage}: {result.Error}", ct).ConfigureAwait(false);
-                await CancelJobsAsync(v.VersionId, CancellationToken.None).ConfigureAwait(false);
+                await CancelJobsAsync(v.VersionId, CancellationToken.None, currentJobId).ConfigureAwait(false);
                 await PublishAsync(v, "failed", stage, ct).ConfigureAwait(false);
                 await ReplicaCards.RefreshAsync(s, v.PersonId, ct).ConfigureAwait(false);
                 return;

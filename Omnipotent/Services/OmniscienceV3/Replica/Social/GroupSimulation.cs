@@ -181,8 +181,17 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             string chatId = job.Job.SubjectId!;
             var chat = chats.Get(chatId);
             if (chat == null || chat.Context.Kind != ChatKinds.Group) return null;
-            var produced = await RunTurnsAsync(chat, payload.Turns, payload.RunToken, job.Job.JobId, job.Cancellation).ConfigureAwait(false);
-            return RJson.Write(new { chatId, turns = produced });
+            try
+            {
+                var produced = await RunTurnsAsync(chat, payload.Turns, payload.RunToken, job.Job.JobId, job.Cancellation).ConfigureAwait(false);
+                await s.PublishAsync(ReplicaTopics.Group, new { chatId, runToken = payload.RunToken, type = "done", turns = produced }, CancellationToken.None).ConfigureAwait(false);
+                return RJson.Write(new { chatId, turns = produced });
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException && (job.Job.Attempts >= job.Job.MaxAttempts || ex is JobFailureException { Class: ErrorClass.Permanent }))
+            {
+                await s.PublishAsync(ReplicaTopics.Group, new { chatId, runToken = payload.RunToken, type = "failed", error = ex.Message }, CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
         }
 
         /// <summary>Generates up to <paramref name="turns"/> simulated turns (also used by the X63 tactic, stage by stage).</summary>

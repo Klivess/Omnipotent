@@ -179,14 +179,24 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
 
         private async Task StopAsync(string chatId, string turnId, CancellationToken ct)
         {
-            if (live.TryGetValue(chatId, out var entry) && entry.TurnId == turnId)
-            {
-                try { entry.Cts.Cancel(); }
-                catch (ObjectDisposedException) { /* the turn finished meanwhile */ }
-            }
+            if (live.TryGetValue(chatId, out var entry) && entry.TurnId == turnId) TryCancel(entry.Cts);
             foreach (var state in new[] { JobStates.Queued, JobStates.Leased })
                 foreach (var job in s.Kernel.Jobs.Query(new JobQuery { ModuleId = ReplicaSchema.ModuleId, RunId = turnId, State = state, Limit = 10 }).Items)
                     await s.Kernel.Jobs.CancelAsync(job.JobId, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>Stops an in-flight generation; false when it had already finished (its token source is disposed).</summary>
+        private static bool TryCancel(CancellationTokenSource cts)
+        {
+            try
+            {
+                cts.Cancel();
+                return true;
+            }
+            catch (ObjectDisposedException)
+            {
+                return false;
+            }
         }
 
         private static string NewTurnId(string chatId) => "rt_" + TextFeatures.Hash(chatId + "|" + Guid.NewGuid().ToString("N"), 16);

@@ -6,6 +6,16 @@ export interface ApiError {
   message: string;
 }
 
+export interface AssistantVoiceMetrics {
+  realSamples: number;
+  assistantSamples: number;
+  testSamples: number;
+  accuracy: number;
+  precision: number;
+  recall: number;
+  auc: number;
+}
+
 export interface CohortDto {
   cohortId: string;
   name: string;
@@ -110,6 +120,16 @@ export interface ExploreResult {
 }
 
 export type FilterOp = "Eq" | "NotEq" | "In" | "NotIn" | "Between" | "Gte" | "Lte" | "Contains" | "IsNull" | "IsNotNull";
+
+export interface GenerationConfig {
+  temperature: number;
+  topP: number;
+  candidates: number;
+  retrieved: number;
+  burstSampling: boolean;
+  llmJudge: boolean;
+  key: string;
+}
 
 export interface JobActionRequest {
   jobId: number;
@@ -359,6 +379,419 @@ export interface ReadModelDto {
   sourceSeq: number;
   computedAtMs: number;
   body: unknown;
+}
+
+export interface ReplicaActionResultDto {
+  changed: boolean;
+  detail?: string | null;
+}
+
+export interface ReplicaAutoRetrainRequest {
+  personId: string;
+  enabled: boolean;
+}
+
+export interface ReplicaBlindAnswerDto {
+  index: number;
+  choice: string;
+  real: string;
+  correct: boolean;
+  answered: number;
+  correctTotal: number;
+}
+
+export interface ReplicaBlindAnswerRequest {
+  sessionId: string;
+  index: number;
+  choice: string;
+}
+
+export interface ReplicaBlindItemDto {
+  index: number;
+  stimulus: string;
+  optionA: string;
+  optionB: string;
+  answered?: string | null;
+  correct?: boolean | null;
+}
+
+export interface ReplicaBlindResultsDto {
+  personId: string;
+  sessions: number;
+  answered: number;
+  correct: number;
+  accuracy?: number | null;
+  recent: ReplicaBlindSessionDto[];
+}
+
+export interface ReplicaBlindSessionDto {
+  sessionId: string;
+  personId: string;
+  versionId: string;
+  createdAtMs: number;
+  items: ReplicaBlindItemDto[];
+  answered: number;
+  correct: number;
+  accuracy?: number | null;
+  finishedAtMs?: number | null;
+}
+
+export interface ReplicaBlindStartRequest {
+  personId: string;
+  count: number;
+}
+
+export interface ReplicaChatActionRequest {
+  chatId: string;
+}
+
+export interface ReplicaChatCreateRequest {
+  personId: string;
+  title?: string | null;
+  asOfMs?: number | null;
+  contextKind?: string | null;
+  addresseePersonId?: string | null;
+}
+
+export interface ReplicaChatDto {
+  chatId: string;
+  kind: string;
+  personId: string;
+  title?: string | null;
+  asOfMs?: number | null;
+  contextKind: string;
+  addresseePersonId?: string | null;
+  archived: boolean;
+  createdAtMs: number;
+  updatedAtMs: number;
+  members: string[];
+  topic?: string | null;
+}
+
+export interface ReplicaChatMessageDto {
+  chatId: string;
+  seq: number;
+  role: string;
+  content: string;
+  atMs: number;
+  personId?: string | null;
+  speaker?: string | null;
+  turnId?: string | null;
+  status?: string | null;
+  error?: string | null;
+  simulated: boolean;
+  versionId?: string | null;
+  generationId?: string | null;
+  burstIndex?: number | null;
+  burstSize?: number | null;
+}
+
+export interface ReplicaChatMessagePageDto {
+  items: ReplicaChatMessageDto[];
+  nextCursor?: number | null;
+}
+
+export interface ReplicaChatPageDto {
+  items: ReplicaChatDto[];
+  nextCursor?: string | null;
+}
+
+export interface ReplicaChatRateRequest {
+  chatId: string;
+  seq: number;
+  rating: number;
+  note?: string | null;
+}
+
+export interface ReplicaChatSendRequest {
+  chatId: string;
+  content: string;
+}
+
+export interface ReplicaChatUpdateRequest {
+  chatId: string;
+  title?: string | null;
+  archived?: boolean | null;
+}
+
+export interface ReplicaCountsDto {
+  pairs: number;
+  replies: number;
+  initiations: number;
+  train: number;
+  holdoutTune: number;
+  holdoutTest: number;
+  shadow: number;
+  eras: number;
+  slices: number;
+  personaItems: number;
+  personaDropped: number;
+  reflexLabelled: number;
+  vectors: number;
+}
+
+export interface ReplicaEraDto {
+  index: number;
+  fromMs: number;
+  toMs: number;
+  pairs: number;
+  means: Record<string, number>;
+}
+
+export interface ReplicaEvalItemDto {
+  pairId: string;
+  configKey: string;
+  split: string;
+  contextKind: string;
+  occurredMs: number;
+  asOfMs: number;
+  stimulus?: string | null;
+  realReply?: string | null;
+  generatedReply?: string | null;
+  outcome: string;
+  judgeCorrect?: boolean | null;
+  judgeConfidence?: number | null;
+  embeddingSimilarity?: number | null;
+  styleDistance?: number | null;
+  lengthError?: number | null;
+  model?: string | null;
+}
+
+export interface ReplicaEvalPageDto {
+  items: ReplicaEvalItemDto[];
+  nextCursor?: string | null;
+  textsIncluded: boolean;
+}
+
+export interface ReplicaFidelityPointDto {
+  versionId: string;
+  number: number;
+  finishedAtMs: number;
+  discriminationAccuracy?: number | null;
+  embeddingSimilarity?: number | null;
+  styleDistance?: number | null;
+  evaluated: number;
+}
+
+export interface ReplicaGroupAdvanceRequest {
+  chatId: string;
+  turns: number;
+}
+
+export interface ReplicaGroupCreateRequest {
+  personIds: string[];
+  topic: string;
+  conversationId?: string | null;
+  turns: number;
+}
+
+export interface ReplicaGroupSendRequest {
+  chatId: string;
+  content: string;
+  turns: number;
+}
+
+export interface ReplicaHouseModelDto {
+  modelId: string;
+  version: number;
+  state: string;
+  trainedAtMs?: number | null;
+  metrics?: AssistantVoiceMetrics | null;
+  detail?: string | null;
+}
+
+export interface ReplicaJobStartedDto {
+  personId: string;
+  jobId: number;
+}
+
+export interface ReplicaMetricsDto {
+  evaluated: number;
+  failed: number;
+  discriminationAccuracy?: number | null;
+  discriminationCiLow?: number | null;
+  discriminationCiHigh?: number | null;
+  embeddingSimilarity?: number | null;
+  styleDistance?: number | null;
+  lengthError?: number | null;
+  burstError?: number | null;
+  configKey?: string | null;
+  tuning: ReplicaTuneResultDto[];
+  discriminationByContext: Record<string, number>;
+  model?: string | null;
+  evaluatedAtMs?: number | null;
+  note: string;
+}
+
+export interface ReplicaModuleStatusDto {
+  encoderModel?: string | null;
+  encoderAvailable: boolean;
+  assistantVoice?: ReplicaHouseModelDto | null;
+  replicas: number;
+  ready: number;
+  building: number;
+  failed: number;
+  blocked: number;
+  stale: number;
+  nowMs: number;
+}
+
+export interface ReplicaPersonDto {
+  personId: string;
+  name: string;
+  status: string;
+  statusDetail?: string | null;
+  stale: boolean;
+  staleReason?: string | null;
+  staleSinceMs?: number | null;
+  newMessagesSinceServing: number;
+  autoRetrain: boolean;
+  readiness?: ReplicaReadinessDto | null;
+  serving?: ReplicaVersionSummaryDto | null;
+  building?: ReplicaVersionSummaryDto | null;
+  fidelityTrend: ReplicaFidelityPointDto[];
+  updatedAtMs: number;
+}
+
+export interface ReplicaPersonPageDto {
+  items: ReplicaPersonDto[];
+  nextCursor?: string | null;
+}
+
+export interface ReplicaPersonRequest {
+  personId: string;
+}
+
+export interface ReplicaReadinessDto {
+  personId: string;
+  name: string;
+  tier: ReplicaTier;
+  mode: string;
+  reason: string;
+  replies: number;
+  initiations: number;
+  effective: number;
+  explicitReplies: number;
+  repliesToKlives: number;
+  authoredMessages: number;
+  nonAuthored: number;
+  deleted: number;
+  minorPeriodExcluded: number;
+  byContext: Record<string, number>;
+  firstMs?: number | null;
+  lastMs?: number | null;
+  conversations: number;
+  ageBand: string;
+  adultFromMs?: number | null;
+  thresholdExperimental: number;
+  thresholdReady: number;
+  isSelf: boolean;
+  isBot: boolean;
+  truncated: boolean;
+  computedAtMs: number;
+  sourceSeq: number;
+}
+
+export interface ReplicaStageDto {
+  stage: string;
+  state: string;
+  attempts: number;
+  startedAtMs?: number | null;
+  finishedAtMs?: number | null;
+  detail?: string | null;
+  error?: string | null;
+  total: number;
+  completed: number;
+  failed: number;
+}
+
+export interface ReplicaStreamEventDto {
+  type: string;
+  chatId: string;
+  turnId?: string | null;
+  stage?: string | null;
+  index?: number | null;
+  of?: number | null;
+  message?: ReplicaChatMessageDto | null;
+  code?: string | null;
+  text?: string | null;
+}
+
+export interface ReplicaStyleDto {
+  bursts: number;
+  fromMs: number;
+  toMs: number;
+  charsP50: number;
+  charsP90: number;
+  burstShares: number[];
+  latencyP50Ms?: number | null;
+  casing: Record<string, number>;
+  endings: Record<string, number>;
+  emojiLines: number;
+  topEmoji: string[];
+  laughter: string[];
+  distinctive: string[];
+  scripts: Record<string, number>;
+  peakLocalHours: number[];
+}
+
+export type ReplicaTier = "Ready" | "Experimental" | "NotPossible" | "Blocked";
+
+export interface ReplicaTrainRequest {
+  personId: string;
+  reason?: string | null;
+}
+
+export interface ReplicaTrainResultDto {
+  personId: string;
+  versionId: string;
+  number: number;
+  jobId: number;
+  alreadyRunning: boolean;
+  readiness?: ReplicaReadinessDto | null;
+}
+
+export interface ReplicaTuneResultDto {
+  configKey: string;
+  temperature: number;
+  retrieved: number;
+  burstSampling: boolean;
+  pairs: number;
+  discriminationAccuracy?: number | null;
+  embeddingSimilarity?: number | null;
+  styleDistance?: number | null;
+  chosen: boolean;
+}
+
+export interface ReplicaVersionDto {
+  summary: ReplicaVersionSummaryDto;
+  personId: string;
+  moduleVersion: number;
+  requestedBy: string;
+  eras: ReplicaEraDto[];
+  style?: ReplicaStyleDto | null;
+  config?: GenerationConfig | null;
+}
+
+export interface ReplicaVersionListDto {
+  versions: ReplicaVersionSummaryDto[];
+}
+
+export interface ReplicaVersionSummaryDto {
+  versionId: string;
+  number: number;
+  state: string;
+  reason: string;
+  createdAtMs: number;
+  finishedAtMs?: number | null;
+  dataFromMs?: number | null;
+  dataToMs?: number | null;
+  encoderModel?: string | null;
+  stages: ReplicaStageDto[];
+  metrics?: ReplicaMetricsDto | null;
+  degraded: string[];
+  counts?: ReplicaCountsDto | null;
+  error?: string | null;
 }
 
 export interface RerunRequest {
