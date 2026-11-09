@@ -140,16 +140,17 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
             var own = block.Split('\n').FirstOrDefault(l => l.StartsWith(name + ": ", StringComparison.Ordinal))?[(name.Length + 2)..] ?? "";
             var partner = Regex.Match(block, @"DM with ([^—]+?) —").Groups[1].Value.Trim();
             string quote = own.Length > 12 ? own[..12] : own;
+            string when = Regex.Match(block, @"(\d{4}-\d{2}-\d{2})").Groups[1].Value; // makes every slice's notes unique
             return new
             {
                 opinions = new object[]
                 {
-                    new { topic = "weekend plans", stance = "likes keeping them loose", strength = "moderate", evidence = new[] { "e1" }, quote },
+                    new { topic = "weekend plans", stance = "likes keeping them loose (" + when + ")", strength = "moderate", evidence = new[] { "e1" }, quote },
                     new { topic = "made up", stance = "hallucinated", evidence = new[] { "e999" }, quote = "never said this" },
                 },
-                relationships = partner.Length == 0 ? Array.Empty<object>() : new object[] { new { person = partner, register = "teases them a lot", evidence = new[] { "e1" } } },
-                self = new object[] { new { text = "talks about their day", evidence = new[] { "e1" }, quote } },
-                interests = new object[] { new { topic = "games", evidence = new[] { "e1" } } },
+                relationships = partner.Length == 0 ? Array.Empty<object>() : new object[] { new { person = partner, register = "teases them a lot (" + when + ")", evidence = new[] { "e1" } } },
+                self = new object[] { new { text = "talks about their day (" + when + ")", evidence = new[] { "e1" }, quote } },
+                interests = new object[] { new { topic = "games (" + when + ")", evidence = new[] { "e1" } } },
                 jokes = Array.Empty<object>(),
             };
         }
@@ -275,7 +276,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
             long t = at + (1 + rng.Next(8)) * 60_000L;
             var lines = Reply(rng, to, at, day);
             // A unique tag per exchange: lets the holdout test trace a held-out reply if it ever reached a prompt.
-            lines[^1] += " #" + (w.Snowflake + 1).ToString(CultureInfo.InvariantCulture);
+            lines[^1] = "#" + (w.Snowflake + 1).ToString(CultureInfo.InvariantCulture) + " " + lines[^1];
             for (int i = 0; i < lines.Count; i++)
             {
                 Post(w, conv, to, t, lines[i], replyTo: i == 0 && day % 7 == 0 ? stim : null);
