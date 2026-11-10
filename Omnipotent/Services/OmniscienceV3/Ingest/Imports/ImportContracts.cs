@@ -160,6 +160,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
         public string? OwnerName { get; init; }
         /// <summary>Overrides the conversation title taken from the file name.</summary>
         public string? ConversationTitle { get; init; }
+        /// <summary>"dm" or "group_dm", for formats that cannot tell (a WhatsApp export does not say which it is).</summary>
+        public string? ConversationKind { get; init; }
         /// <summary>Generic tables: the platform the rows are filed under (default "import").</summary>
         public string? Platform { get; init; }
         /// <summary>Generic tables: field → column name, for columns the header does not name conventionally.</summary>

@@ -158,6 +158,7 @@ export interface ImportOptions {
   dayFirst?: boolean | null;
   ownerName?: string | null;
   conversationTitle?: string | null;
+  conversationKind?: string | null;
   platform?: string | null;
   columns?: Record<string, string> | null;
 }

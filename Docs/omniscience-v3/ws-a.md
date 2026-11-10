@@ -60,9 +60,11 @@ coordinating session does this work itself, in this worktree. This file is kept 
   fetched twice during the shadow run. Turn it on at cutover.
 - **Meta exports:** a sender is scoped to its thread (`thread:<thread>:<name>`) until linked; the account owner is one identity
   (`self:<name>`). The owner is detected as the one name present in every thread (needs two threads), or given as `ownerName`.
-- **WhatsApp:** senders are names (`name:<key>`, the same contact across chats) or phone numbers (`+447…`). Lines the app wrote
-  are system messages from `whatsapp:system`. A chat is a group when more than two people wrote, or two wrote and the chat is
-  named after neither.
+- **WhatsApp:** a sender name is how Klives's phone labelled someone in that export, so it identifies a person **within that
+  chat** (`name:<chat>:<name>`) until linked, as with Meta; a phone number (`+447…`) is the account itself and global; the owner
+  (`ownerName`) is one identity everywhere (`self:<name>`). Lines the app wrote are system messages from `whatsapp:system`. A chat
+  is a group when more than two people wrote, or two wrote and the chat is named after neither; `conversationKind` overrides the
+  guess. An iPhone export's bare `_chat.txt` names no chat, so the import asks for `conversationTitle`.
 - **Taken time of a photo:** exact to the second when the camera recorded its UTC offset, else read on Klives's clock and marked
   `InferredZone`. `media_objects.taken_local` keeps the wall clock so the person-zone model (WS-B/C) can refine it.
 - **HEIC/AVIF** are kept and marked `unsupported` (no decoder in this build; Magick.NET was not added).
@@ -75,7 +77,7 @@ coordinating session does this work itself, in this worktree. This file is kept 
 - `Docs/omniscience-v3/api-contracts.ts` regenerated (import DTOs).
 
 ## Tests (`Omnipotent.Tests/OmniscienceV3/Ingest/`, synthetic data only)
-`CorpusWriterTests` (12), `ImportTests` (15), `MediaTests` (10). Whole v3 suite on this branch: 198 passed, 1 skipped (the opt-in
+`CorpusWriterTests` (12), `ImportTests` (16), `MediaTests` (10). Whole v3 suite on this branch: 199 passed, 1 skipped (the opt-in
 5M perf run). Run: `$env:DOTNET_ROLL_FORWARD='Major'; dotnet test Omnipotent.Tests/Omnipotent.Tests.csproj --filter "FullyQualifiedName~OmniscienceV3"`.
 
 ## Not built yet
@@ -90,10 +92,11 @@ coordinating session does this work itself, in this worktree. This file is kept 
 | Faces (N1): detection, embedding, clustering, conversation-grounded labels, propagation, face pivot X25 | not started |
 | Explore datasets for media/imports (D4 manifest declarations) | not started |
 | ffprobe for video/audio duration and dimensions | not started |
-| Traceability rows for ingest (F-items) | not ticked yet |
+| Traceability | F359, F360, F394, F404–F406, F460–F471 fixed; F403, F422 in progress; OCR, gateway and vault rows untouched |
 
 ## Known limits
-- WhatsApp: a group in which only two people ever wrote and which is named after one of them is read as a direct chat. A
+- WhatsApp: a group in which only two people ever wrote and which is named after one of them is read as a direct chat
+  (override with `conversationKind`). A
   system line containing ": " in an Android export (rare) is read as a message from a sender named by the text before the colon.
   Two different contacts saved under the same name in one chat cannot be told apart from the export.
 - WhatsApp exports from two different phones of the same chat (minute vs second precision) do not dedupe against each other.

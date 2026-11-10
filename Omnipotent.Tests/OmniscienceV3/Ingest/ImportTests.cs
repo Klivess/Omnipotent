@@ -280,6 +280,41 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
             Assert.Equal(0L, One<long>("SELECT COUNT(*) FROM identity_names WHERE value='Someone Else'"));
         }
 
+        [Fact]
+        public async Task WhatsApp_NamesBelongToTheirChat_IdenticalMessagesAreAllKept_AndWhatTheExportCannotSayIsAsked()
+        {
+            var options = new ImportOptions { OwnerName = "Klives Test" };
+            await service.CommitAsync(Put("scoped/WhatsApp Chat with Ada Example.txt",
+                "25/12/2023, 09:16 - Ada Example: hello\n" +
+                "25/12/2023, 09:17 - Klives Test: ok\n" +
+                "25/12/2023, 09:17 - Klives Test: ok\n"), null, options);
+            await service.CommitAsync(Put("scoped/WhatsApp Chat with Book Club.txt",
+                "26/12/2023, 10:00 - Ada Example: next book?\n" +
+                "26/12/2023, 10:01 - Bo Example: something short\n" +
+                "26/12/2023, 10:02 - Klives Test: agreed\n"), null, options);
+
+            // Two identical messages in the same minute are two messages.
+            Assert.Equal(2L, One<long>("SELECT COUNT(*) FROM messages WHERE content='ok'"));
+            // "Ada Example" in two chats is two identities until Klives links them; Klives himself is one.
+            Assert.Equal(2L, One<long>("SELECT COUNT(DISTINCT identity_id) FROM identity_names WHERE value='Ada Example'"));
+            Assert.Equal(1L, One<long>("SELECT COUNT(DISTINCT identity_id) FROM identity_names WHERE value='Klives Test'"));
+            Assert.Equal(1L, One<long>("SELECT COUNT(*) FROM persons WHERE is_self=1"));
+            Assert.Equal(ConversationKinds.Dm, One<string>("SELECT kind FROM conversations WHERE title='Ada Example'"));
+            Assert.Equal(ConversationKinds.GroupDm, One<string>("SELECT kind FROM conversations WHERE title='Book Club'"));
+
+            // One person has written so far in a group named after nobody: the guess can be overridden.
+            string pair = Put("scoped/WhatsApp Chat with Ada Example Fan Club.txt", "27/12/2023, 10:00 - Ada Example: just me so far\n");
+            Assert.Equal(ConversationKinds.Dm, service.Preview(pair, null, options).Conversations[0].Kind);
+            Assert.Equal(ConversationKinds.GroupDm, service.Preview(pair, null, options with { ConversationKind = "group_dm" }).Conversations[0].Kind);
+
+            // An iPhone export's text file on its own is always "_chat.txt": it does not say which chat it is.
+            string anonymous = Put("lonely/_chat.txt", "[25/12/2023, 09:16:00] Ada Example: hello\n[25/12/2023, 09:17:00] Klives Test: hi\n");
+            Assert.Contains("name the conversation", service.Preview(anonymous, null, options).DecisionNeeded);
+            var named = service.Preview(anonymous, null, options with { ConversationTitle = "Ada Example" });
+            Assert.Null(named.DecisionNeeded);
+            Assert.Equal((2, "Ada Example"), (named.Messages, named.Conversations[0].Title));
+        }
+
         // ── Telegram ─────────────────────────────────────────────────────────────
 
         private static object TelegramMessage(int id, long unix, string from, string fromId, object text, Dictionary<string, object>? extra = null)

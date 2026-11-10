@@ -124,7 +124,9 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
             }
             var resolved = Zones.ResolveSequence(wall, zone);
 
-            string title = options.ConversationTitle ?? TitleOf(input, chat);
+            string title = options.ConversationTitle ?? TitleOf(input, chat)
+                ?? throw new ImportDecisionNeededException(
+                    "This export does not say which chat it is (an iPhone export's text file is always called _chat.txt): name the conversation.");
             string conversationKey = "chat:" + ImportIds.Key(title);
             var senders = usable.Where(l => !IsSystem(l)).Select(l => CleanName(l.Sender!)).Distinct(StringComparer.Ordinal).ToList();
             // A chat with one other person is titled with that person's name. More than two writers, or two writers
@@ -132,7 +134,14 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
             // which is named after one of them cannot be told apart from a direct chat by the export alone.)
             string cleanTitle = CleanName(title);
             bool group = senders.Count > 2 || (senders.Count == 2 && !senders.Contains(cleanTitle, StringComparer.OrdinalIgnoreCase));
-            var conversation = new IngestConversation(Platform, conversationKey, group ? ConversationKinds.GroupDm : ConversationKinds.Dm, title);
+            string conversationKind = options.ConversationKind switch
+            {
+                ConversationKinds.Dm => ConversationKinds.Dm,
+                ConversationKinds.GroupDm => ConversationKinds.GroupDm,
+                null => group ? ConversationKinds.GroupDm : ConversationKinds.Dm,
+                _ => throw new ImportDecisionNeededException("A WhatsApp chat is either \"dm\" or \"group_dm\"."),
+            };
+            var conversation = new IngestConversation(Platform, conversationKey, conversationKind, title);
             string? owner = options.OwnerName == null ? null : CleanName(options.OwnerName);
             if (owner != null && !senders.Contains(owner, StringComparer.Ordinal))
                 diagnostics.Warn($"Nobody in this chat is named \"{owner}\", so no message was marked as Klives's own.");
@@ -203,7 +212,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
 
                 var author = system
                     ? systemIdentity
-                    : new IngestIdentity(Platform, UserIdOf(senderName), DisplayName: IsPhone(senderName) ? null : senderName,
+                    : new IngestIdentity(Platform, UserIdOf(senderName, conversationKey, owner), DisplayName: IsPhone(senderName) ? null : senderName,
                         Username: IsPhone(senderName) ? NormalisePhone(senderName) : null, IsSelf: owner != null && senderName == owner);
 
                 yield return new IngestMessage
@@ -346,20 +355,37 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
             return new IngestAttachment(fileName, SizeBytes: entry.Length, LocalFile: () => input.OpenEntry(entry));
         }
 
-        private static string TitleOf(ImportInput input, ImportEntry chat)
+        /// <summary>
+        /// The chat's name, from where the export carries it: Android names the text file after the chat, iOS names
+        /// the zip. An iOS text file on its own is always "_chat.txt" and names nothing — null, so the caller asks,
+        /// rather than filing every such export under one conversation.
+        /// </summary>
+        private static string? TitleOf(ImportInput input, ImportEntry chat)
         {
             var android = FileTitleAndroid.Match(chat.FileName);
             if (android.Success) return android.Groups["t"].Value.Trim();
             var ios = FileTitleIos.Match(input.Name);
             if (ios.Success) return ios.Groups["t"].Value.Trim();
-            string name = Path.GetFileNameWithoutExtension(input.IsDirectory || chat.FileName.Equals("_chat.txt", StringComparison.OrdinalIgnoreCase) ? input.Name : chat.FileName);
-            return string.IsNullOrWhiteSpace(name) ? "WhatsApp chat" : name;
+            bool anonymous = chat.FileName.Equals("_chat.txt", StringComparison.OrdinalIgnoreCase);
+            string name = Path.GetFileNameWithoutExtension(anonymous ? input.Name : chat.FileName);
+            if (string.IsNullOrWhiteSpace(name) || name.Equals("_chat", StringComparison.OrdinalIgnoreCase)) return null;
+            return name;
         }
 
         private static string CleanName(string name) => name.Trim('\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\uFEFF', ' ', '\u00A0', '~').Normalize(NormalizationForm.FormC);
         private static bool IsPhone(string name) => PhoneNumber.IsMatch(name);
         private static string NormalisePhone(string name) => "+" + new string(name.Where(char.IsAsciiDigit).ToArray());
-        private static string UserIdOf(string name) => IsPhone(name) ? NormalisePhone(name) : "name:" + ImportIds.Key(name);
+        /// <summary>
+        /// A phone number is the account itself. A name is only how Klives's phone labelled someone in this export,
+        /// so it identifies a person within this chat; the same name in another chat is linked by Klives (or by the
+        /// identity-link suggestions), never assumed. The owner is the same account in every chat.
+        /// </summary>
+        private static string UserIdOf(string name, string conversationKey, string? owner)
+        {
+            if (IsPhone(name)) return NormalisePhone(name);
+            if (owner != null && name == owner) return "self:" + ImportIds.Key(name);
+            return $"name:{conversationKey["chat:".Length..]}:{ImportIds.Key(name)}";
+        }
         private static string? NullIfEmpty(string s) => s.Length == 0 ? null : s;
     }
 }
