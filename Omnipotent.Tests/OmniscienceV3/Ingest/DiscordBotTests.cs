@@ -333,6 +333,30 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
         }
 
         [Fact]
+        public async Task OpenThreadsAreFoundAndRead_AndACleanStopWritesWhatWasHeard()
+        {
+            const string thread = "700000000000000003";
+            feed.ChannelList.Add(GeneralChannel);
+            discord.ActiveThreads.Add(El(new JsonObject { ["id"] = thread, ["type"] = 11, ["name"] = "release plans", ["guild_id"] = Guild, ["parent_id"] = General }));
+            Post(Old, "in the channel");
+            Post(Old + 1000, "in the thread", channel: thread);
+            var (host, _) = await StartAsync();
+            var sink = feed.Sink!;
+
+            sink(new BotConnected("ready"));
+            await Until(() => One<long>("SELECT COUNT(*) FROM messages") == 2, "the channel and its thread to be read");
+            Assert.Equal(("thread", "discord:" + General, "release plans"),
+                Rows("SELECT kind, parent_conversation_id, title FROM conversations WHERE conversation_id=$c", r => (r.GetString(0), r.GetString(1), r.GetString(2)), ("$c", "discord:" + thread)).Single());
+
+            // Heard a moment before the service stops: still written.
+            string id = One<string>("SELECT platform_message_id FROM messages WHERE content='in the thread'");
+            sink(new BotMessagesDeleted(thread, new[] { id }));
+            await host.DisposeAsync();
+            Assert.NotNull(One<long?>("SELECT deleted_at_ms FROM messages WHERE content='in the thread'"));
+            Assert.Empty(errors);
+        }
+
+        [Fact]
         public async Task AChannelWhoseHistoryIsRefused_KeepsWhatTheConnectionRelayed()
         {
             feed.ChannelList.Add(GeneralChannel);

@@ -678,6 +678,17 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
                 try { await pump.ConfigureAwait(false); }
                 catch (Exception ex) { Context.LogError("[OmniscienceV3] the Discord event loop ended with an error during shutdown.", ex); }
             }
+            // What was heard but not yet written is written now: a clean stop loses nothing (F442).
+            try
+            {
+                var rest = new List<(BotEvent Event, long AtMs)>();
+                while (inbox.Reader.TryRead(out var item)) rest.Add(item);
+                if (rest.Count > 0 && Enabled) await ApplyAsync(rest, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Context.LogError("[OmniscienceV3] the last Discord events could not be written during shutdown.", ex);
+            }
             ownedApi?.Dispose();
             stop.Dispose();
         }
