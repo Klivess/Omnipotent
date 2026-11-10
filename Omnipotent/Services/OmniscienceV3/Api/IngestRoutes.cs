@@ -69,6 +69,48 @@ namespace Omnipotent.Services.OmniscienceV3.Api
 
             await Post("imports/preview", OmnisciencePerms.SourcesManage, req => StartAsync(req, ImportModule.PreviewKind), ct).ConfigureAwait(false);
             await Post("imports/commit", OmnisciencePerms.SourcesManage, req => StartAsync(req, ImportModule.CommitKind), ct).ConfigureAwait(false);
+
+            // An attachment's bytes, by attachment id. Whoever may read messages may see what was attached to them.
+            await Get("media/file", OmnisciencePerms.MessagesRead, req => ServeMediaAsync(req, thumbnail: false), ct).ConfigureAwait(false);
+            await Get("media/thumb", OmnisciencePerms.MessagesRead, req => ServeMediaAsync(req, thumbnail: true), ct).ConfigureAwait(false);
+        }
+
+        private async Task ServeMediaAsync(UserRequest req, bool thumbnail)
+        {
+            string attachmentId = ApiQuery.Of(req).Required("attachment", 256);
+            var rt = host.Require();
+            (bool Found, string? Sha, string? Mime, string State, string? Error) attachment;
+            using (var c = rt.Stores.Corpus.OpenRead())
+                attachment = c.Query(null, "SELECT cas_sha256, mime, download_state, download_error FROM attachments WHERE attachment_id=$a",
+                    r => (true, r.GetStringOrNull(0), r.GetStringOrNull(1), r.GetString(2), r.GetStringOrNull(3)), ("$a", attachmentId)).FirstOrDefault();
+            if (!attachment.Found) throw ApiException.NotFound("No such attachment.");
+            if (attachment.Sha == null)
+                throw new ApiException(HttpStatusCode.NotFound, "not_stored", $"This attachment's file is not stored ({attachment.State}{(attachment.Error == null ? "" : ": " + attachment.Error)}).");
+
+            string sha = attachment.Sha;
+            string mime = attachment.Mime ?? "application/octet-stream";
+            if (thumbnail)
+            {
+                string? thumb;
+                using (var c = rt.Stores.Intel.OpenRead())
+                    thumb = c.Query(null, "SELECT thumb_sha256 FROM media_objects WHERE sha256=$s", r => r.GetStringOrNull(0), ("$s", sha)).FirstOrDefault();
+                if (thumb == null) throw new ApiException(HttpStatusCode.NotFound, "not_built", "This attachment has no thumbnail (it is not an image, or has not been processed yet).");
+                sha = thumb;
+                mime = "image/webp";
+            }
+
+            string? relative;
+            using (var c = rt.Stores.Corpus.OpenRead())
+                relative = c.Scalar<string>(null, "SELECT relative_path FROM cas_objects WHERE sha256=$s", ("$s", sha));
+            string? path = relative == null ? null : Storage.MediaPaths.Resolve(rt.Stores.Paths, relative);
+            if (path == null || !File.Exists(path)) throw new ApiException(HttpStatusCode.NotFound, "not_stored", "The stored file is missing from disk.");
+
+            Omnipotent.Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("omniscience-v3: media bytes");
+            await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
+            // Content never changes under an attachment id once stored, so the browser may keep it; never a shared cache.
+            var headers = new System.Collections.Specialized.NameValueCollection { ["Cache-Control"] = "private, max-age=86400", ["X-Content-Type-Options"] = "nosniff" };
+            await using var output = req.PrepareStreamResponse(mime, file.Length, HttpStatusCode.OK, headers);
+            await file.CopyToAsync(output, host.Stopping).ConfigureAwait(false);
         }
 
         private async Task StartAsync(UserRequest req, string kind)
