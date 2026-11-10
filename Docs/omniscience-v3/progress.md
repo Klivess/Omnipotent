@@ -29,7 +29,7 @@ Another live session commits and pushes on master from the main folder, so never
 |---|---|---|
 | 0 | Branch, docs, contracts | done |
 | 1 | Foundations: temporal ✓, storage ✓, kernel ✓, LLM gateway ✓, ML runtime ✓, policy ✓, API skeleton ✓, legacy importer ✓, synthetic corpus + perf harness ✓ | done (contracts to freeze) |
-| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | running: WS-A to WS-D started 2026-11-06; WS-E first slice (foundation + engine pages) committed 2026-11-09, domain pages wait for DTOs; WS-A taken over by the coordinating session 2026-11-10 (imports and media store landed) |
+| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | running: WS-A to WS-D started 2026-11-06; WS-E first slice (foundation + engine pages) committed 2026-11-09, domain pages wait for DTOs; WS-A taken over by the coordinating session 2026-11-10 (imports, media store, media text and Discord-through-KliveBot landed; captions, visual search and faces not built) |
 | 3 | Integration, shadow run, parity gates, cutover | not started |
 
 ## Log
@@ -109,14 +109,24 @@ Another live session commits and pushes on master from the main folder, so never
 
    **WS-A** has been done by the coordinating session since 2026-11-10, on Klives's instruction ("do WS-A by yourself"), in
    WS-A's own worktree and branch (its original session had produced no commits and is idle; do not wake it). Landed so far,
-   tested (208 v3 tests passing on that branch, tip `928b8e1`): the corpus writer every source goes through, the
+   tested (239 v3 tests passing on that branch, tip `211e9a1`): the corpus writer every source goes through, the
    content-addressed media store, five import formats (WhatsApp, Telegram, Instagram/Messenger, the Discord data package,
    CSV/JSON tables) with preview and idempotent commit as kernel jobs, image probing (orientation, taken-time, perceptual
    hash, thumbnails), the attachment downloader, OCR and transcripts filed as labels (tested with stand-in engines; the real
-   Tesseract, ffmpeg and Whisper paths have not run), and routes for imports and media. Not built yet: KliveBot live ingest,
-   an upload route, captions, visual search and faces. Details, decisions and the full "not built" list: `ws-a.md` on that branch.
+   Tesseract, ffmpeg and Whisper paths have not run), and routes for imports and media. Since 2026-11-10 also: **Discord
+   through KliveBot** (module `ingest.discord_bot`, off by default until cutover) — it listens to the connection the KliveBot
+   service already holds, reads each channel forward and backward through the bot API with a cursor per channel, and
+   records deletions, reactions, presence, voice and membership; an export **upload route**; and automatic preview of
+   exports dropped in the inbox. The Discord path is tested against a stand-in connection and a stand-in bot API only:
+   **it has never run against Discord.** Not built yet: captions, visual search, faces, Explore dataset declarations, and the
+   4014 intent downgrade in the KliveBot service. Details, decisions and the full "not built" list: `ws-a.md` on that branch.
    **A decision there narrows the plan:** the Discord user-token gateway is not built in v3 (official bot gateway and
    Discord's data package only); it is Klives's call to reopen.
+
+   Shared files WS-A's branch changes, for the merge: `Kernel/ModuleHost.DisposeAsync` (disposes modules that hold
+   resources), `Api/ApiPlumbing.RouteRegistrar.StreamingRouteAsync`, `OmniscienceV3.BuildModules`, `Storage/Legacy/DiscordRaw`
+   (`IsSystemType`), `Storage/Sqlite/SqliteExtensions` (`PreparedStatement.Reader`), `traceability.md` (75 rows, and a new
+   `n/a` status) and `api-contracts.ts`.
 
    State of the other workstreams on 2026-11-10 (all sessions idle since the spend limit on 2026-11-09 23:44 UTC): WS-B at
    `fc02987` (inquiry module, X01–X16, knowledge API; 4 files uncommitted); WS-C at `2b948cc` (C-base 3/3: rollups and
