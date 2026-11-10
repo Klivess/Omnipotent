@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
+using Omnipotent.Services.OmniscienceV3.Storage.Legacy;
 using Omnipotent.Services.OmniscienceV3.Temporal;
 
 namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
@@ -42,14 +43,15 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
 
         // [31/12/2020, 23:59:41]  |  31/12/2020, 23:59 -   (separators / . -, optional seconds, optional am/pm with any space before it)
         private static readonly Regex Header = new(
-            @"^[‎‏‪-‮﻿]*(?<open>\[)?(?<a>\d{1,4})[./-](?<b>\d{1,2})[./-](?<c>\d{1,4}),?[   ]+" +
-            @"(?<h>\d{1,2})[:.](?<mi>\d{2})(?:[:.](?<s>\d{2}))?(?:[   ]*(?<ap>[AaPp])\.?[   ]?[Mm]\.?)?" +
-            @"(?(open)\][  ]?|[  ]+[-–][  ]+)(?<rest>.*)$",
+            @"^[\u200E\u200F\u202A-\u202E\uFEFF]*(?<open>\[)?(?<a>\d{1,4})[./-](?<b>\d{1,2})[./-](?<c>\d{1,4}),?[ \u00A0\u202F]+" +
+            @"(?<h>\d{1,2})[:.](?<mi>\d{2})(?:[:.](?<s>\d{2}))?(?:[ \u00A0\u202F]*(?<ap>[AaPp])\.?[ \u00A0\u202F]?[Mm]\.?)?" +
+            @"(?(open)\][ \u00A0]?|[ \u00A0]+[-–][ \u00A0]+)(?<rest>.*)$",
             RegexOptions.Compiled | RegexOptions.Singleline);
 
-        private static readonly Regex AttachedIos = new(@"^[‎‏]*<attached: (?<f>[^>]+)>$", RegexOptions.Compiled);
-        private static readonly Regex AttachedAndroid = new(@"^[‎‏]*(?<f>[^\r\n<>:""/\\|?*]+\.[A-Za-z0-9]{2,5}) \(file attached\)$", RegexOptions.Compiled);
-        private static readonly Regex PhoneNumber = new(@"^[‪-‮‎‏]*\+[\d  ()\-]{6,}[‪-‮‎‏]*$", RegexOptions.Compiled);
+        private static readonly Regex AttachedIos = new(@"^[\u200E\u200F]*<attached: (?<f>[^>]+)>$", RegexOptions.Compiled);
+        private static readonly Regex AttachedAndroid = new(@"^[\u200E\u200F]*(?<f>[^\r\n<>:""/\\|?*]+\.[A-Za-z0-9]{2,5}) \(file attached\)$", RegexOptions.Compiled);
+        private static readonly Regex OmittedIos = new(@"^[\u200E\u200F]*(?<k>image|video|audio|sticker|GIF|document|Contact card) omitted$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
+        private static readonly Regex PhoneNumber = new(@"^[\u202A-\u202E\u200E\u200F]*\+[\d \u00A0()\-]{6,}[\u202A-\u202E\u200E\u200F]*$", RegexOptions.Compiled);
         private static readonly Regex FileTitleAndroid = new(@"^WhatsApp Chat with (?<t>.+?)(?:\.txt)?$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
         private static readonly Regex FileTitleIos = new(@"^WhatsApp Chat - (?<t>.+?)(?:\.zip)?$", RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
@@ -124,7 +126,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
 
             string title = options.ConversationTitle ?? TitleOf(input, chat);
             string conversationKey = "chat:" + ImportIds.Key(title);
-            var senders = usable.Where(l => l.Sender != null).Select(l => CleanName(l.Sender!)).Distinct(StringComparer.Ordinal).ToList();
+            var senders = usable.Where(l => !IsSystem(l)).Select(l => CleanName(l.Sender!)).Distinct(StringComparer.Ordinal).ToList();
             // A chat with one other person is titled with that person's name. More than two writers, or two writers
             // neither of whom the chat is named after, is a group. (A group in which only two people ever wrote and
             // which is named after one of them cannot be told apart from a direct chat by the export alone.)
@@ -145,12 +147,9 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
                 if (at.WasAmbiguous) diagnostics.AmbiguousTimes++;
                 if (at.WasInvalid) diagnostics.InvalidTimes++;
 
-                string text = line.Text.ToString();
-                bool leadingMark = text.Length > 0 && text[0] is '‎' or '‏';
-                text = text.Trim('‎', '‏', '﻿');
-                // Android writes app notices with no sender; iOS gives them a sender and marks the text with U+200E.
-                bool system = line.Sender == null;
-                string senderName = system ? "" : CleanName(line.Sender!);
+                string text = line.Text.ToString().Trim('\u200E', '\u200F', '\uFEFF');
+                bool system = IsSystem(line);
+                string senderName = line.Sender == null ? "" : CleanName(line.Sender);
 
                 long flags = 0;
                 long? deleted = null;
@@ -159,7 +158,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
 
                 if (content.EndsWith(EditedMarker, StringComparison.Ordinal))
                 {
-                    content = content[..^EditedMarker.Length].TrimEnd(' ', '‎');
+                    content = content[..^EditedMarker.Length].TrimEnd(' ', '\u200E');
                     flags |= IngestFlags.EditedAtUnknownTime;
                 }
                 if (DeletedTexts.Contains(content, StringComparer.Ordinal))
@@ -167,29 +166,33 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
                     deleted = at.UtcMs;
                     content = null;
                 }
-                else if (content == MediaOmitted || content.StartsWith(MediaOmitted + "\n", StringComparison.Ordinal))
+                else if (!system)
                 {
-                    attachments.Add(new IngestAttachment(null, Unavailable: true));
-                    diagnostics.MediaMissing++;
-                    content = NullIfEmpty(content[MediaOmitted.Length..].TrimStart('\n'));
-                }
-                else
-                {
-                    // The attachment marker is the first line; a caption may follow on the next lines.
+                    // A media marker is the first line; a caption may follow on the next lines.
                     int newline = content.IndexOf('\n');
                     string first = newline < 0 ? content : content[..newline];
-                    var match = AttachedIos.Match(first);
-                    if (!match.Success) match = AttachedAndroid.Match(first);
-                    if (match.Success)
+                    string? rest = NullIfEmpty(newline < 0 ? "" : content[(newline + 1)..]);
+                    var attached = AttachedIos.Match(first);
+                    if (!attached.Success) attached = AttachedAndroid.Match(first);
+                    var omitted = OmittedIos.Match(first);
+                    if (attached.Success)
                     {
-                        attachments.Add(Attachment(input, match.Groups["f"].Value.Trim(), diagnostics));
-                        content = NullIfEmpty(newline < 0 ? "" : content[(newline + 1)..]);
+                        attachments.Add(Attachment(input, attached.Groups["f"].Value.Trim(), diagnostics));
+                        content = rest;
                     }
-                    else if (leadingMark && !system)
+                    else if (first == MediaOmitted || omitted.Success)
                     {
-                        // A marked line that is not media is an app notice written under a participant's name
-                        // ("Ada changed the group description"): not something they said.
-                        system = true;
+                        // Exported without media: the message had an attachment that this export does not contain.
+                        string? kind = !omitted.Success ? null : omitted.Groups["k"].Value.ToLowerInvariant() switch
+                        {
+                            "image" or "sticker" or "gif" => MediaKinds.Image,
+                            "video" => MediaKinds.Video,
+                            "audio" => MediaKinds.Voice,
+                            _ => MediaKinds.File,
+                        };
+                        attachments.Add(new IngestAttachment(null, MediaKind: kind, Unavailable: true));
+                        diagnostics.MediaMissing++;
+                        content = rest;
                     }
                 }
                 if (system) diagnostics.SystemLines++;
@@ -198,7 +201,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
                 int occurrence = occurrences.GetValueOrDefault(idKey);
                 occurrences[idKey] = occurrence + 1;
 
-                var author = line.Sender == null
+                var author = system
                     ? systemIdentity
                     : new IngestIdentity(Platform, UserIdOf(senderName), DisplayName: IsPhone(senderName) ? null : senderName,
                         Username: IsPhone(senderName) ? NormalisePhone(senderName) : null, IsSelf: owner != null && senderName == owner);
@@ -218,6 +221,24 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
                     Attachments = attachments,
                 };
             }
+        }
+
+        /// <summary>
+        /// Whether the app wrote the line rather than a person. Android writes its notices with no sender. iOS gives
+        /// every line a sender (the group's name, or the person an event is about) and marks text it generated with
+        /// U+200E; of those marked lines, media markers and deletion notices still stand for something the sender did,
+        /// and everything else (joins, renames, calls, the encryption notice) is the app speaking.
+        /// </summary>
+        private static bool IsSystem(RawLine line)
+        {
+            if (line.Sender == null) return true;
+            if (line.Text.Length == 0 || line.Text[0] is not ('\u200E' or '\u200F')) return false;
+            string text = line.Text.ToString().Trim('\u200E', '\u200F', '\uFEFF');
+            if (text.EndsWith(EditedMarker, StringComparison.Ordinal)) text = text[..^EditedMarker.Length].TrimEnd(' ', '\u200E');
+            int newline = text.IndexOf('\n');
+            string first = newline < 0 ? text : text[..newline];
+            return !(first == MediaOmitted || OmittedIos.IsMatch(first) || AttachedIos.IsMatch(first) || AttachedAndroid.IsMatch(first)
+                     || DeletedTexts.Contains(text, StringComparer.Ordinal));
         }
 
         private static List<RawLine> Parse(string text)
@@ -240,7 +261,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
                         Minute = int.Parse(m.Groups["mi"].Value, CultureInfo.InvariantCulture),
                         Second = m.Groups["s"].Success ? int.Parse(m.Groups["s"].Value, CultureInfo.InvariantCulture) : null,
                         AmPm = m.Groups["ap"].Success ? char.ToUpperInvariant(m.Groups["ap"].Value[0]) : null,
-                        Stamp = line[..m.Groups["rest"].Index].Trim('‎', '‏', '﻿', ' ', ' '),
+                        Stamp = line[..m.Groups["rest"].Index].Trim('\u200E', '\u200F', '\uFEFF', ' ', '\u00A0'),
                         Text = new StringBuilder(),
                     };
                     // A pasted chat log inside a message looks like headers too, but its dates run far behind the
@@ -335,7 +356,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
             return string.IsNullOrWhiteSpace(name) ? "WhatsApp chat" : name;
         }
 
-        private static string CleanName(string name) => name.Trim('‎', '‏', '‪', '‫', '‬', '‭', '‮', '﻿', ' ', ' ', '~').Normalize(NormalizationForm.FormC);
+        private static string CleanName(string name) => name.Trim('\u200E', '\u200F', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E', '\uFEFF', ' ', '\u00A0', '~').Normalize(NormalizationForm.FormC);
         private static bool IsPhone(string name) => PhoneNumber.IsMatch(name);
         private static string NormalisePhone(string name) => "+" + new string(name.Where(char.IsAsciiDigit).ToArray());
         private static string UserIdOf(string name) => IsPhone(name) ? NormalisePhone(name) : "name:" + ImportIds.Key(name);

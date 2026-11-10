@@ -182,7 +182,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
             {
                 if (header == null)
                 {
-                    header = cells.Select(c => c.Trim('﻿', ' ')).ToList();
+                    header = cells.Select(c => c.Trim('\uFEFF', ' ')).ToList();
                     continue;
                 }
                 var row = new Dictionary<string, string?>(StringComparer.Ordinal);

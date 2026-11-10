@@ -250,7 +250,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
         private static int IndexOf(IReadOnlyList<string> row, string name)
         {
             for (int i = 0; i < row.Count; i++)
-                if (row[i].Trim('﻿', ' ').Equals(name, StringComparison.OrdinalIgnoreCase)) return i;
+                if (row[i].Trim('\uFEFF', ' ').Equals(name, StringComparison.OrdinalIgnoreCase)) return i;
             return -1;
         }
 

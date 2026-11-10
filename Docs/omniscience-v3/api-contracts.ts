@@ -111,6 +111,124 @@ export interface ExploreResult {
 
 export type FilterOp = "Eq" | "NotEq" | "In" | "NotIn" | "Between" | "Gte" | "Lte" | "Contains" | "IsNull" | "IsNotNull";
 
+export interface ImportFormatDto {
+  id: string;
+  title: string;
+  needsZone: boolean;
+}
+
+export interface ImportInboxEntryDto {
+  name: string;
+  isFolder: boolean;
+  bytes: number;
+  modifiedAtMs: number;
+}
+
+export interface ImportJobPayload {
+  name: string;
+  format?: string | null;
+  options?: ImportOptions | null;
+}
+
+export interface ImportJobStartedDto {
+  jobId: number;
+}
+
+export interface ImportLedgerEntryDto {
+  importId: string;
+  format: string;
+  sha256: string;
+  zone?: string | null;
+  state: string;
+  createdAtMs: number;
+  committedAtMs?: number | null;
+  error?: string | null;
+  countsJson?: string | null;
+}
+
+export interface ImportListDto {
+  inboxPath: string;
+  inbox: ImportInboxEntryDto[];
+  ledger: ImportLedgerEntryDto[];
+  formats: ImportFormatDto[];
+}
+
+export interface ImportOptions {
+  zone?: string | null;
+  dayFirst?: boolean | null;
+  ownerName?: string | null;
+  conversationTitle?: string | null;
+  platform?: string | null;
+  columns?: Record<string, string> | null;
+}
+
+export interface ImportPreview {
+  name: string;
+  format: string;
+  formatTitle: string;
+  sha256: string;
+  messages: number;
+  systemMessages: number;
+  firstMs?: number | null;
+  lastMs?: number | null;
+  alreadyInCorpus: number;
+  committedBeforeMs?: number | null;
+  conversations: ImportPreviewConversation[];
+  senders: ImportPreviewSender[];
+  senderCount: number;
+  zoneUsed?: string | null;
+  dateOrder?: string | null;
+  ambiguousTimes: number;
+  invalidTimes: number;
+  mediaFound: number;
+  mediaMissing: number;
+  repairedText: number;
+  skippedRecords: number;
+  ownerDetected?: string | null;
+  unreadableFiles: ImportUnreadableFile[];
+  warnings: string[];
+  decisionNeeded?: string | null;
+}
+
+export interface ImportPreviewConversation {
+  conversationId: string;
+  title?: string | null;
+  kind: string;
+  messages: number;
+}
+
+export interface ImportPreviewSender {
+  name: string;
+  identityId: string;
+  messages: number;
+  isOwner: boolean;
+}
+
+export interface ImportResult {
+  importId: string;
+  format: string;
+  sha256: string;
+  read: number;
+  inserted: number;
+  updated: number;
+  unchanged: number;
+  rejected: number;
+  newIdentities: number;
+  newConversations: number;
+  attachmentsAdded: number;
+  attachmentsStored: number;
+  mediaTooLarge: number;
+  mediaFailed: number;
+  skippedRecords: number;
+  unreadableFiles: ImportUnreadableFile[];
+  warnings: string[];
+}
+
+export interface ImportUnreadableFile {
+  file: string;
+  reason: string;
+}
+
 export interface JobActionRequest {
   jobId: number;
 }
