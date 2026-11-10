@@ -13,6 +13,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         public const int ImportRank = 10;
         /// <summary>The platform itself, live or by history request: the platform's current truth.</summary>
         public const int PlatformRank = 20;
+        /// <summary>The platform as a client library relays it: live, but missing fields the platform's own payload has.</summary>
+        public const int RelayedRank = 15;
     }
 
     /// <summary>The conversation kinds stored in <c>conversations.kind</c>.</summary>
@@ -26,6 +28,12 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         /// <summary>A broadcast channel (Telegram channels, announcement feeds).</summary>
         public const string Channel = "channel";
         public const string Unknown = "unknown";
+        /// <summary>What Omniscience v2 called every server conversation, whatever it was. Rows migrated from v2 keep it
+        /// until a source that knows better (a text channel, a thread, an announcement feed) names the real kind.</summary>
+        public const string LegacyServerChannel = "guild_channel";
+
+        /// <summary>True for kinds that only say "not known precisely" and may be replaced by a specific one.</summary>
+        public static bool IsVague(string? kind) => kind is null or Unknown or LegacyServerChannel;
     }
 
     /// <summary>
@@ -33,13 +41,29 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
     /// has one; importers of formats that only give a name build a scoped id (see each importer).
     /// </summary>
     public sealed record IngestIdentity(string Platform, string PlatformUserId, string? Username = null, string? DisplayName = null,
-        bool IsBot = false, bool IsSelf = false);
+        bool IsBot = false, bool IsSelf = false)
+    {
+        /// <summary>A name the account carries only inside one server or group (a Discord server nickname).</summary>
+        public string? Nickname { get; init; }
+        /// <summary>The server or group <see cref="Nickname"/> belongs to (its platform id). Without it the nickname is not stored.</summary>
+        public string? NicknameScope { get; init; }
+        /// <summary>The platform's hash of the account's current picture, when the source gives one.</summary>
+        public string? AvatarHash { get; init; }
+        /// <summary>
+        /// When the names and picture here were current, if that is not the time of the message they came with. A
+        /// history request returns today's profile on a message from years ago: without this, today's name would be
+        /// recorded as the name the account had back then.
+        /// </summary>
+        public long? ObservedAtMs { get; init; }
+    }
 
     public sealed record IngestConversation(string Platform, string ChannelId, string Kind, string? Title = null, string? GuildId = null,
         string? GuildName = null, string? ParentChannelId = null)
     {
         /// <summary>People the source says are in the conversation even if they wrote nothing in this batch (the other side of a DM).</summary>
         public IReadOnlyList<IngestIdentity>? Members { get; init; }
+        /// <summary>When the title here was current, if not the time of the message it came with (see <see cref="IngestIdentity.ObservedAtMs"/>).</summary>
+        public long? ObservedAtMs { get; init; }
     }
 
     /// <summary>

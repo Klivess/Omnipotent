@@ -270,6 +270,26 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             }
         }
 
+        /// <summary>
+        /// A route whose handler reads the request body as a stream (<c>UserRequest.RequestBodyStream</c>) instead of
+        /// having it buffered in memory: uploads. <paramref name="maxBodyBytes"/> is enforced while reading.
+        /// </summary>
+        public async Task StreamingRouteAsync(string path, HttpMethod method, PermissionDef permission, Func<UserRequest, Task> handler,
+            long maxBodyBytes, CancellationToken ct = default)
+        {
+            var target = await ApiAsync(ct).ConfigureAwait(false);
+            try
+            {
+                await target.CreateStreamingRoute(path, req => GuardAsync(path, method, handler, req), method, permission, maxBodyBytes).ConfigureAwait(false);
+                registered[method.Method + " " + path] = 0;
+            }
+            catch (Exception ex)
+            {
+                logError($"[OmniscienceV3] failed to register route {method} {path}.", ex);
+                throw;
+            }
+        }
+
         public async Task WebSocketAsync(string path, PermissionDef permission,
             Func<HttpListenerContext, System.Net.WebSockets.WebSocket, NameValueCollection, Omnipotent.Profiles.KMProfileManager.KMProfile?, Task> handler,
             CancellationToken ct = default)

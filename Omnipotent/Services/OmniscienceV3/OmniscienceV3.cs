@@ -124,7 +124,17 @@ namespace Omnipotent.Services.OmniscienceV3
             // Speech-to-text comes from KliveLLM's AIRouter audio client, resolved when a transcript is first needed.
             new Ingest.Media.MediaTextModule(async () =>
                 await ResolveKliveLlmAsync().ConfigureAwait(false) is { } llm ? new Ingest.Media.AiRouterTranscriber(llm.Audio) : null),
+            // Discord through the connection the KliveBot service already holds; v3 opens none of its own. Off until cutover.
+            new Ingest.Discord.DiscordBotModule(
+                new Ingest.Discord.KliveBotFeed(() => GetActiveServices().OfType<KliveBot_Discord.KliveBotDiscord>().FirstOrDefault()?.Client,
+                    Omnipotent.Data_Handling.OmniPaths.KlivesDiscordAccountID.ToString(System.Globalization.CultureInfo.InvariantCulture)),
+                ReadKliveBotTokenAsync,
+                Omnipotent.Data_Handling.OmniPaths.KlivesDiscordAccountID.ToString(System.Globalization.CultureInfo.InvariantCulture)),
         };
+
+        /// <summary>KliveBot's token, read from where the bot service keeps it, for requests to Discord's bot API only.</summary>
+        private async Task<string?> ReadKliveBotTokenAsync() =>
+            await GetDataHandler().ReadDataFromFile(Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.KliveBotDiscordTokenText), true).ConfigureAwait(false);
 
         private Task<KliveLLM.KliveLLM?> ResolveKliveLlmAsync() =>
             Task.FromResult(GetActiveServices().OfType<KliveLLM.KliveLLM>().FirstOrDefault(s => s.IsServiceActive()));

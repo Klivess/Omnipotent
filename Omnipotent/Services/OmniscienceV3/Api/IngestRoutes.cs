@@ -25,11 +25,25 @@ namespace Omnipotent.Services.OmniscienceV3.Api
     [ApiContract]
     public sealed record ImportJobStartedDto(long JobId);
 
-    /// <summary>Routes of the ingest workstream: imports today; sources, media and faces as they land.</summary>
+    /// <summary>An export received into the inbox, and the job previewing it (its result is an <see cref="ImportPreview"/>).</summary>
+    [ApiContract]
+    public sealed record ImportUploadedDto(string Name, long Bytes, long PreviewJobId);
+
+    /// <summary>Ask for one Discord channel to be read back to its first message now.</summary>
+    [ApiContract]
+    public sealed record DiscordBackfillRequest(string ChannelId);
+
+    /// <summary>Routes of the ingest workstream: imports, the Discord source and media; faces as they land.</summary>
     public sealed class IngestRoutes
     {
+        /// <summary>The largest export accepted by upload. Larger ones go into the inbox folder directly.</summary>
+        public const long MaxUploadBytes = 32L << 30;
+
         private readonly V3Host host;
         private readonly RouteRegistrar registrar;
+
+        private Ingest.Discord.DiscordBotModule Discord => host.Require().Host.Modules.OfType<Ingest.Discord.DiscordBotModule>().FirstOrDefault()
+                                                           ?? throw ApiException.Unavailable(ApiErrors.Unavailable, "The Discord source is not part of this build.");
 
         public IngestRoutes(V3Host host, RouteRegistrar registrar)
         {
@@ -49,7 +63,8 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                 var dir = new DirectoryInfo(module.InboxPath);
                 if (dir.Exists)
                 {
-                    foreach (var entry in dir.EnumerateFileSystemInfos().OrderByDescending(e => e.LastWriteTimeUtc).Take(500))
+                    foreach (var entry in dir.EnumerateFileSystemInfos().Where(e => !e.Name.EndsWith(ImportModule.UploadingSuffix, StringComparison.OrdinalIgnoreCase))
+                                 .OrderByDescending(e => e.LastWriteTimeUtc).Take(500))
                     {
                         bool folder = entry is DirectoryInfo;
                         // A folder's size is not summed here: an unpacked export can hold a hundred thousand files.
@@ -69,6 +84,18 @@ namespace Omnipotent.Services.OmniscienceV3.Api
 
             await Post("imports/preview", OmnisciencePerms.SourcesManage, req => StartAsync(req, ImportModule.PreviewKind), ct).ConfigureAwait(false);
             await Post("imports/commit", OmnisciencePerms.SourcesManage, req => StartAsync(req, ImportModule.CommitKind), ct).ConfigureAwait(false);
+            // PUT imports/upload?name=<file name>, the export as the request body. It lands in the inbox and is previewed.
+            await registrar.StreamingRouteAsync(V3Routes.Prefix + "/imports/upload", HttpMethod.Put, OmnisciencePerms.SourcesManage, UploadAsync, MaxUploadBytes, ct).ConfigureAwait(false);
+
+            await Get("sources/discord", OmnisciencePerms.SourcesView, req => ApiResponses.OkAsync(req, Discord.Status()), ct).ConfigureAwait(false);
+            await Post("sources/discord/backfill", OmnisciencePerms.SourcesManage, async req =>
+            {
+                var body = ApiBody.Read<DiscordBackfillRequest>(req);
+                long jobId;
+                try { jobId = await Discord.RequestBackfillAsync(body.ChannelId, host.Stopping).ConfigureAwait(false); }
+                catch (ArgumentException ex) { throw ApiException.BadRequest(ex.Message); }
+                await ApiResponses.OkAsync(req, new ImportJobStartedDto(jobId), HttpStatusCode.Accepted).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
 
             // An attachment's bytes, by attachment id. Whoever may read messages may see what was attached to them.
             await Get("media/file", OmnisciencePerms.MessagesRead, req => ServeMediaAsync(req, thumbnail: false), ct).ConfigureAwait(false);
@@ -111,6 +138,41 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             var headers = new System.Collections.Specialized.NameValueCollection { ["Cache-Control"] = "private, max-age=86400", ["X-Content-Type-Options"] = "nosniff" };
             await using var output = req.PrepareStreamResponse(mime, file.Length, HttpStatusCode.OK, headers);
             await file.CopyToAsync(output, host.Stopping).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// Receives an export into the import inbox, streamed to disk (exports run to gigabytes). It is written under
+        /// a temporary name and only takes its real name once complete; a preview job is queued for it straight away.
+        /// </summary>
+        private async Task UploadAsync(UserRequest req)
+        {
+            string name = ApiQuery.Of(req).Required("name", 200);
+            var module = Imports;
+            string target;
+            try { target = module.NewInboxFile(name); }
+            catch (InvalidDataException ex) { throw ApiException.BadRequest(ex.Message); }
+
+            string temp = target + ImportModule.UploadingSuffix;
+            long bytes;
+            try
+            {
+                await using (var file = new FileStream(temp, FileMode.Create, FileAccess.Write, FileShare.None, 1 << 20, useAsync: true))
+                {
+                    await req.RequestBodyStream.CopyToAsync(file, host.Stopping).ConfigureAwait(false);
+                    bytes = file.Length;
+                }
+                if (bytes == 0) throw ApiException.BadRequest("The upload was empty.");
+                File.Move(temp, target);
+            }
+            catch
+            {
+                // Whatever went wrong (a dropped connection, a full disk, too large), no partial file is left to be imported.
+                try { File.Delete(temp); }
+                catch (IOException ex) { throw new IOException($"The upload failed and its partial file could not be removed: {ex.Message}", ex); }
+                throw;
+            }
+            long jobId = await module.EnqueueAsync(ImportModule.PreviewKind, new ImportJobPayload(name), host.Stopping).ConfigureAwait(false);
+            await ApiResponses.OkAsync(req, new ImportUploadedDto(name, bytes, jobId), HttpStatusCode.Created).ConfigureAwait(false);
         }
 
         private async Task StartAsync(UserRequest req, string kind)

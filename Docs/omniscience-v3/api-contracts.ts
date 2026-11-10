@@ -51,6 +51,29 @@ export interface DimensionDefinition {
 
 export type DimensionKind = "Time" | "Entity" | "Category" | "Number" | "Flag";
 
+export interface DiscordBackfillRequest {
+  channelId: string;
+}
+
+export interface DiscordBotStatusDto {
+  enabled: boolean;
+  attached: boolean;
+  botUserId?: string | null;
+  contentIntent: boolean;
+  sourceStatus: string;
+  sourceStatusDetail?: string | null;
+  eventsReceived: number;
+  eventsWritten: number;
+  eventsDropped: number;
+  lastEventAtMs?: number | null;
+  lastError?: string | null;
+  channels: number;
+  channelsComplete: number;
+  channelsForbidden: number;
+  channelsGone: number;
+  apiRequests: number;
+}
+
 export interface ExploreColumn {
   id: string;
   title: string;
@@ -228,6 +251,12 @@ export interface ImportResult {
 export interface ImportUnreadableFile {
   file: string;
   reason: string;
+}
+
+export interface ImportUploadedDto {
+  name: string;
+  bytes: number;
+  previewJobId: number;
 }
 
 export interface JobActionRequest {

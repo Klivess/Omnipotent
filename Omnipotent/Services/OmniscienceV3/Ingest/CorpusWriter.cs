@@ -26,7 +26,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
     /// </list>
     /// Create one per write transaction, inside the corpus writer; it only touches the database.
     /// </summary>
-    public sealed class CorpusWriter : IDisposable
+    public sealed partial class CorpusWriter : IDisposable
     {
         private readonly SqliteConnection c;
         private readonly SqliteTransaction tx;
@@ -36,6 +36,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
 
         private readonly Dictionary<string, IdentityState> identities = new(StringComparer.Ordinal);
         private readonly Dictionary<string, List<NameInterval>> names = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, (string? Hash, long From)> avatars = new(StringComparer.Ordinal);
         private readonly HashSet<string> conversations = new(StringComparer.Ordinal);
         private readonly HashSet<string> guilds = new(StringComparer.Ordinal);
         private readonly HashSet<string> members = new(StringComparer.Ordinal);
@@ -215,10 +216,11 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
 
         private bool Merge(IngestMessage m, string messageId, Existing cur, string? replyTo, string? person, string conversationId)
         {
-            bool changed = false;
+            bool changed = false, versioned = false;
 
             if (!string.Equals(m.Content, cur.Content, StringComparison.Ordinal) && IncomingContentWins(m, cur))
             {
+                versioned = true;
                 int version = cur.Version + 1;
                 c.Exec(tx, "INSERT INTO message_versions(message_id, version, content, edited_at_ms, recorded_at_ms, source_id) VALUES($m,$v,$c,$e,$r,$s)",
                     ("$m", messageId), ("$v", version), ("$c", m.Content), ("$e", m.EditedAtMs), ("$r", now), ("$s", source.SourceId));
@@ -255,6 +257,30 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
                 c.Exec(tx, "UPDATE messages SET reply_to_message_id=$r WHERE message_id=$m", ("$r", replyTo), ("$m", messageId));
                 changed = true;
             }
+
+            // The platform's own payload replaces what a poorer copy recorded about the message (its type, flags,
+            // forward, embeds, poll): a row first written from a client library's relay, an export or v2 is brought
+            // up to what the platform says (F394, F452). The text is not touched here, so this is not logged as a
+            // new version and derived work is not redone for it.
+            bool platformPayload = m.RawJson != null && source.Rank >= IngestSource.PlatformRank;
+            if (platformPayload && source.Rank == cur.Rank)
+            {
+                // The platform showing the message again: what it gained since (an embed that finished loading) is added,
+                // and after an edit the kept payload is the edited one.
+                changed |= Details(m, messageId) > 0;
+                if (versioned) c.Exec(tx, "UPDATE messages SET raw_json=$raw, flags=$f WHERE message_id=$m", ("$raw", m.RawJson), ("$f", m.Flags), ("$m", messageId));
+            }
+            if (platformPayload && source.Rank > cur.Rank)
+            {
+                c.Exec(tx, """
+                    UPDATE messages SET raw_json=$raw, type=$ty, flags=$f, is_system=$sys, is_webhook=$wh, is_bot=MAX(is_bot,$bot),
+                        forwarded_from_json=COALESCE($fw, forwarded_from_json), best_source_id=$src, best_source_rank=$rank
+                    WHERE message_id=$m
+                    """, ("$raw", m.RawJson), ("$ty", m.Type), ("$f", m.Flags), ("$sys", m.IsSystem ? 1 : 0), ("$wh", m.IsWebhook ? 1 : 0),
+                    ("$bot", m.Author.IsBot ? 1 : 0), ("$fw", m.ForwardedFromJson), ("$src", source.SourceId), ("$rank", source.Rank), ("$m", messageId));
+                Details(m, messageId);
+                changed = true;
+            }
             return changed;
         }
 
@@ -265,21 +291,33 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             if (m.EditedAtMs != null) return cur.EditedAtMs == null || m.EditedAtMs > cur.EditedAtMs;
             // No edit time on the incoming copy: it cannot be shown to be newer than an edit we already hold.
             if (cur.EditedAtMs != null) return false;
+            // Text beats no text whatever the source: a copy captured without the right to read content must never
+            // shadow the real message (F458), and an empty copy never blanks a captured one.
+            if (string.IsNullOrEmpty(cur.Content)) return m.Content.Length > 0;
+            if (m.Content.Length == 0) return false;
             return source.Rank > cur.Rank;
         }
 
         private void Parts(IngestMessage m, string messageId, string? person, string conversationId)
         {
-            foreach (var mention in m.Mentions) insertMention.Run(messageId, mention.Kind, mention.Target);
+            Details(m, messageId);
+            Attachments(m, messageId, person, conversationId);
+            Reactions(m, messageId, person, conversationId);
+        }
+
+        /// <summary>Mentions, embeds, stickers and the poll. Rows that exist are left as they are; returns how many were new.</summary>
+        private int Details(IngestMessage m, string messageId)
+        {
+            int added = 0;
+            foreach (var mention in m.Mentions) added += insertMention.Run(messageId, mention.Kind, mention.Target);
             for (int i = 0; i < m.Embeds.Count; i++)
             {
                 var e = m.Embeds[i];
-                insertEmbed.Run(messageId, i, e.Type, e.Provider, e.Url, e.Title, e.Description, e.Json);
+                added += insertEmbed.Run(messageId, i, e.Type, e.Provider, e.Url, e.Title, e.Description, e.Json);
             }
-            foreach (var s in m.Stickers) insertSticker.Run(messageId, s.Id, s.Name);
-            if (m.Poll is { } poll) insertPoll.Run(messageId, poll.Question, poll.AnswersJson, poll.ExpiryMs);
-            Attachments(m, messageId, person, conversationId);
-            Reactions(m, messageId, person, conversationId);
+            foreach (var s in m.Stickers) added += insertSticker.Run(messageId, s.Id, s.Name);
+            if (m.Poll is { } poll) added += insertPoll.Run(messageId, poll.Question, poll.AnswersJson, poll.ExpiryMs);
+            return added;
         }
 
         private void Attachments(IngestMessage m, string messageId, string? person, string conversationId)
@@ -389,10 +427,49 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             if (i.IsSelf)
                 c.Exec(tx, "UPDATE persons SET is_self=1 WHERE person_id IN ($p,$c) AND is_self=0", ("$p", state.PersonId), ("$c", state.Canonical));
 
-            ObserveName(id, "username", i.Username, seenAtMs, state.Canonical);
-            ObserveName(id, "display", i.DisplayName, seenAtMs, state.Canonical);
+            ObserveProfile(id, i, seenAtMs, state.Canonical);
             return state;
         }
+
+        /// <summary>Records the names and picture an account is seen with: its username, display name, a server nickname, its avatar.</summary>
+        private void ObserveProfile(string id, IngestIdentity i, long seenAtMs, string? person)
+        {
+            // A profile that is "as of now" (see IngestIdentity.ObservedAtMs) is recorded at that time, not the message's.
+            long nameAt = i.ObservedAtMs ?? seenAtMs;
+            long? messageAt = i.ObservedAtMs != null ? seenAtMs : null;
+            ObserveName(id, "username", i.Username, nameAt, person, messageAt);
+            ObserveName(id, "display", i.DisplayName, nameAt, person, messageAt);
+            if (NullIfBlank(i.NicknameScope) is { } scope)
+            {
+                // A scope with no nickname says the account has none there now: the one it had ends (F451).
+                if (NullIfBlank(i.Nickname) != null) ObserveName(id, NicknameKind(scope), i.Nickname, nameAt, person, messageAt);
+                else CloseName(id, NicknameKind(scope), nameAt, person);
+            }
+            ObserveAvatar(id, i.AvatarHash, nameAt, person);
+        }
+
+        /// <summary>
+        /// An account that was only seen — in a member list, online, in voice — rather than doing something in a
+        /// conversation. Its names and picture are recorded against its id, but it is not made into a person: a
+        /// server's thousands of silent members are not people Klives knows (F397). The records link up by id the
+        /// moment the account writes or reacts. An account already known is treated as usual.
+        /// </summary>
+        private (string Id, string? Person) Witness(IngestIdentity i, long atMs)
+        {
+            string id = CorpusIds.Identity(i.Platform, i.PlatformUserId);
+            bool known = identities.ContainsKey(id);
+            if (!known)
+            {
+                using var r = FindReader(findIdentity, id);
+                known = r.Read();
+            }
+            if (known) return (id, Identity(i, atMs).Canonical);
+            ObserveProfile(id, i, atMs, null);
+            return (id, null);
+        }
+
+        /// <summary>The name kind a nickname is stored under: one timeline per server or group, keyed by its id (F421).</summary>
+        public static string NicknameKind(string scope) => "nick:" + scope.Trim();
 
         /// <summary>
         /// Records that <paramref name="value"/> was the identity's name at <paramref name="atMs"/>. Sightings arrive
@@ -400,24 +477,31 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         /// new interval; a name before the earliest known one opens an interval that ends where the earliest began;
         /// the same name earlier just moves the start back. A different name sighted inside a closed interval is not
         /// recorded — the surrounding sightings already bound it and splitting on one message would invent precision.
+        /// <para>
+        /// <paramref name="firstKnownAt"/> is given when the name is "as of now" on an older message. The only name
+        /// ever known for an account is then taken to reach back to that message — there is nothing better to show
+        /// for it — but once a second name is known, old messages no longer move anything.
+        /// </para>
         /// </summary>
-        private void ObserveName(string identityId, string kind, string? value, long atMs, string? person)
+        private void ObserveName(string identityId, string kind, string? value, long atMs, string? person, long? firstKnownAt = null)
         {
             value = NullIfBlank(value);
             if (value == null) return;
-            string key = identityId + "\u0001" + kind;
-            if (!names.TryGetValue(key, out var timeline))
-            {
-                timeline = c.Query(tx, "SELECT value, valid_from_ms, valid_to_ms FROM identity_names WHERE identity_id=$i AND name_kind=$k ORDER BY valid_from_ms",
-                    r => new NameInterval(r.GetString(0), r.GetInt64(1), r.GetInt64OrNull(2)), ("$i", identityId), ("$k", kind));
-                names[key] = timeline;
-            }
+            var timeline = Timeline(identityId, kind);
 
             if (timeline.Count == 0)
             {
-                InsertName(identityId, kind, value, atMs, null);
-                timeline.Add(new NameInterval(value, atMs, null));
+                long from = firstKnownAt is { } f && f < atMs ? f : atMs;
+                InsertName(identityId, kind, value, from, null);
+                timeline.Add(new NameInterval(value, from, null));
                 Change(ChangeKinds.IdentityName, identityId, person, null);
+                return;
+            }
+            if (firstKnownAt is { } older && timeline.Count == 1 && timeline[0].Value == value && older < timeline[0].From)
+            {
+                c.Exec(tx, "UPDATE identity_names SET valid_from_ms=$n WHERE identity_id=$i AND name_kind=$k AND valid_from_ms=$f",
+                    ("$n", older), ("$i", identityId), ("$k", kind), ("$f", timeline[0].From));
+                timeline[0] = timeline[0] with { From = older };
                 return;
             }
 
@@ -457,6 +541,56 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             c.Exec(tx, "INSERT OR IGNORE INTO identity_names(identity_id, name_kind, value, valid_from_ms, valid_to_ms, source_kind) VALUES($i,$k,$v,$f,$t,$s)",
                 ("$i", identityId), ("$k", kind), ("$v", value), ("$f", from), ("$t", to), ("$s", sourceKind));
 
+        /// <summary>The known intervals of one kind of name for an identity, oldest first (read once per transaction).</summary>
+        private List<NameInterval> Timeline(string identityId, string kind)
+        {
+            string key = identityId + "\u0001" + kind;
+            if (!names.TryGetValue(key, out var timeline))
+            {
+                timeline = c.Query(tx, "SELECT value, valid_from_ms, valid_to_ms FROM identity_names WHERE identity_id=$i AND name_kind=$k ORDER BY valid_from_ms",
+                    r => new NameInterval(r.GetString(0), r.GetInt64(1), r.GetInt64OrNull(2)), ("$i", identityId), ("$k", kind));
+                names[key] = timeline;
+            }
+            return timeline;
+        }
+
+        /// <summary>Ends the open interval of a name that was taken away (a server nickname removed). True when one was open.</summary>
+        private bool CloseName(string identityId, string kind, long atMs, string? person)
+        {
+            var timeline = Timeline(identityId, kind);
+            if (timeline.Count == 0 || timeline[^1].To != null || timeline[^1].From >= atMs) return false;
+            c.Exec(tx, "UPDATE identity_names SET valid_to_ms=$t WHERE identity_id=$i AND name_kind=$k AND valid_from_ms=$f",
+                ("$t", atMs), ("$i", identityId), ("$k", kind), ("$f", timeline[^1].From));
+            timeline[^1] = timeline[^1] with { To = atMs };
+            Change(ChangeKinds.IdentityName, identityId, person, null);
+            return true;
+        }
+
+        /// <summary>
+        /// Records the account's picture (its platform hash; the file is fetched by the media side). Only a newer
+        /// sighting replaces the current one: an older message cannot say what the picture was back then (F400).
+        /// </summary>
+        private void ObserveAvatar(string identityId, string? hash, long atMs, string? person)
+        {
+            hash = NullIfBlank(hash);
+            if (hash == null) return;
+            if (!avatars.TryGetValue(identityId, out var current))
+            {
+                current = c.Query(tx, "SELECT avatar_hash, valid_from_ms FROM identity_avatars WHERE identity_id=$i AND valid_to_ms IS NULL ORDER BY valid_from_ms DESC LIMIT 1",
+                    r => (Hash: (string?)r.GetString(0), From: r.GetInt64(1)), ("$i", identityId)).FirstOrDefault();
+                avatars[identityId] = current;
+            }
+            if (current.Hash == hash) return;
+            if (current.Hash != null)
+            {
+                if (atMs <= current.From) return;
+                c.Exec(tx, "UPDATE identity_avatars SET valid_to_ms=$t WHERE identity_id=$i AND valid_to_ms IS NULL", ("$t", atMs), ("$i", identityId));
+            }
+            c.Exec(tx, "INSERT OR IGNORE INTO identity_avatars(identity_id, avatar_hash, valid_from_ms) VALUES($i,$h,$f)", ("$i", identityId), ("$h", hash), ("$f", atMs));
+            avatars[identityId] = (hash, atMs);
+            Change(ChangeKinds.IdentityUpsert, identityId, person, null);
+        }
+
         // ── places ───────────────────────────────────────────────────────────────
 
         private (string ConversationId, string? GuildId) Conversation(IngestConversation cv, long atMs)
@@ -470,8 +604,9 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
 
             string? title = NullIfBlank(cv.Title);
             string? parent = string.IsNullOrWhiteSpace(cv.ParentChannelId) ? null : CorpusIds.Conversation(platform, cv.ParentChannelId);
-            var cur = c.Query(tx, "SELECT title, kind, guild_id, first_seen_ms FROM conversations WHERE conversation_id=$c",
-                r => (Found: true, Title: r.GetStringOrNull(0), Kind: r.GetString(1), Guild: r.GetStringOrNull(2), First: r.GetInt64(3)), ("$c", id)).FirstOrDefault();
+            var cur = c.Query(tx, "SELECT title, kind, guild_id, first_seen_ms, parent_conversation_id FROM conversations WHERE conversation_id=$c",
+                r => (Found: true, Title: r.GetStringOrNull(0), Kind: r.GetString(1), Guild: r.GetStringOrNull(2), First: r.GetInt64(3), Parent: r.GetStringOrNull(4)),
+                ("$c", id)).FirstOrDefault();
             if (!cur.Found)
             {
                 c.Exec(tx, "INSERT INTO conversations(conversation_id, platform, kind, guild_id, parent_conversation_id, title, first_seen_ms) VALUES($id,$p,$k,$g,$par,$t,$f)",
@@ -484,19 +619,26 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             }
 
             bool retitled = title != null && title != cur.Title;
-            bool kindLearned = cur.Kind == ConversationKinds.Unknown && cv.Kind != ConversationKinds.Unknown;
+            // A vague kind gives way to a specific one, and a DM that gained people is a group (F402).
+            bool kindLearned = cv.Kind != cur.Kind && !ConversationKinds.IsVague(cv.Kind)
+                               && (ConversationKinds.IsVague(cur.Kind) || (cur.Kind == ConversationKinds.Dm && cv.Kind == ConversationKinds.GroupDm));
             bool guildLearned = cur.Guild == null && guildId != null;
-            if (retitled || kindLearned || guildLearned)
+            bool parentLearned = cur.Parent == null && parent != null;
+            if (retitled || kindLearned || guildLearned || parentLearned)
             {
-                c.Exec(tx, "UPDATE conversations SET title=COALESCE($t, title), kind=$k, guild_id=COALESCE(guild_id, $g) WHERE conversation_id=$id",
-                    ("$t", title), ("$k", kindLearned ? cv.Kind : cur.Kind), ("$g", guildId), ("$id", id));
+                c.Exec(tx, """
+                    UPDATE conversations SET title=COALESCE($t, title), kind=$k, guild_id=COALESCE(guild_id, $g),
+                        parent_conversation_id=COALESCE(parent_conversation_id, $par)
+                    WHERE conversation_id=$id
+                    """, ("$t", title), ("$k", kindLearned ? cv.Kind : cur.Kind), ("$g", guildId), ("$par", parent), ("$id", id));
                 if (retitled)
                 {
-                    // The new title holds from this message on; an older message cannot rename the conversation backwards.
-                    if (cur.Title == null || atMs > cur.First)
+                    // The new title holds from when it was seen; an older message cannot rename the conversation backwards.
+                    long renamedAt = cv.ObservedAtMs ?? atMs;
+                    if (cur.Title == null || renamedAt > cur.First)
                     {
-                        c.Exec(tx, "UPDATE conversation_names SET valid_to_ms=$n WHERE conversation_id=$id AND valid_to_ms IS NULL AND valid_from_ms < $n", ("$n", atMs), ("$id", id));
-                        c.Exec(tx, "INSERT OR IGNORE INTO conversation_names(conversation_id, name, valid_from_ms) VALUES($id,$n,$f)", ("$id", id), ("$n", title), ("$f", atMs));
+                        c.Exec(tx, "UPDATE conversation_names SET valid_to_ms=$n WHERE conversation_id=$id AND valid_to_ms IS NULL AND valid_from_ms < $n", ("$n", renamedAt), ("$id", id));
+                        c.Exec(tx, "INSERT OR IGNORE INTO conversation_names(conversation_id, name, valid_from_ms) VALUES($id,$n,$f)", ("$id", id), ("$n", title), ("$f", renamedAt));
                     }
                 }
                 Change(ChangeKinds.ConversationUpsert, id, null, id);
