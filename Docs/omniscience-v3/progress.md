@@ -29,7 +29,7 @@ Another live session commits and pushes on master from the main folder, so never
 |---|---|---|
 | 0 | Branch, docs, contracts | done |
 | 1 | Foundations: temporal ✓, storage ✓, kernel ✓, LLM gateway ✓, ML runtime ✓, policy ✓, API skeleton ✓, legacy importer ✓, synthetic corpus + perf harness ✓ | done (contracts to freeze) |
-| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | running: WS-A to WS-D started 2026-11-06; WS-E first slice (foundation + engine pages) committed 2026-11-09, domain pages wait for DTOs |
+| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | running: WS-A to WS-D started 2026-11-06; WS-E first slice (foundation + engine pages) committed 2026-11-09, domain pages wait for DTOs; WS-A taken over by the coordinating session 2026-11-10 (imports and media store landed) |
 | 3 | Integration, shadow run, parity gates, cutover | not started |
 
 ## Log
@@ -107,7 +107,18 @@ Another live session commits and pushes on master from the main folder, so never
    Report and the list of contract gaps it found for the other workstreams: [ws-e.md](ws-e.md). The domain pages
    (people, conversations, search, faces, replicas, radar, digests, review, graph, sources) start when their DTOs exist.
 
-   State of the other workstreams on 2026-11-09 (all four sessions running): WS-A no commits yet; WS-B two commits
-   (knowledge store, evidence assembly, retrieval); WS-C two commits (encoder, vector store); WS-D no commits yet,
-   `Replica/` uncommitted.
+   **WS-A** has been done by the coordinating session since 2026-11-10, on Klives's instruction ("do WS-A by yourself"), in
+   WS-A's own worktree and branch (its original session had produced no commits and is idle; do not wake it). Landed so far,
+   tested (199 v3 tests passing on that branch): the corpus writer every source goes through, the content-addressed media
+   store, five import formats (WhatsApp, Telegram, Instagram/Messenger, the Discord data package, CSV/JSON tables) with
+   preview and idempotent commit as kernel jobs, image probing (orientation, taken-time, perceptual hash, thumbnails), the
+   attachment downloader, and routes for imports and media. Not built yet: KliveBot live ingest, an upload route, OCR,
+   transcripts, captions, visual search and faces. Details, decisions and the full "not built" list: `ws-a.md` on that branch.
+   **A decision there narrows the plan:** the Discord user-token gateway is not built in v3 (official bot gateway and
+   Discord's data package only); it is Klives's call to reopen.
+
+   State of the other workstreams on 2026-11-10 (all sessions idle since the spend limit on 2026-11-09 23:44 UTC): WS-B at
+   `fc02987` (inquiry module, X01–X16, knowledge API; 4 files uncommitted); WS-C at `2b948cc` (C-base 3/3: rollups and
+   read-model projections; 8 files uncommitted); WS-D at `d8cead7` (replica fidelity gates; 1 file uncommitted). Each was
+   sent the contract gaps that concern it (ws-e.md) on 2026-11-09; whether they acted is in their `ws-x.md`.
 2. Phase 3: shadow run on live data, parity gates, Quality Lab gates, cutover.
