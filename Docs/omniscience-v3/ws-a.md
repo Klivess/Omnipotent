@@ -13,6 +13,8 @@ coordinating session does this work itself, in this worktree. This file is kept 
 | `Media/ImageProbe.cs` | One read of an image: upright size, frames, EXIF taken-time (never GPS), perceptual hash, WebP thumbnail; `LoadFrames` for vision steps. |
 | `Media/MediaProcessor.cs` | Downloading (allow-listed https hosts, no redirects, size ceilings) and probing (once per distinct content, quarantine of damaged files). |
 | `Media/MediaModule.cs` | Module `media.store`: download and probe jobs from the change log, a sweep for media that predates the module. Intel table `media_objects`. |
+| `Media/MediaText.cs` | Text from media: `MediaTextProcessor` (once per content, cached, labels per attachment), `TesseractOcr`, `FfmpegSegmenter`, `AiRouterTranscriber`, `TranscriptMerge`. |
+| `Media/MediaTextModule.cs` | Module `media.text`: an `extract` job per stored attachment, a sweep for what was missed. Intel table `media_text`. |
 | `Imports/ImportContracts.cs` | `ImportInput` (file, zip or folder), `ImportOptions`, `IImportFormat`, `TextDecoding` (BOMs, UTF-16, mojibake repair), `JsonPullReader` (streaming JSON), `ImportIds`. |
 | `Imports/*Import.cs` | Formats: `WhatsAppImport`, `TelegramImport`, `MetaImport` (Instagram, Messenger), `DiscordPackageImport`, `TableImport` (CSV/TSV/JSON). |
 | `Imports/ImportService.cs` | Detect → preview (no writes) → commit (idempotent, batched, media into the store). |
@@ -24,6 +26,7 @@ coordinating session does this work itself, in this worktree. This file is kept 
 |---|---|---|
 | `ingest.imports` | `preview`, `commit` | Lane Io. Single-flight per export; `MaxAttempts = 1` (a failed import is retried by Klives after he fixes what it named). |
 | `media.store` | `download`, `probe`, `sweep` | Subscribes to `attachment.add` and `attachment.stored`. Sweep every 10 min. |
+| `media.text` | `extract`, `sweep` | Depends on `media.store`; subscribes to `attachment.stored`. Sweep every 15 min. Lane Io. |
 
 ## Routes (all under `/omniscience/v3/`)
 | Route | Permission | What |
@@ -33,6 +36,15 @@ coordinating session does this work itself, in this worktree. This file is kept 
 | `POST imports/commit` | `sources.manage` | Same body → job whose `resultJson` is an `ImportResult`. |
 | `GET media/file?attachment=<id>` | `messages.read` | The attachment's stored bytes. 404 `not_stored` when there are none. |
 | `GET media/thumb?attachment=<id>` | `messages.read` | Its WebP thumbnail (max side 320). 404 `not_built` when not an image or not yet probed. |
+
+## What other workstreams read from here
+- **Media text (WS-B's evidence reader):** `labels` rows with `item_kind='attachment'`, `item_id` = attachment id, `task` = `ocr` or
+  `transcript`, `signals_json` = `{ text, language, origin, sha256 }` where `origin` is `image_text` or `speech` (quoted material,
+  never the poster's own words). An empty `text` with `abstained=1` means "read, nothing there". `model_version` changes when
+  the engine or its language data does; older labels stay beside the new ones. Task `caption` is not written yet.
+- **Media facts:** intel `media_objects` (by content hash): upright size, frames, orientation, `phash`, `taken_local`,
+  `thumb_sha256`, `state` (`ok` / `corrupt` / `unsupported`).
+- **Frames for vision:** `ImageProbe.LoadFrames(path, maxFrames)` gives upright bitmaps (three spread frames of an animation).
 
 ## Answers to WS-E's questions (ws-e.md contract gaps)
 - **How files reach the importers:** today only by the **inbox folder** (`SavedData/Omniscience/v3/imports/`): Klives drops a file,
@@ -71,13 +83,14 @@ coordinating session does this work itself, in this worktree. This file is kept 
 
 ## Shared-file edits (for the integrator)
 - `Storage/Sqlite/SqliteExtensions.cs`: `PreparedStatement.Reader(...)` added (additive).
-- `OmniscienceV3.BuildModules()`: two lines (`ImportModule`, `MediaModule`). `Api/V3Routes.RegisterAsync`: one line (`IngestRoutes`).
+- `OmniscienceV3.BuildModules()`: now an instance method (it resolves KliveLLM for the transcriber) with three modules added
+  (`ImportModule`, `MediaModule`, `MediaTextModule`). `Api/V3Routes.RegisterAsync`: one line (`IngestRoutes`).
 - `Omnipotent/Omnipotent.csproj`: `SkiaSharp` 3.119.0 (MIT) referenced explicitly; it was already resolved at that version
   through ScottPlot, so nothing new is downloaded.
 - `Docs/omniscience-v3/api-contracts.ts` regenerated (import DTOs).
 
 ## Tests (`Omnipotent.Tests/OmniscienceV3/Ingest/`, synthetic data only)
-`CorpusWriterTests` (12), `ImportTests` (16), `MediaTests` (10). Whole v3 suite on this branch: 199 passed, 1 skipped (the opt-in
+`CorpusWriterTests` (12), `ImportTests` (16), `MediaTests` (10), `MediaTextTests` (9). Whole v3 suite on this branch: 208 passed, 1 skipped (the opt-in
 5M perf run). Run: `$env:DOTNET_ROLL_FORWARD='Major'; dotnet test Omnipotent.Tests/Omnipotent.Tests.csproj --filter "FullyQualifiedName~OmniscienceV3"`.
 
 ## Not built yet
@@ -87,12 +100,14 @@ coordinating session does this work itself, in this worktree. This file is kept 
 | Discord history backfill through the bot (channels the bot is in) | not started |
 | Upload route for exports (PUT stream into the inbox) | not started; the inbox folder works today |
 | Drop-folder auto-preview | not started (previews are requested explicitly) |
-| OCR, transcripts (N3), captions (N2) → `labels` rows (`item_kind='attachment'`, tasks `ocr` / `transcript` / `caption`, text in `signals_json.text`, as WS-B's reader expects) | not started |
+| OCR and transcripts (N3) | **built, tested with stand-in engines only.** The real paths — Tesseract with language data from ModelHub, ffmpeg cutting, Whisper through KliveLLM's AIRouter audio client — compile but have never run: no test downloads language data or calls the speech service. First real run is part of the shadow run. |
+| Captions (N2) → `labels` task `caption` | not started |
+| Prioritised backlog order (tracked people first, plan R2) for OCR/transcripts | not built: the sweep goes in attachment-id order |
 | Visual search (N2): local image embeddings, search route, image pivot X24 | not started |
 | Faces (N1): detection, embedding, clustering, conversation-grounded labels, propagation, face pivot X25 | not started |
 | Explore datasets for media/imports (D4 manifest declarations) | not started |
 | ffprobe for video/audio duration and dimensions | not started |
-| Traceability | F359, F360, F394, F404–F406, F460–F471 fixed; F403, F422 in progress; OCR, gateway and vault rows untouched |
+| Traceability | F359, F360, F394, F404–F406, F460–F471 fixed; F403, F422 in progress; OCR rows (F334, F335, F407, F472–F476) built but left unticked until the real engines have run; gateway and vault rows untouched |
 
 ## Known limits
 - WhatsApp: a group in which only two people ever wrote and which is named after one of them is read as a direct chat
@@ -101,4 +116,9 @@ coordinating session does this work itself, in this worktree. This file is kept 
   Two different contacts saved under the same name in one chat cannot be told apart from the export.
 - WhatsApp exports from two different phones of the same chat (minute vs second precision) do not dedupe against each other.
 - EXIF taken-time is read from JPEG only (not PNG `eXIf` or WebP).
+- OCR and transcript jobs run on the Io lane (one job kind covers both; the kind of file is only known when the job runs),
+  so a burst of OCR competes with downloads rather than with CPU-lane work.
+- The media-text sweep treats an attachment as done once it has any `ocr`/`transcript` label, so changing the OCR languages
+  re-reads new attachments but not the backlog.
+- Tesseract language data is pinned on first download (trust on first use in the model lock file), not to a hash in the source.
 - The import preview reads the whole export (a job, not a request); for a multi-gigabyte Telegram export that takes minutes.

@@ -115,12 +115,15 @@ namespace Omnipotent.Services.OmniscienceV3
         }
 
         /// <summary>The modules this build runs. Workstreams add theirs here.</summary>
-        private static IReadOnlyList<IIntelModule> BuildModules() => new IIntelModule[]
+        private IReadOnlyList<IIntelModule> BuildModules() => new IIntelModule[]
         {
             // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
             new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
             new Ingest.Imports.ImportModule(),
             new Ingest.Media.MediaModule(),
+            // Speech-to-text comes from KliveLLM's AIRouter audio client, resolved when a transcript is first needed.
+            new Ingest.Media.MediaTextModule(async () =>
+                await ResolveKliveLlmAsync().ConfigureAwait(false) is { } llm ? new Ingest.Media.AiRouterTranscriber(llm.Audio) : null),
         };
 
         private Task<KliveLLM.KliveLLM?> ResolveKliveLlmAsync() =>
