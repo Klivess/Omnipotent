@@ -56,6 +56,15 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public string? OriginalCaption { get; set; }
         public long? ContentViews { get; set; }
         public string TumblrState { get; set; } = "";
+        // ── A reblog: whose post, and how it was doing when picked ──
+        public string? ReblogOf { get; set; }
+        public string? ReblogUrl { get; set; }
+        public string? ReblogSummary { get; set; }
+        public long? ReblogNotes { get; set; }
+        public string? ReblogTag { get; set; }
+        public string? ReblogType { get; set; }
+        public string? ReblogReason { get; set; }
+        public bool? ReblogSeenByModel { get; set; }
     }
 
     public sealed class SeriesPointDto
@@ -249,7 +258,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 UsedVision = p.CaptionInfo.UsedVision,
                 CaptionModel = p.CaptionInfo.Model,
                 Approved = p.Approved,
-                HasThumbnail = p.Media.Any(m => m.ThumbnailPath != null),
+                HasThumbnail = p.Media.Any(m => m.ThumbnailPath != null) || p.Reblog?.PreviewPath != null,
                 MediaCount = p.Media.Count,
                 IsVideo = first?.IsVideo ?? false,
                 DurationSeconds = first?.DurationSeconds,
@@ -276,6 +285,14 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 OriginalCaption = p.Content?.OriginalCaption,
                 ContentViews = p.Content?.Views,
                 TumblrState = p.TumblrState.ToString(),
+                ReblogOf = p.Reblog?.ParentBlogName,
+                ReblogUrl = p.Reblog?.ParentUrl,
+                ReblogSummary = p.Reblog?.Summary,
+                ReblogNotes = p.Reblog?.ParentNotes,
+                ReblogTag = p.Reblog?.FoundUnderTag,
+                ReblogType = p.Reblog?.ParentType,
+                ReblogReason = p.Reblog?.Reason,
+                ReblogSeenByModel = p.Reblog?.SeenByModel,
             };
         }
 
@@ -304,7 +321,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             var conn = s.Connection(b.ConnectionId);
             var insights = s.InsightsOf(b.BlogId);
             var pending = posts.Where(p => p.IsPending).OrderBy(p => p.ScheduledUtc).ToList();
-            var published30 = posts.Where(p => p.Status == PostStatus.Published && p.PublishedUtc > now.AddDays(-30)).ToList();
+            // Notes are counted on the blog's own posts only: a reblog carries the original's.
+            var published30 = posts.Where(p => p.Status == PostStatus.Published && !p.IsReblog && p.PublishedUtc > now.AddDays(-30)).ToList();
             var last = posts.Where(p => p.Status == PostStatus.Published).OrderByDescending(p => p.PublishedUtc).FirstOrDefault();
             var dto = new BlogSummaryDto
             {
@@ -363,8 +381,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public static FleetKpisDto FleetKpis(OmniTumblrState s, DateTime now)
         {
             var all = s.AllPosts().ToList();
-            var published30 = all.Where(p => p.Status == PostStatus.Published && p.PublishedUtc > now.AddDays(-30)).ToList();
-            int failed30 = all.Count(p => p.Status == PostStatus.Failed && p.UpdatedUtc > now.AddDays(-30));
+            var published30 = all.Where(p => p.Status == PostStatus.Published && !p.IsReblog && p.PublishedUtc > now.AddDays(-30)).ToList();
+            int failed30 = all.Count(p => p.Status == PostStatus.Failed && !p.IsReblog && p.UpdatedUtc > now.AddDays(-30));
             var next = all.Where(p => p.IsPending).OrderBy(p => p.ScheduledUtc).FirstOrDefault();
             var kpis = new FleetKpisDto
             {
@@ -486,7 +504,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             };
 
             var ourPosts = blogs.SelectMany(b => s.PostsOf(b.BlogId).Select(p => (Blog: b, Post: p))).ToList();
-            var published = ourPosts.Where(x => x.Post.Status == PostStatus.Published && x.Post.PublishedUtc.HasValue).ToList();
+            // The blog's own posts: a reblog's notes are the original's, so reblogs stay out of every figure here.
+            var published = ourPosts.Where(x => x.Post.Status == PostStatus.Published && x.Post.PublishedUtc.HasValue && !x.Post.IsReblog).ToList();
             var inRange = published.Where(x => x.Post.PublishedUtc >= from).ToList();
             var inPrev = published.Where(x => x.Post.PublishedUtc >= prevFrom && x.Post.PublishedUtc < from).ToList();
             dto.PostsPublished = inRange.Count;
@@ -543,7 +562,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             {
                 var row = Day(p.PublishedUtc);
                 if (p.OmniPostId != null) row.Ours++; else row.Others++;
-                row.Notes += p.Notes;
+                if (!p.IsReblog) row.Notes += p.Notes;
             }
             dto.Posting = posting.Values.ToList();
 
@@ -572,7 +591,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             dto.Activity = activity.Values.ToList();
 
             // Best times: every indexed post 1–120 days old, by local weekday/hour of publishing.
-            var sample = index.Where(x => x.Post.PublishedUtc <= now.AddDays(-1) && x.Post.PublishedUtc >= now.AddDays(-120)).Select(x => x.Post).ToList();
+            var sample = index.Where(x => !x.Post.IsReblog && x.Post.PublishedUtc <= now.AddDays(-1) && x.Post.PublishedUtc >= now.AddDays(-120)).Select(x => x.Post).ToList();
             dto.SampleSize = sample.Count;
             dto.Heatmap = sample
                 .GroupBy(p =>
@@ -589,7 +608,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
 
             // Top posts in range (all posts on the blog, ours flagged).
             var ourById = published.Where(x => x.Post.TumblrPostId != null).GroupBy(x => x.Post.TumblrPostId!).ToDictionary(g => g.Key, g => g.First().Post, StringComparer.Ordinal);
-            dto.TopPosts = index.Where(x => x.Post.PublishedUtc >= from)
+            dto.TopPosts = index.Where(x => x.Post.PublishedUtc >= from && !x.Post.IsReblog)
                 .OrderByDescending(x => x.Post.Notes)
                 .Take(12)
                 .Select(x => new TopPostDto

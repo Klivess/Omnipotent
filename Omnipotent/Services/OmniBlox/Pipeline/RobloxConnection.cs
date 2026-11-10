@@ -171,15 +171,20 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 return View();
             }
             await saveApiKey(key);
+            ctx.Credentials.Accepted(key);
             var now = ctx.Clock();
             ctx.Store.Mutate(s =>
             {
                 s.Studio.ApiKey = new ApiKeyInfo { Name = info!.Name, OwnerUserId = info.OwnerUserId, Scopes = info.Scopes, ExpiresUtc = info.ExpiresUtc, CheckedUtc = now };
                 s.ResolveOwnerTasks("apikey", now);
                 s.ResolveOwnerTasks("apikey-products", now);
+                // A new key gets a fresh try at whatever Roblox refused the old one.
+                s.ResolveOwnerTasks(CredentialCheck.EngineRefusedKey, now);
+                s.ResolveOwnerTasks(CredentialCheck.UnknownKey, now);
                 s.MarkStudio();
                 s.AddEvent(EventLevel.Success, "studio.apikey", $"The API key \"{info.Name}\" (user {info.OwnerUserId}) is set.", null, now);
             });
+            CredentialCheck.Review(ctx);
             return View();
         }
 
@@ -202,6 +207,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                         s.MarkStudio();
                     });
                     StorePageChores.Succeeded(ctx, StorePageChores.SessionKey);
+                    CredentialCheck.Review(ctx);
+                    if (CredentialCheck.SessionIsOthers(ctx) is long other)
+                        lock (sync) lastError = $"Roblox accepts the session, but it is {name} (user {other}), not the studio's account (user {ctx.Settings.CreatorUserId}). Connect that account, or choose \"switch the studio to this account\".";
                 }
                 catch (RobloxSessionException ex)
                 {
@@ -281,6 +289,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 s.MarkStudio();
                 s.AddEvent(EventLevel.Success, "store.session", $"Connected the Roblox account {name} ({(method == QuickLogin ? "Quick Log In" : "pasted cookie")}).", null, now);
             });
+            // After a switch the old account's key is now the other one: the owner hears it needs replacing.
+            CredentialCheck.Review(ctx);
             lock (sync) lastError = null;
             Chores = Task.Run(() => RunChoresAsync());
             return true;
@@ -288,7 +298,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
 
         /// <summary>
         /// Makes another Roblox account the studio's: it becomes the creator, and the experiences of the old account are
-        /// retired (the studio's own and the owner's listed slots), so no new game lands there. Games already published
+        /// retired (the studio's own and the owner's listed slots), so no new game lands there. A game with nothing
+        /// published there gets a new experience on the new account when it next needs one. Games already published
         /// there stay up and are flagged; the owner moves each with the game action "move", once the API key is the new
         /// account's too.
         /// </summary>
@@ -300,15 +311,29 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             {
                 foreach (long universe in s.Studio.CreatedExperiences.Select(e => e.UniverseId).Concat(ctx.Settings.Slots.Select(sl => sl.UniverseId)))
                     if (!s.Studio.RetiredExperiences.Contains(universe)) s.Studio.RetiredExperiences.Add(universe);
+                int released = 0, flagged = 0;
                 foreach (var g in s.Games.Values.Where(g => g.Slot != null && g.Stage != GameStage.Abandoned))
                 {
-                    g.Publish.OnOldAccount = true;
-                    s.MarkGame(g.GameId);
+                    if (g.Publish.LastPublishedVersion == null && !g.Publish.IsPublic)
+                    {
+                        // Nothing of it is published there (a game in production, or one whose launch never got through):
+                        // it gets an experience on the new account when it next needs one, its launch included. Move is
+                        // for games players have, so it would otherwise be stuck on the old account.
+                        GameActions.ForgetExperience(s, g, now);
+                        released++;
+                    }
+                    else
+                    {
+                        g.Publish.OnOldAccount = true;
+                        s.MarkGame(g.GameId);
+                        flagged++;
+                    }
                 }
                 s.MarkStudio();
                 s.AddEvent(EventLevel.Warning, "studio.account",
                     $"Switched the studio to the Roblox account {name} ({userId})" + (previous is long p ? $", from user {p}" : "") +
-                    ". New games go to experiences on this account; move the games already published (each game's Manage → Move) once the API key is this account's too.", null, now);
+                    ". New games go to experiences on this account" + (released > 0 ? $", and so do the {released} game(s) with nothing published yet" : "") +
+                    (flagged > 0 ? $"; move the {flagged} game(s) already published (each game's Manage → Move) once the API key is this account's too." : "; set this account's API key on the Roblox account card."), null, now);
             });
         }
 

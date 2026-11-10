@@ -60,6 +60,7 @@ namespace Omnipotent.Services.OmniTumblr
                 ("/omnitumblr/dashboard-stats", DashboardStats, get, OmniTumblrPerms.OverviewView),
                 ("/omnitumblr/blog", BlogDetail, get, OmniTumblrPerms.BlogsRead),
                 ("/omnitumblr/analytics", Analytics, get, OmniTumblrPerms.BlogsRead),
+                ("/omnitumblr/reach", Reach, get, OmniTumblrPerms.BlogsRead),
                 ("/omnitumblr/posts", Posts, get, OmniTumblrPerms.BlogsRead),
                 ("/omnitumblr/post", PostDetail, get, OmniTumblrPerms.BlogsRead),
                 ("/omnitumblr/media", Media, get, OmniTumblrPerms.BlogsRead),
@@ -91,6 +92,7 @@ namespace Omnipotent.Services.OmniTumblr
                 ("/omnitumblr/posts/delete-remote", PostsDeleteRemote, post, OmniTumblrPerms.PostsPublish),
                 ("/omnitumblr/library/delete", LibraryDelete, post, OmniTumblrPerms.LibraryManage),
                 ("/omnitumblr/captions/preview", CaptionPreview, post, OmniTumblrPerms.PostsAct),
+                ("/omnitumblr/tags/research", TagsResearch, post, OmniTumblrPerms.BlogsManage),
             };
 
             int registered = 0;
@@ -276,6 +278,13 @@ namespace Omnipotent.Services.OmniTumblr
                 SyncErrors = service.Sync?.LastErrors.Select(kv => new { Job = kv.Key, Error = kv.Value }).ToList(),
                 EdgeGate = service.EdgeGate?.Snapshot(),
                 ProxyConfigured = !string.IsNullOrEmpty(service.TumblrApi?.Proxy),
+                Reblogs = new { Enabled = service.ReblogsEnabled },
+                TagResearch = new
+                {
+                    Enabled = service.TagResearchEnabled,
+                    Available = service.TagResearch?.CanLookUp ?? false,
+                    TagsKnown = s.Tags.Count,
+                },
             };
         }
 
@@ -422,6 +431,38 @@ namespace Omnipotent.Services.OmniTumblr
             await Respond(req, dto);
         }
 
+        /// <summary>Why the blog is or is not being seen: findings, plus what Tumblr's listings say about its tags.</summary>
+        private async Task Reach(UserRequest req)
+        {
+            string blogId = RequiredQuery(req, "blogId");
+            DateTime now = DateTime.UtcNow;
+            var dto = Store.Read(s =>
+            {
+                var blog = s.Blog(blogId) ?? throw NotFound("No such blog.");
+                return OmniTumblrReach.Build(s, blog, now, service.TagResearchEnabled);
+            });
+            await Respond(req, dto);
+        }
+
+        /// <summary>Looks tags up on Tumblr now (the Strategy tab's "check tags"): up to 20 a call.</summary>
+        private async Task TagsResearch(UserRequest req)
+        {
+            var body = Body(req);
+            var tags = OptStringList(body, "tags").Select(OmniTumblrTagMath.Key).Where(t => t.Length > 0).Distinct().Take(20).ToList();
+            if (tags.Count == 0) throw Bad("Give at least one tag.");
+            var research = service.TagResearch ?? throw Conflict("Tag research is not running.");
+            if (!service.TagResearchEnabled) throw Conflict("Tag research is switched off (OmniSetting OmniTumblr_TagResearchEnabled).");
+            if (!research.CanLookUp)
+                throw Conflict(service.EdgeGate?.IsBlocked == true
+                    ? "Tumblr is refusing this server's requests right now, so tags cannot be looked up."
+                    : "Tags cannot be looked up right now: the Tumblr app key is missing or today's API allowance is nearly used.");
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(90));
+            List<TagResearch> results;
+            try { results = await research.ResearchAsync(tags, cts.Token, force: OptBool(body, "force") ?? false); }
+            catch (OperationCanceledException) { throw new RouteException(HttpStatusCode.GatewayTimeout, "Tumblr took too long; try again."); }
+            await Respond(req, new { Tags = results.Select(r => OmniTumblrReach.TagHealth(r.Verdict == TagVerdict.Unknown && r.Error == null ? null : r, r.Tag, "checked")).ToList() });
+        }
+
         private async Task Posts(UserRequest req)
         {
             string? blogId = Query(req, "blogId");
@@ -469,8 +510,15 @@ namespace Omnipotent.Services.OmniTumblr
                     Media = p.Media.Select((m, i) => new { Index = i, m.MimeType, m.Bytes, m.Width, m.Height, m.DurationSeconds, HasThumbnail = m.ThumbnailPath != null, Exists = File.Exists(m.Path), FileName = Path.GetFileName(m.Path) }).ToList(),
                     p.AttemptLog,
                     MetricsHistory = p.Metrics.History,
+                    TagHealth = p.Tags.Select(t => OmniTumblrReach.TagHealth(
+                        s.Tags.TryGetValue(OmniTumblrTagMath.Key(t), out var r) && r.Verdict != TagVerdict.Unknown ? r : null, t, "post")).ToList(),
                     p.CaptionInfo,
                     p.Content,
+                    Reblog = p.Reblog == null ? null : new
+                    {
+                        p.Reblog.ParentPostId, p.Reblog.ParentBlogName, p.Reblog.ParentUrl, p.Reblog.Summary, p.Reblog.ParentTags, p.Reblog.ParentNotes,
+                        p.Reblog.ParentPublishedUtc, p.Reblog.ParentType, p.Reblog.FoundUnderTag, p.Reblog.SeenByModel, p.Reblog.Reason,
+                    },
                     p.Slug,
                     p.Deferrals,
                     p.NeedsReconcile,
@@ -490,6 +538,9 @@ namespace Omnipotent.Services.OmniTumblr
             var media = Store.Read(s =>
             {
                 var p = s.FindPost(postId) ?? throw NotFound("No such post.");
+                // A reblog has no file of ours: its preview is a small copy of the original's picture.
+                if (p.Reblog?.PreviewPath is string preview && index == 0)
+                    return new PostMedia { Path = preview, ThumbnailPath = preview, MimeType = "image/jpeg" };
                 return index >= 0 && index < p.Media.Count ? OmniTumblrStore.Clone(p.Media[index]) : throw NotFound("No such media.");
             });
             string? path = full ? media.Path : media.ThumbnailPath;
@@ -768,8 +819,38 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
                     bool captionsChanged = Fingerprint(strategy) != Fingerprint(blog.Strategy);
                     bool tagsChanged = !strategy.FixedTags.SequenceEqual(blog.Strategy.FixedTags) || !strategy.RotatingTags.SequenceEqual(blog.Strategy.RotatingTags)
                         || strategy.RotatingTagsPerPost != blog.Strategy.RotatingTagsPerPost || strategy.MaxTags != blog.Strategy.MaxTags;
+                    var reblogsBefore = blog.Strategy.Reblogs ?? new ReblogSettings();
                     blog.Strategy = strategy;
-                    foreach (var p in posts.Where(p => p.Origin == PostOrigin.Autopilot && p.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval))
+
+                    // Reblogs already queued follow the new reblog settings.
+                    var queuedReblogs = posts.Where(p => p.IsReblog && p.Status is PostStatus.Ready or PostStatus.AwaitingApproval).ToList();
+                    if (!strategy.Reblogs.Enabled && queuedReblogs.Count > 0)
+                    {
+                        foreach (var p in queuedReblogs)
+                        {
+                            p.Status = PostStatus.Cancelled;
+                            p.LastError = "Curated reblogs were switched off.";
+                            s.Touch(p, now);
+                        }
+                        notesOut.Add($"Cancelled {queuedReblogs.Count} queued reblog(s).");
+                    }
+                    else if (strategy.Reblogs.RequireApproval != reblogsBefore.RequireApproval)
+                    {
+                        foreach (var p in queuedReblogs)
+                        {
+                            // One the screening model could not look at waits for approval whatever the setting.
+                            bool hold = strategy.Reblogs.RequireApproval || p.Reblog?.SeenByModel != true;
+                            p.Approved = !hold;
+                            p.Status = hold ? PostStatus.AwaitingApproval : PostStatus.Ready;
+                            s.Touch(p, now);
+                        }
+                    }
+                    if (strategy.Reblogs.Enabled && !reblogsBefore.Enabled)
+                        notesOut.Add(strategy.Reblogs.RequireApproval
+                            ? "Curated reblogs are on: picks will appear in the queue for approval."
+                            : "Curated reblogs are on: picks the screening model has looked at go out on their own.");
+
+                    foreach (var p in posts.Where(p => p.Origin == PostOrigin.Autopilot && !p.IsReblog && p.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval))
                     {
                         if (captionsChanged && !p.CaptionInfo.Edited)
                         {
@@ -813,7 +894,8 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
                 if (requireApproval.HasValue && requireApproval.Value != blog.RequireApproval)
                 {
                     blog.RequireApproval = requireApproval.Value;
-                    foreach (var p in posts.Where(p => p.Origin == PostOrigin.Autopilot && p.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval))
+                    // Reblogs have their own approval switch.
+                    foreach (var p in posts.Where(p => p.Origin == PostOrigin.Autopilot && !p.IsReblog && p.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval))
                     {
                         if (blog.RequireApproval)
                         {
@@ -836,6 +918,12 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
 
             service.Planner!.ReconcileSlots(blogId);
             await Store.FlushAsync();
+            if (strategy != null)
+            {
+                service.Sync?.ExpediteTags(blogId); // new fixed or rotating tags get looked up now, not tomorrow
+                service.Curator?.Expedite(blogId);
+                service.Engine?.WakeSync();
+            }
             service.Engine?.WakePlanner(blogId);
             service.Engine?.WakePublisher();
             DateTime after = DateTime.UtcNow;
@@ -892,6 +980,7 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
             var blogIds = OptStringList(body, "blogIds");
             if (blogIds.Count == 0) throw Bad("Choose at least one blog.");
             if (!Enum.TryParse<PostKind>(OptString(body, "kind") ?? "Video", true, out var kind)) throw Bad("Unknown post kind.");
+            if (kind == PostKind.Reblog) throw Bad("Reblogs are picked by the blog's curated reblogs, not composed.");
             string captionMode = (OptString(body, "captionMode") ?? "manual").ToLowerInvariant();
             string? caption = OptString(body, "caption")?.Trim();
             string? title = OptString(body, "title")?.Trim();
@@ -1044,6 +1133,8 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
                     p.Approved = true;
                     if (p.Status == PostStatus.AwaitingApproval) p.Status = PostStatus.Ready;
                     if (p.BlockedReason == "Waiting for approval.") p.BlockedReason = null;
+                    // A reblog approved after its time goes out now (spaced like any post), not into the missed-slot bin.
+                    if (p.IsReblog && p.ScheduledUtc < now) p.ScheduledUtc = now;
                     s.Touch(p, now);
                 }
                 if (targets.Count > 0) s.AddEvent(EventLevel.Info, "post.approved", $"Approved {targets.Count} post(s).", targets[0].BlogId, targets.Count == 1 ? targets[0].PostId : null, now);
@@ -1091,6 +1182,7 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
             Store.Mutate(s =>
             {
                 var post = RequirePending(s, postId);
+                if (post.IsReblog) throw Bad("A reblog has no caption to write. Type a comment to add under it, or leave it empty.");
                 post.CaptionInfo.Mode = CaptionMode.AI;
                 post.CaptionInfo.Edited = false;
                 if (!string.IsNullOrWhiteSpace(instruction)) post.CaptionInfo.Direction = instruction.Trim();
@@ -1117,8 +1209,20 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
         private async Task PostsSwapContent(UserRequest req)
         {
             string postId = Required(Body(req), "postId");
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
-            var (ok, message) = await service.Planner!.SwapContentAsync(postId, cts.Token);
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(120));
+            bool reblog = Store.Read(s => s.FindPost(postId)?.IsReblog == true);
+            (bool ok, string message) result;
+            try
+            {
+                result = reblog
+                    ? await (service.Curator ?? throw Conflict("Curated reblogs are not running.")).ReplaceAsync(postId, cts.Token)
+                    : await service.Planner!.SwapContentAsync(postId, cts.Token);
+            }
+            catch (OperationCanceledException)
+            {
+                throw new RouteException(HttpStatusCode.GatewayTimeout, "Finding another took too long; try again.");
+            }
+            var (ok, message) = result;
             if (!ok) throw Conflict(message);
             service.Engine?.WakePlanner();
             var summary = Store.Read(s => s.FindPost(postId) is OmniTumblrPost p ? OmniTumblrViews.Summary(p, s.Blog(p.BlogId)) : null);
@@ -1336,12 +1440,16 @@ h1{{margin:0 0 8px;font-size:20px;color:{accent}}}p{{margin:0;color:#b3c2ad}}sma
                     RecentCaptions = snap.Recent,
                     Frames = frames,
                     ExtraInstruction = instruction,
+                    TagCandidates = service.Planner!.TagCandidates(strategy),
                 }, cts.Token);
+                var chosen = await service.Planner!.ChooseAiTagsAsync(strategy, result.Tags, cts.Token);
                 await Respond(req, new
                 {
                     result.Caption,
-                    Tags = OmniTumblrPlanner.ComposeTags(strategy, result.Tags),
-                    SuggestedTags = result.Tags,
+                    Tags = OmniTumblrPlanner.ComposeTags(strategy, chosen.Kept),
+                    SuggestedTags = chosen.Kept,
+                    DroppedTags = chosen.Dropped,
+                    TagsResearched = chosen.Researched,
                     result.AltText,
                     result.Model,
                     result.UsedVision,

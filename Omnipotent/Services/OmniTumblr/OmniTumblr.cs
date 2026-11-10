@@ -31,6 +31,8 @@ namespace Omnipotent.Services.OmniTumblr
         internal OmniTumblrCaptioner? Captioner { get; private set; }
         internal OmniTumblrMediaTools? MediaTools { get; private set; }
         internal OmniTumblrFingerprints? Fingerprints { get; private set; }
+        internal OmniTumblrTagResearch? TagResearch { get; private set; }
+        internal OmniTumblrCurator? Curator { get; private set; }
         internal OmniTumblrApiBudget? ApiBudget { get; private set; }
         internal TumblrApiClient? TumblrApi { get; private set; }
         internal TumblrEdgeGate? EdgeGate { get; private set; }
@@ -38,6 +40,8 @@ namespace Omnipotent.Services.OmniTumblr
         internal Task Ready => ready.Task;
         internal bool Enabled { get; private set; } = true;
         internal bool PublishingEnabled { get; private set; } = true;
+        internal bool TagResearchEnabled { get; private set; } = true;
+        internal bool ReblogsEnabled { get; private set; } = true;
         internal TimeSpan FleetSpacing { get; private set; } = OmniTumblrPublisher.DefaultFleetSpacing;
         internal DateTime StartedUtc { get; private set; }
         internal string StartupState { get; private set; } = "starting";
@@ -74,17 +78,26 @@ namespace Omnipotent.Services.OmniTumblr
                 TumblrApi = new TumblrApiClient(onCall: ApiBudget.Count, onRateHeaders: ApiBudget.Observe, edgeGate: EdgeGate);
                 MediaTools = new OmniTumblrMediaTools(OmniPaths.GetPath(OmniPaths.GlobalPaths.FFMpegDirectory));
                 ContentSources = new OmniTumblrContentSources(new MemeScraperReelCatalog(FindService<MemeScraper.MemeScraper>), MediaTools, store.LibraryDirectory);
-                Captioner = new OmniTumblrCaptioner(new KliveLlmCaptionModel(FindService<KliveLLM.KliveLLM>));
+                var languageModel = new KliveLlmCaptionModel(FindService<KliveLLM.KliveLLM>);
+                Captioner = new OmniTumblrCaptioner(languageModel);
                 Auth = new OmniTumblrAuth(store, TumblrApi, clock);
                 Fingerprints = new OmniTumblrFingerprints(store, MediaTools, clock);
-                Planner = new OmniTumblrPlanner(store, ContentSources, Captioner, MediaTools, clock, Fingerprints);
+                TagResearch = new OmniTumblrTagResearch(store, TumblrApi, Auth, clock, ApiBudget, EdgeGate, message => _ = ServiceLog(message, false))
+                {
+                    Enabled = () => TagResearchEnabled,
+                };
+                Planner = new OmniTumblrPlanner(store, ContentSources, Captioner, MediaTools, clock, Fingerprints, TagResearch);
                 Publisher = new OmniTumblrPublisher(store, TumblrApi, Auth, clock, AlertAsync, EdgeGate)
                 {
                     PublishingEnabled = () => PublishingEnabled,
                     FleetSpacing = () => FleetSpacing,
                 };
-                Sync = new OmniTumblrAnalyticsSync(store, TumblrApi, Auth, ApiBudget, clock, message => _ = ServiceLog(message, false), EdgeGate);
-                Engine = new OmniTumblrEngine(store, Planner, Publisher, Sync, clock, (ex, message) => _ = ServiceLogError(ex, message));
+                Sync = new OmniTumblrAnalyticsSync(store, TumblrApi, Auth, ApiBudget, clock, message => _ = ServiceLog(message, false), EdgeGate, TagResearch);
+                Curator = new OmniTumblrCurator(store, TumblrApi, Auth, languageModel, MediaTools, clock, ApiBudget, EdgeGate, message => _ = ServiceLog(message, false))
+                {
+                    Enabled = () => ReblogsEnabled,
+                };
+                Engine = new OmniTumblrEngine(store, Planner, Publisher, Sync, clock, (ex, message) => _ = ServiceLogError(ex, message), Curator);
                 var planner = Planner;
                 var engine = Engine;
                 Publisher.OnContentFailure = async postId =>
@@ -131,6 +144,8 @@ namespace Omnipotent.Services.OmniTumblr
         {
             Enabled = await GetBoolOmniSetting("OmniTumblr_Enabled", defaultValue: true);
             PublishingEnabled = await GetBoolOmniSetting("OmniTumblrV2_PublishingEnabled", defaultValue: true);
+            TagResearchEnabled = await GetBoolOmniSetting("OmniTumblr_TagResearchEnabled", defaultValue: true);
+            ReblogsEnabled = await GetBoolOmniSetting("OmniTumblr_ReblogsEnabled", defaultValue: true);
             int spacing = await GetIntOmniSetting("OmniTumblr_FleetSpacingMinutes", (int)OmniTumblrPublisher.DefaultFleetSpacing.TotalMinutes);
             FleetSpacing = TimeSpan.FromMinutes(Math.Clamp(spacing, 0, 6 * 60));
 

@@ -480,7 +480,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 g.WaitingReason = null;
                 g.Paused = false;
                 s.ResolveOwnerTasks("stuck:" + gameId, now);
-                s.ResolveOwnerTasks("approve:" + gameId, now);
+                s.ResolveOwnerTasks(Approvals.LaunchKey(gameId), now);
+                // Nothing to play and sign off any more (a revived game is asked again).
+                s.ResolveOwnerTasks(Approvals.SignoffKey(gameId), now);
                 s.Touch(g, now);
                 s.AddEvent(EventLevel.Warning, "owner.abandon", "Abandoned by the owner: " + Clip(reason, 200), gameId, now);
             });

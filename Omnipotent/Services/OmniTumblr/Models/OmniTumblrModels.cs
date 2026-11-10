@@ -25,7 +25,7 @@ namespace Omnipotent.Services.OmniTumblr.Models
     public enum PostOrigin { Autopilot, Manual, Imported }
 
     [JsonConverter(typeof(StringEnumConverter))]
-    public enum PostKind { Video, Photo, Text, Link }
+    public enum PostKind { Video, Photo, Text, Link, Reblog }
 
     [JsonConverter(typeof(StringEnumConverter))]
     public enum ContentSourceKind { None, MemeScraper, Folder, Library }
@@ -49,6 +49,14 @@ namespace Omnipotent.Services.OmniTumblr.Models
 
     [JsonConverter(typeof(StringEnumConverter))]
     public enum EventLevel { Info, Success, Warning, Error }
+
+    /// <summary>
+    /// What Tumblr's own listing of a tag says about it. Dead: nobody else posts under it, so nobody browses
+    /// it. Quiet: under a post a day. Active: posted to daily. Crowded: so busy a post leaves the first page
+    /// within the hour.
+    /// </summary>
+    [JsonConverter(typeof(StringEnumConverter))]
+    public enum TagVerdict { Unknown, Dead, Quiet, Active, Crowded }
 
     public static class OmniTumblrIds
     {
@@ -157,6 +165,47 @@ namespace Omnipotent.Services.OmniTumblr.Models
         public HashSet<string> RejectedContentKeys { get; set; } = new(StringComparer.Ordinal);
         /// <summary>Position in the caption pool for Rotate mode.</summary>
         public int CaptionPoolCursor { get; set; }
+        /// <summary>
+        /// Other people's posts considered for a reblog (by Tumblr post id), so a post turned down is not put
+        /// to the model again and one blog is not reblogged from over and over. Bounded; oldest go first.
+        /// </summary>
+        public Dictionary<string, ReblogDecision> ReblogHistory { get; set; } = new(StringComparer.Ordinal);
+    }
+
+    public sealed class ReblogDecision
+    {
+        public DateTime Utc { get; set; }
+        /// <summary>taken | rejected | failed</summary>
+        public string Outcome { get; set; } = "";
+        public string? Reason { get; set; }
+        public string? SourceBlog { get; set; }
+    }
+
+    /// <summary>
+    /// Curated reblogs: a few times a day the blog reblogs a well-liked post from the tags it lives in. On
+    /// Tumblr reblogging is how a blog takes part: the original poster is told, the blog shows up in the
+    /// post's notes, and the blog's own page is more than one account's uploads. Off until switched on.
+    /// </summary>
+    public sealed class ReblogSettings
+    {
+        public bool Enabled { get; set; }
+        public int PerDay { get; set; } = 3;
+        /// <summary>Tags to look in. Empty: the blog's fixed and rotating tags.</summary>
+        public List<string> Tags { get; set; } = new();
+        /// <summary>Only posts that already have this many notes.</summary>
+        public long MinNotes { get; set; } = 50;
+        public int MaxAgeHours { get; set; } = 72;
+        public bool Images { get; set; } = true;
+        /// <summary>Off by default: only one frame of a video can be screened, so video picks always wait for approval.</summary>
+        public bool Videos { get; set; }
+        public bool Text { get; set; } = true;
+        /// <summary>Picks wait in the queue until approved. On by default: these are other people's posts.</summary>
+        public bool RequireApproval { get; set; } = true;
+        /// <summary>Reblogs are spread between these hours of the blog's local day.</summary>
+        public int StartHour { get; set; } = 9;
+        public int EndHour { get; set; } = 23;
+        /// <summary>Extra direction for the model that screens candidates ("nothing about football").</summary>
+        public string Guidance { get; set; } = "";
     }
 
     public sealed class BlogStats
@@ -164,6 +213,9 @@ namespace Omnipotent.Services.OmniTumblr.Models
         public long? Followers { get; set; }
         public long? Posts { get; set; }
         public long? Likes { get; set; }
+        /// <summary>From /info, when Tumblr reports them: used to spot a blog still wearing the default look.</summary>
+        public string? AvatarUrl { get; set; }
+        public string? HeaderImageUrl { get; set; }
         public DateTime? InfoSyncedUtc { get; set; }
         public DateTime? FollowersSyncedUtc { get; set; }
         public DateTime? PostsIndexSyncedUtc { get; set; }
@@ -180,6 +232,54 @@ namespace Omnipotent.Services.OmniTumblr.Models
         /// <summary>Set when the planner could not find content for an upcoming slot.</summary>
         public string? ContentWarning { get; set; }
         public DateTime? ContentWarningUtc { get; set; }
+        public SearchVisibility Search { get; set; } = new();
+    }
+
+    /// <summary>
+    /// Whether Tumblr lists the blog's posts under their tags. A blog with few followers is found through
+    /// tags and little else, so a blog Tumblr has stopped listing reaches nobody however good its posts are.
+    /// Checked by looking for a recent post in the listing of one of its own quieter tags.
+    /// </summary>
+    public sealed class SearchVisibility
+    {
+        public DateTime? CheckedUtc { get; set; }
+        /// <summary>Null until a check could be made.</summary>
+        public bool? Listed { get; set; }
+        public string? Tag { get; set; }
+        public string? PostId { get; set; }
+        public DateTime? LastListedUtc { get; set; }
+        /// <summary>Checks in a row, each on a different post, that did not find the post.</summary>
+        public int Misses { get; set; }
+    }
+
+    /// <summary>
+    /// One tag as Tumblr's listing shows it (GET /v2/tagged), with our own blogs' posts left out: how often
+    /// other people post under it and what their posts earn. See <c>OmniTumblrTagMath</c>.
+    /// </summary>
+    public sealed class TagResearch
+    {
+        public string Tag { get; set; } = "";
+        public DateTime CheckedUtc { get; set; }
+        public TagVerdict Verdict { get; set; }
+        /// <summary>0–100, from the notes other blogs' posts under the tag end up with. Ranks candidate tags.</summary>
+        public double Score { get; set; }
+        /// <summary>Other blogs' posts looked at.</summary>
+        public int Sampled { get; set; }
+        public double? PostsPerDay { get; set; }
+        public DateTime? NewestPostUtc { get; set; }
+        /// <summary>Posts old enough (12 hours or more) for their notes to mean something.</summary>
+        public int Settled { get; set; }
+        /// <summary>Median notes of the settled posts.</summary>
+        public double? TypicalNotes { get; set; }
+        /// <summary>Share of the settled posts with at least one note, 0–1.</summary>
+        public double? ShareWithNotes { get; set; }
+        public int Videos { get; set; }
+        public int Images { get; set; }
+        public int Texts { get; set; }
+        /// <summary>Tags other people put alongside this one, most common first.</summary>
+        public List<string> Related { get; set; } = new();
+        public string? Error { get; set; }
+        public int Failures { get; set; }
     }
 
     public sealed class WeeklySlot
@@ -275,11 +375,19 @@ namespace Omnipotent.Services.OmniTumblr.Models
         public List<string> RotatingTags { get; set; } = new();
         public int RotatingTagsPerPost { get; set; } = 3;
         public int MaxTags { get; set; } = 12;
+        /// <summary>
+        /// Look each AI-suggested tag up on Tumblr first: keep the ones other people's posts get notes under,
+        /// best first, and leave out the ones nobody else uses.
+        /// </summary>
+        public bool ResearchTags { get; set; } = true;
 
         // ── Post ──
         public TumblrPostState PostState { get; set; } = TumblrPostState.Published;
         /// <summary>Attach the original content's URL as the post's Tumblr "source".</summary>
         public bool CreditSource { get; set; }
+
+        // ── Reblogs ──
+        public ReblogSettings Reblogs { get; set; } = new();
 
         /// <summary>The out-of-the-box strategy: one meme video every Friday evening with an AI caption.</summary>
         public static OmniTumblrStrategy CreateDefault() => new()
@@ -321,6 +429,8 @@ namespace Omnipotent.Services.OmniTumblr.Models
         public bool CaptionPending { get; set; }
         public CaptionInfo CaptionInfo { get; set; } = new();
         public ContentRef? Content { get; set; }
+        /// <summary>For <see cref="PostKind.Reblog"/>: the post being reblogged.</summary>
+        public ReblogRef? Reblog { get; set; }
 
         // ── Publishing ──
         public int Attempts { get; set; }
@@ -350,6 +460,13 @@ namespace Omnipotent.Services.OmniTumblr.Models
         [JsonIgnore]
         public bool IsTerminal => Status is PostStatus.Published or PostStatus.Failed or PostStatus.Cancelled or PostStatus.Skipped or PostStatus.Removed;
 
+        /// <summary>
+        /// Someone else's post, reblogged. Tumblr reports the original's notes on every reblog of it, so a
+        /// reblog's notes say nothing about this blog and are kept out of every figure.
+        /// </summary>
+        [JsonIgnore]
+        public bool IsReblog => Kind == PostKind.Reblog;
+
         /// <summary>Not yet published and still going to be: occupies its slot.</summary>
         [JsonIgnore]
         public bool IsPending => Status is PostStatus.Draft or PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval or PostStatus.Publishing;
@@ -370,6 +487,32 @@ namespace Omnipotent.Services.OmniTumblr.Models
         public DateTime? ThumbnailAttemptUtc { get; set; }
 
         [JsonIgnore] public bool IsVideo => MimeType.StartsWith("video/", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>The post a reblog reblogs, and why it was picked.</summary>
+    public sealed class ReblogRef
+    {
+        public string ParentPostId { get; set; } = "";
+        public string ParentBlogUuid { get; set; } = "";
+        public string ParentBlogName { get; set; } = "";
+        public string ReblogKey { get; set; } = "";
+        public string? ParentUrl { get; set; }
+        public string? Summary { get; set; }
+        public List<string> ParentTags { get; set; } = new();
+        /// <summary>Notes on the original when it was picked.</summary>
+        public long ParentNotes { get; set; }
+        public DateTime? ParentPublishedUtc { get; set; }
+        /// <summary>photo | video | text</summary>
+        public string? ParentType { get; set; }
+        public string? FoundUnderTag { get; set; }
+        /// <summary>The reblog time of day this fills (see <c>OmniTumblrCurator</c>).</summary>
+        public DateTime? SlotUtc { get; set; }
+        /// <summary>A small JPEG of the original's picture, for the queue.</summary>
+        public string? PreviewPath { get; set; }
+        /// <summary>The screening model was shown the picture (or the post has none).</summary>
+        public bool SeenByModel { get; set; }
+        /// <summary>Why the screening model let it through.</summary>
+        public string? Reason { get; set; }
     }
 
     /// <summary>Where a post's content came from.</summary>
@@ -430,7 +573,12 @@ namespace Omnipotent.Services.OmniTumblr.Models
         /// <summary>Extra direction for the AI on this post (from the composer or a regenerate request).</summary>
         public string? Direction { get; set; }
         public string? AltText { get; set; }
+        /// <summary>The AI's tags that went on the post (after tag research, when it ran).</summary>
         public List<string> SuggestedTags { get; set; } = new();
+        /// <summary>Tags the AI proposed that were left out because nobody else on Tumblr uses them.</summary>
+        public List<string> DroppedTags { get; set; } = new();
+        /// <summary>The suggested tags were checked against Tumblr's listings.</summary>
+        public bool TagsResearched { get; set; }
     }
 
     public sealed class PublishAttempt
@@ -486,6 +634,8 @@ namespace Omnipotent.Services.OmniTumblr.Models
         public string? Summary { get; set; }
         /// <summary>Set when the post was published by OmniTumblr.</summary>
         public string? OmniPostId { get; set; }
+        /// <summary>A reblog of someone else's post: its notes are the original's, not this blog's.</summary>
+        public bool IsReblog { get; set; }
     }
 
     public sealed class ActivityItem

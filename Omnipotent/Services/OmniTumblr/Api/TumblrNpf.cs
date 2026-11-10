@@ -27,6 +27,12 @@ namespace Omnipotent.Services.OmniTumblr.Api
         public string? Slug { get; set; }
         public List<NpfUpload> Uploads { get; set; } = new();
 
+        // A reblog: the three values Tumblr needs to tie the new post to the one being reblogged.
+        public string? ParentBlogUuid { get; set; }
+        public string? ParentPostId { get; set; }
+        public string? ReblogKey { get; set; }
+        public bool IsReblog => !string.IsNullOrEmpty(ParentPostId);
+
         public string ToJson()
         {
             var body = new Dictionary<string, object?>
@@ -34,6 +40,13 @@ namespace Omnipotent.Services.OmniTumblr.Api
                 ["content"] = Content,
                 ["state"] = State,
             };
+            if (IsReblog)
+            {
+                body["parent_tumblelog_uuid"] = ParentBlogUuid;
+                // Documented as an integer; ids are 64-bit.
+                body["parent_post_id"] = long.TryParse(ParentPostId, System.Globalization.NumberStyles.None, System.Globalization.CultureInfo.InvariantCulture, out long id) ? id : ParentPostId;
+                body["reblog_key"] = ReblogKey;
+            }
             if (Layout is { Count: > 0 }) body["layout"] = Layout;
             if (!string.IsNullOrWhiteSpace(Tags)) body["tags"] = Tags;
             if (!string.IsNullOrWhiteSpace(SourceUrl)) body["source_url"] = SourceUrl;
@@ -54,6 +67,8 @@ namespace Omnipotent.Services.OmniTumblr.Api
         public string? Slug { get; set; }
         public TumblrPostState State { get; set; } = TumblrPostState.Published;
         public string? AltText { get; set; }
+        /// <summary>For <see cref="PostKind.Reblog"/>: what is being reblogged. The caption, if any, is added under it.</summary>
+        public ReblogRef? Reblog { get; set; }
     }
 
     /// <summary>
@@ -145,6 +160,17 @@ namespace Omnipotent.Services.OmniTumblr.Api
                     request.Content.Add(block);
                     break;
                 }
+                case PostKind.Reblog:
+                {
+                    var parent = input.Reblog ?? throw new InvalidOperationException("A reblog needs the post it reblogs.");
+                    if (string.IsNullOrWhiteSpace(parent.ParentPostId) || string.IsNullOrWhiteSpace(parent.ParentBlogUuid) || string.IsNullOrWhiteSpace(parent.ReblogKey))
+                        throw new InvalidOperationException("The reblog is missing the original post's id, blog or reblog key.");
+                    request.ParentPostId = parent.ParentPostId;
+                    request.ParentBlogUuid = parent.ParentBlogUuid;
+                    request.ReblogKey = parent.ReblogKey;
+                    request.SourceUrl = null; // the trail is the attribution
+                    break;
+                }
                 case PostKind.Text:
                 {
                     if (!string.IsNullOrWhiteSpace(input.Title))
@@ -161,7 +187,7 @@ namespace Omnipotent.Services.OmniTumblr.Api
             foreach (string paragraph in SplitText(input.Caption))
                 request.Content.Add(new Dictionary<string, object?> { ["type"] = "text", ["text"] = paragraph });
 
-            if (request.Content.Count == 0)
+            if (request.Content.Count == 0 && !request.IsReblog)
                 throw new InvalidOperationException("The post has no content.");
             return request;
         }

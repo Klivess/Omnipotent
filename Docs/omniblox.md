@@ -208,6 +208,7 @@ Every decision is kept in the dossier (`Publish.Approvals`) and the owner's chan
    - Either way the session lands in `OmniBlox_RobloxSessionCookie`. Whatever waited for it (icon, thumbnails, questionnaire) runs at once, with the studio on or off.
    - **Disconnect** signs out a session the studio made, but never a pasted one, which would sign your browser out.
    - If Roblox signs the session out later, the dashboard asks you to connect again. Without a session these chores stay owner tasks, and the questionnaire task says the game is unplayable until it is answered.
+   - **Whose the key and session are.** Both live in OmniSettings and are re-read every minute, so one pasted there directly skips the checks above. `Pipeline/CredentialCheck.cs` asks Roblox about each whenever it changes: API-key introspection gives the key's owner, `users/authenticated` the session's. When either belongs to another user than `OmniBlox_CreatorUserId`, the owner gets one task naming both accounts and the two ways out: that account's key and session, or **switch the studio to this account**. Another account's key is refused on every place upload with `User unauthorized to update place`, whatever its permissions. On Nov 2 2026 that sat behind an owner task blaming missing permissions for days. While Roblox refuses the key (another account's, unknown, or an open engine-refusal task), `run_tests` uses the local engine for building and does not ask Roblox again. A launch or an update still asks. A new key, a version Roblox accepts, or the owner marking the task done lets Roblox's engine try again. Switching accounts releases the experiences of games still in production, so they get new ones on the new account. Launched games move with Manage → Move.
 4. **Experience slots.** Create a few blank experiences in the Creator Dashboard and add each as `universeId:placeId` to `OmniBlox_ExperienceSlots`.
 5. **AIRouter.** OmniBlox only runs model work while `RemoteLLMProvider` is `AIRouter`.
 6. Open **Schemery → OmniBlox** on the KM site. Switch the **harvester** on first so the Asset Library fills up, then switch the **studio** on.
@@ -269,8 +270,10 @@ The game page's **Manage on Roblox** card (`Pipeline/GameActions.cs`, `studio.ma
 
 **Changing accounts.** On the Roblox account card:
 1. Use **Switch to another account** and confirm the code with the other account. It becomes the creator (`OmniBlox_CreatorUserId`).
-2. Every experience of the old account (the studio's and your listed slots) is retired, so no new game lands there. Games already published are flagged (`Publish.OnOldAccount`) and listed with **Move to this account**.
-3. Set the new account's API key on the same card. Roblox's introspection (`POST apis.roblox.com/api-keys/v1/introspect`) must say it exists, is enabled, has not expired, works from the server, and belongs to the studio's account. A key for another account is refused.
+2. Every experience of the old account (the studio's and your listed slots) is retired, so no new game lands there.
+   - A game with nothing published on its experience (in production, or a launch that never got through) forgets that experience. It gets a new one on the new account when it next needs one, its launch included; no Move is needed.
+   - Games already published are flagged (`Publish.OnOldAccount`) and listed with **Move to this account**.
+3. Set the new account's API key on the same card. Roblox's introspection (`POST apis.roblox.com/api-keys/v1/introspect`) must say it exists, is enabled, has not expired, works from the server, and belongs to the studio's account. A key for another account is refused. Until it is set, the studio creates no experience (the old key could not reach one) and builds test in the local engine.
 
 ## Settings
 

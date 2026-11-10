@@ -471,6 +471,51 @@ namespace Omnipotent.Tests.OmniTumblr
             Assert.Contains("refresh_token=r1", stub.Requests[0].Body);
         }
 
+        [Fact]
+        public async Task TaggedListing_IsABareArray_ReadInBothPostShapes_WithJustTheAppKey()
+        {
+            // One post in the Neue Post Format, one legacy "text" post whose video is in its HTML, one reblog
+            // (no content of its own: what it shows is in the trail).
+            const string listing = "{\"meta\":{\"status\":200},\"response\":[" +
+                "{\"type\":\"blocks\",\"id_string\":\"11\",\"blog_name\":\"madridfan\",\"timestamp\":1794260395,\"note_count\":6,\"tags\":[\"Real Madrid\",\"la liga\"],\"content\":[{\"type\":\"image\"},{\"type\":\"text\",\"text\":\"what a goal\"}]}," +
+                "{\"type\":\"text\",\"id\":22,\"blog_name\":\"clips\",\"timestamp\":1794250000,\"note_count\":\"3\",\"tags\":[\"real madrid\"],\"body\":\"<figure><video controls></video></figure><p>hm</p>\"}," +
+                "{\"type\":\"blocks\",\"id_string\":\"33\",\"blog_name\":\"reblogger\",\"timestamp\":1794240000,\"note_count\":900,\"tags\":[\"real madrid\"],\"content\":[],\"trail\":[{\"content\":[{\"type\":\"video\"}]}]}" +
+                "]}";
+            var stub = new StubHandler { Respond = _ => Task.FromResult(Json(HttpStatusCode.OK, listing)) };
+            var client = new TumblrApiClient(new HttpClient(stub));
+
+            var posts = await client.GetTaggedAsync(new TumblrCredentials { ConsumerKey = "ck", ConsumerSecret = "cs" }, "real madrid", 1794000000, CancellationToken.None);
+
+            Assert.Equal(new[] { "11", "22", "33" }, posts.Select(p => p.Id));
+            Assert.Equal(new[] { "photo", "video", "video" }, posts.Select(p => p.Type));
+            Assert.Equal(new long[] { 6, 3, 900 }, posts.Select(p => p.NoteCount));
+            Assert.Equal("madridfan", posts[0].BlogName);
+            Assert.Equal(new[] { "Real Madrid", "la liga" }, posts[0].Tags);
+            string url = stub.Requests[0].Request.RequestUri!.AbsoluteUri;
+            Assert.StartsWith("https://api.tumblr.com/v2/tagged?", url);
+            Assert.Contains("tag=real%20madrid", url);
+            Assert.Contains("before=1794000000", url);
+            Assert.Contains("api_key=ck", url);
+            Assert.False(stub.Requests[0].Request.Headers.Contains("Authorization")); // an API-key endpoint: no user token involved
+        }
+
+        [Fact]
+        public async Task BlogInfo_ReportsTheAvatarAndHeader_SoADefaultLookCanBeSpotted()
+        {
+            var stub = new StubHandler
+            {
+                Respond = _ => Task.FromResult(Json(HttpStatusCode.OK, "{\"meta\":{\"status\":200},\"response\":{\"blog\":{\"name\":\"memeblog\",\"title\":\"Memes\",\"description\":\"\",\"posts\":51," +
+                    "\"avatar\":[{\"width\":64,\"height\":64,\"url\":\"https://64.media.tumblr.com/a/s64x64u_c1/x.png\"},{\"width\":512,\"height\":512,\"url\":\"https://64.media.tumblr.com/a/s512x512u_c1/x.png\"}]," +
+                    "\"theme\":{\"header_image\":\"https://assets.tumblr.com/images/default_header/optica_pattern_11.png\"}}}}")),
+            };
+            var client = new TumblrApiClient(new HttpClient(stub));
+
+            var info = await client.GetBlogInfoAsync(OAuth1, "memeblog", CancellationToken.None);
+
+            Assert.Equal("https://64.media.tumblr.com/a/s512x512u_c1/x.png", info.AvatarUrl);
+            Assert.Contains("default_header", info.HeaderImageUrl);
+        }
+
         [Theory]
         [InlineData("memeblog", "memeblog")]
         [InlineData("@MemeBlog", "memeblog")]

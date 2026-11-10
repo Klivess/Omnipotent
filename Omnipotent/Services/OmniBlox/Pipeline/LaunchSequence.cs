@@ -58,7 +58,7 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             game = ctx.Game(gameId)!;
             if (!StageGates.EnginePassed(game))
             {
-                var (engine, message) = await BuildTools.RunEngineTestsAsync(ctx, gameId, ct, build);
+                var (engine, message) = await BuildTools.RunEngineTestsAsync(ctx, gameId, ct, build, requireRoblox: true);
                 if (engine == null) return (LaunchResult.Failed, "the engine tests could not run: " + message);
                 if (!engine.Ok && !TestStage.GameChecksPass(engine))
                 {

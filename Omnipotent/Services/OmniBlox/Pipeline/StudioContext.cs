@@ -74,6 +74,9 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         /// <summary>The cycles running now, for the dashboard's live view.</summary>
         public LiveBoard Live { get; } = new();
 
+        /// <summary>Whose the API key and session are (checked with Roblox whenever either changes).</summary>
+        public CredentialCheck Credentials { get; } = new();
+
         /// <summary>One store-page chore sweep at a time (housekeeping and a fresh Roblox connection could both start one; a questionnaire must not be answered twice).</summary>
         public SemaphoreSlim ChoreGate { get; } = new(1, 1);
 

@@ -23,6 +23,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public List<OmniTumblrEvent> Events { get; } = new();
         /// <summary>Content key → fingerprint of its media (see <see cref="OmniTumblrFingerprints"/>).</summary>
         public Dictionary<string, MediaFingerprint> Fingerprints { get; } = new(StringComparer.Ordinal);
+        /// <summary>Tag (lower case) → what Tumblr's listing of it showed (see <see cref="OmniTumblrTagResearch"/>).</summary>
+        public Dictionary<string, TagResearch> Tags { get; } = new(StringComparer.Ordinal);
 
         public OmniTumblrVault Vault => store.Vault;
 
@@ -65,6 +67,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public void MarkFlows() => store.MarkDirty("flows");
         public void MarkEngine() => store.MarkDirty("engine");
         public void MarkFingerprints() => store.MarkDirty("fingerprints");
+        public void MarkTags() => store.MarkDirty("tags");
         public void MarkBlog(string blogId) => store.MarkDirty("blog:" + blogId);
         public void MarkPosts(string blogId) => store.MarkDirty("posts:" + blogId);
         public void MarkInsights(string blogId) => store.MarkDirty("insights:" + blogId);
@@ -134,6 +137,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private string FlowsPath => Path.Combine(Root, "auth-flows.json");
         private string EnginePath => Path.Combine(Root, "engine.json");
         private string FingerprintsPath => Path.Combine(Root, "fingerprints.json");
+        private string TagsPath => Path.Combine(Root, "tags.json");
         private string EventsPath => Path.Combine(Root, "events.jsonl");
         private string BlogDir(string blogId) => Path.Combine(BlogsDirectory, blogId);
 
@@ -196,14 +200,19 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     if (!string.IsNullOrEmpty(f.FlowId)) State.Flows[f.FlowId] = f;
                 foreach (var (key, fingerprint) in ReadJson<Dictionary<string, MediaFingerprint>>(FingerprintsPath) ?? new())
                     if (fingerprint?.Version == MediaFingerprint.CurrentVersion) State.Fingerprints[key] = fingerprint;
+                foreach (var (key, research) in ReadJson<Dictionary<string, TagResearch>>(TagsPath) ?? new())
+                    if (research != null) State.Tags[key] = research;
 
                 foreach (string dir in Directory.EnumerateDirectories(BlogsDirectory))
                 {
                     var blog = ReadJson<OmniTumblrBlog>(Path.Combine(dir, "blog.json"));
                     if (blog == null || string.IsNullOrEmpty(blog.BlogId)) continue;
                     blog.Strategy ??= OmniTumblrStrategy.CreateDefault();
+                    blog.Strategy.Reblogs ??= new ReblogSettings();
+                    blog.ReblogHistory ??= new Dictionary<string, ReblogDecision>(StringComparer.Ordinal);
                     blog.Stats ??= new BlogStats();
                     blog.Health ??= new BlogHealth();
+                    blog.Health.Search ??= new SearchVisibility();
                     blog.UsedContentKeys ??= new HashSet<string>(StringComparer.Ordinal);
                     blog.RejectedContentKeys ??= new HashSet<string>(StringComparer.Ordinal);
                     State.Blogs[blog.BlogId] = blog;
@@ -339,6 +348,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (key == "flows") return (FlowsPath, JsonConvert.SerializeObject(State.Flows.Values.ToList(), Formatting.Indented, JsonSettings));
             if (key == "engine") return (EnginePath, JsonConvert.SerializeObject(State.Engine, Formatting.Indented, JsonSettings));
             if (key == "fingerprints") return (FingerprintsPath, JsonConvert.SerializeObject(State.Fingerprints, Formatting.None, JsonSettings));
+            if (key == "tags") return (TagsPath, JsonConvert.SerializeObject(State.Tags, Formatting.None, JsonSettings));
             int colon = key.IndexOf(':');
             if (colon < 0) return null;
             string kind = key[..colon], blogId = key[(colon + 1)..];
@@ -361,6 +371,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (path == FlowsPath) return "flows";
             if (path == EnginePath) return "engine";
             if (path == FingerprintsPath) return "fingerprints";
+            if (path == TagsPath) return "tags";
             string blogId = Path.GetFileName(Path.GetDirectoryName(path)) ?? "";
             return Path.GetFileName(path) switch
             {

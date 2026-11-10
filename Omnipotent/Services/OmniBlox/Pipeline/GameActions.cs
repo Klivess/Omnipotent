@@ -286,38 +286,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
                 step(await ProductsOffSaleAsync(gameId, old, ct));
             }
 
-            // Everything that belonged to the old experience is forgotten; what the game is (build, store page, products) stays.
             var now = ctx.Clock();
             ctx.Store.Mutate(s =>
             {
                 var g = s.Game(gameId)!;
                 if (old != null) Retire(s, g, old.UniverseId);
-                g.Slot = null;
-                foreach (var p in g.Products) { p.RobloxId = null; p.SyncedUtc = null; p.Retired = false; p.RetiredUtc = null; }
-                var pub = g.Publish;
-                pub.IsPublic = false;
-                pub.LastPublishedVersion = null;
-                pub.LastPublishedRevision = null;
-                pub.LastSavedVersion = null;
-                pub.LastSavedRevision = null;
-                pub.EngineTestedRevision = null;
-                pub.IconUploadedHash = null;
-                pub.IconUploadedUtc = null;
-                pub.StoreThumbnails.Clear();
-                pub.StoreThumbnailsUploaded = 0;
-                pub.Questionnaire = null;
-                pub.Reach = null;
-                pub.LaunchFailures = 0;
-                pub.LastLaunchStep = null;
-                pub.LastLaunchError = null;
-                pub.OnOldAccount = false;
-                g.Store.Applied = false;
-                foreach (var key in new[] { StorePageChores.IconKey(gameId), StorePageChores.QuestionnaireKey(gameId) })
-                {
-                    s.Studio.Chores.Remove(key);
-                    s.ResolveOwnerTasks(key, now);
-                }
-                s.MarkStudio();
+                ForgetExperience(s, g, now);
                 s.Touch(g, now);
             });
 
@@ -376,6 +350,43 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
             if (game.Stage == GameStage.Live && game.Publish.IsPublic) return $"Live again, in experience {slot.UniverseId}.";
             string waiting = game.WaitingReason ?? game.Publish.LastLaunchError ?? "it carries on with the studio";
             return $"Moved to experience {slot.UniverseId}; the launch there is waiting: {waiting}" + (ctx.Settings.Enabled ? "." : " (switch the studio on so it carries on).");
+        }
+
+        /// <summary>
+        /// Everything that belonged to the game's experience is forgotten (its products' ids, versions, icon,
+        /// thumbnails, rating, launch progress); what the game is (build, store page, products) stays. It gets an
+        /// experience again when it next needs one (a move gives it one at once).
+        /// </summary>
+        public static void ForgetExperience(OmniBloxState s, GameDossier g, DateTime now)
+        {
+            foreach (var key in s.Studio.SlotAssignments.Where(kv => kv.Value == g.GameId).Select(kv => kv.Key).ToList()) s.Studio.SlotAssignments.Remove(key);
+            g.Slot = null;
+            foreach (var p in g.Products) { p.RobloxId = null; p.SyncedUtc = null; p.Retired = false; p.RetiredUtc = null; }
+            var pub = g.Publish;
+            pub.IsPublic = false;
+            pub.LastPublishedVersion = null;
+            pub.LastPublishedRevision = null;
+            pub.LastSavedVersion = null;
+            pub.LastSavedRevision = null;
+            pub.EngineTestedRevision = null;
+            pub.IconUploadedHash = null;
+            pub.IconUploadedUtc = null;
+            pub.StoreThumbnails.Clear();
+            pub.StoreThumbnailsUploaded = 0;
+            pub.Questionnaire = null;
+            pub.Reach = null;
+            pub.LaunchFailures = 0;
+            pub.LastLaunchStep = null;
+            pub.LastLaunchError = null;
+            pub.OnOldAccount = false;
+            g.Store.Applied = false;
+            foreach (var key in new[] { StorePageChores.IconKey(g.GameId), StorePageChores.QuestionnaireKey(g.GameId) })
+            {
+                s.Studio.Chores.Remove(key);
+                s.ResolveOwnerTasks(key, now);
+            }
+            s.MarkGame(g.GameId);
+            s.MarkStudio();
         }
 
         /// <summary>An experience no game gets again; it stops being the game's.</summary>

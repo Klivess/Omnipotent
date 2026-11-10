@@ -80,6 +80,13 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public IReadOnlyList<string> RecentCaptions { get; set; } = Array.Empty<string>();
         public IReadOnlyList<byte[]> Frames { get; set; } = Array.Empty<byte[]>();
         public string? ExtraInstruction { get; set; }
+        /// <summary>
+        /// How many tags to ask for. Above the blog's MaxSuggestedTags when the tags will be checked against
+        /// Tumblr afterwards, so some can be left out; 0 asks for MaxSuggestedTags.
+        /// </summary>
+        public int TagCandidates { get; set; }
+
+        internal int TagCount => !Settings.SuggestTags ? 0 : Math.Clamp(TagCandidates > 0 ? TagCandidates : Settings.MaxSuggestedTags, 0, OmniTumblrCaptioner.MaxTagCandidates);
     }
 
     public sealed class CaptionResult
@@ -103,6 +110,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
     /// </summary>
     internal sealed class OmniTumblrCaptioner
     {
+        public const int MaxTagCandidates = 20;
         private readonly ICaptionModel model;
 
         public OmniTumblrCaptioner(ICaptionModel model) => this.model = model;
@@ -116,19 +124,25 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             string system = BuildSystemPrompt(request);
             string user = BuildUserPrompt(request, vision);
             Exception? last = null;
+            CaptionResult? withoutTags = null;
 
             for (int attempt = 1; attempt <= 3; attempt++)
             {
                 ct.ThrowIfCancellationRequested();
                 try
                 {
-                    var reply = await model.CompleteAsync(system, user, vision ? request.Frames : Array.Empty<byte[]>(), settings.Model, 700, ct);
-                    var parsed = ParseReply(reply.Text, settings);
+                    var reply = await model.CompleteAsync(system, user, vision ? request.Frames : Array.Empty<byte[]>(), settings.Model, 1100, ct);
+                    var parsed = ParseReply(reply.Text, settings, request.TagCount);
                     if (parsed != null)
                     {
                         parsed.Model = reply.Model;
                         parsed.UsedVision = vision;
-                        return parsed;
+                        // A reply cut off after the caption still parses, but without its tags, and a post that is
+                        // found only through its tags then goes out with none of its own. Ask once more.
+                        if (request.TagCount == 0 || parsed.Tags.Count > 0 || withoutTags != null) return parsed;
+                        withoutTags = parsed;
+                        user += "\n\nYour previous reply had no tags. Reply again with ONLY the JSON object, including \"tags\".";
+                        continue;
                     }
                     last = new FormatException("The model's reply had no usable caption: " + Clip(reply.Text, 160));
                     user += "\n\nYour previous reply could not be used. Reply with ONLY the JSON object described, with a non-empty \"caption\".";
@@ -150,6 +164,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     if (attempt < 3) await Task.Delay(TimeSpan.FromSeconds(2 * attempt), ct);
                 }
             }
+            if (withoutTags != null) return withoutTags;
             throw new CaptionGenerationException("AI caption failed: " + (last?.Message ?? "unknown error"), last);
         }
 
@@ -189,8 +204,17 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 foreach (string example in examples) sb.AppendLine("- " + example.Trim());
             }
             sb.AppendLine();
-            if (s.SuggestTags)
-                sb.AppendLine($"Also suggest up to {Math.Clamp(s.MaxSuggestedTags, 1, 15)} Tumblr tags: lowercase, short, specific to what is shown (subject, vibe, fandom, format), no '#'.");
+            if (request.TagCount > 0)
+            {
+                // Tags are how a post gets found. The earlier wording ("specific to what is shown") produced tags
+                // like "plastic chair" that nobody browses: see OmniTumblrTagMath.
+                sb.AppendLine($"Also list up to {request.TagCount} Tumblr tags, the ones most likely to have followers first. A tag only helps if people on Tumblr already browse it, so:");
+                sb.AppendLine("- Name who and what it is, the way fans tag it: the people, characters, shows, films, games, teams, songs or franchises that are named or unmistakable (\"kylian mbappe\", \"real madrid\", \"assassins creed\", \"joker\", \"south park\").");
+                sb.AppendLine("- Then the wider subject or community (\"football\", \"gaming\", \"politics\", \"movies\", \"anime\", \"cats\").");
+                sb.AppendLine("- Use the usual spelling: lowercase, words separated by spaces not hyphens, no '#'.");
+                sb.AppendLine("- Never describe what the frame looks like (\"plastic chair\", \"black and white\", \"red lighting\", \"two guys\"), never tag the format (\"video\", \"screen recording\"), and never invent a phrase or put the joke in a tag: nobody browses those.");
+                sb.AppendLine("- Do not guess who someone is. With nothing recognisable, give fewer tags.");
+            }
             sb.AppendLine("Also write alt_text: one plain sentence describing what is visible, for screen-reader users.");
             sb.AppendLine();
             sb.Append("Reply with ONLY a JSON object, no prose and no code fences: {\"caption\": \"...\", \"tags\": [\"...\"], \"alt_text\": \"...\"}");
@@ -237,7 +261,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         // ─────────────────────────────── Parsing ───────────────────────────────
 
         /// <summary>Extracts {caption, tags, alt_text} from a model reply; null when nothing usable came back.</summary>
-        internal static CaptionResult? ParseReply(string? raw, AiCaptionSettings settings)
+        /// <param name="maxTags">How many tags to keep; null keeps the blog's MaxSuggestedTags.</param>
+        internal static CaptionResult? ParseReply(string? raw, AiCaptionSettings settings, int? maxTags = null)
         {
             if (string.IsNullOrWhiteSpace(raw)) return null;
             string text = raw.Trim();
@@ -268,6 +293,10 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 // A bare caption is acceptable if it is caption-sized and not an apology or explanation.
                 var m = Regex.Match(text, "\"caption\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"");
                 caption = m.Success ? Regex.Unescape(m.Groups[1].Value) : text.Length <= Math.Max(40, settings.MaxLength * 2) && !text.Contains('{') ? text : null;
+                // Broken JSON is usually a reply cut off part-way: keep the tags that arrived whole.
+                var list = Regex.Match(text, "\"tags\"\\s*:\\s*\\[([^\\]]*)");
+                if (m.Success && list.Success)
+                    tags = Regex.Matches(list.Groups[1].Value, "\"((?:[^\"\\\\]|\\\\.)*)\"").Select(t => Regex.Unescape(t.Groups[1].Value)).ToList();
             }
 
             if (caption == null) return null;
@@ -278,7 +307,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             return new CaptionResult
             {
                 Caption = caption,
-                Tags = settings.SuggestTags ? NormalizeAiTags(tags, settings.MaxSuggestedTags) : new List<string>(),
+                Tags = settings.SuggestTags ? NormalizeAiTags(tags, maxTags ?? settings.MaxSuggestedTags) : new List<string>(),
                 AltText = string.IsNullOrWhiteSpace(alt) ? null : Clip(alt.Trim(), 400),
             };
         }
@@ -329,7 +358,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         }
 
         internal static List<string> NormalizeAiTags(IEnumerable<string> tags, int max) =>
-            TumblrNpf.NormalizeTags(tags.Select(t => t.Trim().TrimStart('#').ToLowerInvariant()), Math.Clamp(max, 0, 15));
+            TumblrNpf.NormalizeTags(tags.Select(t => t.Trim().TrimStart('#').ToLowerInvariant()), Math.Clamp(max, 0, MaxTagCandidates));
 
         /// <summary>The source's own caption minus hashtags, mentions, links and "follow/credit" boilerplate.</summary>
         public static string CleanSourceCaption(string? text)

@@ -40,11 +40,12 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private readonly OmniTumblrMediaTools media;
         private readonly Func<DateTime> clock;
         private readonly OmniTumblrFingerprints? fingerprints;
+        private readonly OmniTumblrTagResearch? tagResearch;
         /// <summary>"postId|contentKey" of pending posts already checked for repeats.</summary>
         private readonly ConcurrentDictionary<string, byte> repeatChecked = new(StringComparer.Ordinal);
 
         public OmniTumblrPlanner(OmniTumblrStore store, OmniTumblrContentSources content, OmniTumblrCaptioner captioner,
-            OmniTumblrMediaTools media, Func<DateTime> clock, OmniTumblrFingerprints? fingerprints = null)
+            OmniTumblrMediaTools media, Func<DateTime> clock, OmniTumblrFingerprints? fingerprints = null, OmniTumblrTagResearch? tagResearch = null)
         {
             this.store = store;
             this.content = content;
@@ -52,6 +53,61 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             this.media = media;
             this.clock = clock;
             this.fingerprints = fingerprints;
+            this.tagResearch = tagResearch;
+        }
+
+        // ─────────────────────────────── Tags ───────────────────────────────
+
+        /// <summary>
+        /// How many tags to ask the caption model for: about twice what the post will carry when they are going
+        /// to be checked against Tumblr (so the ones nobody uses can be left out), otherwise 0 (the blog's setting).
+        /// </summary>
+        public int TagCandidates(OmniTumblrStrategy strategy)
+        {
+            if (tagResearch == null || !strategy.ResearchTags || !strategy.Ai.SuggestTags || strategy.Ai.MaxSuggestedTags <= 0 || !tagResearch.Enabled()) return 0;
+            return Math.Clamp(strategy.Ai.MaxSuggestedTags * 2 + 2, 8, 18);
+        }
+
+        /// <summary>
+        /// The caption model's tags a post should carry. With tag research on, each is looked up on Tumblr: the
+        /// ones other people's posts get notes under come first and the ones nobody else uses are left out.
+        /// Research never holds a post up: when it fails or runs long, the model's own first choices are used.
+        /// </summary>
+        public async Task<TagVetting> ChooseAiTagsAsync(OmniTumblrStrategy strategy, IReadOnlyList<string> aiTags, CancellationToken ct)
+        {
+            int keep = Math.Clamp(strategy.Ai.MaxSuggestedTags, 0, 15);
+            var asGiven = new TagVetting { Kept = aiTags.Take(keep).ToList() };
+            if (aiTags.Count == 0 || TagCandidates(strategy) == 0) return asGiven;
+            using var limit = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            limit.CancelAfter(TimeSpan.FromSeconds(75));
+            try
+            {
+                return await tagResearch!.VetAsync(aiTags, keep, limit.Token);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested)
+            {
+                throw;
+            }
+            catch (Exception)
+            {
+                return asGiven;
+            }
+        }
+
+        /// <summary>
+        /// A post's tags after a new caption: what it had, minus the tags an earlier caption added, plus the new
+        /// caption's. Returns the tags and the ones this caption added (which the next caption may take off again).
+        /// </summary>
+        internal static (List<string> Tags, List<string> Added) MergeAiTags(OmniTumblrStrategy strategy, IEnumerable<string> current,
+            IEnumerable<string> previouslyAdded, IEnumerable<string> suggested)
+        {
+            var keepAlways = new HashSet<string>((strategy.FixedTags ?? new()).Concat(strategy.RotatingTags ?? new()), StringComparer.OrdinalIgnoreCase);
+            var stale = new HashSet<string>(previouslyAdded, StringComparer.OrdinalIgnoreCase);
+            var own = current.Where(t => keepAlways.Contains(t) || !stale.Contains(t)).ToList();
+            var ownSet = new HashSet<string>(own, StringComparer.OrdinalIgnoreCase);
+            var tags = TumblrNpf.NormalizeTags(own.Concat(suggested), Math.Clamp(strategy.MaxTags, 1, TumblrNpf.MaxTags));
+            var added = tags.Where(t => !ownSet.Contains(t)).ToList();
+            return (tags, added);
         }
 
         // ─────────────────────────────── Planning ───────────────────────────────
@@ -293,7 +349,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 bool reuse = s.Blog(blogId)?.Strategy.MemeScraper.AllowReuseAcrossBlogs == true;
                 return s.Blogs.Values.Where(b => b.BlogId == blogId || !reuse)
                     .SelectMany(b => s.PostsOf(b.BlogId)
-                        .Where(p => p.PostId != exceptPostId && (p.IsPending || p.Status is PostStatus.Published or PostStatus.Removed))
+                        .Where(p => p.PostId != exceptPostId && !p.IsReblog && (p.IsPending || p.Status is PostStatus.Published or PostStatus.Removed))
                         .Select(p => (p.PostId, BlogName: b.Name, p.Status, p.ScheduledUtc, Origin: p.Content?.Origin,
                             Key: OmniTumblrFingerprints.KeyOf(p), Path: p.Media.FirstOrDefault()?.Path)))
                     .ToList();
@@ -322,7 +378,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             var fingerprints = this.fingerprints;
             if (fingerprints == null) return 0;
             var queue = store.Read(s => s.AllPosts()
-                .Where(p => p.Origin == PostOrigin.Autopilot && !p.ManualOverride && p.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval)
+                .Where(p => p.Origin == PostOrigin.Autopilot && !p.IsReblog && !p.ManualOverride && p.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval)
                 .OrderBy(p => p.ScheduledUtc).ThenBy(p => p.PostId, StringComparer.Ordinal)
                 .Select(p => (p.PostId, p.BlogId, p.ScheduledUtc, Key: OmniTumblrFingerprints.KeyOf(p), Path: p.Media.FirstOrDefault()?.Path))
                 .ToList());
@@ -508,7 +564,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             var snap = store.Read(s =>
             {
                 var post = s.FindPost(postId);
-                if (post == null || !(post.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval)) return null;
+                if (post == null || post.IsReblog || !(post.Status is PostStatus.Planned or PostStatus.Ready or PostStatus.AwaitingApproval)) return null;
                 var blog = s.Blog(post.BlogId);
                 if (blog == null || blog.Strategy.Source == ContentSourceKind.None) return null;
                 return new
@@ -539,6 +595,10 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 post.Media = fresh.Media;
                 post.Content = fresh.Content;
                 post.SourceUrl = fresh.SourceUrl;
+                // The old clip's tags describe the old clip (until Nov 2026 they stayed on the post).
+                post.Tags = post.Origin == PostOrigin.Autopilot
+                    ? fresh.Tags
+                    : MergeAiTags(blog.Strategy, post.Tags, post.CaptionInfo.SuggestedTags, Array.Empty<string>()).Tags;
                 post.Status = PostStatus.Planned;
                 post.CaptionPending = post.CaptionInfo.Mode != CaptionMode.None || blog.Strategy.CaptionMode != CaptionMode.None;
                 post.CaptionInfo = new CaptionInfo { Mode = post.Origin == PostOrigin.Autopilot ? blog.Strategy.CaptionMode : post.CaptionInfo.Mode };
@@ -652,6 +712,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             bool wantCaption = forceRegenerate || (post.CaptionPending && !post.CaptionInfo.Edited);
             string? caption = null;
             CaptionResult? ai = null;
+            TagVetting? aiTags = null;
             string? error = null;
             var mode = post.CaptionInfo.Mode;
             if (wantCaption)
@@ -698,8 +759,10 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                                 RecentCaptions = snap.Recent,
                                 Frames = frames,
                                 ExtraInstruction = extraInstruction ?? post.CaptionInfo.Direction,
+                                TagCandidates = TagCandidates(blog.Strategy),
                             }, ct);
                             caption = ai.Caption;
+                            aiTags = await ChooseAiTagsAsync(blog.Strategy, ai.Tags, ct);
                         }
                         catch (OperationCanceledException) when (ct.IsCancellationRequested)
                         {
@@ -744,10 +807,16 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                             live.CaptionInfo.Model = ai.Model;
                             live.CaptionInfo.UsedVision = ai.UsedVision;
                             live.CaptionInfo.AltText = ai.AltText;
-                            live.CaptionInfo.SuggestedTags = ai.Tags;
-                            // Fixed + rotating tags were chosen at planning time; AI suggestions fill the rest.
-                            if (ai.Tags.Count > 0)
-                                live.Tags = TumblrNpf.NormalizeTags(live.Tags.Concat(ai.Tags), Math.Clamp(liveBlog.Strategy.MaxTags, 1, TumblrNpf.MaxTags));
+                            // Fixed + rotating tags were chosen at planning time; the caption's tags fill the rest,
+                            // replacing the ones an earlier caption for this post added.
+                            var chosen = aiTags ?? new TagVetting { Kept = ai.Tags };
+                            (live.Tags, live.CaptionInfo.SuggestedTags) = MergeAiTags(liveBlog.Strategy, live.Tags, live.CaptionInfo.SuggestedTags, chosen.Kept);
+                            live.CaptionInfo.DroppedTags = chosen.Dropped;
+                            live.CaptionInfo.TagsResearched = chosen.Researched;
+                            if (chosen.Dropped.Count > 0)
+                                s.AddEvent(EventLevel.Info, "tags.dropped",
+                                    $"@{liveBlog.Name}: left out {chosen.Dropped.Count} suggested tag(s) nobody else on Tumblr uses ({string.Join(", ", chosen.Dropped.Take(6).Select(t => "#" + t))}).",
+                                    liveBlog.BlogId, postId, now);
                         }
                         if (mode == CaptionMode.Rotate) s.MarkBlog(liveBlog.BlogId);
                         changed = true;

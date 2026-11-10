@@ -108,6 +108,7 @@ namespace Omnipotent.Services.OmniBlox
                 StartupState = "running";
 
                 _ = Task.Run(() => Orchestrator.RunAsync(stop.Token));
+                _ = Task.Run(CheckCredentialsAsync);
                 _ = Task.Run(HarvesterLoopAsync);
                 _ = Task.Run(SettingsLoopAsync);
                 _ = Task.Run(() => WatchLoopAsync(new LiveWatch(ctx)));
@@ -212,7 +213,20 @@ namespace Omnipotent.Services.OmniBlox
                 try { await Task.Delay(TimeSpan.FromSeconds(60), stop.Token); }
                 catch (OperationCanceledException) { return; }
                 try { await RefreshSettingsAsync(); } catch { /* settings briefly unavailable */ }
+                await CheckCredentialsAsync();
             }
+        }
+
+        /// <summary>
+        /// Asks Roblox whose the API key and session are whenever either changed (a key or cookie pasted straight into
+        /// OmniSettings skips the dashboard's checks): see <see cref="CredentialCheck"/>.
+        /// </summary>
+        private async Task CheckCredentialsAsync()
+        {
+            if (Context is not { } ctx) return;
+            try { await ctx.Credentials.CheckAsync(ctx, stop.Token); }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+            catch (Exception ex) { await ServiceLogError(ex, "[OmniBlox] checking the Roblox key and session failed", false); }
         }
 
         private async Task HarvesterLoopAsync()

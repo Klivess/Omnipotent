@@ -64,6 +64,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
     /// note breakdowns at 1d/3d/7d/30d, and the activity feed). Jobs are staggered, budgeted and
     /// independent — one failing blog or endpoint never stalls the rest. While Tumblr's edge refuses this
     /// server (<see cref="TumblrEdgeGate"/>) the jobs wait, and the first one due is the gate's probe.
+    /// With <see cref="OmniTumblrTagResearch"/>, two more jobs per blog: its own fixed and rotating tags are
+    /// kept looked up, and once a day a recent post is searched for in one of its tags' listings.
     /// </summary>
     internal sealed class OmniTumblrAnalyticsSync
     {
@@ -75,6 +77,9 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private static readonly TimeSpan NotesEvery = TimeSpan.FromHours(2);
         private static readonly TimeSpan ActivityEvery = TimeSpan.FromMinutes(30);
         private static readonly TimeSpan HousekeepingEvery = TimeSpan.FromHours(24);
+        private static readonly TimeSpan TagsEvery = TimeSpan.FromHours(24);
+        private static readonly TimeSpan ListedEvery = TimeSpan.FromHours(20);
+        private static readonly TimeSpan ListedRetryEvery = TimeSpan.FromHours(3);
         private static readonly TimeSpan[] BreakdownMilestones = { TimeSpan.FromDays(1), TimeSpan.FromDays(3), TimeSpan.FromDays(7), TimeSpan.FromDays(30) };
 
         private readonly OmniTumblrStore store;
@@ -84,12 +89,14 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private readonly Func<DateTime> clock;
         private readonly Action<string> log;
         private readonly TumblrEdgeGate edgeGate;
+        private readonly OmniTumblrTagResearch? tagResearch;
         private readonly ConcurrentDictionary<string, string> lastErrors = new(StringComparer.Ordinal);
         private readonly SemaphoreSlim runLock = new(1, 1);
 
         public OmniTumblrAnalyticsSync(OmniTumblrStore store, ITumblrApi api, OmniTumblrAuth auth, OmniTumblrApiBudget budget, Func<DateTime> clock, Action<string> log,
-            TumblrEdgeGate? edgeGate = null)
+            TumblrEdgeGate? edgeGate = null, OmniTumblrTagResearch? tagResearch = null)
         {
+            this.tagResearch = tagResearch;
             this.store = store;
             this.api = api;
             this.auth = auth;
@@ -101,7 +108,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
 
         public IReadOnlyDictionary<string, string> LastErrors => lastErrors;
 
-        private enum JobKind { UserInfo, Limits, BlogInfo, Posts, Notes, Activity, Housekeeping }
+        private enum JobKind { UserInfo, Limits, BlogInfo, Posts, Notes, Activity, Housekeeping, Tags, Listed }
 
         private sealed record Job(string Key, JobKind Kind, string Target, int Priority);
 
@@ -145,6 +152,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (connectionId != null) await RunJobAsync(new Job("user:" + connectionId, JobKind.UserInfo, connectionId, 0), ct);
             foreach (var kind in new[] { JobKind.BlogInfo, JobKind.Posts, JobKind.Notes, JobKind.Activity })
                 await RunJobAsync(new Job(JobKey(kind, blogId), kind, blogId, 1), ct);
+            if (tagResearch != null) await RunJobAsync(new Job(JobKey(JobKind.Tags, blogId), JobKind.Tags, blogId, 1), ct);
         }
 
         /// <summary>Makes a blog's or connection's jobs due immediately (after adding a blog, reconnecting…).</summary>
@@ -160,6 +168,13 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             });
         }
 
+        /// <summary>Has the blog's own tags looked up on the next sync tick (its strategy changed).</summary>
+        public void ExpediteTags(string blogId)
+        {
+            if (tagResearch == null) return;
+            Reschedule(JobKey(JobKind.Tags, blogId), DateTime.MinValue);
+        }
+
         public DateTime? NextDueUtc() => store.Read(s => s.Engine.NextDueUtc.Count == 0 ? (DateTime?)null : s.Engine.NextDueUtc.Values.Min());
 
         private static string JobKey(JobKind kind, string target) => kind switch
@@ -170,6 +185,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             JobKind.Posts => "posts:" + target,
             JobKind.Notes => "notes:" + target,
             JobKind.Activity => "activity:" + target,
+            JobKind.Tags => "tags:" + target,
+            JobKind.Listed => "listed:" + target,
             _ => "housekeeping",
         };
 
@@ -204,6 +221,11 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 Consider(JobKind.BlogInfo, blog.BlogId, 3);
                 Consider(JobKind.Activity, blog.BlogId, 3);
                 Consider(JobKind.Notes, blog.BlogId, 4);
+                if (tagResearch != null)
+                {
+                    Consider(JobKind.Tags, blog.BlogId, 4);
+                    Consider(JobKind.Listed, blog.BlogId, 4);
+                }
             }
             if (!s.Engine.NextDueUtc.TryGetValue("housekeeping", out var hk)) { hk = now.AddMinutes(10); s.Engine.NextDueUtc["housekeeping"] = hk; s.MarkEngine(); }
             if (hk <= now) jobs.Add(new Job("housekeeping", JobKind.Housekeeping, "", 5));
@@ -240,6 +262,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     JobKind.Posts => await SyncPostsAsync(job.Target, ct),
                     JobKind.Notes => await SyncNotesAsync(job.Target, ct),
                     JobKind.Activity => await SyncActivityAsync(job.Target, ct),
+                    JobKind.Tags => await SyncTagsAsync(job.Target, ct),
+                    JobKind.Listed => await SyncListedAsync(job.Target, ct),
                     _ => await HousekeepingAsync(ct),
                 };
                 lastErrors.TryRemove(job.Key, out _);
@@ -347,6 +371,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 blog.Url = info.Url ?? blog.Url;
                 blog.Stats.Posts = info.Posts ?? blog.Stats.Posts;
                 blog.Stats.Likes = info.Likes ?? blog.Stats.Likes;
+                blog.Stats.AvatarUrl = info.AvatarUrl ?? blog.Stats.AvatarUrl;
+                blog.Stats.HeaderImageUrl = info.HeaderImageUrl ?? blog.Stats.HeaderImageUrl;
                 blog.Stats.InfoSyncedUtc = now;
                 if (followers.HasValue)
                 {
@@ -391,6 +417,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     byId.TryGetValue(summary.Id, out var p) ? p
                     : summary.Slug != null && bySlug.TryGetValue(summary.Slug, out var q) ? q : null;
 
+                foreach (var summary in collected)
+                    if (Match(summary)?.IsReblog == true) summary.IsReblog = true;
                 OmniTumblrInsights.MergeIndex(s.InsightsOf(blogId), collected, summary => Match(summary)?.PostId);
                 foreach (var summary in collected)
                 {
@@ -405,7 +433,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     }
                     post.TumblrIdProvisional = false;
                     if (!string.IsNullOrEmpty(summary.PostUrl)) post.TumblrUrl = summary.PostUrl;
-                    UpdateMetrics(post, summary.NoteCount, null, null, now);
+                    // Tumblr reports the original's notes on a reblog: they are not this blog's.
+                    if (!post.IsReblog) UpdateMetrics(post, summary.NoteCount, null, null, now);
                     s.Touch(post, now);
                 }
                 if (total.HasValue) blog.Stats.Posts = total;
@@ -451,7 +480,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (target == null) return NotesEvery;
             DateTime now = clock();
             var wanted = store.Read(s => s.PostsOf(blogId)
-                .Where(p => p.Status == PostStatus.Published && p.TumblrPostId != null && p.PublishedUtc.HasValue)
+                .Where(p => p.Status == PostStatus.Published && p.TumblrPostId != null && p.PublishedUtc.HasValue && !p.IsReblog)
                 .Where(p => NeedsBreakdown(p, now))
                 .OrderByDescending(p => p.PublishedUtc)
                 .Take(6)
@@ -541,12 +570,30 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             return ActivityEvery;
         }
 
+        /// <summary>Keeps the blog's own fixed and rotating tags looked up (only stale ones cost a call).</summary>
+        private async Task<TimeSpan> SyncTagsAsync(string blogId, CancellationToken ct)
+        {
+            if (tagResearch == null || !tagResearch.CanLookUp) return TimeSpan.FromHours(1);
+            var tags = store.Read(s => s.Blog(blogId) is OmniTumblrBlog b
+                ? (b.Strategy.FixedTags ?? new()).Concat(b.Strategy.RotatingTags ?? new()).Take(30).ToList()
+                : new List<string>());
+            if (tags.Count > 0) await tagResearch.ResearchAsync(tags, ct);
+            return TagsEvery;
+        }
+
+        /// <summary>Looks for a recent post in one of its tags' listings: is Tumblr still listing this blog?</summary>
+        private async Task<TimeSpan> SyncListedAsync(string blogId, CancellationToken ct)
+        {
+            if (tagResearch == null) return ListedEvery;
+            return await tagResearch.CheckListedAsync(blogId, ct) ? ListedEvery : ListedRetryEvery;
+        }
+
         private Task<TimeSpan> HousekeepingAsync(CancellationToken ct)
         {
             auth.ExpireFlows();
             DateTime now = clock();
             var referenced = store.Read(s => new HashSet<string>(
-                s.AllPosts().SelectMany(p => p.Media.SelectMany(m => new[] { m.Path, m.ThumbnailPath }))
+                s.AllPosts().SelectMany(p => p.Media.SelectMany(m => new[] { m.Path, m.ThumbnailPath }).Append(p.Reblog?.PreviewPath))
                     .Where(p => p != null).Select(p => Path.GetFullPath(p!)),
                 StringComparer.OrdinalIgnoreCase));
             int removed = 0;

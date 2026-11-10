@@ -59,6 +59,9 @@ namespace Omnipotent.Tests.OmniTumblr
         public Func<int, TumblrPostsPage>? OnGetPosts { get; set; }
         public Func<string, TumblrNotesSummary>? OnNotes { get; set; }
         public Func<long?, TumblrNotificationsPage>? OnNotifications { get; set; }
+        /// <summary>Tag (lower case) → every public post under it, as Tumblr's listing would hold them. A tag not here has no posts.</summary>
+        public Dictionary<string, List<TumblrPostSummary>> Tagged { get; } = new(StringComparer.OrdinalIgnoreCase);
+        public Func<string, long?, List<TumblrPostSummary>>? OnTagged { get; set; }
         public Dictionary<string, TumblrLimit> Limits { get; set; } = new();
         public Func<string, string, (string, string)> OnRequestToken { get; set; } = (key, secret) => ("req-token", "req-secret");
         public Func<string, (string, string)> OnAccessToken { get; set; } = verifier => ("access-token", "access-secret");
@@ -113,6 +116,16 @@ namespace Omnipotent.Tests.OmniTumblr
         {
             Calls.Enqueue("blog/notifications");
             return Task.FromResult(OnNotifications?.Invoke(before) ?? new TumblrNotificationsPage());
+        }
+
+        public Task<List<TumblrPostSummary>> GetTaggedAsync(TumblrCredentials creds, string tag, long? before, CancellationToken ct)
+        {
+            Calls.Enqueue($"tagged:{tag}{(before.HasValue ? ":before" : "")}");
+            if (OnTagged != null) return Task.FromResult(OnTagged(tag, before));
+            // Newest first, 20 a page, older than "before" — as the real listing pages.
+            var all = Tagged.TryGetValue(tag, out var posts) ? posts : new List<TumblrPostSummary>();
+            DateTime cutoff = before.HasValue ? DateTimeOffset.FromUnixTimeSeconds(before.Value).UtcDateTime : DateTime.MaxValue;
+            return Task.FromResult(all.Where(p => p.PublishedUtc < cutoff).OrderByDescending(p => p.PublishedUtc).Take(20).ToList());
         }
 
         public async Task<TumblrCreatedPost> CreatePostAsync(TumblrCredentials creds, string blog, NpfPostRequest request, CancellationToken ct)
@@ -237,6 +250,17 @@ namespace Omnipotent.Tests.OmniTumblr
         public OmniTumblrPublisher Publisher { get; }
         public OmniTumblrApiBudget Budget { get; }
         public OmniTumblrAnalyticsSync Sync { get; }
+        /// <summary>
+        /// Tag research over the fake listings in <see cref="FakeTumblrApi.Tagged"/>. Not wired into
+        /// <see cref="Planner"/> or <see cref="Sync"/>; <see cref="ResearchPlanner"/> and <see cref="ResearchSync"/> use it.
+        /// </summary>
+        public OmniTumblrTagResearch TagResearch { get; }
+        public OmniTumblrPlanner ResearchPlanner { get; }
+        public OmniTumblrAnalyticsSync ResearchSync { get; }
+        /// <summary>Curated reblogs over <see cref="FakeTumblrApi.Tagged"/>, screened by <see cref="Model"/>, with pictures from <see cref="Pictures"/>.</summary>
+        public OmniTumblrCurator Curator { get; }
+        /// <summary>Picture URL → bytes. A URL not here does not load.</summary>
+        public Dictionary<string, byte[]> Pictures { get; } = new(StringComparer.Ordinal);
         /// <summary>Shared by the publisher and sync, as in production. The fake API does not report to it; tests do, as the real client would.</summary>
         public TumblrEdgeGate Gate { get; }
         public List<string> RefilledFor { get; } = new();
@@ -260,6 +284,63 @@ namespace Omnipotent.Tests.OmniTumblr
             };
             Budget = new OmniTumblrApiBudget(Clock.Func);
             Sync = new OmniTumblrAnalyticsSync(Store, Api, Auth, Budget, Clock.Func, _ => { }, Gate);
+            TagResearch = new OmniTumblrTagResearch(Store, Api, Auth, Clock.Func, Budget, Gate);
+            ResearchPlanner = new OmniTumblrPlanner(Store, Content, Captioner, Media, Clock.Func, Fingerprints, TagResearch);
+            ResearchSync = new OmniTumblrAnalyticsSync(Store, Api, Auth, Budget, Clock.Func, _ => { }, Gate, TagResearch);
+            Curator = new OmniTumblrCurator(Store, Api, Auth, Model, Media, Clock.Func, Budget, Gate)
+            {
+                FetchPicture = (url, _) => Task.FromResult(Pictures.TryGetValue(url, out var bytes) ? bytes : null),
+            };
+        }
+
+        /// <summary>
+        /// Files someone else's original post under a tag, complete with what a reblog of it needs. With
+        /// <paramref name="picture"/> it has a small JPEG on Tumblr's media host that <see cref="Pictures"/> serves.
+        /// </summary>
+        public TumblrPostSummary AddCandidate(string tag, string id, string blog, long notes, double ageHours, string type = "photo", bool picture = true, string? text = null)
+        {
+            if (!Api.Tagged.TryGetValue(tag, out var list)) Api.Tagged[tag] = list = new List<TumblrPostSummary>();
+            var post = new TumblrPostSummary
+            {
+                Id = id,
+                BlogName = blog,
+                BlogUuid = "t:" + blog,
+                ReblogKey = "key-" + id,
+                PublishedUtc = Clock.Now.AddHours(-ageHours),
+                NoteCount = notes,
+                Type = type,
+                Tags = new List<string> { tag, "relatable" },
+                Summary = text ?? "when the wifi drops mid-download",
+                PostUrl = $"https://www.tumblr.com/{blog}/{id}",
+            };
+            if (picture && type != "text")
+            {
+                string url = $"https://64.media.tumblr.com/{id}/s640x960/picture.jpg";
+                post.Images.Add(new TumblrImage { Url = url, Type = "image/jpeg", Width = 640 });
+                Pictures[url] = new byte[] { 0xFF, 0xD8, 0xFF, 0xE0 }.Concat(RandomNumberGenerator.GetBytes(400)).ToArray();
+            }
+            list.Add(post);
+            return post;
+        }
+
+        /// <summary>
+        /// Files <paramref name="count"/> posts by other blogs under a tag, one every <paramref name="every"/>
+        /// back from <paramref name="newestAge"/> ago, each with <paramref name="notes"/> notes.
+        /// </summary>
+        public void SeedTag(string tag, int count, TimeSpan every, long notes, TimeSpan? newestAge = null, string type = "photo", params string[] alsoTagged)
+        {
+            if (!Api.Tagged.TryGetValue(tag, out var list)) Api.Tagged[tag] = list = new List<TumblrPostSummary>();
+            DateTime newest = Clock.Now - (newestAge ?? TimeSpan.FromMinutes(5));
+            for (int i = 0; i < count; i++)
+                list.Add(new TumblrPostSummary
+                {
+                    Id = $"{tag}-{list.Count}",
+                    BlogName = "someone" + (i % 7),
+                    PublishedUtc = newest - TimeSpan.FromTicks(every.Ticks * i),
+                    NoteCount = notes,
+                    Type = type,
+                    Tags = new[] { tag }.Concat(alsoTagged).ToList(),
+                });
         }
 
         /// <summary>What the real client does on a bare nginx 403: tell the gate, then throw.</summary>
