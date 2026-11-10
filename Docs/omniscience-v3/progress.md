@@ -109,11 +109,12 @@ Another live session commits and pushes on master from the main folder, so never
 
    **WS-A** has been done by the coordinating session since 2026-11-10, on Klives's instruction ("do WS-A by yourself"), in
    WS-A's own worktree and branch (its original session had produced no commits and is idle; do not wake it). Landed so far,
-   tested (199 v3 tests passing on that branch): the corpus writer every source goes through, the content-addressed media
-   store, five import formats (WhatsApp, Telegram, Instagram/Messenger, the Discord data package, CSV/JSON tables) with
-   preview and idempotent commit as kernel jobs, image probing (orientation, taken-time, perceptual hash, thumbnails), the
-   attachment downloader, and routes for imports and media. Not built yet: KliveBot live ingest, an upload route, OCR,
-   transcripts, captions, visual search and faces. Details, decisions and the full "not built" list: `ws-a.md` on that branch.
+   tested (208 v3 tests passing on that branch, tip `928b8e1`): the corpus writer every source goes through, the
+   content-addressed media store, five import formats (WhatsApp, Telegram, Instagram/Messenger, the Discord data package,
+   CSV/JSON tables) with preview and idempotent commit as kernel jobs, image probing (orientation, taken-time, perceptual
+   hash, thumbnails), the attachment downloader, OCR and transcripts filed as labels (tested with stand-in engines; the real
+   Tesseract, ffmpeg and Whisper paths have not run), and routes for imports and media. Not built yet: KliveBot live ingest,
+   an upload route, captions, visual search and faces. Details, decisions and the full "not built" list: `ws-a.md` on that branch.
    **A decision there narrows the plan:** the Discord user-token gateway is not built in v3 (official bot gateway and
    Discord's data package only); it is Klives's call to reopen.
 
