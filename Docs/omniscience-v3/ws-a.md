@@ -164,10 +164,10 @@ end against `FakeFeed` and `FakeDiscord` in `DiscordFixtures.cs`). Whole v3 suit
 | Private archived threads | not listed (needs Manage Threads); public archived threads and forum posts are. |
 | Upload of a folder or multipart form | not built: `imports/upload` takes one file as the raw body. |
 | OCR and transcripts (N3) | **built, tested with stand-in engines only.** The real paths — Tesseract with language data from ModelHub, ffmpeg cutting, Whisper through KliveLLM's AIRouter audio client — compile but have never run: no test downloads language data or calls the speech service. First real run is part of the shadow run. |
-| Captions (N2) → `labels` task `caption` | not started |
+| Captions (N2) → `labels` task `caption` | not started. **Blocked on the LLM gateway:** v3's `ILlmClient` / `LlmRequest` carry no images. KliveLLM does take them, through its tool-session calls (how OmniTumblr's captioner works), so captions need either image input added to the v3 gateway (a frozen-contract change, made on the coordinator branch so the audit trail and the background class cover it) or a vision seam of WS-A's own that still writes `llm_calls`. Decide that first. |
 | Prioritised backlog order (tracked people first, plan R2) for OCR/transcripts | not built: the sweep goes in attachment-id order |
-| Visual search (N2): local image embeddings, search route, image pivot X24 | not started |
-| Faces (N1): detection, embedding, clustering, conversation-grounded labels, propagation, face pivot X25 | not started |
+| Visual search (N2): local image embeddings, search route, image pivot X24 | not started. The plan wants the model "chosen by measurement and licence"; that needs candidate model files on this machine. None has been downloaded: fetching them here waits for Klives's go-ahead. |
+| Faces (N1): detection, embedding, clustering, conversation-grounded labels, propagation, face pivot X25 | not started. The Phase 1 spike that was to pick the face stack (OpenCvSharp's detectors vs YuNet/SFace on ONNX Runtime) left no recorded result, so that choice is open too, and it also needs model files here. Guardrails as recorded: local only, never an external lookup, no labels for minors, meme and celebrity faces not treated as people Klives knows. |
 | Explore datasets for media/imports (D4 manifest declarations) | not started |
 | ffprobe for video/audio duration and dimensions | not started |
 | Traceability | F359, F360, F394, F404–F406, F460–F471 fixed; F403, F422 in progress; OCR rows (F334, F335, F407, F472–F476) and the Discord rows (see traceability.md) are marked built-not-run until the real engines and the real service have been exercised; user-gateway and vault rows are not applicable (no user-token gateway) |
