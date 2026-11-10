@@ -356,9 +356,14 @@ namespace Omnipotent.Services.KliveAPI
                     }
                     if (req.HttpMethod == "OPTIONS")
                     {
-                        resp.Headers.Set("Access-Control-Allow-Headers", "*");
+                        // Name the headers rather than answering "*". A wildcard never covers
+                        // Authorization, so a browser cannot reuse a cached preflight for any request
+                        // that carries it, and every request from the website does: each one was
+                        // costing two round trips (preflights were 44% of all requests served).
+                        resp.Headers.Set("Access-Control-Allow-Headers", PreflightAllowedHeaders(req.Headers["Access-Control-Request-Headers"]));
                         resp.Headers.Set("Access-Control-Allow-Methods", "*");
                         resp.Headers.Set("Access-Control-Max-Age", "1728000");
+                        resp.Headers.Set("Vary", "Access-Control-Request-Headers");
                     }
                     resp.Headers.Set("Access-Control-Allow-Origin", "*");
                     resp.Headers.Set("Access-Control-Expose-Headers", "*");
@@ -725,8 +730,33 @@ namespace Omnipotent.Services.KliveAPI
         public ConcurrentDictionary<string, RouteInfo> AdditionalMethodRoutes;
         public ConcurrentDictionary<string, WebSocketRouteInfo> WebSocketRouteLookup;
 
+        /// <summary>Headers the website sends, for a preflight that does not say which it wants.</summary>
+        internal const string DefaultPreflightHeaders = "Authorization, Content-Type, X-Klive-Client, X-Klive-Page, Cache-Control, If-None-Match, Range";
+
+        /// <summary>
+        /// The Access-Control-Allow-Headers value for a preflight: the header names the browser asked
+        /// for, echoed back. Anything that is not a plain list of header names falls back to the
+        /// headers the website is known to send.
+        /// </summary>
+        public static string PreflightAllowedHeaders(string? requested)
+        {
+            if (string.IsNullOrWhiteSpace(requested) || requested.Length > 1024) return DefaultPreflightHeaders;
+            var names = new List<string>();
+            foreach (string part in requested.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                // RFC 9110 token characters only: nothing here can break out of the header.
+                if (part.Length > 64 || !part.All(c => char.IsAsciiLetterOrDigit(c) || c is '-' or '_' or '.')) return DefaultPreflightHeaders;
+                names.Add(part);
+            }
+            return names.Count == 0 ? DefaultPreflightHeaders : string.Join(", ", names);
+        }
+
         private KMProfileManager profileManager;
         private KliveApiStatisticsStore? apiStatistics;
+        /// <summary>Requests recorded since statistics began (the lifetime total /KliveAPI/Statistics reports).</summary>
+        public long TotalRequestsRecorded => apiStatistics?.TotalRequests ?? 0;
+        /// <summary>Requests answered with a 5xx since statistics began.</summary>
+        public long ServerErrorsRecorded => apiStatistics?.ServerErrorRequests ?? 0;
 
         // ── Request telemetry (per-stage tracing, histograms, materialized views) ──
         private readonly TelemetryOptions telemetryOptions = new();
@@ -917,9 +947,11 @@ namespace Omnipotent.Services.KliveAPI
             // Guest (not Anybody) so a stale-cookie call fails once at pipeline
             // level (smart-tarpit fast-fail) instead of N per-item 401s.
             await CreateBufferedRoute("/batch", HandleBatchRequest, HttpMethod.Post, Perms.SignedIn, 64 * 1024);
+            // ?days=N limits dailyHistory to the most recent N days (the store keeps every day it has seen).
             await CreateRoute("/KliveAPI/Statistics", async (req) =>
             {
-                await req.ReturnResponse(JsonConvert.SerializeObject(apiStatistics?.GetSummary() ?? new
+                int? historyDays = int.TryParse(req.userParameters["days"], out int parsedDays) && parsedDays > 0 ? parsedDays : null;
+                await req.ReturnResponse(JsonConvert.SerializeObject(apiStatistics?.GetSummary(historyDays) ?? new
                 {
                     lifetime = new
                     {
@@ -1355,21 +1387,36 @@ namespace Omnipotent.Services.KliveAPI
         }
 
         /// <summary>
-        /// Emits a health snapshot once a minute from a DEDICATED OS thread (never the
-        /// thread pool), so it keeps logging even when the pool is fully starved — the
+        /// Takes a health snapshot once a minute from a DEDICATED OS thread (never the
+        /// thread pool), so it keeps working even when the pool is fully starved — the
         /// prime suspect for "API stops responding after a while". The trajectory of
         /// inFlight / worker-threads-available / heapMB across the minutes leading up to
         /// the failure is what pins the cause. Guarded so a graceful restart reuses the
         /// single long-lived thread instead of spawning duplicates.
+        ///
+        /// The snapshot is logged every minute only while something looks strained, and every
+        /// quarter of an hour otherwise. Logged unconditionally it was 1,440 lines a day in a log
+        /// that keeps 4,000: on a quiet day most of the buffer was heartbeats, and the errors
+        /// people open the log for had been pushed out after about twelve hours.
         /// </summary>
         private void StartHealthHeartbeat()
         {
             if (_healthHeartbeatThread is { IsAlive: true }) return;
             _healthHeartbeatThread = new Thread(() =>
             {
+                DateTime lastLoggedUtc = DateTime.MinValue;
                 while (ContinueListenLoop)
                 {
-                    try { _ = ServiceLog($"[watchdog-diag heartbeat] {CaptureRuntimeHealth()}"); }
+                    try
+                    {
+                        ThreadPool.GetAvailableThreads(out int workersAvailable, out _);
+                        if (HeartbeatWorthLogging(Volatile.Read(ref _inFlightRequests), ThreadPool.PendingWorkItemCount,
+                                workersAvailable, DateTime.UtcNow - lastLoggedUtc))
+                        {
+                            lastLoggedUtc = DateTime.UtcNow;
+                            _ = ServiceLog($"[watchdog-diag heartbeat] {CaptureRuntimeHealth()}");
+                        }
+                    }
                     catch { }
                     try { Thread.Sleep(60000); }
                     catch (ThreadInterruptedException) { return; }
@@ -1378,6 +1425,15 @@ namespace Omnipotent.Services.KliveAPI
             { IsBackground = true, Name = "KliveAPI_HealthHeartbeat" };
             _healthHeartbeatThread.Start();
         }
+
+        internal static readonly TimeSpan QuietHeartbeatEvery = TimeSpan.FromMinutes(15);
+
+        /// <summary>
+        /// Whether this minute's heartbeat belongs in the log: always when requests are piling up or
+        /// the pool is running out of threads, otherwise only once the quiet interval has passed.
+        /// </summary>
+        internal static bool HeartbeatWorthLogging(int inFlight, long pendingWork, int workersAvailable, TimeSpan sinceLastLogged)
+            => sinceLastLogged >= QuietHeartbeatEvery || inFlight >= 25 || pendingWork >= 200 || workersAvailable < 8;
 
         /// <summary>
         /// Cheap, lock-free snapshot of process/runtime health formatted for a single log
@@ -1425,6 +1481,8 @@ namespace Omnipotent.Services.KliveAPI
             ServiceLog("Stopping KliveAPI listener, as service is quitting.");
             ContinueListenLoop = false;
             StopTelemetry();
+            // The statistics file is only written every so often: save what the interval is still holding.
+            try { _ = apiStatistics?.FlushAsync(); } catch { }
             // Close() (not just Stop()) so http.sys fully releases the URL group. A bare Stop()
             // can leave the "https://+:443/" registration lingering, which then makes the next
             // start (e.g. a crash-restart of this Critical service) fail with

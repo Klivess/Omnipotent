@@ -67,6 +67,16 @@ namespace Omnipotent.Services.OmniDefence
         public IpThreatTracker Tracker => tracker;
         internal string? OverviewJson => overviewSnapshot?.CurrentJson;
         internal long OverviewBuildMs => overviewSnapshot?.LastBuildMs ?? 0;
+        /// <summary>The overview builder names each step as it starts it, so a stalled build can say where it is.</summary>
+        internal void OverviewStep(string step) => overviewSnapshot?.ReportStep(step);
+        /// <summary>How the overview build is going. Answers whether or not an overview exists.</summary>
+        internal object OverviewStatus() => new
+        {
+            overview = overviewSnapshot?.Status(),
+            auditQueue = store?.PendingAuditRows ?? 0,
+            auditRowsDropped = store?.DroppedAuditRows ?? 0,
+            readPoolTimeouts = store?.ReadPoolTimeouts ?? 0,
+        };
         internal OmniDefenceReadSnapshotCache ReadSnapshots => readSnapshots
             ?? throw new InvalidOperationException("OmniDefence read snapshots are not running.");
         public OmniDefenceScanner Scanner => scanner;

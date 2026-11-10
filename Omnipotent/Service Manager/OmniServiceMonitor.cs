@@ -34,6 +34,13 @@ namespace Omnipotent.Service_Manager
         {
             public DateTime StartTime { get; set; }
             public DateTime LastKnownUpTime { get; set; }
+            /// <summary>
+            /// The commit the process ran (short hash). A start on a different commit from the one before
+            /// was a deploy; the same commit means a crash or a manual restart. Absent on periods recorded
+            /// before this was kept.
+            /// </summary>
+            [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+            public string? Commit { get; set; }
             [JsonIgnore]
             public TimeSpan Duration => LastKnownUpTime - StartTime;
         }
@@ -176,7 +183,8 @@ namespace Omnipotent.Service_Manager
             currentUptimePeriod = new UptimePeriod
             {
                 StartTime = DateTime.UtcNow,
-                LastKnownUpTime = DateTime.UtcNow
+                LastKnownUpTime = DateTime.UtcNow,
+                Commit = string.IsNullOrEmpty(BuildIdentity.Current.CommitShort) ? null : BuildIdentity.Current.CommitShort
             };
             uptimeStatistics.Periods.Add(currentUptimePeriod);
         }
@@ -207,34 +215,84 @@ namespace Omnipotent.Service_Manager
             await SetupTerminalApiRoutesAsync();
         }
 
+        // ?days=N returns only the periods overlapping the last N days; ?periods=0 leaves the list out
+        // for callers that only show the totals. Both exist because the full history grows with every
+        // restart and this route is polled.
         private async Task HandleUptimeStatisticsRequest(UserRequest req)
         {
-            var stats = CalculateUptimeStatistics();
-            string json = JsonConvert.SerializeObject(stats, Formatting.Indented);
-            await req.ReturnResponse(json, code: HttpStatusCode.OK);
+            Omnipotent.Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("uptime");
+            int? days = int.TryParse(req.userParameters["days"], out int parsedDays) && parsedDays > 0 ? Math.Min(parsedDays, 3650) : null;
+            bool includePeriods = req.userParameters["periods"] != "0";
+            var report = BuildUptimeReport(uptimeStatistics.Periods, DateTime.UtcNow, days, includePeriods);
+            await req.ReturnResponse(JsonConvert.SerializeObject(report), code: HttpStatusCode.OK);
         }
 
-        private object CalculateUptimeStatistics()
+        public sealed class UptimeReport
         {
-            // Calculate total possible time since the very first recorded start time
-            TimeSpan totalOutage = TimeSpan.Zero;
-            if (uptimeStatistics.Periods.Count > 0)
+            public double TotalUptimeSeconds;
+            public double AverageUptimeHours;
+            public double CurrentUptimeSeconds;
+            public double TotalOutageSeconds;
+            public int TotalPeriods;
+            public DateTime AsOfUtc;
+            /// <summary>The window Periods was limited to, or null for the whole history.</summary>
+            public int? WindowDays;
+            [JsonProperty(NullValueHandling = NullValueHandling.Ignore)]
+            public List<UptimePeriod>? Periods;
+        }
+
+        /// <summary>
+        /// Totals over the whole recorded history, plus the periods asked for. The last period belongs to
+        /// the process answering, so it runs to <paramref name="nowUtc"/>: its stored end is only refreshed
+        /// once a minute, which would otherwise read as up to a minute of outage that never happened.
+        /// </summary>
+        public static UptimeReport BuildUptimeReport(IReadOnlyList<UptimePeriod> recorded, DateTime nowUtc, int? days, bool includePeriods)
+        {
+            var periods = new List<UptimePeriod>(recorded.Count);
+            for (int i = 0; i < recorded.Count; i++)
             {
-                DateTime firstStart = uptimeStatistics.Periods.First().StartTime;
-                TimeSpan totalTimeSinceFirstStart = DateTime.UtcNow - firstStart;
-                totalOutage = totalTimeSinceFirstStart - uptimeStatistics.TotalUptime;
-                if (totalOutage.TotalSeconds < 0) totalOutage = TimeSpan.Zero;
+                UptimePeriod period = recorded[i];
+                bool current = i == recorded.Count - 1;
+                periods.Add(new UptimePeriod
+                {
+                    StartTime = period.StartTime,
+                    LastKnownUpTime = current && nowUtc > period.StartTime ? nowUtc : period.LastKnownUpTime,
+                    Commit = period.Commit,
+                });
             }
 
-            return new
+            double totalUptime = periods.Sum(period => Math.Max(0, period.Duration.TotalSeconds));
+            double totalOutage = 0;
+            if (periods.Count > 0)
             {
-                TotalUptimeSeconds = uptimeStatistics.TotalUptime.TotalSeconds,
-                AverageUptimeHours = uptimeStatistics.AverageUptimeHours,
-                CurrentUptimeSeconds = uptimeStatistics.CurrentUptime.TotalSeconds,
-                TotalOutageSeconds = totalOutage.TotalSeconds,
-                TotalPeriods = uptimeStatistics.Periods.Count,
-                Periods = uptimeStatistics.Periods
+                // Everything since the first recorded start that was not uptime.
+                totalOutage = Math.Max(0, (nowUtc - periods[0].StartTime).TotalSeconds - totalUptime);
+            }
+
+            var report = new UptimeReport
+            {
+                TotalUptimeSeconds = totalUptime,
+                AverageUptimeHours = periods.Count > 0 ? totalUptime / 3600 / periods.Count : 0,
+                CurrentUptimeSeconds = periods.Count > 0 ? Math.Max(0, periods[^1].Duration.TotalSeconds) : 0,
+                TotalOutageSeconds = totalOutage,
+                TotalPeriods = periods.Count,
+                AsOfUtc = nowUtc,
+                WindowDays = days,
             };
+
+            if (includePeriods)
+            {
+                if (days is int windowDays)
+                {
+                    DateTime windowStart = nowUtc.AddDays(-windowDays);
+                    report.Periods = periods.Where(period => period.LastKnownUpTime >= windowStart).ToList();
+                }
+                else
+                {
+                    report.Periods = periods;
+                }
+            }
+            return report;
         }
 
         private async void UpdateCPUandRAMCounters()

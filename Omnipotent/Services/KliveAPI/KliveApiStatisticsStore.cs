@@ -7,16 +7,29 @@ namespace Omnipotent.Services.KliveAPI
     {
         private readonly object _lifetimeLock = new();
         private readonly string persistencePath;
+        private readonly TimeSpan saveInterval;
+        private readonly SemaphoreSlim writeGate = new(1, 1);
         private int saveScheduled;
         private int saveDirty;
+        private int persistCount;
 
         private readonly ConcurrentDictionary<string, ApiDailyBucket> _days = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, ApiRouteBucket> _routes = new(StringComparer.OrdinalIgnoreCase);
 
-        public KliveApiStatisticsStore(string persistencePath)
+        // Every save rewrites the whole file: every day and every route ever seen. The delay between
+        // saves used to be 750 ms, and since something is always polling the API that meant a full
+        // re-serialise and disk write more than once a second for as long as the process lived.
+        // These are counters, so losing the last half minute to a hard kill costs nothing that matters.
+        public static readonly TimeSpan DefaultSaveInterval = TimeSpan.FromSeconds(30);
+
+        public KliveApiStatisticsStore(string persistencePath, TimeSpan? saveInterval = null)
         {
             this.persistencePath = persistencePath;
+            this.saveInterval = saveInterval ?? DefaultSaveInterval;
         }
+
+        /// <summary>How many times the file has been written by this instance.</summary>
+        public int PersistCount => Volatile.Read(ref persistCount);
 
         public long TotalRequests { get; private set; }
         public long SuccessfulRequests { get; private set; }
@@ -202,7 +215,7 @@ namespace Omnipotent.Services.KliveAPI
             {
                 while (true)
                 {
-                    await Task.Delay(750);
+                    await Task.Delay(saveInterval);
                     Interlocked.Exchange(ref saveDirty, 0);
                     await PersistAsync();
                     if (Volatile.Read(ref saveDirty) == 0) break;
@@ -218,8 +231,20 @@ namespace Omnipotent.Services.KliveAPI
             }
         }
 
+        /// <summary>
+        /// Writes the counters as they stand, now, after any write already under way. For an orderly stop,
+        /// where waiting out the interval would lose what it is holding.
+        /// </summary>
+        public async Task FlushAsync()
+        {
+            Interlocked.Exchange(ref saveDirty, 0);
+            await PersistAsync();
+        }
+
         private async Task PersistAsync()
         {
+            // One writer at a time: the scheduled save and a flush share the same temp file.
+            await writeGate.WaitAsync();
             try
             {
                 string? directory = Path.GetDirectoryName(persistencePath);
@@ -247,8 +272,9 @@ namespace Omnipotent.Services.KliveAPI
                 };
 
                 string tempPath = persistencePath + ".tmp";
-                string json = JsonConvert.SerializeObject(snapshot, Formatting.Indented);
+                string json = JsonConvert.SerializeObject(snapshot, Formatting.None);
                 await File.WriteAllTextAsync(tempPath, json);
+                Interlocked.Increment(ref persistCount);
 
                 if (File.Exists(persistencePath))
                 {
@@ -262,13 +288,23 @@ namespace Omnipotent.Services.KliveAPI
             catch
             {
             }
+            finally
+            {
+                writeGate.Release();
+            }
         }
 
-        public object GetSummary()
+        /// <param name="days">Limits dailyHistory to the most recent N recorded days; null returns every day.</param>
+        public object GetSummary(int? days = null)
         {
             double avgResponseMs = TotalRequests > 0 ? TotalResponseTimeMs / TotalRequests : 0;
-            var dailyHistory = _days.Values
-                .OrderBy(day => day.Date)
+            IEnumerable<ApiDailyBucket> orderedDays = _days.Values.OrderBy(day => day.Date);
+            int recordedDays = _days.Count;
+            if (days is int limit && limit > 0 && recordedDays > limit)
+            {
+                orderedDays = orderedDays.Skip(recordedDays - limit);
+            }
+            var dailyHistory = orderedDays
                 .Select(day => new
                 {
                     date = day.Date,
@@ -337,7 +373,8 @@ namespace Omnipotent.Services.KliveAPI
                 {
                     firstDay = dailyHistory.FirstOrDefault()?.date,
                     lastDay = dailyHistory.LastOrDefault()?.date,
-                    totalDays = dailyHistory.Count
+                    totalDays = dailyHistory.Count,
+                    recordedDays
                 },
                 dailyHistory,
                 topRoutes,

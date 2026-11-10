@@ -26,6 +26,26 @@ namespace Omnipotent.Services.OmniUpdater
         private string stateFilePath = string.Empty;
         private string lastSeenSha = string.Empty;
         private string? lastEtag;
+        private string? lastFetchError;
+        private DateTime? lastNewCommitUtc;
+
+        /// <summary>What the updater last saw on GitHub. Replaced whole after every poll.</summary>
+        public sealed class UpdaterStatus
+        {
+            public string Branch = string.Empty;
+            public string LastSeenSha = string.Empty;
+            public DateTime? LastCheckUtc;
+            public bool LastCheckOk;
+            public string? LastError;
+            public int PollIntervalSeconds;
+            /// <summary>False off the server: a new commit is announced but nothing is deployed.</summary>
+            public bool AutoDeploy;
+            /// <summary>When this process last saw the branch move (it deploys straight after).</summary>
+            public DateTime? LastNewCommitUtc;
+        }
+
+        /// <summary>Null until the first poll of this process has finished.</summary>
+        public static UpdaterStatus? LatestStatus { get; private set; }
 
         private static readonly HttpClient httpClient = CreateHttpClient();
 
@@ -71,14 +91,27 @@ namespace Omnipotent.Services.OmniUpdater
                 {
                     try
                     {
+                        lastFetchError = null;
                         await CheckForUpdate();
                     }
                     catch (Exception ex)
                     {
+                        lastFetchError = ex.Message;
                         await ServiceLogError(ex, "OmniUpdater poll iteration failed");
                     }
 
                     TimeSpan pollInterval = await GetPollInterval();
+                    LatestStatus = new UpdaterStatus
+                    {
+                        Branch = Branch,
+                        LastSeenSha = lastSeenSha,
+                        LastCheckUtc = DateTime.UtcNow,
+                        LastCheckOk = lastFetchError == null,
+                        LastError = lastFetchError,
+                        PollIntervalSeconds = (int)pollInterval.TotalSeconds,
+                        AutoDeploy = OmniPaths.CheckIfOnServer(),
+                        LastNewCommitUtc = lastNewCommitUtc,
+                    };
                     try { await Task.Delay(pollInterval, cancellationToken.Token); }
                     catch (OperationCanceledException) { break; }
                 }
@@ -129,6 +162,7 @@ namespace Omnipotent.Services.OmniUpdater
 
             // Persist the new SHA before triggering an update so a restart loop can't re-trigger.
             lastSeenSha = newSha;
+            lastNewCommitUtc = DateTime.UtcNow;
             await SaveState();
 
             await NotifyKlives(shortSha, commitMessage, commitAuthor, commitUrl);
@@ -188,6 +222,7 @@ namespace Omnipotent.Services.OmniUpdater
             if (!response.IsSuccessStatusCode)
             {
                 string body = await response.Content.ReadAsStringAsync();
+                lastFetchError = $"GitHub answered {(int)response.StatusCode} {response.ReasonPhrase}";
                 await ServiceLogError($"GitHub commits API returned {(int)response.StatusCode} {response.ReasonPhrase}: {body}");
                 return null;
             }

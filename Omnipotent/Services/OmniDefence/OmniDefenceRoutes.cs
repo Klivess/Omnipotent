@@ -38,6 +38,14 @@ namespace Omnipotent.Services.OmniDefence
                 await req.ReturnResponse(json, "application/json");
             }, HttpMethod.Get, OmniDefencePerms.OverviewView);
 
+            // How the overview build is going. Answers even when the overview itself cannot: whether a
+            // build is running, for how long, in which step, and how old the overview being served is.
+            await parent.CreateAPIRoute("/omnidefence/overview/status", async req =>
+            {
+                CacheDeps.MarkUncacheable("OmniDefence overview build status");
+                await req.ReturnResponse(JsonConvert.SerializeObject(parent.OverviewStatus()), "application/json");
+            }, HttpMethod.Get, OmniDefencePerms.OverviewView);
+
             // Requests filtered query
             await parent.CreateAPIRoute("/omnidefence/requests", async req =>
             {
@@ -466,24 +474,44 @@ namespace Omnipotent.Services.OmniDefence
             long day = now - 86400;
             long week = now - 86400 * 7;
 
+            // One step at a time, each named and timed. The timings go out in the overview's health
+            // block and the name of the running step in /omnidefence/overview/status, so the next slow
+            // build shows which step it is instead of an overview that never arrives. The in-memory
+            // work is timed as well as the queries: the slow one has been guessed wrong before.
+            var stepMs = new Dictionary<string, long>();
+            async Task<T> Step<T>(string name, Func<Task<T>> run)
+            {
+                parent.OverviewStep(name);
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
+                try { return await run(); }
+                finally { stepMs[name] = (long)System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds; }
+            }
+            T StepNow<T>(string name, Func<T> run)
+            {
+                parent.OverviewStep(name);
+                long started = System.Diagnostics.Stopwatch.GetTimestamp();
+                try { return run(); }
+                finally { stepMs[name] = (long)System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds; }
+            }
+
             // Windowed counts come from the utc_ts index (the last 7 days only); all-time totals are
             // carried forward by the store. One aggregate over the whole table took ~17 s per
             // refresh in production and ran more than half of every minute.
-            var requestCountsTask = parent.Store.QueryAsync(@"
+            var requestCountRows = await Step("requests in the last 7 days", () => parent.Store.QueryAsync(@"
                 SELECT COUNT(*) AS requests7d,
                     COALESCE(SUM(CASE WHEN utc_ts >= $day THEN 1 ELSE 0 END), 0) AS requests24h,
                     COALESCE(SUM(CASE WHEN utc_ts >= $day AND (deny_reason IS NOT NULL OR status_code >= 400) THEN 1 ELSE 0 END), 0) AS denied24h
-                FROM requests WHERE utc_ts >= $week", new() { ["$day"] = day, ["$week"] = week });
-            var totalsTask = parent.Store.ReadAuditTotalsAsync();
-            var authCountsTask = parent.Store.QueryAsync(@"
+                FROM requests WHERE utc_ts >= $week", new() { ["$day"] = day, ["$week"] = week }));
+            var totals = await Step("all-time request totals", () => parent.Store.ReadAuditTotalsAsync());
+            var authCountRows = await Step("auth events", () => parent.Store.QueryAsync(@"
                 SELECT COUNT(*) AS totalAuthEvents,
                     COALESCE(SUM(CASE WHEN utc_ts >= $day AND type IN
                         ('UnauthRoute','InsufficientClearance','InvalidPassword','WebsiteNoProfile','WebsiteInvalidProfile')
                         THEN 1 ELSE 0 END), 0) AS unauth24h
-                FROM auth_events", new() { ["$day"] = day });
+                FROM auth_events", new() { ["$day"] = day }));
 
             // Enumerate the concurrent tracker once instead of repeatedly sorting it.
-            var ips = parent.Tracker.All().ToArray();
+            var ips = StepNow("IP records", () => parent.Tracker.All().ToArray());
             int blocked = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Blocked));
             int watched = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Watch));
             int honey = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Honeypot));
@@ -501,25 +529,26 @@ namespace Omnipotent.Services.OmniDefence
                 unauth = r.UnauthAttempts, country = r.Country, asn = r.Asn, attacker = true
             }).FirstOrDefault();
 
-            var topRoutesTask = parent.Store.QueryAsync(
+            var topRoutes = await Step("busiest routes today", () => parent.Store.QueryAsync(
                 "SELECT route, COUNT(*) AS hits FROM requests WHERE utc_ts >= $t GROUP BY route ORDER BY hits DESC LIMIT 10",
-                new() { ["$t"] = day });
-            var originBreakdownTask = parent.Store.QueryAsync(
+                new() { ["$t"] = day }));
+            var originBreakdown = await Step("request origins today", () => parent.Store.QueryAsync(
                 $"SELECT origin, COUNT(*) AS hits FROM (SELECT {DerivedRequestOriginSql} AS origin FROM requests WHERE utc_ts >= $t) GROUP BY origin ORDER BY hits DESC",
-                new() { ["$t"] = day });
-            await Task.WhenAll(requestCountsTask, totalsTask, authCountsTask, topRoutesTask, originBreakdownTask);
-            var requestCounts = requestCountsTask.Result[0];
-            var authCounts = authCountsTask.Result[0];
+                new() { ["$t"] = day }));
+            var classBreakdown = StepNow("class breakdown", () => ClassBreakdown(parent));
+            var tagBreakdown = StepNow("tag breakdown", () => TagBreakdown(parent));
+            var review = StepNow("review lists", () => JToken.FromObject(OmniDefenceReview.Build(ips, now), CamelCase));
+            parent.OverviewStep("writing the overview");
+            var requestCounts = requestCountRows[0];
+            var authCounts = authCountRows[0];
             long Count(Dictionary<string, object?> row, string key) => Convert.ToInt64(row[key] ?? 0);
             long reqs24h = Count(requestCounts, "requests24h");
-            long totalRequests = totalsTask.Result.Requests;
+            long totalRequests = totals.Requests;
             long reqs7d = Count(requestCounts, "requests7d");
             long denied24h = Count(requestCounts, "denied24h");
-            long totalDenied = totalsTask.Result.Denied;
+            long totalDenied = totals.Denied;
             long unauth24h = Count(authCounts, "unauth24h");
             long totalAuthEvents = Count(authCounts, "totalAuthEvents");
-            var topRoutes = topRoutesTask.Result;
-            var originBreakdown = originBreakdownTask.Result;
 
             var resp = new
             {
@@ -542,13 +571,16 @@ namespace Omnipotent.Services.OmniDefence
                 topAttackers,
                 topRoutes,
                 originBreakdown,
-                classBreakdown = ClassBreakdown(parent),
-                tagBreakdown = TagBreakdown(parent),
-                review = JToken.FromObject(OmniDefenceReview.Build(ips, now), CamelCase),
+                classBreakdown,
+                tagBreakdown,
+                review,
                 // Engine health, so the next stall shows on the page instead of in a log dig.
                 health = new
                 {
                     overviewBuildMs = parent.OverviewBuildMs,
+                    // This build's time per step, in milliseconds. Writing the overview out is the
+                    // one step not in here: the status route's lastBuildMs less this total.
+                    buildSteps = stepMs,
                     auditQueue = parent.Store.PendingAuditRows,
                     auditRowsDropped = parent.Store.DroppedAuditRows,
                     readPoolTimeouts = parent.Store.ReadPoolTimeouts,
