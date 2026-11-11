@@ -25,6 +25,12 @@ namespace Omnipotent.Services.KliveMail
         private readonly SemaphoreSlim statsRefreshRequested = new(0, 1);
         private MailSummarySnapshot? currentSummary;
         private readonly string? statsSnapshotPathOverride;
+        private DateTime lastSmtpAlertUtc = DateTime.MinValue;
+
+        /// <summary>Every change queues a refresh; this is only how long an idle summary may sit.</summary>
+        private static readonly TimeSpan IdleRefresh = TimeSpan.FromSeconds(30);
+
+        public KliveMailHealth Health { get; } = new();
 
         internal string? StatsSnapshotJson => FreshSummary()?.StatsJson;
         internal string? MailboxesSnapshotJson => FreshSummary()?.MailboxesJson;
@@ -52,6 +58,7 @@ namespace Omnipotent.Services.KliveMail
         {
             try
             {
+                Health.Started();
                 Db = new KliveMailDb();
                 await Db.InitialiseAsync();
                 Repo = new KliveMailRepository(Db);
@@ -61,6 +68,10 @@ namespace Omnipotent.Services.KliveMail
 
                 routes = new KliveMailRoutes(this);
                 await routes.RegisterRoutes();
+
+                // Previews and codes for mail stored before the digest existed (or under older
+                // rules). Behind the routes: until it reaches a row the list shows it without one.
+                _ = Task.Run(() => BackfillDigestsAsync(cancellationToken.Token));
 
                 await TryEnsurePortForwardAsync();
 
@@ -94,41 +105,112 @@ namespace Omnipotent.Services.KliveMail
             }
         }
 
+        /// <summary>
+        /// Runs the SMTP listener for the life of the service and restarts it if it ever fails or
+        /// returns (15 s, doubling to 10 min). It used to log one error and stay down until the next
+        /// process start, with nothing on any page saying mail had stopped arriving.
+        /// </summary>
         private async Task RunSmtpServerAsync(CancellationToken ct)
         {
+            X509Certificate2? cert;
+            try { cert = await WaitForCertificateAsync(ct); }
+            catch (OperationCanceledException) { return; }
+
+            await ServiceLog(cert != null
+                ? "KliveMail SMTP: STARTTLS enabled (reusing klive.dev certificate)."
+                : "KliveMail SMTP: no certificate available — running plaintext (senders may still deliver).");
+
+            var delay = TimeSpan.FromSeconds(15);
+            while (!ct.IsCancellationRequested)
+            {
+                try
+                {
+                    var server = CreateSmtpServer(SmtpPort, cert, new KliveMailMessageStore(this, Repo));
+                    server.SessionCreated += (_, _) => Health.SessionStarted();
+                    server.SessionFaulted += (_, _) => Health.SessionFaulted();
+                    smtpServer = server;
+                    Health.SmtpListening(cert != null);
+                    await server.StartAsync(ct);
+                    if (ct.IsCancellationRequested) break;
+                    Health.SmtpStopped();
+                    await ServiceLogError(new InvalidOperationException("The SMTP listener returned without being stopped."),
+                        $"KliveMail SMTP listener stopped; restarting in {delay.TotalSeconds:0} s.", false);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
+                catch (Exception ex)
+                {
+                    Health.SmtpFailed(ex.GetType().Name + ": " + ex.Message);
+                    await ServiceLogError(ex, $"KliveMail SMTP listener failed; restarting in {delay.TotalSeconds:0} s.");
+                    await AlertSmtpDownAsync(ex.Message);
+                }
+
+                try { await Task.Delay(delay, ct); } catch (OperationCanceledException) { break; }
+                delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 2, 600));
+                Health.SmtpRestarting();
+                QueueStatsRefresh();
+            }
+        }
+
+        /// <summary>
+        /// The SMTP server as KliveMail runs it: catch-all for @klive.dev, never a relay, no logins
+        /// (KliveMailReceiveOnly), STARTTLS when the site's certificate is available.
+        /// </summary>
+        internal static SmtpServer.SmtpServer CreateSmtpServer(int port, X509Certificate2? cert, SmtpServer.Storage.IMessageStore store,
+            System.Net.IPAddress? bindTo = null)
+        {
+            var options = new SmtpServerOptionsBuilder()
+                .ServerName(KliveMailRepository.MailDomain)
+                .Endpoint(builder =>
+                {
+                    // Every interface in production; tests bind loopback only.
+                    if (bindTo != null) builder.Endpoint(new System.Net.IPEndPoint(bindTo, port));
+                    else builder.Port(port);
+                    builder.AllowUnsecureAuthentication(false);
+                    if (cert != null)
+                        builder.Certificate(cert);
+                })
+                .Build();
+
+            var serviceProvider = new SmtpServer.ComponentModel.ServiceProvider();
+            serviceProvider.Add(store);
+            serviceProvider.Add(new KliveMailMailboxFilter());
+            serviceProvider.Add(KliveMailReceiveOnly.RefuseAllLogins);
+            serviceProvider.Add(new KliveMailReceiveOnly.CommandFactory());
+            return new SmtpServer.SmtpServer(options, serviceProvider);
+        }
+
+        private async Task AlertSmtpDownAsync(string reason)
+        {
+            if (DateTime.UtcNow - lastSmtpAlertUtc < TimeSpan.FromHours(6)) return;
+            lastSmtpAlertUtc = DateTime.UtcNow;
             try
             {
-                X509Certificate2? cert = await WaitForCertificateAsync(ct);
-
-                var options = new SmtpServerOptionsBuilder()
-                    .ServerName(KliveMailRepository.MailDomain)
-                    .Endpoint(builder =>
-                    {
-                        builder.Port(SmtpPort);
-                        builder.AllowUnsecureAuthentication(true);
-                        if (cert != null)
-                            builder.Certificate(cert);
-                    })
-                    .Build();
-
-                await ServiceLog(cert != null
-                    ? "KliveMail SMTP: STARTTLS enabled (reusing klive.dev certificate)."
-                    : "KliveMail SMTP: no certificate available — running plaintext (senders may still deliver).");
-
-                var serviceProvider = new SmtpServer.ComponentModel.ServiceProvider();
-                serviceProvider.Add(new KliveMailMessageStore(this, Repo));
-                serviceProvider.Add(new KliveMailMailboxFilter());
-
-                smtpServer = new SmtpServer.SmtpServer(options, serviceProvider);
-                await smtpServer.StartAsync(ct);
-            }
-            catch (OperationCanceledException)
-            {
-                // Service shutting down — expected.
+                await ExecuteServiceMethod<KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
+                    $"KliveMail is not receiving mail: the SMTP listener on port {SmtpPort} failed ({reason}). It retries on its own, up to every 10 minutes; /klivemail shows its state.");
             }
             catch (Exception ex)
             {
-                await ServiceLogError(ex, "KliveMail SMTP server crashed.");
+                await ServiceLogError(ex, "KliveMail couldn't send the SMTP-down alert.", false);
+            }
+        }
+
+        private async Task BackfillDigestsAsync(CancellationToken ct)
+        {
+            try
+            {
+                var watch = System.Diagnostics.Stopwatch.StartNew();
+                int built = await Repo.BackfillDigestsAsync(ct);
+                Health.DigestsBuilt(built, watch.ElapsedMilliseconds);
+                if (built > 0)
+                {
+                    QueueStatsRefresh();
+                    await ServiceLog($"KliveMail: built previews and codes for {built} message(s) in {watch.ElapsedMilliseconds} ms.");
+                }
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "KliveMail: could not build message previews; lists show those messages without one.", false);
             }
         }
 
@@ -158,6 +240,7 @@ namespace Omnipotent.Services.KliveMail
         // Called by the message store once a message is persisted.
         internal void RaiseMailStored(Models.StoredMessage message)
         {
+            Health.MessageStored();
             QueueStatsRefresh();
             var handler = MailStored;
             if (handler == null) return;
@@ -278,7 +361,11 @@ namespace Omnipotent.Services.KliveMail
             => await ServiceLog($"KliveMail received mail for [{string.Join(", ", recipients)}] from {from}: {subject}");
 
         public async Task LogStoreError(Exception ex)
-            => await ServiceLogError(ex, "KliveMail: error storing inbound message.");
+        {
+            Health.StoreFailed(ex.GetType().Name + ": " + ex.Message);
+            QueueStatsRefresh();
+            await ServiceLogError(ex, "KliveMail: error storing inbound message.");
+        }
 
         internal void QueueStatsRefresh()
         {
@@ -311,21 +398,10 @@ namespace Omnipotent.Services.KliveMail
         {
             while (!ct.IsCancellationRequested)
             {
-                bool failed = false;
                 try
                 {
-                    // Both database scans and JSON creation happen only on this background task.
-                    var (total, unread, trash) = await Repo.GetStatsAsync(ct);
-                    var mailboxes = await Repo.ListMailboxesAsync(ct);
-                    var snapshot = new MailSummarySnapshot
-                    {
-                        GeneratedAtUtc = DateTime.UtcNow,
-                        StatsJson = JsonConvert.SerializeObject(new { total, unread, trash }),
-                        MailboxesJson = JsonConvert.SerializeObject(new
-                        {
-                            all = new { total, unread }, trash, mailboxes
-                        })
-                    };
+                    // Both database reads and JSON creation happen only on this background task.
+                    var snapshot = BuildSnapshot(await Repo.GetSummaryAsync(DateTime.UtcNow, ct), Health.View(), DateTime.UtcNow);
                     string path = StatsSnapshotPath;
                     string temporary = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
                     try
@@ -345,20 +421,49 @@ namespace Omnipotent.Services.KliveMail
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
                 catch (Exception ex)
                 {
-                    failed = true;
                     await ServiceLogError(ex, "KliveMail: could not refresh the mail summary.", false);
                 }
 
                 try
                 {
-                    await statsRefreshRequested.WaitAsync(
-                        failed ? TimeSpan.FromSeconds(30) : TimeSpan.FromSeconds(5), ct);
+                    await statsRefreshRequested.WaitAsync(IdleRefresh, ct);
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested) { break; }
             }
         }
 
-        private sealed class MailSummarySnapshot
+        /// <summary>
+        /// The two summary documents the routes hand out. /klivemail/stats stays small (the dashboard
+        /// reads it); /klivemail/mailboxes carries everything the mail page's rail and header show.
+        /// The first three fields of each keep their old names, for pages from before this.
+        /// </summary>
+        internal static MailSummarySnapshot BuildSnapshot(Models.MailSummary s, object health, DateTime nowUtc)
+        {
+            return new MailSummarySnapshot
+            {
+                GeneratedAtUtc = nowUtc,
+                StatsJson = JsonConvert.SerializeObject(new
+                {
+                    total = s.Total, unread = s.Unread, trash = s.Trash,
+                    lastReceivedUtc = s.LastReceivedUtc, received24h = s.Received24h, received7d = s.Received7d,
+                }),
+                MailboxesJson = JsonConvert.SerializeObject(new
+                {
+                    all = new { total = s.Total, unread = s.Unread },
+                    trash = s.Trash,
+                    mailboxes = s.Mailboxes,
+                    others = s.Others,
+                    daily = s.Daily,
+                    lastReceivedUtc = s.LastReceivedUtc,
+                    received24h = s.Received24h,
+                    received7d = s.Received7d,
+                    health,
+                    generatedAtUtc = nowUtc,
+                }),
+            };
+        }
+
+        internal sealed class MailSummarySnapshot
         {
             public DateTime GeneratedAtUtc { get; set; }
             public string? StatsJson { get; set; }

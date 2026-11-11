@@ -253,6 +253,48 @@ namespace Omnipotent.Services.KliveAgent
         public List<AgentScheduledTask> ListActive() =>
             tasks.Values.Where(t => t.Enabled).OrderBy(t => t.DueAtUtc).ToList();
 
+        /// <summary>For the website: every active task (soonest first), the most recent finished ones, and
+        /// which are firing right now. Until 2026-11-11 only the agent's own tools could see these.</summary>
+        public object Snapshot(int recentLimit = 20) => BuildSnapshot(tasks.Values, IsFiring, recentLimit);
+
+        internal static object BuildSnapshot(IEnumerable<AgentScheduledTask> source, Func<string, bool> isFiring, int recentLimit)
+        {
+            var all = source.ToList();
+            object View(AgentScheduledTask t) => new
+            {
+                id = t.Id,
+                instruction = t.Instruction,
+                dueAtUtc = t.DueAtUtc,
+                repeatEverySeconds = t.RepeatEvery.HasValue ? (long?)t.RepeatEvery.Value.TotalSeconds : null,
+                createdAt = t.CreatedAt,
+                conversationId = t.ConversationId,
+                enabled = t.Enabled,
+                firing = isFiring(t.Id),
+                lastFiredAt = t.LastFiredAt,
+                firedCount = t.FiredCount,
+                lastOutcome = t.LastOutcome,
+            };
+            return new
+            {
+                active = all.Where(t => t.Enabled).OrderBy(t => t.DueAtUtc).Select(View).ToList(),
+                recent = all.Where(t => !t.Enabled)
+                    .OrderByDescending(t => t.LastFiredAt ?? t.CreatedAt)
+                    .Take(Math.Clamp(recentLimit, 0, 100))
+                    .Select(View).ToList(),
+                maxActive = MaxActiveTasks,
+            };
+        }
+
+        /// <summary>Cancels one task by its full id (the page always has it). False when it is not active.</summary>
+        public async Task<bool> CancelByIdAsync(string id, string by)
+        {
+            if (string.IsNullOrWhiteSpace(id) || !tasks.TryGetValue(id.Trim(), out var task) || !task.Enabled) return false;
+            task.Enabled = false;
+            task.LastOutcome = $"cancelled by {by} at {TemporalFormat.NowStamp()}";
+            await PersistAsync(task);
+            return true;
+        }
+
         private async Task PersistAsync(AgentScheduledTask task)
         {
             try

@@ -556,6 +556,8 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
+                    // One that was slow to read at start-up is read now rather than reported missing.
+                    try { await service.EnsureConversationLoadedAsync(id); } catch (IOException) { }
                     var conversation = service.GetConversation(id);
                     if (conversation == null)
                     {
@@ -637,6 +639,27 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(JsonConvert.SerializeObject(
                     service.GetLongTermJobs(activeOnly, limit)));
             }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
+
+            // What the agent will do on its own later: the tasks it scheduled for itself (schedule_task).
+            await CreateDurableRoute("/kliveagent/schedule", async req =>
+            {
+                KliveAPI.Caching.CacheDeps.MarkUncacheable("live scheduled tasks");
+                var scheduler = service.Scheduler;
+                await req.ReturnResponse(JsonConvert.SerializeObject(scheduler == null
+                    ? new { active = Array.Empty<object>(), recent = Array.Empty<object>(), maxActive = 0 }
+                    : scheduler.Snapshot()), headers: NoStore());
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
+
+            await CreateDurableRoute("/kliveagent/schedule/cancel", async req =>
+            {
+                var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                string id = body?.id;
+                var scheduler = service.Scheduler;
+                bool cancelled = scheduler != null && await scheduler.CancelByIdAsync(id ?? "", req.user?.Name ?? "the website");
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = cancelled }),
+                    code: cancelled ? HttpStatusCode.OK : HttpStatusCode.Conflict);
+            }, HttpMethod.Post, KliveAgentPerms.JobsManage);
 
             await CreateDurableRoute("/kliveagent/jobs/get", async req =>
             {

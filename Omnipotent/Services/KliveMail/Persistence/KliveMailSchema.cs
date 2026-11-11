@@ -85,6 +85,30 @@ namespace Omnipotent.Services.KliveMail.Persistence
                     SELECT message_id, from_address, from_name, subject, body_text FROM messages_fts_v1;
 
                 DROP TABLE messages_fts_v1;
+            "),
+            (3, @"
+                -- List speed. Each row stores is_read / is_deleted / has_attachments after
+                -- body_html, so reading any of them walks the row's overflow chain (~10 pages for a
+                -- typical 40 KB marketing mail), and with no statistics SQLite picked the
+                -- one-bit idx_messages_deleted for every query and sorted every row. The live list
+                -- took 5-35 s whenever those pages were not cached. These indexes carry the flags
+                -- the lists filter and show (and the id, which search matches against), in the
+                -- order they are read, so a page of 50 touches 50 rows' first pages and nothing else.
+                CREATE INDEX idx_messages_feed ON messages(is_deleted, received_utc, is_read, has_attachments, to_address, id);
+                CREATE INDEX idx_messages_box ON messages(to_address, is_deleted, received_utc, is_read, has_attachments, id);
+                CREATE INDEX idx_messages_conv ON messages(thread_id, is_deleted, received_utc, is_read, has_attachments, id);
+                DROP INDEX IF EXISTS idx_messages_deleted;
+                DROP INDEX IF EXISTS idx_messages_read;
+
+                -- What a list row shows from the body, worked out once on arrival (KliveMailDigest):
+                -- the preview (from the HTML when there is no text part) and any sign-in code.
+                -- Derived from immutable content, so it never needs updating with read/delete state.
+                CREATE TABLE message_digest (
+                    message_id TEXT PRIMARY KEY,
+                    snippet TEXT NOT NULL DEFAULT '',
+                    code TEXT,
+                    version INTEGER NOT NULL
+                );
             ")
         };
     }

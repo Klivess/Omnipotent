@@ -172,7 +172,7 @@ namespace Omnipotent.Tests.KliveMail
                 using var conn = upDb.OpenAsync().GetAwaiter().GetResult();
                 using var ver = conn.CreateCommand();
                 ver.CommandText = "SELECT version FROM schema_versions ORDER BY version DESC LIMIT 1";
-                Assert.Equal(2, Convert.ToInt32(ver.ExecuteScalar()));
+                Assert.Equal(KliveMailSchema.Migrations.Max(m => m.Version), Convert.ToInt32(ver.ExecuteScalar()));
             }
             finally
             {

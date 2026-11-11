@@ -376,6 +376,8 @@ namespace Omnipotent.Services.KliveAgent
                 // Chat needs the durable state, memory and execution surface. Build optional code
                 // intelligence in the background so a cold repository cannot block conversation.
                 _ = Task.Run(() => WarmCodebaseAsync(serviceToken, generation), serviceToken);
+                // The page's cache statistics read from memory after this; only new lines are parsed later.
+                PromptCache.Warm();
 
                 // Background watchdog: cancels hung (zero-progress) runs and evicts stale pending entries.
                 _ = RunPendingRunWatchdogAsync(serviceToken);
@@ -557,6 +559,7 @@ namespace Omnipotent.Services.KliveAgent
             requestId ??= Guid.NewGuid().ToString("N");
             if (!IsSafeIdentifier(conversationId))
                 return InvalidIdentifierResponse("conversationId", conversationId);
+            await EnsureConversationLoadedAsync(conversationId);
 
             var executionGate = conversationExecutionGates.GetOrAdd(conversationId, _ => new SemaphoreSlim(1, 1));
             if (executionGate.CurrentCount == 0)
@@ -779,6 +782,11 @@ namespace Omnipotent.Services.KliveAgent
                 return InvalidIdentifierResponse("conversationId", conversationId);
             if (!string.IsNullOrWhiteSpace(clientMessageId) && !IsSafeIdentifier(clientMessageId))
                 return InvalidIdentifierResponse("clientMessageId", clientMessageId);
+            try { await EnsureConversationLoadedAsync(conversationId); }
+            catch (IOException ex)
+            {
+                return new AgentChatResponse { Success = false, Response = ex.Message, ErrorMessage = ex.Message };
+            }
 
             var admissionGate = conversationAdmissionGates.GetOrAdd(conversationId, _ => new SemaphoreSlim(1, 1));
             await admissionGate.WaitAsync();
@@ -1911,6 +1919,9 @@ namespace Omnipotent.Services.KliveAgent
                 AgentTaskStatus.Failed => "failed",
                 _ => "running"
             };
+            // A run whose conversation is on disk but unreadable right now must not replace it.
+            try { await EnsureConversationLoadedAsync(run.ConversationId); }
+            catch (IOException) { return; }
             var conversation = conversations.GetOrAdd(run.ConversationId, _ => new AgentConversation
             {
                 ConversationId = run.ConversationId,
@@ -2698,19 +2709,45 @@ namespace Omnipotent.Services.KliveAgent
             return true;
         }
 
-        public async Task<int> MarkAllNotificationsReadAsync()
+        /// <summary>How long "mark all read" holds its request while the read-marks are written.</summary>
+        internal static readonly TimeSpan MarkAllReadWait = TimeSpan.FromSeconds(2);
+
+        public Task<int> MarkAllNotificationsReadAsync() =>
+            MarkAllReadAsync(notifications.Values, PersistNotificationAsync, MarkAllReadWait,
+                ex => _ = ServiceLogError(ex, "[KliveAgent] Could not persist a notification read-mark.", false));
+
+        /// <summary>
+        /// Marks every unread notification read in memory at once, then writes the marks a few at a time.
+        /// The request waits at most <paramref name="wait"/>; any writes still going finish in the background.
+        /// Until 2026-11-11 the marks were written one after another, each an atomic write through the
+        /// shared file queue, and "mark all read" held its request for 217–220 s (three calls, 14 Oct).
+        /// </summary>
+        internal static async Task<int> MarkAllReadAsync(
+            IEnumerable<AgentNotification> source,
+            Func<AgentNotification, Task> persist,
+            TimeSpan wait,
+            Action<Exception> onError,
+            int concurrency = 6)
         {
-            int marked = 0;
-            foreach (var notification in notifications.Values.Where(n => n.ReadAt == null).ToList())
+            var unread = source.Where(n => n.ReadAt == null).ToList();
+            if (unread.Count == 0) return 0;
+            var now = DateTime.UtcNow;
+            foreach (var notification in unread) notification.ReadAt = now;
+
+            // Not disposed here: writes still running after the wait keep using it, and it is released
+            // with the last of them.
+            var slots = new SemaphoreSlim(Math.Max(1, concurrency));
+            var writes = unread.Select(async notification =>
             {
-                notification.ReadAt = DateTime.UtcNow;
-                try { await PersistNotificationAsync(notification); marked++; }
-                catch (Exception ex)
-                {
-                    try { await ServiceLogError(ex, "[KliveAgent] Could not persist a notification read-mark.", false); } catch { }
-                }
-            }
-            return marked;
+                await slots.WaitAsync().ConfigureAwait(false);
+                try { await persist(notification).ConfigureAwait(false); }
+                catch (Exception ex) { try { onError(ex); } catch { } }
+                finally { slots.Release(); }
+            }).ToList();
+            var all = Task.WhenAll(writes);
+            _ = all.ContinueWith(_ => slots.Dispose(), TaskScheduler.Default);
+            await Task.WhenAny(all, Task.Delay(wait)).ConfigureAwait(false);
+            return unread.Count;
         }
 
         private async Task AddNotificationAsync(AgentNotification notification)
@@ -2877,36 +2914,116 @@ namespace Omnipotent.Services.KliveAgent
                 var dir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentConversationsDirectory);
                 if (!Directory.Exists(dir)) return;
 
+                var deferred = new List<string>();
                 foreach (var file in Directory.GetFiles(dir, "*.json"))
                 {
                     try
                     {
                         var conv = await GetDataHandler().ReadAndDeserialiseDataFromFile<AgentConversation>(file);
-                        if (conv != null && IsSafeIdentifier(conv.ConversationId))
-                        {
-                            conv.Messages ??= new List<AgentMessage>();
-                            foreach (var message in conv.Messages)
-                            {
-                                if (string.IsNullOrWhiteSpace(message.MessageId))
-                                    message.MessageId = Guid.NewGuid().ToString("N");
-                                message.DeliveryStatus ??= "completed";
-                            }
-                            if (!conversations.TryGetValue(conv.ConversationId, out var existing)
-                                || existing.LastUpdated < conv.LastUpdated)
-                                conversations[conv.ConversationId] = conv;
-                        }
+                        AdoptLoadedConversation(conv);
+                    }
+                    catch (Exception ex) when (ex is TimeoutException or IOException)
+                    {
+                        // Live 2026-11-11: a read queued during the start-up storm timed out at 60 s and the
+                        // conversation was simply missing for the whole process. It is read again directly,
+                        // in the background, so start-up does not wait on it.
+                        deferred.Add(file);
                     }
                     catch (Exception ex) { await ServiceLogError(ex, $"[KliveAgent] Skipped unreadable conversation file {Path.GetFileName(file)}.", false); }
                 }
 
                 if (conversations.Count > 0)
                 {
-                    await ServiceLog($"[KliveAgent] Loaded {conversations.Count} persisted conversations.");
+                    await ServiceLog($"[KliveAgent] Loaded {conversations.Count} persisted conversations"
+                        + (deferred.Count > 0 ? $"; {deferred.Count} slow to read, retrying in the background." : "."));
                 }
+                if (deferred.Count > 0) _ = Task.Run(() => RetryDeferredConversationsAsync(deferred));
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "[KliveAgent] Error loading conversations.");
+            }
+        }
+
+        /// <summary>Takes a conversation read from disk into memory, unless a newer copy is already there.</summary>
+        private bool AdoptLoadedConversation(AgentConversation conv)
+        {
+            if (conv == null || !IsSafeIdentifier(conv.ConversationId)) return false;
+            conv.Messages ??= new List<AgentMessage>();
+            foreach (var message in conv.Messages)
+            {
+                if (string.IsNullOrWhiteSpace(message.MessageId))
+                    message.MessageId = Guid.NewGuid().ToString("N");
+                message.DeliveryStatus ??= "completed";
+            }
+            if (conversations.TryGetValue(conv.ConversationId, out var existing) && existing.LastUpdated >= conv.LastUpdated)
+                return false;
+            conversations[conv.ConversationId] = conv;
+            return true;
+        }
+
+        /// <summary>Reads a conversation file straight from disk (not through the shared file queue and its
+        /// 60 s cap), retrying a few times while the file is being replaced.</summary>
+        internal static async Task<AgentConversation?> ReadConversationFileAsync(string path, int attempts = 3, TimeSpan? timeout = null)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromMinutes(2));
+                    string json = await File.ReadAllTextAsync(path, cts.Token).ConfigureAwait(false);
+                    return JsonConvert.DeserializeObject<AgentConversation>(json);
+                }
+                catch (Exception) when (attempt < attempts)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2 * attempt)).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private async Task RetryDeferredConversationsAsync(List<string> files)
+        {
+            int recovered = 0;
+            foreach (var file in files)
+            {
+                try
+                {
+                    if (AdoptLoadedConversation(await ReadConversationFileAsync(file))) recovered++;
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, $"[KliveAgent] Skipped unreadable conversation file {Path.GetFileName(file)} after retrying.", false);
+                }
+            }
+            if (recovered > 0)
+                await ServiceLog($"[KliveAgent] Loaded {recovered} conversation(s) that were slow to read at start-up.");
+        }
+
+        /// <summary>
+        /// Makes sure a conversation that exists on disk is in memory before anything writes to it. Every
+        /// writer GetOrAdd's the conversation; for one that failed to load, that made an empty conversation
+        /// and the next persist overwrote the file on disk with it.
+        /// </summary>
+        internal async Task EnsureConversationLoadedAsync(string conversationId)
+        {
+            if (string.IsNullOrWhiteSpace(conversationId) || !IsSafeIdentifier(conversationId)
+                || conversations.ContainsKey(conversationId)) return;
+            string path;
+            try
+            {
+                path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentConversationsDirectory), conversationId + ".json");
+            }
+            catch { return; }
+            if (!File.Exists(path)) return;
+            try
+            {
+                AdoptLoadedConversation(await ReadConversationFileAsync(path));
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, $"[KliveAgent] Could not read conversation {conversationId} from disk.", false);
+                // Writing an empty conversation over a file we could not read would lose it.
+                throw new IOException($"Conversation {conversationId} exists on disk but could not be read; not overwriting it.", ex);
             }
         }
 

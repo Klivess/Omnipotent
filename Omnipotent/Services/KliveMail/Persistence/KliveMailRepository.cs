@@ -2,23 +2,37 @@ using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
 using Microsoft.Data.Sqlite;
+using Omnipotent.Services.KliveAPI.Caching;
+using Omnipotent.Services.KliveAPI.Telemetry;
 using Omnipotent.Services.KliveMail.Models;
 
 namespace Omnipotent.Services.KliveMail.Persistence
 {
     // All KliveMail data access. Writes go through KliveMailDb's single write lock; reads use
     // their own short-lived connection (WAL allows concurrent readers).
+    //
+    // Read cost rule: a list never touches a message body. A row's flags (is_read, is_deleted,
+    // has_attachments) sit after body_html in the record, so reading them from the table walks the
+    // row's overflow chain; every list, count and thread query therefore names the index that
+    // carries those flags (INDEXED BY: this database has no statistics, and left to itself SQLite
+    // picked the one-bit is_deleted index and sorted every row), and the preview comes from
+    // message_digest. Only GetMessageAsync reads a body.
     public sealed class KliveMailRepository
     {
         public const string MailDomain = "klive.dev";
+        /// <summary>Response-cache dataset for everything KliveMail stores.</summary>
+        public const string CacheKey = "klivemail";
+        public const int MaxBulkIds = 500;
+
         private readonly KliveMailDb db;
 
         public KliveMailRepository(KliveMailDb db) { this.db = db; }
 
-        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Ingestion â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ─────────────────────────── Ingestion ───────────────────────────
 
         public async Task InsertMessageAsync(StoredMessage m, CancellationToken ct = default)
         {
+            var digest = KliveMailDigest.Build(m.Subject, m.BodyText, m.BodyHtml);
             await db.WithWriteLockAsync(async conn =>
             {
                 await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
@@ -28,7 +42,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
                     cmd.Transaction = tx;
                     cmd.CommandText = @"INSERT INTO messages
                         (id,to_address,from_address,from_name,subject,date_utc,received_utc,message_id,in_reply_to,references_raw,thread_id,body_text,body_html,has_attachments,raw_size,is_read,is_deleted)
-                        VALUES ($id,$to,$from,$fromName,$subject,$date,$received,$messageId,$inReplyTo,$references,$thread,$bodyText,$bodyHtml,$hasAtt,$rawSize,0,0)";
+                        VALUES ($id,$to,$from,$fromName,$subject,$date,$received,$messageId,$inReplyTo,$references,$thread,$bodyText,$bodyHtml,$hasAtt,$rawSize,$read,0)";
                     cmd.Parameters.AddWithValue("$id", m.Id);
                     cmd.Parameters.AddWithValue("$to", m.ToAddress ?? "");
                     cmd.Parameters.AddWithValue("$from", m.FromAddress ?? "");
@@ -44,6 +58,8 @@ namespace Omnipotent.Services.KliveMail.Persistence
                     cmd.Parameters.AddWithValue("$bodyHtml", (object?)m.BodyHtml ?? DBNull.Value);
                     cmd.Parameters.AddWithValue("$hasAtt", m.HasAttachments ? 1 : 0);
                     cmd.Parameters.AddWithValue("$rawSize", m.RawSize);
+                    // A sent copy is filed read; inbound mail always arrives unread.
+                    cmd.Parameters.AddWithValue("$read", m.IsRead ? 1 : 0);
                     await cmd.ExecuteNonQueryAsync(ct);
                 }
 
@@ -80,57 +96,113 @@ namespace Omnipotent.Services.KliveMail.Persistence
                     await fcmd.ExecuteNonQueryAsync(ct);
                 }
 
+                await using (var dcmd = conn.CreateCommand())
+                {
+                    dcmd.Transaction = tx;
+                    AddDigestInsert(dcmd, m.Id, digest);
+                    await dcmd.ExecuteNonQueryAsync(ct);
+                }
+
                 await tx.CommitAsync(ct);
                 return true;
             }, ct);
+            CacheDeps.Bump(CacheKey);
         }
 
-        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Lists / detail â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-        public async Task<List<MessageSummary>> ListMessagesAsync(string? mailbox, bool unreadOnly, bool hasAttachmentOnly, bool trash, int page, int pageSize, CancellationToken ct = default)
+        private static void AddDigestInsert(SqliteCommand cmd, string messageId, KliveMailDigest.Digest digest)
         {
-            page = Math.Max(1, page);
-            pageSize = Math.Clamp(pageSize, 1, 200);
+            cmd.CommandText = "INSERT OR REPLACE INTO message_digest(message_id,snippet,code,version) VALUES ($mid,$snippet,$code,$v)";
+            cmd.Parameters.AddWithValue("$mid", messageId);
+            cmd.Parameters.AddWithValue("$snippet", digest.Snippet);
+            cmd.Parameters.AddWithValue("$code", (object?)digest.Code ?? DBNull.Value);
+            cmd.Parameters.AddWithValue("$v", KliveMailDigest.Version);
+        }
 
-            var where = new List<string> { trash ? "is_deleted = 1" : "is_deleted = 0" };
-            if (!string.IsNullOrWhiteSpace(mailbox)) where.Add("to_address = $mailbox");
-            if (unreadOnly) where.Add("is_read = 0");
-            if (hasAttachmentOnly) where.Add("has_attachments = 1");
+        // ─────────────────────────── Lists / detail ───────────────────────────
 
-            string sql = $@"SELECT id,to_address,from_address,from_name,subject,received_utc,date_utc,thread_id,has_attachments,is_read,
-                    substr(replace(replace(coalesce(body_text,''),char(10),' '),char(13),' '),1,200) AS snippet
-                    FROM messages WHERE {string.Join(" AND ", where)}
-                    ORDER BY received_utc DESC LIMIT $limit OFFSET $offset";
+        /// <summary>Opening the connection is its own span: the live list spent 5-7 s in the handler
+        /// with nothing in its trace to say whether that was the open or the query.</summary>
+        private async Task<SqliteConnection> OpenTracedAsync(CancellationToken ct)
+        {
+            using (RequestTrace.AmbientSpan("mail-open")) return await db.OpenAsync(ct);
+        }
+
+        // Columns every list returns, in MapSummary's order. The flags and the id come from the
+        // index the query names, the rest from the row's first page; the preview from the digest.
+        private const string SummaryColumns =
+            "m.id,m.to_address,m.from_address,m.from_name,m.subject,m.received_utc,m.date_utc,m.thread_id,m.has_attachments,m.is_read,d.snippet,d.code";
+
+        /// <summary>The SQL a list query runs; public so the cost tests can price exactly what ships.</summary>
+        internal static string ListSql(MessageQuery q)
+        {
+            bool box = !string.IsNullOrWhiteSpace(q.Mailbox);
+            var where = new List<string>();
+            if (box) where.Add("m.to_address = $mailbox");
+            where.Add("m.is_deleted = $deleted");
+            if (q.UnreadOnly) where.Add("m.is_read = 0");
+            if (q.HasAttachmentOnly) where.Add("m.has_attachments = 1");
+            if (q.CodesOnly) where.Add("m.id IN (SELECT message_id FROM message_digest WHERE code IS NOT NULL)");
+            return $@"SELECT {SummaryColumns}
+                FROM messages m INDEXED BY {(box ? "idx_messages_box" : "idx_messages_feed")}
+                LEFT JOIN message_digest d ON d.message_id = m.id
+                WHERE {string.Join(" AND ", where)}
+                ORDER BY m.received_utc DESC LIMIT $limit OFFSET $offset";
+        }
+
+        public Task<List<MessageSummary>> ListMessagesAsync(string? mailbox, bool unreadOnly, bool hasAttachmentOnly, bool trash, int page, int pageSize, CancellationToken ct = default)
+            => ListMessagesAsync(new MessageQuery
+            {
+                Mailbox = mailbox, UnreadOnly = unreadOnly, HasAttachmentOnly = hasAttachmentOnly, Trash = trash, Page = page, PageSize = pageSize
+            }, ct);
+
+        public async Task<List<MessageSummary>> ListMessagesAsync(MessageQuery q, CancellationToken ct = default)
+        {
+            CacheDeps.NoteRead(CacheKey);
+            int page = Math.Max(1, q.Page);
+            int pageSize = Math.Clamp(q.PageSize, 1, 200);
 
             var list = new List<MessageSummary>();
-            await using var conn = await db.OpenAsync(ct);
+            await using var conn = await OpenTracedAsync(ct);
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = sql;
-            if (!string.IsNullOrWhiteSpace(mailbox)) cmd.Parameters.AddWithValue("$mailbox", mailbox.ToLowerInvariant());
+            cmd.CommandText = ListSql(q);
+            if (!string.IsNullOrWhiteSpace(q.Mailbox)) cmd.Parameters.AddWithValue("$mailbox", NormalizeAddress(q.Mailbox));
+            cmd.Parameters.AddWithValue("$deleted", q.Trash ? 1 : 0);
             cmd.Parameters.AddWithValue("$limit", pageSize);
             cmd.Parameters.AddWithValue("$offset", (page - 1) * pageSize);
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) list.Add(MapSummary(reader));
+            using (RequestTrace.AmbientSpan("mail-query"))
+            {
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) list.Add(MapSummary(reader));
+            }
             return list;
         }
 
+        internal const string ThreadSql = @"SELECT " + SummaryColumns + @"
+                FROM messages m INDEXED BY idx_messages_conv
+                LEFT JOIN message_digest d ON d.message_id = m.id
+                WHERE m.thread_id = $thread AND m.is_deleted = 0 ORDER BY m.received_utc ASC";
+
         public async Task<List<MessageSummary>> GetThreadAsync(string threadId, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             var list = new List<MessageSummary>();
-            await using var conn = await db.OpenAsync(ct);
+            await using var conn = await OpenTracedAsync(ct);
             await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"SELECT id,to_address,from_address,from_name,subject,received_utc,date_utc,thread_id,has_attachments,is_read,
-                    substr(replace(replace(coalesce(body_text,''),char(10),' '),char(13),' '),1,200) AS snippet
-                    FROM messages WHERE thread_id = $thread AND is_deleted = 0 ORDER BY received_utc ASC";
+            cmd.CommandText = ThreadSql;
             cmd.Parameters.AddWithValue("$thread", threadId);
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) list.Add(MapSummary(reader));
+            using (RequestTrace.AmbientSpan("mail-query"))
+            {
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) list.Add(MapSummary(reader));
+            }
             return list;
         }
 
         public async Task<StoredMessage?> GetMessageAsync(string id, CancellationToken ct = default)
         {
-            await using var conn = await db.OpenAsync(ct);
+            CacheDeps.NoteRead(CacheKey);
+            await using var conn = await OpenTracedAsync(ct);
+            using var span = RequestTrace.AmbientSpan("mail-message");
             StoredMessage? msg = null;
             await using (var cmd = conn.CreateCommand())
             {
@@ -152,8 +224,20 @@ namespace Omnipotent.Services.KliveMail.Persistence
             return msg;
         }
 
+        /// <summary>The stored code for one message, or null (also null before the digest backfill reaches it).</summary>
+        public async Task<string?> GetCodeAsync(string id, CancellationToken ct = default)
+        {
+            CacheDeps.NoteRead(CacheKey);
+            await using var conn = await db.OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT code FROM message_digest WHERE message_id = $id";
+            cmd.Parameters.AddWithValue("$id", id);
+            return await cmd.ExecuteScalarAsync(ct) as string;
+        }
+
         public async Task<StoredAttachment?> GetAttachmentAsync(string id, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             await using var conn = await db.OpenAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT id,message_id,file_name,content_type,size_bytes,storage_path,is_inline,content_id FROM attachments WHERE id = $id";
@@ -163,95 +247,117 @@ namespace Omnipotent.Services.KliveMail.Persistence
             return null;
         }
 
+        /// <summary>
+        /// Search runs the full-text match once, into a set of ids, then walks the date index and keeps
+        /// the rows in that set. Driving from the match instead (the old query) fetched each hit from
+        /// the table to test is_deleted, which walks its body: 28.9 s for one live search.
+        /// </summary>
+        internal static string SearchSql(bool mailbox, bool from) => $@"SELECT {SummaryColumns}
+                FROM messages m INDEXED BY {(mailbox ? "idx_messages_box" : "idx_messages_feed")}
+                LEFT JOIN message_digest d ON d.message_id = m.id
+                WHERE {(mailbox ? "m.to_address = $mailbox AND " : "")}m.is_deleted = 0
+                  AND m.id IN (SELECT message_id FROM messages_fts WHERE messages_fts MATCH $q)
+                  {(from ? "AND m.from_address LIKE $fromEsc" : "")}
+                ORDER BY m.received_utc DESC LIMIT $limit OFFSET $offset";
+
         public async Task<List<MessageSummary>> SearchAsync(string query, int page = 1, int pageSize = 50, string? mailbox = null, string? from = null, CancellationToken ct = default)
         {
+            CacheDeps.NoteRead(CacheKey);
             page = Math.Max(1, page);
             pageSize = Math.Clamp(pageSize, 1, 200);
 
             string ftsQuery = BuildFtsQuery(query);
             if (string.IsNullOrEmpty(ftsQuery)) return new List<MessageSummary>();
 
+            bool hasMailbox = !string.IsNullOrWhiteSpace(mailbox);
+            bool hasFrom = !string.IsNullOrWhiteSpace(from);
             var list = new List<MessageSummary>();
-            await using var conn = await db.OpenAsync(ct);
+            await using var conn = await OpenTracedAsync(ct);
             await using var cmd = conn.CreateCommand();
-            var where = new StringBuilder("messages_fts MATCH $q AND m.is_deleted = 0");
-            if (!string.IsNullOrWhiteSpace(mailbox))
-            {
-                where.Append(" AND m.to_address = $mailbox");
-                cmd.Parameters.AddWithValue("$mailbox", NormalizeAddress(mailbox));
-            }
-            if (!string.IsNullOrWhiteSpace(from))
-            {
-                where.Append(" AND m.from_address LIKE $fromEsc");
-                cmd.Parameters.AddWithValue("$fromEsc", "%" + (from ?? "").Trim() + "%");
-            }
-            cmd.CommandText = @"SELECT m.id,m.to_address,m.from_address,m.from_name,m.subject,m.received_utc,m.date_utc,m.thread_id,m.has_attachments,m.is_read,
-                    substr(replace(replace(coalesce(m.body_text,''),char(10),' '),char(13),' '),1,200) AS snippet
-                    FROM messages_fts f JOIN messages m ON m.id = f.message_id
-                    WHERE " + where + @"
-                    ORDER BY m.received_utc DESC LIMIT $limit OFFSET $offset";
+            cmd.CommandText = SearchSql(hasMailbox, hasFrom);
+            if (hasMailbox) cmd.Parameters.AddWithValue("$mailbox", NormalizeAddress(mailbox!));
+            if (hasFrom) cmd.Parameters.AddWithValue("$fromEsc", "%" + from!.Trim() + "%");
             cmd.Parameters.AddWithValue("$q", ftsQuery);
             cmd.Parameters.AddWithValue("$limit", pageSize);
             cmd.Parameters.AddWithValue("$offset", (page - 1) * pageSize);
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct)) list.Add(MapSummary(reader));
-            return list;
-        }
-
-        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Mutations â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-        public async Task<bool> SetReadAsync(string id, bool read, CancellationToken ct = default)
-        {
-            int rows = 0;
-            await db.WithWriteLockAsync(async conn =>
+            using (RequestTrace.AmbientSpan("mail-query"))
             {
-                await using var cmd = conn.CreateCommand();
-                cmd.CommandText = "UPDATE messages SET is_read = $r WHERE id = $id";
-                cmd.Parameters.AddWithValue("$r", read ? 1 : 0);
-                cmd.Parameters.AddWithValue("$id", id);
-                rows = await cmd.ExecuteNonQueryAsync(ct);
-            }, ct);
-            return rows > 0;
-        }
-
-        public async Task<bool> SoftDeleteAsync(string id, CancellationToken ct = default)
-        {
-            int rows = 0;
-            await db.WithWriteLockAsync(async conn =>
-            {
-                await using var cmd = conn.CreateCommand();
-                cmd.CommandText = "UPDATE messages SET is_deleted = 1 WHERE id = $id";
-                cmd.Parameters.AddWithValue("$id", id);
-                rows = await cmd.ExecuteNonQueryAsync(ct);
-            }, ct);
-            return rows > 0;
-        }
-
-        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Mailboxes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-
-        public async Task<List<MailboxInfo>> ListMailboxesAsync(CancellationToken ct = default)
-        {
-            var list = new List<MailboxInfo>();
-            await using var conn = await db.OpenAsync(ct);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"SELECT mb.address, mb.display_name,
-                    (SELECT COUNT(*) FROM messages m WHERE m.to_address = mb.address AND m.is_deleted = 0) AS total,
-                    (SELECT COUNT(*) FROM messages m WHERE m.to_address = mb.address AND m.is_deleted = 0 AND m.is_read = 0) AS unread
-                    FROM mailboxes mb ORDER BY mb.address ASC";
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-            {
-                list.Add(new MailboxInfo
-                {
-                    Address = reader.GetString(0),
-                    DisplayName = reader.IsDBNull(1) ? null : reader.GetString(1),
-                    Total = reader.GetInt32(2),
-                    Unread = reader.GetInt32(3),
-                    Pinned = true
-                });
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) list.Add(MapSummary(reader));
             }
             return list;
         }
+
+        // ─────────────────────────── Mutations ───────────────────────────
+
+        public async Task<bool> SetReadAsync(string id, bool read, CancellationToken ct = default)
+            => await SetReadManyAsync(new[] { id }, read, ct) > 0 || await ExistsAsync(id, ct);
+
+        public async Task<bool> SoftDeleteAsync(string id, CancellationToken ct = default)
+            => await SetDeletedManyAsync(new[] { id }, true, ct) > 0 || await ExistsAsync(id, ct);
+
+        /// <summary>Sets the read flag on up to <see cref="MaxBulkIds"/> messages; returns how many changed.</summary>
+        public Task<int> SetReadManyAsync(IEnumerable<string> ids, bool read, CancellationToken ct = default)
+            => UpdateFlagAsync("is_read", read, ids, ct);
+
+        /// <summary>Moves messages to the trash (deleted) or back out of it; returns how many changed.</summary>
+        public Task<int> SetDeletedManyAsync(IEnumerable<string> ids, bool deleted, CancellationToken ct = default)
+            => UpdateFlagAsync("is_deleted", deleted, ids, ct);
+
+        private async Task<int> UpdateFlagAsync(string column, bool value, IEnumerable<string> ids, CancellationToken ct)
+        {
+            var list = ids.Where(id => !string.IsNullOrWhiteSpace(id)).Select(id => id.Trim())
+                .Distinct(StringComparer.Ordinal).Take(MaxBulkIds).ToList();
+            if (list.Count == 0) return 0;
+            int rows = 0;
+            await db.WithWriteLockAsync(async conn =>
+            {
+                await using var cmd = conn.CreateCommand();
+                var names = new List<string>(list.Count);
+                for (int i = 0; i < list.Count; i++)
+                {
+                    names.Add("$i" + i);
+                    cmd.Parameters.AddWithValue("$i" + i, list[i]);
+                }
+                cmd.CommandText = $"UPDATE messages SET {column} = $v WHERE id IN ({string.Join(",", names)}) AND {column} <> $v";
+                cmd.Parameters.AddWithValue("$v", value ? 1 : 0);
+                rows = await cmd.ExecuteNonQueryAsync(ct);
+            }, ct);
+            if (rows > 0) CacheDeps.Bump(CacheKey);
+            return rows;
+        }
+
+        /// <summary>Marks every unread message read, in one mailbox or (null) everywhere; returns how many changed.</summary>
+        public async Task<int> MarkAllReadAsync(string? mailbox, CancellationToken ct = default)
+        {
+            int rows = 0;
+            await db.WithWriteLockAsync(async conn =>
+            {
+                await using var cmd = conn.CreateCommand();
+                bool box = !string.IsNullOrWhiteSpace(mailbox);
+                cmd.CommandText = box
+                    ? "UPDATE messages SET is_read = 1 WHERE id IN (SELECT id FROM messages INDEXED BY idx_messages_box WHERE to_address = $mb AND is_deleted = 0 AND is_read = 0)"
+                    : "UPDATE messages SET is_read = 1 WHERE id IN (SELECT id FROM messages INDEXED BY idx_messages_feed WHERE is_deleted = 0 AND is_read = 0)";
+                if (box) cmd.Parameters.AddWithValue("$mb", NormalizeAddress(mailbox!));
+                rows = await cmd.ExecuteNonQueryAsync(ct);
+            }, ct);
+            if (rows > 0) CacheDeps.Bump(CacheKey);
+            return rows;
+        }
+
+        private async Task<bool> ExistsAsync(string id, CancellationToken ct)
+        {
+            await using var conn = await db.OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM messages WHERE id = $id";
+            cmd.Parameters.AddWithValue("$id", id);
+            return await cmd.ExecuteScalarAsync(ct) != null;
+        }
+
+        // ─────────────────────────── Mailboxes ───────────────────────────
+
+        public async Task<List<MailboxInfo>> ListMailboxesAsync(CancellationToken ct = default)
+            => (await GetSummaryAsync(DateTime.UtcNow, ct)).Mailboxes;
 
         public async Task<bool> CreateMailboxAsync(string address, string? displayName, CancellationToken ct = default)
         {
@@ -269,6 +375,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 cmd.Parameters.AddWithValue("$c", DateTime.UtcNow.ToString("o"));
                 rows = await cmd.ExecuteNonQueryAsync(ct);
             }, ct);
+            if (rows > 0) CacheDeps.Bump(CacheKey);
             return rows > 0;
         }
 
@@ -283,26 +390,167 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 cmd.Parameters.AddWithValue("$a", address);
                 rows = await cmd.ExecuteNonQueryAsync(ct);
             }, ct);
+            if (rows > 0) CacheDeps.Bump(CacheKey);
             return rows > 0;
         }
 
-        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Stats â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ─────────────────────────── Stats ───────────────────────────
+
+        /// <summary>Per-address counts in one pass over the mailbox index (it carries every column read).
+        /// Replaced two correlated COUNTs per pinned mailbox, each walking every row: 81 × 2 × 363 row
+        /// reads every 5 s on the live store.</summary>
+        internal const string AddressCountsSql = @"SELECT to_address, COUNT(*) AS total,
+                    SUM(CASE WHEN is_read = 0 THEN 1 ELSE 0 END) AS unread, MAX(received_utc) AS last_received
+                FROM messages INDEXED BY idx_messages_box WHERE is_deleted = 0 GROUP BY to_address";
+
+        internal const string TrashCountSql = "SELECT COUNT(*) FROM messages INDEXED BY idx_messages_feed WHERE is_deleted = 1";
+
+        /// <summary>Arrivals since a cutoff (deleted mail still arrived), by UTC day, from the date index.</summary>
+        internal const string ArrivalsSql = @"SELECT substr(received_utc, 1, 10) AS day, COUNT(*) AS n,
+                    SUM(CASE WHEN received_utc >= $day THEN 1 ELSE 0 END) AS last_day
+                FROM messages INDEXED BY idx_messages_feed
+                WHERE is_deleted IN (0, 1) AND received_utc >= $since GROUP BY day";
+
+        public const int DailyDays = 30;
+
+        public async Task<MailSummary> GetSummaryAsync(DateTime nowUtc, CancellationToken ct = default)
+        {
+            CacheDeps.NoteRead(CacheKey);
+            var summary = new MailSummary();
+            var byAddress = new Dictionary<string, MailboxInfo>(StringComparer.OrdinalIgnoreCase);
+            await using var conn = await db.OpenAsync(ct);
+
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = AddressCountsSql;
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    var info = new MailboxInfo
+                    {
+                        Address = reader.GetString(0),
+                        Total = reader.GetInt32(1),
+                        Unread = reader.GetInt32(2),
+                        LastReceivedUtc = reader.IsDBNull(3) ? null : ParseUtc(reader.GetString(3)),
+                    };
+                    byAddress[info.Address] = info;
+                    summary.Total += info.Total;
+                    summary.Unread += info.Unread;
+                    if (info.LastReceivedUtc is { } last && (summary.LastReceivedUtc == null || last > summary.LastReceivedUtc))
+                        summary.LastReceivedUtc = last;
+                }
+            }
+
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = TrashCountSql;
+                summary.Trash = Convert.ToInt32(await cmd.ExecuteScalarAsync(ct));
+            }
+
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "SELECT address, display_name FROM mailboxes ORDER BY address ASC";
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    string address = reader.GetString(0);
+                    byAddress.Remove(address, out var counts);
+                    summary.Mailboxes.Add(new MailboxInfo
+                    {
+                        Address = address,
+                        DisplayName = reader.IsDBNull(1) ? null : reader.GetString(1),
+                        Total = counts?.Total ?? 0,
+                        Unread = counts?.Unread ?? 0,
+                        LastReceivedUtc = counts?.LastReceivedUtc,
+                        Pinned = true,
+                    });
+                }
+            }
+            summary.Others = byAddress.Values
+                .OrderByDescending(m => m.LastReceivedUtc ?? DateTime.MinValue)
+                .ThenBy(m => m.Address, StringComparer.Ordinal)
+                .ToList();
+
+            DateTime today = nowUtc.Date;
+            DateTime since = today.AddDays(-(DailyDays - 1));
+            var perDay = new Dictionary<string, int>(StringComparer.Ordinal);
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = ArrivalsSql;
+                cmd.Parameters.AddWithValue("$since", since.ToString("yyyy-MM-dd"));
+                cmd.Parameters.AddWithValue("$day", nowUtc.AddDays(-1).ToString("o"));
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    perDay[reader.GetString(0)] = reader.GetInt32(1);
+                    summary.Received24h += reader.GetInt32(2);
+                }
+            }
+            for (var day = since; day <= today; day = day.AddDays(1))
+            {
+                string key = day.ToString("yyyy-MM-dd");
+                int n = perDay.TryGetValue(key, out int count) ? count : 0;
+                summary.Daily.Add(new DayCount { D = key, N = n });
+                if (day > today.AddDays(-7)) summary.Received7d += n;
+            }
+            return summary;
+        }
 
         public async Task<(int Total, int Unread, int Trash)> GetStatsAsync(CancellationToken ct = default)
         {
-            await using var conn = await db.OpenAsync(ct);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = @"SELECT
-                    (SELECT COUNT(*) FROM messages WHERE is_deleted = 0) AS total,
-                    (SELECT COUNT(*) FROM messages WHERE is_deleted = 0 AND is_read = 0) AS unread,
-                    (SELECT COUNT(*) FROM messages WHERE is_deleted = 1) AS trash";
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            if (await reader.ReadAsync(ct))
-                return (reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2));
-            return (0, 0, 0);
+            var summary = await GetSummaryAsync(DateTime.UtcNow, ct);
+            return (summary.Total, summary.Unread, summary.Trash);
         }
 
-        // â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ Helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        // ─────────────────────────── Digest backfill ───────────────────────────
+
+        /// <summary>
+        /// Builds the digest for every message that has none, or one from older rules, in batches so
+        /// arriving mail never waits long for the write lock. Safe to run at every start: when every
+        /// digest is current it is one indexed query. Returns how many it built.
+        /// </summary>
+        public async Task<int> BackfillDigestsAsync(CancellationToken ct = default, int batchSize = 40)
+        {
+            int built = 0;
+            while (!ct.IsCancellationRequested)
+            {
+                var batch = new List<(string Id, string? Subject, string? Text, string? Html)>();
+                await using (var conn = await db.OpenAsync(ct))
+                await using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = @"SELECT m.id, m.subject, m.body_text, m.body_html FROM messages m
+                        LEFT JOIN message_digest d ON d.message_id = m.id
+                        WHERE d.message_id IS NULL OR d.version < $v LIMIT $n";
+                    cmd.Parameters.AddWithValue("$v", KliveMailDigest.Version);
+                    cmd.Parameters.AddWithValue("$n", batchSize);
+                    await using var reader = await cmd.ExecuteReaderAsync(ct);
+                    while (await reader.ReadAsync(ct))
+                        batch.Add((reader.GetString(0), reader.IsDBNull(1) ? null : reader.GetString(1),
+                            reader.IsDBNull(2) ? null : reader.GetString(2), reader.IsDBNull(3) ? null : reader.GetString(3)));
+                }
+                if (batch.Count == 0) break;
+
+                var digests = batch.Select(row => (row.Id, Digest: KliveMailDigest.Build(row.Subject, row.Text, row.Html))).ToList();
+                await db.WithWriteLockAsync(async conn =>
+                {
+                    await using var tx = (SqliteTransaction)await conn.BeginTransactionAsync(ct);
+                    foreach (var (id, digest) in digests)
+                    {
+                        await using var cmd = conn.CreateCommand();
+                        cmd.Transaction = tx;
+                        AddDigestInsert(cmd, id, digest);
+                        await cmd.ExecuteNonQueryAsync(ct);
+                    }
+                    await tx.CommitAsync(ct);
+                }, ct);
+                built += digests.Count;
+                if (batch.Count < batchSize) break;
+            }
+            if (built > 0) CacheDeps.Bump(CacheKey);
+            return built;
+        }
+
+        // ─────────────────────────── Helpers ───────────────────────────
 
         public static string NormalizeAddress(string address)
         {
@@ -320,6 +568,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
             var s = html;
             s = Regex.Replace(s, "(?is)<style[^>]*>.*?</style>", " ");
             s = Regex.Replace(s, "(?is)<script[^>]*>.*?</script>", " ");
+            s = Regex.Replace(s, "(?is)<head(?:\\s[^>]*)?>.*?</head>", " ");
             s = Regex.Replace(s, "(?is)<br\\s*/?>", " ");
             s = Regex.Replace(s, "(?is)</(p|div|li|tr|h[1-6]|table|section|article)>", " ");
             s = Regex.Replace(s, "(?s)<[^>]+>", " ");
@@ -453,7 +702,8 @@ namespace Omnipotent.Services.KliveMail.Persistence
             ThreadId = r.GetString(7),
             HasAttachments = r.GetInt32(8) != 0,
             IsRead = r.GetInt32(9) != 0,
-            Snippet = r.IsDBNull(10) ? null : r.GetString(10)
+            Snippet = r.IsDBNull(10) ? "" : r.GetString(10),
+            Code = r.IsDBNull(11) ? null : r.GetString(11)
         };
 
         private static StoredMessage MapMessage(SqliteDataReader r) => new()

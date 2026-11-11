@@ -29,6 +29,10 @@ namespace Omnipotent.Services.KliveMail
             await service.CreateAPIRoute("/klivemail/messages/mark-unread", HandleMarkUnread, HttpMethod.Post, KliveMailPerms.MessagesAct);
             await service.CreateAPIRoute("/klivemail/messages/delete", HandleDelete, HttpMethod.Post, KliveMailPerms.MessagesDelete);
             await service.CreateAPIRoute("/klivemail/attachments/download", HandleAttachmentDownload, HttpMethod.Get, KliveMailPerms.MessagesRead);
+            // Many messages at once (the inbox held 268 unread across 19 addresses, marked one at a
+            // time), and the way back out of the trash, which had no route at all.
+            await service.CreateAPIRoute("/klivemail/messages/bulk-read", HandleBulkRead, HttpMethod.Post, KliveMailPerms.MessagesAct);
+            await service.CreateAPIRoute("/klivemail/messages/bulk-delete", HandleBulkDelete, HttpMethod.Post, KliveMailPerms.MessagesDelete);
         }
 
         private async Task HandleStats(UserRequest req)
@@ -84,14 +88,16 @@ namespace Omnipotent.Services.KliveMail
         {
             try
             {
-                var mailbox = NormalizeMailboxFilter(req.userParameters.Get("mailbox"));
-                bool unread = ParseBool(req.userParameters.Get("unread"));
-                bool hasAttachment = ParseBool(req.userParameters.Get("hasAttachment"));
-                bool trash = ParseBool(req.userParameters.Get("trash"));
-                int page = ParseInt(req.userParameters.Get("page"), 1);
-                int pageSize = ParseInt(req.userParameters.Get("pageSize"), 50);
-
-                var list = await Repo.ListMessagesAsync(mailbox, unread, hasAttachment, trash, page, pageSize);
+                var list = await Repo.ListMessagesAsync(new Models.MessageQuery
+                {
+                    Mailbox = NormalizeMailboxFilter(req.userParameters.Get("mailbox")),
+                    UnreadOnly = ParseBool(req.userParameters.Get("unread")),
+                    HasAttachmentOnly = ParseBool(req.userParameters.Get("hasAttachment")),
+                    CodesOnly = ParseBool(req.userParameters.Get("codes")),
+                    Trash = ParseBool(req.userParameters.Get("trash")),
+                    Page = ParseInt(req.userParameters.Get("page"), 1),
+                    PageSize = ParseInt(req.userParameters.Get("pageSize"), 50),
+                });
                 await req.ReturnResponse(JsonConvert.SerializeObject(list));
             }
             catch (Exception ex) { await Fail(req, ex); }
@@ -115,8 +121,16 @@ namespace Omnipotent.Services.KliveMail
                     return;
                 }
 
-                if (!msg.IsRead && await Repo.SetReadAsync(id, true)) service.QueueStatsRefresh();
+                // peek=1 reads without marking read (previews, audits); the page opens normally.
+                bool peek = ParseBool(req.userParameters.Get("peek"));
+                bool wasRead = msg.IsRead;
+                if (!peek && !msg.IsRead && await Repo.SetReadAsync(id, true)) service.QueueStatsRefresh();
                 var thread = await Repo.GetThreadAsync(msg.ThreadId);
+                string? code = await Repo.GetCodeAsync(id) ?? KliveMailDigest.FindCode(msg.Subject, msg.BodyText, msg.BodyHtml);
+                // The links a sign-up or sign-in mail wants clicked, best first; footer noise is left out.
+                var links = KliveMailDigest.RankLinks(msg.BodyHtml, msg.BodyText, 12)
+                    .Where(link => link.Score > 0).Take(3)
+                    .Select(link => new { url = link.Url, host = HostOf(link.Url) });
 
                 await req.ReturnResponse(JsonConvert.SerializeObject(new
                 {
@@ -132,7 +146,11 @@ namespace Omnipotent.Services.KliveMail
                     msg.BodyHtml,
                     msg.HasAttachments,
                     msg.RawSize,
-                    IsRead = true,
+                    IsRead = !peek || wasRead,
+                    WasRead = wasRead,
+                    msg.IsDeleted,
+                    Code = code,
+                    Links = links,
                     Attachments = msg.Attachments.Select(a => new
                     {
                         a.Id,
@@ -233,7 +251,80 @@ namespace Omnipotent.Services.KliveMail
             catch (Exception ex) { await Fail(req, ex); }
         }
 
-        // â”€â”€ helpers â”€â”€
+        // Body or query: { "ids": [...] } / ids=a,b,c; plus read=0 (bulk-read) or restore=1 (bulk-delete).
+        private static List<string> ReadIds(UserRequest req)
+        {
+            var ids = new List<string>();
+            string? fromQuery = req.userParameters.Get("ids");
+            if (!string.IsNullOrWhiteSpace(fromQuery)) ids.AddRange(fromQuery.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries));
+            string? body = req.userMessageContent;
+            if (!string.IsNullOrWhiteSpace(body) && body.TrimStart().StartsWith("{"))
+            {
+                try
+                {
+                    var parsed = JsonConvert.DeserializeObject<BulkBody>(body);
+                    if (parsed?.Ids != null) ids.AddRange(parsed.Ids.Where(id => !string.IsNullOrWhiteSpace(id)));
+                }
+                catch (JsonException) { }
+            }
+            return ids;
+        }
+
+        private sealed class BulkBody { public List<string>? Ids { get; set; } }
+
+        private async Task HandleBulkRead(UserRequest req)
+        {
+            try
+            {
+                bool read = req.userParameters.Get("read") is not { } r || ParseBool(r);
+                int changed;
+                if (ParseBool(req.userParameters.Get("all")))
+                {
+                    if (!read)
+                    {
+                        await req.ReturnResponse("all=1 only marks mail read.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    changed = await Repo.MarkAllReadAsync(NormalizeMailboxFilter(req.userParameters.Get("mailbox")));
+                }
+                else
+                {
+                    var ids = ReadIds(req);
+                    if (ids.Count == 0 || ids.Count > KliveMailRepository.MaxBulkIds)
+                    {
+                        await req.ReturnResponse($"Provide 1–{KliveMailRepository.MaxBulkIds} ids, or all=1.", code: HttpStatusCode.BadRequest);
+                        return;
+                    }
+                    changed = await Repo.SetReadManyAsync(ids, read);
+                }
+                if (changed > 0) service.QueueStatsRefresh();
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, changed }));
+            }
+            catch (Exception ex) { await Fail(req, ex); }
+        }
+
+        private async Task HandleBulkDelete(UserRequest req)
+        {
+            try
+            {
+                var ids = ReadIds(req);
+                if (ids.Count == 0 || ids.Count > KliveMailRepository.MaxBulkIds)
+                {
+                    await req.ReturnResponse($"Provide 1–{KliveMailRepository.MaxBulkIds} ids.", code: HttpStatusCode.BadRequest);
+                    return;
+                }
+                bool restore = ParseBool(req.userParameters.Get("restore"));
+                int changed = await Repo.SetDeletedManyAsync(ids, deleted: !restore);
+                if (changed > 0) service.QueueStatsRefresh();
+                await req.ReturnResponse(JsonConvert.SerializeObject(new { success = true, changed, restored = restore }));
+            }
+            catch (Exception ex) { await Fail(req, ex); }
+        }
+
+        // ── helpers ──
+
+        private static string? HostOf(string url)
+            => Uri.TryCreate(url, UriKind.Absolute, out var uri) ? uri.Host : null;
 
         private static async Task Fail(UserRequest req, Exception ex)
             => await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError);

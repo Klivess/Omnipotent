@@ -173,45 +173,11 @@ internal static class KliveAgentMailTools
         return sb.ToString().TrimEnd();
     }
 
-    private static readonly Regex HrefPattern = new(@"href\s*=\s*[""']([^""']+)[""']", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly Regex BareUrlPattern = new(@"https?://[^\s<>""'\)\]]+", RegexOptions.IgnoreCase | RegexOptions.Compiled);
-    private static readonly string[] VerificationCues = { "verify", "verif", "confirm", "activate", "activation", "validate", "email", "token", "auth", "magic", "login", "signin", "sign-in", "register", "welcome", "complete" };
-    private static readonly string[] NoiseCues = { "unsubscribe", "privacy", "terms", "help", "support", "preferences", "policy", "facebook.com", "twitter.com", "instagram.com", "apple.com/app", "play.google", "mailto:" };
-
     /// <summary>Unique http(s) links from the HTML and text bodies, verification-looking ones first,
-    /// footer noise (unsubscribe, privacy, app stores, socials) last.</summary>
+    /// footer noise (unsubscribe, privacy, app stores, socials) last. The ranking lives with KliveMail,
+    /// which shows the same links on the mail page.</summary>
     internal static List<string> ExtractLinks(string? html, string? text, int max = 8)
-    {
-        var found = new List<string>();
-        void Add(string raw)
-        {
-            string url = WebUtility.HtmlDecode(raw).Trim().TrimEnd('.', ',', ';');
-            if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
-                && !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return;
-            if (url.Length > 2000) return;
-            if (!found.Contains(url, StringComparer.Ordinal)) found.Add(url);
-        }
-        if (!string.IsNullOrEmpty(html))
-            foreach (Match match in HrefPattern.Matches(html)) Add(match.Groups[1].Value);
-        foreach (var source in new[] { text, html })
-            if (!string.IsNullOrEmpty(source))
-                foreach (Match match in BareUrlPattern.Matches(source)) Add(match.Value);
-
-        int Score(string url)
-        {
-            string lower = url.ToLowerInvariant();
-            int score = VerificationCues.Count(cue => lower.Contains(cue)) * 10;
-            if (NoiseCues.Any(cue => lower.Contains(cue))) score -= 50;
-            return score;
-        }
-        return found
-            .Select((url, index) => (url, index, score: Score(url)))
-            .OrderByDescending(x => x.score)
-            .ThenBy(x => x.index)
-            .Take(max)
-            .Select(x => x.url)
-            .ToList();
-    }
+        => Omnipotent.Services.KliveMail.KliveMailDigest.RankLinks(html, text, max).Select(link => link.Url).ToList();
 
     private static string HtmlToText(string? html)
     {
