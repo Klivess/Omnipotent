@@ -2,7 +2,9 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAPI.Caching;
+using Omnipotent.Services.KliveAPI.Telemetry;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Net;
 using Omnipotent.Profiles.Permissions;
 
@@ -21,6 +23,16 @@ namespace Omnipotent.Service_Manager
         public List<string> DropdownOptions { get; set; } = new();
         [JsonIgnore] public bool WasUsedThisSession { get; set; }
         [JsonIgnore] public bool HasValue { get; set; }
+
+        // Metadata, persisted in the clear beside the value. None of it is in the AES-GCM associated
+        // data, so adding or changing it never invalidates a protected envelope.
+
+        /// <summary>When the value (or its type or sensitivity) last changed.</summary>
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public DateTime? UpdatedUtc { get; set; }
+        /// <summary>Who changed it: the profile that saved it on the OmniSettings page, "Discord" for a prompt reply, else the service.</summary>
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public string? UpdatedBy { get; set; }
+        /// <summary>When a service last read it. Coarse on disk (see <see cref="OmniGlobalSettingsManager.LastReadPersistInterval"/>), so reads do not rewrite the file.</summary>
+        [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public DateTime? LastReadUtc { get; set; }
     }
 
     public class OmniSettingsChangedEventArgs : EventArgs
@@ -55,10 +67,31 @@ namespace Omnipotent.Service_Manager
         private readonly TaskCompletionSource<bool> settingsLoaded = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public event EventHandler<OmniSettingsChangedEventArgs> OnSettingsChanged;
 
+        // ── what the management page shows beside each value (memory only unless noted) ──
+
+        /// <summary>The default the code passed at its last typed read, by setting key. Never kept for a secret.
+        /// A stored value wins over a changed default forever, so this is how the page shows the gap.</summary>
+        private readonly ConcurrentDictionary<string, string> codeDefaults = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>Exact last read this process. The persisted <see cref="OmniSetting.LastReadUtc"/> is coarse.</summary>
+        private readonly ConcurrentDictionary<string, DateTime> lastReads = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>Settings a service is blocked on until Klives supplies a value, with when it started waiting.</summary>
+        private readonly ConcurrentDictionary<string, DateTime> awaitingSince = new(StringComparer.OrdinalIgnoreCase);
+        /// <summary>A stored read time older than this is refreshed (in one batched write) the next time the setting is read.</summary>
+        internal static readonly TimeSpan LastReadPersistInterval = TimeSpan.FromHours(6);
+        internal TimeSpan LastReadFlushDelay { get; set; } = TimeSpan.FromSeconds(60);
+        internal Func<DateTime> UtcNow { get; set; } = () => DateTime.UtcNow;
+        private int lastReadFlushScheduled;
+        /// <summary>Tests only: stands in for the Discord notice that a secret is needed (there is no service manager in a test).</summary>
+        internal Func<string, Task>? SensitiveNoticeOverride { get; set; }
+        /// <summary>Persisted: when read times started being kept, so "never read" can mean something.</summary>
+        private DateTime? readTrackingSinceUtc;
+        private readonly DateTime sessionStartedUtc;
+
         private sealed class SettingsDocument
         {
             public int FormatVersion { get; set; } = 1;
             public List<OmniSetting> Settings { get; set; } = new();
+            [JsonProperty(NullValueHandling = NullValueHandling.Ignore)] public DateTime? ReadTrackingSinceUtc { get; set; }
         }
         private sealed class SecretPayload
         {
@@ -78,6 +111,8 @@ namespace Omnipotent.Service_Manager
             settingsDirectory = Path.GetFullPath(directory);
             settingsFilePath = Path.Combine(settingsDirectory, "settings.json");
             this.protector = protector;
+            try { sessionStartedUtc = Process.GetCurrentProcess().StartTime.ToUniversalTime(); }
+            catch { sessionStartedUtc = DateTime.UtcNow; }
         }
 
         protected override async void ServiceMain()
@@ -131,6 +166,7 @@ namespace Omnipotent.Service_Manager
                     if (File.Exists(legacyStagingPath)) sourceFilePath = legacyStagingPath;
                     else
                     {
+                        readTrackingSinceUtc = UtcNow();
                         await PersistSettingsLocked(Array.Empty<OmniSetting>());
                         protector.MarkMigrated(settingsFilePath);
                         return;
@@ -152,6 +188,7 @@ namespace Omnipotent.Service_Manager
                 if (legacy && previouslyMigrated)
                     throw new InvalidDataException("Protected settings cannot be downgraded to legacy storage.");
                 List<OmniSetting> list;
+                DateTime? savedTrackingSince = null;
                 if (legacy) list = token.ToObject<List<OmniSetting>>() ?? throw new InvalidDataException("Invalid settings document.");
                 else
                 {
@@ -160,6 +197,7 @@ namespace Omnipotent.Service_Manager
                         || token["FormatVersion"]!.Value<int>() != 1 || token["Settings"]?.Type != JTokenType.Array)
                         throw new InvalidDataException("Unsupported settings format.");
                     list = document.Settings;
+                    savedTrackingSince = document.ReadTrackingSinceUtc;
                 }
                 // Older releases skipped nameless records and used the last normalized duplicate.
                 // Only the legacy format receives that tolerance; encrypted documents stay strict.
@@ -203,6 +241,7 @@ namespace Omnipotent.Service_Manager
                     loaded[key] = EncodeSetting(plain);
                 }
                 // Complete an atomic migration before making settings available to services.
+                readTrackingSinceUtc = savedTrackingSince ?? UtcNow();
                 await PersistSettingsLocked(loaded.Values);
                 protector.MarkMigrated(settingsFilePath);
                 // Previous releases used this fixed staging name and could leave plaintext after a crash.
@@ -218,15 +257,25 @@ namespace Omnipotent.Service_Manager
             finally { FileIOLock.Release(); }
         }
 
+        // Each step is a span on the request that caused the write: a save took 179 ms at the median and
+        // 2.4 s at p95 on the live server (30 days, Nov 2026), all of it in this handler, with nothing to
+        // say which step. The spans accumulate by name, so a trace reads as the cost of each kind of work.
         private async Task PersistSettingsLocked(IEnumerable<OmniSetting> values)
         {
-            OmniSettingsProtector.HardenDirectory(settingsDirectory);
-            OmniSettingsProtector.ValidatePath(settingsFilePath);
-            if (!File.Exists(settingsFilePath) && protector.WasMigrated(settingsFilePath))
-                throw new InvalidDataException("The protected settings file is missing. Restore the saved document.");
-            string json = JsonConvert.SerializeObject(new SettingsDocument { Settings = values.ToList() }, Formatting.Indented);
-            if (System.Text.Encoding.UTF8.GetByteCount(json) > MaxSettingsFileBytes)
-                throw new InvalidDataException("Settings file exceeds its size limit.");
+            using (RequestTrace.AmbientSpan("settings-acl"))
+            {
+                OmniSettingsProtector.HardenDirectory(settingsDirectory);
+                OmniSettingsProtector.ValidatePath(settingsFilePath);
+                if (!File.Exists(settingsFilePath) && protector.WasMigrated(settingsFilePath))
+                    throw new InvalidDataException("The protected settings file is missing. Restore the saved document.");
+            }
+            string json;
+            using (RequestTrace.AmbientSpan("settings-serialize"))
+            {
+                json = JsonConvert.SerializeObject(new SettingsDocument { Settings = values.ToList(), ReadTrackingSinceUtc = readTrackingSinceUtc }, Formatting.Indented);
+                if (System.Text.Encoding.UTF8.GetByteCount(json) > MaxSettingsFileBytes)
+                    throw new InvalidDataException("Settings file exceeds its size limit.");
+            }
             string tempPath = Path.Combine(settingsDirectory, $"settings-{Guid.NewGuid():N}.tmp");
             try
             {
@@ -234,17 +283,23 @@ namespace Omnipotent.Service_Manager
                 await using (var stream = new FileStream(tempPath, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                     4096, FileOptions.Asynchronous | FileOptions.WriteThrough))
                 {
-                    OmniSettingsProtector.HardenFile(tempPath);
-                    await stream.WriteAsync(System.Text.Encoding.UTF8.GetBytes(json));
-                    stream.Flush(flushToDisk: true);
+                    using (RequestTrace.AmbientSpan("settings-acl")) OmniSettingsProtector.HardenFile(tempPath);
+                    using (RequestTrace.AmbientSpan("settings-write"))
+                    {
+                        await stream.WriteAsync(System.Text.Encoding.UTF8.GetBytes(json));
+                        stream.Flush(flushToDisk: true);
+                    }
                 }
-                OmniSettingsProtector.ValidatePath(settingsFilePath);
-                if (File.Exists(settingsFilePath))
+                using (RequestTrace.AmbientSpan("settings-acl")) OmniSettingsProtector.ValidatePath(settingsFilePath);
+                using (RequestTrace.AmbientSpan("settings-replace"))
                 {
-                    OmniSettingsProtector.HardenFile(settingsFilePath);
-                    File.Replace(tempPath, settingsFilePath, null);
+                    if (File.Exists(settingsFilePath))
+                    {
+                        OmniSettingsProtector.HardenFile(settingsFilePath);
+                        File.Replace(tempPath, settingsFilePath, null);
+                    }
+                    else File.Move(tempPath, settingsFilePath);
                 }
-                else File.Move(tempPath, settingsFilePath);
             }
             finally { if (File.Exists(tempPath)) File.Delete(tempPath); }
         }
@@ -267,8 +322,8 @@ namespace Omnipotent.Service_Manager
                     next[ComposeKey(plain.ParentServiceId, plain.Name)] = EncodeSetting(plain);
                 }
             }
-            protector.MarkMigrated(settingsFilePath);
-            await FileIOLock.WaitAsync();
+            using (RequestTrace.AmbientSpan("settings-marker")) protector.MarkMigrated(settingsFilePath);
+            using (RequestTrace.AmbientSpan("settings-io-wait")) await FileIOLock.WaitAsync();
             try { await PersistSettingsLocked(next.Values); }
             finally { FileIOLock.Release(); }
             settings = next;
@@ -283,6 +338,7 @@ namespace Omnipotent.Service_Manager
             stored.HasValue = !string.IsNullOrEmpty(plain.Value);
             if (stored.Sensitive)
             {
+                using var crypto = RequestTrace.AmbientSpan("settings-crypto");
                 stored.Value = protector.Protect(JsonConvert.SerializeObject(new SecretPayload
                     { Value = plain.Value ?? "", DropdownOptions = plain.DropdownOptions,
                       ParentServiceName = plain.ParentServiceName ?? "" }), stored);
@@ -296,6 +352,7 @@ namespace Omnipotent.Service_Manager
             var plain = Copy(stored);
             if (stored.Sensitive)
             {
+                using var crypto = RequestTrace.AmbientSpan("settings-crypto");
                 var payload = JsonConvert.DeserializeObject<SecretPayload>(protector.Unprotect(stored.Value, stored))
                     ?? throw new InvalidDataException("Invalid protected payload.");
                 if (payload.ParentServiceName != null
@@ -313,7 +370,8 @@ namespace Omnipotent.Service_Manager
             Name = s.Name, Type = s.Type, Sensitive = s.Sensitive, Value = s.Value,
             ParentServiceId = s.ParentServiceId, ParentServiceName = s.ParentServiceName,
             DropdownOptions = s.DropdownOptions?.ToList() ?? new(),
-            WasUsedThisSession = s.WasUsedThisSession, HasValue = s.HasValue
+            WasUsedThisSession = s.WasUsedThisSession, HasValue = s.HasValue,
+            UpdatedUtc = s.UpdatedUtc, UpdatedBy = s.UpdatedBy, LastReadUtc = s.LastReadUtc
         };
 
         internal static OmniSetting Redact(OmniSetting s)
@@ -436,7 +494,7 @@ namespace Omnipotent.Service_Manager
             if (type == OmniSettingType.Dropdown && options.Count == 0) throw new ArgumentException("Dropdown settings need options.");
             OmniSetting result;
             OmniSettingsChangedEventArgs? change = null;
-            await stateGate.WaitAsync();
+            using (RequestTrace.AmbientSpan("settings-gate")) await stateGate.WaitAsync();
             try
             {
                 var existing = ResolveServiceSetting(name, parentServiceId, parentServiceName);
@@ -469,21 +527,36 @@ namespace Omnipotent.Service_Manager
                 plain.Type = type;
                 plain.DropdownOptions = type == OmniSettingType.Dropdown ? options : new();
                 if (type == OmniSettingType.Dropdown) plain.Value = NormalizeDropdownValue(plain.Value, options);
-                bool modified = isNew || existing!.Sensitive != plain.Sensitive || existing.Type != plain.Type
-                    || previousValue != plain.Value || !previousOptions.SequenceEqual(plain.DropdownOptions);
+                bool valueChanged = isNew || existing!.Sensitive != plain.Sensitive || existing.Type != plain.Type
+                    || previousValue != plain.Value;
+                bool modified = valueChanged || !previousOptions.SequenceEqual(plain.DropdownOptions);
                 plain.WasUsedThisSession = true;
                 plain.HasValue = !string.IsNullOrEmpty(plain.Value);
+
+                DateTime now = UtcNow();
+                string settingKey = ComposeKey(plain.ParentServiceId, plain.Name);
+                if (valueChanged) { plain.UpdatedUtc = now; plain.UpdatedBy = parentServiceName ?? "UnknownService"; }
+                // The page shows what the code asks for beside what is stored: a stored value outlives any change of default.
+                if (plain.Sensitive) codeDefaults.TryRemove(settingKey, out _);
+                else codeDefaults[settingKey] = type == OmniSettingType.Dropdown ? NormalizeDropdownValue(defaultValue, options) : defaultValue ?? "";
+                lastReads[settingKey] = now;
+                bool stampRead = plain.LastReadUtc is not DateTime storedRead || now - storedRead >= LastReadPersistInterval;
+                if (stampRead) plain.LastReadUtc = now;
+
                 if (modified)
                 {
                     await CommitSetting(EncodeSetting(plain), UpdatedOwnerCopies(plain, ownerKeys));
                     change = CreateChange(plain, previousValue, isNew);
                 }
-                else if (!existing!.WasUsedThisSession)
+                else if (!existing!.WasUsedThisSession || stampRead)
                 {
                     var used = Copy(existing);
                     used.WasUsedThisSession = true;
-                    settings[ComposeKey(used.ParentServiceId, used.Name)] = used;
-                    CacheDeps.Bump(CacheKey);
+                    if (stampRead) used.LastReadUtc = now;
+                    settings[settingKey] = used;
+                    if (!existing.WasUsedThisSession) CacheDeps.Bump(CacheKey);
+                    // A read time is informational: written with the next change, or in one batch shortly after.
+                    if (stampRead) ScheduleLastReadFlush();
                 }
                 var aliasKey = ServiceAliasKey(name, parentServiceId, parentServiceName);
                 if (followsSavedOwner) serviceSettingAliases[aliasKey] = new(ComposeKey(plain.ParentServiceId, plain.Name), ownerKeys);
@@ -500,16 +573,21 @@ namespace Omnipotent.Service_Manager
                 string trackingId = $"setting-fulfillment:{key}:{Guid.NewGuid():N}";
                 if (pendingFulfillmentPromptIds.TryAdd(key, trackingId))
                 {
+                    awaitingSince.TryAdd(key, UtcNow());
                     try
                     {
                         var response = (string?)await ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>("SendTextPromptToKlivesDiscordTracked",
                             trackingId, $"Please provide value for setting '{name}' ({type})", $"Enter the value for setting '{name}'.",
                             TimeSpan.FromDays(7), "Setting value", "Value");
                         if (!string.IsNullOrEmpty(response))
-                            await SetOmniSetting(name, response.Trim(), result.ParentServiceId, result.ParentServiceName, type, dropdownOptions: options);
+                            await SetOmniSetting(name, response.Trim(), result.ParentServiceId, result.ParentServiceName, type, dropdownOptions: options, changedBy: "Discord");
                     }
                     catch { }
-                    finally { pendingFulfillmentPromptIds.TryRemove(key, out _); }
+                    finally
+                    {
+                        pendingFulfillmentPromptIds.TryRemove(key, out _);
+                        awaitingSince.TryRemove(key, out _);
+                    }
                 }
                 if (settings.TryGetValue(key, out var refreshed)) result = DecodeSetting(refreshed);
             }
@@ -526,9 +604,12 @@ namespace Omnipotent.Service_Manager
                 if (settings.TryGetValue(key, out var recheck) && recheck.HasValue) return DecodeSetting(recheck);
                 if (ReferenceEquals(pending, completion))
                 {
+                    // Before the notice, which can fail: the page still shows that a service is waiting.
+                    awaitingSince.TryAdd(key, UtcNow());
                     // A notice has no text-entry modal: credentials never pass through Discord.
-                    await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives",
-                        $"Sensitive setting '{setting.Name}' needs a value. Enter it in the OmniSettings management page over HTTPS.");
+                    string notice = $"Sensitive setting '{setting.Name}' needs a value. Enter it in the OmniSettings management page over HTTPS.";
+                    if (SensitiveNoticeOverride != null) await SensitiveNoticeOverride(notice);
+                    else await ExecuteServiceMethod<Omnipotent.Services.KliveBot_Discord.KliveBotDiscord>("SendMessageToKlives", notice);
                 }
                 await pending.Task.WaitAsync(TimeSpan.FromDays(7));
             }
@@ -538,6 +619,7 @@ namespace Omnipotent.Service_Manager
                 if (ReferenceEquals(pending, completion))
                 {
                     pendingSensitiveFulfillments.TryRemove(new KeyValuePair<string, TaskCompletionSource<bool>>(key, completion));
+                    awaitingSince.TryRemove(key, out _);
                     completion.TrySetResult(false);
                 }
             }
@@ -649,9 +731,10 @@ namespace Omnipotent.Service_Manager
         }
 
 
+        /// <param name="changedBy">Recorded as <see cref="OmniSetting.UpdatedBy"/> when the value changes; the calling service when omitted.</param>
         public async Task<bool> SetOmniSetting(string name, string value, string parentServiceId = null, string parentServiceName = null,
             OmniSettingType type = OmniSettingType.String, bool fulfilledViaApi = false, IEnumerable<string>? dropdownOptions = null,
-            bool sensitive = false)
+            bool sensitive = false, string? changedBy = null)
         {
             await EnsureSettingsLoadedAsync();
             name = NormalizeSettingName(name);
@@ -667,7 +750,8 @@ namespace Omnipotent.Service_Manager
             if (!Enum.IsDefined(type)) throw new ArgumentException("Invalid setting type.");
             OmniSettingsChangedEventArgs? change = null;
             string resolvedKey = "";
-            await stateGate.WaitAsync();
+            bool hasValueNow = false;
+            using (RequestTrace.AmbientSpan("settings-gate")) await stateGate.WaitAsync();
             try
             {
                 var existing = ResolveExisting(name, parentServiceId);
@@ -709,13 +793,21 @@ namespace Omnipotent.Service_Manager
                 plain.Value = type == OmniSettingType.Dropdown ? NormalizeDropdownValue(value, plain.DropdownOptions) : value ?? "";
                 plain.HasValue = !string.IsNullOrEmpty(plain.Value);
                 plain.WasUsedThisSession = true;
+                if (existing == null || previousValue != plain.Value || existing.Type != plain.Type || existing.Sensitive != plain.Sensitive)
+                {
+                    plain.UpdatedUtc = UtcNow();
+                    plain.UpdatedBy = changedBy ?? parentServiceName ?? "UnknownService";
+                }
                 await CommitSetting(EncodeSetting(plain), UpdatedOwnerCopies(plain, ownerKeys));
                 change = CreateChange(plain, previousValue, existing == null);
                 resolvedKey = ComposeKey(plain.ParentServiceId, plain.Name);
+                hasValueNow = plain.HasValue;
             }
             catch (ArgumentException) { throw; }
             catch { return false; }
             finally { stateGate.Release(); }
+            // Whoever was waiting on this value is released below; the page stops listing it at once.
+            if (hasValueNow) awaitingSince.TryRemove(resolvedKey, out _);
             RaiseSettingsChanged(change);
             if (pendingSensitiveFulfillments.TryRemove(resolvedKey, out var sensitiveCompletion))
                 sensitiveCompletion.TrySetResult(true);
@@ -788,7 +880,7 @@ namespace Omnipotent.Service_Manager
         {
             await EnsureSettingsLoadedAsync();
             if (string.IsNullOrWhiteSpace(name)) return false;
-            await stateGate.WaitAsync();
+            using (RequestTrace.AmbientSpan("settings-gate")) await stateGate.WaitAsync();
             try
             {
                 var existing = ResolveExisting(name, parentServiceId);
@@ -796,13 +888,16 @@ namespace Omnipotent.Service_Manager
                 string key = ComposeKey(existing.ParentServiceId, existing.Name);
                 var next = new ConcurrentDictionary<string, OmniSetting>(settings, StringComparer.OrdinalIgnoreCase);
                 next.TryRemove(key, out _);
-                protector.MarkMigrated(settingsFilePath);
-                await FileIOLock.WaitAsync();
+                using (RequestTrace.AmbientSpan("settings-marker")) protector.MarkMigrated(settingsFilePath);
+                using (RequestTrace.AmbientSpan("settings-io-wait")) await FileIOLock.WaitAsync();
                 try { await PersistSettingsLocked(next.Values); }
                 finally { FileIOLock.Release(); }
                 settings = next;
                 pendingFulfillmentPromptIds.TryRemove(key, out _);
                 if (pendingSensitiveFulfillments.TryRemove(key, out var pending)) pending.TrySetResult(false);
+                awaitingSince.TryRemove(key, out _);
+                codeDefaults.TryRemove(key, out _);
+                lastReads.TryRemove(key, out _);
                 CacheDeps.Bump(CacheKey);
                 return true;
             }
@@ -918,6 +1013,103 @@ namespace Omnipotent.Service_Manager
             return new { safe.Name, safe.Type, safe.Sensitive, safe.ParentServiceId, safe.ParentServiceName,
                 safe.WasUsedThisSession, safe.HasValue, safe.DropdownOptions, safe.Value };
         }
+
+        // ───────────────────────────── management page ─────────────────────────────
+
+        /// <summary>
+        /// One setting as the OmniSettings page shows it: <see cref="ApiView"/>'s redacted fields, plus when a
+        /// service last read it, when and by whom it last changed, what the code's default is (never for a
+        /// secret) and whether a service is blocked waiting for it. Empty fields are left out.
+        /// </summary>
+        internal Dictionary<string, object?> BoardView(OmniSetting stored)
+        {
+            var safe = Redact(stored);
+            string key = ComposeKey(stored.ParentServiceId, stored.Name);
+            // Only a service's read counts: a save from the page also sets WasUsedThisSession.
+            bool readThisSession = lastReads.TryGetValue(key, out var exactRead);
+            DateTime? lastRead = readThisSession ? exactRead : stored.LastReadUtc;
+            string? codeDefault = !stored.Sensitive && codeDefaults.TryGetValue(key, out var recorded) ? recorded : null;
+            var view = new Dictionary<string, object?>
+            {
+                ["Name"] = safe.Name, ["Type"] = safe.Type, ["Sensitive"] = safe.Sensitive, ["HasValue"] = safe.HasValue,
+                ["ParentServiceId"] = safe.ParentServiceId, ["ParentServiceName"] = safe.ParentServiceName,
+                ["Value"] = safe.Value, ["ReadThisSession"] = readThisSession,
+            };
+            if (safe.DropdownOptions.Count > 0) view["DropdownOptions"] = safe.DropdownOptions;
+            if (lastRead != null) view["LastReadUtc"] = lastRead;
+            if (safe.UpdatedUtc != null) view["UpdatedUtc"] = safe.UpdatedUtc;
+            if (!string.IsNullOrEmpty(safe.UpdatedBy)) view["UpdatedBy"] = safe.UpdatedBy;
+            if (codeDefault != null)
+            {
+                view["DefaultValue"] = codeDefault;
+                view["MatchesDefault"] = SameSettingValue(stored.Type, stored.Value, codeDefault);
+            }
+            if (awaitingSince.TryGetValue(key, out var since))
+            {
+                view["Awaiting"] = true;
+                view["AwaitingSinceUtc"] = since;
+            }
+            return view;
+        }
+
+        internal string BuildBoardJson() => JsonConvert.SerializeObject(new
+        {
+            Version = 1,
+            GeneratedUtc = UtcNow(),
+            SessionStartedUtc = sessionStartedUtc,
+            ReadTrackingSinceUtc = readTrackingSinceUtc,
+            Settings = settings.Values
+                .OrderBy(s => s.ParentServiceName, StringComparer.OrdinalIgnoreCase)
+                .ThenBy(s => s.Name, StringComparer.OrdinalIgnoreCase)
+                .Select(BoardView)
+                .ToList(),
+        });
+
+        /// <summary>Equal as the setting's type reads them: "True" is "true", "007" is 7, a list ignores blank entries.</summary>
+        internal static bool SameSettingValue(OmniSettingType type, string? stored, string? other)
+        {
+            stored ??= "";
+            other ??= "";
+            return type switch
+            {
+                OmniSettingType.Bool => bool.TryParse(stored, out var a) && bool.TryParse(other, out var b)
+                    ? a == b : string.Equals(stored.Trim(), other.Trim(), StringComparison.OrdinalIgnoreCase),
+                OmniSettingType.Int => int.TryParse(stored, out var x) && int.TryParse(other, out var y)
+                    ? x == y : string.Equals(stored.Trim(), other.Trim(), StringComparison.Ordinal),
+                OmniSettingType.Dropdown => string.Equals(stored.Trim(), other.Trim(), StringComparison.OrdinalIgnoreCase),
+                OmniSettingType.StringList => DeserializeStringList(stored).SequenceEqual(DeserializeStringList(other), StringComparer.Ordinal),
+                _ => string.Equals(stored, other, StringComparison.Ordinal),
+            };
+        }
+
+        private void ScheduleLastReadFlush()
+        {
+            if (Interlocked.Exchange(ref lastReadFlushScheduled, 1) == 1) return;
+            _ = Task.Run(async () =>
+            {
+                try { await Task.Delay(LastReadFlushDelay); } catch { }
+                // Reads stamped from here on schedule the next batch.
+                Interlocked.Exchange(ref lastReadFlushScheduled, 0);
+                await FlushLastReadsAsync();
+            });
+        }
+
+        /// <summary>Writes the read times stamped in memory. Best effort: a failure costs only their freshness.</summary>
+        internal async Task<bool> FlushLastReadsAsync()
+        {
+            try { await EnsureSettingsLoadedAsync(); } catch { return false; }
+            await stateGate.WaitAsync();
+            try
+            {
+                protector.MarkMigrated(settingsFilePath);
+                await FileIOLock.WaitAsync();
+                try { await PersistSettingsLocked(settings.Values); }
+                finally { FileIOLock.Release(); }
+                return true;
+            }
+            catch { return false; }
+            finally { stateGate.Release(); }
+        }
         private static JObject ParseRequest(string content)
         {
             if (string.IsNullOrEmpty(content) || content.Length > MaxRequestBodyBytes) throw new ArgumentException("Invalid settings request.");
@@ -944,6 +1136,13 @@ namespace Omnipotent.Service_Manager
             {
                 CacheDeps.MarkUncacheable("protected-settings");
                 await req.ReturnResponse(JsonConvert.SerializeObject(settings.Values.Select(ApiView)), "application/json");
+            }, HttpMethod.Get, SystemPerms.SettingsRead);
+
+            // The management page's view. List keeps its shape for the pages that read one service's settings.
+            await CreateAPIRoute("/OmniGlobalSettings/Board", async req =>
+            {
+                CacheDeps.MarkUncacheable("protected-settings");
+                await req.ReturnResponse(BuildBoardJson(), "application/json");
             }, HttpMethod.Get, SystemPerms.SettingsRead);
 
             await CreateAPIRoute("/OmniGlobalSettings/Get", async req =>
@@ -980,11 +1179,24 @@ namespace Omnipotent.Service_Manager
                         if (obj["sensitive"]!.Type != JTokenType.Boolean) throw new ArgumentException("Invalid sensitive flag.");
                         sensitive = obj["sensitive"]!.Value<bool>();
                     }
+                    // The management page asks for the saved row back (normalised value, change stamp, default match).
+                    bool returnView = false;
+                    if (obj["returnView"] != null)
+                    {
+                        if (obj["returnView"]!.Type != JTokenType.Boolean) throw new ArgumentException("Invalid view flag.");
+                        returnView = obj["returnView"]!.Value<bool>();
+                    }
                     var existing = ResolveExisting(name, parentId);
                     parentId = existing?.ParentServiceId ?? parentId ?? "0";
                     parentName = existing?.ParentServiceName ?? parentName ?? "API/Global";
+                    string changedBy = string.IsNullOrWhiteSpace(req.user?.Name) ? "OmniSettings page" : req.user!.Name;
                     bool saved = await SetOmniSetting(name, value, parentId, parentName, existing?.Type ?? OmniSettingType.String,
-                        fulfilledViaApi: true, sensitive: sensitive);
+                        fulfilledViaApi: true, sensitive: sensitive, changedBy: changedBy);
+                    if (saved && returnView && ResolveExisting(name, parentId) is { } updated)
+                    {
+                        await req.ReturnResponse(JsonConvert.SerializeObject(BoardView(updated)), "application/json");
+                        return;
+                    }
                     await req.ReturnResponse(saved ? "OK" : "SettingsUnavailable", code: saved ? HttpStatusCode.OK : HttpStatusCode.InternalServerError);
                 }
                 catch (ArgumentException) { await req.ReturnResponse("InvalidSettingsRequest", code: HttpStatusCode.BadRequest); }

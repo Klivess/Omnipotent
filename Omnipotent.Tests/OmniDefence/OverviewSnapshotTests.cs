@@ -92,6 +92,45 @@ public sealed class OverviewSnapshotTests : IDisposable
     }
 
     [Fact]
+    public async Task ABuildThatNeverYieldsItsThreadIsReportedSlowWhileItRuns()
+    {
+        string path = Path.Combine(directory, "overview.snapshot.json");
+        using var release = new ManualResetEventSlim(false);
+        var reported = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        OmniDefenceOverviewSnapshot? snapshot = null;
+        snapshot = new OmniDefenceOverviewSnapshot(path, () =>
+        {
+            // What the real build does: SQLite's async calls complete synchronously, so the build
+            // holds its thread from start to finish and hands back a task that is already done.
+            snapshot!.ReportStep("busiest routes today");
+            release.Wait();
+            return Task.FromResult("{\"requests24h\":1}");
+        }, ex => reported.TrySetResult(ex), slowBuildAfter: TimeSpan.FromMilliseconds(100));
+
+        using var stop = new CancellationTokenSource();
+        Task loop = Task.Run(() => snapshot.RunAsync(stop.Token));
+        try
+        {
+            // Called straight from the loop, such a build blocked it: the slow-build watch started
+            // only after the build was over, so it never fired. In production a build sat in this
+            // step for over an hour and the log stayed empty.
+            Exception error = await reported.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.IsType<TimeoutException>(error);
+            Assert.Contains("still in step 'busiest routes today'", error.Message);
+            // Said while the build was running, not once it had finished.
+            Assert.Null(snapshot.CurrentJson);
+            Assert.True(Newtonsoft.Json.Linq.JObject.FromObject(snapshot.Status()).Value<bool>("building"));
+        }
+        finally
+        {
+            release.Set();
+            stop.Cancel();
+            await loop.WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        Assert.Equal("{\"requests24h\":1}", snapshot.CurrentJson);
+    }
+
+    [Fact]
     public async Task FailedRefreshKeepsLastPublishedSnapshot()
     {
         string path = Path.Combine(directory, "overview.snapshot.json");

@@ -23,6 +23,74 @@ namespace Omnipotent.Services.OmniDefence
             ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver()
         });
 
+        // ---- The overview's reads of the request log ----
+        // Each names the utc_ts index (INDEXED BY), so it costs the window it asks about and not the
+        // whole log. Left to the planner, "busiest routes today" did the opposite. SQLite has no
+        // statistics for this database, so it cannot tell that "utc_ts >= ?" keeps only the newest
+        // rows, and it prefers to walk the whole route index, where the rows come out already
+        // grouped. That walk fetches every row ever logged, in route order, to test its utc_ts. On
+        // 10 Nov 2026 the log held 1,694,632 rows, about 3,000 of them from the last day, and a build
+        // was still in that step more than an hour after it started; the four steps before it took
+        // under 51 seconds together. OverviewQueryCostTests holds each read to its window.
+
+        /// <summary>Every request since $week, oldest first: when, and whether it was denied or errored.</summary>
+        internal const string OverviewWindowSql =
+            "SELECT utc_ts, (deny_reason IS NOT NULL OR status_code >= 400) FROM requests INDEXED BY ix_requests_ts WHERE utc_ts >= $week";
+
+        /// <summary>One hour of the request log. <c>H</c> is the unix time of its first second.</summary>
+        internal sealed record HourOfRequests(long H, long Requests, long Denied);
+
+        /// <summary>The last week of the request log by hour, with the last 24 hours counted to the second.</summary>
+        internal sealed record RequestWindow(long Requests7d, long Requests24h, long Denied24h, List<HourOfRequests> Hourly);
+
+        /// <summary>
+        /// One pass over the week. The rows arrive in time order and are folded into hours here:
+        /// grouping in SQL (GROUP BY utc_ts / 3600) sorts the whole window first, because SQLite
+        /// cannot tell that the index already delivers it in that order.
+        /// </summary>
+        internal static Task<RequestWindow> ReadRequestWindowAsync(OmniDefenceStore store, long week, long day)
+            => store.WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = OverviewWindowSql;
+            cmd.Parameters.AddWithValue("$week", week);
+            long requests7d = 0, requests24h = 0, denied24h = 0;
+            var hourly = new List<HourOfRequests>(7 * 24 + 1);
+            long hour = long.MinValue, hourRequests = 0, hourDenied = 0;
+            using var reader = await cmd.ExecuteReaderAsync();
+            while (reader.Read())
+            {
+                long ts = reader.GetInt64(0);
+                bool denied = !reader.IsDBNull(1) && reader.GetInt64(1) != 0;
+                long startOfHour = ts - ts % 3600;
+                if (startOfHour != hour)
+                {
+                    if (hourRequests > 0) hourly.Add(new HourOfRequests(hour, hourRequests, hourDenied));
+                    hour = startOfHour;
+                    hourRequests = 0;
+                    hourDenied = 0;
+                }
+                hourRequests++;
+                requests7d++;
+                if (denied) hourDenied++;
+                if (ts >= day)
+                {
+                    requests24h++;
+                    if (denied) denied24h++;
+                }
+            }
+            if (hourRequests > 0) hourly.Add(new HourOfRequests(hour, hourRequests, hourDenied));
+            return new RequestWindow(requests7d, requests24h, denied24h, hourly);
+        });
+
+        /// <summary>The ten busiest routes since $t.</summary>
+        internal const string OverviewTopRoutesSql =
+            "SELECT route, COUNT(*) AS hits FROM requests INDEXED BY ix_requests_ts WHERE utc_ts >= $t GROUP BY route ORDER BY hits DESC, route LIMIT 10";
+
+        /// <summary>Requests since $t by where they came from.</summary>
+        internal const string OverviewOriginsSql =
+            "SELECT origin, COUNT(*) AS hits FROM (SELECT " + DerivedRequestOriginSql + " AS origin FROM requests INDEXED BY ix_requests_ts WHERE utc_ts >= $t) GROUP BY origin ORDER BY hits DESC";
+
         public static async Task RegisterAsync(OmniDefence parent)
         {
             // Overview
@@ -462,15 +530,26 @@ namespace Omnipotent.Services.OmniDefence
             }, HttpMethod.Get, OmniDefencePerms.DataExport);
 
             await RegisterFingerprintRoutesAsync(parent);
+            await RegisterConsoleRoutesAsync(parent);
         }
 
         /// <summary>
         /// Runs only on the overview refresh worker. Keep all aggregation and database
         /// access here, never in the HTTP handler above.
         /// </summary>
-        internal static async Task<string> BuildOverviewJsonAsync(OmniDefence parent)
+        internal static Task<string> BuildOverviewJsonAsync(OmniDefence parent)
+            => BuildOverviewJsonAsync(parent.Store, parent.Tracker, parent.OverviewStep,
+                parent.OverviewBuildMs, () => parent.Fingerprints?.Backlog ?? 0);
+
+        /// <summary>
+        /// The build itself, on nothing but the store and the IP records, so a test can run all of it
+        /// against a real database. An earlier rework of this build was checked by tests that never
+        /// ran it, and in production the overview then went unanswered for eleven days.
+        /// </summary>
+        internal static async Task<string> BuildOverviewJsonAsync(OmniDefenceStore store, IpThreatTracker tracker,
+            Action<string> reportStep, long lastBuildMs, Func<int> fingerprintBacklog, long? nowUtc = null)
         {
-            long now = DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+            long now = nowUtc ?? DateTimeOffset.UtcNow.ToUnixTimeSeconds();
             long day = now - 86400;
             long week = now - 86400 * 7;
 
@@ -481,14 +560,14 @@ namespace Omnipotent.Services.OmniDefence
             var stepMs = new Dictionary<string, long>();
             async Task<T> Step<T>(string name, Func<Task<T>> run)
             {
-                parent.OverviewStep(name);
+                reportStep(name);
                 long started = System.Diagnostics.Stopwatch.GetTimestamp();
                 try { return await run(); }
                 finally { stepMs[name] = (long)System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds; }
             }
             T StepNow<T>(string name, Func<T> run)
             {
-                parent.OverviewStep(name);
+                reportStep(name);
                 long started = System.Diagnostics.Stopwatch.GetTimestamp();
                 try { return run(); }
                 finally { stepMs[name] = (long)System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds; }
@@ -497,13 +576,10 @@ namespace Omnipotent.Services.OmniDefence
             // Windowed counts come from the utc_ts index (the last 7 days only); all-time totals are
             // carried forward by the store. One aggregate over the whole table took ~17 s per
             // refresh in production and ran more than half of every minute.
-            var requestCountRows = await Step("requests in the last 7 days", () => parent.Store.QueryAsync(@"
-                SELECT COUNT(*) AS requests7d,
-                    COALESCE(SUM(CASE WHEN utc_ts >= $day THEN 1 ELSE 0 END), 0) AS requests24h,
-                    COALESCE(SUM(CASE WHEN utc_ts >= $day AND (deny_reason IS NOT NULL OR status_code >= 400) THEN 1 ELSE 0 END), 0) AS denied24h
-                FROM requests WHERE utc_ts >= $week", new() { ["$day"] = day, ["$week"] = week }));
-            var totals = await Step("all-time request totals", () => parent.Store.ReadAuditTotalsAsync());
-            var authCountRows = await Step("auth events", () => parent.Store.QueryAsync(@"
+            var window = await Step("requests in the last 7 days", () => ReadRequestWindowAsync(store, week, day));
+            var totals = await Step("all-time request totals", () => store.ReadAuditTotalsAsync());
+            // The whole of auth_events on purpose: it held 1,741 rows on 10 Nov 2026.
+            var authCountRows = await Step("auth events", () => store.QueryAsync(@"
                 SELECT COUNT(*) AS totalAuthEvents,
                     COALESCE(SUM(CASE WHEN utc_ts >= $day AND type IN
                         ('UnauthRoute','InsufficientClearance','InvalidPassword','WebsiteNoProfile','WebsiteInvalidProfile')
@@ -511,7 +587,7 @@ namespace Omnipotent.Services.OmniDefence
                 FROM auth_events", new() { ["$day"] = day }));
 
             // Enumerate the concurrent tracker once instead of repeatedly sorting it.
-            var ips = StepNow("IP records", () => parent.Tracker.All().ToArray());
+            var ips = StepNow("IP records", () => tracker.All().ToArray());
             int blocked = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Blocked));
             int watched = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Watch));
             int honey = ips.Count(r => r.Status == nameof(IpThreatTracker.IpStatus.Honeypot));
@@ -529,23 +605,20 @@ namespace Omnipotent.Services.OmniDefence
                 unauth = r.UnauthAttempts, country = r.Country, asn = r.Asn, attacker = true
             }).FirstOrDefault();
 
-            var topRoutes = await Step("busiest routes today", () => parent.Store.QueryAsync(
-                "SELECT route, COUNT(*) AS hits FROM requests WHERE utc_ts >= $t GROUP BY route ORDER BY hits DESC LIMIT 10",
-                new() { ["$t"] = day }));
-            var originBreakdown = await Step("request origins today", () => parent.Store.QueryAsync(
-                $"SELECT origin, COUNT(*) AS hits FROM (SELECT {DerivedRequestOriginSql} AS origin FROM requests WHERE utc_ts >= $t) GROUP BY origin ORDER BY hits DESC",
-                new() { ["$t"] = day }));
-            var classBreakdown = StepNow("class breakdown", () => ClassBreakdown(parent));
-            var tagBreakdown = StepNow("tag breakdown", () => TagBreakdown(parent));
+            var topRoutes = await Step("busiest routes today", () => store.QueryAsync(
+                OverviewTopRoutesSql, new() { ["$t"] = day }));
+            var originBreakdown = await Step("request origins today", () => store.QueryAsync(
+                OverviewOriginsSql, new() { ["$t"] = day }));
+            var classBreakdown = StepNow("class breakdown", () => ClassBreakdown(ips));
+            var tagBreakdown = StepNow("tag breakdown", () => TagBreakdown(ips));
             var review = StepNow("review lists", () => JToken.FromObject(OmniDefenceReview.Build(ips, now), CamelCase));
-            parent.OverviewStep("writing the overview");
-            var requestCounts = requestCountRows[0];
+            reportStep("writing the overview");
             var authCounts = authCountRows[0];
             long Count(Dictionary<string, object?> row, string key) => Convert.ToInt64(row[key] ?? 0);
-            long reqs24h = Count(requestCounts, "requests24h");
+            long reqs24h = window.Requests24h;
             long totalRequests = totals.Requests;
-            long reqs7d = Count(requestCounts, "requests7d");
-            long denied24h = Count(requestCounts, "denied24h");
+            long reqs7d = window.Requests7d;
+            long denied24h = window.Denied24h;
             long totalDenied = totals.Denied;
             long unauth24h = Count(authCounts, "unauth24h");
             long totalAuthEvents = Count(authCounts, "totalAuthEvents");
@@ -556,6 +629,9 @@ namespace Omnipotent.Services.OmniDefence
                 requests24h = reqs24h,
                 totalRequests,
                 requests7d = reqs7d,
+                // The same seven days by hour, oldest first: h is the unix time the hour starts,
+                // and hours with no requests are left out.
+                hourly = window.Hourly.Select(hour => new { h = hour.H, requests = hour.Requests, denied = hour.Denied }),
                 denied24h,
                 totalDenied,
                 authFailures24h = unauth24h,
@@ -577,14 +653,14 @@ namespace Omnipotent.Services.OmniDefence
                 // Engine health, so the next stall shows on the page instead of in a log dig.
                 health = new
                 {
-                    overviewBuildMs = parent.OverviewBuildMs,
+                    overviewBuildMs = lastBuildMs,
                     // This build's time per step, in milliseconds. Writing the overview out is the
                     // one step not in here: the status route's lastBuildMs less this total.
                     buildSteps = stepMs,
-                    auditQueue = parent.Store.PendingAuditRows,
-                    auditRowsDropped = parent.Store.DroppedAuditRows,
-                    readPoolTimeouts = parent.Store.ReadPoolTimeouts,
-                    fingerprintBacklog = parent.Fingerprints?.Backlog ?? 0
+                    auditQueue = store.PendingAuditRows,
+                    auditRowsDropped = store.DroppedAuditRows,
+                    readPoolTimeouts = store.ReadPoolTimeouts,
+                    fingerprintBacklog = fingerprintBacklog()
                 }
             };
             return JsonConvert.SerializeObject(resp);

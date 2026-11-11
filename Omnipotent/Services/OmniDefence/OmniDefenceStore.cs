@@ -1001,6 +1001,52 @@ namespace Omnipotent.Services.OmniDefence
             return list;
         });
 
+        // ---------- Profile links ----------
+        // Which profile last used each IP lives on the IP record, written as requests arrive. After
+        // a start the tracker reads the audit rows it has not yet linked: the tail a crash left
+        // unflushed. That used to be one query over the whole log, grouped by IP, awaited during
+        // start-up: SQLite walked an IP index and fetched every row of the table through it, in IP
+        // order, to test profile_id. On 10 Nov 2026 the service's routes were still missing 82 and
+        // 92 minutes after two starts. The rows are now read in the order they are stored, from a
+        // watermark, so each start reads only the rows added since the one before.
+
+        /// <summary>od_settings key: the highest audit-row id whose profile has been linked to its IP.</summary>
+        internal const string ProfileLinkWatermarkKey = "profile_links_through_id";
+
+        /// <summary>
+        /// NOT INDEXED pins this to a walk of the table by id, the order the rows are stored in,
+        /// whatever indexes exist: a page is read once, and neighbouring rows share it.
+        /// </summary>
+        internal const string ProfileLinkRowsSql = @"SELECT id, ip, profile_id, profile_name, profile_rank, utc_ts
+                FROM requests NOT INDEXED
+                WHERE id > $after AND id <= $through
+                    AND profile_id IS NOT NULL AND profile_id <> '' AND ip IS NOT NULL AND ip <> ''
+                ORDER BY id";
+
+        public sealed record ProfileLinkRow(long Id, string Ip, string ProfileId, string? ProfileName, int? ProfileRank, long UtcTs);
+
+        /// <summary>Audit rows that carry a profile, ids in (afterId, throughId], in id order. One bounded read.</summary>
+        public Task<List<ProfileLinkRow>> ReadProfileLinkRowsAsync(long afterId, long throughId) => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = ProfileLinkRowsSql;
+            cmd.Parameters.AddWithValue("$after", afterId);
+            cmd.Parameters.AddWithValue("$through", throughId);
+            var list = new List<ProfileLinkRow>();
+            using var rdr = await cmd.ExecuteReaderAsync();
+            while (await rdr.ReadAsync())
+            {
+                list.Add(new ProfileLinkRow(
+                    rdr.GetInt64(0),
+                    rdr.GetString(1),
+                    rdr.GetString(2),
+                    rdr.IsDBNull(3) ? null : rdr.GetString(3),
+                    rdr.IsDBNull(4) ? null : rdr.GetInt32(4),
+                    rdr.IsDBNull(5) ? 0 : rdr.GetInt64(5)));
+            }
+            return list;
+        });
+
         // ---------- Intel cache ----------
 
         public Task UpsertIntelAsync(string ip, string provider, long fetchedUtc, string? json) => WithLockAsync(async conn =>
@@ -1069,6 +1115,15 @@ namespace Omnipotent.Services.OmniDefence
                 if (!rdr.IsDBNull(1)) map[rdr.GetString(0)] = rdr.GetString(1);
             }
             return map;
+        });
+
+        /// <summary>One od_settings value, or null when the key has never been written.</summary>
+        public Task<string?> GetSettingAsync(string key) => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT value FROM od_settings WHERE key = $k";
+            cmd.Parameters.AddWithValue("$k", key);
+            return await cmd.ExecuteScalarAsync() as string;
         });
 
         public Task SetSettingAsync(string key, string? value) => WithLockAsync(async conn =>

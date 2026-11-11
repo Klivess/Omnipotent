@@ -37,6 +37,7 @@ namespace Omnipotent.Services.OmniDefence
         private readonly Func<Task<string>> build;
         private readonly Func<DateTimeOffset> utcNow;
         private readonly Action<Exception>? reportError;
+        private readonly TimeSpan slowBuildAfter;
         private Snapshot? current;
         // UTC ticks of the build under way, 0 when none: a long, so the status route reads it whole.
         private long buildStartedTicks;
@@ -44,12 +45,14 @@ namespace Omnipotent.Services.OmniDefence
         private string? lastError;
 
         public OmniDefenceOverviewSnapshot(string path, Func<Task<string>> build,
-            Action<Exception>? reportError = null, Func<DateTimeOffset>? utcNow = null)
+            Action<Exception>? reportError = null, Func<DateTimeOffset>? utcNow = null,
+            TimeSpan? slowBuildAfter = null)
         {
             this.path = path;
             this.build = build;
             this.reportError = reportError;
             this.utcNow = utcNow ?? (() => DateTimeOffset.UtcNow);
+            this.slowBuildAfter = slowBuildAfter ?? SlowBuildAfter;
         }
 
         /// <summary>
@@ -160,20 +163,24 @@ namespace Omnipotent.Services.OmniDefence
             {
                 try
                 {
-                    Task refresh = RefreshOnceAsync();
+                    // On its own thread. SQLite's "async" calls never yield, so a build called
+                    // straight from here ran to its end inside that call and the watch below only
+                    // started once it was over: on 10 Nov 2026 a build sat in one step for over an
+                    // hour and this loop logged nothing.
+                    Task refresh = Task.Run(RefreshOnceAsync);
                     // A build that outlives the window says so, naming its step, then is left to
                     // finish: abandoning it would only start the same slow work again.
                     bool overran;
                     using (var watch = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                     {
-                        overran = await Task.WhenAny(refresh, Task.Delay(SlowBuildAfter, watch.Token)) != refresh;
+                        overran = await Task.WhenAny(refresh, Task.Delay(slowBuildAfter, watch.Token)) != refresh;
                         watch.Cancel();
                     }
                     if (overran && !cancellationToken.IsCancellationRequested && ShouldReportSlowBuild(lastSlowReport, utcNow()))
                     {
                         lastSlowReport = utcNow();
                         reportError?.Invoke(new TimeoutException(
-                            $"The OmniDefence overview build has run for over {SlowBuildAfter.TotalMinutes:0} minutes and is still in step '{Volatile.Read(ref step)}'. The page shows the previous overview until it finishes."));
+                            $"The OmniDefence overview build has run for over {slowBuildAfter.TotalMinutes:0.##} minutes and is still in step '{Volatile.Read(ref step)}'. The page shows the previous overview until it finishes."));
                     }
                     await refresh;
                 }

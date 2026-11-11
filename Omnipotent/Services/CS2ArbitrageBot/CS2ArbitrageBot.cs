@@ -390,6 +390,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     SteamWalletHeadroomPence = headroom,
                     SteamMaxListingPence = fx > 0 && settings.SteamMaxListingUsd > 0 ? settings.SteamMaxListingUsd * 100 * fx : null,
                     CSFloatSellingPaused = csfloatAccountInformation?.Away ?? false,
+                    SteamUnavailableReason = steamAPIWrapper?.profileWrapper?.SessionProblem,
                 };
             }
         }
@@ -403,7 +404,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         MarketDriftModel IExitHost.MarketModel => marketModel;
         ExitCalibrationSnapshot IExitHost.ExitCalibration => CurrentExitCalibration;
         string? IExitHost.OwnSteamId => OwnSteamId;
-        Task<bool> IExitHost.SellOnSteamAsync(PurchasedListing position, int pricePence) => SellSkinOnSteam(position, pricePence);
+        Task<SteamSellResult> IExitHost.SellOnSteamAsync(PurchasedListing position, int pricePence) => SellSkinOnSteam(position, pricePence);
         Task<string?> IExitHost.ListOnCSFloatAsync(PurchasedListing position, int priceCents, CancellationToken ct) => ListOnCSFloatAsync(position, priceCents, ct);
         Task IExitHost.SaveAsync(PurchasedListing position) => scanalytics.UpdatePurchasedListing(position);
         Task IExitHost.NotifyAsync(PurchasedListing position, string title, string message) =>
@@ -475,7 +476,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         /// <summary>Anything not finished (shown on the status route).</summary>
         private static bool IsOpen(PurchasedListing p) =>
-            p.CurrentStrategicStage is not (StrategicStages.StrategyCompleted or StrategicStages.TradeCancelled);
+            p.CurrentStrategicStage is not (StrategicStages.StrategyCompleted or StrategicStages.TradeCancelled or StrategicStages.LeftInventory);
 
         /// <summary>The item itself is still ours: bought, in trade, in protection, or relisted on CSFloat.</summary>
         private static bool IsHolding(PurchasedListing p) =>
@@ -761,6 +762,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             {
                 try
                 {
+                    // Positions whose unit has gone (sold or moved by hand) are closed first, so nothing below tries to
+                    // sell them or reports them.
+                    await ReconcileHeldPositionsAsync(ct);
+                    await WakeSalesWaitingForSteamAsync();
+
                     // Only items whose trade protection has lifted (the exact moment CSFloat reported) can be sold.
                     var due = scanalytics.PurchasesSnapshot().Where(p =>
                         p.CurrentStrategicStage == StrategicStages.JustRetrieved
@@ -768,16 +774,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         && p.SaleDeferredUntilUtc <= DateTime.UtcNow
                         && (p.LastSaleAttemptUtc == default || DateTime.UtcNow - p.LastSaleAttemptUtc >= TimeSpan.FromHours(6))).ToList();
                     if (due.Count > 0) await RefreshAccountForExitsAsync(ct);
+                    await ReportPositionsNeedingAttentionAsync(due.Where(p => !IsAutoSellable(p, DateTime.UtcNow)).ToList());
                     foreach (var p in due)
                     {
-                        if (!IsAutoSellable(p, DateTime.UtcNow))
-                        {
-                            await AlertKlivesAsync("not-auto-selling:" + p.CSFloatListingID, "CS2 Arbitrage — position needs a manual look",
-                                $"**{p.ItemMarketHashName}** ({p.CSFloatListingID}) is not being sold automatically: " +
-                                (p.SaleAttempts >= MaxSaleAttempts ? $"{p.SaleAttempts} sale attempts failed." : "it is a pre-rewrite position whose sale date passed long ago (sold by hand?)."),
-                                TimeSpan.FromDays(30));
-                            continue;
-                        }
+                        if (!IsAutoSellable(p, DateTime.UtcNow)) continue;
                         if (!salesInFlight.TryAdd(p.CSFloatListingID, 0)) continue;
                         _ = Task.Run(async () =>
                         {
@@ -801,6 +801,175 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         }
 
         public const int MaxSaleAttempts = 5;
+
+        // ── Positions the inventory no longer has ──
+        // Positions Klives had sold by hand stayed "in inventory" for ever: every sale attempt failed (no unit to sell),
+        // each one ran out of attempts, and each was reported as "needs a manual look" — again on every restart, because
+        // the alert's cooldown lived in memory. The inventory (read through CSFloat, so no Steam login is needed) is now
+        // checked every hour, and a position with no unit on two checks at least an hour apart is closed.
+        internal static readonly TimeSpan InventoryCheckInterval = TimeSpan.FromHours(1);
+        internal static readonly TimeSpan MissingConfirmAfter = TimeSpan.FromHours(1);
+        private DateTime lastInventoryCheckUtc;
+        private DateTime lastInventoryCheckOkUtc;
+
+        /// <summary>Held, unlocked positions the bot means to sell: their unit should be in the inventory.</summary>
+        internal static bool ShouldBeInInventory(PurchasedListing p, DateTime nowUtc) =>
+            p.CurrentStrategicStage == StrategicStages.JustRetrieved
+            && (p.PredictedTimeToBeResoldOnSteam == default || p.PredictedTimeToBeResoldOnSteam.ToUniversalTime() <= nowUtc);
+
+        /// <summary>
+        /// The positions the inventory has no unit for. Units are matched per item — a skin to the unit with its float
+        /// first — and only a shortfall counts, so units of the same item Klives keeps himself never close a position
+        /// (at worst a sold one stays open).
+        /// </summary>
+        internal static List<PurchasedListing> PositionsWithoutAUnit(IEnumerable<PurchasedListing> held, IReadOnlyCollection<CSFloatWrapper.InventoryItem> inventory)
+        {
+            var missing = new List<PurchasedListing>();
+            foreach (var group in held.GroupBy(p => p.ItemMarketHashName, StringComparer.Ordinal))
+            {
+                var units = inventory.Where(i => string.Equals(i.MarketHashName, group.Key, StringComparison.Ordinal)).ToList();
+                // First each position whose float matches a unit exactly; then the rest by count, newest purchases first
+                // (an older position is the likelier one to have been sold by hand).
+                var unmatched = group.OrderByDescending(p => p.TimeOfPurchase).ToList();
+                foreach (var p in unmatched.Where(p => p.ItemFloatValue > 0).ToList())
+                {
+                    var unit = units.FirstOrDefault(u => u.FloatValue is double f && Math.Abs(f - p.ItemFloatValue) < 1e-5);
+                    if (unit == null) continue;
+                    units.Remove(unit);
+                    unmatched.Remove(p);
+                }
+                foreach (var p in unmatched)
+                {
+                    if (units.Count > 0) units.RemoveAt(0);
+                    else missing.Add(p);
+                }
+            }
+            return missing;
+        }
+
+        private async Task ReconcileHeldPositionsAsync(CancellationToken ct)
+        {
+            DateTime now = DateTime.UtcNow;
+            if (now - lastInventoryCheckUtc < InventoryCheckInterval) return;
+            // A sale in flight may be moving the unit into a Steam listing right now.
+            var held = scanalytics.PurchasesSnapshot().Where(p => ShouldBeInInventory(p, now) && !salesInFlight.ContainsKey(p.CSFloatListingID)).ToList();
+            if (held.Count == 0) return;
+            lastInventoryCheckUtc = now;
+
+            List<CSFloatWrapper.InventoryItem> inventory;
+            try { inventory = await csFloatWrapper.GetInventoryAsync(ct); }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                await ServiceLog($"Couldn't read the inventory to check held positions: {ex.Message}", false);
+                return;
+            }
+            // An empty answer is far more likely a CSFloat/Steam hiccup than an emptied inventory: never close on it.
+            if (inventory.Count == 0)
+            {
+                await ServiceLog("The inventory came back empty; not closing any position on that.", false);
+                return;
+            }
+            lastInventoryCheckOkUtc = now;
+
+            var missing = PositionsWithoutAUnit(held, inventory).ToHashSet();
+            var closed = new List<PurchasedListing>();
+            foreach (var p in held)
+            {
+                if (!missing.Contains(p))
+                {
+                    if (p.MissingFromInventorySinceUtc != default)
+                    {
+                        p.MissingFromInventorySinceUtc = default;
+                        await scanalytics.UpdatePurchasedListing(p);
+                    }
+                    continue;
+                }
+                if (p.MissingFromInventorySinceUtc == default)
+                {
+                    p.MissingFromInventorySinceUtc = now;
+                    await scanalytics.UpdatePurchasedListing(p);
+                    continue;
+                }
+                if (now - p.MissingFromInventorySinceUtc < MissingConfirmAfter) continue;
+                p.CurrentStrategicStage = StrategicStages.LeftInventory;
+                p.WaitingForSteamLoginSinceUtc = default;
+                p.Notes = (string.IsNullOrEmpty(p.Notes) ? "" : p.Notes + Environment.NewLine)
+                          + $"Closed {now:u}: no longer in the inventory (missing since {p.MissingFromInventorySinceUtc:u}) — sold or moved outside the bot.";
+                await scanalytics.UpdatePurchasedListing(p);
+                closed.Add(p);
+            }
+            if (closed.Count == 0) return;
+            await ServiceLog($"Closed {closed.Count} position(s) whose unit left the inventory: {string.Join(", ", closed.Select(p => p.ItemMarketHashName))}.", false);
+            await SendEmbedAsync("CS2 Arbitrage — positions closed",
+                $"{closed.Count} position{(closed.Count == 1 ? " is" : "s are")} no longer in the inventory (sold or moved by hand), so the bot has stopped trying to sell {(closed.Count == 1 ? "it" : "them")}:\n" +
+                BulletList(closed.Select(p => $"**{p.ItemMarketHashName}**")), DiscordColor.Teal, null);
+        }
+
+        /// <summary>
+        /// One message for every position that has just stopped being sold automatically — not one alert each, and
+        /// never again after a restart (the time it was reported is saved on the position). A position the latest
+        /// inventory check could not vouch for is left to <see cref="ReconcileHeldPositionsAsync"/> rather than reported.
+        /// </summary>
+        private async Task ReportPositionsNeedingAttentionAsync(List<PurchasedListing> stuck)
+        {
+            DateTime now = DateTime.UtcNow;
+            bool inventoryVouches = now - lastInventoryCheckOkUtc < InventoryCheckInterval + TimeSpan.FromMinutes(30);
+            var fresh = stuck.Where(p => p.ManualAttentionAlertedUtc == default && p.MissingFromInventorySinceUtc == default && inventoryVouches).ToList();
+            if (fresh.Count == 0) return;
+            foreach (var p in fresh)
+            {
+                p.ManualAttentionAlertedUtc = now;
+                await scanalytics.UpdatePurchasedListing(p);
+            }
+            string Reason(PurchasedListing p) => p.SaleAttempts >= MaxSaleAttempts
+                ? $"{p.SaleAttempts} sale attempts failed" + (string.IsNullOrWhiteSpace(p.LastSaleFailure) ? "" : $" (last: {p.LastSaleFailure})")
+                : "a pre-rewrite position whose sale date passed long ago";
+            await ServiceLogError($"{fresh.Count} CS2 position(s) are no longer sold automatically: {string.Join("; ", fresh.Select(p => p.ItemMarketHashName + " — " + Reason(p)))}", false);
+            await SendEmbedAsync("CS2 Arbitrage — positions need a manual look",
+                $"{(fresh.Count == 1 ? "This item is" : $"These {fresh.Count} items are")} still in the inventory but no longer sold automatically:\n" +
+                BulletList(fresh.Select(p => $"**{p.ItemMarketHashName}** — {Reason(p)}")) +
+                "\nYou won't be told about these again.", DiscordColor.Red, null);
+        }
+
+        private static string BulletList(IEnumerable<string> lines, int max = 15)
+        {
+            var all = lines.ToList();
+            string shown = string.Join("\n", all.Take(max).Select(l => "• " + l));
+            return all.Count > max ? shown + $"\n…and {all.Count - max} more" : shown;
+        }
+
+        /// <summary>
+        /// Sales parked on a lapsed Steam login: once the login works again they go now (not at their next check), and
+        /// while it doesn't, Klives is asked to approve one — a single prompt that says what is waiting, rate-limited by
+        /// the profile wrapper.
+        /// </summary>
+        private async Task WakeSalesWaitingForSteamAsync()
+        {
+            var profile = steamAPIWrapper?.profileWrapper;
+            if (profile == null) return;
+            DateTime now = DateTime.UtcNow;
+            var waiting = scanalytics.PurchasesSnapshot()
+                .Where(p => p.CurrentStrategicStage == StrategicStages.JustRetrieved && p.WaitingForSteamLoginSinceUtc != default && p.MissingFromInventorySinceUtc == default)
+                .ToList();
+            if (waiting.Count == 0) return;
+            if (profile.SessionKnownGood)
+            {
+                foreach (var p in waiting.Where(p => p.SaleDeferredUntilUtc > now))
+                {
+                    p.SaleDeferredUntilUtc = default;
+                    await scanalytics.UpdatePurchasedListing(p);
+                }
+                return;
+            }
+            if (profile.SessionProblem == null || profile.LoginPromptOpen) return;
+            string reason = $"{waiting.Count} item{(waiting.Count == 1 ? " is" : "s are")} waiting to be sold on Steam: " +
+                            string.Join(", ", waiting.Take(5).Select(p => p.ItemMarketHashName)) + (waiting.Count > 5 ? $" and {waiting.Count - 5} more" : "") + ".";
+            _ = Task.Run(async () =>
+            {
+                try { await profile.RequestInteractiveLoginAsync(reason); }
+                catch (Exception ex) { await ServiceLogError(ex, "Asking for a Steam login failed.", false); }
+            }, CancellationToken.None);
+        }
 
         /// <summary>
         /// Exit decisions depend on the account's state (away mode blocks CSFloat selling; the fee is the account's),
@@ -879,33 +1048,35 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             return listingId;
         }
 
-        private async Task<bool> SellSkinOnSteam(PurchasedListing data, int salePriceInPence)
+        /// <summary>
+        /// Lists the unit on the Steam Market. Discord hears about it only when it is listed (the confirmation prompt,
+        /// then "Listed ✓"): a failed attempt is recorded on the position and retried, and only a position that keeps
+        /// failing is reported, once (see the sale scheduler). It used to post "Listing on Steam" and "Failed to List"
+        /// on every attempt.
+        /// </summary>
+        private async Task<SteamSellResult> SellSkinOnSteam(PurchasedListing data, int salePriceInPence)
         {
             try
             {
-                data.ActualSalePriceOnSteam = salePriceInPence / 100f;
-                await SendEmbedAsync("CS2 Arbitrage — Listing on Steam",
-                    $"Item: {data.ItemMarketHashName}\nFloat: {data.ItemFloatValue}\nSale price: **£{data.ActualSalePriceOnSteam:F2}** (highest buy order; you receive £{ArbitrageMath.SteamSellerReceives(salePriceInPence) / 100.0:F2})\n" +
-                    $"Bought on CSFloat for: {data.comparison?.CSFloatListing.PriceText}\nExpected profit: {data.ExpectedProfitPercentage:F1}%\n\nAttempting to list on Steam Market...",
-                    DiscordColor.Teal, null);
-
-                bool sold = await steamAPIWrapper.profileWrapper.SellItem(data, salePriceInPence);
-                if (sold)
+                var result = await steamAPIWrapper.profileWrapper.SellItem(data, salePriceInPence);
+                if (result.Listed)
                 {
+                    data.ActualSalePriceOnSteam = salePriceInPence / 100f;
                     data.CurrentStrategicStage = StrategicStages.WaitingForMarketSaleOnSteam;
                     data.ActualTimeResoldOnSteam = DateTime.Now;
                     await scanalytics.UpdatePurchasedListing(data);
-                    await SendEmbedAsync("CS2 Arbitrage — Listed on Steam ✓", $"Item: {data.ItemMarketHashName}\nListed for: **£{data.ActualSalePriceOnSteam:F2}**\nConvert the Steam wallet back with the liquidity plan (KM → CS2 Arbitrage).", DiscordColor.Green, null);
-                    return true;
+                    await SendEmbedAsync("CS2 Arbitrage — Listed on Steam ✓",
+                        $"Item: {data.ItemMarketHashName}\nListed for: **£{data.ActualSalePriceOnSteam:F2}** (highest buy order; you receive £{ArbitrageMath.SteamSellerReceives(salePriceInPence) / 100.0:F2})\n" +
+                        $"Bought on CSFloat for: {data.comparison?.CSFloatListing.PriceText}\nConvert the Steam wallet back with the liquidity plan (KM → CS2 Arbitrage).", DiscordColor.Green, null);
+                    return result;
                 }
-                await ServiceLogError($"Failed to list {data.ItemMarketHashName} on Steam Market.");
-                await SendEmbedAsync("CS2 Arbitrage — Failed to List", $"Item: {data.ItemMarketHashName}\nCould not list on the Steam Market; will retry in 6 hours.", DiscordColor.Red, null);
-                return false;
+                await ServiceLogError($"Couldn't list {data.ItemMarketHashName} on the Steam Market: {result.Outcome} — {result.Detail}.", false);
+                return result;
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, $"Error in SellSkinOnSteam for {data.ItemMarketHashName}");
-                return false;
+                return new SteamSellResult(SteamSellOutcome.Refused, "listing threw: " + ex.Message);
             }
         }
 
@@ -1213,6 +1384,21 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     lastError = lastTradePollError,
                     pollRunningSinceUtc = tradePollInFlight is { IsCompleted: false } ? tradePollStartedUtc : (DateTime?)null,
                 },
+                steamSession = !ready || steamAPIWrapper?.profileWrapper is not { } profile ? null : new
+                {
+                    problem = profile.SessionProblem,
+                    problemSinceUtc = profile.SessionProblemSinceUtc,
+                    lastWorkedUtc = profile.SessionOkUtc,
+                    checkedUtc = profile.SessionCheckedUtc,
+                    loginPromptOpen = profile.LoginPromptOpen,
+                    lastLoginPromptUtc = profile.LastLoginPromptUtc,
+                    lastLoginPromptOutcome = profile.LastLoginPromptOutcome,
+                },
+                inventoryCheck = new
+                {
+                    lastCheckUtc = lastInventoryCheckUtc == default ? (DateTime?)null : lastInventoryCheckUtc,
+                    lastOkUtc = lastInventoryCheckOkUtc == default ? (DateTime?)null : lastInventoryCheckOkUtc,
+                },
                 exitModel = !ready ? null : new
                 {
                     settings = engineSettings.Exit,
@@ -1229,6 +1415,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                         ? new { priceCents = p.CSFloatResalePriceCents, listedUtc = p.ListedOnCSFloatAtUtc, p.RelistRepriceCount, expectedDaysToSell = p.RelistBaseDaysToSell, p.RelistModelExposure, nextReviewUtc = p.NextExitReviewUtc }
                         : null,
                     saleDeferrals = p.SaleDeferrals,
+                    saleAttempts = p.SaleAttempts,
+                    lastSaleFailure = string.IsNullOrEmpty(p.LastSaleFailure) ? null : p.LastSaleFailure,
+                    autoSelling = p.CurrentStrategicStage != StrategicStages.JustRetrieved || IsAutoSellable(p, DateTime.UtcNow),
+                    waitingForSteamLoginSinceUtc = p.WaitingForSteamLoginSinceUtc == default ? (DateTime?)null : p.WaitingForSteamLoginSinceUtc,
+                    missingFromInventorySinceUtc = p.MissingFromInventorySinceUtc == default ? (DateTime?)null : p.MissingFromInventorySinceUtc,
                     lastDecision = p.ExitHistory?.LastOrDefault() ?? p.PurchasePlan,
                 }),
                 totals = aggregate == null ? null : new { aggregate.TotalEvaluated, aggregate.QualifiedOpportunities, aggregate.PurchaseAttempts, aggregate.Purchases, aggregate.HighestRoi, aggregate.HighestRoiItem },

@@ -1,6 +1,7 @@
 ﻿using Omnipotent.Data_Handling;
 using Newtonsoft.Json;
 using Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs;
+using Omnipotent.Services.CS2ArbitrageBot.Engine;
 using SteamKit2;
 using SteamKit2.Authentication;
 using System.Text;
@@ -17,12 +18,58 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         private string? steamSessionId;
         private ulong? authenticatedSteamId64;
 
+        // ── Session state ──
+        // Only Klives can approve a Steam login (the Steam app's sign-in prompt). Background work (the 10-minute wallet
+        // check, sales, startup) used to start that interactive login whenever the saved token was rejected: a Discord
+        // prompt on every restart and every probe, each holding the auth lock for up to a day, while every sale attempt
+        // behind it failed and was counted against the position. Now only RequestInteractiveLoginAsync prompts, at most
+        // once per LoginPromptCooldown; everything else records the problem and returns.
+        public static readonly TimeSpan LoginPromptCooldown = TimeSpan.FromHours(6);
+        private static readonly TimeSpan BackgroundAuthWait = TimeSpan.FromSeconds(30);
+        private volatile string? sessionProblem;
+        private DateTime sessionProblemSinceUtc;
+        private DateTime sessionOkUtc;
+        private DateTime sessionCheckedUtc;
+        private volatile bool loginPromptOpen;
+        private int interactiveLoginRunning;
+        private string? loginPromptReason;
+        private string? lastLoginPromptAnswer;
+
+        /// <summary>Why the Steam session does not work (it needs Klives's approval), or null when it works or has not been checked.</summary>
+        public string? SessionProblem => sessionProblem;
+        public DateTime? SessionProblemSinceUtc => sessionProblem == null || sessionProblemSinceUtc == default ? null : sessionProblemSinceUtc;
+        /// <summary>When a Steam request last proved the session works.</summary>
+        public DateTime? SessionOkUtc => sessionOkUtc == default ? null : sessionOkUtc;
+        public DateTime? SessionCheckedUtc => sessionCheckedUtc == default ? null : sessionCheckedUtc;
+        /// <summary>True only once a request has proved the session works and nothing has failed since.</summary>
+        public bool SessionKnownGood => sessionProblem == null && sessionOkUtc != default;
+        public bool LoginPromptOpen => loginPromptOpen;
+        public DateTime? LastLoginPromptUtc { get; private set; }
+        public string? LastLoginPromptOutcome { get; private set; }
+
+        private void MarkSessionWorking()
+        {
+            sessionOkUtc = sessionCheckedUtc = DateTime.UtcNow;
+            sessionProblemSinceUtc = default;
+            sessionProblem = null;
+        }
+
+        private void MarkSessionDown(string problem)
+        {
+            sessionCheckedUtc = DateTime.UtcNow;
+            if (sessionProblem == null || sessionProblemSinceUtc == default) sessionProblemSinceUtc = DateTime.UtcNow;
+            sessionProblem = problem;
+        }
+
         private class SteamAuthState
         {
             public string? RefreshToken { get; set; }
             public string? AccessToken { get; set; }
             public string? GuardData { get; set; }
             public DateTime UpdatedAtUtc { get; set; }
+            /// <summary>When Klives was last asked to approve a login, and how it ended ("open" while waiting).</summary>
+            public DateTime? LastLoginPromptUtc { get; set; }
+            public string? LastLoginPromptOutcome { get; set; }
         }
 
         private sealed class SteamMobileOnlyAuthenticator : IAuthenticator
@@ -51,10 +98,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 try
                 {
                     // One prompt (it used to be "are you ready?" then "confirmed"): approve in the app, tap Done.
+                    string why = string.IsNullOrWhiteSpace(wrapper.loginPromptReason) ? "" : "\n\n" + wrapper.loginPromptReason;
                     string response = (string)await wrapper.parent.parent.ExecuteServiceMethod<Omnipotent.Services.Notifications.NotificationsService>(
                         "SendButtonsPromptToKlivesDiscord",
                         "CS2 Arbitrage — approve the Steam login",
-                        "The bot is logging in to Steam. Approve the sign-in request in your Steam app, then tap **Done**.",
+                        "The bot is logging in to Steam. Approve the sign-in request in your Steam app, then tap **Done**." + why,
                         new Dictionary<string, DSharpPlus.ButtonStyle>
                         {
                             { "Done", DSharpPlus.ButtonStyle.Success },
@@ -63,6 +111,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                         TimeSpan.FromHours(24)
                     );
 
+                    wrapper.lastLoginPromptAnswer = response;
                     return response == "Done";
                 }
                 catch (Exception ex)
@@ -87,12 +136,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             public double TotalBalanceInPounds;
         }
 
-        public async Task<string?> GetSteamInventoryAssetID(string marketHashName)
+        /// <summary>The unit's marketable asset id, or why there is none (no login, inventory unreadable, still held, not there).</summary>
+        private async Task<(string? AssetId, SteamSellResult? Problem)> FindInventoryAssetAsync(string marketHashName)
         {
             if (!await CheckIfCommunityCookieStringWorks())
             {
                 parent.parent.ServiceLogError("Not logged in, can't fetch Steam inventory.");
-                return null;
+                return (null, new SteamSellResult(SteamSellOutcome.LoginUnavailable, SessionProblem ?? "not logged in to Steam"));
             }
 
             string cookieString = await ProduceCommunityCookieString();
@@ -119,7 +169,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     if (++throttled > 5)
                     {
                         parent.parent.ServiceLogError("Steam inventory stayed rate limited after 5 attempts; giving up for now.");
-                        return null;
+                        return (null, new SteamSellResult(SteamSellOutcome.InventoryUnavailable, "Steam's inventory stayed rate limited"));
                     }
                     parent.parent.ServiceLog("Steam inventory rate limited, waiting 30 seconds...");
                     await Task.Delay(30000);
@@ -128,7 +178,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 if (!response.IsSuccessStatusCode)
                 {
                     parent.parent.ServiceLogError($"Failed to fetch Steam inventory. Status: {response.StatusCode}");
-                    return null;
+                    return (null, new SteamSellResult(SteamSellOutcome.InventoryUnavailable, $"Steam's inventory answered {(int)response.StatusCode}"));
                 }
 
                 string content = await response.Content.ReadAsStringAsync();
@@ -164,7 +214,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                                 int marketable = Convert.ToInt32(desc.marketable);
                                 if (marketable == 1)
                                 {
-                                    return Convert.ToString(asset.assetid);
+                                    string found = Convert.ToString(asset.assetid);
+                                    return (found, null);
                                 }
                                 else
                                 {
@@ -185,35 +236,25 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             if (foundButNotMarketableAssetId != null)
             {
                 parent.parent.ServiceLogError($"Item {marketHashName} exists in inventory (assetid: {foundButNotMarketableAssetId}) but is not marketable (likely trade-held).");
+                return (null, new SteamSellResult(SteamSellOutcome.NotMarketableYet, "in the Steam inventory but not marketable yet (trade hold)"));
             }
-            else
-            {
-                parent.parent.ServiceLogError($"Could not find asset ID for item {marketHashName} in Steam inventory.");
-            }
-            return null;
+            parent.parent.ServiceLogError($"Could not find asset ID for item {marketHashName} in Steam inventory.");
+            return (null, new SteamSellResult(SteamSellOutcome.NotInInventory, "not in the Steam inventory (sold or moved by hand?)"));
         }
 
-        public async Task<bool> SellItem(Scanalytics.PurchasedListing purchasedListing, int salePriceInPence)
+        /// <summary>Lists the unit on the Steam Market. Never throws for Steam's answers; says what stopped it.</summary>
+        public async Task<SteamSellResult> SellItem(Scanalytics.PurchasedListing purchasedListing, int salePriceInPence)
         {
-            if (!await CheckIfCommunityCookieStringWorks())
-            {
-                parent.parent.ServiceLogError("Not logged in to Steam, cannot sell item.");
-                return false;
-            }
-
-            string? assetId = await GetSteamInventoryAssetID(purchasedListing.ItemMarketHashName);
-            if (string.IsNullOrEmpty(assetId))
-            {
-                parent.parent.ServiceLogError($"Could not find {purchasedListing.ItemMarketHashName} in Steam inventory to sell.");
-                return false;
-            }
+            var (assetId, problem) = await FindInventoryAssetAsync(purchasedListing.ItemMarketHashName);
+            if (problem is SteamSellResult stopped) return stopped;
+            if (string.IsNullOrEmpty(assetId)) return new SteamSellResult(SteamSellOutcome.NotInInventory, "not in the Steam inventory");
 
             string cookieString = await ProduceCommunityCookieString();
             string? sessionId = ExtractSessionIdFromCookies(cookieString);
             if (string.IsNullOrEmpty(sessionId))
             {
                 parent.parent.ServiceLogError("Could not extract sessionid from Steam cookies.");
-                return false;
+                return new SteamSellResult(SteamSellOutcome.LoginUnavailable, SessionProblem ?? "no Steam session cookie");
             }
 
             // sellitem's "price" is what the seller receives. Steam's fee rounding means floor(price/1.15)
@@ -222,7 +263,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             if (sellerReceivesInPence <= 0)
             {
                 parent.parent.ServiceLogError($"Refusing to list {purchasedListing.ItemMarketHashName}: sale price {salePriceInPence}p leaves nothing after Steam fees.");
-                return false;
+                return new SteamSellResult(SteamSellOutcome.Refused, $"a {salePriceInPence}p sale leaves nothing after Steam's fees");
             }
             string url = "https://steamcommunity.com/market/sellitem/";
 
@@ -257,7 +298,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                         parent.parent.ServiceLog($"Successfully submitted sell request for {purchasedListing.ItemMarketHashName} on Steam Market for £{salePriceInPence / 100.0:F2}. Awaiting mobile confirmation.");
 
                         bool confirmed = await WaitForSteamMobileConfirmation(purchasedListing.ItemMarketHashName, salePriceInPence);
-                        return confirmed;
+                        return confirmed
+                            ? SteamSellResult.Ok()
+                            : new SteamSellResult(SteamSellOutcome.NotConfirmed, "listed on Steam, but the listing was not confirmed in the Steam app");
                     }
                     else
                     {
@@ -270,12 +313,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                             retryCount++;
                             continue;
                         }
-                        return false;
+                        return new SteamSellResult(SteamSellOutcome.Refused, "Steam refused the listing: " + message);
                     }
                 }
                 else
                 {
                     parent.parent.ServiceLogError($"Steam sellitem failed. Status: {response.StatusCode}, Body: {responseBody}");
+                    if (response.StatusCode is System.Net.HttpStatusCode.Unauthorized or System.Net.HttpStatusCode.Forbidden)
+                    {
+                        MarkSessionDown($"Steam refused the session when listing ({(int)response.StatusCode})");
+                        return new SteamSellResult(SteamSellOutcome.LoginUnavailable, sessionProblem ?? "Steam refused the session");
+                    }
 
                     if (retryCount < maxRetries - 1)
                     {
@@ -283,12 +331,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                         retryCount++;
                         continue;
                     }
-                    return false;
+                    return new SteamSellResult(SteamSellOutcome.Refused, $"Steam's sellitem answered {(int)response.StatusCode}");
                 }
             }
 
             parent.parent.ServiceLogError($"Exceeded maximum retries for selling {purchasedListing.ItemMarketHashName}.");
-            return false;
+            return new SteamSellResult(SteamSellOutcome.Refused, "Steam kept refusing the listing");
         }
 
         /// <summary>
@@ -412,7 +460,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             using var response = await CommunityHttp.SendAsync(request);
             string body = await response.Content.ReadAsStringAsync();
             if (!response.IsSuccessStatusCode) return null;
-            return ParseWalletDetails(body);
+            var parsed = ParseWalletDetails(body);
+            if (parsed != null) MarkSessionWorking(); // the access token works
+            return parsed;
         }
 
         /// <summary>Parses GetClientWalletDetails: balance / delayed_balance are minor units (pence for a GBP wallet).</summary>
@@ -440,21 +490,52 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             return double.TryParse(number, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double pounds) ? pounds : null;
         }
 
+        /// <summary>Startup: uses the saved login if Steam still accepts it. Never prompts — see <see cref="RequestInteractiveLoginAsync"/>.</summary>
         public async Task InitialiseLogin()
         {
+            await LoadLoginPromptStateAsync();
             if (await EnsureSteamAuthAsync() && await CheckIfCommunityCookieStringWorks(reLogin: true))
             {
                 parent.parent.ServiceLog("SteamKit2 refresh-token login is ready for Steam community requests.");
             }
             else
             {
-                parent.parent.ServiceLogError("Steam auth did not initialize correctly. Steam community requests may fail.");
+                parent.parent.ServiceLogError($"Steam login is not working ({SessionProblem ?? "unknown reason"}). Selling on Steam waits until Klives approves a new login; the bot asks when something needs it.", false);
             }
         }
 
-        private async Task<bool> EnsureSteamAuthAsync(bool forceRefresh = false)
+        /// <summary>
+        /// Asks Klives to approve a Steam login (one Discord prompt) when the saved one no longer works. At most one
+        /// prompt is open at a time, and after one is declined, times out or fails, none is sent for
+        /// <see cref="LoginPromptCooldown"/> — across restarts, since the time is saved. A prompt that was still open
+        /// when the process stopped can't be answered any more, so that one is re-sent. Returns whether the session works now.
+        /// </summary>
+        public async Task<bool> RequestInteractiveLoginAsync(string reason)
         {
-            await authLock.WaitAsync();
+            if (Interlocked.CompareExchange(ref interactiveLoginRunning, 1, 0) != 0) return false;
+            try
+            {
+                await LoadLoginPromptStateAsync();
+                if (LastLoginPromptUtc is DateTime last && LastLoginPromptOutcome != "open" && DateTime.UtcNow - last < LoginPromptCooldown) return false;
+                loginPromptReason = reason;
+                return await EnsureSteamAuthAsync(forceRefresh: true, interactive: true) && await CheckIfCommunityCookieStringWorks(reLogin: false);
+            }
+            finally
+            {
+                loginPromptReason = null;
+                Interlocked.Exchange(ref interactiveLoginRunning, 0);
+            }
+        }
+
+        /// <summary>
+        /// Makes sure there is an access token. Without <paramref name="interactive"/> it never asks Klives: a rejected
+        /// saved login is recorded in <see cref="SessionProblem"/> and false returned, and it gives up after a short wait
+        /// rather than queue behind an open login prompt.
+        /// </summary>
+        private async Task<bool> EnsureSteamAuthAsync(bool forceRefresh = false, bool interactive = false)
+        {
+            if (interactive) await authLock.WaitAsync();
+            else if (!await authLock.WaitAsync(BackgroundAuthWait)) return false;
             try
             {
                 await LoadSteamAuthStateFromDisk();
@@ -467,33 +548,50 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 if (!ulong.TryParse(parent.SteamIDOfSteamClient, out ulong steamId64))
                 {
                     parent.parent.ServiceLogError($"Invalid SteamID configured: {parent.SteamIDOfSteamClient}");
+                    MarkSessionDown("the configured SteamID is invalid");
                     return false;
                 }
 
                 steamId64 = ResolveSteamIdForTokenGeneration(steamId64);
 
+                bool loggedInNow = false;
                 if (string.IsNullOrWhiteSpace(steamRefreshToken))
                 {
-                    bool loginWorked = await AcquireRefreshTokenProgrammatically();
-                    if (!loginWorked)
+                    if (!interactive)
                     {
+                        MarkSessionDown("there is no saved Steam login; it needs approving in the Steam app");
                         return false;
                     }
+                    if (!await AcquireRefreshTokenProgrammatically()) return false;
+                    loggedInNow = true;
                 }
 
-                bool generatedFromRefreshToken = await TryGenerateAccessTokenFromRefreshToken(steamId64);
-                if (!generatedFromRefreshToken)
+                if (!loggedInNow && !await TryGenerateAccessTokenFromRefreshToken(steamId64))
                 {
-                    bool reloginWorked = await AcquireRefreshTokenProgrammatically();
-                    if (!reloginWorked)
+                    if (!interactive)
                     {
+                        MarkSessionDown("Steam rejected the saved login; it needs approving in the Steam app");
                         return false;
                     }
+                    if (!await AcquireRefreshTokenProgrammatically()) return false;
+                    loggedInNow = true;
+                }
 
+                if (loggedInNow)
+                {
+                    // The login returned its own access token. Minting one from the new refresh token is only a bonus: a
+                    // failure there used to throw away a login Klives had just approved.
+                    string? fromLogin = steamAccessToken;
                     if (!await TryGenerateAccessTokenFromRefreshToken(steamId64))
                     {
-                        parent.parent.ServiceLogError("SteamKit2 failed to mint an access token even after programmatic re-login.");
-                        return false;
+                        steamAccessToken = fromLogin;
+                        if (string.IsNullOrWhiteSpace(steamAccessToken))
+                        {
+                            parent.parent.ServiceLogError("SteamKit2 failed to mint an access token even after programmatic re-login.");
+                            MarkSessionDown("the approved Steam login returned no usable access token");
+                            return false;
+                        }
+                        parent.parent.ServiceLogError("Couldn't mint an access token from the new Steam refresh token; using the one the login returned.", false);
                     }
                 }
 
@@ -509,6 +607,40 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             finally
             {
                 authLock.Release();
+            }
+        }
+
+        private async Task LoadLoginPromptStateAsync()
+        {
+            try
+            {
+                string stateJson = await parent.parent.GetDataHandler().ReadDataFromFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamAuthState));
+                if (string.IsNullOrWhiteSpace(stateJson)) return;
+                var state = JsonConvert.DeserializeObject<SteamAuthState>(stateJson);
+                if (state == null) return;
+                LastLoginPromptUtc = state.LastLoginPromptUtc;
+                LastLoginPromptOutcome = state.LastLoginPromptOutcome;
+            }
+            catch { }
+        }
+
+        /// <summary>Saves when Klives was asked to approve a login and how it ended, keeping the rest of the auth state.</summary>
+        private async Task RecordLoginPromptAsync(DateTime atUtc, string outcome)
+        {
+            LastLoginPromptUtc = atUtc;
+            LastLoginPromptOutcome = outcome;
+            try
+            {
+                string statePath = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamAuthState);
+                string existing = await parent.parent.GetDataHandler().ReadDataFromFile(statePath);
+                var state = string.IsNullOrWhiteSpace(existing) ? new SteamAuthState() : JsonConvert.DeserializeObject<SteamAuthState>(existing) ?? new SteamAuthState();
+                state.LastLoginPromptUtc = atUtc;
+                state.LastLoginPromptOutcome = outcome;
+                await parent.parent.GetDataHandler().WriteToFile(statePath, JsonConvert.SerializeObject(state, Formatting.Indented));
+            }
+            catch (Exception ex)
+            {
+                parent.parent.ServiceLogError(ex, "Couldn't save the Steam login prompt state.", false);
             }
         }
 
@@ -549,15 +681,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
         }
 
+        /// <summary>The interactive login: Steam sends a sign-in request to Klives's Steam app and a Discord prompt asks him to approve it.</summary>
         private async Task<bool> AcquireRefreshTokenProgrammatically()
         {
             SteamClient client = new();
+            DateTime? promptedAt = null;
             try
             {
                 var credentials = await LoadSteamCredentialsFromDisk();
                 if (credentials == null)
                 {
                     parent.parent.ServiceLogError("Steam username/password not configured on disk. Cannot programmatically obtain refresh token.");
+                    MarkSessionDown("no Steam username/password is configured");
                     return false;
                 }
 
@@ -569,9 +704,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 if (string.IsNullOrWhiteSpace(credentials.Value.Username) || string.IsNullOrWhiteSpace(credentials.Value.Password))
                 {
                     parent.parent.ServiceLogError("Steam username/password settings are empty. Cannot log in to Steam.");
+                    MarkSessionDown("the Steam username/password settings are empty");
                     return false;
                 }
 
+                promptedAt = DateTime.UtcNow;
+                lastLoginPromptAnswer = null;
+                loginPromptOpen = true;
+                await RecordLoginPromptAsync(promptedAt.Value, "open");
                 var authSession = await client.Authentication.BeginAuthSessionViaCredentialsAsync(new AuthSessionDetails
                 {
                     Username = credentials.Value.Username,
@@ -587,6 +727,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 if (string.IsNullOrWhiteSpace(authResult.RefreshToken))
                 {
                     parent.parent.ServiceLogError("Steam login succeeded but returned no refresh token.");
+                    await RecordLoginPromptAsync(promptedAt.Value, "failed: Steam returned no refresh token");
+                    MarkSessionDown("the approved Steam login returned no refresh token");
                     return false;
                 }
 
@@ -610,6 +752,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 state.UpdatedAtUtc = DateTime.UtcNow;
                 await parent.parent.GetDataHandler().WriteToFile(statePath, JsonConvert.SerializeObject(state, Formatting.Indented));
                 await parent.parent.GetDataHandler().WriteToFile(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotSteamRefreshToken), steamRefreshToken);
+                await RecordLoginPromptAsync(promptedAt.Value, "approved");
 
                 parent.parent.ServiceLog("Programmatically obtained Steam refresh token via SteamKit2 credentials flow.");
                 return true;
@@ -617,10 +760,20 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             catch (Exception ex)
             {
                 parent.parent.ServiceLogError(ex, "Programmatic Steam refresh-token acquisition failed.");
+                string outcome = lastLoginPromptAnswer switch
+                {
+                    null => "failed: " + ex.Message,
+                    "Done" => "approved in Discord, but Steam did not complete the login: " + ex.Message,
+                    "Not now" => "declined",
+                    var other => "not approved (" + other + ")",
+                };
+                if (promptedAt is DateTime at) await RecordLoginPromptAsync(at, outcome);
+                MarkSessionDown("the Steam login was not approved (" + outcome + ")");
                 return false;
             }
             finally
             {
+                loginPromptOpen = false;
                 client.Disconnect();
             }
         }
@@ -861,12 +1014,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     using HttpResponseMessage response = await CommunityHttp.SendAsync(request);
                     if (response.IsSuccessStatusCode)
                     {
+                        MarkSessionWorking();
                         return true;
                     }
                     // The May 2026 market redesign may retire this probe; a logged-in profile redirect
                     // (/my/ → /profiles/{id} or /id/{name}, never /login) proves the cookies still work.
                     if (await ProfileRedirectProvesLogin(cookieString))
                     {
+                        MarkSessionWorking();
                         return true;
                     }
 
@@ -877,12 +1032,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                         continue;
                     }
 
+                    // Never interactive: a rejected saved login is recorded, and only RequestInteractiveLoginAsync asks Klives.
                     if (reLogin && attempt == 0)
                     {
                         await EnsureSteamAuthAsync(forceRefresh: true);
                         continue;
                     }
 
+                    MarkSessionDown(sessionProblem ?? "Steam no longer accepts the bot's session");
                     return false;
                 }
                 catch (Exception ex)

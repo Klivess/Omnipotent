@@ -31,11 +31,14 @@ internal sealed class FakeExitHost : IExitHost
     public List<string> Alerts { get; } = new();
     public int Saves { get; private set; }
 
-    public Task<bool> SellOnSteamAsync(PurchasedListing position, int pricePence)
+    /// <summary>What the next Steam listing attempt returns (listed by default).</summary>
+    public SteamSellResult SteamResult { get; set; } = SteamSellResult.Ok();
+
+    public Task<SteamSellResult> SellOnSteamAsync(PurchasedListing position, int pricePence)
     {
         Actions.Add(("steam", pricePence));
-        position.CurrentStrategicStage = StrategicStages.WaitingForMarketSaleOnSteam;
-        return Task.FromResult(true);
+        if (SteamResult.Listed) position.CurrentStrategicStage = StrategicStages.WaitingForMarketSaleOnSteam;
+        return Task.FromResult(SteamResult);
     }
 
     public Task<string?> ListOnCSFloatAsync(PurchasedListing position, int priceCents, CancellationToken ct)
@@ -194,6 +197,60 @@ public class ExitManagerTests
         Assert.Single(host.Actions);                // only the listing itself
         Assert.Equal(0, p.RelistTotalExposure);     // ten hidden days are no evidence against the price
         Assert.Equal(T0.AddDays(10), p.RelistExposureUpdatedUtc);
+    }
+
+    [Fact]
+    public async Task ALapsedSteamLoginParksTheSaleWithoutCountingItThenTakesTheRelist()
+    {
+        // Steam pays well here (£6 buy order), so it is the better exit — but the bot's Steam login needs approving.
+        var host = new FakeExitHost(CSFloat(), Steam(bid: 600)) { ExitEnvironment = ExitEnvironment.Default with { SteamUnavailableReason = "the login needs approving" } };
+        var p = Position();
+
+        Assert.Equal("waiting for steam login", await new ExitManager(host, () => T0).RunSaleAsync(p, CancellationToken.None));
+        Assert.Empty(host.Actions);
+        Assert.Equal(0, p.SaleAttempts);
+        Assert.Equal(T0, p.WaitingForSteamLoginSinceUtc);
+        Assert.Equal(T0 + ExitManager.SteamLoginRetry, p.SaleDeferredUntilUtc);
+
+        // Still down a day later: keep waiting, still nothing counted.
+        Assert.Equal("waiting for steam login", await new ExitManager(host, () => T0.AddDays(1)).RunSaleAsync(p, CancellationToken.None));
+        Assert.Equal(T0, p.WaitingForSteamLoginSinceUtc);
+        Assert.Equal(0, p.SaleAttempts);
+
+        // After two days holding costs more than the gap: the relist is taken.
+        Assert.Equal("relist", await new ExitManager(host, () => T0 + ExitManager.SteamOutageRelistAfter).RunSaleAsync(p, CancellationToken.None));
+        Assert.Equal("list", host.Actions.Single().Action);
+        Assert.Equal(default, p.WaitingForSteamLoginSinceUtc);
+    }
+
+    [Fact]
+    public async Task OutagesWhileListingOnSteamAreGivenBackAndRealFailuresAreCountedWithTheirReason()
+    {
+        var host = new FakeExitHost(CSFloat(), Steam(bid: 600)) { SteamResult = new SteamSellResult(SteamSellOutcome.LoginUnavailable, "Steam rejected the saved login") };
+        var p = Position();
+
+        Assert.Equal("waiting for steam login", await new ExitManager(host, () => T0).RunSaleAsync(p, CancellationToken.None));
+        Assert.Equal(0, p.SaleAttempts);
+        Assert.Equal(default, p.LastSaleAttemptUtc);
+        Assert.Equal(T0, p.WaitingForSteamLoginSinceUtc);
+
+        host.SteamResult = new SteamSellResult(SteamSellOutcome.InventoryUnavailable, "Steam's inventory answered 500");
+        Assert.Equal("steam unavailable", await new ExitManager(host, () => T0).RunSaleAsync(p, CancellationToken.None));
+        Assert.Equal(0, p.SaleAttempts);
+        Assert.Equal(T0 + ExitManager.SteamInventoryRetry, p.SaleDeferredUntilUtc);
+
+        host.SteamResult = new SteamSellResult(SteamSellOutcome.NotInInventory, "not in the Steam inventory");
+        Assert.Equal("failed", await new ExitManager(host, () => T0).RunSaleAsync(p, CancellationToken.None));
+        Assert.Equal(1, p.SaleAttempts);
+        Assert.Equal(T0, p.LastSaleAttemptUtc);
+        Assert.Equal("not in the Steam inventory", p.LastSaleFailure);
+
+        host.SteamResult = SteamSellResult.Ok();
+        Assert.Equal("steam", await new ExitManager(host, () => T0.AddHours(6)).RunSaleAsync(p, CancellationToken.None));
+        Assert.Equal("", p.LastSaleFailure);
+        Assert.Equal(default, p.WaitingForSteamLoginSinceUtc);
+        Assert.All(host.Actions, a => Assert.Equal("steam", a.Action));
+        Assert.Empty(host.Alerts);
     }
 
     [Fact]

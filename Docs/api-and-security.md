@@ -360,6 +360,25 @@ session (`WebsiteNoProfile`) are +3. An IP the fingerprint classifier calls `Own
 alerts skip the website's logged-out traffic and IPs classed as people. The OmniDefence page's
 "Needs review" rail lists where the classifier and the gate still disagree.
 
+The overview (`/omnidefence/overview`) is never computed on a request. A background worker rebuilds it
+and the route serves the last copy, marked `stale` with `ageSeconds` once it is over two minutes old.
+Each build step is named and timed (`health.buildSteps`), and a build that runs past two minutes logs
+the step it is in. `/omnidefence/overview/status` answers whether or not an overview exists: the step a
+running build is in, how long the last start took step by step (`startup`), and the pass that links IPs
+to profiles after it (`profileLinks`).
+
+Two rules keep the build and the start fast as the request log grows; `OverviewQueryCostTests` and
+`StartupCostTests` hold them, counting database pages rather than milliseconds.
+
+- **Every read of the request log names how it reaches the rows**: `INDEXED BY ix_requests_ts` for a
+  time window, `NOT INDEXED` for a walk by id. SQLite has no statistics for this database, and left to
+  choose it walked a whole index to save a sort, fetching every row ever logged: with 1.69 million rows
+  that kept one overview build in a single step for over an hour, and kept the service's routes
+  missing for 103 minutes after a start.
+- **Nothing on the start-up path reads the whole log.** The routes register last, so a slow step there
+  is how long honeypots, blocked regions, fingerprinting and every `/omnidefence` route are missing.
+  Work that must look at history runs after the routes, from a watermark in `od_settings`.
+
 ## Security posture — read this before deploying anything
 
 This is a **single-owner, self-hosted personal system**, and the threat model is "the owner's own

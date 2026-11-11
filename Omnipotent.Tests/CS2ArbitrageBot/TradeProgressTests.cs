@@ -118,6 +118,66 @@ public class TradeProgressTests
         Assert.False(global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.IsAutoSellable(failing, Now));
     }
 
+    private static CSFloatWrapper.InventoryItem Unit(string name, double? floatValue = null) =>
+        new() { AssetId = Guid.NewGuid().ToString("N"), MarketHashName = name, Tradable = true, FloatValue = floatValue };
+
+    private static PurchasedListing Held(string name, float floatValue = 0) => new()
+    {
+        CSFloatListingID = Guid.NewGuid().ToString("N"),
+        ItemMarketHashName = name,
+        ItemFloatValue = floatValue,
+        CurrentStrategicStage = StrategicStages.JustRetrieved,
+        PurchaseCostPence = 300,
+        PredictedTimeToBeResoldOnSteam = Now.AddDays(-20),
+    };
+
+    [Fact]
+    public void OnlyAShortfallOfUnitsMarksPositionsAsGone()
+    {
+        // Live, Nov 10 2026: positions sold by hand stayed "in inventory", failed every sale and were reported on every restart.
+        var gamma = new[] { Held("Gamma 2 Case"), Held("Gamma 2 Case"), Held("Gamma 2 Case") };
+        var macTen = Held("Souvenir MAC-10 | Amber Fade (Field-Tested)", 0.2512f);
+        var spectrum = Held("Spectrum 2 Case");
+        var inventory = new List<CSFloatWrapper.InventoryItem>
+        {
+            Unit("Gamma 2 Case"),                                              // one of the three is left
+            Unit("Souvenir MAC-10 | Amber Fade (Field-Tested)", 0.31),         // another MAC-10 (Klives's own?): a unit all the same
+            Unit("Spectrum 2 Case"), Unit("Spectrum 2 Case"),                  // more units than positions
+        };
+
+        var missing = global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.PositionsWithoutAUnit(gamma.Append(macTen).Append(spectrum), inventory);
+
+        Assert.Equal(2, missing.Count);
+        Assert.All(missing, m => Assert.Equal("Gamma 2 Case", m.ItemMarketHashName));
+        Assert.DoesNotContain(macTen, missing);   // conservative: any unit of the item keeps a position open
+        Assert.DoesNotContain(spectrum, missing);
+    }
+
+    [Fact]
+    public void ASkinsUnitGoesToThePositionWithItsFloat()
+    {
+        var sold = Held("AK-47 | Slate (Minimal Wear)", 0.1001f);
+        var kept = Held("AK-47 | Slate (Minimal Wear)", 0.1402f);
+        var missing = global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.PositionsWithoutAUnit(
+            new[] { sold, kept }, new[] { Unit("AK-47 | Slate (Minimal Wear)", 0.14020000123) });
+        Assert.Equal(new[] { sold }, missing);
+    }
+
+    [Fact]
+    public void OnlyUnlockedPositionsWaitingToBeSoldAreCheckedAgainstTheInventory()
+    {
+        var unlocked = Held("Gamma 2 Case");
+        Assert.True(global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.ShouldBeInInventory(unlocked, Now));
+
+        var stillLocked = Held("Gamma 2 Case");
+        stillLocked.PredictedTimeToBeResoldOnSteam = Now.AddDays(2);
+        Assert.False(global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.ShouldBeInInventory(stillLocked, Now));
+
+        var listedOnSteam = Held("Gamma 2 Case");
+        listedOnSteam.CurrentStrategicStage = StrategicStages.WaitingForMarketSaleOnSteam;
+        Assert.False(global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.ShouldBeInInventory(listedOnSteam, Now));
+    }
+
     [Fact]
     public void CancelledResaleEitherStaysListedOrGoesBackForResale()
     {

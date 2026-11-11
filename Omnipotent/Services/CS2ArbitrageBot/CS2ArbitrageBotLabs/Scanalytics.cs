@@ -453,6 +453,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             TradeCancelled,
             /// <summary>Relisted on CSFloat after trade protection; waiting for a buyer.</summary>
             WaitingForCSFloatResale,
+            /// <summary>The unit left the inventory without the bot selling it (sold or moved by hand); closed with no recorded result.</summary>
+            LeftInventory,
         }
 
         public class PurchasedListing
@@ -527,6 +529,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             /// <summary>Sale decisions postponed because the market data to make them was unavailable.</summary>
             public int SaleDeferrals;
             public DateTime SaleDeferredUntilUtc;
+
+            // ── v4 fields: sale failures (absent in old files → defaults) ──
+            /// <summary>Why the last counted sale attempt failed ("" after a sale); shown when the position stops being sold automatically.</summary>
+            public string LastSaleFailure = "";
+            /// <summary>Since when the sale has been waiting for the bot's Steam login to work again (default when not waiting).</summary>
+            public DateTime WaitingForSteamLoginSinceUtc;
+            /// <summary>When Klives was told this position is no longer sold automatically — persisted, so a restart doesn't tell him again.</summary>
+            public DateTime ManualAttentionAlertedUtc;
+            /// <summary>When an inventory check first found no unit for this position (default while it is there); a second miss closes it.</summary>
+            public DateTime MissingFromInventorySinceUtc;
 
             public void RecordExitDecision(ExitDecision decision)
             {

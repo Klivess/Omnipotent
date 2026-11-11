@@ -69,6 +69,46 @@ namespace Omnipotent.Services.OmniDefence
             }
         }
 
+        /// <summary>Audit-row ids covered by one read of a profile-link pass, so no read holds a read slot for long.</summary>
+        internal const int ProfileLinkSpan = 5_000;
+
+        /// <summary>What one pass covered: audit rows with ids in (FromId, ThroughId], and how many of them carried a profile.</summary>
+        public sealed record ProfileLinkPass(long FromId, long ThroughId, long RowsRead);
+
+        /// <summary>
+        /// Links each IP to the profile that last used it, from the audit rows added since the
+        /// previous pass. Requests link their own IP as they arrive, so this only recovers what a
+        /// crash left unflushed. It reads the log in the order it is stored, from a watermark: the
+        /// first pass on a database reads the whole log once, every later pass only the new rows.
+        /// Call after <see cref="LoadAsync"/>; safe to run beside live traffic.
+        /// </summary>
+        public async Task<ProfileLinkPass> CatchUpProfileLinksAsync(int span = ProfileLinkSpan, CancellationToken cancellationToken = default)
+        {
+            var invariant = System.Globalization.CultureInfo.InvariantCulture;
+            long through = await store.MaxRequestIdAsync();
+            long from = long.TryParse(await store.GetSettingAsync(OmniDefenceStore.ProfileLinkWatermarkKey),
+                System.Globalization.NumberStyles.Integer, invariant, out long saved) && saved > 0 ? saved : 0;
+            if (from > through) from = 0; // the log was rebuilt under a kept settings table
+
+            long rows = 0;
+            for (long after = from; after < through;)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                long upTo = Math.Min(after + Math.Max(1, span), through);
+                foreach (var row in await store.ReadProfileLinkRowsAsync(after, upTo))
+                {
+                    if (string.IsNullOrWhiteSpace(row.Ip) || string.IsNullOrWhiteSpace(row.ProfileId)) continue;
+                    LinkProfile(GetOrCreate(row.Ip), row.ProfileId, row.ProfileName, row.ProfileRank, row.UtcTs);
+                    rows++;
+                }
+                after = upTo;
+                // Links first, watermark second: a crash between the two re-reads a span, never skips one.
+                await PersistAllDirtyAsync();
+                await store.SetSettingAsync(OmniDefenceStore.ProfileLinkWatermarkKey, after.ToString(invariant));
+            }
+            return new ProfileLinkPass(from, through, rows);
+        }
+
         public IpRecord GetOrCreate(string ip)
         {
             return cache.GetOrAdd(ip, key =>

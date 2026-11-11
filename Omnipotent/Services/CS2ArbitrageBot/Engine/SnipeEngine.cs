@@ -543,8 +543,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 Demand = demand,
                 AllowRelist = settings.Evaluation.AllowRelistExit,
                 Calibration = host.ExitCalibration,
-                // The account's away mode only blocks selling now; by the time this unit unlocks it may be back.
-                Environment = environment with { CSFloatSellingPaused = false },
+                // The account's away mode and a lapsed Steam login only block selling now; by the time this unit unlocks they may be back.
+                Environment = environment with { CSFloatSellingPaused = false, SteamUnavailableReason = null },
                 TradeFailureProbability = environment.Timeline.PurchaseFailureProbability(listing.SellerTotalTrades, listing.SellerFailedTrades + listing.SellerAvoidedTrades),
             };
             return ExitPlanner.Plan(context, settings.Exit, nowUtc);
