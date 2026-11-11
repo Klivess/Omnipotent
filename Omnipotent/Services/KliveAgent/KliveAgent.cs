@@ -2535,10 +2535,12 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>A reveal-applied copy of a run snapshot. FinalResponse is cloned first: snapshots
-        /// share it with the live run, and the live run must keep the reference.</summary>
-        public AgentPendingChatResponse? RevealRunForKlives(AgentPendingChatResponse? run)
+        /// share it with the live run, and the live run must keep the reference.
+        /// <paramref name="reveal"/> is the caller's accounts.secrets.reveal grant: the chat routes only
+        /// need kliveagent.history.read, so without it the references are returned exactly as stored.</summary>
+        public AgentPendingChatResponse? RevealRunForKlives(AgentPendingChatResponse? run, bool reveal)
         {
-            if (run == null) return null;
+            if (run == null || !reveal) return run;
             run.Response = RevealForKlives(run.Response);
             if (run.FinalResponse != null)
             {
@@ -2563,12 +2565,13 @@ namespace Omnipotent.Services.KliveAgent
             return run;
         }
 
-        /// <summary>A reveal-applied conversation view (its messages are already clones).</summary>
-        public AgentConversationView? RevealConversationForKlives(AgentConversationView? view)
+        /// <summary>A reveal-applied conversation view (its messages are already clones). Without the
+        /// caller's accounts.secrets.reveal grant (<paramref name="reveal"/>) it is returned unchanged.</summary>
+        public AgentConversationView? RevealConversationForKlives(AgentConversationView? view, bool reveal)
         {
-            if (view == null) return null;
+            if (view == null || !reveal) return view;
             foreach (var message in view.Messages) message.Content = RevealForKlives(message.Content);
-            for (int i = 0; i < view.RecentRuns.Count; i++) view.RecentRuns[i] = RevealRunForKlives(view.RecentRuns[i])!;
+            for (int i = 0; i < view.RecentRuns.Count; i++) view.RecentRuns[i] = RevealRunForKlives(view.RecentRuns[i], reveal)!;
             return view;
         }
 

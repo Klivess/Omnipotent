@@ -528,6 +528,12 @@ namespace Omnipotent.Services.Projects
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to recover queued Commander triggers"); }
             try { SubAgentRunner.RecoverInterruptedWakes(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to recover interrupted agent wakes"); }
+            try
+            {
+                int settled = SettleStrandedPausing();
+                if (settled > 0) _ = ServiceLog($"Projects: settled {settled} project(s) left in 'Pausing' with no wake to finish it.");
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "Projects: failed to settle stranded Pausing states"); }
 
             // Human instructions are stored independently of the transient wake/session state.
             // Re-deliver every open directive after recovery so a restart can never make Klives'
@@ -1441,7 +1447,7 @@ namespace Omnipotent.Services.Projects
         /// what the timeline is told, and a timeline that credits Klives with a decision a guardrail
         /// made is worse than useless during an incident.
         /// </summary>
-        public bool HaltProject(string projectID, string? automaticReason = null)
+        public bool HaltProject(string projectID, string? automaticReason = null, ProjectActionTrace? trace = null)
         {
             var project = Store.GetProject(projectID);
             if (project == null) return false;
@@ -1451,18 +1457,22 @@ namespace Omnipotent.Services.Projects
             ProjectStatus fromStatus = project.Status;
             project.HaltedFromStatus = project.Status;
             project.Status = ProjectStatus.Paused;
-            Store.SaveProject(project);
+            Timed(trace, projectID, "save-status", () => Store.SaveProject(project));
             if (DiscordManager != null)
                 _ = DiscordManager.SyncProjectChannelAsync(project);
-            RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing);
+            Timed(trace, projectID, "set-pausing", () => RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing));
             // Stop the in-flight wake + sub-agents so a halt bites immediately, mirroring /projects/pause.
-            bool cancelled = CommanderRunner.CancelActiveWake(project.ProjectID);
-            SubAgentRunner.CancelProject(project.ProjectID);
+            bool cancelled = Timed(trace, projectID, "cancel-wake", () => CommanderRunner.CancelActiveWake(project.ProjectID));
+            Timed(trace, projectID, "cancel-agents", () => SubAgentRunner.CancelProject(project.ProjectID));
+            // Pausing settles to Paused when the cancelled wake ends. With no wake to cancel nothing
+            // ever would, and the project read "Pausing" for good (two did for 11 days after 31 Oct).
+            if (!cancelled)
+                Timed(trace, projectID, "set-paused", () => RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Paused));
             // A halted project holds no conversation permits and keeps no deferrals: leaving either
             // behind would let a stopped project keep a live project out of the warm budget.
-            WakeAdmission.Forget(project.ProjectID);
+            Timed(trace, projectID, "release-admission", () => WakeAdmission.Forget(project.ProjectID));
             bool automatic = !string.IsNullOrWhiteSpace(automaticReason);
-            EventLog.Append(new ProjectEvent
+            Timed(trace, projectID, "record-event", () => EventLog.Append(new ProjectEvent
             {
                 ProjectID = project.ProjectID,
                 Type = ProjectEventTypes.Status,
@@ -1475,8 +1485,51 @@ namespace Omnipotent.Services.Projects
                     : cancelled
                         ? "Project halted by Klives (fleet halt-all) — in-flight wake halted."
                         : "Project halted by Klives (fleet halt-all).",
-            });
+            }));
             return true;
+        }
+
+        /// <summary>Runs one step of a lifecycle action, timed when the action carries a trace.</summary>
+        internal static T Timed<T>(ProjectActionTrace? trace, string projectID, string step, Func<T> body)
+            => trace == null ? body() : trace.Step(projectID, step, body);
+
+        internal static void Timed(ProjectActionTrace? trace, string projectID, string step, Action body)
+        {
+            if (trace == null) body();
+            else trace.Step(projectID, step, body);
+        }
+
+        /// <summary>
+        /// A paused, archived or completed project whose runtime state still reads "Pausing" with no
+        /// wake left in this process to finish the transition. Before HaltProject and pause settled it
+        /// themselves, a halt that found no wake left the project there permanently.
+        /// </summary>
+        internal static bool IsStrandedPausing(ProjectStatus status, ProjectExecutionDisposition disposition, bool hasLiveWake)
+            => disposition == ProjectExecutionDisposition.Pausing && !hasLiveWake
+               && status is ProjectStatus.Paused or ProjectStatus.Archived or ProjectStatus.Completed;
+
+        /// <summary>Settles every stranded "Pausing" disposition to the state its project is in. Run once
+        /// recovery has cleared leases from the previous process, so no wake can still end it properly.</summary>
+        internal int SettleStrandedPausing()
+        {
+            int settled = 0;
+            foreach (var project in Store.ListProjects())
+            {
+                try
+                {
+                    var disposition = RuntimeState.GetSummary(project.ProjectID).Disposition;
+                    if (!IsStrandedPausing(project.Status, disposition, CommanderRunner.HasLiveWake(project.ProjectID))) continue;
+                    RuntimeState.SetDisposition(project.ProjectID, project.Status switch
+                    {
+                        ProjectStatus.Archived => ProjectExecutionDisposition.Archived,
+                        ProjectStatus.Completed => ProjectExecutionDisposition.Completed,
+                        _ => ProjectExecutionDisposition.Paused,
+                    });
+                    settled++;
+                }
+                catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: could not settle the Pausing state of {project.ProjectID}"); }
+            }
+            return settled;
         }
 
         /// <summary>
@@ -1485,7 +1538,7 @@ namespace Omnipotent.Services.Projects
         /// other restored state (Paused, BudgetPaused, Blocked) is left at rest for Klives to resume.
         /// No-op (returns false) for projects that are not under a global halt.
         /// </summary>
-        public bool UnhaltProject(string projectID)
+        public bool UnhaltProject(string projectID, ProjectActionTrace? trace = null)
         {
             var project = Store.GetProject(projectID);
             if (project == null) return false;
@@ -1496,7 +1549,7 @@ namespace Omnipotent.Services.Projects
             // at 51.6%. Restarting the ramp here covers both routes back (unhalt-all and clearing the
             // cache halt with unhalt:true); a bulk restore simply restarts it once per project, which
             // is the same thing as restarting it when the last one lands.
-            WakeAdmission.BeginWarmRestart();
+            Timed(trace, projectID, "warm-restart", WakeAdmission.BeginWarmRestart);
 
             ProjectStatus target = project.HaltedFromStatus.Value;
             ProjectStatus fromStatus = project.Status;
@@ -1508,18 +1561,21 @@ namespace Omnipotent.Services.Projects
                 // The Grand Plan gate still stands: a project with no approved plan resumes to Planning.
                 bool wasPlanning = target == ProjectStatus.Planning || !GrandPlans.HasApprovedPlan(project.ProjectID);
                 project.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
-                Store.SaveProject(project);
+                Timed(trace, projectID, "save-status", () => Store.SaveProject(project));
                 if (DiscordManager != null)
                     _ = DiscordManager.SyncProjectChannelAsync(project);
-                RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
-                RuntimeState.ClearBlocker(project.ProjectID);
-                RuntimeState.CloseCircuit(project.ProjectID);
-                // The circuit is only half the admission gate: the per-actor provider deadline
-                // refuses the wake below on its own, and a halt caught in a wake's startup window
-                // leaves a cancel-on-birth flag that kills whichever wake starts next.
-                RuntimeState.ClearProviderAdmission(project.ProjectID);
+                Timed(trace, projectID, "set-running", () =>
+                {
+                    RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
+                    RuntimeState.ClearBlocker(project.ProjectID);
+                    RuntimeState.CloseCircuit(project.ProjectID);
+                    // The circuit is only half the admission gate: the per-actor provider deadline
+                    // refuses the wake below on its own, and a halt caught in a wake's startup window
+                    // leaves a cancel-on-birth flag that kills whichever wake starts next.
+                    RuntimeState.ClearProviderAdmission(project.ProjectID);
+                });
                 CommanderRunner.ClearPendingCancellation(project.ProjectID);
-                EventLog.Append(new ProjectEvent
+                Timed(trace, projectID, "record-event", () => EventLog.Append(new ProjectEvent
                 {
                     ProjectID = project.ProjectID,
                     Type = ProjectEventTypes.Status,
@@ -1527,24 +1583,24 @@ namespace Omnipotent.Services.Projects
                     PayloadJson = ProjectLifecycleEvents.Payload(
                         fromStatus, project.Status, "fleet-unhalt"),
                     Text = $"Project unhalted by Klives (fleet unhalt-all) — resumed to {project.Status}.",
-                });
-                CommanderRunner.Wake(project, wasPlanning
+                }));
+                Timed(trace, projectID, "wake-commander", () => CommanderRunner.Wake(project, wasPlanning
                     ? "Project unhalted by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
-                    : "Project unhalted by Klives. Rehydrate current state and continue with the next concrete step.");
+                    : "Project unhalted by Klives. Rehydrate current state and continue with the next concrete step."));
                 // HaltProject cancels every worker wake exactly as pause does, so unhalting has to
                 // put the roster back to work too. Fleet-wide, this is the difference between
                 // unhalt-all restarting the whole estate and it restarting only the Commanders.
-                ResumeWorkers(project);
+                Timed(trace, projectID, "wake-workers", () => ResumeWorkers(project));
             }
             else
             {
                 project.Status = target;
-                Store.SaveProject(project);
+                Timed(trace, projectID, "save-status", () => Store.SaveProject(project));
                 if (DiscordManager != null)
                     _ = DiscordManager.SyncProjectChannelAsync(project);
-                RuntimeState.SetDisposition(project.ProjectID, target == ProjectStatus.Blocked
-                    ? ProjectExecutionDisposition.Blocked : ProjectExecutionDisposition.Paused);
-                EventLog.Append(new ProjectEvent
+                Timed(trace, projectID, "set-disposition", () => RuntimeState.SetDisposition(project.ProjectID, target == ProjectStatus.Blocked
+                    ? ProjectExecutionDisposition.Blocked : ProjectExecutionDisposition.Paused));
+                Timed(trace, projectID, "record-event", () => EventLog.Append(new ProjectEvent
                 {
                     ProjectID = project.ProjectID,
                     Type = ProjectEventTypes.Status,
@@ -1552,7 +1608,7 @@ namespace Omnipotent.Services.Projects
                     PayloadJson = ProjectLifecycleEvents.Payload(
                         fromStatus, project.Status, "fleet-unhalt-restore"),
                     Text = $"Project unhalted by Klives (fleet unhalt-all) — restored to {target} (left at rest).",
-                });
+                }));
             }
             return true;
         }
@@ -1899,25 +1955,26 @@ namespace Omnipotent.Services.Projects
         /// re-opens admission for anything Klives resumes by hand, which is the right default while
         /// he is still checking whether the cause is actually fixed.
         /// </summary>
-        public (bool cleared, int restored, List<string> projectIDs) ClearCacheHalt(string clearedBy, bool unhalt)
+        public (bool cleared, int restored, List<string> projectIDs) ClearCacheHalt(string clearedBy, bool unhalt,
+            ProjectActionTrace? trace = null)
         {
-            bool cleared = CacheHealth.Clear(clearedBy);
+            bool cleared = Timed(trace, "fleet", "clear-latch", () => CacheHealth.Clear(clearedBy));
             // Restart the warm ramp BEFORE anything is restored. Every conversation in a halted fleet
             // is cold, so releasing all of them at once is the worst possible load: full prefills at
             // ~120s a slot instead of ~15s, which is how the 2026-09-17 clear went straight back into
             // a 51.6% window. The ramp lets them warm in sequence instead.
-            if (cleared) WakeAdmission.BeginWarmRestart();
+            if (cleared) Timed(trace, "fleet", "warm-restart", WakeAdmission.BeginWarmRestart);
             if (cleared)
                 foreach (var project in Store.ListProjects())
                 {
-                    try { RuntimeState.ClearBlocker(project.ProjectID, CacheHaltBlockerID); }
+                    try { Timed(trace, project.ProjectID, "clear-blocker", () => RuntimeState.ClearBlocker(project.ProjectID, CacheHaltBlockerID)); }
                     catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: cache-halt blocker clear failed for {project.ProjectID}"); }
                 }
             var restored = new List<string>();
             if (unhalt)
                 foreach (var project in Store.ListProjects())
                 {
-                    try { if (UnhaltProject(project.ProjectID)) restored.Add(project.ProjectID); }
+                    try { if (UnhaltProject(project.ProjectID, trace)) restored.Add(project.ProjectID); }
                     catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: cache-halt clear could not restore {project.ProjectID}"); }
                 }
             if (cleared)
@@ -1925,14 +1982,14 @@ namespace Omnipotent.Services.Projects
                 {
                     try
                     {
-                        EventLog.Append(new ProjectEvent
+                        Timed(trace, project.ProjectID, "record-event", () => EventLog.Append(new ProjectEvent
                         {
                             ProjectID = project.ProjectID,
                             Type = ProjectEventTypes.CacheHaltCleared,
                             Author = "klives",
                             Text = $"Prompt-cache halt cleared by {clearedBy}"
                                 + (unhalt ? " — projects restored to their pre-halt status." : " — projects left where they are."),
-                        });
+                        }));
                     }
                     catch (Exception ex) { _ = ServiceLogError(ex, $"Projects: cache-halt clear event failed for {project.ProjectID}"); }
                 }

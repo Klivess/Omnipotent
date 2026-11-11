@@ -183,6 +183,55 @@ namespace Omnipotent.Tests.OmniDefence
         }
 
         [Fact]
+        public async Task StartupTrace_AStepAfterTheRoutes_IsTimedAndShown_ButNothingWaitsForIt()
+        {
+            // Loading the fingerprint engine took 193.8 s of a 318.5 s start on 11 Nov 2026, all of
+            // it before the routes existed. It now runs after them: the start is ready without it.
+            DateTimeOffset now = new(2026, 11, 11, 0, 28, 39, TimeSpan.Zero);
+            var trace = new OmniDefenceStartupTrace(() => now);
+            trace.Begin();
+            await trace.Step("IP records", () => Task.CompletedTask);
+            now = now.AddSeconds(124);
+            await trace.Step("routes", () => Task.CompletedTask);
+            trace.Ready();
+
+            var loading = new TaskCompletionSource();
+            Task late = trace.Step("fingerprinting", () => loading.Task);
+            now = now.AddSeconds(190);
+
+            var during = JObject.FromObject(trace.Status());
+            Assert.True(during.Value<bool>("ready"));
+            Assert.False(trace.Running);                                 // so no slow-start alert for it
+            Assert.Equal(124, during.Value<double>("seconds"));          // the wait for the routes, not for this
+            Assert.Equal("fingerprinting", during.Value<string>("step"));
+
+            loading.SetResult();
+            await late;
+            var after = JObject.FromObject(trace.Status());
+            Assert.Null(after.Value<string>("step"));
+            Assert.Equal(124, after.Value<double>("seconds"));
+            Assert.Equal(new[] { "IP records", "routes", "fingerprinting" }, ((JObject)after["steps"]!).Properties().Select(p => p.Name));
+        }
+
+        [Fact]
+        public async Task OpeningTheStore_ReportsItsThreeSteps_SoTheSlowOneCanBeNamed()
+        {
+            var steps = new List<string>();
+            var store = new OmniDefenceStore(dbPath);
+            await store.InitializeAsync(async (name, run) =>
+            {
+                steps.Add(name);
+                await run();
+            });
+
+            Assert.Equal(new[] { "opening the database", "checking the schema", "scrubbing settings audits" }, steps);
+            // And it is a working store: the schema is there and the audit flusher is running.
+            await store.InsertRequestsAsync(new[] { Audit("198.51.100.20", 1000, "p1", 1) });
+            Assert.Equal(1, await store.MaxRequestIdAsync());
+            await store.ShutdownAsync();
+        }
+
+        [Fact]
         public async Task StartupTrace_AFailedStepIsStillTimed_AndTheStartReportsItsError()
         {
             var trace = new OmniDefenceStartupTrace();

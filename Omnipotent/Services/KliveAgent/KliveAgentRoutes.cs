@@ -216,7 +216,7 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
-                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealRunForKlives(pendingResponse)), headers: new WebHeaderCollection
+                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealRunForKlives(pendingResponse, req.Can(AccountsPerms.SecretsReveal))), headers: new WebHeaderCollection
                     {
                         ["Cache-Control"] = "no-store",
                         ["X-Klive-Pending-Wait"] = "supported"
@@ -247,8 +247,9 @@ namespace Omnipotent.Services.KliveAgent
                     }
                     bool includeCompleted = !string.Equals(
                         req.userParameters["includeCompleted"], "false", StringComparison.OrdinalIgnoreCase);
+                    bool reveal = req.Can(AccountsPerms.SecretsReveal);
                     var runs = service.GetPendingApiResponses(conversationId, includeCompleted)
-                        .Select(run => service.RevealRunForKlives(run))
+                        .Select(run => service.RevealRunForKlives(run, reveal))
                         .ToList();
                     await req.ReturnResponse(JsonConvert.SerializeObject(runs), headers: NoStore());
                 }
@@ -565,8 +566,9 @@ namespace Omnipotent.Services.KliveAgent
                     }
 
                     // Requested credentials appear as {account:...} references in the stored reply and
-                    // are resolved only here, for Klives' own authenticated view.
-                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealConversationForKlives(conversation)),
+                    // are resolved only here, and only for a caller who may reveal account secrets:
+                    // this route needs just kliveagent.history.read.
+                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealConversationForKlives(conversation, req.Can(AccountsPerms.SecretsReveal))),
                         headers: NoStore());
                 }
                 catch (Exception ex)

@@ -35,7 +35,9 @@ namespace Omnipotent.Services.OmniDefence
                 // Per-IP value: must never be served from the shared response cache.
                 CacheDeps.MarkUncacheable("per-IP beacon nonce");
                 string ip = OmniDefence.ExtractClientIp(req.req);
-                bool enabled = parent.Settings.BeaconEnabled && parent.Settings.FingerprintEnabled;
+                // Off until the engine exists: it loads after the routes, and a beacon posted
+                // before then would be refused.
+                bool enabled = parent.Settings.BeaconEnabled && parent.Settings.FingerprintEnabled && parent.Fingerprints != null;
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { enabled, nonce = enabled ? parent.IssueBeaconNonce(ip) : null }), "application/json");
             }, HttpMethod.Get, Perms.Public);
 

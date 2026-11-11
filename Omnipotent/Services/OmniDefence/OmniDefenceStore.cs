@@ -60,15 +60,24 @@ namespace Omnipotent.Services.OmniDefence
             }.ToString();
         }
 
-        public async Task InitializeAsync()
+        /// <summary>
+        /// Opens the database, brings the schema up to date and scrubs legacy settings audits.
+        /// <paramref name="step"/> runs each of the three under its name so the caller can time them:
+        /// together they took 68 s of one start-up (11 Nov 2026) and it is not known which it was.
+        /// </summary>
+        public async Task InitializeAsync(Func<string, Func<Task>, Task>? step = null)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
-            sharedConnection = new SqliteConnection(connectionString);
-            await sharedConnection.OpenAsync();
+            step ??= (_, run) => run();
+            await step("opening the database", async () =>
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+                sharedConnection = new SqliteConnection(connectionString);
+                await sharedConnection.OpenAsync();
 
-            using var pragma = sharedConnection.CreateCommand();
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;";
-            await pragma.ExecuteNonQueryAsync();
+                using var pragma = sharedConnection.CreateCommand();
+                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;";
+                await pragma.ExecuteNonQueryAsync();
+            });
 
             string[] schema = new[]
             {
@@ -230,9 +239,19 @@ namespace Omnipotent.Services.OmniDefence
                 );"
             };
 
+            await step("checking the schema", () => ApplySchemaAsync(schema));
+            await step("scrubbing settings audits", async () =>
+            {
+                SensitiveAuditMigrationChangedRows = await ScrubLegacySensitiveSettingsAuditsAsync();
+            });
+            StartAuditFlusher();
+        }
+
+        private async Task ApplySchemaAsync(string[] schema)
+        {
             foreach (var stmt in schema)
             {
-                using var cmd = sharedConnection.CreateCommand();
+                using var cmd = Connection.CreateCommand();
                 cmd.CommandText = stmt;
                 await cmd.ExecuteNonQueryAsync();
             }
@@ -265,9 +284,6 @@ namespace Omnipotent.Services.OmniDefence
             await EnsureColumnAsync("ip_records", "reverse_dns", "TEXT");
             await EnsureColumnAsync("ip_records", "timezone", "TEXT");
             await EnsureColumnAsync("ip_records", "as_name", "TEXT");
-
-            SensitiveAuditMigrationChangedRows = await ScrubLegacySensitiveSettingsAuditsAsync();
-            StartAuditFlusher();
         }
 
         /// <summary>

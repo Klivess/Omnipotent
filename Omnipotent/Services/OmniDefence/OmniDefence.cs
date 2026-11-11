@@ -94,18 +94,17 @@ namespace Omnipotent.Services.OmniDefence
 
         protected override async void ServiceMain()
         {
-            // Every step is named and timed (see OmniDefenceStartupTrace): the routes register
-            // last, so whatever is slow here is how long the whole service is missing.
+            // Every step is named and timed (see OmniDefenceStartupTrace): whatever runs before
+            // the routes register is how long the whole service is missing.
             startup.Begin();
             _ = ReportSlowStartupAsync();
             try
             {
-                await startup.Step("opening the store", async () =>
-                {
-                    Directory.CreateDirectory(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory));
-                    store = new OmniDefenceStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDatabaseFile));
-                    await store.InitializeAsync();
-                });
+                Directory.CreateDirectory(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory));
+                store = new OmniDefenceStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDatabaseFile));
+                // Three steps of its own: opening the database, checking the schema, scrubbing
+                // settings audits.
+                await store.InitializeAsync(startup.Step);
 
                 // Audit rows are batched, so a shutdown between flushes would drop the
                 // tail of the log. Commit what is queued on the way out.
@@ -166,21 +165,33 @@ namespace Omnipotent.Services.OmniDefence
                 // Periodic flush so threat scores survive restarts.
                 _ = PeriodicFlushLoop();
 
-                await startup.Step("fingerprinting", StartFingerprintingAsync);
-
                 await startup.Step("routes", () => OmniDefenceRoutes.RegisterAsync(this));
 
                 startup.Ready();
                 await ServiceLog($"OmniDefence start-up took {startup.Summary()}.");
 
-                // After the routes, never before them: nothing on the start path waits for this.
-                _ = Task.Run(CatchUpProfileLinksAsync);
+                // After the routes, never before them: nothing on the start path waits for these.
+                _ = Task.Run(FinishStartupAsync);
             }
             catch (Exception ex)
             {
                 startup.Failed(ex);
                 await ServiceLogError(ex, "OmniDefence failed to start.");
             }
+        }
+
+        /// <summary>
+        /// What start-up leaves until the routes exist. Loading the fingerprint engine and its intel
+        /// took 193.8 s of a 318.5 s start on 11 Nov 2026, and every /omnidefence route waited for
+        /// it. The engine queues signals and commands until it has loaded, and each route answers
+        /// without it, so it now loads once the service is up. The profile links follow: they read
+        /// only the audit rows added since the last start. One after the other, because each holds
+        /// one of the two read slots while it reads.
+        /// </summary>
+        private async Task FinishStartupAsync()
+        {
+            await startup.Step("fingerprinting", StartFingerprintingAsync);
+            await CatchUpProfileLinksAsync();
         }
 
         /// <summary>

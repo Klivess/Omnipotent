@@ -375,9 +375,13 @@ Two rules keep the build and the start fast as the request log grows; `OverviewQ
   choose it walked a whole index to save a sort, fetching every row ever logged: with 1.69 million rows
   that kept one overview build in a single step for over an hour, and kept the service's routes
   missing for 103 minutes after a start.
-- **Nothing on the start-up path reads the whole log.** The routes register last, so a slow step there
-  is how long honeypots, blocked regions, fingerprinting and every `/omnidefence` route are missing.
-  Work that must look at history runs after the routes, from a watermark in `od_settings`.
+- **Nothing on the start-up path reads the whole log, and nothing waits that does not have to.** Until
+  the routes register every `/omnidefence` route answers 404, so each step before them is timed
+  (`startup.steps`) and a start over two minutes logs the step it is in. What can load once the service
+  is answering does: the fingerprint engine and its intel (the engine queues signals and commands until
+  it has loaded, and the beacon nonce reports `enabled: false` until then), then the profile links,
+  which read from a watermark in `od_settings`. `startup.seconds` is the wait for the routes; a step
+  listed after `routes` ran afterwards.
 
 ## Security posture — read this before deploying anything
 

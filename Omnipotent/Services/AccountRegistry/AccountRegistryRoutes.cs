@@ -8,9 +8,10 @@ using Omnipotent.Profiles.Permissions;
 namespace Omnipotent.Services.AccountRegistry
 {
     /// <summary>
-    /// REST routes for the global account registry — all Klives-only (the same trust boundary as
-    /// KliveAgent/Projects). Responses are camelCase with enums-as-strings so the website reads
-    /// fields directly. Secrets are masked unless ?revealSensitive=true (the omnisettings pattern).
+    /// REST routes for the global account registry. Responses are camelCase with enums-as-strings so
+    /// the website reads fields directly. Secrets are masked unless ?revealSensitive=true, and that
+    /// is honoured only for a caller holding accounts.secrets.reveal: the route itself needs only
+    /// accounts.registry.read, so the handler must check the stronger grant itself.
     /// </summary>
     public class AccountRegistryRoutes
     {
@@ -28,38 +29,15 @@ namespace Omnipotent.Services.AccountRegistry
 
         public async Task RegisterRoutes()
         {
-            await parent.CreateAPIRoute("/accounts/list", async req =>
-            {
-                try
-                {
-                    bool reveal = string.Equals(req.userParameters?.Get("revealSensitive"), "true", StringComparison.OrdinalIgnoreCase);
-                    var list = parent.Store.List().Select(a => new
-                    {
-                        a.AccountID,
-                        a.ServiceKey,
-                        a.ServiceDisplay,
-                        a.Username,
-                        a.Email,
-                        a.Description,
-                        a.Notes,
-                        Status = a.Status.ToString(),
-                        a.CreatedBy,
-                        a.Owners,
-                        a.CreatedAt,
-                        a.UpdatedAt,
-                        a.LastUsedAt,
-                        Secrets = a.Secrets.Select(s => new
-                        {
-                            s.Name,
-                            s.UpdatedAt,
-                            Value = reveal ? (parent.Store.GetDecryptedSecret(a.AccountID, s.Name) ?? "") : "••••••",
-                            Placeholder = $"{{account:{a.ServiceKey}/{a.Username}/{s.Name}}}",
-                        }).ToList(),
-                    }).ToList();
-                    await req.ReturnResponse(Json(list));
-                }
-                catch (Exception ex) { await Err(req, ex); }
-            }, HttpMethod.Get, AccountsPerms.RegistryRead);
+            await parent.CreateAPIRoute("/accounts/list",
+                req => HandleListAsync(req, parent.Store, message => parent.ServiceLog(message)),
+                HttpMethod.Get, AccountsPerms.RegistryRead);
+
+            // One secret, for the page's reveal and copy buttons: only what was asked for is
+            // decrypted and sent, instead of every agent password in one response.
+            await parent.CreateAPIRoute("/accounts/secret",
+                req => HandleSecretAsync(req, parent.Store, message => parent.ServiceLog(message)),
+                HttpMethod.Get, AccountsPerms.SecretsReveal);
 
             await parent.CreateAPIRoute("/accounts/update", async req =>
             {
@@ -100,6 +78,100 @@ namespace Omnipotent.Services.AccountRegistry
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, AccountsPerms.RegistryManage);
+        }
+
+        /// <summary>
+        /// GET /accounts/list. Reading the registry and reading its secrets are separate grants:
+        /// without accounts.secrets.reveal, ?revealSensitive=true is refused with the same 403 the
+        /// gate gives (naming the permission) and nothing is decrypted. Every reveal is logged with
+        /// the profile that asked, because it puts every agent password on one screen.
+        /// </summary>
+        internal static async Task HandleListAsync(Services.KliveAPI.KliveAPI.UserRequest req, AccountRegistryStore store,
+            Func<string, Task>? audit = null)
+        {
+            try
+            {
+                bool reveal = string.Equals(req.userParameters?.Get("revealSensitive"), "true", StringComparison.OrdinalIgnoreCase);
+                if (reveal && !req.Can(AccountsPerms.SecretsReveal))
+                {
+                    var decision = AccessEvaluator.Evaluate(req.user, AccountsPerms.SecretsReveal);
+                    var refusal = Services.KliveAPI.KliveAPI.BuildDenialBody(decision, "/accounts/list", req.user);
+                    var code = Services.KliveAPI.KliveAPI.DeniedCodeFor(decision.Reason);
+                    await req.ReturnResponse(refusal.ToString(Formatting.None),
+                        headers: new System.Collections.Specialized.NameValueCollection { { "RequestDeniedCode", ((int)code).ToString() } },
+                        code: HttpStatusCode.Forbidden);
+                    return;
+                }
+
+                var accounts = store.List();
+                var list = accounts.Select(a => new
+                {
+                    a.AccountID,
+                    a.ServiceKey,
+                    a.ServiceDisplay,
+                    a.Username,
+                    a.Email,
+                    a.Description,
+                    a.Notes,
+                    Status = a.Status.ToString(),
+                    a.CreatedBy,
+                    a.Owners,
+                    a.CreatedAt,
+                    a.UpdatedAt,
+                    a.LastUsedAt,
+                    Secrets = a.Secrets.Select(s => new
+                    {
+                        s.Name,
+                        s.UpdatedAt,
+                        Value = reveal ? (store.GetDecryptedSecret(a.AccountID, s.Name) ?? "") : "••••••",
+                        Placeholder = $"{{account:{a.ServiceKey}/{a.Username}/{s.Name}}}",
+                    }).ToList(),
+                }).ToList();
+                await req.ReturnResponse(Json(list));
+
+                if (reveal && audit != null)
+                {
+                    int withSecrets = accounts.Count(a => a.Secrets.Count > 0);
+                    try { await audit($"[AccountRegistry] Secrets of {withSecrets} account(s) revealed to {req.user?.Name ?? "an unknown caller"}."); }
+                    catch { /* the audit line must never fail the response */ }
+                }
+            }
+            catch (Exception ex) { await Err(req, ex); }
+        }
+
+        /// <summary>
+        /// GET /accounts/secret?accountID=&amp;name= (accounts.secrets.reveal, enforced by the gate). Never
+        /// cached, sent with no-store, and logged with the profile that asked.
+        /// </summary>
+        internal static async Task HandleSecretAsync(Services.KliveAPI.KliveAPI.UserRequest req, AccountRegistryStore store,
+            Func<string, Task>? audit = null)
+        {
+            try
+            {
+                Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("decrypted account secret");
+                string accountID = (req.userParameters?.Get("accountID") ?? "").Trim();
+                string name = (req.userParameters?.Get("name") ?? "").Trim();
+                if (accountID.Length == 0 || name.Length == 0)
+                {
+                    await req.ReturnResponse(Json(new { error = "accountID and name are required." }), code: HttpStatusCode.BadRequest);
+                    return;
+                }
+                var account = store.Get(accountID);
+                string? value = account == null ? null : store.GetDecryptedSecret(accountID, name);
+                if (account == null || value == null)
+                {
+                    await req.ReturnResponse(Json(new { error = "No such secret." }), code: HttpStatusCode.NotFound);
+                    return;
+                }
+                await req.ReturnResponse(Json(new { accountID, name, value }),
+                    headers: new System.Collections.Specialized.NameValueCollection { { "Cache-Control", "no-store" } });
+                if (audit != null)
+                {
+                    try { await audit($"[AccountRegistry] The {name} of {account.ServiceKey}/{account.Username} was revealed to {req.user?.Name ?? "an unknown caller"}."); }
+                    catch { /* the audit line must never fail the response */ }
+                }
+            }
+            catch (Exception ex) { await Err(req, ex); }
         }
 
         private static async Task Err(Services.KliveAPI.KliveAPI.UserRequest req, Exception ex)

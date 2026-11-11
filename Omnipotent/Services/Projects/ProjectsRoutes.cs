@@ -52,6 +52,61 @@ namespace Omnipotent.Services.Projects
             this.parent = parent;
         }
 
+        /// <summary>How long a lifecycle route waits for its action before answering that it is still settling.</summary>
+        internal static TimeSpan LifecycleWait { get; set; } = TimeSpan.FromSeconds(8);
+
+        private ProjectActionTrace NewTrace(string action) => new(action, message => _ = parent.ServiceLog(message));
+
+        /// <summary>
+        /// Runs a lifecycle action (pause, resume, archive, halt-all, unhalt-all, clearing the cache
+        /// halt, a message) off the request thread and waits for it at most <see cref="LifecycleWait"/>.
+        /// Healthy, these take milliseconds; in October every one Klives clicked held its request for
+        /// an hour or more and the page gave up (see <see cref="ProjectActionTrace"/>). The action is
+        /// never abandoned: if it outlives the wait the route answers 202 with pending:true and the
+        /// step it is in, the work finishes in the background, and the trace still logs a stuck step.
+        /// </summary>
+        internal Task<(bool Completed, T? Result)> RunLifecycleActionAsync<T>(
+            Services.KliveAPI.KliveAPI.UserRequest req, ProjectActionTrace trace, Func<T> action)
+            => RunBoundedAsync(req.Trace, trace, action, LifecycleWait, ex =>
+                _ = parent.ServiceLogError(ex, "Projects: a lifecycle action failed after its request had already answered"));
+
+        internal static async Task<(bool Completed, T? Result)> RunBoundedAsync<T>(
+            Services.KliveAPI.Telemetry.RequestTrace? requestTrace, ProjectActionTrace trace, Func<T> action,
+            TimeSpan wait, Action<Exception>? lateFailure)
+        {
+            Task<T> work;
+            // Nothing ambient (request trace, response-cache scope) may follow the work past the response.
+            using (ExecutionContext.SuppressFlow()) work = Task.Run(action);
+            var finished = await Task.WhenAny(work, Task.Delay(wait));
+            if (finished == work)
+            {
+                try { return (true, await work); }
+                finally
+                {
+                    trace.AttachSpans(requestTrace);
+                    trace.Dispose();
+                }
+            }
+            _ = work.ContinueWith(t =>
+            {
+                if (t.IsFaulted) lateFailure?.Invoke(t.Exception!.GetBaseException());
+                trace.Dispose();
+            }, TaskScheduler.Default);
+            return (false, default);
+        }
+
+        private static Task ReturnPendingAsync(Services.KliveAPI.KliveAPI.UserRequest req, string action,
+            ProjectActionTrace trace, string projectID)
+            => req.ReturnResponse(Json(new
+            {
+                ok = true,
+                pending = true,
+                action,
+                projectID,
+                step = trace.CurrentStep,
+                message = $"The {action} is still being applied and will finish by itself.",
+            }), code: HttpStatusCode.Accepted);
+
         public async Task RegisterRoutes()
         {
             await parent.RegisterHttpRouteAsync("/projects/overview", async req =>
@@ -183,27 +238,37 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    ProjectStatus fromStatus = project!.Status;
-                    project.Status = ProjectStatus.Paused;
-                    project.HaltedFromStatus = null; // individual pause overrides any remembered fleet-halt state
-                    parent.Store.SaveProject(project);
-                    if (parent.DiscordManager != null)
-                        await parent.DiscordManager.SyncProjectChannelAsync(project);
-                    parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Pausing);
-                    // Halt the in-flight wake too, so "pause" stops work promptly rather than only
-                    // preventing the NEXT wake (item 1: halt progression).
-                    bool halted = parent.CommanderRunner.CancelActiveWake(project.ProjectID);
-                    parent.SubAgentRunner.CancelProject(project.ProjectID);
-                    parent.EventLog.Append(new ProjectEvent
+                    string pid = project!.ProjectID;
+                    var trace = NewTrace("pause");
+                    var (done, paused) = await RunLifecycleActionAsync(req, trace, () =>
                     {
-                        ProjectID = project.ProjectID,
-                        Type = ProjectEventTypes.Status,
-                        Author = "klives",
-                        PayloadJson = ProjectLifecycleEvents.Payload(
-                            fromStatus, ProjectStatus.Paused, "manual-pause"),
-                        Text = halted ? "Project paused by Klives — in-flight wake halted." : "Project paused by Klives.",
+                        ProjectStatus fromStatus = project.Status;
+                        project.Status = ProjectStatus.Paused;
+                        project.HaltedFromStatus = null; // individual pause overrides any remembered fleet-halt state
+                        Projects.Timed(trace, pid, "save-status", () => parent.Store.SaveProject(project));
+                        if (parent.DiscordManager != null)
+                            _ = parent.DiscordManager.SyncProjectChannelAsync(project);
+                        Projects.Timed(trace, pid, "set-pausing", () => parent.RuntimeState.SetDisposition(pid, ProjectExecutionDisposition.Pausing));
+                        // Halt the in-flight wake too, so "pause" stops work promptly rather than only
+                        // preventing the NEXT wake (item 1: halt progression).
+                        bool halted = Projects.Timed(trace, pid, "cancel-wake", () => parent.CommanderRunner.CancelActiveWake(pid));
+                        Projects.Timed(trace, pid, "cancel-agents", () => parent.SubAgentRunner.CancelProject(pid));
+                        // Only a cancelled wake's ending settles Pausing; with none, settle it here.
+                        if (!halted)
+                            Projects.Timed(trace, pid, "set-paused", () => parent.RuntimeState.SetDisposition(pid, ProjectExecutionDisposition.Paused));
+                        Projects.Timed(trace, pid, "record-event", () => parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = pid,
+                            Type = ProjectEventTypes.Status,
+                            Author = "klives",
+                            PayloadJson = ProjectLifecycleEvents.Payload(
+                                fromStatus, ProjectStatus.Paused, "manual-pause"),
+                            Text = halted ? "Project paused by Klives — in-flight wake halted." : "Project paused by Klives.",
+                        }));
+                        return project;
                     });
-                    await req.ReturnResponse(Json(project));
+                    if (done) await req.ReturnResponse(Json(paused!));
+                    else await ReturnPendingAsync(req, "pause", trace, pid);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
@@ -214,25 +279,32 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
-                    ProjectStatus fromStatus = project!.Status;
-                    project.Status = ProjectStatus.Archived;
-                    project.HaltedFromStatus = null; // shelving overrides any remembered fleet-halt state
-                    parent.Store.SaveProject(project);
-                    if (parent.DiscordManager != null)
-                        await parent.DiscordManager.SyncProjectChannelAsync(project);
-                    parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Archived);
-                    parent.CommanderRunner.CancelActiveWake(project.ProjectID); // shelved projects do no work
-                    parent.SubAgentRunner.CancelProject(project.ProjectID);
-                    parent.EventLog.Append(new ProjectEvent
+                    string pid = project!.ProjectID;
+                    var trace = NewTrace("archive");
+                    var (done, archived) = await RunLifecycleActionAsync(req, trace, () =>
                     {
-                        ProjectID = project.ProjectID,
-                        Type = ProjectEventTypes.Status,
-                        Author = "klives",
-                        PayloadJson = ProjectLifecycleEvents.Payload(
-                            fromStatus, ProjectStatus.Archived, "archive"),
-                        Text = "Project archived (shelved) by Klives.",
+                        ProjectStatus fromStatus = project.Status;
+                        project.Status = ProjectStatus.Archived;
+                        project.HaltedFromStatus = null; // shelving overrides any remembered fleet-halt state
+                        Projects.Timed(trace, pid, "save-status", () => parent.Store.SaveProject(project));
+                        if (parent.DiscordManager != null)
+                            _ = parent.DiscordManager.SyncProjectChannelAsync(project);
+                        Projects.Timed(trace, pid, "set-archived", () => parent.RuntimeState.SetDisposition(pid, ProjectExecutionDisposition.Archived));
+                        Projects.Timed(trace, pid, "cancel-wake", () => parent.CommanderRunner.CancelActiveWake(pid)); // shelved projects do no work
+                        Projects.Timed(trace, pid, "cancel-agents", () => parent.SubAgentRunner.CancelProject(pid));
+                        Projects.Timed(trace, pid, "record-event", () => parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = pid,
+                            Type = ProjectEventTypes.Status,
+                            Author = "klives",
+                            PayloadJson = ProjectLifecycleEvents.Payload(
+                                fromStatus, ProjectStatus.Archived, "archive"),
+                            Text = "Project archived (shelved) by Klives.",
+                        }));
+                        return project;
                     });
-                    await req.ReturnResponse(Json(project));
+                    if (done) await req.ReturnResponse(Json(archived!));
+                    else await ReturnPendingAsync(req, "archive", trace, pid);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
@@ -493,58 +565,68 @@ namespace Omnipotent.Services.Projects
                         await req.ReturnResponse("raise the token budget above current spend before resuming", code: HttpStatusCode.Conflict);
                         return;
                     }
-                    // A project paused mid-planning resumes to Planning (the Grand Plan gate still stands).
-                    bool wasPlanning = !parent.GrandPlans.HasApprovedPlan(project.ProjectID);
-                    ProjectStatus fromStatus = project!.Status;
-                    project.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
-                    bool wasBlocked = project.BlockedAt.HasValue || !string.IsNullOrWhiteSpace(project.BlockedReason);
-                    project.BlockedAt = null;
-                    project.BlockedReason = null;
-                    project.HaltedFromStatus = null; // individual resume overrides any remembered fleet-halt state
-                    parent.Store.SaveProject(project);
-                    parent.RuntimeState.SetDisposition(project.ProjectID, ProjectExecutionDisposition.Running);
-                    parent.RuntimeState.ClearBlocker(project.ProjectID);
-                    parent.RuntimeState.CloseCircuit(project.ProjectID);
-                    // Closing the shared circuit is not enough: a wake is also refused while the
-                    // per-actor provider-admission deadline stands (up to 15 minutes, or whatever
-                    // Retry-After the router asked for). Klives pressing resume IS the instruction
-                    // to try again now, so the deadline goes with the circuit — otherwise the
-                    // resume wake is silently deferred and nothing happens until it expires.
-                    parent.RuntimeState.ClearProviderAdmission(project.ProjectID);
-                    // A pause that landed in the wake's startup window armed a cancel-on-birth flag.
-                    // Left set, it kills the very wake this resume is about to start.
-                    parent.CommanderRunner.ClearPendingCancellation(project.ProjectID);
-                    // Agents may already be attached to Docker desktops that survived the pause or
-                    // process restart, so the Desktops menu should see the same live fleet the agents
-                    // use. But a reconcile lists Docker, inspects every container, restarts stopped
-                    // ones and stops duplicates (15s grace each) — awaiting that here delayed the
-                    // wake itself by however long Docker took. It runs alongside the resume instead.
-                    _ = parent.RefreshDesktopRegistryAsync();
-                    parent.EventLog.Append(new ProjectEvent
+                    string pid = project!.ProjectID;
+                    var trace = NewTrace("resume");
+                    var (done, resumed) = await RunLifecycleActionAsync(req, trace, () =>
                     {
-                        ProjectID = project.ProjectID,
-                        Type = wasBlocked ? ProjectEventTypes.ProjectUnblocked : ProjectEventTypes.Status,
-                        Author = "klives",
-                        Text = "Project resumed by Klives.",
-                        PayloadJson = ProjectLifecycleEvents.Payload(
-                            fromStatus, project.Status, wasBlocked ? "unblock" : "manual-resume"),
+                        // A project paused mid-planning resumes to Planning (the Grand Plan gate still stands).
+                        bool wasPlanning = !parent.GrandPlans.HasApprovedPlan(pid);
+                        ProjectStatus fromStatus = project.Status;
+                        project.Status = wasPlanning ? ProjectStatus.Planning : ProjectStatus.Active;
+                        bool wasBlocked = project.BlockedAt.HasValue || !string.IsNullOrWhiteSpace(project.BlockedReason);
+                        project.BlockedAt = null;
+                        project.BlockedReason = null;
+                        project.HaltedFromStatus = null; // individual resume overrides any remembered fleet-halt state
+                        Projects.Timed(trace, pid, "save-status", () => parent.Store.SaveProject(project));
+                        Projects.Timed(trace, pid, "set-running", () =>
+                        {
+                            parent.RuntimeState.SetDisposition(pid, ProjectExecutionDisposition.Running);
+                            parent.RuntimeState.ClearBlocker(pid);
+                            parent.RuntimeState.CloseCircuit(pid);
+                            // Closing the shared circuit is not enough: a wake is also refused while the
+                            // per-actor provider-admission deadline stands (up to 15 minutes, or whatever
+                            // Retry-After the router asked for). Klives pressing resume IS the instruction
+                            // to try again now, so the deadline goes with the circuit — otherwise the
+                            // resume wake is silently deferred and nothing happens until it expires.
+                            parent.RuntimeState.ClearProviderAdmission(pid);
+                        });
+                        // A pause that landed in the wake's startup window armed a cancel-on-birth flag.
+                        // Left set, it kills the very wake this resume is about to start.
+                        parent.CommanderRunner.ClearPendingCancellation(pid);
+                        // Agents may already be attached to Docker desktops that survived the pause or
+                        // process restart, so the Desktops menu should see the same live fleet the agents
+                        // use. But a reconcile lists Docker, inspects every container, restarts stopped
+                        // ones and stops duplicates (15s grace each) — awaiting that here delayed the
+                        // wake itself by however long Docker took. It runs alongside the resume instead.
+                        _ = parent.RefreshDesktopRegistryAsync();
+                        Projects.Timed(trace, pid, "record-event", () => parent.EventLog.Append(new ProjectEvent
+                        {
+                            ProjectID = pid,
+                            Type = wasBlocked ? ProjectEventTypes.ProjectUnblocked : ProjectEventTypes.Status,
+                            Author = "klives",
+                            Text = "Project resumed by Klives.",
+                            PayloadJson = ProjectLifecycleEvents.Payload(
+                                fromStatus, project.Status, wasBlocked ? "unblock" : "manual-resume"),
+                        }));
+                        // Urgent: Klives is watching this project restart, so the Commander skips the fleet's
+                        // conversation budget and its first turn goes at interactive priority.
+                        Projects.Timed(trace, pid, "wake-commander", () => parent.CommanderRunner.Wake(project, wasPlanning
+                            ? "Project resumed by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
+                            : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.",
+                            urgent: true));
+                        // Pause cancelled every worker's in-flight wake too, and nothing else brings them
+                        // back: the heartbeat only nudges an agent once its quiet period (20 min, doubling
+                        // to 4 h) has elapsed since its LAST wake — which the cancelled one just reset.
+                        // Resuming therefore has to re-wake the task force, or the Commander comes back
+                        // alone and the project looks stalled for the whole interval.
+                        Projects.Timed(trace, pid, "wake-workers", () => parent.ResumeWorkers(project));
+                        // Commands sent while paused are not discarded or falsely marked delivered;
+                        // their durable directive records are re-injected as soon as work resumes.
+                        Projects.Timed(trace, pid, "deliver-directives", () => parent.DeliverPendingDirectives(pid));
+                        return project;
                     });
-                    // Urgent: Klives is watching this project restart, so the Commander skips the fleet's
-                    // conversation budget and its first turn goes at interactive priority.
-                    parent.CommanderRunner.Wake(project, wasPlanning
-                        ? "Project resumed by Klives — still in PLANNING. Continue converging on a Grand Plan and submit it for approval."
-                        : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.",
-                        urgent: true);
-                    // Pause cancelled every worker's in-flight wake too, and nothing else brings them
-                    // back: the heartbeat only nudges an agent once its quiet period (20 min, doubling
-                    // to 4 h) has elapsed since its LAST wake — which the cancelled one just reset.
-                    // Resuming therefore has to re-wake the task force, or the Commander comes back
-                    // alone and the project looks stalled for the whole interval.
-                    parent.ResumeWorkers(project);
-                    // Commands sent while paused are not discarded or falsely marked delivered;
-                    // their durable directive records are re-injected as soon as work resumes.
-                    parent.DeliverPendingDirectives(project.ProjectID);
-                    await req.ReturnResponse(Json(project));
+                    if (done) await req.ReturnResponse(Json(resumed!));
+                    else await ReturnPendingAsync(req, "resume", trace, pid);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, ProjectsPerms.LifecycleManage);
@@ -626,10 +708,23 @@ namespace Omnipotent.Services.Projects
             {
                 try
                 {
-                    var halted = new List<string>();
-                    foreach (var p in parent.Store.ListProjects())
-                        if (parent.HaltProject(p.ProjectID)) halted.Add(p.ProjectID);
-                    await req.ReturnResponse(Json(new { ok = true, halted = halted.Count, projectIDs = halted }));
+                    var trace = NewTrace("halt-all");
+                    var halted = new ConcurrentQueue<string>();
+                    var (done, _) = await RunLifecycleActionAsync(req, trace, () =>
+                    {
+                        foreach (var p in parent.Store.ListProjects())
+                            if (parent.HaltProject(p.ProjectID, trace: trace)) halted.Enqueue(p.ProjectID);
+                        return true;
+                    });
+                    var ids = halted.ToList();
+                    await req.ReturnResponse(Json(new
+                    {
+                        ok = true,
+                        pending = !done,
+                        halted = ids.Count,
+                        projectIDs = ids,
+                        step = done ? null : trace.CurrentStep,
+                    }), code: done ? HttpStatusCode.OK : HttpStatusCode.Accepted);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, ProjectsPerms.FleetControl);
@@ -676,15 +771,19 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     bool unhalt = (bool?)ParseBody(req)?["unhalt"] ?? false;
-                    var result = parent.ClearCacheHalt(req.user?.Name ?? "klives", unhalt);
+                    string by = req.user?.Name ?? "klives";
+                    var trace = NewTrace("cache-halt clear");
+                    var (done, result) = await RunLifecycleActionAsync(req, trace, () => parent.ClearCacheHalt(by, unhalt, trace));
                     await req.ReturnResponse(Json(new
                     {
                         ok = true,
-                        cleared = result.cleared,
-                        restored = result.restored,
-                        projectIDs = result.projectIDs,
+                        pending = !done,
+                        step = done ? null : trace.CurrentStep,
+                        cleared = done ? result.cleared : (bool?)null,
+                        restored = done ? result.restored : 0,
+                        projectIDs = done ? result.projectIDs : new List<string>(),
                         halt = parent.CacheHealth.GetState(),
-                    }));
+                    }), code: done ? HttpStatusCode.OK : HttpStatusCode.Accepted);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, ProjectsPerms.FleetControl);
@@ -695,9 +794,15 @@ namespace Omnipotent.Services.Projects
             {
                 try
                 {
-                    var restored = new List<string>();
-                    foreach (var p in parent.Store.ListProjects())
-                        if (parent.UnhaltProject(p.ProjectID)) restored.Add(p.ProjectID);
+                    var trace = NewTrace("unhalt-all");
+                    var restoredQueue = new ConcurrentQueue<string>();
+                    var (done, _) = await RunLifecycleActionAsync(req, trace, () =>
+                    {
+                        foreach (var p in parent.Store.ListProjects())
+                            if (parent.UnhaltProject(p.ProjectID, trace)) restoredQueue.Enqueue(p.ProjectID);
+                        return true;
+                    });
+                    var restored = restoredQueue.ToList();
                     // Restoring statuses does not re-open LLM admission while the prompt-cache latch
                     // is still closed: every restored project would wake and immediately defer. Say
                     // so, rather than leaving Klives to infer it from a wave of deferred wakes.
@@ -708,10 +813,12 @@ namespace Omnipotent.Services.Projects
                     await req.ReturnResponse(Json(new
                     {
                         ok = true,
+                        pending = !done,
+                        step = done ? null : trace.CurrentStep,
                         restored = restored.Count,
                         projectIDs = restored,
                         warning = cacheHalt,
-                    }));
+                    }), code: done ? HttpStatusCode.OK : HttpStatusCode.Accepted);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, ProjectsPerms.FleetControl);
@@ -1648,9 +1755,14 @@ namespace Omnipotent.Services.Projects
                     var kind = ParseDirectiveKind((string?)body["kind"], defaultKind);
                     string? key = ((string?)body["key"])?.Trim();
                     int priority = Math.Clamp((int?)body["priority"] ?? 100, -1000, 1000);
-                    var receipt = parent.MessageProjectWithReceipt(project!.ProjectID, text, kind, remember,
-                        key, priority, ParseStringArray(body["expectedArtifactPaths"]));
-                    await req.ReturnResponse(Json(new { ok = receipt.Accepted, receipt }));
+                    string pid = project!.ProjectID;
+                    var expected = ParseStringArray(body["expectedArtifactPaths"]);
+                    var trace = NewTrace("message");
+                    var (done, receipt) = await RunLifecycleActionAsync(req, trace, () =>
+                        Projects.Timed(trace, pid, "deliver-message", () =>
+                            parent.MessageProjectWithReceipt(pid, text, kind, remember, key, priority, expected)));
+                    if (done) await req.ReturnResponse(Json(new { ok = receipt!.Accepted, receipt }));
+                    else await ReturnPendingAsync(req, "message", trace, pid);
                 }
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Post, ProjectsPerms.AgentsMessage);
@@ -1726,6 +1838,10 @@ namespace Omnipotent.Services.Projects
                 try
                 {
                     if (!RequireProject(req, out var project)) return;
+                    // A webhook's ingress token lets anyone post a stimulus that wakes an agent with
+                    // text of their choosing (/projects/hooks/webhook is public). This route needs only
+                    // details.read, so the token goes only to a caller who could create the hook.
+                    bool showTokens = req.Can(ProjectsPerms.HooksManage);
                     var enriched = parent.Hooks.List(project!.ProjectID).Select(h =>
                     {
                         var arm = h.Enabled ? parent.Adapters.GetArmInfo(h.HookID) : null;
@@ -1738,7 +1854,7 @@ namespace Omnipotent.Services.Projects
                             h.SourceSpecJson,
                             h.RecognitionCriterion,
                             h.DestinationAgentID,
-                            IngressToken = h.SourceKind == "webhook" ? h.IngressToken : null,
+                            IngressToken = h.SourceKind == "webhook" && showTokens ? h.IngressToken : null,
                             h.Priority,
                             h.Durability,
                             h.Enabled,
