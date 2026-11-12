@@ -194,17 +194,79 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
 
         /// <summary>Intel tables that key rows by a message, a person or an identity: every one of them is swept, whichever
         /// module owns it (so a module added later is covered the day it ships).</summary>
+        /// <summary>The knowledge tables (WS-B) that quote their evidence as JSON (<c>{"messageId": ..., "quote": ...}</c> items).</summary>
+        private static readonly string[] EvidenceJsonTables = { "kn_hypotheses", "kn_aliases", "kn_entities", "kn_life_events", "kn_plans" };
+
+        private static readonly System.Text.RegularExpressions.Regex JsonString = new("\"((?:[^\"\\\\]|\\\\.)*)\"", System.Text.RegularExpressions.RegexOptions.Compiled);
+
+        private static bool TableExists(SqliteConnection c, SqliteTransaction tx, string table) =>
+            c.Scalar<long>(tx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=$t", ("$t", table)) > 0;
+
+        /// <summary>
+        /// Knowledge that rests on these messages in ways a column sweep cannot see: claims (linked through
+        /// <c>kn_claim_messages</c>) and rows that quote them in <c>evidence_json</c>. They go, quotes and all; the people they
+        /// were about are added to <paramref name="affected"/>, so their facts can be consolidated again from what is left.
+        /// </summary>
+        private static int RemoveKnowledgeCiting(SqliteConnection c, SqliteTransaction tx, IReadOnlyList<string> messageIds, HashSet<string> affected)
+        {
+            int n = 0;
+            if (messageIds.Count == 0) return 0;
+            if (TableExists(c, tx, "kn_claim_messages") && TableExists(c, tx, "kn_claims"))
+            {
+                var claims = new List<(string Claim, string Person)>();
+                foreach (var chunk in messageIds.Chunk(400))
+                {
+                    var (list, args) = SqlHelpers.InList(chunk, "$m");
+                    claims.AddRange(c.Query(tx, $"SELECT DISTINCT k.claim_id, k.person_id FROM kn_claim_messages m JOIN kn_claims k ON k.claim_id=m.claim_id WHERE m.message_id IN ({list})",
+                        r => (r.GetString(0), r.GetString(1)), args));
+                }
+                foreach (var (_, person) in claims) affected.Add(person);
+                foreach (var chunk in claims.Select(x => x.Claim).Distinct(StringComparer.Ordinal).Chunk(400))
+                {
+                    var (list, args) = SqlHelpers.InList(chunk, "$c");
+                    n += c.Exec(tx, $"DELETE FROM kn_claim_messages WHERE claim_id IN ({list})", args);
+                    n += c.Exec(tx, $"DELETE FROM kn_claims WHERE claim_id IN ({list})", args);
+                }
+            }
+            var ids = messageIds.ToHashSet(StringComparer.Ordinal);
+            foreach (string table in EvidenceJsonTables)
+            {
+                if (!TableExists(c, tx, table)) continue;
+                var doomed = new List<long>();
+                foreach (var (rowid, json) in c.Query(tx, $"SELECT rowid, evidence_json FROM {table}", r => (r.GetInt64(0), r.GetStringOrNull(1))))
+                    if (json != null && JsonString.Matches(json).Any(m => ids.Contains(m.Groups[1].Value))) doomed.Add(rowid);
+                foreach (var chunk in doomed.Chunk(400))
+                    n += c.Exec(tx, $"DELETE FROM {table} WHERE rowid IN ({string.Join(",", chunk)})");
+            }
+            return n;
+        }
+
+        /// <summary>Columns that hold a person id, beyond <c>person_id</c>: the knowledge tables name people by role (WS-B).</summary>
+        private static readonly string[] PersonColumns =
+        {
+            "person_id", "partner_id", "other_person_id", "author_person_id", "owner_person_id", "counterparty_person_id", "person_a", "person_b",
+            "subject_id", "object_id", "primary_subject_id",
+        };
+
+        /// <summary>Columns that hold an identity id, beyond <c>identity_id</c> and <c>author_identity_id</c>.</summary>
+        private static readonly string[] IdentityColumns = { "identity_a", "identity_b" };
+
         private Dictionary<string, List<string>> TablesByColumn()
         {
             using var c = Context.Stores.Intel.OpenRead();
             var result = new Dictionary<string, List<string>>(StringComparer.Ordinal)
             {
-                ["message_id"] = new(), ["person_id"] = new(), ["partner_id"] = new(), ["other_person_id"] = new(), ["identity_id"] = new(), ["author_identity_id"] = new(),
-                ["key"] = new(),
+                ["message_id"] = new(), ["identity_id"] = new(), ["author_identity_id"] = new(), ["key"] = new(),
             };
+            foreach (string column in PersonColumns.Concat(IdentityColumns)) result[column] = new();
             foreach (string table in c.Query(null, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'", r => r.GetString(0)))
             {
                 if (!table.All(ch => char.IsLetterOrDigit(ch) || ch == '_')) continue;
+                // The replica module removes its own rows when it is told (person.erase): its versions own child rows and
+                // vectors that only it can find, so deleting its person rows here first would orphan them.
+                if (table.StartsWith("replica_", StringComparison.Ordinal)) continue;
+                // Jobs are handled on their own (finished ones only), never swept by subject.
+                if (table == "jobs") continue;
                 foreach (string column in c.Query(null, $"SELECT name FROM pragma_table_info('{table}')", r => r.GetString(0)))
                     if (result.TryGetValue(column, out var list)) list.Add(table);
             }
@@ -229,6 +291,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                 var references = OperatorReferences();
                 bool erase = target.Level != LevelDerived;
 
+                // People whose knowledge lost evidence it rested on (a claim or a quote from these messages): consolidated again at the end.
+                var lostEvidence = new HashSet<string>(StringComparer.Ordinal);
+
                 // Everything derived from a batch of messages: vectors, and every derived row keyed by a message.
                 async Task RemoveDerivedOfAsync(IReadOnlyList<string> ids)
                 {
@@ -236,7 +301,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                     Add("derived rows", await Context.Stores.Intel.WriteAsync((c, tx) =>
                     {
                         Secure(c, tx);
-                        int n = 0;
+                        // Before the column sweep: it would remove the claim-to-message links this needs.
+                        int n = RemoveKnowledgeCiting(c, tx, ids, lostEvidence);
                         foreach (var chunk in ids.Chunk(400))
                         {
                             var (list, args) = SqlHelpers.InList(chunk, "$m");
@@ -316,6 +382,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                 await Context.Stores.Corpus.WriteAsync((c, tx) =>
                 {
                     foreach (string person in target.Persons) ChangeLog.Append(c, tx, Context.Clock.NowMs, ChangeKinds.PersonErase, person, null, null, SourceKinds.Operator);
+                    // Others whose facts rested on what was removed are consolidated again from what is left (WS-B listens).
+                    foreach (string person in lostEvidence.Where(p => !target.Persons.Contains(p)).OrderBy(p => p, StringComparer.Ordinal))
+                        ChangeLog.Append(c, tx, Context.Clock.NowMs, ChangeKinds.EvidenceRemoved, person, person, null, SourceKinds.Operator);
                 }, ct).ConfigureAwait(false);
 
                 if (erase)
@@ -454,22 +523,20 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
             foreach (var chunk in t.Persons.Chunk(400))
             {
                 var (list, args) = SqlHelpers.InList(chunk, "$p");
-                foreach (string column in new[] { "person_id", "partner_id", "other_person_id" })
-                    foreach (string table in tables[column]) n += c.Exec(tx, $"DELETE FROM {table} WHERE {column} IN ({list})", args);
-                n += c.Exec(tx, $"DELETE FROM labels WHERE item_kind='person' AND item_id IN ({list})", args);
+                // Facts about them and their evidence first: the column sweep below would remove the facts and orphan the evidence.
                 n += c.Exec(tx, $"DELETE FROM assertion_evidence WHERE assertion_id IN (SELECT assertion_id FROM assertions WHERE (subject_kind='person' AND subject_id IN ({list})) OR (object_kind='person' AND object_id IN ({list})))", args);
                 n += c.Exec(tx, $"DELETE FROM assertions WHERE (subject_kind='person' AND subject_id IN ({list})) OR (object_kind='person' AND object_id IN ({list}))", args);
+                foreach (string column in PersonColumns)
+                    foreach (string table in tables[column]) n += c.Exec(tx, $"DELETE FROM {table} WHERE {column} IN ({list})", args);
+                n += c.Exec(tx, $"DELETE FROM labels WHERE item_kind='person' AND item_id IN ({list})", args);
                 n += c.Exec(tx, $"DELETE FROM read_models WHERE key IN ({list})", args);
                 n += c.Exec(tx, $"DELETE FROM jobs WHERE subject_id IN ({list}) AND state IN ('succeeded','dead','cancelled')", args);
             }
             foreach (var chunk in t.Identities.Chunk(400))
             {
                 var (list, args) = SqlHelpers.InList(chunk, "$i");
-                foreach (string table in tables["identity_id"].Concat(tables["author_identity_id"]).Distinct(StringComparer.Ordinal))
-                {
-                    bool author = tables["author_identity_id"].Contains(table);
-                    n += c.Exec(tx, $"DELETE FROM {table} WHERE {(author ? "author_identity_id" : "identity_id")} IN ({list})", args);
-                }
+                foreach (string column in new[] { "identity_id", "author_identity_id" }.Concat(IdentityColumns))
+                    foreach (string table in tables[column]) n += c.Exec(tx, $"DELETE FROM {table} WHERE {column} IN ({list})", args);
             }
             // A module's own key/value rows about one of their accounts or about them ("identity:<id>", "<id>|...", ...): the id
             // must stand whole between separators, so another id that merely starts or ends the same way is never touched.

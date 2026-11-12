@@ -33,6 +33,9 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
         public const string PersonErase = "person.erase";
         /// <summary>Analysis was switched back on for a person (N20): what is derived from their messages is built again.</summary>
         public const string PersonReanalyse = "person.reanalyse";
+        /// <summary>Derived knowledge about a person lost evidence it rested on (a forgotten person's message): their facts are
+        /// consolidated again from what is left. The entity is the person whose knowledge it was.</summary>
+        public const string EvidenceRemoved = "evidence.removed";
         public const string ConversationUpsert = "conversation.upsert";
         public const string GuildUpsert = "guild.upsert";
         public const string PresenceEvent = "event.presence";

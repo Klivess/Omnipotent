@@ -118,54 +118,17 @@ namespace Omnipotent.Services.OmniscienceV3
         /// <summary>The modules this build runs. Workstreams add theirs here.</summary>
         private IReadOnlyList<IIntelModule> BuildModules()
         {
-            // Discord through the connection the KliveBot service already holds; v3 opens none of its own. Off until cutover.
-            var discord = new Ingest.Discord.DiscordBotModule(
-                new Ingest.Discord.KliveBotFeed(() => GetActiveServices().OfType<KliveBot_Discord.KliveBotDiscord>().FirstOrDefault()?.Client,
-                    Omnipotent.Data_Handling.OmniPaths.KlivesDiscordAccountID.ToString(System.Globalization.CultureInfo.InvariantCulture)),
-                ReadKliveBotTokenAsync,
-                Omnipotent.Data_Handling.OmniPaths.KlivesDiscordAccountID.ToString(System.Globalization.CultureInfo.InvariantCulture));
-            // Signals also takes the findings of other modules (notices), so it is built first and handed to them.
-            var signals = new Modules.Signalling.SignalsModule();
-            var modules = new List<IIntelModule>
+            string owner = Omnipotent.Data_Handling.OmniPaths.KlivesDiscordAccountID.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            return ProductionModules.Create(new ProductionModuleInputs
             {
-                // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
-                new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
-                // WS-A: imports, the media store, text from media, Discord through KliveBot.
-                new Ingest.Imports.ImportModule(),
-                // An expired Discord link is refreshed through the bot API, only once Discord capture is switched on (F403).
-                new Ingest.Media.MediaModule(links: () => discord.LinkRefresher),
+                LegacyDatabase = () => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile),
+                // Discord through the connection the KliveBot service already holds; v3 opens none of its own. Off until cutover.
+                DiscordFeed = new Ingest.Discord.KliveBotFeed(() => GetActiveServices().OfType<KliveBot_Discord.KliveBotDiscord>().FirstOrDefault()?.Client, owner),
+                KliveBotToken = ReadKliveBotTokenAsync,
+                OwnerDiscordUserId = owner,
                 // Speech-to-text comes from KliveLLM's AIRouter audio client, resolved when a transcript is first needed.
-                new Ingest.Media.MediaTextModule(async () =>
-                    await ResolveKliveLlmAsync().ConfigureAwait(false) is { } llm ? new Ingest.Media.AiRouterTranscriber(llm.Audio) : null),
-                discord,
-                // WS-C: classification, rollups, projections, Explore and signals.
-                new Modules.Classification.ClassificationModule(),
-                new Modules.Rollups.RollupModule(),
-                new Modules.Projections.ProjectionModule(),
-                signals,
-                new Modules.DataControls.DataControlsModule(),
-                new Modules.Links.LinksModule(),
-                new Modules.Translate.TranslateModule(),
-                // Monitors hand their findings to the signals module's notices.
-                new Modules.Monitors.MonitorsModule(signals),
-                // WS-B: knowledge, deduction, identity, timeline, plans, the Quality Lab and inquiries.
-                new Knowledge.Deduction.DeductionModule(),
-                new Knowledge.Entities.IdentityModule(),
-                new Knowledge.Timeline.TimelineModule(),
-                new Knowledge.Plans.PlansModule(),
-                new Knowledge.Quality.QualityModule(),
-                new Knowledge.Inquiry.InquiryModule(),
-                // WS-D: replicas.
-                new Replica.ReplicaModule(),
-            };
-            // Digests read a foreign-language message with its stored translation beside it.
-            modules.Add(new Modules.Briefs.BriefsModule(() => modules.OfType<Kernel.Modules.ITranslations>().FirstOrDefault()));
-            // Explore mirrors the datasets of every module in this list that offers them (IExploreSourceProvider).
-            modules.Add(new Modules.Insights.InsightsModule(signals, () => modules.OfType<Kernel.Explore.IExploreEngine>().FirstOrDefault()));
-            // Transforms checks saved charts against the datasets the modules in this list declare.
-            modules.Add(new Modules.Transforms.TransformsModule(() => modules));
-            modules.Add(new Modules.Explore.ExploreModule(() => modules));
-            return modules;
+                Transcriber = async () => await ResolveKliveLlmAsync().ConfigureAwait(false) is { } llm ? new Ingest.Media.AiRouterTranscriber(llm.Audio) : null,
+            });
         }
 
         /// <summary>KliveBot's token, read from where the bot service keeps it, for requests to Discord's bot API only.</summary>

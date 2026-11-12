@@ -56,7 +56,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
             finally
             {
                 await stores.DisposeAsync().ConfigureAwait(false);
-                SqliteConnection.ClearAllPools();
                 try { Directory.Delete(root, true); }
                 catch (IOException ex) { live.LogError("[OmniscienceV3] Quality Lab scratch store could not be deleted; it is removed before the next run.", ex); }
             }

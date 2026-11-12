@@ -271,11 +271,15 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
                 async Task FlushAsync()
                 {
                     if (batch.Count == 0) return;
-                    // Files first, outside the writer: the corpus transaction only ever touches the database.
+                    // Files first, outside the writer: the corpus transaction only ever touches the database. A forgotten
+                    // person's message is not stored, so neither are its files (N20); the writer counts it.
+                    var gone = Forgotten.Load(stores.Operator);
                     var prepared = new List<IngestMessage>(batch.Count);
                     foreach (var m in batch)
                     {
-                        if (m.Attachments.All(a => a.LocalFile == null)) { prepared.Add(m); continue; }
+                        bool forgottenMessage = gone.Any && gone.Blocks(CorpusIds.Identity(m.Author.Platform, m.Author.PlatformUserId),
+                            CorpusIds.Conversation(m.Conversation.Platform.Trim().ToLowerInvariant(), m.Conversation.ChannelId));
+                        if (forgottenMessage || m.Attachments.All(a => a.LocalFile == null)) { prepared.Add(m); continue; }
                         var stored = new List<IngestAttachment>(m.Attachments.Count);
                         foreach (var a in m.Attachments)
                         {
@@ -292,7 +296,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Imports
                     long now = clock.NowMs;
                     var stats = await stores.Corpus.WriteAsync((c, tx) =>
                     {
-                        using var writer = new CorpusWriter(c, tx, source, SourceKinds.Import, now);
+                        using var writer = new CorpusWriter(c, tx, source, SourceKinds.Import, now, gone);
                         foreach (var m in prepared) writer.Message(m);
                         return writer.Complete();
                     }, ct).ConfigureAwait(false);

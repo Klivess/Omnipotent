@@ -33,6 +33,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         private readonly IngestSource source;
         private readonly string sourceKind;
         private readonly long now;
+        private readonly ForgottenSet forgotten;
 
         private readonly Dictionary<string, IdentityState> identities = new(StringComparer.Ordinal);
         private readonly Dictionary<string, List<NameInterval>> names = new(StringComparer.Ordinal);
@@ -56,7 +57,12 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
 
         private sealed record NameInterval(string Value, long From, long? To);
 
-        public CorpusWriter(SqliteConnection c, SqliteTransaction tx, IngestSource source, string sourceKind, long nowMs)
+        /// <param name="forgotten">
+        /// The tombstones of forgotten people (N20, <see cref="Forgotten.Load"/>): nothing written by their accounts, in
+        /// their direct chats or about their presence is stored again, and mentions of them are dropped. Every ingest
+        /// path loads it once per batch and passes it; only tests that forget nobody leave it out.
+        /// </param>
+        public CorpusWriter(SqliteConnection c, SqliteTransaction tx, IngestSource source, string sourceKind, long nowMs, ForgottenSet? forgotten = null)
         {
             if (!SourceKinds.IsKnown(sourceKind)) throw new ArgumentException($"Unknown source kind '{sourceKind}'.", nameof(sourceKind));
             this.c = c;
@@ -64,6 +70,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             this.source = source;
             this.sourceKind = sourceKind;
             now = nowMs;
+            this.forgotten = forgotten ?? ForgottenSet.None;
 
             c.Exec(tx, """
                 INSERT INTO sources(source_id, platform, kind, label, status, rank, created_at_ms, updated_at_ms) VALUES($s,$p,$k,$l,'active',$r,$n,$n)
@@ -132,14 +139,22 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
                 return false;
             }
 
-            var author = Identity(m.Author, m.SentAtMs);
             string authorId = CorpusIds.Identity(m.Author.Platform, m.Author.PlatformUserId);
+            // A forgotten person's message, or anything in their direct chat, is not stored again; not even quarantined,
+            // which would keep their id (N20).
+            if (forgotten.Any && forgotten.Blocks(authorId, CorpusIds.Conversation(m.Conversation.Platform.Trim().ToLowerInvariant(), m.Conversation.ChannelId)))
+            {
+                stats += new IngestStats { Forgotten = 1 };
+                return false;
+            }
+            var author = Identity(m.Author, m.SentAtMs);
             var (conversationId, guildId) = Conversation(m.Conversation, m.SentAtMs);
             Member(conversationId, authorId, m.SentAtMs);
             foreach (var member in m.Conversation.Members ?? Array.Empty<IngestIdentity>())
             {
                 if (string.IsNullOrWhiteSpace(member.Platform) || string.IsNullOrWhiteSpace(member.PlatformUserId)) continue;
                 string memberId = CorpusIds.Identity(member.Platform, member.PlatformUserId);
+                if (forgotten.Identities.Contains(memberId)) continue;
                 if (members.Contains(conversationId + "\u0001" + memberId)) continue;
                 Identity(member, m.SentAtMs);
                 Member(conversationId, memberId, m.SentAtMs);
@@ -309,7 +324,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         private int Details(IngestMessage m, string messageId)
         {
             int added = 0;
-            foreach (var mention in m.Mentions) added += insertMention.Run(messageId, mention.Kind, mention.Target);
+            foreach (var mention in m.Mentions)
+                if (!(mention.Kind == "user" && forgotten.Identities.Contains(mention.Target))) added += insertMention.Run(messageId, mention.Kind, mention.Target);
             for (int i = 0; i < m.Embeds.Count; i++)
             {
                 var e = m.Embeds[i];
@@ -368,8 +384,13 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
                 if (string.IsNullOrWhiteSpace(r.EmojiKey)) continue;
                 if (r.Actor != null)
                 {
-                    Identity(r.Actor, r.AtMs ?? m.SentAtMs);
                     string actorId = CorpusIds.Identity(r.Actor.Platform, r.Actor.PlatformUserId);
+                    if (forgotten.Identities.Contains(actorId))
+                    {
+                        stats += new IngestStats { Forgotten = 1 };
+                        continue;
+                    }
+                    Identity(r.Actor, r.AtMs ?? m.SentAtMs);
                     // Without its own time a reaction is only known to be no earlier than the message: the time stays empty.
                     int inserted = insertReaction.Run(messageId, r.EmojiKey, r.EmojiName, actorId, r.AtMs, (int)(r.AtMs != null ? TimeQuality.Exact : TimeQuality.Day), sourceKind);
                     if (inserted == 1)

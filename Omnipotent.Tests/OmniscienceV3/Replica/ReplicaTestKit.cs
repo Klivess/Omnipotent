@@ -420,7 +420,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
         public async ValueTask DisposeAsync()
         {
             await Runtime.DisposeAsync();
-            SqliteConnection.ClearAllPools();
             try { Directory.Delete(root, true); }
             catch (IOException) { /* unique temp dir */ }
         }

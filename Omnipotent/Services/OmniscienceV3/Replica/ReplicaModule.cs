@@ -58,6 +58,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             SubscribedChangeKinds = new[]
             {
                 ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete, ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge, ChangeKinds.PersonErase,
+                ChangeKinds.PersonReanalyse,
             },
             Schedules = new[]
             {
@@ -112,7 +113,8 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
         public override async Task InitializeAsync(ModuleContext context, CancellationToken ct)
         {
             await base.InitializeAsync(context, ct).ConfigureAwait(false);
-            var services = new ReplicaServices(context, encoder, ModuleVersion);
+            // An encoder given to the module (tests) wins; otherwise the kernel's shared encoder (integration, Phase 3).
+            var services = new ReplicaServices(context, () => encoder() ?? context.Encoder, ModuleVersion);
             var chat = new ReplicaChatOrchestrator(services);
             runtime = new ReplicaRuntime
             {
@@ -136,7 +138,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                     case ChangeKinds.MessageInsert or ChangeKinds.MessageVersion or ChangeKinds.MessageDelete:
                         if (c.PersonId != null) yield return new DirtySubject("person", c.PersonId);
                         break;
-                    case ChangeKinds.PersonMerge or ChangeKinds.PersonUnmerge or ChangeKinds.PersonErase:
+                    case ChangeKinds.PersonMerge or ChangeKinds.PersonUnmerge or ChangeKinds.PersonErase or ChangeKinds.PersonReanalyse:
                         yield return new DirtySubject("person", c.EntityId);
                         if (c.PersonId != null) yield return new DirtySubject("person", c.PersonId);
                         break;
@@ -180,6 +182,9 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             };
         }
 
+        /// <summary>The block reason of a replica whose person's analysis was switched off (N20); lifted when it is switched back on.</summary>
+        public const string AnalysisOffReason = "Analysis is switched off for this person (N20).";
+
         // ── staleness and auto-retrain (F284) ────────────────────────────────────
 
         private async Task<string?> PersonChangedAsync(ReplicaRuntime r, JobContext job)
@@ -199,11 +204,26 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             using (var corpus = s.Stores.Corpus.OpenRead()) scope = People.Resolve(corpus, canonical);
             if (scope == null)
             {
-                // Erased from the corpus (N20 erase): nothing of them may remain in derived stores.
+                // Erased from the corpus (N20 erase): nothing of them may remain in derived stores, not even the replica's own
+                // rows (the forget run leaves replica tables to this module, which alone knows their version-owned rows).
                 await r.Trainer.BlockPersonAsync(canonical, "The person was erased from the corpus.", ct).ConfigureAwait(false);
+                await s.Versions.ForgetAsync(canonical, ct).ConfigureAwait(false);
+                await ReplicaCards.RefreshAsync(s, canonical, ct).ConfigureAwait(false);
                 return RJson.Write(new { canonical, erased = true });
             }
+            bool analysisOff = AnalysisOff.Load(s.Stores).Person(canonical);
+            // Analysis switched back on (N20): a block set only because it was off is lifted; the replica is trained again on request.
+            if (person.Status == PersonStatus.Blocked && !analysisOff && await s.Versions.UnblockAsync(canonical, AnalysisOffReason, ct).ConfigureAwait(false))
+            {
+                await ReplicaCards.RefreshAsync(s, canonical, ct).ConfigureAwait(false);
+                return RJson.Write(new { canonical, unblocked = true });
+            }
             if (person.Status == PersonStatus.Blocked) return null;
+            if (analysisOff)
+            {
+                await r.Trainer.BlockPersonAsync(canonical, AnalysisOffReason, ct).ConfigureAwait(false);
+                return RJson.Write(new { canonical, blocked = true, analysisOff = true });
+            }
             if (MinorGuard.IsRestricted(Context.Policy.BandOf(canonical, s.Clock.NowMs)))
             {
                 await r.Trainer.BlockPersonAsync(canonical, "MinorGuard: new evidence says the person is, or may be, under 18.", ct).ConfigureAwait(false);
@@ -262,10 +282,17 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             bool upgrade = job.Payload<MaintenancePayload>()?.ModuleUpgrade == true;
             int blocked = 0, resumed = 0, stalled = 0, staled = 0;
             string? encoderModel = s.EncoderModel;
+            var off = AnalysisOff.Load(s.Stores);
             foreach (var person in s.Versions.Persons())
             {
                 ct.ThrowIfCancellationRequested();
                 if (person.Status == PersonStatus.Blocked) continue;
+                if (off.Person(person.PersonId))
+                {
+                    await r.Trainer.BlockPersonAsync(person.PersonId, AnalysisOffReason, ct).ConfigureAwait(false);
+                    blocked++;
+                    continue;
+                }
                 if ((person.ServingVersionId != null || person.BuildingVersionId != null) && MinorGuard.IsRestricted(Context.Policy.BandOf(person.PersonId, s.Clock.NowMs)))
                 {
                     await r.Trainer.BlockPersonAsync(person.PersonId, "MinorGuard: the person is, or may be, under 18.", ct).ConfigureAwait(false);

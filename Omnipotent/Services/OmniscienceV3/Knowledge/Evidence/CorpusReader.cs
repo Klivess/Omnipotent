@@ -50,6 +50,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         private readonly OmniscienceStores stores;
         private readonly IPolicyOracle policy;
         private readonly ConcurrentDictionary<string, (bool IsSelf, long AtMs)> selfCache = new(StringComparer.Ordinal);
+        private (AnalysisOffSet Set, long LoadedTicks) off = (AnalysisOffSet.None, long.MinValue);
+        private const long OffRefreshMs = 15_000;
 
         public CorpusReader(OmniscienceStores stores, IPolicyOracle policy)
         {
@@ -58,6 +60,29 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         }
 
         public OmniscienceStores Stores => stores;
+
+        /// <summary>
+        /// The people whose analysis is switched off (N20), re-read at most every few seconds. What they wrote never reaches
+        /// the knowledge layer: every message read here leaves theirs out, so nothing is extracted, inferred or quoted from it.
+        /// </summary>
+        public AnalysisOffSet AnalysisOff
+        {
+            get
+            {
+                var current = off;
+                long nowTicks = Environment.TickCount64;
+                if (current.LoadedTicks != long.MinValue && nowTicks - current.LoadedTicks < OffRefreshMs) return current.Set;
+                var set = Storage.AnalysisOff.Load(stores);
+                off = (set, nowTicks);
+                return set;
+            }
+        }
+
+        private IReadOnlyList<CorpusMessage> Keep(IReadOnlyList<CorpusMessage> messages)
+        {
+            var set = AnalysisOff;
+            return set.Any ? messages.Where(m => !set.Author(m.AuthorIdentityId)).ToList() : messages;
+        }
 
         public string Canonical(string personId) => policy.Canonical(personId);
 
@@ -217,7 +242,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         {
             if (messageIds.Count == 0) return Array.Empty<CorpusMessage>();
             using var c = stores.Corpus.OpenRead();
-            return c.QueryIn(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.message_id IN ({{keys}})", messageIds, MapMessage);
+            return Keep(c.QueryIn(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.message_id IN ({{keys}})", messageIds, MapMessage));
         }
 
         public CorpusMessage? Message(string messageId) => Messages(new[] { messageId }).FirstOrDefault();
@@ -230,7 +255,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
             foreach (var identity in identityIds)
                 result.AddRange(c.Query(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.author_identity_id=$a AND m.sent_at_ms BETWEEN $f AND $t ORDER BY m.sent_at_ms LIMIT $l",
                     MapMessage, ("$a", identity), ("$f", fromMs), ("$t", toMs), ("$l", limit)));
-            return Ordered(result).Take(limit).ToList();
+            return Keep(Ordered(result).Take(limit).ToList());
         }
 
         /// <summary>Most recent messages authored by the identities before <paramref name="beforeMs"/> (newest first, then re-ordered).</summary>
@@ -241,7 +266,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
             foreach (var identity in identityIds)
                 result.AddRange(c.Query(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.author_identity_id=$a AND m.sent_at_ms <= $t ORDER BY m.sent_at_ms DESC LIMIT $l",
                     MapMessage, ("$a", identity), ("$t", beforeMs), ("$l", limit)));
-            return Ordered(result.OrderByDescending(m => m.SentAtMs).Take(limit)).ToList();
+            return Keep(Ordered(result.OrderByDescending(m => m.SentAtMs).Take(limit)).ToList());
         }
 
         /// <summary>Replies to any of <paramref name="parentIds"/>.</summary>
@@ -249,7 +274,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         {
             if (parentIds.Count == 0) return Array.Empty<CorpusMessage>();
             using var c = stores.Corpus.OpenRead();
-            return c.QueryIn(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.reply_to_message_id IN ({{keys}})", parentIds, MapMessage);
+            return Keep(c.QueryIn(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.reply_to_message_id IN ({{keys}})", parentIds, MapMessage));
         }
 
         /// <summary>Messages that @-mention any of the identities.</summary>
@@ -280,15 +305,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                 MapMessage, ("$c", conversationId), ("$t", aroundMs), ("$l", Math.Max(0, before)));
             var newer = c.Query(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.conversation_id=$c AND m.sent_at_ms >= $t ORDER BY m.sent_at_ms, m.order_key LIMIT $l",
                 MapMessage, ("$c", conversationId), ("$t", aroundMs), ("$l", Math.Max(1, after + 1)));
-            return Ordered(older.Concat(newer)).ToList();
+            return Keep(Ordered(older.Concat(newer)).ToList());
         }
 
         /// <summary>Every message of a conversation in [fromMs, toMs] (bounded).</summary>
         public IReadOnlyList<CorpusMessage> ConversationRange(string conversationId, long fromMs, long toMs, int limit = 5_000)
         {
             using var c = stores.Corpus.OpenRead();
-            return c.Query(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.conversation_id=$c AND m.sent_at_ms BETWEEN $f AND $t ORDER BY m.sent_at_ms, m.order_key LIMIT $l",
-                MapMessage, ("$c", conversationId), ("$f", fromMs), ("$t", toMs), ("$l", limit));
+            return Keep(c.Query(null, $"SELECT {MessageColumns} FROM messages m {MessageJoins} WHERE m.conversation_id=$c AND m.sent_at_ms BETWEEN $f AND $t ORDER BY m.sent_at_ms, m.order_key LIMIT $l",
+                MapMessage, ("$c", conversationId), ("$f", fromMs), ("$t", toMs), ("$l", limit)));
         }
 
         public string? VersionText(string messageId, int version)

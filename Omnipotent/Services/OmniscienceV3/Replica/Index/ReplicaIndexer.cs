@@ -1,3 +1,4 @@
+using Omnipotent.Services.OmniscienceV3.Storage;
 using System.Globalization;
 using System.Text;
 using Microsoft.Data.Sqlite;
@@ -68,12 +69,18 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
 
         private readonly SqliteConnection corpus;
         private readonly Func<string, long, (TimeZoneInfo? Zone, string Source)> zoneOf;
+        private readonly AnalysisOffSet off;
 
-        public ReplicaIndexer(SqliteConnection corpus, Func<string, long, (TimeZoneInfo? Zone, string Source)> zoneOf)
+        /// <param name="off">People whose analysis is switched off (N20): what they wrote is shown to the index only as a
+        /// placeholder, like a deleted message, so no replica learns from their words.</param>
+        public ReplicaIndexer(SqliteConnection corpus, Func<string, long, (TimeZoneInfo? Zone, string Source)> zoneOf, AnalysisOffSet? off = null)
         {
             this.corpus = corpus;
             this.zoneOf = zoneOf;
+            this.off = off ?? AnalysisOffSet.None;
         }
+
+        private Msg Masked(Msg m) => off.Any && off.Author(m.Author) ? m with { Text = null, Deleted = true } : m;
 
         private sealed record Msg(string Id, string ConversationId, string? GuildId, string Platform, string Author, long SentAt, int Quality, long OrderKey,
             bool Bot, bool System, bool Webhook, string? ReplyTo, bool Forwarded, string? Text, bool Edited, bool Deleted, long Seq);
@@ -239,14 +246,14 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                 if (ownById.TryGetValue(m.Id, out var own)) { result.Add(own); seen.Add(m.Id); continue; }
                 // Own messages outside this cluster (a minor period, beyond the read bound) are not the person's to use.
                 if (mine.Contains(m.Author)) continue;
-                result.Add(m);
+                result.Add(Masked(m));
             }
             foreach (var m in cluster) if (!seen.Contains(m.Id)) result.Add(m);
             return result.OrderBy(m => m.SentAt).ThenBy(m => m.OrderKey).ToList();
         }
 
         private Msg? ById(string messageId) =>
-            corpus.Query(null, $"SELECT {MsgColumns} FROM messages WHERE message_id=$m", MapMsg, ("$m", messageId)).FirstOrDefault();
+            corpus.Query(null, $"SELECT {MsgColumns} FROM messages WHERE message_id=$m", MapMsg, ("$m", messageId)).Select(Masked).FirstOrDefault();
 
         private Dictionary<string, ConvInfo> LoadConversations(IReadOnlyCollection<string> ids)
         {

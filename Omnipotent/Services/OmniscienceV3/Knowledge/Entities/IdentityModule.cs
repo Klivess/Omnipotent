@@ -61,6 +61,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
             {
                 job.Cancellation.ThrowIfCancellationRequested();
                 if (rejected.Contains(IdentityLinkEngine.LinkKey(a, b))) continue;
+                // Nothing is worked out about someone whose analysis is switched off (N20), not even that two accounts are theirs.
+                if (kit.Corpus.AnalysisOff.Author(a) || kit.Corpus.AnalysisOff.Author(b)) continue;
                 var l = await engine.AssessAsync(a, b, job.Job.JobId, judge: true, job.Cancellation).ConfigureAwait(false);
                 assessed++;
                 if (!l.Suggestable || l.JudgeVerdict == "different") continue;

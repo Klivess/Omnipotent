@@ -309,6 +309,19 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                     """, ("$p", personId), ("$r", reason), ("$t", now));
             }, ct);
 
+        /// <summary>Removes the person's replica rows themselves (an erased person, after their derived rows were purged).</summary>
+        public Task ForgetAsync(string personId, CancellationToken ct) =>
+            intel.WriteAsync((c, tx) =>
+            {
+                c.Exec(tx, "DELETE FROM replica_versions WHERE person_id=$p", ("$p", personId));
+                c.Exec(tx, "DELETE FROM replica_persons WHERE person_id=$p", ("$p", personId));
+            }, ct);
+
+        /// <summary>Lifts a block that was set for <paramref name="reason"/> (analysis switched back on): the person can be trained again.</summary>
+        public Task<bool> UnblockAsync(string personId, string reason, CancellationToken ct) =>
+            intel.WriteAsync((c, tx) => c.Exec(tx, "UPDATE replica_persons SET status='none', status_detail=NULL, updated_at_ms=$t WHERE person_id=$p AND status='blocked' AND status_detail=$r",
+                ("$t", clock.NowMs), ("$p", personId), ("$r", reason)) > 0, ct);
+
         /// <summary>Moves a replica row to a person's new canonical id after a merge (their versions keep their history).</summary>
         public Task RekeyAsync(string fromPersonId, string toPersonId, CancellationToken ct) =>
             intel.WriteAsync((c, tx) =>

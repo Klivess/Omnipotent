@@ -293,7 +293,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
                 long now = Context.Clock.NowMs;
                 int wrote = await Context.Stores.Corpus.WriteAsync((c, tx) =>
                 {
-                    using var w = new CorpusWriter(c, tx, Source, SourceKinds.Live, now);
+                    using var w = new CorpusWriter(c, tx, Source, SourceKinds.Live, now, Forgotten.Load(Context.Stores.Operator));
                     int n = 0;
                     foreach (var (e, at) in direct) n += Write(w, e, at);
                     w.Complete();

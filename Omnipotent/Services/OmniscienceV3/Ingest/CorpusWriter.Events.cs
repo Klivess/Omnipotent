@@ -33,13 +33,29 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         private readonly HashSet<string> eventLogged = new(StringComparer.Ordinal);
 
         /// <summary>Records a conversation's kind, title, server and parent without a message (a channel created or renamed).</summary>
-        public string ConversationSeen(IngestConversation conversation, long atMs) => Conversation(conversation, atMs).ConversationId;
+        public string ConversationSeen(IngestConversation conversation, long atMs)
+        {
+            string id = CorpusIds.Conversation(conversation.Platform.Trim().ToLowerInvariant(), conversation.ChannelId);
+            return forgotten.Conversations.Contains(id) ? id : Conversation(conversation, atMs).ConversationId;
+        }
 
         /// <summary>
         /// Records the names and picture of an account that was seen without doing anything (a member list). It
         /// does not become a person until it takes part in a conversation. Returns its identity id.
         /// </summary>
-        public string IdentitySeen(IngestIdentity identity, long atMs) => Witness(identity, atMs).Id;
+        public string IdentitySeen(IngestIdentity identity, long atMs)
+        {
+            string id = CorpusIds.Identity(identity.Platform, identity.PlatformUserId);
+            return forgotten.Identities.Contains(id) ? id : Witness(identity, atMs).Id;
+        }
+
+        /// <summary>A sighting of a forgotten person (or in their direct chat) is counted and not stored (N20).</summary>
+        private bool Gone(string? identityId, string? conversationId = null)
+        {
+            if (!forgotten.Any || !forgotten.Blocks(identityId, conversationId)) return false;
+            stats += new IngestStats { Forgotten = 1 };
+            return true;
+        }
 
         public void GuildSeen(string platform, string platformGuildId, string? name, long atMs)
         {
@@ -69,8 +85,9 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             if (string.IsNullOrWhiteSpace(emojiKey)) return false;
             platform = platform.Trim().ToLowerInvariant();
             string message = CorpusIds.Message(platform, platformMessageId);
-            Identity(actor, atMs);
             string actorId = CorpusIds.Identity(actor.Platform, actor.PlatformUserId);
+            if (Gone(actorId, string.IsNullOrWhiteSpace(channelId) ? null : CorpusIds.Conversation(platform, channelId))) return false;
+            Identity(actor, atMs);
             int n = c.Exec(tx, """
                 INSERT INTO reactions(message_id, emoji_key, emoji_name, identity_id, is_burst, added_at_ms, removed_at_ms, time_quality, source_kind)
                 VALUES($m,$e,$n,$i,0,$t,NULL,$q,$sk)
@@ -89,8 +106,9 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             if (string.IsNullOrWhiteSpace(emojiKey)) return false;
             platform = platform.Trim().ToLowerInvariant();
             string message = CorpusIds.Message(platform, platformMessageId);
-            Identity(actor, atMs);
             string actorId = CorpusIds.Identity(actor.Platform, actor.PlatformUserId);
+            if (Gone(actorId, string.IsNullOrWhiteSpace(channelId) ? null : CorpusIds.Conversation(platform, channelId))) return false;
+            Identity(actor, atMs);
             int n = c.Exec(tx, """
                 UPDATE reactions SET removed_at_ms=$t
                 WHERE message_id=$m AND emoji_key=$e AND identity_id=$i AND removed_at_ms IS NULL AND (added_at_ms IS NULL OR added_at_ms <= $t)
@@ -123,6 +141,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         public bool Typing(IngestIdentity who, string platform, string channelId, long atMs)
         {
             platform = platform.Trim().ToLowerInvariant();
+            if (Gone(CorpusIds.Identity(who.Platform, who.PlatformUserId), CorpusIds.Conversation(platform, channelId))) return false;
             return c.Exec(tx, "INSERT OR IGNORE INTO typing_events(identity_id, conversation_id, at_ms, source_id) VALUES($i,$c,$t,$s)",
                 ("$i", CorpusIds.Identity(who.Platform, who.PlatformUserId)), ("$c", CorpusIds.Conversation(platform, channelId)), ("$t", atMs), ("$s", source.SourceId)) == 1;
         }
@@ -149,6 +168,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         public bool Presence(PresenceSighting p, long atMs)
         {
             string id = CorpusIds.Identity(p.Who.Platform, p.Who.PlatformUserId);
+            if (Gone(id)) return false;
             if (!lastPresence.TryGetValue(id, out string? last))
             {
                 last = c.Scalar<string>(tx, "SELECT dedupe_key FROM presence_events WHERE identity_id=$i ORDER BY at_ms DESC, event_id DESC LIMIT 1", ("$i", id));
@@ -180,6 +200,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             string id = CorpusIds.Identity(platform, v.Who.PlatformUserId);
             string? guild = string.IsNullOrWhiteSpace(v.GuildId) ? null : CorpusIds.Guild(platform, v.GuildId);
             string? channel = string.IsNullOrWhiteSpace(v.ChannelId) ? null : CorpusIds.Conversation(platform, v.ChannelId);
+            if (Gone(id)) return false;
             var open = c.Query(tx, "SELECT session_id, channel_id, flags_json FROM voice_sessions WHERE identity_id=$i AND left_at_ms IS NULL AND guild_id IS $g ORDER BY joined_at_ms DESC",
                 r => (Id: r.GetString(0), Channel: r.GetStringOrNull(1), Flags: r.GetStringOrNull(2)), ("$i", id), ("$g", guild));
 
@@ -237,6 +258,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         /// </summary>
         public bool MemberEvent(IngestIdentity who, string platformGuildId, string kind, long atMs, string? detailJson)
         {
+            if (Gone(CorpusIds.Identity(who.Platform, who.PlatformUserId))) return false;
             var (id, person) = Witness(who, atMs);
             string guild = CorpusIds.Guild(who.Platform.Trim().ToLowerInvariant(), platformGuildId);
             int n = c.Exec(tx, "INSERT OR IGNORE INTO member_events(guild_id, identity_id, kind, at_ms, detail_json, source_id, dedupe_key) VALUES($g,$i,$k,$t,$d,$s,$key)",

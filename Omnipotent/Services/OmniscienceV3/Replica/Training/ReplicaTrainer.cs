@@ -1,3 +1,4 @@
+using Omnipotent.Services.OmniscienceV3.Storage;
 using System.Globalization;
 using Microsoft.Data.Sqlite;
 using Omnipotent.Services.OmniscienceV3.Kernel.Jobs;
@@ -79,7 +80,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                 long first = FirstMessageMs(corpus, person) ?? now;
                 var (restricted, af) = People.AdultFrom(s.Kernel.Policy, person.CanonicalId, first, now);
                 adultFrom = af;
-                var indexer = new ReplicaIndexer(corpus, (pid, at) => s.Zones.ZoneAt(pid, person.IsSelf, at));
+                var indexer = new ReplicaIndexer(corpus, (pid, at) => s.Zones.ZoneAt(pid, person.IsSelf, at), AnalysisOff.Load(s.Stores));
                 result = restricted
                     ? new IndexResult(person, Array.Empty<ReplicaPair>(), new IndexStats(), ChangeLogSeq(corpus))
                     : indexer.Build(person, Options(adultFrom, now) with { KeepPairs = false });
@@ -130,6 +131,8 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                 await ReplicaCards.RefreshAsync(s, person.CanonicalId, ct).ConfigureAwait(false);
                 throw new ReplicaRefusedException($"Not available: the evidence says {person.DisplayName} is, or may be, under 18 ({band}). Omniscience never builds a replica of a minor.", cached);
             }
+            if (AnalysisOff.Load(s.Stores).Person(person.CanonicalId))
+                throw new ReplicaRefusedException($"Not available: analysis is switched off for {person.DisplayName}. Switch it back on under Data controls first.", cached);
             if (cached is { IsBot: true }) throw new ReplicaRefusedException("Not possible: this is a bot account.", cached);
             if (authored < s.Settings.MinRepliesExperimental)
                 throw new ReplicaRefusedException($"Not possible yet: {person.DisplayName} has written {authored} messages in the corpus; at least {s.Settings.MinRepliesExperimental} replies are needed.", cached);
@@ -326,7 +329,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                 var (restricted, af) = People.AdultFrom(s.Kernel.Policy, person.CanonicalId, first, now);
                 if (restricted) return StageResult.Blocked($"MinorGuard: {person.DisplayName} is, or may be, under 18; no replica is built.");
                 adultFrom = af;
-                var indexer = new ReplicaIndexer(corpus, (pid, at) => s.Zones.ZoneAt(pid, person.IsSelf, at));
+                var indexer = new ReplicaIndexer(corpus, (pid, at) => s.Zones.ZoneAt(pid, person.IsSelf, at), AnalysisOff.Load(s.Stores));
                 result = indexer.Build(person, Options(adultFrom, now));
             }
             ct.ThrowIfCancellationRequested();
@@ -741,6 +744,14 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             await s.Stores.Vectors.WriteAsync((c, tx) =>
             {
                 c.Exec(tx, "DELETE FROM vectors WHERE space IN ($a,$b) AND partition_key=$p", ("$a", VectorIds.StimulusSpace), ("$b", VectorIds.ReplySpace), ("$p", personId));
+            }, ct).ConfigureAwait(false);
+            // Summaries of chats that are no longer in Klives's records: forgetting a person removes their chats there first.
+            HashSet<string> chats;
+            using (var op = s.Stores.Operator.OpenRead()) chats = op.Query(null, "SELECT chat_id FROM replica_chats", r => r.GetString(0)).ToHashSet(StringComparer.Ordinal);
+            await s.Stores.Intel.WriteAsync((c, tx) =>
+            {
+                foreach (string chat in c.Query(tx, "SELECT chat_id FROM replica_chat_memory", r => r.GetString(0)).Where(id => !chats.Contains(id)).ToList())
+                    c.Exec(tx, "DELETE FROM replica_chat_memory WHERE chat_id=$c", ("$c", chat));
             }, ct).ConfigureAwait(false);
         }
 

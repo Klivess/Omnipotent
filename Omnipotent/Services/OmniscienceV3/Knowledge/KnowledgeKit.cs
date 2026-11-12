@@ -64,7 +64,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge
             Assertions = new AssertionStore(context.Stores, context.Clock);
             Gold = new GoldLabelStore(context.Stores, context.Clock);
             Corpus = new CorpusReader(context.Stores, context.Policy);
-            Modality = new LabelTableModalityOracle(context.Stores.Intel);
+            // WS-C's classifier labels first (classify_message), the generic labels table when it has none (integration, Phase 3).
+            Modality = new ClassifierModalityOracle(context.Stores, new LabelTableModalityOracle(context.Stores.Intel));
+            // The kernel's shared encoder (null in kernels started without one); a test may set another.
+            Encoder = context.Encoder;
             Media = new CorpusAttachmentTextSource(context.Stores);
             Fiction = new LabelTableFictionOracle(context.Stores.Intel);
             Zones = new SelfZoneOracle(Corpus, () => context.Settings.KlivesZone);
@@ -89,6 +92,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge
         public IFictionOracle Fiction { get; set; }
         /// <summary>WS-C's Explore engine (X11 explains a chart point from its drill records). Null until wired.</summary>
         public Kernel.Explore.IExploreEngine? Explore { get; set; }
+        /// <summary>WS-C's stored translations (N19): evidence shows a foreign-language message with its translation beside it,
+        /// as a reading aid; quotes stay the original. Null until wired.</summary>
+        public Kernel.Modules.ITranslations? Translations { get; set; }
     }
 
     /// <summary>Reads WS-C's per-message labels (intel.db <c>labels</c>, contract R7 #5) for the modality and dialogue-act tasks.</summary>

@@ -337,6 +337,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
             var sb = new StringBuilder();
             var sliceMessages = new List<SliceMessage>();
             var refOf = new Dictionary<string, string>(StringComparer.Ordinal);
+            var translated = kit.Translations?.Cached(segments.SelectMany(s => s.Messages).Select(m => m.MessageId).Distinct(StringComparer.Ordinal).ToList())
+                             ?? new Dictionary<string, Kernel.Modules.Translation>();
             int n = 0;
             foreach (var segment in segments)
             {
@@ -362,6 +364,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                     line.Append(": ");
                     if (m.ForwardedJson != null) line.Append("[forwarded message, not written by ").Append(handle).Append("] ");
                     line.Append(EvidenceRenderer.Indent(content.Length == 0 ? "(no text)" : content));
+                    // A stored translation of a foreign-language message (N19), only of this version of it: a reading aid, never quoted.
+                    if (translated.TryGetValue(m.MessageId, out var tr) && tr.Version == m.Version && !string.IsNullOrWhiteSpace(tr.Text))
+                        line.Append("\n    [machine translation from ").Append(tr.SourceLanguage).Append(", for reading only; quote the original]: ")
+                            .Append(EvidenceRenderer.Truncate(EvidenceRenderer.Sanitize(tr.Text).Replace('\n', ' '), 400));
                     if (m.ReplyToMessageId != null)
                     {
                         if (refOf.TryGetValue(m.ReplyToMessageId, out var parentRef)) line.Append("\n    ↪ in reply to ").Append(parentRef);

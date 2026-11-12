@@ -171,7 +171,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
                 // A change to a message already held happened now, so it is live whatever the message's age. A message
                 // first seen through its edit is only live if it is itself recent.
                 bool known = c.Scalar<long>(tx, "SELECT COUNT(*) FROM messages WHERE message_id=$m", ("$m", CorpusIds.Message(DiscordPayload.Platform, message.PlatformMessageId))) > 0;
-                using var w = new CorpusWriter(c, tx, src, known || message.SentAtMs >= liveAfter ? SourceKinds.Live : SourceKinds.Backfill, now);
+                using var w = new CorpusWriter(c, tx, src, known || message.SentAtMs >= liveAfter ? SourceKinds.Live : SourceKinds.Backfill, now, Forgotten.Load(stores.Operator));
                 w.Message(message);
                 return w.Complete();
             }, ct).ConfigureAwait(false);
@@ -189,7 +189,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
             var ordered = messages.OrderBy(m => m.OrderKey).ToList();
             return stores.Corpus.WriteAsync((c, tx) =>
             {
-                using var w = new CorpusWriter(c, tx, relaySource, SourceKinds.Live, now);
+                using var w = new CorpusWriter(c, tx, relaySource, SourceKinds.Live, now, Forgotten.Load(stores.Operator));
                 foreach (var m in ordered) w.Message(m);
                 return w.Complete();
             }, ct);
@@ -233,6 +233,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
             string? min = MinId(page), max = MaxId(page);
             string conversation = CorpusIds.Conversation(DiscordPayload.Platform, channel.ChannelId);
 
+            // The tombstones of forgotten people (N20): none of their messages are stored again.
+            var gone = Forgotten.Load(stores.Operator);
             return await stores.Corpus.WriteAsync((c, tx) =>
             {
                 var stats = new IngestStats { Rejected = unreadable };
@@ -241,20 +243,20 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
                 // One writer after the other, never interleaved: each keeps what it has read of the corpus in memory.
                 if (old.Count > 0)
                 {
-                    using var w = new CorpusWriter(c, tx, src, SourceKinds.Backfill, now);
+                    using var w = new CorpusWriter(c, tx, src, SourceKinds.Backfill, now, gone);
                     foreach (var m in old) w.Message(m);
                     stats += w.Complete();
                 }
                 if (fresh.Count > 0)
                 {
-                    using var w = new CorpusWriter(c, tx, src, SourceKinds.Live, now);
+                    using var w = new CorpusWriter(c, tx, src, SourceKinds.Live, now, gone);
                     foreach (var m in fresh) w.Message(m);
                     stats += w.Complete();
                 }
                 if (old.Count == 0 && fresh.Count == 0)
                 {
                     // The source row must exist before a cursor can name it.
-                    using var w = new CorpusWriter(c, tx, src, SourceKinds.Backfill, now);
+                    using var w = new CorpusWriter(c, tx, src, SourceKinds.Backfill, now, gone);
                     w.ConversationSeen(channel.ToConversation(now), now);
                     stats += w.Complete();
                 }

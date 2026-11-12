@@ -57,7 +57,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             Description = "Extracts verified, bitemporal facts about tracked people from whole conversations, consolidates them with calibrated confidence, and derives labelled inferences and hypotheses.",
             DefaultLane = Lane.LlmBackground,
             MinorRestricted = true,
-            SubscribedChangeKinds = new[] { ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete, ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge },
+            SubscribedChangeKinds = new[]
+            {
+                ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete, ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge, ChangeKinds.EvidenceRemoved,
+            },
             Schedules = new[]
             {
                 new ScheduleTrigger("sweep", Every: TimeSpan.FromMinutes(1)),
@@ -115,6 +118,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                         if (c.PersonId != null) yield return new DirtySubject("merge", c.PersonId);
                         yield return new DirtySubject("merge", c.EntityId);
                         break;
+                    // A forgotten person's messages took claims with them (N20): the facts they supported are consolidated again.
+                    case ChangeKinds.EvidenceRemoved:
+                        yield return new DirtySubject("consolidate", c.EntityId);
+                        break;
                 }
             }
         }
@@ -137,7 +144,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     case "person":
                     {
                         string canonical = kit.Corpus.Canonical(d.Id);
-                        if (tracked.Contains(canonical)) jobs.Add(Job(ExtractKind, "person", canonical, 100));
+                        // Nothing is extracted about someone whose analysis is switched off (N20).
+                        if (tracked.Contains(canonical) && !kit.Corpus.AnalysisOff.Person(canonical)) jobs.Add(Job(ExtractKind, "person", canonical, 100));
                         break;
                     }
                     case "conversation":
@@ -150,6 +158,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     }
                     case "message":
                         jobs.Add(Job(ReverifyKind, "message", d.Id, 150));
+                        break;
+                    case "consolidate":
+                        jobs.Add(Job(ConsolidateKind, "person", kit.Corpus.Canonical(d.Id), 160));
                         break;
                     case "merge":
                     {

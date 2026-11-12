@@ -127,6 +127,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
         public int AttachmentsAdded { get; init; }
         public int AttachmentsStored { get; init; }
         public int ReactionsAdded { get; init; }
+        /// <summary>Messages, reactions and sightings left out because they are a forgotten person's (N20).</summary>
+        public int Forgotten { get; init; }
 
         public static IngestStats operator +(IngestStats a, IngestStats b) => new()
         {
@@ -139,6 +141,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest
             AttachmentsAdded = a.AttachmentsAdded + b.AttachmentsAdded,
             AttachmentsStored = a.AttachmentsStored + b.AttachmentsStored,
             ReactionsAdded = a.ReactionsAdded + b.ReactionsAdded,
+            Forgotten = a.Forgotten + b.Forgotten,
         };
     }
 }
