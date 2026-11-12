@@ -14,6 +14,7 @@ lands, so a restart can resume from it.
 | Explore engine | the commit after 2b948cc | `Modules/Explore`, `Kernel/Explore/ExploreContracts.cs` (additive), `Temporal/Zones.OffsetSegments` (additive), routes `explore/facets` and `explore/export`. Done by the coordinating session from 2026-11-12 (the workstream's own session stopped mid-way through it). |
 | Signals (radar, watch rules, reply inbox, X41, X49) | the commit after the Explore engine | `Modules/Signalling`, `Api/SignalsRoutes.cs`. Needs nothing from another workstream; reads the classifier's labels and the rollups when they are installed. |
 | Digests and briefs (N10, N4, X18, X30, X31, X52) | the commit after Signals | `Modules/Briefs`, `Modules/PersonZones.cs`, `Api/BriefsRoutes.cs`. Reads the rollups, the reply inbox and the frozen `assertions` table when they are there. |
+| Transforms without a model (X20–X22, X28, X29, X34, X37–X40) | the commit after digests and briefs | `Modules/Transforms`, `Api/TransformsRoutes.cs`. `TransformsModule` is given the module list (to check saved charts against declared datasets), like Explore. |
 
 ## What the other workstreams integrate against (C-base)
 - **Shared encoder:** `ModuleContext.Encoder` (`IEmbeddingEncoder`, frozen R7 #5). Production: `LazyE5Encoder` from
@@ -196,7 +197,33 @@ Module id `briefs`, code in `Modules/Briefs/`. Tables `brief_digests`, `brief_pe
 `analysis.run`; subscriptions need `alerts.manage`. The finished item is also read model `briefs.digest` (key `all`,
 `guild:<id>`, `conversation:<id>`, `person:<id>`) and `briefs.person` (key: person id), announced on the live stream.
 
+## Transforms without a model (X20–X22, X28, X29, X34, X37–X40)
+Module id `transforms`, code in `Modules/Transforms/`. No jobs and no intel tables: the tactics read the corpus, the
+vectors and the rollups, and keep bundles and charts in operator.db (`notes` kind `bundle`, `saved_views` page
+`dashboard`).
+
+| Tactic | What it does | Notes |
+|---|---|---|
+| `x20.find_similar` | messages (or a description in `text`) → the messages closest in meaning | Query = the centre of the seeds' vectors. With people, conversations, servers or a time range selected the search is exact over that scope's newest 50,000 messages; otherwise it goes through the IVF index. Seeds, deleted messages and anything after the as-of are never returned. |
+| `x21.context` | one message → the messages before and after, the message it replied to, the replies, the reactions | Honours the as-of: later replies and reactions are not there yet. Reactions come from who reacted, or from the observed count where only a count exists. |
+| `x22.phrase_tracker` | a phrase → first use, each person's first use, monthly and per-server counts, who picked it up from whom | FTS5 phrase match with the phrase quoted as data. "Picked up from" = whoever last used it before them in the conversation of their first use, within 30 days. |
+| `x28.cohort_comparison` | a cohort against everyone else active in the period | Mann–Whitney U per measure, Benjamini–Hochberg at 5% across measures, sample sizes on every row. Needs three qualifying people on each side. |
+| `x29.period_comparison` | two periods of a server, a conversation, a person or everything | Activity, who appeared and who went quiet, and one chi-square per label task (corrected across tasks). |
+| `x34.common_ground` | two to five people → shared servers and conversations, mutual contacts, shared facts, what is between them | Facts pass the dossier's filters per person. |
+| `x37.closest_contacts` | a person → who they interact with most, how mutual, growing or fading | From the rollups' pair totals. |
+| `x38.evidence_bundle` | any selection → a case file with a title and a note; run again with its id to add | Exports as Markdown or JSON (`GET bundles/export`), written from the corpus as it is now; a protected fact is listed as withheld. **No PDF**: print the Markdown. |
+| `x39.dataset_export` | an Explore drill selection → what to post to `explore/export` | The file is streamed by the route; the tactic exists so the export can be chained and offered by Ask. |
+| `x40.custom_chart` | a dataset, dimensions and measures → a chart saved on the dashboard | Checked against the dataset's own dimensions and measures before it is saved; the saved view records the permission the dataset needs. |
+
+MinorGuard: X28, X29, X34 and X37 are refused when a selected person is or may be a minor, and minors are left out of
+rankings, comparisons and member lists (counted, never named). `Stats.cs` holds the tests (Mann–Whitney with tie and
+continuity correction, chi-square with its exact tail, Benjamini–Hochberg), checked against textbook values.
+
+**Not built here:** X17 (extract from a selection) calls WS-B's extractor and is a merge step; X23 (link tracker) comes
+with link intelligence (N15); X32, X33, X35 and X36 are pending.
+
 ## Shared files touched (small, additive)
+- Transforms: one line each in `Api/V3Routes.cs` (`TransformsRoutes`) and `OmniscienceV3.BuildModules()` (`TransformsModule`, before Explore).
 - Briefs: one line each in `Api/V3Routes.cs` (`BriefsRoutes`) and `OmniscienceV3.BuildModules()` (`BriefsModule`).
 - Signals: one line in `Api/V3Routes.cs` registering `SignalsRoutes`, one in `OmniscienceV3.BuildModules()` adding `SignalsModule` (before Explore, which mirrors its datasets). Nothing else shared.
 - `Kernel/Explore/ExploreContracts.cs`: `ExploreSource`, `IExploreSourceProvider`, `ExploreColumnKinds` (additive; the frozen
@@ -271,7 +298,8 @@ Module id `briefs`, code in `Modules/Briefs/`. Tables `brief_digests`, `brief_pe
 | Signals: radar, semantic watch rules (N11), reply inbox (N9), nudges; tactics X41 and X49; routes; Explore datasets | done, tested (16 tests with supplied readings; the classifier's real readings and KliveBot delivery are not exercised) |
 | Digests (N10, scheduled X52), person brief (N4), cited summaries; tactics X18, X30, X31 | done, tested (8 tests with a scripted model: what a real model writes is first seen in the shadow run) |
 | Analytics modules, N12–N16, N19, N20 | pending |
-| Tactics X17, X20–X23, X28–X29, X32–X40 (X18, X19, X26, X27, X30, X31 done; X24–X25 WS-A), monitors X42–X48 and X50–X51 | pending |
+| Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
+| Tactics X17 (merge step), X23, X32, X33, X35, X36; monitors X42–X48 and X50–X51 | pending |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)

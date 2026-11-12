@@ -143,6 +143,7 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             await new WsCRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
             await new SignalsRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
             await new BriefsRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
+            await new TransformsRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
         }
 
         private async Task StreamAsync(HttpListenerContext context, WebSocket socket, NameValueCollection query, KMProfileManager.KMProfile? user)

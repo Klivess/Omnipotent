@@ -122,6 +122,42 @@ export interface BriefStyleDto {
   languages: string[];
 }
 
+export interface BundleDeleteRequest {
+  bundleId: string;
+}
+
+export interface BundleDeletedDto {
+  bundleId: string;
+  deleted: boolean;
+}
+
+export interface BundleDto {
+  bundleId: string;
+  title: string;
+  note?: string | null;
+  items: BundleItemDto[];
+  createdBy: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface BundleExportDto {
+  bundleId: string;
+  format: string;
+  fileName: string;
+  content: string;
+}
+
+export interface BundleItemDto {
+  kind: string;
+  id: string;
+  label?: string | null;
+}
+
+export interface BundleListDto {
+  bundles: BundleDto[];
+}
+
 export interface CitedPoint {
   text: string;
   refs: string[];

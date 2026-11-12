@@ -130,6 +130,8 @@ namespace Omnipotent.Services.OmniscienceV3
                 new Modules.Briefs.BriefsModule(),
             };
             // Explore mirrors the datasets of every module in this list that offers them (IExploreSourceProvider).
+            // Transforms checks saved charts against the datasets the modules in this list declare.
+            modules.Add(new Modules.Transforms.TransformsModule(() => modules));
             modules.Add(new Modules.Explore.ExploreModule(() => modules));
             return modules;
         }
