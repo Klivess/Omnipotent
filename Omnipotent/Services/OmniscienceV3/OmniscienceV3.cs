@@ -155,6 +155,8 @@ namespace Omnipotent.Services.OmniscienceV3
                 new Knowledge.Plans.PlansModule(),
                 new Knowledge.Quality.QualityModule(),
                 new Knowledge.Inquiry.InquiryModule(),
+                // WS-D: replicas.
+                new Replica.ReplicaModule(),
             };
             // Digests read a foreign-language message with its stored translation beside it.
             modules.Add(new Modules.Briefs.BriefsModule(() => modules.OfType<Kernel.Modules.ITranslations>().FirstOrDefault()));
