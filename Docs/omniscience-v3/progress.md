@@ -132,4 +132,17 @@ Another live session commits and pushes on master from the main folder, so never
    `fc02987` (inquiry module, X01–X16, knowledge API; 4 files uncommitted); WS-C at `2b948cc` (C-base 3/3: rollups and
    read-model projections; 8 files uncommitted); WS-D at `d8cead7` (replica fidelity gates; 1 file uncommitted). Each was
    sent the contract gaps that concern it (ws-e.md) on 2026-11-09; whether they acted is in their `ws-x.md`.
+   **2026-11-12 — the coordinating session now does every workstream itself**, one at a time, each in that workstream's own
+   worktree and branch (Klives: "Implement this plan"; the four workstream sessions have been idle since 2026-11-10 and are
+   not woken). What it found and did that day:
+
+   | Branch | Tip | State |
+   |---|---|---|
+   | WS-C `claude/omniscience-v3-ws-c-99fa83` | `981baeb` | The **Explore engine** is finished and committed (it had been left half-written and uncommitted): mirror, lenses, drill, facets, export, other modules' datasets, policy. 221 v3 tests pass; 5M-row benchmark p95 290 ms (budget 500 ms). Details and the answers to the website's contract gaps 3–5: `ws-c.md`. Still to build: analytics modules, radar and watchlists, digests and briefs, reply inbox, N12–N16, N19, N20, tactics X17–X40 and monitors X41–X52. C-base traceability rows are not ticked. |
+   | WS-B `claude/omniscience-v3-ws-b-49da68` | `a273cde` | Its uncommitted tests did not compile and, once they did, found three defects, now fixed: **the age-evidence policy oracle never read its evidence** (MinorGuard knew only Klives's own marks), a non-monotone calibration curve, and a deterministic date check that misread vague phrases. 196 v3 tests pass, including the planted-fact accuracy gate. **Never run, no tests:** the inquiry engine, tactics X01–X16, identity links and merges, the timeline, plans, the Quality Lab module and every knowledge route. Traceability rows are not ticked. |
+   | WS-D `claude/omniscience-v3-ws-d-21c7c3` | `cb80345` | Chat tests committed; 190 v3 tests pass. **No tests:** Rehearsal, Group Simulation, the social tactics. Traceability rows are not ticked; `ws-d.md` still says "in progress" for parts that are committed. |
+   | WS-A `claude/omniscience-v3-ws-a-878bce` | `730150f` | Unchanged. Captions, visual search and faces wait on decisions (see `ws-a.md`). |
+
+   Order of work from here: test what WS-B and WS-D built but never ran (the inquiry engine first), then the rest of WS-C,
+   then the website's domain pages, then Phase 3. Merging the branches into `omniscience-v3` still waits for Klives's word.
 2. Phase 3: shadow run on live data, parity gates, Quality Lab gates, cutover.
