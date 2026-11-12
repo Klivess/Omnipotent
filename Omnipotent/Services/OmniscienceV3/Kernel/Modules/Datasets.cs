@@ -92,6 +92,9 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Modules
             new DimensionDefinition("prov.run", "Run", DimensionKind.Entity, "Provenance", "run"),
             new DimensionDefinition("prov.confidence", "Confidence", DimensionKind.Number, "Provenance"),
             new DimensionDefinition("prov.status", "Status", DimensionKind.Category, "Provenance"),
+            new DimensionDefinition("prov.source_kind", "Evidence source", DimensionKind.Category, "Provenance"),
+            new DimensionDefinition("knowledge.attribute", "Fact attribute", DimensionKind.Category, "Knowledge"),
+            new DimensionDefinition("knowledge.category", "Fact category", DimensionKind.Category, "Knowledge"),
         };
 
         private static readonly Dictionary<string, DimensionDefinition> byId = All.ToDictionary(d => d.Id, StringComparer.Ordinal);

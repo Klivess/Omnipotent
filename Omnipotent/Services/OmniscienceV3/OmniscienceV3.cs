@@ -148,6 +148,13 @@ namespace Omnipotent.Services.OmniscienceV3
                 new Modules.Translate.TranslateModule(),
                 // Monitors hand their findings to the signals module's notices.
                 new Modules.Monitors.MonitorsModule(signals),
+                // WS-B: knowledge, deduction, identity, timeline, plans, the Quality Lab and inquiries.
+                new Knowledge.Deduction.DeductionModule(),
+                new Knowledge.Entities.IdentityModule(),
+                new Knowledge.Timeline.TimelineModule(),
+                new Knowledge.Plans.PlansModule(),
+                new Knowledge.Quality.QualityModule(),
+                new Knowledge.Inquiry.InquiryModule(),
             };
             // Digests read a foreign-language message with its stored translation beside it.
             modules.Add(new Modules.Briefs.BriefsModule(() => modules.OfType<Kernel.Modules.ITranslations>().FirstOrDefault()));

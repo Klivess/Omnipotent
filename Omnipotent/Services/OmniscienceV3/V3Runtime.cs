@@ -96,7 +96,12 @@ namespace Omnipotent.Services.OmniscienceV3
                     ownedEncoder = encoder as IDisposable;
                 }
                 host = new ModuleHost(stores, options.Clock, options.Kernel, options.Log, options.LogError, gate,
-                    new KernelServices { Llm = llm, Models = models, Encoder = encoder, Vectors = vectors });
+                    new KernelServices
+                    {
+                        Llm = llm, Models = models, Encoder = encoder, Vectors = vectors,
+                        // MinorGuard reads age evidence as well as Klives's own marks (WS-B).
+                        Policy = new Knowledge.Policy.EvidencePolicyOracle(new Knowledge.Policy.OperatorPolicyOracle(stores), stores, options.Clock),
+                    });
                 var registered = host;
                 // The tactic runner is a core module: its catalogue is the kernel's tactics plus every module's.
                 var tactics = new TacticRunner(() => BuiltinTactics.All.Concat(registered.Modules.Where(m => m is not TacticRunner).SelectMany(m => m.Tactics)));
