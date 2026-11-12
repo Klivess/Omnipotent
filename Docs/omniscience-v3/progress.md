@@ -139,10 +139,16 @@ Another live session commits and pushes on master from the main folder, so never
    | Branch | Tip | State |
    |---|---|---|
    | WS-C `claude/omniscience-v3-ws-c-99fa83` | `981baeb` | The **Explore engine** is finished and committed (it had been left half-written and uncommitted): mirror, lenses, drill, facets, export, other modules' datasets, policy. 221 v3 tests pass; 5M-row benchmark p95 290 ms (budget 500 ms). Details and the answers to the website's contract gaps 3–5: `ws-c.md`. Still to build: analytics modules, radar and watchlists, digests and briefs, reply inbox, N12–N16, N19, N20, tactics X17–X40 and monitors X41–X52. C-base traceability rows are not ticked. |
-   | WS-B `claude/omniscience-v3-ws-b-49da68` | `a273cde` | Its uncommitted tests did not compile and, once they did, found three defects, now fixed: **the age-evidence policy oracle never read its evidence** (MinorGuard knew only Klives's own marks), a non-monotone calibration curve, and a deterministic date check that misread vague phrases. 196 v3 tests pass, including the planted-fact accuracy gate. **Never run, no tests:** the inquiry engine, tactics X01–X16, identity links and merges, the timeline, plans, the Quality Lab module and every knowledge route. Traceability rows are not ticked. |
-   | WS-D `claude/omniscience-v3-ws-d-21c7c3` | `cb80345` | Chat tests committed; 190 v3 tests pass. **No tests:** Rehearsal, Group Simulation, the social tactics. Traceability rows are not ticked; `ws-d.md` still says "in progress" for parts that are committed. |
+   | WS-B `claude/omniscience-v3-ws-b-49da68` | `fcc2b52` | Its uncommitted tests did not compile. Now 219 v3 tests pass, with the whole inquiry engine, every reasoning tactic X01–X16, standing questions, identity links and merges, and the six modules through the kernel loop under test. **Thirteen defects found by those tests and fixed**, listed in `ws-b.md`; the worst: the age-evidence policy oracle never read its evidence (MinorGuard knew only Klives's own marks), a person asked about by first name was never found, and every reasoning tactic threw when started with a selection. Never exercised: the 33 knowledge routes and the Ask router (no route test harness). Traceability: eight rows ticked from tests; the rest are not. |
+   | WS-D `claude/omniscience-v3-ws-d-21c7c3` | `ccfb51b` | 194 v3 tests pass. Chat tests and tests for all thirteen tactics X53–X65 landed (run-through tests with a scripted model). One defect fixed (a generated draft was marked as such only in words). Never exercised: the replica routes. Fidelity on real people is unmeasured until the shadow run. Traceability rows are not ticked. |
    | WS-A `claude/omniscience-v3-ws-a-878bce` | `730150f` | Unchanged. Captions, visual search and faces wait on decisions (see `ws-a.md`). |
 
-   Order of work from here: test what WS-B and WS-D built but never ran (the inquiry engine first), then the rest of WS-C,
-   then the website's domain pages, then Phase 3. Merging the branches into `omniscience-v3` still waits for Klives's word.
+   Done on 2026-11-12: what WS-B and WS-D had built but never ran is now under test (above). Order of work from here: the
+   rest of WS-C, then the website's domain pages, then Phase 3.
+
+   **For the merge (Phase 3), wiring the branches leave open:** WS-B's modality and fiction oracles read the `labels` table but
+   WS-C packs per-message labels in `classify_message` (set `KnowledgeKit.Modality` to an oracle over `ClassificationReader`);
+   WS-B's modules should offer their datasets to Explore (`IExploreSourceProvider`) and get `KnowledgeKit.Explore` and
+   `KnowledgeKit.Encoder`; WS-D's `ReplicaModule` takes WS-C's encoder; WS-A's and WS-C's module disposal overlap (keep one);
+   Explore's own `assertions` dataset gives way to WS-B's `knowledge.assertions`. Merging the branches into `omniscience-v3` still waits for Klives's word.
 2. Phase 3: shadow run on live data, parity gates, Quality Lab gates, cutover.
