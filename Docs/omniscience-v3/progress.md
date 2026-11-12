@@ -29,8 +29,8 @@ Another live session commits and pushes on master from the main folder, so never
 |---|---|---|
 | 0 | Branch, docs, contracts | done |
 | 1 | Foundations: temporal ✓, storage ✓, kernel ✓, LLM gateway ✓, ML runtime ✓, policy ✓, API skeleton ✓, legacy importer ✓, synthetic corpus + perf harness ✓ | done (contracts to freeze) |
-| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | running: WS-A to WS-D started 2026-11-06; WS-E first slice (foundation + engine pages) committed 2026-11-09, domain pages wait for DTOs; WS-A taken over by the coordinating session 2026-11-10 (imports, media store, media text and Discord-through-KliveBot landed; captions, visual search and faces not built) |
-| 3 | Integration, shadow run, parity gates, cutover | not started |
+| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | built on every branch, each branch tested on its own (2026-11-12). Not built: captions, visual search and faces (WS-A, waiting on decisions); X17, X48, X50 (WS-C, need WS-B's code: merge steps); website pages for WS-A/B/D routes |
+| 3 | Integration, shadow run, parity gates, cutover | not started: merging waits for Klives's word. A merge survey (below) found only "keep both" conflicts |
 
 ## Log
 - 2026-11-06:
@@ -146,9 +146,32 @@ Another live session commits and pushes on master from the main folder, so never
    Done on 2026-11-12: what WS-B and WS-D had built but never ran is now under test (above). Order of work from here: the
    rest of WS-C, then the website's domain pages, then Phase 3.
 
+   **Later on 2026-11-12** (same session, Klives: "continue everything left to do"):
+
+   | Branch | Tip | State |
+   |---|---|---|
+   | WS-C `claude/omniscience-v3-ws-c-99fa83` | `366ac1c` | **Complete except X17 (a merge step with WS-B's extractor), X48 and X50 (need WS-B).** Since `981baeb`: signals (radar, watch rules N11, reply inbox N9, X41, X49), briefs and digests (N4, N10, X18, X30, X31, X52), transforms (X20–X22, X28, X29, X34, X37–X40), notices and relationship dynamics (N12, X36, X45), check-ins (N14, X44), data controls with both forget levels and backups (N20, X76), community pages (N13), similar people and the people map (N16), links (N15, X23), translation (N19, X33), monitors (X42, X43, X46, X47, X51) and the discourse tactics X32, X35. 295 v3 tests, 290 pass, 5 opt-in skipped. `ws-c.md` has every section and a "For the merge" list. |
+   | WS-A `claude/omniscience-v3-ws-a-878bce` | `d8c8019` | The leftovers that need no model download: the OCR/transcript backlog of tracked people first (plan R2), expired attachment links refreshed through their source (F403; Discord only while its capture is on), audio/video length and size from ffprobe. 243 v3 tests pass, 1 opt-in skipped. Still waiting on decisions: captions, visual search, faces. |
+   | WS-E website `omniscience-v3` | `5b49b9c` | Second slice on WS-C's contract: people directory and person page, signals, digests, communities (places, circles, the people map), links, data controls and health; nav groups, page access rules, a typed synthetic domain mock and 9 e2e tests (27 with the engine spec, all pass). Details and ten contract gaps: [ws-e.md](ws-e.md). |
+
+   **Merge survey for Phase 3 (2026-11-12, `git merge-tree` in memory; no branch was touched).** Merging in the R7 order onto
+   `omniscience-v3` (`d00b0e9`): WS-A merges cleanly; WS-C then conflicts in `api-contracts.ts` (generated: regenerate with the
+   contract test), `traceability.md` (rows ticked on both sides), `Api/V3Routes.cs` (both add route registrations: keep both)
+   and `OmniscienceV3.cs` (both rewrite `BuildModules`: keep every module; it must stay an instance method, WS-A's modules use
+   the service); WS-B and WS-D conflict in the same files, WS-B also in `V3Runtime.cs`. No conflict in kernel or module code.
+   The wiring the branches leave open is the list below plus `ws-c.md` "For the merge".
+
    **For the merge (Phase 3), wiring the branches leave open:** WS-B's modality and fiction oracles read the `labels` table but
    WS-C packs per-message labels in `classify_message` (set `KnowledgeKit.Modality` to an oracle over `ClassificationReader`);
    WS-B's modules should offer their datasets to Explore (`IExploreSourceProvider`) and get `KnowledgeKit.Explore` and
    `KnowledgeKit.Encoder`; WS-D's `ReplicaModule` takes WS-C's encoder; WS-A's and WS-C's module disposal overlap (keep one);
-   Explore's own `assertions` dataset gives way to WS-B's `knowledge.assertions`. Merging the branches into `omniscience-v3` still waits for Klives's word.
-2. Phase 3: shadow run on live data, parity gates, Quality Lab gates, cutover.
+   Explore's own `assertions` dataset gives way to WS-B's `knowledge.assertions`. From WS-C (2026-11-12): WS-A's ingest
+   must skip forgotten accounts and conversations (`Forgotten.Load(...).Blocks(...)`); WS-B's extraction and WS-D's replica
+   training must leave out people whose analysis is off (`AnalysisOff.Load`); KliveRAG's Omniscience connector must purge a
+   forgotten person; WS-B should read stored translations (`ITranslations.Cached`); WS-C removed every
+   `SqliteConnection.ClearAllPools()` from v3 code and tests (it closes other databases' pooled connections) while WS-A's
+   tests still call it — keep WS-C's version. Merging the branches into `omniscience-v3` still waits for Klives's word.
+2. Phase 3, once Klives says to merge: merge A → C → B → D into `omniscience-v3` (conflicts above), wire the list above,
+   run every v3 test, then merge the website branch; shadow run on live data, parity gates, Quality Lab gates, cutover.
+   Decisions still open for Klives: the merge itself; downloading model files (faces, visual search); image input for
+   captions; whether link provider lookups (`links.unfurl.enabled`, off) should be on; the Discord user-token gateway (not built).
