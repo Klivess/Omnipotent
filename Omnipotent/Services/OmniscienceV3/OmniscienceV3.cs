@@ -129,9 +129,12 @@ namespace Omnipotent.Services.OmniscienceV3
                 new Modules.Rollups.RollupModule(),
                 new Modules.Projections.ProjectionModule(),
                 signals,
-                new Modules.Briefs.BriefsModule(),
                 new Modules.DataControls.DataControlsModule(),
+                new Modules.Links.LinksModule(),
+                new Modules.Translate.TranslateModule(),
             };
+            // Digests read a foreign-language message with its stored translation beside it.
+            modules.Add(new Modules.Briefs.BriefsModule(() => modules.OfType<Kernel.Modules.ITranslations>().FirstOrDefault()));
             // Explore mirrors the datasets of every module in this list that offers them (IExploreSourceProvider).
             modules.Add(new Modules.Insights.InsightsModule(signals, () => modules.OfType<Kernel.Explore.IExploreEngine>().FirstOrDefault()));
             // Transforms checks saved charts against the datasets the modules in this list declare.

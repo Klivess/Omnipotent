@@ -241,6 +241,13 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
                 var off = AnalysisOff.Load(Context.Stores);
                 if (off.Any) total -= messages.RemoveAll(m => off.Author(m.AuthorIdentity));
                 messages.Reverse();
+                // A message in another language is read with its stored translation beside it (N19); the original stays.
+                if (translations?.Invoke() is { } layer && messages.Count > 0)
+                {
+                    var cached = layer.Cached(messages.Select(m => m.Id).ToList());
+                    if (cached.Count > 0)
+                        messages = messages.Select(m => cached.TryGetValue(m.Id, out var t) && t.SourceLanguage != t.Target ? m with { Text = m.Text + " [translation: " + t.Text + "]" } : m).ToList();
+                }
                 names = new Naming(corpus, messages);
                 scopeTitle = row.ScopeKind switch
                 {

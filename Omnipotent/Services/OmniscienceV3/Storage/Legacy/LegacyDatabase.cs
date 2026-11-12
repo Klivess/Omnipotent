@@ -105,7 +105,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 destination.Exec(null, "PRAGMA journal_mode=DELETE;");
             }, ct).ConfigureAwait(false);
             ct.ThrowIfCancellationRequested();
-            SqliteConnection.ClearAllPools();
+            // Both connections were unpooled, so the files are closed by now.
             File.Move(partial, target, overwrite: true);
             return target;
         }

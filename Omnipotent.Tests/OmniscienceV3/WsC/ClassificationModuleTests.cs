@@ -58,7 +58,6 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         public async Task DisposeAsync()
         {
             await rt.DisposeAsync();
-            SqliteConnection.ClearAllPools();
             try { Directory.Delete(root, true); }
             catch (IOException) { /* lingering handle on Windows; unique temp dir */ }
         }

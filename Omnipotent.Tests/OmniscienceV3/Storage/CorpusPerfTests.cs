@@ -36,7 +36,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
 
         public Task DisposeAsync()
         {
-            SqliteConnection.ClearAllPools();
             foreach (var r in roots)
             {
                 try { Directory.Delete(r, true); }

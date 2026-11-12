@@ -52,7 +52,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Api
         public async Task DisposeAsync()
         {
             await host.StopAsync();
-            SqliteConnection.ClearAllPools();
             try { Directory.Delete(root, true); }
             catch (IOException) { /* lingering handle on Windows; unique temp dir */ }
         }
@@ -565,7 +564,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Api
             }
             finally
             {
-                SqliteConnection.ClearAllPools();
                 try { Directory.Delete(other, true); }
                 catch (IOException) { /* lingering handle on Windows; unique temp dir */ }
             }

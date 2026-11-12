@@ -52,6 +52,9 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
                 "classify.concept.label" => Concept(user),
                 "signals.watch.policy" => JsonSerializer.Serialize(new { targets_special_category = SensitiveRules.Any(w => user.Contains(w, StringComparison.OrdinalIgnoreCase)) }),
                 "signals.watch.confirm" => Watch(user),
+                "translate.batch" => Translate(user),
+                // Links: every link is filed under "other" unless a test says otherwise (Override).
+                "links.categorise" => JsonSerializer.Serialize(new { items = Regex.Matches(user, "<l ref=\"(?<ref>[0-9]+)\"").Select(m => new { @ref = m.Groups["ref"].Value, topic = "other", summary = "A link." }) }),
                 _ => throw new InvalidOperationException($"FakeLlm has no answer for purpose '{request.Purpose}'."),
             };
             return Task.FromResult(Ok(json, user));
@@ -61,6 +64,29 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             new(true, null, json, LlmErrorKind.None, null, "stop", "fake-model", "fake", Math.Max(1, prompt.Length / 4), 0, json.Length / 4, prompt.Length, 5);
 
         private static string Decode(string s) => s.Replace("‹", "<").Replace("›", ">");
+
+        /// <summary>What the fake translator knows. Anything else comes back unchanged.</summary>
+        public static readonly Dictionary<string, string> Phrases = new()
+        {
+            ["これは新しいテストです"] = "this is a new test", ["これはテストです"] = "this is a test", ["привет как дела"] = "hi how are you", ["مرحبا بالعالم"] = "hello world", ["日本"] = "Japan",
+        };
+
+        /// <summary>The translator: known phrases are replaced, markers are kept (unless the text says DROPMARK), a message
+        /// that says SKIPME is not answered for, and the language is read off the script.</summary>
+        private static string Translate(string user)
+        {
+            var items = new List<object>();
+            foreach (Match m in Any.Matches(user))
+            {
+                string text = Decode(m.Groups["text"].Value);
+                if (text.Contains("SKIPME")) continue;
+                string translated = text;
+                foreach (var (from, to) in Phrases.OrderByDescending(x => x.Key.Length)) translated = translated.Replace(from, to);
+                if (text.Contains("DROPMARK")) translated = Regex.Replace(translated, "⟦[0-9]+⟧", "");
+                items.Add(new { @ref = m.Groups["ref"].Value, lang = OracleLanguage(text), text = translated });
+            }
+            return JsonSerializer.Serialize(new { items });
+        }
 
         private static string Teacher(string user)
         {

@@ -23,6 +23,12 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
     /// </summary>
     public sealed partial class BriefsModule : IntelModuleBase
     {
+        private readonly Func<ITranslations?>? translations;
+
+        /// <param name="translations">The translation layer of this build, when it has one: a message in another language is
+        /// then summarised with its stored translation beside it. Nothing is translated on a digest's account.</param>
+        public BriefsModule(Func<ITranslations?>? translations = null) => this.translations = translations;
+
         public const string ModuleId = "briefs";
         public const string DigestModel = "briefs.digest";
         public const string PersonModel = "briefs.person";

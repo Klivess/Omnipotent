@@ -18,7 +18,8 @@ lands, so a restart can resume from it.
 | Notices, relationship dynamics and communities (N12, X36, X45) | the commit after the transforms | `Kernel/Modules/Notices.cs` (additive contract), `Modules/Insights`, `Api/InsightsRoutes.cs`, signals migration 2. `InsightsModule` is given the signals module (its notice sink). |
 | Wellbeing check-ins (N14, X44) | 9cb702a | `InsightsModule.Wellbeing.cs`, insights migration 2. |
 | Data controls (N20, X76) | 5bf8ec4 | `Modules/DataControls`, `Storage/Forgotten.cs`, `Storage/AnalysisOff.cs`, `Api/DataControlsRoutes.cs`; analysis off touches the classifier, rollups, signals, briefs, insights, transforms, explore, projections and the tactic runner (a few lines each); the old-database importer honours both. See "For the merge" in its section. |
-| Community pages (N13), similar people and map (N16) | the commit after data controls | `InsightsModule.Spaces.cs`, `InsightsModule.People.cs`, `Layout2D.cs`; insights migrations 3 and 4; rollups migration 2 (`rollup_scope_day.klives`). |
+| Community pages (N13), similar people and map (N16) | 59c185d | `InsightsModule.Spaces.cs`, `InsightsModule.People.cs`, `Layout2D.cs`; insights migrations 3 and 4; rollups migration 2 (`rollup_scope_day.klives`). |
+| Link intelligence (N15, X23) and translation (N19, X33) | the commit after community pages | `Modules/Links`, `Modules/Translate`, `Api/LinksRoutes.cs`, `Api/TranslateRoutes.cs`, `Kernel/Modules/Translations.cs` (additive). `BriefsModule` now takes the translation layer; in `BuildModules()` it is added after the list for that reason. Looking links up at providers is **off by default** (`links.unfurl.enabled`). |
 
 ## What the other workstreams integrate against (C-base)
 - **Shared encoder:** `ModuleContext.Encoder` (`IEmbeddingEncoder`, frozen R7 #5). Production: `LazyE5Encoder` from
@@ -340,6 +341,67 @@ who is an adult and whose analysis is on.
   tables, a few seconds on half the cores). A trait that hardly varies between people still counts as much as one that
   does, once standardised. "Personality" here is the mix of readings of someone's messages, nothing more.
 
+## Link intelligence (N15, X23)
+Module `links` (`Modules/Links`), routes under `links/` (`Api/LinksRoutes.cs`), tactic `x23.link_tracker`.
+
+- **What a link is.** `LinkParser` finds the links in a message and normalises them, structurally: tracking parameters and
+  fragments go, the rest is put in one order, and every spelling of a known thing becomes one address (`youtu.be/…`,
+  `/shorts/…`, `music.youtube.com/watch?v=…` are one video; `twitter.com`, `vxtwitter.com` and `x.com` one post; and so on
+  for Spotify, Steam, Reddit, Vimeo). Each link has a `kind` (video, music, game, post, code, reference, gif, image, shop,
+  invite, page) from a table of hosts. The platform's own media links are not links.
+- **Sensitive links.** A link with credentials in it, a query parameter that carries a token, code or signature, a long
+  opaque value, a path that signs in or acts on an emailed link (reset, verify, invite, …), or a host where the link is
+  itself the permission to read a private file (Google Docs, Dropbox, OneDrive, Discord invites, …) is kept **without its
+  query**, marked, and never looked up anywhere.
+- **Where the description comes from.** First the preview stored with the message (`message_embeds`): no request at all,
+  stamped with when the message arrived. Only when a link has none, **and only when `links.unfurl.enabled` is switched on
+  (it is off by default)**, the provider's own metadata endpoint is asked: eight fixed hosts (`LinkParser.EndpointHosts`),
+  about a public link, never the shared address itself. The fetcher (`HttpLinkFetcher`) allows only https, those hosts,
+  default port and no credentials; resolves the host itself and refuses private, loopback and link-local addresses, then
+  connects to exactly the address it checked; follows at most two redirects, each through the same checks; sends no
+  cookies; reads at most 256 KB in eight seconds. What comes back is cleaned to plain, bounded text and stamped with when
+  it was fetched. A provider that fails is tried three times, then left alone. `links.unfurl.per_run` (20) every five minutes.
+- **Topics.** Every half hour links with a title are filed under one of twelve topics with a one-line summary
+  (`links.categorise`, background). The list has no special category on purpose: what someone shares must not become a
+  reading of their politics, religion, health or sexuality, so such links are "news" or "other", and a topic outside the
+  list is "other" too.
+- **Reads.** `GET links/person` (a person's media diet: kinds, providers, sites, topics, the latest), `GET links/search`
+  ("what did X share about Y": words, person, site, kind, topic, time), `GET links/track` (one address in any spelling, or
+  a whole site: who shared it first, who at all, where, month by month, and the reactions those messages got). X23 does
+  the same from an address, a site or a selected message, inside selected servers, conversations or a time range.
+- **Rules.** Bots' links are nobody's. A minor's shares are counted and not named, and their diet is refused. Someone
+  whose analysis is off has no shares and none are read. A forgotten person's shares leave the counts and a link only
+  they shared is removed. Edits and deletions are followed.
+- Not built: an Explore dataset for shares; "summarised" is one line from title and description (the page itself is never read).
+  Not exercised: a real provider (the tests use a stand-in that is held to the real fetcher's rules), and real embeds.
+
+## Translation (N19, X33)
+Module `translate` (`Modules/Translate`), routes under `translate/` (`Api/TranslateRoutes.cs`), tactic
+`x33.translate_selection`, kernel contract `Kernel/Modules/Translations.cs` (`ITranslations.Cached`, additive).
+
+- **Which messages.** The classifier already reads each message's language, leaning on the author's usual language for
+  short ones. Messages read as another language than `translate.target` (en) with at least `translate.min_probability`
+  (0.7) are queued from the label outbox: what was written to Klives directly and by people he tracks first, then the
+  rest, newest first. Not his own messages, not bots', not deleted ones, not someone's whose analysis is off.
+- **Budget.** The background job translates at most `translate.auto.per_hour` (300) messages an hour, in batches of
+  `translate.batch` (20). A backlog of years therefore takes time; anything can be translated at once on request.
+- **Per version.** A translation belongs to one version of a message. After an edit the old one is not served for the new
+  text, the new text is queued again by its own reading, and the old row is dropped.
+- **What is never translated.** Mentions, channel and role references, custom emoji, links and code are taken out by
+  their syntax before the model sees the text and put back afterwards; if the model drops or invents a marker the
+  translation is marked `lossy`. The names of the people involved are listed for the model as words to keep.
+- **Originals.** Never replaced; every answer carries the original beside the translation and a state (translated, same,
+  skipped, failed).
+- **Use.** `POST translate/messages` and X33 translate a selection now (up to 200 messages; a conversation's latest 200).
+  `GET translate/search` searches the translations (their own FTS index), so a search in Klives's language finds what was
+  said in another. Digests read a foreign message with its stored translation beside it (`BriefsModule` takes the
+  layer; nothing is translated on a digest's account). `GET translate/status` shows the queue and the hour's use.
+- Forgetting a person removes their translations with their messages, out of the search index too (the index follows the
+  table by triggers).
+- For the merge: WS-B's extraction and search should read `ITranslations.Cached` the way digests do (the general search
+  can union `translate/search`). "Multilingual embeddings" is the encoder's property (C-base), not this module's.
+- Not exercised: a real model's translations, and real language readings (the tests write the readings and script the model).
+
 ## Data controls (N20, X76): two forget levels, retention, backups, export
 Module `datacontrols` (`Modules/DataControls`), routes under `data/` (`Api/DataControlsRoutes.cs`).
 
@@ -443,6 +505,15 @@ exercised: a real corpus's size (the erase works in batches of 2,000 messages; t
 holds the corpus writer for its duration, seconds on a few million messages).
 
 ## Shared files touched (small, additive)
+- **Connection pools.** v3 no longer calls `SqliteConnection.ClearAllPools()` anywhere (it did in `LegacyDatabase.SnapshotAsync`
+  and `LegacyImportModule`, for connections that were unpooled anyway): that call closes the pooled connections of every
+  SQLite database in the process, the other services' included, and can close one at the moment it is handed out.
+  `SqliteStore.OpenRead` now takes another connection when that happens to it (other services still clear all pools when
+  they shut down). The v3 tests no longer clear all pools either; a store clears its own pool when it is disposed. Found as
+  a rare test failure (`ObjectDisposedException` in a rollup drain while another test class was tearing down).
+- Links and translation: `Kernel/Modules/Translations.cs` (new, additive); one line each in `Api/V3Routes.cs`; in
+  `OmniscienceV3.BuildModules()` the links and translation modules join the list and `BriefsModule` is added after it
+  (it is handed the translation layer).
 - Data controls: `Storage/Forgotten.cs` and `Storage/AnalysisOff.cs` (new); `Storage/ChangeLog.cs` gains the change kind
   `person.reanalyse`; `Storage/Legacy/LegacyImporter*.cs` honour the tombstones and analysis off (and a quarantined
   message now also names its author as v3 knows the account); `Kernel/Tactics/TacticRunner.cs` refuses a tactic on an
@@ -529,9 +600,10 @@ holds the corpus writer for its duration, seconds on a few million messages).
 | Data controls (N20, X76): erase and "forget what was worked out" with analysis off, tombstones honoured by the importer, retention, encrypted backups with restore and key transfer, per-person export | done, tested (6 tests, 2 importer tests; real sizes and WS-A's ingest hook are not exercised) |
 | Community pages of servers and group chats (N13) | done, tested (2 tests on a seeded server; real volumes not exercised) |
 | Similar people and their map (N16) | done, tested (layout maths on planted clusters; similarity and map on 18 and 60 planted people) |
-| Links (N15), translation (N19) | pending |
+| Link intelligence (N15, X23) | done, tested (5 tests: parser rules, fetch guards, collection, opt-in lookups, topics, tracker, forgetting; no real provider) |
+| Translation (N19, X33) | done, tested (4 tests with a scripted model: queue, budget, per-version, shielding, selection, digests) |
 | Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
-| Tactics X17 (merge step), X23, X32, X33, X35; monitors X42, X43, X46–X48, X50–X51 | pending |
+| Tactics X17 (merge step), X32, X35; monitors X42, X43, X46–X48, X50–X51 | pending |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)

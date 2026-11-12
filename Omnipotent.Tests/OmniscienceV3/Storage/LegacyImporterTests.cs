@@ -37,7 +37,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         public async Task DisposeAsync()
         {
             await stores.DisposeAsync();
-            SqliteConnection.ClearAllPools();
             try { Directory.Delete(root, true); }
             catch (IOException) { /* lingering handle on Windows; unique temp dir */ }
         }
@@ -194,7 +193,12 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
             return c.Scalar<T>(null, sql, args)!;
         }
 
-        private static string Hash(string path) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+        /// <summary>Reads the file while SQLite may still hold it open (a test must not empty every connection pool of the process to read one file).</summary>
+        private static string Hash(string path)
+        {
+            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return Convert.ToHexString(SHA256.HashData(file));
+        }
 
         // ── the full migration ───────────────────────────────────────────────────
 
@@ -202,10 +206,8 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         public async Task Snapshot_MigratesEveryTableFaithfully()
         {
             Seed();
-            SqliteConnection.ClearAllPools();
             string before = Hash(legacyPath);
             var report = await Run(LegacyImportMode.Snapshot);
-            SqliteConnection.ClearAllPools();
             Assert.Equal(before, Hash(legacyPath)); // v2's bytes are never changed
 
             // Messages: 7 imported + 1 recovered from the delete archive; the ghost-author one quarantined.
@@ -560,10 +562,8 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         public async Task Snapshot_CopiesTheLiveDatabaseWithoutTouchingIt()
         {
             Seed();
-            SqliteConnection.ClearAllPools();
             string before = Hash(legacyPath);
             string snap = await LegacyDatabase.SnapshotAsync(legacyPath, stores.Paths.LegacySnapshots, clock, default);
-            SqliteConnection.ClearAllPools();
             Assert.Equal(before, Hash(legacyPath));
             using var db = LegacyDatabase.OpenReadOnly(snap);
             Assert.Equal(8, db.Count("messages"));
@@ -575,7 +575,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         {
             Seed();
             await stores.DisposeAsync();
-            SqliteConnection.ClearAllPools();
             var logs = new System.Collections.Concurrent.ConcurrentQueue<string>();
             await using var rt = await Omnipotent.Services.OmniscienceV3.V3Runtime.StartAsync(new Omnipotent.Services.OmniscienceV3.V3RuntimeOptions
             {

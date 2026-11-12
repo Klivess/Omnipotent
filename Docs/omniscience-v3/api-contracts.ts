@@ -773,6 +773,68 @@ export interface LaneJobsDto {
   cancelled: number;
 }
 
+export interface LinkCountDto {
+  key: string;
+  label?: string | null;
+  shares: number;
+}
+
+export interface LinkDto {
+  urlId: string;
+  url: string;
+  host: string;
+  site: string;
+  provider?: string | null;
+  kind: string;
+  sensitive: boolean;
+  title?: string | null;
+  author?: string | null;
+  description?: string | null;
+  metaSource?: string | null;
+  metaAtMs?: number | null;
+  topic?: string | null;
+  summary?: string | null;
+  shares: number;
+  sharers: number;
+  firstSharedMs?: number | null;
+  lastSharedMs?: number | null;
+}
+
+export interface LinkSearchDto {
+  items: LinkShareDto[];
+  truncated: boolean;
+}
+
+export interface LinkShareDto {
+  messageId: string;
+  personId?: string | null;
+  personName?: string | null;
+  conversationId: string;
+  conversationTitle?: string | null;
+  guildId?: string | null;
+  atMs: number;
+  reactions: number;
+  link: LinkDto;
+}
+
+export interface LinkTrackDto {
+  target: string;
+  targetKind: string;
+  link?: LinkDto | null;
+  shares: number;
+  sharers: number;
+  reactions: number;
+  firstAtMs?: number | null;
+  lastAtMs?: number | null;
+  first?: LinkShareDto | null;
+  people: LinkCountDto[];
+  places: LinkCountDto[];
+  months: LinkCountDto[];
+  topLinks: LinkDto[];
+  items: LinkShareDto[];
+  truncated: boolean;
+}
+
 export interface LlmCallDto {
   callId: number;
   atMs: number;
@@ -1118,6 +1180,19 @@ export interface PersonCardDto {
 export interface PersonExportRequest {
   personId: string;
   format: string;
+}
+
+export interface PersonLinksDto {
+  personId: string;
+  name?: string | null;
+  days: number;
+  shares: number;
+  links: number;
+  kinds: LinkCountDto[];
+  providers: LinkCountDto[];
+  sites: LinkCountDto[];
+  topics: LinkCountDto[];
+  recent: LinkShareDto[];
 }
 
 export interface PersonRelationshipsDto {
@@ -1670,6 +1745,49 @@ export interface TaskCatalogEntryDto {
 export type TimeBucket = "None" | "Hour" | "Day" | "Week" | "Month" | "Quarter" | "Year" | "HourOfDay" | "DayOfWeek";
 
 export type TimeLens = "Klives" | "Subject" | "Utc";
+
+export interface TranslateRequest {
+  messageIds: string[];
+}
+
+export interface TranslateStatusDto {
+  target: string;
+  auto: boolean;
+  queued: number;
+  stored: number;
+  usedThisHour: number;
+  perHour: number;
+}
+
+export interface TranslationDto {
+  messageId: string;
+  version: number;
+  original?: string | null;
+  translation?: string | null;
+  sourceLanguage?: string | null;
+  target: string;
+  state: string;
+  lossy: boolean;
+  note?: string | null;
+}
+
+export interface TranslationHitDto {
+  messageId: string;
+  sourceLanguage?: string | null;
+  snippet: string;
+}
+
+export interface TranslationSearchDto {
+  items: TranslationHitDto[];
+  target: string;
+}
+
+export interface TranslationsDto {
+  items: TranslationDto[];
+  target: string;
+  fromCache: number;
+  translated: number;
+}
 
 export type V3Phase = "Disabled" | "Starting" | "Ready" | "Failed" | "Stopping";
 
