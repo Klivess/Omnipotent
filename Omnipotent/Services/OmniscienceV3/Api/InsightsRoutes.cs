@@ -9,6 +9,13 @@ namespace Omnipotent.Services.OmniscienceV3.Api
     [ApiContract]
     public sealed record InsightsRefreshDto(long JobId);
 
+    /// <summary><c>state</c>: done (Klives checked in), dismissed, or new.</summary>
+    [ApiContract]
+    public sealed record WellbeingStateRequest(string SuggestionId, string State);
+
+    [ApiContract]
+    public sealed record WellbeingStateDto(string SuggestionId, string State);
+
     /// <summary>
     /// Insights routes under <c>/omniscience/v3/insights/</c>: relationship dynamics and communities (N12). The communities
     /// are also read model <c>insights.communities</c>; a person's relationships and a single pair are read from the tables
@@ -41,6 +48,22 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                 string a = q.Required("a", 200), b = q.Required("b", 200);
                 return ApiResponses.OkAsync(req, Guard(() => Insights.Pair(a, b)) ?? throw ApiException.NotFound("These two have too few interactions to be tracked as a relationship."));
             }, ct).ConfigureAwait(false);
+
+            await Get("insights/wellbeing", OmnisciencePerms.PersonsRead, req =>
+            {
+                var q = ApiQuery.Of(req);
+                return ApiResponses.OkAsync(req, Insights.Wellbeing(q.Str("state", 16)?.ToLowerInvariant(), q.Int("limit", 50, 1, 200)));
+            }, ct).ConfigureAwait(false);
+
+            await registrar.RouteAsync(V3Routes.Prefix + "/insights/wellbeing/state", HttpMethod.Post, OmniscienceV3Perms.AlertsManage, async req =>
+            {
+                var body = ApiBody.Read<WellbeingStateRequest>(req);
+                bool changed;
+                try { changed = await Insights.SetWellbeingStateAsync(body.SuggestionId ?? "", body.State, ApiBody.Actor(req), host.Stopping).ConfigureAwait(false); }
+                catch (ArgumentException ex) { throw ApiException.BadRequest(ex.Message); }
+                if (!changed) throw ApiException.NotFound($"No check-in suggestion '{body.SuggestionId}' that can be changed.");
+                await ApiResponses.OkAsync(req, new WellbeingStateDto(body.SuggestionId!, body.State)).ConfigureAwait(false);
+            }, RouteRegistrar.DefaultMaxBodyBytes, ct).ConfigureAwait(false);
 
             await registrar.RouteAsync(V3Routes.Prefix + "/insights/refresh", HttpMethod.Post, OmniscienceV3Perms.EngineManage, async req =>
             {

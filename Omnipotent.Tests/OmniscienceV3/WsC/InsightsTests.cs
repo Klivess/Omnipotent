@@ -295,5 +295,133 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.False(off[0].Data!.Value.GetProperty("enabled").GetBoolean());
             Assert.False(h.Settings.Get("insights.notify.relationships", true));
         }
+
+        /// <summary>One week of a person's own activity, written straight into the person rollup: how many messages, and how
+        /// many of the answered ones read as negative.</summary>
+        private static Task PersonWeekAsync(SignalsHarness h, string person, int weeksAgo, int msgs, int answered = 0, int negative = 0) =>
+            h.Runtime.Stores.Intel.WriteAsync((c, tx) =>
+            {
+                string day = ThisWeek.AddDays(-7 * weeksAgo + 2).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                string labels = JsonSerializer.Serialize(new { sentiment = new Dictionary<string, int> { ["negative"] = negative, ["positive"] = (answered - negative) / 2, ["neutral"] = answered - negative - (answered - negative) / 2 } });
+                c.Exec(tx, """
+                    INSERT INTO rollup_person_day(person_id, day, zone, zone_known, msgs, authored, deleted, edited, replies, forwarded, non_authored, with_attachments, with_links, chars, words,
+                        dm_msgs, group_msgs, server_msgs, day_only, reactions_given, mentions_made, hours, labels, conversations, guilds, labelset, source_seq, computed_at_ms)
+                    VALUES($p,$d,'UTC',0,$m,$m,0,0,0,0,0,0,0,$m*20,$m*4,0,0,$m,0,0,0,'[]',$l,'{}','{}',1,1,$n)
+                    ON CONFLICT(person_id, day) DO UPDATE SET msgs=excluded.msgs, authored=excluded.authored, labels=excluded.labels
+                    """, ("$p", person), ("$d", day), ("$m", msgs), ("$l", labels), ("$n", h.Clock.NowMs));
+            });
+
+        [Fact]
+        public async Task Wellbeing_SuggestsACheckIn_WhenSomeoneCloseIsFarFromTheirOwnUsual_TwoWeeksRunning()
+        {
+            await using var h = await SignalsHarness.StartAsync(insights: true);
+            foreach (string p in new[] { "p-dan", "p-kid", "p-far" }) await AddPersonAsync(h, p);
+            await h.MarkMinorAsync("p-kid");
+            await h.Driver.RunUntilIdleAsync(5_000);
+            // Who is close to Klives: Ben, Ana, Cyd and the minor by interaction; Dan because Klives tracks him; "far" is neither.
+            foreach (string p in new[] { Ben, Ana, Cyd, "p-kid" }) await BothWaysAsync(h, K, p, 30, 0, 5);
+            await h.Runtime.Stores.Operator.WriteAsync((c, tx) => c.Exec(tx, "INSERT INTO person_settings(person_id, tier, updated_at_ms) VALUES('p-dan','tracked',$t)", ("$t", h.Clock.NowMs)));
+
+            var wobble = new[] { 3, 4, 2, 3, 5, 3, 2, 4 };
+            for (int w = 85; w >= 3; w--)
+            {
+                await PersonWeekAsync(h, Ben, w, 40 + w % 5, answered: 30, negative: wobble[w % 8]);          // about a tenth negative, always
+                await PersonWeekAsync(h, Ana, w, 50 + w % 7, answered: 30, negative: 3);
+                await PersonWeekAsync(h, "p-dan", w, 45, answered: 30, negative: wobble[w % 8]);
+                await PersonWeekAsync(h, "p-kid", w, 45, answered: 30, negative: 3);
+                await PersonWeekAsync(h, "p-far", w, 45, answered: 30, negative: 3);
+                // Cyd goes quiet for two weeks at this time every year.
+                await PersonWeekAsync(h, Cyd, w, w is 53 or 54 ? 1 : 48 + w % 6, answered: w is 53 or 54 ? 0 : 30, negative: 3);
+            }
+            foreach (int w in new[] { 2, 1 })
+            {
+                await PersonWeekAsync(h, Ben, w, 42, answered: 30, negative: 18);         // far more negative than is usual for him
+                await PersonWeekAsync(h, Ana, w, 2);                                       // nearly silent
+                await PersonWeekAsync(h, Cyd, w, 1);                                       // nearly silent, as every year
+                await PersonWeekAsync(h, "p-kid", w, 1, answered: 0);
+                await PersonWeekAsync(h, "p-far", w, 1, answered: 0);
+            }
+            await PersonWeekAsync(h, "p-dan", 2, 45, answered: 30, negative: 3);
+            await PersonWeekAsync(h, "p-dan", 1, 45, answered: 30, negative: 20);         // one bad week is not a pattern
+
+            var result = await RebuildAsync(h);
+            var wellbeing = h.Driver.LastResult(InsightsModule.WellbeingKind)!.Value;
+            Assert.Equal(4, wellbeing.GetProperty("people").GetInt32());                  // Ben, Ana, Cyd, Dan: not the minor, not the stranger, not Klives
+            _ = result;
+            var all = h.Insights!.Wellbeing(null, 50).Suggestions.ToDictionary(s => s.PersonId + "/" + s.Kind);
+            Assert.Equal(new[] { "p-ana/withdrawn", "p-ben/mood", "p-cyd/withdrawn" }, all.Keys.OrderBy(k => k, StringComparer.Ordinal));
+            Assert.Equal(("new", "new", "seasonal"), (all["p-ben/mood"].State, all["p-ana/withdrawn"].State, all["p-cyd/withdrawn"].State));
+            var mood = all["p-ben/mood"];
+            Assert.Equal("Ben", mood.PersonName);
+            Assert.Equal(0.6, mood.Data.GetProperty("negativeShare")[0].GetDouble());
+            Assert.Equal(0.1, mood.Data.GetProperty("usualShare").GetDouble(), 1);
+            Assert.All(mood.Data.GetProperty("z").EnumerateArray(), z => Assert.True(z.GetDouble() >= 2));
+            Assert.Null(mood.ResourceText);
+            Assert.True(all["p-cyd/withdrawn"].Data.GetProperty("seasonal").GetBoolean());
+
+            // Klives is told about the two real ones; the yearly pattern is recorded but not suggested.
+            var notices = h.Signals.Notices(null, "wellbeing", null, null, 50).Items;
+            Assert.Equal(new[] { "p-ana", "p-ben" }, notices.Select(n => n.PersonId).OrderBy(p => p, StringComparer.Ordinal));
+            Assert.All(notices, n => Assert.Equal("attention", n.Severity));
+
+            // A week later it still holds: the same stretch is not suggested again.
+            h.Clock.Advance(TimeSpan.FromDays(7));
+            await PersonWeekAsync(h, Ben, -1 + 1, 42, answered: 30, negative: 17);
+            await RebuildAsync(h);
+            Assert.Equal(3, h.Insights.Wellbeing(null, 50).Suggestions.Count);
+            Assert.Equal(2, h.Signals.Notices(null, "wellbeing", null, null, 50).Items.Count);
+
+            // Klives checked in with Ben.
+            Assert.True(await h.Insights.SetWellbeingStateAsync(mood.SuggestionId, "done", "tester", CancellationToken.None));
+            Assert.Equal("p-ana", Assert.Single(h.Insights.Wellbeing("new", 50).Suggestions).PersonId);
+            Assert.False(await h.Insights.SetWellbeingStateAsync(all["p-cyd/withdrawn"].SuggestionId, "done", "tester", CancellationToken.None));
+            await Assert.ThrowsAsync<ArgumentException>(() => h.Insights.SetWellbeingStateAsync(mood.SuggestionId, "fixed", "tester", CancellationToken.None));
+
+            // A message that explicitly says the author is in danger: suggested at once, urgently, with what to do.
+            string live = await h.PostAsync(SignalsHarness.DmBen, SignalsHarness.Ben, "(a message the ensemble read as crisis)");
+            string imported = await h.PostAsync(SignalsHarness.DmBen, SignalsHarness.Ben, "(an old one from an export)", source: Omnipotent.Services.OmniscienceV3.Storage.SourceKinds.Import);
+            await h.Runtime.Stores.Intel.WriteAsync((c, tx) =>
+            {
+                c.Exec(tx, "INSERT INTO classify_labelsets(labelset, state, encoder, heads_json, fusion_json, created_at_ms) VALUES(9,'active','test',$h,$f,$n)",
+                    ("$h", """{"single":{},"context":{}}"""), ("$f", """{"tasks":{},"llmReliability":{}}"""), ("$n", h.Clock.NowMs));
+                foreach (string id in new[] { live, imported })
+                    c.Exec(tx, "INSERT INTO classify_message(message_id, labelset, item_version, text_hash, codes, gate, as_of_ms, source_seq) VALUES($m,9,1,$m,'distress=crisis:90',NULL,$n,1)",
+                        ("$m", id), ("$n", h.Clock.NowMs));
+            });
+            await RebuildAsync(h);
+            var crisis = h.Insights.Wellbeing(null, 50).Suggestions.Single(s => s.Kind == "crisis");
+            Assert.Equal(("p-ben", InsightsModule.CrisisResourceText), (crisis.PersonId, crisis.ResourceText));
+            Assert.Equal(new[] { live }, crisis.Data.GetProperty("messageIds").EnumerateArray().Select(m => m.GetString()));
+            var urgent = h.Signals.Notices(null, "wellbeing", null, null, 50).Items.Single(n => n.Severity == "urgent");
+            Assert.Equal(("p-ben", "pushed"), (urgent.PersonId, urgent.Delivery));
+            await RebuildAsync(h);
+            Assert.Single(h.Insights.Wellbeing(null, 50).Suggestions, s => s.Kind == "crisis");
+
+            // X44 switches it off; a forgotten person leaves nothing behind.
+            string runId = await h.Runtime.Tactics.StartAsync(WellbeingWatchTactic.Key, new TacticInput(Array.Empty<Selection>(), JsonSerializer.SerializeToElement(new { enabled = false })), "tester");
+            await h.Driver.RunUntilIdleAsync();
+            Assert.Equal(TacticRunStates.Succeeded, h.Runtime.Tactics.Get(runId)!.State);
+            Assert.False(h.Insights.Wellbeing(null, 1).Enabled);
+            await RebuildAsync(h);
+            Assert.Equal("switched off", h.Driver.LastResult(InsightsModule.WellbeingKind)!.Value.GetProperty("skipped").GetString());
+            await h.Runtime.Stores.Corpus.WriteAsync((c, tx) =>
+                Omnipotent.Services.OmniscienceV3.Storage.ChangeLog.Append(c, tx, h.Clock.NowMs, Omnipotent.Services.OmniscienceV3.Storage.ChangeKinds.PersonErase, "p-ben", "p-ben", null, Omnipotent.Services.OmniscienceV3.Storage.SourceKinds.Operator));
+            await h.Driver.RunUntilIdleAsync(5_000);
+            h.Driver.AssertNoFailures();
+            foreach (string table in new[] { "ins_wellbeing WHERE person_id='p-ben'", "ins_pairs WHERE a='p-ben' OR b='p-ben'", "ins_pair_week WHERE a='p-ben' OR b='p-ben'", "ins_members WHERE person_id='p-ben'" })
+                Assert.Equal(0, h.Intel("SELECT COUNT(*) FROM " + table));
+        }
+
+        [Fact]
+        public void RobustZ_MeasuresAgainstAPersonsOwnUsual()
+        {
+            var steady = Enumerable.Repeat(0.1, 20).ToList();
+            // A perfectly regular history has no spread; the floor keeps a small wobble from looking like an alarm.
+            Assert.Equal(0.4, InsightsModule.RobustZ(0.12, steady, 0.05), 6);
+            Assert.True(InsightsModule.RobustZ(0.6, steady, 0.05) > 9);
+            var varied = new double[] { 0.05, 0.1, 0.15, 0.1, 0.2, 0.1, 0.05, 0.15, 0.1, 0.1 };
+            Assert.True(InsightsModule.RobustZ(0.2, varied, 0.01) is > 1 and < 3);
+            Assert.True(InsightsModule.RobustZ(0.0, varied, 0.01) < -1);
+        }
     }
 }

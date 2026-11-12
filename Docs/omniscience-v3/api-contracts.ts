@@ -1419,6 +1419,34 @@ export interface WatchSaveRequest {
   enabled: boolean;
 }
 
+export interface WellbeingListDto {
+  suggestions: WellbeingSuggestionDto[];
+  enabled: boolean;
+  asOfMs: number;
+}
+
+export interface WellbeingStateDto {
+  suggestionId: string;
+  state: string;
+}
+
+export interface WellbeingStateRequest {
+  suggestionId: string;
+  state: string;
+}
+
+export interface WellbeingSuggestionDto {
+  suggestionId: string;
+  personId: string;
+  personName?: string | null;
+  kind: string;
+  week: string;
+  state: string;
+  data: unknown;
+  resourceText?: string | null;
+  createdAtMs: number;
+}
+
 export interface ZoneReadingDto {
   zone?: string | null;
   offsetMinutes?: number | null;

@@ -259,6 +259,29 @@ hours when handed in is listed, never pushed. A person-targeted notice about a p
 **For the integrator:** WS-B's standing-question flips (X50) and WS-A's source health can hand their findings to the same
 sink: pass the `SignalsModule` instance to them in `BuildModules()`.
 
+## Wellbeing check-ins (N14, X44)
+Part of the `insights` module (`InsightsModule.Wellbeing.cs`, table `ins_wellbeing`); the job `insights/wellbeing` runs
+after the nightly relationship job.
+
+- **Who:** the people Klives tracks or pinned, and the `insights.wellbeing.close_contacts` (30) people he interacts with
+  most. Never minors.
+- **What is measured:** per person and week, the share of answered messages the ensemble read as negative (weeks with at
+  least 10 answered), and how many messages they wrote (people who usually write at least 15 a week). Each is compared
+  with that person's own previous 26 weeks by a robust z (median and MAD, with a floor so a perfectly regular history does
+  not turn a wobble into an alarm).
+- **When it suggests:** both of the last two complete weeks beyond `insights.wellbeing.threshold` (2): `mood` or
+  `withdrawn`. Not when the same two weeks a year earlier looked the same against their own baseline: that is recorded as
+  `seasonal` and not suggested. One suggestion per person and kind in four weeks.
+- **Crisis:** a live message of the last 48 hours that the ensemble read as `distress = crisis` (probability at least
+  `insights.wellbeing.crisis_probability`) is suggested at once, as an urgent notice, with a general text on what to do.
+- **What it says:** the measurements (shares, counts, z-scores, the weeks), never a judgement or a diagnosis. Suggestions
+  only; nothing is sent to anyone.
+- **Routes:** `GET insights/wellbeing`, `POST insights/wellbeing/state` (done, dismissed). `x44.wellbeing_watch` switches
+  it on or off (`insights.wellbeing.enabled`) and lists the open suggestions.
+- **Forgetting a person** removes their rows from every insights table at once (the module follows `person.erase`).
+- Not exercised: the ensemble's `sentiment` and `distress` readings on real messages (the tests write the rollups and the
+  labels themselves).
+
 ## Shared files touched (small, additive)
 - `Kernel/Modules/Notices.cs`: `Notice`, `NoticeSeverity`, `INoticeSink` (additive). Insights: one line in `Api/V3Routes.cs`; in `OmniscienceV3.BuildModules()` the signals module is built first and handed to `InsightsModule`.
 - Transforms: one line each in `Api/V3Routes.cs` (`TransformsRoutes`) and `OmniscienceV3.BuildModules()` (`TransformsModule`, before Explore).
@@ -336,9 +359,10 @@ sink: pass the `SignalsModule` instance to them in `BuildModules()`.
 | Signals: radar, semantic watch rules (N11), reply inbox (N9), nudges; tactics X41 and X49; routes; Explore datasets | done, tested (16 tests with supplied readings; the classifier's real readings and KliveBot delivery are not exercised) |
 | Digests (N10, scheduled X52), person brief (N4), cited summaries; tactics X18, X30, X31 | done, tested (8 tests with a scripted model: what a real model writes is first seen in the shadow run) |
 | Relationship dynamics and communities (N12), notices, X36, X45 | done, tested (Leiden on planted graphs; the relationship job on written pair rollups, so the conflict labels it reads are the test's) |
-| Community pages (N13), wellbeing (N14), links (N15), similar people (N16), translation (N19), data controls (N20) | pending |
+| Wellbeing check-ins (N14, X44) | done, tested (the rollups and labels it reads are written by the test) |
+| Community pages (N13), links (N15), similar people (N16), translation (N19), data controls (N20) | pending |
 | Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
-| Tactics X17 (merge step), X23, X32, X33, X35; monitors X42–X44, X46–X48, X50–X51 | pending |
+| Tactics X17 (merge step), X23, X32, X33, X35; monitors X42, X43, X46–X48, X50–X51 | pending |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)

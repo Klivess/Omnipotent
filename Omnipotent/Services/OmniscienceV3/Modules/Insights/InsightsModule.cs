@@ -52,6 +52,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Insights
             Category = "analytics",
             Description = "Relationship dynamics, communities, wellbeing check-ins and the map of similar people, recomputed nightly from the rollups.",
             DependsOn = new[] { RollupModule.ModuleId },
+            SubscribedChangeKinds = new[] { Storage.ChangeKinds.PersonErase },
             Schedules = new[] { new ScheduleTrigger("nightly", DailyAtLocal: new TimeOnly(4, 15)) },
             DefaultLane = Lane.Cpu,
             MinorRestricted = true,
@@ -62,6 +63,10 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Insights
                 new SettingDescriptor("insights.community.min_edge", SettingTypes.Int, "3", "Two people need at least this many interactions in half a year to count as connected.", 1, 1000),
                 new SettingDescriptor("insights.community.resolution", SettingTypes.Number, "1", "Higher finds more, smaller communities.", 0.1, 5),
                 new SettingDescriptor("insights.notify.relationships", SettingTypes.Bool, "true", "Tell Klives when a relationship of his, or between people he tracks, changes (X45)."),
+                new SettingDescriptor("insights.wellbeing.enabled", SettingTypes.Bool, "true", "Suggest checking in with a close contact whose mood or activity has shifted (X44)."),
+                new SettingDescriptor("insights.wellbeing.close_contacts", SettingTypes.Int, "30", "How many of the people Klives interacts with most are watched, besides those he tracks or pinned.", 0, 500),
+                new SettingDescriptor("insights.wellbeing.threshold", SettingTypes.Number, "2", "How far from their own usual (in robust standard deviations) two weeks running must be.", 1, 6),
+                new SettingDescriptor("insights.wellbeing.crisis_probability", SettingTypes.Number, "0.6", "How sure the ensemble must be that a message says the author is in danger.", 0.3, 0.99),
             },
             Datasets = new[]
             {
@@ -161,27 +166,60 @@ CREATE TABLE ins_state(
 INSERT INTO ins_state(name, value) VALUES('change_seq', 0);
 INSERT INTO ins_state(name, value) VALUES('community_seq', 0);
 """),
+            WellbeingMigration,
         };
 
         internal ModuleContext Ctx => Context;
 
-        public override IReadOnlyList<ITactic> Tactics => tactics ??= new ITactic[] { new InfluenceTactic(this), new RelationshipWatchTactic(this) };
+        public override IReadOnlyList<ITactic> Tactics => tactics ??= new ITactic[] { new InfluenceTactic(this), new RelationshipWatchTactic(this), new WellbeingWatchTactic(this) };
 
         private IReadOnlyList<ITactic>? tactics;
 
+        public const string ForgetKind = "forget";
+
+        public override IEnumerable<DirtySubject> MapChanges(IReadOnlyList<Storage.ChangeRecord> changes) =>
+            changes.Where(c => c.Kind == Storage.ChangeKinds.PersonErase).SelectMany(c => new[] { c.EntityId, c.PersonId }).OfType<string>().Distinct(StringComparer.Ordinal)
+                .Select(p => new DirtySubject("person", p));
+
         public override IEnumerable<JobRequest> Plan(PlanContext context)
         {
+            // The nightly pass rebuilds the relationships; the wellbeing pass follows it (it reads who is close to Klives).
             if (context.VersionChanged || context.DueSchedules.Any(s => s.Name == "nightly")) yield return Job(RelationshipsKind, "all", "all", priority: 60);
+            foreach (var d in context.Dirty.Where(d => d.Kind == "person")) yield return Job(ForgetKind, "person", d.Id, priority: 200);
         }
 
         public override async Task<string?> ExecuteAsync(JobContext job) => job.Job.Kind switch
         {
             RelationshipsKind => await BuildRelationshipsAsync(job).ConfigureAwait(false),
+            WellbeingKind => await BuildWellbeingAsync(job).ConfigureAwait(false),
+            ForgetKind => await ForgetAsync(job).ConfigureAwait(false),
             _ => throw new JobFailureException(ErrorClass.Permanent, $"Unknown insights job kind '{job.Job.Kind}'."),
         };
 
         /// <summary>Queues a recomputation now (the nightly schedule does the same).</summary>
         public Task<long> RefreshAsync(CancellationToken ct) => Context.Jobs.EnqueueAsync(Job(RelationshipsKind, "all", "all", priority: 160), ct);
+
+        /// <summary>A person was forgotten: everything kept about them here goes at once (the nightly rebuild would only reach
+        /// the tables it recomputes).</summary>
+        private async Task<string?> ForgetAsync(JobContext job)
+        {
+            string person = job.Job.SubjectId ?? throw new JobFailureException(ErrorClass.Permanent, "Forget job without a person.");
+            int removed = await Context.Stores.Intel.WriteAsync((c, tx) =>
+            {
+                int n = c.Exec(tx, "DELETE FROM ins_pair_week WHERE a=$p OR b=$p", ("$p", person));
+                n += c.Exec(tx, "DELETE FROM ins_pairs WHERE a=$p OR b=$p", ("$p", person));
+                n += c.Exec(tx, "DELETE FROM ins_pair_events WHERE a=$p OR b=$p OR json_extract(data_json,'$.by')=$p", ("$p", person));
+                n += c.Exec(tx, "DELETE FROM ins_members WHERE person_id=$p", ("$p", person));
+                n += c.Exec(tx, "DELETE FROM ins_wellbeing WHERE person_id=$p", ("$p", person));
+                foreach (var (id, top) in c.Query(tx, "SELECT community_id, top_json FROM ins_communities WHERE top_json LIKE $l", r => (r.GetString(0), r.GetString(1)), ("$l", "%" + person + "%")))
+                {
+                    var kept = (JsonSerializer.Deserialize<List<JsonElement>>(top, KernelJson.Options) ?? new List<JsonElement>()).Where(t => t.GetProperty("personId").GetString() != person).ToList();
+                    c.Exec(tx, "UPDATE ins_communities SET top_json=$t WHERE community_id=$c", ("$t", JsonSerializer.Serialize(kept, KernelJson.Options)), ("$c", id));
+                }
+                return n;
+            }, job.Cancellation).ConfigureAwait(false);
+            return Json(new { person, removed });
+        }
 
         // ── shared pieces ────────────────────────────────────────────────────────
 
