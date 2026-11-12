@@ -38,7 +38,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
     /// (DST-safe, once late after downtime, never a catch-up storm). Minors get no reminders, and their birthdays are never
     /// stored in the first place (MinorGuard). Klives's own promises are highlighted.
     /// </summary>
-    public sealed class PlansModule : IntelModuleBase
+    public sealed class PlansModule : IntelModuleBase, Kernel.Explore.IExploreSourceProvider
     {
         public const string Id = KnowledgeSchema.PlansModule;
         public const string ProjectKind = "project";
@@ -49,6 +49,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
         public const string AgendaDaysSetting = Id + ".agenda_days";
 
         private KnowledgeKit kit = null!;
+
+        /// <summary>The datasets this module declares, offered to the Explore mirror (integration, Phase 3).</summary>
+        public IReadOnlyList<Kernel.Explore.ExploreSource> ExploreSources => Store.KnowledgeSchema.ExploreSourcesOf(Manifest.Datasets);
 
         public override ModuleManifest Manifest { get; } = new()
         {
@@ -307,8 +310,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
             }
         }
 
-        /// <summary>Fires due reminders as live events (<c>person.plan.reminder</c>, delivered by the notification tactics). A reminder
-        /// missed while the service was down fires once, late, with its lateness — unless the occurrence itself is already past.</summary>
+        /// <summary>Fires due reminders as live events (<c>person.plan.reminder</c>) and as notices (X48: kind <c>plan_reminder</c>,
+        /// delivered under Klives's rules). A reminder missed while the service was down fires once, late, with its lateness —
+        /// unless the occurrence itself is already past. One whose plan has gone (forgotten, superseded away) or has been held
+        /// back by the minor guard since it was set is cancelled, not fired.</summary>
         public async Task<object> FireRemindersAsync(CancellationToken ct)
         {
             long now = Context.Clock.NowMs;
@@ -316,21 +321,30 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
             using (var c = Context.Stores.Intel.OpenRead())
                 due = c.Query(null, "SELECT reminder_id, plan_id, occurrence_ms, fire_at_ms, kind FROM kn_reminders WHERE state='pending' AND fire_at_ms <= $n ORDER BY fire_at_ms LIMIT 200",
                     r => (r.GetString(0), r.GetString(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4)), ("$n", now));
-            int fired = 0, missed = 0;
+            int fired = 0, missed = 0, withheld = 0;
             foreach (var r in due)
             {
+                (bool Found, string Title, string Owner, string? Counterparty, bool Restricted) plan;
+                using (var c = Context.Stores.Intel.OpenRead())
+                    plan = c.Query(null, "SELECT title, owner_person_id, counterparty_person_id, minor_restricted FROM kn_plans WHERE plan_id=$p",
+                        x => (true, x.GetString(0), x.GetString(1), x.GetStringOrNull(2), x.GetInt32(3) == 1), ("$p", r.Plan)).FirstOrDefault();
                 bool occurrencePast = now > r.Occurrence + 86_400_000L;
-                string state = occurrencePast ? "missed" : "fired";
+                string state = !plan.Found || plan.Restricted ? "cancelled" : occurrencePast ? "missed" : "fired";
                 await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "UPDATE kn_reminders SET state=$s, fired_at_ms=$n WHERE reminder_id=$i AND state='pending'",
-                    ("$s", state), ("$n", now), ("$i", r.Id)), ct).ConfigureAwait(false);
+                    ("$s", state), ("$n", state == "cancelled" ? (long?)null : now), ("$i", r.Id)), ct).ConfigureAwait(false);
+                if (state == "cancelled") { withheld++; continue; }
                 if (occurrencePast) { missed++; continue; }
-                string? title;
-                using (var c = Context.Stores.Intel.OpenRead()) title = c.Scalar<string>(null, "SELECT title FROM kn_plans WHERE plan_id=$p", ("$p", r.Plan));
+                string title = plan.Title;
                 await Context.Events.PublishAsync("person.plan.reminder", new { reminderId = r.Id, planId = r.Plan, title, r.Kind, occurrenceMs = r.Occurrence, latenessMs = now - r.FireAt }, ct)
                     .ConfigureAwait(false);
+                // X48: the reminder is also a notice, delivered under Klives's rules (quiet hours, the hourly cap, the digest).
+                if (kit.Notices is { } notices)
+                    await notices.NoticeAsync(new Notice("plan|" + r.Id, "plan_reminder", Id, now,
+                        new { reminderId = r.Id, planId = r.Plan, title, kind = r.Kind, occurrenceMs = r.Occurrence, latenessMs = now - r.FireAt },
+                        NoticeSeverity.Attention, plan.Owner, plan.Counterparty), ct).ConfigureAwait(false);
                 fired++;
             }
-            return new { fired, missed };
+            return new { fired, missed, withheld };
         }
 
         // ── agenda ───────────────────────────────────────────────────────────────

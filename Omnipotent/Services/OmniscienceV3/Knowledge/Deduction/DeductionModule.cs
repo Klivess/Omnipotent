@@ -24,7 +24,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
     /// rotation: at most a few slices per job, F184), picks up people newly promoted to tracked (F179/F265) and enforces
     /// MinorGuard on stored facts. Calibration refits daily from Klives's decisions.
     /// </summary>
-    public sealed class DeductionModule : IntelModuleBase
+    public sealed class DeductionModule : IntelModuleBase, Kernel.Explore.IExploreSourceProvider
     {
         public const string Id = KnowledgeSchema.DeductionModule;
         public const int ModuleVersion = 1;
@@ -47,6 +47,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         private KnowledgeKit kit = null!;
         private ClaimStore claims = null!;
         private ReviewQueue review = null!;
+
+        /// <summary>The datasets this module declares, offered to the Explore mirror (integration, Phase 3).</summary>
+        public IReadOnlyList<Kernel.Explore.ExploreSource> ExploreSources => Store.KnowledgeSchema.ExploreSourcesOf(Manifest.Datasets);
 
         public override ModuleManifest Manifest { get; } = new()
         {

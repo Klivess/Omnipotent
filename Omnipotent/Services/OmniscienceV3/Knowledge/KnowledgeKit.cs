@@ -95,6 +95,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge
         /// <summary>WS-C's stored translations (N19): evidence shows a foreign-language message with its translation beside it,
         /// as a reading aid; quotes stay the original. Null until wired.</summary>
         public Kernel.Modules.ITranslations? Translations { get; set; }
+        /// <summary>WS-C's notices (the signals module): plan reminders (X48) and standing-question flips (X50) are handed to it,
+        /// so they follow Klives's delivery rules (quiet hours, digest, push). Null until wired: they are then only published live.</summary>
+        public Kernel.Modules.INoticeSink? Notices { get; set; }
     }
 
     /// <summary>Reads WS-C's per-message labels (intel.db <c>labels</c>, contract R7 #5) for the modality and dialogue-act tasks.</summary>

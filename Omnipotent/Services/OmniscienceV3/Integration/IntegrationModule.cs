@@ -7,7 +7,8 @@ namespace Omnipotent.Services.OmniscienceV3.Integration
 {
     /// <summary>
     /// Connects the workstreams' plug-in points once every module exists (plan Phase 3): the knowledge layer gets WS-C's
-    /// Explore engine (X11 explains a chart point from its drill records) and stored translations (N19). What can be wired
+    /// Explore engine (X11 explains a chart point from its drill records), stored translations (N19) and the notices that plan
+    /// reminders (X48) and standing-question flips (X50) are handed to. What can be wired
     /// where it is defined is wired there instead: the shared encoder comes through the module context, the classifier's
     /// modality labels are the knowledge kit's default. It runs no jobs and owns no tables.
     /// </summary>
@@ -37,6 +38,7 @@ namespace Omnipotent.Services.OmniscienceV3.Integration
             var all = modules();
             kit.Explore ??= all.OfType<IExploreEngine>().FirstOrDefault();
             kit.Translations ??= all.OfType<ITranslations>().FirstOrDefault();
+            kit.Notices ??= all.OfType<INoticeSink>().FirstOrDefault();
         }
 
         public override Task<string?> ExecuteAsync(JobContext job) =>

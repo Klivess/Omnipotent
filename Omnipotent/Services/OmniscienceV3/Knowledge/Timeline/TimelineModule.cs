@@ -18,13 +18,16 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Timeline
     /// intervals, never collapsed to a fake precise date (T8); retracted facts remove their events; MinorGuard-restricted
     /// categories never appear for minors.
     /// </summary>
-    public sealed class TimelineModule : IntelModuleBase
+    public sealed class TimelineModule : IntelModuleBase, Kernel.Explore.IExploreSourceProvider
     {
         public const string Id = KnowledgeSchema.TimelineModule;
         public const string ReadModel = "knowledge.timeline";
         public const string ProjectKind = "project";
 
         private KnowledgeKit kit = null!;
+
+        /// <summary>The datasets this module declares, offered to the Explore mirror (integration, Phase 3).</summary>
+        public IReadOnlyList<Kernel.Explore.ExploreSource> ExploreSources => Store.KnowledgeSchema.ExploreSourcesOf(Manifest.Datasets);
 
         public override ModuleManifest Manifest { get; } = new()
         {

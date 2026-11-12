@@ -42,6 +42,10 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                 bound[ds.Id] = new Bound(ds, ds.Id, key, time, ExploreDatasets.HasSubjectZone(ds.Id), ExploreDatasets.HasTimeQuality(ds.Id), null, Array.Empty<(string, ColumnType)>());
             }
             if (otherModules == null) return;
+            // The knowledge layer's own facts dataset (WS-B) is richer than the mirror's reading of the assertions table: when
+            // it is offered, the mirror's is not served beside it under the same title.
+            if (otherModules().OfType<IExploreSourceProvider>().Any(p => p.ExploreSources.Any(s => s.DatasetId == "knowledge.assertions")))
+                bound.Remove(ExploreDatasets.Assertions);
             foreach (var module in otherModules())
             {
                 if (ReferenceEquals(module, this) || module is not IExploreSourceProvider provider) continue;

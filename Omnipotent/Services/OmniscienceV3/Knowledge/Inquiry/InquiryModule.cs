@@ -39,7 +39,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
     /// Klives's "was this right?" feedback becomes a gold label, confirms or rejects the inquiry's inferred assertion, and
     /// feeds the inquiry calibration curve the Quality Lab refits.
     /// </summary>
-    public sealed class InquiryModule : IntelModuleBase
+    public sealed class InquiryModule : IntelModuleBase, Kernel.Explore.IExploreSourceProvider
     {
         public const string Id = KnowledgeSchema.InquiryModule;
         public const string StandingKind = "standing";
@@ -49,6 +49,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
         public const string FreshnessSetting = Id + ".live_freshness_hours";
 
         private KnowledgeKit kit = null!;
+
+        /// <summary>The datasets this module declares, offered to the Explore mirror (integration, Phase 3).</summary>
+        public IReadOnlyList<Kernel.Explore.ExploreSource> ExploreSources => Store.KnowledgeSchema.ExploreSourcesOf(Manifest.Datasets);
 
         public override ModuleManifest Manifest { get; } = new()
         {
@@ -190,11 +193,24 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
             await SaveStateAsync(questionId, maxSeq, state, pending: false, budgetUse: 1, ct, report, runId).ConfigureAwait(false);
             await Context.Stores.Operator.WriteAsync((c, tx) => c.Exec(tx, "UPDATE standing_questions SET last_evaluated_ms=$n, updated_at_ms=$n WHERE question_id=$q", ("$n", now), ("$q", questionId)), ct).ConfigureAwait(false);
             if (flipped)
-                await Context.Events.PublishAsync(Topics.Alert, new
+            {
+                // X50: the flip is a notice, delivered under Klives's rules (quiet hours, the hourly cap, the digest), about the
+                // people the question is about. Without the notices in the build it is pushed as a live alert, as before.
+                if (kit.Notices is { } notices)
                 {
-                    kind = "standing_question.flip", questionId, question = def.Question, from = state!.LastVerdict, to = report.Verdict.ToString(),
-                    fromProbability = state.LastProbability, toProbability = report.Probability, inquiryId = report.InquiryId,
-                }, ct).ConfigureAwait(false);
+                    var people = def.PersonIds.Select(kit.Corpus.Canonical).Distinct(StringComparer.Ordinal).ToList();
+                    await notices.NoticeAsync(new Notice("standing|" + questionId + "|" + report.InquiryId, "standing_question", Id, now,
+                        new { questionId, question = def.Question, from = state!.LastVerdict, to = report.Verdict.ToString(), fromProbability = state.LastProbability,
+                              toProbability = report.Probability, inquiryId = report.InquiryId },
+                        NoticeSeverity.Attention, people.FirstOrDefault(), people.Skip(1).FirstOrDefault(), PersonTargeted: people.Count > 0), ct).ConfigureAwait(false);
+                }
+                else
+                    await Context.Events.PublishAsync(Topics.Alert, new
+                    {
+                        kind = "standing_question.flip", questionId, question = def.Question, from = state!.LastVerdict, to = report.Verdict.ToString(),
+                        fromProbability = state.LastProbability, toProbability = report.Probability, inquiryId = report.InquiryId,
+                    }, ct).ConfigureAwait(false);
+            }
             return new { questionId, outcome = "evaluated", verdict = report.Verdict.ToString(), report.Probability, flipped };
         }
 

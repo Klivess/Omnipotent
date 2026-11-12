@@ -330,6 +330,42 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.False(module.StandingQuestions().ContainsKey(first.StandingId!));
         }
 
+        [Fact]
+        public async Task X50_AFlip_IsHandedToTheNotices_AboutThePersonAsked_AndNotAlertedASecondTime()
+        {
+            var (h, corpus, model) = await StartAsync();
+            await using var _h = h;
+            var notices = new Omnipotent.Tests.OmniscienceV3.Integration.RecordingNotices();
+            h.Kit.Notices = notices;
+            model.Understand = _ => new { restatement = "Does Dee Marsh live in Glasgow?", answer_type = "binary" };
+            model.Plan = new { facets = new[] { new { name = "home", kind = "direct", queries = new[] { "live in", "moved to", "moving" }, counter_queries = Array.Empty<string>() } } };
+            model.Pass = (_, dossier) =>
+            {
+                var left = Mentioning(dossier, "left Glasgow");
+                return left.Length > 0
+                    ? new { answer = "no", probability = 0.1, evidence_for = left, evidence_against = Mentioning(dossier, "moved to Glasgow"), reasoning = "She has left." }
+                    : new { answer = "yes", probability = 0.9, evidence_for = Mentioning(dossier, "moved to Glasgow"), evidence_against = Array.Empty<string>(), reasoning = "She moved there." };
+            };
+            var (_, first, _) = await InquiryTests.RunAsync(h, "x14.standing_question", Input(new { question = "Does Dee live in Glasgow?", minIntervalHours = 1 }, new[] { Dee }));
+            Assert.Empty(notices.Received); // the first answer is not a flip
+
+            h.Clock.Advance(TimeSpan.FromHours(2));
+            string dmDee = corpus.Messages.First(m => m.AuthorPersonId == Dee && m.Text.Contains("Bristol")).ConversationId;
+            await WriteAsync(h, Dee, dmDee, h.Clock.NowMs - 10_000, "big news, I left Glasgow and moved to Cardiff", SourceKinds.Live);
+            long eventsBefore = h.Runtime.Host.Events.Bounds().LatestEver;
+            var module = h.Module<InquiryModule>();
+            Assert.Equal("evaluated", Outcome(await module.EvaluateStandingAsync(first!.StandingId!, h.Job("knowledge.inquiry", InquiryModule.StandingKind, first.StandingId), force: false)));
+
+            var notice = Assert.Single(notices.Received);
+            Assert.Equal(("standing_question", InquiryModule.Id, Dee, true), (notice.Kind, notice.ModuleId, notice.PersonId, notice.PersonTargeted));
+            Assert.StartsWith("standing|" + first.StandingId + "|", notice.NoticeId);
+            string data = JsonSerializer.Serialize(notice.Data, KernelJson.Options);
+            Assert.Contains("\"from\":\"Yes\"", data);
+            Assert.Contains("\"to\":\"No\"", data);
+            // The notices decide whether to push it; the module does not push its own alert beside them.
+            Assert.DoesNotContain(h.Runtime.Host.Events.Replay(eventsBefore, 100), e => e.Topic == Topics.Alert);
+        }
+
         private static string Outcome(object result) => JsonSerializer.SerializeToElement(result, KernelJson.Options).GetProperty("outcome").GetString()!;
 
         /// <summary>Writes a message of a planted person with a source kind (the planted identities use their own id scheme).</summary>

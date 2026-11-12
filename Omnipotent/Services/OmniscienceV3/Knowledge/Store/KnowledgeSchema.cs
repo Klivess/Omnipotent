@@ -508,6 +508,28 @@ CREATE TABLE kn_standing_state(
             ["knowledge.inquiries"] = "kn_inquiries",
         };
 
+        /// <summary>
+        /// Where the Explore mirror (WS-C) copies each knowledge dataset from: table, key, the row's time, and the column that
+        /// grows when a row changes (null: small tables copied whole). The Quality Lab's metrics have a composite key and are
+        /// not mirrored.
+        /// </summary>
+        private static readonly IReadOnlyDictionary<string, Kernel.Explore.ExploreSource> Sources = new Dictionary<string, Kernel.Explore.ExploreSource>(StringComparer.Ordinal)
+        {
+            ["knowledge.assertions"] = new("knowledge.assertions", "kn_assertion_dims", "assertion_id", "occurred_at_ms", "recorded_at_ms"),
+            ["knowledge.claims"] = new("knowledge.claims", "kn_claims", "claim_id", "asserted_at_ms", "recorded_at_ms"),
+            ["knowledge.review"] = new("knowledge.review", "kn_review_items", "item_id", "created_at_ms", "updated_at_ms"),
+            ["knowledge.hypotheses"] = new("knowledge.hypotheses", "kn_hypotheses", "hypothesis_id", "created_at_ms"),
+            ["knowledge.aliases"] = new("knowledge.aliases", "kn_aliases", "alias_id", "last_seen_ms", "updated_at_ms"),
+            ["knowledge.identity_links"] = new("knowledge.identity_links", "kn_identity_links", "link_id", "created_at_ms", "updated_at_ms"),
+            ["knowledge.life_events"] = new("knowledge.life_events", "kn_life_events", "event_id", "recorded_at_ms", "updated_at_ms"),
+            ["knowledge.plans"] = new("knowledge.plans", "kn_plans", "plan_id", "created_at_ms", "updated_at_ms"),
+            ["knowledge.inquiries"] = new("knowledge.inquiries", "kn_inquiries", "inquiry_id", "created_at_ms"),
+        };
+
+        /// <summary>The Explore sources of the datasets a module declares (integration, Phase 3).</summary>
+        public static IReadOnlyList<Kernel.Explore.ExploreSource> ExploreSourcesOf(IEnumerable<DatasetDescriptor> datasets) =>
+            datasets.Select(d => Sources.TryGetValue(d.Id, out var s) ? s : null).Where(s => s != null).Select(s => s!).ToList();
+
         private static DimensionBinding B(string dim, string col) => new(dim, col);
         private static MeasureDescriptor Count(string title) => new("count", title, "count", null);
 

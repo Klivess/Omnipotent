@@ -81,6 +81,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
         private long received, written, dropped, lastEventAtMs;
         private volatile string? lastError;
         private volatile bool unauthorised;
+        private int markingUnauthorised;
         private volatile bool confirmedActive;
 
         /// <param name="feed">KliveBot's connection.</param>
@@ -171,7 +172,9 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
         private async Task PumpAsync(CancellationToken ct)
         {
             Task<bool>? waiting = null;
-            long lastHousekeepingMs = 0;
+            // Housekeeping is paced on the monotonic tick, not the engine clock: a paused or fixed clock must not stop the
+            // re-ring that answers a doorbell which arrived while its channel's pull was finishing.
+            long lastHousekeepingTick = 0;
             while (!ct.IsCancellationRequested)
             {
                 try
@@ -197,11 +200,11 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
                         if (batch.Count > 0) await ApplyAsync(batch, ct).ConfigureAwait(false);
                     }
 
-                    long now = Context.Clock.NowMs;
-                    if (now - lastHousekeepingMs >= 2000)
+                    long tick = Environment.TickCount64;
+                    if (tick - lastHousekeepingTick >= 2000)
                     {
-                        lastHousekeepingMs = now;
-                        await RingUnansweredAsync(now, ct).ConfigureAwait(false);
+                        lastHousekeepingTick = tick;
+                        await RingUnansweredAsync(tick, ct).ConfigureAwait(false);
                     }
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -231,6 +234,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
             if (attachment == null) return;
             // A new connection may come with a replaced token: try again rather than stay stopped.
             unauthorised = false;
+            Interlocked.Exchange(ref markingUnauthorised, 0);
             confirmedActive = false;
             Context.Log("[OmniscienceV3] listening to KliveBot's Discord connection.");
         }
@@ -363,20 +367,21 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
                 fetched[channelId] = doorbells.GetValueOrDefault(channelId);
                 return;
             }
-            lastEnqueued[channelId] = Context.Clock.NowMs;
+            lastEnqueued[channelId] = Environment.TickCount64;
             await Context.Jobs.EnqueueAsync(Job(PullKind, "channel", channelId, priority: 900), ct).ConfigureAwait(false);
         }
 
         /// <summary>
         /// Rings again for channels whose latest doorbell no pull has answered: a job that was already finishing when
-        /// the doorbell rang, or one that failed. Single-flight makes a repeat ring cost nothing.
+        /// the doorbell rang (single-flight folded the ring into it), or one that failed. A repeat ring costs nothing.
         /// </summary>
-        private async Task RingUnansweredAsync(long now, CancellationToken ct)
+        /// <param name="tick">The monotonic tick (<see cref="Environment.TickCount64"/>) the ring times are kept in.</param>
+        private async Task RingUnansweredAsync(long tick, CancellationToken ct)
         {
             foreach (var (channelId, generation) in doorbells)
             {
                 if (fetched.GetValueOrDefault(channelId) >= generation) continue;
-                if (now - lastEnqueued.GetValueOrDefault(channelId) < 3000) continue;
+                if (tick - lastEnqueued.GetValueOrDefault(channelId) < 3000) continue;
                 await RingAsync(channelId, ct).ConfigureAwait(false);
             }
         }
@@ -625,15 +630,23 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
         /// </summary>
         private async Task MarkUnauthorisedAsync(string detail)
         {
-            if (unauthorised) return;
-            unauthorised = true;
-            lastError = "Discord refused KliveBot's token.";
-            long now = Context.Clock.NowMs;
-            await Context.Stores.Corpus.WriteAsync((c, tx) => c.Exec(tx, """
-                INSERT INTO sources(source_id, platform, kind, label, status, status_detail, rank, created_at_ms, updated_at_ms)
-                VALUES($s,$p,'bot','KliveBot','unauthorised',$d,$r,$t,$t)
-                ON CONFLICT(source_id) DO UPDATE SET status='unauthorised', status_detail=excluded.status_detail, updated_at_ms=excluded.updated_at_ms
-                """, ("$s", SourceId), ("$p", DiscordPayload.Platform), ("$d", detail), ("$r", IngestSource.PlatformRank), ("$t", now)), CancellationToken.None).ConfigureAwait(false);
+            if (unauthorised || Interlocked.Exchange(ref markingUnauthorised, 1) == 1) return;
+            try
+            {
+                lastError = "Discord refused KliveBot's token.";
+                long now = Context.Clock.NowMs;
+                await Context.Stores.Corpus.WriteAsync((c, tx) => c.Exec(tx, """
+                    INSERT INTO sources(source_id, platform, kind, label, status, status_detail, rank, created_at_ms, updated_at_ms)
+                    VALUES($s,$p,'bot','KliveBot','unauthorised',$d,$r,$t,$t)
+                    ON CONFLICT(source_id) DO UPDATE SET status='unauthorised', status_detail=excluded.status_detail, updated_at_ms=excluded.updated_at_ms
+                    """, ("$s", SourceId), ("$p", DiscordPayload.Platform), ("$d", detail), ("$r", IngestSource.PlatformRank), ("$t", now)), CancellationToken.None).ConfigureAwait(false);
+                // Set once the source row says so: the status the console reads never runs ahead of what is stored.
+                unauthorised = true;
+            }
+            finally
+            {
+                if (!unauthorised) Interlocked.Exchange(ref markingUnauthorised, 0);
+            }
             await Context.Events.PublishAsync(Topic, new { kind = "unauthorised", detail }, CancellationToken.None).ConfigureAwait(false);
             Context.LogError("[OmniscienceV3] Discord refused KliveBot's token; Discord reading is stopped until the service restarts with a working token.", null);
         }

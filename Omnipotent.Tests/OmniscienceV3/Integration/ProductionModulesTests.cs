@@ -85,6 +85,13 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
                 Assert.NotNull(kit.Translations);
                 Assert.NotNull(kit.Encoder);
                 Assert.IsType<ClassifierModalityOracle>(kit.Modality);
+
+                // The knowledge layer's datasets are served by Explore (WS-B → WS-C); its facts once, not beside the mirror's own reading.
+                var served = rt.Host.Modules.OfType<Omnipotent.Services.OmniscienceV3.Modules.Explore.ExploreModule>().Single().ServedDatasets.Select(d => d.Id).ToList();
+                foreach (string id in new[] { "knowledge.assertions", "knowledge.claims", "knowledge.review", "knowledge.hypotheses", "knowledge.aliases",
+                                              "knowledge.identity_links", "knowledge.life_events", "knowledge.plans", "knowledge.inquiries" })
+                    Assert.Contains(id, served);
+                Assert.DoesNotContain(Omnipotent.Services.OmniscienceV3.Modules.Explore.ExploreDatasets.Assertions, served);
                 Assert.Empty(errors);
             }
             finally

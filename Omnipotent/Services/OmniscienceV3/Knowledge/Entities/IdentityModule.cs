@@ -16,12 +16,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
     /// decisions on them. A weekly scan assesses blocked candidate pairs; X67 assesses two chosen people now. Klives accepts
     /// (merge, with explicit confirmation and an undo) or rejects (a gold label that stops the pair being suggested again).
     /// </summary>
-    public sealed class IdentityModule : IntelModuleBase
+    public sealed class IdentityModule : IntelModuleBase, Kernel.Explore.IExploreSourceProvider
     {
         public const string Id = KnowledgeSchema.IdentityModule;
         public const string ScanKind = "scan";
 
         private KnowledgeKit kit = null!;
+
+        /// <summary>The datasets this module declares, offered to the Explore mirror (integration, Phase 3).</summary>
+        public IReadOnlyList<Kernel.Explore.ExploreSource> ExploreSources => Store.KnowledgeSchema.ExploreSourcesOf(Manifest.Datasets);
 
         public override ModuleManifest Manifest { get; } = new()
         {
