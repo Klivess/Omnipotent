@@ -58,9 +58,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
             HashSet<string>? only = null;
             if (personFilter != null)
                 only = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(personFilter)).Select(i => i.IdentityId).ToHashSet(StringComparer.Ordinal);
-            // Names: every identity sharing a normalised name with another identity.
-            var byName = c.Query(null, "SELECT identity_id, value FROM identity_names", r => (r.GetString(0), NaturalKeys.Normalize(r.GetString(1))))
-                .Where(x => x.Item2.Length >= 3).GroupBy(x => x.Item2, StringComparer.Ordinal).Where(g => g.Select(x => x.Item1).Distinct().Count() is > 1 and <= 20);
+            // Names: every identity whose name, with spacing and punctuation folded away, is another identity's name
+            // ("Dee Marsh", "dee_marsh" and "dee.marsh" are one key: the same folding the name signal uses).
+            var byName = c.Query(null, "SELECT identity_id, value FROM identity_names", r => (r.GetString(0), NameKey(r.GetString(1))))
+                .Where(x => x.Item2.Length >= 4).GroupBy(x => x.Item2, StringComparer.Ordinal).Where(g => g.Select(x => x.Item1).Distinct().Count() is > 1 and <= 20);
             foreach (var g in byName) AddAll(pairs, g.Select(x => x.Item1).Distinct(StringComparer.Ordinal).ToList(), only);
             // Avatars.
             foreach (var g in c.Query(null, "SELECT identity_id, avatar_hash FROM identity_avatars", r => (r.GetString(0), r.GetString(1))).GroupBy(x => x.Item2, StringComparer.Ordinal)
@@ -196,10 +197,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
             c.Query(null, "SELECT DISTINCT (sent_at_ms / 2629746000) FROM messages WHERE author_identity_id=$i", r => (int)r.GetInt64(0), ("$i", identity)).ToHashSet();
 
         /// <summary>Normalised similarity of two names (exact arithmetic): 1 − edit distance / longer length, after normalisation.</summary>
+        /// <summary>A name with case, spacing and punctuation folded away: its letters and digits only.</summary>
+        public static string NameKey(string? name) => new(NaturalKeys.Normalize(name).Where(char.IsLetterOrDigit).ToArray());
+
         public static double NameSimilarity(string x, string y)
         {
-            string a = NaturalKeys.Normalize(x).Replace(" ", "").Replace("_", "").Replace(".", "");
-            string b = NaturalKeys.Normalize(y).Replace(" ", "").Replace("_", "").Replace(".", "");
+            string a = NameKey(x), b = NameKey(y);
             if (a.Length == 0 || b.Length == 0) return 0;
             if (a == b) return 1;
             var prev = new int[b.Length + 1];
