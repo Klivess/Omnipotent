@@ -84,6 +84,14 @@ export interface ApiError {
   message: string;
 }
 
+export interface BridgeDto {
+  personId: string;
+  name?: string | null;
+  communityId: string;
+  bridgeTo: string;
+  outsideShare: number;
+}
+
 export interface BriefFactDto {
   assertionId: string;
   attribute: string;
@@ -188,6 +196,28 @@ export interface CohortDto {
 export interface CohortSelectionDto {
   cohort: CohortDto;
   selection: Selection;
+}
+
+export interface CommunitiesDto {
+  communities: CommunityDto[];
+  bridges: BridgeDto[];
+  people: number;
+  modularity: number;
+  asOfMs: number;
+  note: string;
+}
+
+export interface CommunityDto {
+  communityId: string;
+  size: number;
+  weight: number;
+  top: CommunityMemberDto[];
+}
+
+export interface CommunityMemberDto {
+  personId: string;
+  name?: string | null;
+  strength: number;
 }
 
 export interface ConceptDto {
@@ -573,6 +603,10 @@ export interface InboxResolveResultDto {
   open: number;
 }
 
+export interface InsightsRefreshDto {
+  jobId: number;
+}
+
 export interface JobActionRequest {
   jobId: number;
 }
@@ -768,6 +802,42 @@ export interface NameSpanDto {
   toMs?: number | null;
 }
 
+export interface NoticeDto {
+  noticeId: string;
+  kind: string;
+  moduleId: string;
+  severity: string;
+  personId?: string | null;
+  personName?: string | null;
+  otherPersonId?: string | null;
+  otherPersonName?: string | null;
+  guildId?: string | null;
+  conversationId?: string | null;
+  occurredAtMs: number;
+  data: unknown;
+  state: string;
+  delivery: string;
+  createdAtMs: number;
+}
+
+export interface NoticePageDto {
+  items: NoticeDto[];
+  nextCursor?: string | null;
+  unseen: number;
+}
+
+export interface NoticeStateRequest {
+  state: AlertState;
+  noticeIds?: string[] | null;
+  all: boolean;
+  kind?: string | null;
+}
+
+export interface NoticeStateResultDto {
+  changed: number;
+  unseen: number;
+}
+
 export interface OverviewDayDto {
   day: string;
   msgs: number;
@@ -795,6 +865,52 @@ export interface PackedLabelDto {
   label: string;
   probability: number;
   abstained: boolean;
+}
+
+export interface PairDetailDto {
+  summary: PairSummaryDto;
+  weeks: PairWeekDto[];
+  events: PairEventDto[];
+  medianReplySecondsFromA?: number | null;
+  medianReplySecondsFromB?: number | null;
+  asOfMs: number;
+}
+
+export interface PairEventDto {
+  eventId: string;
+  a: string;
+  b: string;
+  kind: string;
+  week: string;
+  atMs: number;
+  data: unknown;
+}
+
+export interface PairSummaryDto {
+  a: string;
+  aName?: string | null;
+  b: string;
+  bName?: string | null;
+  interactions: number;
+  recent: number;
+  closeness: number;
+  previousCloseness: number;
+  reciprocity: number;
+  tension: number;
+  trend: string;
+  firstWeek: string;
+  lastWeek: string;
+}
+
+export interface PairWeekDto {
+  week: string;
+  fromA: number;
+  fromB: number;
+  conflict: number;
+  negative: number;
+  positive: number;
+  answered: number;
+  closeness: number;
 }
 
 export interface PartnerSummaryDto {
@@ -876,6 +992,17 @@ export interface PersonCardDto {
   msgs90: number;
   topGuild?: string | null;
   sentiment90?: Record<string, number> | null;
+}
+
+export interface PersonRelationshipsDto {
+  personId: string;
+  name?: string | null;
+  communityId?: string | null;
+  bridgeTo?: string | null;
+  outsideShare?: number | null;
+  relationships: PairSummaryDto[];
+  events: PairEventDto[];
+  asOfMs: number;
 }
 
 export interface Playbook {

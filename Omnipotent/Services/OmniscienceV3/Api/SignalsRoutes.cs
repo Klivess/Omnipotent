@@ -21,6 +21,13 @@ namespace Omnipotent.Services.OmniscienceV3.Api
     [ApiContract]
     public sealed record AlertFeedbackResultDto(AlertFeedbackDto Feedback, bool ClassifierCorrected);
 
+    /// <summary>Marks the named notices, or with <c>all</c> every unseen one (optionally of one kind), in one call.</summary>
+    [ApiContract]
+    public sealed record NoticeStateRequest(AlertState State, IReadOnlyList<string>? NoticeIds = null, bool All = false, string? Kind = null);
+
+    [ApiContract]
+    public sealed record NoticeStateResultDto(int Changed, long Unseen);
+
     [ApiContract]
     public sealed record WatchListDto(IReadOnlyList<WatchRuleDto> Rules);
 
@@ -90,6 +97,20 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                     corrected = true;
                 }
                 await ApiResponses.OkAsync(req, new AlertFeedbackResultDto(feedback, corrected)).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
+
+            await Get("signals/notices", OmnisciencePerms.PersonsRead, req =>
+            {
+                var q = ApiQuery.Of(req);
+                return ApiResponses.OkAsync(req, Guard(() => Signals.Notices(q.Enum<AlertState>("state"), q.Str("kind", 32), q.Str("person", 200), q.Str("cursor", 400), q.Int("limit", 50, 1, 200))));
+            }, ct).ConfigureAwait(false);
+
+            await Post("signals/notices/state", OmniscienceV3Perms.AlertsManage, async req =>
+            {
+                var body = ApiBody.Read<NoticeStateRequest>(req);
+                var signals = Signals;
+                int changed = await GuardAsync(() => signals.SetNoticeStateAsync(body.NoticeIds, body.All, body.Kind, body.State, ApiBody.Actor(req), host.Stopping)).ConfigureAwait(false);
+                await ApiResponses.OkAsync(req, new NoticeStateResultDto(changed, signals.UnseenNotices())).ConfigureAwait(false);
             }, ct).ConfigureAwait(false);
 
             await Get("signals/watchlists", OmnisciencePerms.PersonsRead, req => ApiResponses.OkAsync(req, new WatchListDto(Signals.Watches())), ct).ConfigureAwait(false);

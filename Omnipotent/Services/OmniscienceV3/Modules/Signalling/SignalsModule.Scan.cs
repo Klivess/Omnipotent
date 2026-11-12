@@ -367,6 +367,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Signalling
                 c.Exec(tx, "DELETE FROM sig_alert_hits WHERE alert_id IN (SELECT alert_id FROM sig_alerts WHERE person_id=$p)", ("$p", person));
                 c.Exec(tx, "DELETE FROM sig_alerts WHERE person_id=$p", ("$p", person));
                 c.Exec(tx, "DELETE FROM sig_inbox WHERE person_id=$p", ("$p", person));
+                c.Exec(tx, "DELETE FROM sig_notices WHERE person_id=$p OR other_person_id=$p", ("$p", person));
             }
 
             foreach (var hit in d.Radar.OrderBy(h => h.Message.SentAt))
@@ -593,9 +594,12 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Signalling
                     r => new { kind = r.GetString(0), alerts = r.GetInt64(1), messages = r.GetInt64(2), newestMs = r.GetInt64OrNull(3) });
                 var waiting = c.Query(null, "SELECT kind, COUNT(*), MIN(sent_at_ms) FROM sig_inbox WHERE state='open' GROUP BY kind ORDER BY kind",
                     r => new { kind = r.GetString(0), items = r.GetInt64(1), oldestMs = r.GetInt64OrNull(2) });
+                var notices = c.Query(null, "SELECT kind, COUNT(*), MAX(created_at_ms) FROM sig_notices WHERE state='new' GROUP BY kind ORDER BY kind",
+                    r => new { kind = r.GetString(0), notices = r.GetInt64(1), newestMs = r.GetInt64OrNull(2) });
                 body = new
                 {
                     unseenAlerts = unseen, unseenTotal = unseen.Sum(u => u.alerts), waiting, waitingTotal = waiting.Sum(w => w.items),
+                    unseenNotices = notices, unseenNoticesTotal = notices.Sum(n => n.notices),
                     heldForDigest = c.Scalar<long>(null, "SELECT COUNT(*) FROM sig_alerts WHERE state='new' AND delivery IN ('quiet','digest')"),
                 };
             }

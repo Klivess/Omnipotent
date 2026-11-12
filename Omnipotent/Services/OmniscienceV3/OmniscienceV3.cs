@@ -118,6 +118,8 @@ namespace Omnipotent.Services.OmniscienceV3
         /// <summary>The modules this build runs. Workstreams add theirs here.</summary>
         private static IReadOnlyList<IIntelModule> BuildModules()
         {
+            // Signals also takes the findings of other modules (notices), so it is built first and handed to them.
+            var signals = new Modules.Signalling.SignalsModule();
             var modules = new List<IIntelModule>
             {
                 // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
@@ -126,10 +128,11 @@ namespace Omnipotent.Services.OmniscienceV3
                 new Modules.Classification.ClassificationModule(),
                 new Modules.Rollups.RollupModule(),
                 new Modules.Projections.ProjectionModule(),
-                new Modules.Signalling.SignalsModule(),
+                signals,
                 new Modules.Briefs.BriefsModule(),
             };
             // Explore mirrors the datasets of every module in this list that offers them (IExploreSourceProvider).
+            modules.Add(new Modules.Insights.InsightsModule(signals, () => modules.OfType<Kernel.Explore.IExploreEngine>().FirstOrDefault()));
             // Transforms checks saved charts against the datasets the modules in this list declare.
             modules.Add(new Modules.Transforms.TransformsModule(() => modules));
             modules.Add(new Modules.Explore.ExploreModule(() => modules));

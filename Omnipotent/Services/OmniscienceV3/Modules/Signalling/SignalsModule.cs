@@ -153,6 +153,12 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Signalling
                     D("where.guild", "guild_id"), D("where.platform", "platform"), D("where.kind", "conversation_kind"), D("content.event", "kind"), D("prov.status", "state"),
                 }, new[] { new MeasureDescriptor("count", "Items", "count", null), new MeasureDescriptor("people", "People", "distinct", "person_id") },
                     "inbox_item", "omniscience.persons.read", MinorFiltered: true),
+                new DatasetDescriptor(NoticesDataset, "Notices", new[]
+                {
+                    D("time.occurred", "occurred_at_ms"), D("time.recorded", "created_at_ms"), D("person.subject", "person_id"), D("person.partner", "other_person_id"),
+                    D("where.guild", "guild_id"), D("where.conversation", "conversation_id"), D("content.event", "kind"), D("prov.module", "module_id"), D("prov.status", "state"),
+                }, new[] { new MeasureDescriptor("count", "Notices", "count", null), new MeasureDescriptor("people", "People", "distinct", "person_id") },
+                    "notice", "omniscience.persons.read", MinorFiltered: true),
             },
             ReadModels = new[]
             {
@@ -164,6 +170,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Signalling
         {
             new ExploreSource(AlertsDataset, "sig_alerts", "alert_id", "occurred_at_ms", "change_seq"),
             new ExploreSource(InboxDataset, "sig_inbox", "item_id", "sent_at_ms", "change_seq"),
+            new ExploreSource(NoticesDataset, "sig_notices", "notice_id", "occurred_at_ms", "change_seq"),
         };
 
         public override IReadOnlyList<Migration> IntelMigrations { get; } = new[]
@@ -278,6 +285,7 @@ CREATE TABLE sig_state(
 );
 INSERT INTO sig_state(name, value) VALUES('change_seq', 0);
 """),
+            NoticesMigration,
         };
 
         public override async Task InitializeAsync(ModuleContext context, CancellationToken ct)

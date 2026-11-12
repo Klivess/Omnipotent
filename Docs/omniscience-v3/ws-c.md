@@ -15,6 +15,7 @@ lands, so a restart can resume from it.
 | Signals (radar, watch rules, reply inbox, X41, X49) | the commit after the Explore engine | `Modules/Signalling`, `Api/SignalsRoutes.cs`. Needs nothing from another workstream; reads the classifier's labels and the rollups when they are installed. |
 | Digests and briefs (N10, N4, X18, X30, X31, X52) | the commit after Signals | `Modules/Briefs`, `Modules/PersonZones.cs`, `Api/BriefsRoutes.cs`. Reads the rollups, the reply inbox and the frozen `assertions` table when they are there. |
 | Transforms without a model (X20–X22, X28, X29, X34, X37–X40) | the commit after digests and briefs | `Modules/Transforms`, `Api/TransformsRoutes.cs`. `TransformsModule` is given the module list (to check saved charts against declared datasets), like Explore. |
+| Notices, relationship dynamics and communities (N12, X36, X45) | the commit after the transforms | `Kernel/Modules/Notices.cs` (additive contract), `Modules/Insights`, `Api/InsightsRoutes.cs`, signals migration 2. `InsightsModule` is given the signals module (its notice sink). |
 
 ## What the other workstreams integrate against (C-base)
 - **Shared encoder:** `ModuleContext.Encoder` (`IEmbeddingEncoder`, frozen R7 #5). Production: `LazyE5Encoder` from
@@ -222,7 +223,44 @@ continuity correction, chi-square with its exact tail, Benjamini–Hochberg), ch
 **Not built here:** X17 (extract from a selection) calls WS-B's extractor and is a merge step; X23 (link tracker) comes
 with link intelligence (N15); X32, X33, X35 and X36 are pending.
 
+## Relationship dynamics and communities (N12, X36, X45) and notices
+Module id `insights`, code in `Modules/Insights/`; tables `ins_pair_week`, `ins_pairs`, `ins_pair_events`,
+`ins_communities`, `ins_members`. One job (`insights/relationships`, nightly at 04:15 in Klives's zone, or
+`POST insights/refresh`) rebuilds everything from `rollup_pair_day`, so it can be thrown away and recomputed.
+
+- **Series:** per pair and week (Monday to Sunday): interactions each way, and how many of them the ensemble read as
+  conflict, negative or positive. `closeness` = their interactions over the geometric mean of everything each of them did
+  in the same weeks, so it is a share of attention, not a volume: someone who writes less to everyone is not "drifting".
+- **Trend** (last 8 weeks against the 26 before): `new`, `closer`, `steady`, `drifting`, or `quiet` when one of them
+  stopped writing to anyone. Pairs with fewer than `insights.pair.min_interactions` in the window are not tracked.
+- **Events** (stable ids, so a rebuild finds nothing twice): `fight` (a week with at least 3 conflict-read interactions
+  that are at least 30% of the week), `reconciled` (within 8 weeks: they talk again, calmly, and it did not flare up in
+  between), `drifting` / `closer` / `new` (once per half-year), `introduced` (their first interaction comes after both had
+  at least 5 interactions with a third person in the 12 weeks before; the event names that person).
+- **Communities:** Leiden (`Leiden.cs`: local moving, refinement, aggregation; deterministic) on the interactions of the
+  last half year. A community keeps its id while it keeps most of its people (Jaccard matching against the previous run).
+  A **bridge** is someone with a quarter or more of their interactions in another community.
+- **Notices (X45):** a new event of the last two weeks in one of Klives's own relationships, or between two people he
+  tracks, becomes a notice (a fight or drifting of his own asks for attention; the rest is for information).
+  `x45.relationship_watch` switches this on and off and lists what was found; `x36.influence` shows whom a person brought
+  together, which communities they bridge, and who turns to them far more than they turn back (direction of attention,
+  **not** topics: "whose topics they amplify" needs the topic model and is not claimed).
+- **Minors** are in none of it: not in pairs, events, communities or tactic outputs.
+- **Reply-time asymmetry** is computed when a pair is opened (`GET insights/pair`), from the rollups' latency histograms.
+- **Routes:** `GET insights/communities` (also read model `insights.communities`), `GET insights/person`,
+  `GET insights/pair`, `POST insights/refresh`. Explore datasets `insights.pairs` and `insights.pair_events`.
+- **Coverage:** a community exists only in interactions Omniscience has seen; the read model says so.
+
+**Notices** are the one list for findings of any module (`Kernel/Modules/Notices.cs`: `Notice`, `INoticeSink`; the signals
+module implements the sink, table `sig_notices`, routes `GET signals/notices`, `POST signals/notices/state`, dataset
+`signals.notices`). A notice id is chosen by the module, so finding the same thing again changes nothing. Severity `info`
+is listed only, `attention` follows quiet hours and the hourly cap, `urgent` is pushed at once. A finding older than 48
+hours when handed in is listed, never pushed. A person-targeted notice about a possible minor is not recorded.
+**For the integrator:** WS-B's standing-question flips (X50) and WS-A's source health can hand their findings to the same
+sink: pass the `SignalsModule` instance to them in `BuildModules()`.
+
 ## Shared files touched (small, additive)
+- `Kernel/Modules/Notices.cs`: `Notice`, `NoticeSeverity`, `INoticeSink` (additive). Insights: one line in `Api/V3Routes.cs`; in `OmniscienceV3.BuildModules()` the signals module is built first and handed to `InsightsModule`.
 - Transforms: one line each in `Api/V3Routes.cs` (`TransformsRoutes`) and `OmniscienceV3.BuildModules()` (`TransformsModule`, before Explore).
 - Briefs: one line each in `Api/V3Routes.cs` (`BriefsRoutes`) and `OmniscienceV3.BuildModules()` (`BriefsModule`).
 - Signals: one line in `Api/V3Routes.cs` registering `SignalsRoutes`, one in `OmniscienceV3.BuildModules()` adding `SignalsModule` (before Explore, which mirrors its datasets). Nothing else shared.
@@ -297,9 +335,10 @@ with link intelligence (N15); X32, X33, X35 and X36 are pending.
 | Explore engine (DuckDB mirror, lenses, drill, facets, export, other modules' datasets, policy) | done, tested (8 tests + the opt-in 5M-row run) |
 | Signals: radar, semantic watch rules (N11), reply inbox (N9), nudges; tactics X41 and X49; routes; Explore datasets | done, tested (16 tests with supplied readings; the classifier's real readings and KliveBot delivery are not exercised) |
 | Digests (N10, scheduled X52), person brief (N4), cited summaries; tactics X18, X30, X31 | done, tested (8 tests with a scripted model: what a real model writes is first seen in the shadow run) |
-| Analytics modules, N12–N16, N19, N20 | pending |
+| Relationship dynamics and communities (N12), notices, X36, X45 | done, tested (Leiden on planted graphs; the relationship job on written pair rollups, so the conflict labels it reads are the test's) |
+| Community pages (N13), wellbeing (N14), links (N15), similar people (N16), translation (N19), data controls (N20) | pending |
 | Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
-| Tactics X17 (merge step), X23, X32, X33, X35, X36; monitors X42–X48 and X50–X51 | pending |
+| Tactics X17 (merge step), X23, X32, X33, X35; monitors X42–X44, X46–X48, X50–X51 | pending |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)

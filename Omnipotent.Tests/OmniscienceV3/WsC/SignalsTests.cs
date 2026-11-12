@@ -59,21 +59,24 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         public ExploreModule? Explore { get; private set; }
         public Omnipotent.Services.OmniscienceV3.Modules.Briefs.BriefsModule? Briefs { get; private set; }
         public Omnipotent.Services.OmniscienceV3.Modules.Transforms.TransformsModule? Transforms { get; private set; }
+        public Omnipotent.Services.OmniscienceV3.Modules.Insights.InsightsModule? Insights { get; private set; }
         public List<string> Errors { get; } = new();
         public KernelSettings Settings => Runtime.Host.Settings;
 
         /// <param name="utcNow">Defaults to a Monday at 13:00 in Klives's zone (Europe/London), outside quiet hours.</param>
         public static async Task<SignalsHarness> StartAsync(DateTime? utcNow = null, bool explore = false, bool rollups = false, bool classification = false, ISignalReadings? readings = null,
-            bool briefs = false, bool transforms = false)
+            bool briefs = false, bool transforms = false, bool insights = false)
         {
             var h = new SignalsHarness { Clock = new FixedClock(Instant.FromUtc(utcNow ?? new DateTime(2025, 6, 2, 12, 0, 0, DateTimeKind.Utc))) };
             h.Signals = new SignalsModule(readings ?? h.Readings);
             var modules = new List<IIntelModule>();
             // Rollups read the classifier's labels and Explore reads the rollups, so each brings what it depends on.
+            rollups |= insights;
             if (classification || rollups || explore) modules.Add(new ClassificationModule());
             if (rollups || explore) modules.Add(new RollupModule());
             modules.Add(h.Signals);
             if (briefs) modules.Add(h.Briefs = new Omnipotent.Services.OmniscienceV3.Modules.Briefs.BriefsModule());
+            if (insights) modules.Add(h.Insights = new Omnipotent.Services.OmniscienceV3.Modules.Insights.InsightsModule(h.Signals, () => h.Explore));
             if (transforms) modules.Add(h.Transforms = new Omnipotent.Services.OmniscienceV3.Modules.Transforms.TransformsModule(() => modules));
             if (explore) modules.Add(h.Explore = new ExploreModule(() => modules));
             h.Runtime = await V3Runtime.StartAsync(new V3RuntimeOptions
@@ -825,6 +828,52 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
                 Input(new { rule = "talking about school" }, Selection.Of(SelectionKind.Person, new[] { "p-ana" })), "tester"));
             Assert.Contains("under 18", refused.Message);
             await Assert.ThrowsAsync<TacticRefusedException>(() => h.Runtime.Tactics.StartAsync(SemanticWatchTactic.Key, Input(new { rule = "x" }), "tester"));
+        }
+
+        // ── notices from other modules ───────────────────────────────────────────
+
+        [Fact]
+        public async Task Notices_AreRecordedOnce_DeliveredBySeverity_AndWithheldForMinors()
+        {
+            // 02:00 in London: quiet hours.
+            await using var h = await SignalsHarness.StartAsync(new DateTime(2025, 6, 2, 1, 0, 0, DateTimeKind.Utc));
+            long now = h.Clock.NowMs;
+            Notice Make(string id, string severity, string? person = "p-ana", long? at = null, bool targeted = true) =>
+                new(id, "relationship", "test", at ?? now, new { change = "drifting", weeks = 8 }, severity, person, PersonTargeted: targeted);
+
+            Assert.True(await h.Signals.NoticeAsync(Make("n1", NoticeSeverity.Attention), CancellationToken.None));
+            Assert.False(await h.Signals.NoticeAsync(Make("n1", NoticeSeverity.Urgent), CancellationToken.None));          // the same finding again: nothing changes
+            Assert.True(await h.Signals.NoticeAsync(Make("n2", NoticeSeverity.Urgent), CancellationToken.None));
+            Assert.True(await h.Signals.NoticeAsync(Make("n3", NoticeSeverity.Info), CancellationToken.None));
+            Assert.True(await h.Signals.NoticeAsync(Make("n4", NoticeSeverity.Attention, at: now - 3 * 86_400_000L), CancellationToken.None));   // found late: listed, not pushed
+            var byId = h.Signals.Notices(null, null, null, null, 50).Items.ToDictionary(n => n.NoticeId);
+            Assert.Equal(("quiet", "pushed", "listed", "listed"), (byId["n1"].Delivery, byId["n2"].Delivery, byId["n3"].Delivery, byId["n4"].Delivery));
+            Assert.Equal(("attention", "Ana", 8), (byId["n1"].Severity, byId["n1"].PersonName, byId["n1"].Data.GetProperty("weeks").GetInt32()));
+            var pushed = Assert.Single(h.Pushed("notice"));
+            Assert.Equal(("n2", "relationship", "urgent"), (pushed.GetProperty("noticeId").GetString(), pushed.GetProperty("noticeKind").GetString(), pushed.GetProperty("severity").GetString()));
+            await Assert.ThrowsAsync<ArgumentException>(() => h.Signals.NoticeAsync(Make("n5", "loud"), CancellationToken.None));
+
+            // A person-targeted notice about someone who may be a minor is not recorded; one that is not about a person's doings is.
+            await h.MarkMinorAsync("p-ben");
+            Assert.False(await h.Signals.NoticeAsync(Make("n6", NoticeSeverity.Urgent, "p-ben"), CancellationToken.None));
+            Assert.True(await h.Signals.NoticeAsync(new Notice("n7", "health", "test", now, new { source = "discord", state = "down" }, NoticeSeverity.Attention, PersonTargeted: false), CancellationToken.None));
+            Assert.Equal(5, h.Signals.Notices(null, null, null, null, 50).Items.Count);
+            // Someone marked as a minor afterwards: their notices are no longer shown.
+            await h.MarkMinorAsync("p-ana");
+            Assert.Equal("n7", Assert.Single(h.Signals.Notices(null, null, null, null, 50).Items).NoticeId);
+
+            // By day, attention is pushed; the summary counts what is unseen; marking them is one call.
+            h.Clock.Set(Instant.FromUtc(new DateTime(2025, 6, 2, 9, 0, 0, DateTimeKind.Utc)));
+            Assert.True(await h.Signals.NoticeAsync(Make("n8", NoticeSeverity.Attention, "p-cyd"), CancellationToken.None));
+            Assert.Equal(2, h.Pushed("notice").Count);
+            var summary = JsonDocument.Parse(h.Runtime.Host.ReadModels.Get(SignalsModule.SummaryModel, "klives")!.BodyJson).RootElement;
+            Assert.Equal(6, summary.GetProperty("unseenNoticesTotal").GetInt64());
+            Assert.Equal(1, h.Signals.Notices(null, "health", null, null, 50).Items.Count);
+            Assert.Equal("n8", Assert.Single(h.Signals.Notices(null, null, "p-cyd", null, 50).Items).NoticeId);
+            Assert.Equal(6, await h.Signals.SetNoticeStateAsync(null, true, null, AlertState.Seen, "tester", CancellationToken.None));
+            Assert.Equal(0, h.Signals.UnseenNotices());
+            Assert.Equal(1, await h.Signals.SetNoticeStateAsync(new[] { "n8" }, false, null, AlertState.Dismissed, "tester", CancellationToken.None));
+            Assert.Equal("n8", Assert.Single(h.Signals.Notices(AlertState.Dismissed, null, null, null, 50).Items).NoticeId);
         }
 
         // ── forgetting, first pass, datasets, the production readings ────────────
