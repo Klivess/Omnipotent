@@ -42,6 +42,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
     {
         public const int MinimumGold = 30;
 
+        /// <summary>
+        /// Fits the curve in three steps: pool-adjacent-violators on the observed rates; blocks backed by too few labels
+        /// are folded into a neighbour (a step fitted on three labels is noise, and a curve of many tiny steps does not
+        /// carry over to new labels); then the smoothed values are made monotone again, because smoothing pulls a small
+        /// block towards one half harder than a large one and can reverse their order.
+        /// </summary>
         public static IReadOnlyList<IsotonicBlock> Fit(IEnumerable<(double Predicted, bool Outcome)> samples)
         {
             var sorted = samples.Where(s => double.IsFinite(s.Predicted)).OrderBy(s => s.Predicted).ToList();
@@ -49,15 +55,51 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             foreach (var (p, y) in sorted)
             {
                 blocks.Add((p, p, y ? 1 : 0, 1));
-                while (blocks.Count >= 2 && blocks[^2].Sum / blocks[^2].N > blocks[^1].Sum / blocks[^1].N)
-                {
-                    var a = blocks[^2];
-                    var b = blocks[^1];
-                    blocks.RemoveRange(blocks.Count - 2, 2);
-                    blocks.Add((a.Lo, b.Hi, a.Sum + b.Sum, a.N + b.N));
-                }
+                Pool(blocks, b => b.Sum / b.N);
             }
-            return blocks.Select(b => new IsotonicBlock(b.Lo, b.Hi, (b.Sum + 0.5) / (b.N + 1.0), b.N)).ToList();
+
+            // At least a twentieth of the labels (and never fewer than five) behind every step.
+            int minimum = Math.Max(5, sorted.Count / 20);
+            while (blocks.Count > 1)
+            {
+                int small = -1;
+                for (int i = 0; i < blocks.Count; i++)
+                    if (blocks[i].N < minimum && (small < 0 || blocks[i].N < blocks[small].N)) small = i;
+                if (small < 0) break;
+                // Into the neighbour whose rate is closer (the one there is, at either end).
+                double rate = blocks[small].Sum / blocks[small].N;
+                int into = small == 0 ? 1
+                    : small == blocks.Count - 1 ? small - 1
+                    : Math.Abs(blocks[small - 1].Sum / blocks[small - 1].N - rate) <= Math.Abs(blocks[small + 1].Sum / blocks[small + 1].N - rate) ? small - 1 : small + 1;
+                int first = Math.Min(small, into);
+                var a = blocks[first];
+                var b = blocks[first + 1];
+                blocks[first] = (a.Lo, b.Hi, a.Sum + b.Sum, a.N + b.N);
+                blocks.RemoveAt(first + 1);
+            }
+
+            var monotone = new List<(double Lo, double Hi, double Sum, int N)>();
+            foreach (var b in blocks)
+            {
+                monotone.Add(b);
+                Pool(monotone, Smoothed);
+            }
+            return monotone.Select(b => new IsotonicBlock(b.Lo, b.Hi, Smoothed(b), b.N)).ToList();
+        }
+
+        /// <summary>Add-one smoothing: a block of three confirmations never claims certainty.</summary>
+        private static double Smoothed((double Lo, double Hi, double Sum, int N) b) => (b.Sum + 0.5) / (b.N + 1.0);
+
+        /// <summary>Merges the last block into its predecessor while it breaks the order of <paramref name="value"/>.</summary>
+        private static void Pool(List<(double Lo, double Hi, double Sum, int N)> blocks, Func<(double Lo, double Hi, double Sum, int N), double> value)
+        {
+            while (blocks.Count >= 2 && value(blocks[^2]) > value(blocks[^1]))
+            {
+                var a = blocks[^2];
+                var b = blocks[^1];
+                blocks.RemoveRange(blocks.Count - 2, 2);
+                blocks.Add((a.Lo, b.Hi, a.Sum + b.Sum, a.N + b.N));
+            }
         }
     }
 

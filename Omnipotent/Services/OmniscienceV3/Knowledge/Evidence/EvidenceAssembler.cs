@@ -134,6 +134,46 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
             return anchors.Values.OrderBy(a => a.SentAtMs).ThenBy(a => a.OrderKey).ThenBy(a => a.IngestSeq).ThenBy(a => a.MessageId, StringComparer.Ordinal).ToList();
         }
 
+        /// <summary>
+        /// Messages that mention the subject by name or alias without an @ (plan "every message mentioning them by @, name or alias"),
+        /// scoped to the conversations the subject belongs to (names are community-scoped: another "Sam" elsewhere is not them),
+        /// excluding the subject's own messages. The model decides relevance; this only widens what it reads.
+        /// </summary>
+        public IReadOnlyList<EvidenceAnchor> NameMentions(IReadOnlyCollection<string> names, IReadOnlyCollection<string> conversations, IReadOnlyCollection<string> ownIdentities,
+            long asOfMs, int limitPerName = 400)
+        {
+            var result = new Dictionary<string, EvidenceAnchor>(StringComparer.Ordinal);
+            if (names.Count == 0 || conversations.Count == 0) return Array.Empty<EvidenceAnchor>();
+            var own = ownIdentities.ToHashSet(StringComparer.Ordinal);
+            using var c = Stores.Corpus.OpenRead();
+            foreach (var name in names.Select(n => n.Trim()).Where(n => n.Length >= 3).Distinct(StringComparer.OrdinalIgnoreCase).Take(12))
+            {
+                string phrase = "\"" + new string(name.Where(ch => char.IsLetterOrDigit(ch) || ch == ' ' || ch == '-' || ch == '\'').ToArray()).Trim() + "\"";
+                if (phrase.Length <= 2) continue;
+                foreach (var chunk in conversations.Chunk(200))
+                {
+                    var args = new List<(string, object?)> { ("$q", phrase), ("$t", asOfMs), ("$l", limitPerName) };
+                    var names2 = chunk.Select((conv, i) => { args.Add(("$c" + i, conv)); return "$c" + i; }).ToList();
+                    try
+                    {
+                        foreach (var a in c.Query(null, $"""
+                                     SELECT m.message_id, m.current_version, m.sent_at_ms, m.order_key, m.conversation_id, m.ingest_seq, m.author_identity_id
+                                     FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
+                                     WHERE messages_fts MATCH $q AND m.conversation_id IN ({string.Join(",", names2)}) AND m.sent_at_ms <= $t LIMIT $l
+                                     """, r => (Anchor: new EvidenceAnchor(r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4), r.GetInt64(5), EvidenceRelation.Mention),
+                                         Author: r.GetString(6)), args.ToArray()))
+                            if (!own.Contains(a.Author)) result.TryAdd(a.Anchor.MessageId, a.Anchor);
+                    }
+                    catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("fts5", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("syntax", StringComparison.OrdinalIgnoreCase))
+                    {
+                        // A name the full-text grammar cannot express finds nothing by name; @-mentions still work.
+                        break;
+                    }
+                }
+            }
+            return result.Values.ToList();
+        }
+
         /// <summary>Anchors not yet covered at their current version by <paramref name="promptVersion"/>.</summary>
         public IReadOnlyList<EvidenceAnchor> Uncovered(string personId, IReadOnlyList<EvidenceAnchor> anchors, string promptVersion)
         {

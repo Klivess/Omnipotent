@@ -57,6 +57,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                     // A recogniser failure on odd input is "unresolved", never a crash of the verifier.
                     continue;
                 }
+                // The recogniser must have read the expression, not a fragment of it: in "back in the day" it finds "the day"
+                // and calls it today. A reading that leaves most of the words unexplained is no reading at all.
+                if (Coverage(expression, results) < MinimumCoverage) continue;
                 var resolved = new List<TemporalResolution>();
                 foreach (var r in results)
                     foreach (var value in Values(r))
@@ -64,6 +67,25 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                 if (resolved.Count > 0) return resolved;
             }
             return Array.Empty<TemporalResolution>();
+        }
+
+        /// <summary>The share of the expression's letters and digits a deterministic reading must account for.</summary>
+        public const double MinimumCoverage = 0.6;
+
+        /// <summary>The share of the expression's letters and digits that lie inside what the recogniser matched.</summary>
+        private static double Coverage(string expression, IReadOnlyList<ModelResult> results)
+        {
+            var covered = new bool[expression.Length];
+            foreach (var r in results)
+                for (int i = Math.Max(0, r.Start); i <= r.End && i < expression.Length; i++) covered[i] = true;
+            int total = 0, matched = 0;
+            for (int i = 0; i < expression.Length; i++)
+            {
+                if (!char.IsLetterOrDigit(expression[i])) continue;
+                total++;
+                if (covered[i]) matched++;
+            }
+            return total == 0 ? 0 : (double)matched / total;
         }
 
         private static IEnumerable<string> Order(string? preferred)

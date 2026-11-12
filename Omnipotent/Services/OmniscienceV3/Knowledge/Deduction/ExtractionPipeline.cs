@@ -87,7 +87,16 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             var ids = kit.Corpus.PersonIdsOf(canonical);
             var identities = kit.Corpus.IdentitiesOf(ids).Select(i => i.IdentityId).ToList();
             long asOf = kit.Context.Clock.NowMs;
-            var anchors = assembler.Anchors(identities, asOf);
+            var anchors = assembler.Anchors(identities, asOf).ToList();
+            // Mentions by name or alias (not only @-mentions), scoped to the subject's own conversations.
+            var names = kit.Corpus.NamesOf(identities).SelectMany(n => new[] { n.Value, n.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "" })
+                .Concat(new Entities.AliasEngine(kit, new ReviewQueue(kit.Context.Stores, kit.Context.Clock)).Aliases(canonical, asOf).Where(a => a.Status is "accepted" or "confirmed").Select(a => a.Alias))
+                .Where(n => n.Length >= 3).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            var conversations = kit.Corpus.ConversationsOf(identities).Select(c => c.ConversationId)
+                .Concat(identities.SelectMany(MemberConversations)).Distinct(StringComparer.Ordinal).ToList();
+            var seen = anchors.Select(a => a.MessageId).ToHashSet(StringComparer.Ordinal);
+            anchors.AddRange(assembler.NameMentions(names, conversations, identities, asOf).Where(a => seen.Add(a.MessageId)));
+            anchors = anchors.OrderBy(a => a.SentAtMs).ThenBy(a => a.OrderKey).ThenBy(a => a.IngestSeq).ThenBy(a => a.MessageId, StringComparer.Ordinal).ToList();
             var uncovered = assembler.Uncovered(canonical, anchors, ExtractionPrompt.Version);
             if (uncovered.Count == 0)
             {
@@ -287,6 +296,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             foreach (var r in rejected) stats.Rejections[r.Reason] = stats.Rejections.GetValueOrDefault(r.Reason) + 1;
             foreach (var v in verified) stats.TouchedSubjects.Add(v.SubjectPersonId);
             foreach (var a in ages) stats.TouchedSubjects.Add(a.PersonId);
+        }
+
+        private IEnumerable<string> MemberConversations(string identity)
+        {
+            using var c = kit.Context.Stores.Corpus.OpenRead();
+            return c.Query(null, "SELECT conversation_id FROM conversation_members WHERE identity_id=$i", r => r.GetString(0), ("$i", identity));
         }
 
         private int MaxOutput() => options.MaxOutputTokens;

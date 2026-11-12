@@ -20,7 +20,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
         private readonly OmniscienceStores stores;
         private readonly IClock clock;
         private readonly ConcurrentDictionary<string, (IReadOnlyList<AgeEvidenceRow> Rows, long ReadAtMs)> cache = new(StringComparer.Ordinal);
-        private long tableCheckedAtMs = long.MinValue;
         private bool tableExists;
         private static readonly long CacheMs = 30_000;
 
@@ -54,7 +53,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
         {
             long now = clock.NowMs;
             if (cache.TryGetValue(canonicalPersonId, out var hit) && now - hit.ReadAtMs < CacheMs) return hit.Rows;
-            if (!TableExists(now)) return Array.Empty<AgeEvidenceRow>();
+            if (!TableExists()) return Array.Empty<AgeEvidenceRow>();
             List<string> ids;
             using (var c = stores.Corpus.OpenRead())
                 ids = c.Query(null, "SELECT person_id FROM person_canonical WHERE canonical_id=$c", r => r.GetString(0), ("$c", canonicalPersonId));
@@ -75,14 +74,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
             return result;
         }
 
-        private bool TableExists(long now)
+        /// <summary>
+        /// Whether the deduction module's table is there yet (the oracle is built before the modules' migrations run).
+        /// "Not yet" is never remembered: a remembered "no" would switch the evidence off — and with it the guard — for as
+        /// long as the memory lasted, and the check is one indexed lookup.
+        /// </summary>
+        private bool TableExists()
         {
-            if (tableExists) return true;
-            if (now - tableCheckedAtMs < CacheMs) return false;
-            tableCheckedAtMs = now;
+            if (Volatile.Read(ref tableExists)) return true;
             using var c = stores.Intel.OpenRead();
-            tableExists = c.Scalar<long>(null, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kn_age_evidence'") > 0;
-            return tableExists;
+            bool exists = c.Scalar<long>(null, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='kn_age_evidence'") > 0;
+            if (exists) Volatile.Write(ref tableExists, true);
+            return exists;
         }
 
         internal static AgeEvidenceRow Map(SqliteDataReader r)
