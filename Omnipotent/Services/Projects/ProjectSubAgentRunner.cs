@@ -348,8 +348,9 @@ namespace Omnipotent.Services.Projects
                 if (llmServices == null || llmServices.Length == 0)
                     throw new InvalidOperationException("KliveLLM service not available.");
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
-                flatFeeProvider = await llm.IsFlatFeeProviderAsync();
-                if (parent.ProviderCredit != null && await llm.IsOpenRouterActiveAsync())
+                var llmCaller = KliveLLM.LlmConsumerCatalog.Callers.ProjectsSubAgent.For(projectID);
+                flatFeeProvider = await llm.IsFlatFeeProviderAsync(llmCaller);
+                if (parent.ProviderCredit != null && await llm.IsOpenRouterActiveAsync(llmCaller))
                 {
                     var credit = await parent.ProviderCredit.CheckAsync(cts.Token);
                     if (credit.Status == OpenRouterCreditStatus.Exhausted)
@@ -376,7 +377,7 @@ namespace Omnipotent.Services.Projects
                 var routeSampling = ModelParameterCatalog.ToSamplingParameters(tierParameters);
                 string? routeReasoning = ModelParameterCatalog.ReasoningEffort(tierParameters);
                 bool visionEnabled = await ProjectAgentToolCatalog.ResolveEffectiveVisionAsync(
-                    llm, settings.VisionEnabled, agent.Tier, modelRoutes, cts.Token);
+                    llm, settings.VisionEnabled, agent.Tier, modelRoutes, cts.Token, llmCaller);
                 // Live indicator (parity with the Commander): a token sink switches KliveLLM to SSE so
                 // the Conversation panel can show this worker generating before its turn commits.
                 Action<string>? activitySink = settings.LiveActivityStreaming
@@ -391,7 +392,7 @@ namespace Omnipotent.Services.Projects
                 bool attemptLedgerEnabled = settings.AttemptLedgerEnabled;
                 messagesPerWake = Math.Clamp(settings.WorkerMessagesPerWake, 1, 100);
                 var contextPolicy = await parent.ResolveContextPolicyAsync(
-                    llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token);
+                    llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token, llmCaller);
                 if (contextPolicy != null)
                 {
                     maxOutputTokens = contextPolicy.MaxOutputTokens;
@@ -413,9 +414,10 @@ namespace Omnipotent.Services.Projects
                 await BuildWakeSeed(project, agent, trigger, briefSections);
                 var promptStart = llm.StartOrContinueBriefedToolSession(sessionId,
                     BuildSystemPrompt(project, agent, visionEnabled), ProjectPromptContinuity.FitReferences(briefSections),
-                    ProjectPromptContinuity.CompatibilityKey(await llm.GetBriefProviderKeyAsync(),
+                    ProjectPromptContinuity.CompatibilityKey(await llm.GetBriefProviderKeyAsync(llmCaller),
                         modelRoutes, toolDefs, tierParameters),
-                    ProjectPromptContinuity.MessageBudget(sliceTokenBudget, maxOutputTokens, toolDefs, contextPolicy));
+                    ProjectPromptContinuity.MessageBudget(sliceTokenBudget, maxOutputTokens, toolDefs, contextPolicy),
+                    caller: llmCaller);
                 parent.EventLog.Append(Evt(projectID, wakeID, agent.AgentID, ProjectEventTypes.Status,
                     $"Prompt continuity: {promptStart.Reason}; appended ~{promptStart.AppendedTokens:N0} tokens " +
                     $"(full brief ~{promptStart.FullBriefTokens:N0})."));
@@ -556,6 +558,7 @@ namespace Omnipotent.Services.Projects
                                 RoutedProvider = resp.RoutedProvider,
                                 CacheMetricsAvailable = resp.CacheMetricsAvailable,
                                 CacheWritePromptTokens = resp.CacheWritePromptTokens,
+                                FlatFee = resp.RouterId != null ? resp.FlatFee : null,
                                 UpstreamInferenceCostUsd = resp.UpstreamInferenceCostUsd,
                                 TurnIndex = modelTurns,
                                 RequestDurationMs = resp.RequestDurationMs,

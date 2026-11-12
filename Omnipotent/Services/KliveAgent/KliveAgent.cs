@@ -35,6 +35,10 @@ namespace Omnipotent.Services.KliveAgent
         private KliveAgentComputer? computer;
         /// <summary>KliveAgent's computer: its own isolated desktop by default, or the host desktop.</summary>
         public KliveAgentComputer Computer => computer ??= new KliveAgentComputer(this);
+        private KliveAgentSecretGuard? secretGuard;
+        /// <summary>Keeps literal secrets out of what a run stores and serves. See KliveAgentSecretGuard.</summary>
+        public KliveAgentSecretGuard SecretGuard =>
+            LazyInitializer.EnsureInitialized(ref secretGuard, () => KliveAgentSecretGuard.ForService(this));
 
         /// <summary>Talk mode: which conversations have a live spoken session attached, and the warm
         /// model session behind each.</summary>
@@ -274,6 +278,10 @@ namespace Omnipotent.Services.KliveAgent
                 // initialization fails. Load them before the execution-readiness gate.
                 await EnsureDirectories();
                 if (Superseded()) return;
+                // Off unless KliveAgent_MaskStoredConversationsOnce is switched on: rewrites the stored files
+                // (keeping the originals) before anything below reads them.
+                await SecretGuard.RunStoredPassIfEnabledAsync(this, serviceToken);
+                if (Superseded()) return;
                 await LoadConversationsAsync();
                 if (Superseded()) return;
                 await LoadChatRunsAsync();
@@ -315,7 +323,8 @@ namespace Omnipotent.Services.KliveAgent
                     OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentDirectory),
                     "KliveAgentStats.json"))
                 {
-                    ErrorLogger = (ex, msg) => _ = ServiceLogError(ex, msg, false)
+                    ErrorLogger = (ex, msg) => _ = ServiceLogError(ex, msg, false),
+                    Alert = alert => _ = RaiseHealthAlertAsync(alert)
                 };
                 await Stats.InitializeAsync();
                 if (Superseded()) return;
@@ -528,7 +537,8 @@ namespace Omnipotent.Services.KliveAgent
             AgentChatRunControl runControl = null,
             Action<AgentSteeringMessage> onSteeringApplied = null,
             long? expectedServiceGeneration = null,
-            IReadOnlyList<AgentAttachment>? messageAttachments = null)
+            IReadOnlyList<AgentAttachment>? messageAttachments = null,
+            bool background = false)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
             {
@@ -588,9 +598,11 @@ namespace Omnipotent.Services.KliveAgent
                 await RecordAcceptedUserMessageAsync(conversation, requestId, message, senderName,
                     attachments: messageAttachments);
 
-            // Process through the brain
-            var response = await brain.ProcessMessageAsync(message, conversation, senderName, onProgress,
-                cancellationToken, runControl, onSteeringApplied, messageAttachments);
+            // Process through the brain. Everything it reports for the record (script results, activity
+            // lines) passes the secret guard first, so neither the run nor the conversation holds a
+            // literal key; the brain keeps its own real results for the model.
+            var response = SecretGuard.MaskResponse(await brain.ProcessMessageAsync(message, conversation, senderName,
+                SecretGuard.Wrap(onProgress), cancellationToken, runControl, onSteeringApplied, messageAttachments, background))!;
 
             if (expectedServiceGeneration.HasValue
                 && expectedServiceGeneration.Value != Volatile.Read(ref serviceGeneration))
@@ -764,7 +776,9 @@ namespace Omnipotent.Services.KliveAgent
             string senderName = null,
             string clientMessageId = null,
             IReadOnlyList<AgentAttachment>? messageAttachments = null,
-            AgentPendingChatResponse? resumedFrom = null)
+            AgentPendingChatResponse? resumedFrom = null,
+            bool background = false,
+            bool allowAutoResume = true)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
                 return new AgentChatResponse { Success = false, Response = availabilityMessage, ErrorMessage = availabilityMessage };
@@ -889,8 +903,8 @@ namespace Omnipotent.Services.KliveAgent
                         return PendingReceipt(active, wasSteering: true, acceptedMessageId: steered.MessageId);
                 }
 
-                int resumeCount = resumedFrom == null ? 0 : resumedFrom.ResumeCount + 1;
-                bool resumesAfterShutdown = resumeCount < MaxAutoResumes
+                int resumeCount = NextResumeCount(resumedFrom);
+                bool resumesAfterShutdown = allowAutoResume && resumeCount < MaxAutoResumes
                     && await GetBoolOmniSetting("KliveAgent_AutoResumeInterruptedRuns", defaultValue: true);
                 var serviceToken = cancellationToken.Token;
                 var pending = new AgentPendingChatResponse
@@ -902,9 +916,16 @@ namespace Omnipotent.Services.KliveAgent
                     SenderName = senderName ?? "API",
                     Response = string.Empty,
                     CancellationSource = CancellationTokenSource.CreateLinkedTokenSource(serviceToken),
-                    Control = new AgentChatRunControl { ServiceToken = serviceToken, ResumesAfterShutdown = resumesAfterShutdown },
+                    Control = new AgentChatRunControl
+                    {
+                        ServiceToken = serviceToken, ResumesAfterShutdown = resumesAfterShutdown,
+                        // A continuation keeps the notes of the run it continues.
+                        Ledger = resumedFrom?.Ledger?.Copy() ?? new AgentRunLedger(),
+                    },
+                    Ledger = resumedFrom?.Ledger?.Copy(),
                     ResumedFromRequestId = resumedFrom?.RequestId,
                     ResumeCount = resumeCount,
+                    Background = background,
                 };
 
                 pendingApiResponses[pending.RequestId] = pending;
@@ -977,6 +998,7 @@ namespace Omnipotent.Services.KliveAgent
                                         pending.PendingApproval = update.Approval.Status == "pending" ? update.Approval : null;
                                     if (!string.IsNullOrWhiteSpace(update.ComputerContainerId))
                                         pending.ComputerContainerId = update.ComputerContainerId;
+                                    if (update.Ledger != null) pending.Ledger = update.Ledger;
                                     TouchRunLocked(pending);
                                     if (update.Frame != null)
                                     {
@@ -992,6 +1014,7 @@ namespace Omnipotent.Services.KliveAgent
                             runControl: pending.Control,
                             expectedServiceGeneration: runGeneration,
                             messageAttachments: pending.Attachments,
+                            background: background,
                             onSteeringApplied: steering =>
                             {
                                 lock (pending)
@@ -1106,6 +1129,10 @@ namespace Omnipotent.Services.KliveAgent
                                 // the record is kept but does not count as unread.
                                 bool watched = DateTime.UtcNow - pending.LastObservedAt < WatchedRunWindow;
                                 bool interrupted = pending.Status == AgentTaskStatus.Interrupted;
+                                // A background run that finished cleanly reported to whoever started it
+                                // (Alpha Lab keeps its own record, the scheduler sends its own message):
+                                // it is recorded but is not unread news. One that did not finish is.
+                                bool quiet = pending.Background && pending.Status == AgentTaskStatus.Completed;
                                 await AddNotificationAsync(new AgentNotification
                                 {
                                     NotificationId = "run" + pending.RequestId,
@@ -1117,11 +1144,11 @@ namespace Omnipotent.Services.KliveAgent
                                     Body = notificationBody,
                                     ConversationId = pending.ConversationId,
                                     RequestId = pending.RequestId,
-                                    ReadAt = watched ? DateTime.UtcNow : null,
+                                    ReadAt = watched || quiet ? DateTime.UtcNow : null,
                                 });
                                 // A run that continues automatically after the restart reports when that
                                 // continuation finishes; the interruption itself is not news.
-                                if (!watched && !pending.AutoResumePending) await NotifyRunFinishedOffSiteAsync(pending);
+                                if (!watched && !quiet && !pending.AutoResumePending) await NotifyRunFinishedOffSiteAsync(pending);
                             }
                             catch (Exception ex)
                             {
@@ -1145,6 +1172,46 @@ namespace Omnipotent.Services.KliveAgent
             pendingApiResponses.TryGetValue(requestId, out var pendingResponse);
             return pendingResponse == null ? null : SnapshotRun(pendingResponse);
         }
+
+        /// <summary>
+        /// Runs a message for another service (OmniTrader's Alpha Lab, the scheduler) as a real run and
+        /// waits for its answer.
+        ///
+        /// Those callers used to call <see cref="HandleIncomingMessage"/> directly: no run record, so no
+        /// stall watchdog, no live view on the website, nothing said when the run died, and a conversation
+        /// left reading "running" for ever (three Alpha Lab runs between 24 Oct and 6 Nov 2026, each cut by
+        /// a restart, and two tool calls that hung for 2 h and 3 h 16 min with nothing watching).
+        ///
+        /// Automatic continuation after a restart is off here on purpose: both callers already retry what
+        /// a restart interrupted (Alpha Lab requeues its papers, a scheduled task fires late), so
+        /// continuing as well would do the work twice.
+        /// </summary>
+        public async Task<AgentChatResponse> RunDurableAsync(string message, string conversationId, string senderName,
+            bool background = true, CancellationToken cancellationToken = default)
+        {
+            var receipt = await QueueIncomingApiMessageAsync(message, conversationId, senderName,
+                background: background, allowAutoResume: false);
+            if (!receipt.IsPending || string.IsNullOrEmpty(receipt.PendingRequestId)) return receipt;
+
+            string requestId = receipt.PendingRequestId;
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!pendingApiResponses.TryGetValue(requestId, out var pending))
+                    return new AgentChatResponse
+                    {
+                        Success = false, ConversationId = receipt.ConversationId, PendingRequestId = requestId,
+                        Response = "The run's record is gone, so its result is unknown.",
+                        ErrorMessage = "Run record not found.",
+                    };
+                AgentChatResponse? final;
+                lock (pending) final = pending.CompletedAt != null ? pending.FinalResponse : null;
+                if (final != null) return final;
+                await Task.Delay(DurableRunPollInterval, cancellationToken);
+            }
+        }
+
+        internal static TimeSpan DurableRunPollInterval { get; set; } = TimeSpan.FromSeconds(1);
 
         public async Task<AgentPendingChatResponse?> WaitForPendingApiResponseAsync(string requestId, long afterSequence, int waitMs)
         {
@@ -1698,6 +1765,8 @@ namespace Omnipotent.Services.KliveAgent
                     ResumedFromRequestId = source.ResumedFromRequestId,
                     ResumeCount = source.ResumeCount,
                     AutoResumePending = source.AutoResumePending,
+                    Background = source.Background,
+                    Ledger = source.Ledger,
                     LastObservedAt = source.LastObservedAt
                 };
             }
@@ -2395,9 +2464,23 @@ namespace Omnipotent.Services.KliveAgent
         /// <summary>Runs found mid-flight at load (the process restarted under them).</summary>
         private readonly List<AgentPendingChatResponse> interruptedAtBoot = new();
 
-        /// <summary>At most this many automatic continuations chain from one request, so a crash
-        /// loop cannot keep restarting the same work.</summary>
+        /// <summary>At most this many automatic continuations IN A ROW THAT GOT NOWHERE chain from one
+        /// request, so a crash loop cannot keep restarting the same work. A continuation that made
+        /// progress before the next restart does not count: on a day with twelve to fifteen deploys a
+        /// flat limit of two ended a long task at its third restart however well it was going.</summary>
         internal const int MaxAutoResumes = 2;
+
+        /// <summary>How much of the original request a continuation carries.</summary>
+        internal const int ContinuationTaskChars = 60_000;
+
+        /// <summary>Whether a run did anything before it was interrupted.</summary>
+        internal static bool MadeProgress(AgentPendingChatResponse run) =>
+            run != null && (run.Iteration >= 2 || (run.ScriptsExecuted?.Count ?? 0) > 0
+                || (run.Activity?.Any(a => a.Kind is "tool" or "script" or "action") ?? false));
+
+        /// <summary>The count a continuation of <paramref name="resumedFrom"/> starts with.</summary>
+        internal static int NextResumeCount(AgentPendingChatResponse? resumedFrom) =>
+            resumedFrom == null ? 0 : MadeProgress(resumedFrom) && resumedFrom.ResumeCount > 0 ? resumedFrom.ResumeCount : resumedFrom.ResumeCount + 1;
 
         /// <summary>How long a continuation waits for the interrupted run to finish unwinding.</summary>
         private static readonly TimeSpan InterruptedRunUnwindWait = TimeSpan.FromMinutes(3);
@@ -2421,17 +2504,26 @@ namespace Omnipotent.Services.KliveAgent
                 s = (s ?? "").Trim();
                 return s.Length <= max ? s : s[..max] + "…";
             }
+            static string OneLine(string? s) => (s ?? "").Replace("\r", "").Replace('\n', ' ');
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("[Automatic continuation after an Omnipotent restart]");
             sb.AppendLine($"Omnipotent restarted while you were working on this request from Klives (started {TemporalFormat.StampMinute(run.CreatedAt)}):");
             sb.AppendLine();
-            sb.AppendLine("“" + Clip(run.UserMessage, 4000) + "”");
+            // The request in full. It used to be cut at 4,000 characters, and a brief from another service
+            // runs to 33 KB: the continuation was then working from the first eighth of its task.
+            sb.AppendLine("“" + Clip(run.UserMessage, ContinuationTaskChars) + "”");
             var steering = run.SteeringMessages?.Where(s => s.Status == "applied").ToList() ?? new();
             if (steering.Count > 0)
             {
                 sb.AppendLine();
                 sb.AppendLine("Guidance he added while you worked:");
                 foreach (var s in steering) sb.AppendLine("- " + Clip(s.Message, 600));
+            }
+            if (run.Ledger is { IsEmpty: false } ledger)
+            {
+                sb.AppendLine();
+                sb.AppendLine("Your own ledger from that run (it is restored: keep using task_ledger):");
+                sb.AppendLine(ledger.Render());
             }
             var activity = run.Activity ?? new();
             if (activity.Count > 0)
@@ -2440,6 +2532,18 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("What you had done before the restart (oldest first):");
                 foreach (var a in activity.TakeLast(60))
                     sb.AppendLine($"- [{TemporalFormat.StampMinute(a.Timestamp)}] step {a.Iteration} {a.Kind}: {Clip(a.Text, 200)}");
+            }
+            var scripts = run.ScriptsExecuted ?? new();
+            if (scripts.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine($"Your last scripts (of {scripts.Count}; their variables are gone with the restart, so redo what you still need):");
+                foreach (var script in scripts.TakeLast(6))
+                {
+                    sb.AppendLine($"- {(script.Success ? "OK" : "FAILED")}: {Clip(OneLine(script.Code), 300)}");
+                    string outcome = script.Success ? script.Output : script.ErrorMessage;
+                    if (!string.IsNullOrWhiteSpace(outcome)) sb.AppendLine("    → " + Clip(OneLine(outcome), 300));
+                }
             }
             if (!string.IsNullOrWhiteSpace(run.Response))
             {
@@ -2551,6 +2655,9 @@ namespace Omnipotent.Services.KliveAgent
         /// need kliveagent.history.read, so without it the references are returned exactly as stored.</summary>
         public AgentPendingChatResponse? RevealRunForKlives(AgentPendingChatResponse? run, bool reveal)
         {
+            // Whoever is asking: scripts, their output and activity lines never leave with a literal secret.
+            // A run recorded before the guard existed is masked here; its file is left as it is.
+            SecretGuard.MaskRunView(run);
             if (run == null || !reveal) return run;
             run.Response = RevealForKlives(run.Response);
             if (run.FinalResponse != null)
@@ -2580,6 +2687,7 @@ namespace Omnipotent.Services.KliveAgent
         /// caller's accounts.secrets.reveal grant (<paramref name="reveal"/>) it is returned unchanged.</summary>
         public AgentConversationView? RevealConversationForKlives(AgentConversationView? view, bool reveal)
         {
+            SecretGuard.MaskConversationView(view);
             if (view == null || !reveal) return view;
             foreach (var message in view.Messages) message.Content = RevealForKlives(message.Content);
             for (int i = 0; i < view.RecentRuns.Count; i++) view.RecentRuns[i] = RevealRunForKlives(view.RecentRuns[i], reveal)!;
@@ -2681,6 +2789,30 @@ namespace Omnipotent.Services.KliveAgent
             return discordOk
                 ? $"Sent to Klives on Discord at {Data_Handling.TemporalFormat.NowStamp()} (also listed in the website's Results panel)."
                 : $"Discord delivery failed ({discordError}); the message is listed in the website's Results panel only.";
+        }
+
+        /// <summary>
+        /// A message from the stats watch (script failures up, provider slow): one Discord message and a
+        /// Results entry. KliveAgent_HealthAlerts switches the messages off; the watch keeps counting, and
+        /// its state stays on the script-health route either way.
+        /// </summary>
+        private async Task RaiseHealthAlertAsync(KliveAgentHealthAlert alert)
+        {
+            try
+            {
+                if (!await GetBoolOmniSetting("KliveAgent_HealthAlerts", true)) return;
+                await ServiceLog($"[KliveAgent] Health alert ({alert.Kind}): {alert.Message}");
+                try { await SendDiscordToKlivesAsync(alert.Message); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "[KliveAgent] A health alert did not reach Discord.", false); }
+                await AddNotificationAsync(new AgentNotification
+                {
+                    NotificationId = "hlt" + Guid.NewGuid().ToString("N"),
+                    Kind = "health-" + alert.Kind,
+                    Title = alert.Title,
+                    Body = alert.Message,
+                });
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "[KliveAgent] A health alert could not be recorded.", false); }
         }
 
         public List<AgentNotification> GetNotifications(bool unreadOnly = false, int? limit = null) =>
@@ -2914,36 +3046,48 @@ namespace Omnipotent.Services.KliveAgent
                 var dir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentConversationsDirectory);
                 if (!Directory.Exists(dir)) return;
 
-                var deferred = new List<string>();
-                foreach (var file in Directory.GetFiles(dir, "*.json"))
-                {
-                    try
+                // Read straight from disk, four at a time. They used to go one by one through the file queue
+                // every service shares, which is at its busiest during start-up: 334 files took 2 min 58 s
+                // (live, 2026-11-11), and KliveAgent answers nothing until they are in. Nothing writes these
+                // files before the service is ready, so reading them directly is safe.
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                var deferred = new System.Collections.Concurrent.ConcurrentBag<string>();
+                await Parallel.ForEachAsync(Directory.GetFiles(dir, "*.json"),
+                    new ParallelOptions { MaxDegreeOfParallelism = ConversationLoadParallelism },
+                    async (file, _) =>
                     {
-                        var conv = await GetDataHandler().ReadAndDeserialiseDataFromFile<AgentConversation>(file);
-                        AdoptLoadedConversation(conv);
-                    }
-                    catch (Exception ex) when (ex is TimeoutException or IOException)
-                    {
-                        // Live 2026-11-11: a read queued during the start-up storm timed out at 60 s and the
-                        // conversation was simply missing for the whole process. It is read again directly,
-                        // in the background, so start-up does not wait on it.
-                        deferred.Add(file);
-                    }
-                    catch (Exception ex) { await ServiceLogError(ex, $"[KliveAgent] Skipped unreadable conversation file {Path.GetFileName(file)}.", false); }
-                }
+                        try
+                        {
+                            AdoptLoadedConversation(await ReadConversationFileAsync(file, attempts: 1, timeout: TimeSpan.FromSeconds(30)));
+                        }
+                        catch (Exception ex) when (ex is TimeoutException or IOException or OperationCanceledException)
+                        {
+                            // Live 2026-11-11: a read during the start-up storm timed out and the conversation
+                            // was simply missing for the whole process. It is read again in the background,
+                            // so start-up does not wait on it.
+                            deferred.Add(file);
+                        }
+                        catch (Exception ex)
+                        {
+                            try { await ServiceLogError(ex, $"[KliveAgent] Skipped unreadable conversation file {Path.GetFileName(file)}.", false); } catch { }
+                        }
+                    });
 
                 if (conversations.Count > 0)
                 {
-                    await ServiceLog($"[KliveAgent] Loaded {conversations.Count} persisted conversations"
+                    await ServiceLog($"[KliveAgent] Loaded {conversations.Count} persisted conversations in {timer.Elapsed.TotalSeconds:0.0} s"
                         + (deferred.Count > 0 ? $"; {deferred.Count} slow to read, retrying in the background." : "."));
                 }
-                if (deferred.Count > 0) _ = Task.Run(() => RetryDeferredConversationsAsync(deferred));
+                if (deferred.Count > 0) _ = Task.Run(() => RetryDeferredConversationsAsync(deferred.ToList()));
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "[KliveAgent] Error loading conversations.");
             }
         }
+
+        /// <summary>How many conversation files are read at once at start-up.</summary>
+        internal const int ConversationLoadParallelism = 4;
 
         /// <summary>Takes a conversation read from disk into memory, unless a newer copy is already there.</summary>
         private bool AdoptLoadedConversation(AgentConversation conv)

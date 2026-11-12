@@ -41,6 +41,9 @@ public sealed class ProjectTokenUsageContext
     public string? CacheSessionID { get; set; }
     public string? ResponseCacheStatus { get; set; }
     public string? PromptCacheTelemetryVersion { get; set; }
+    /// <summary>The router that served this turn charges nothing per token (KliveLLM's answer for this
+    /// exact call). Null when not known; the budget ledger then asks the turn's lane.</summary>
+    public bool? FlatFee { get; set; }
 }
 
 /// <summary>Version gate separating measurements produced after the repaired Projects prefix

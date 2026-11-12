@@ -435,10 +435,12 @@ namespace Omnipotent.Services.Projects
                 if (llmServices == null || llmServices.Length == 0)
                     throw new InvalidOperationException("KliveLLM service not available.");
                 var llm = (KliveLLM.KliveLLM)llmServices[0];
-                flatFeeProvider = await llm.IsFlatFeeProviderAsync();
-                if (!await llm.SupportsNativeToolCallingAsync())
+                // Every call of this wake is routed and recorded as this project's Commander lane.
+                var llmCaller = KliveLLM.LlmConsumerCatalog.Callers.ProjectsCommander.For(projectID);
+                flatFeeProvider = await llm.IsFlatFeeProviderAsync(llmCaller);
+                if (!await llm.SupportsNativeToolCallingAsync(llmCaller))
                     throw new InvalidOperationException("The Commander requires a remote LLM provider with native tool calling.");
-                if (parent.ProviderCredit != null && await llm.IsOpenRouterActiveAsync())
+                if (parent.ProviderCredit != null && await llm.IsOpenRouterActiveAsync(llmCaller))
                 {
                     var credit = await parent.ProviderCredit.CheckAsync(cts.Token);
                     if (credit.Status == OpenRouterCreditStatus.Exhausted)
@@ -462,7 +464,7 @@ namespace Omnipotent.Services.Projects
                 var routeSampling = ModelParameterCatalog.ToSamplingParameters(commanderParameters);
                 string? routeReasoning = ModelParameterCatalog.ReasoningEffort(commanderParameters);
                 bool visionEnabled = await ProjectAgentToolCatalog.ResolveEffectiveVisionAsync(
-                    llm, settings.VisionEnabled, ProjectAgentTier.TextImageVideo, modelRoutes, cts.Token);
+                    llm, settings.VisionEnabled, ProjectAgentTier.TextImageVideo, modelRoutes, cts.Token, llmCaller);
                 // Live indicator: supplying a token sink switches KliveLLM to its SSE transport, which
                 // is what lets the Conversation panel show the Commander generating before the turn
                 // commits an event. Off → buffered path, and the indicator degrades to phase-only.
@@ -477,7 +479,7 @@ namespace Omnipotent.Services.Projects
                 int toolResultKeepRecent = Math.Clamp(settings.ToolResultKeepRecent, 2, 256);
                 bool attemptLedgerEnabled = settings.AttemptLedgerEnabled;
                 var contextPolicy = await parent.ResolveContextPolicyAsync(
-                    llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token);
+                    llm, modelRoutes, maxOutputTokens, sliceTokenBudget, cts.Token, llmCaller);
                 if (contextPolicy != null)
                 {
                     maxOutputTokens = contextPolicy.MaxOutputTokens;
@@ -500,9 +502,10 @@ namespace Omnipotent.Services.Projects
                     settings.ChronologicalRecentEvents, flatFeeProvider, briefSections);
                 var promptStart = llm.StartOrContinueBriefedToolSession(sessionId,
                     ProjectCommanderAgent.BuildSystemPrompt(project, visionEnabled), ProjectPromptContinuity.FitReferences(briefSections),
-                    ProjectPromptContinuity.CompatibilityKey(await llm.GetBriefProviderKeyAsync(),
+                    ProjectPromptContinuity.CompatibilityKey(await llm.GetBriefProviderKeyAsync(llmCaller),
                         modelRoutes, toolDefs, commanderParameters),
-                    ProjectPromptContinuity.MessageBudget(sliceTokenBudget, maxOutputTokens, toolDefs, contextPolicy));
+                    ProjectPromptContinuity.MessageBudget(sliceTokenBudget, maxOutputTokens, toolDefs, contextPolicy),
+                    caller: llmCaller);
                 parent.EventLog.Append(WakeEvt(projectID, wakeID, ProjectEventTypes.Status, "system",
                     $"Prompt continuity: {promptStart.Reason}; appended ~{promptStart.AppendedTokens:N0} tokens " +
                     $"(full brief ~{promptStart.FullBriefTokens:N0})."));
@@ -728,6 +731,7 @@ namespace Omnipotent.Services.Projects
                                 CacheMetricsAvailable = resp.CacheMetricsAvailable,
                                 CacheWritePromptTokens = resp.CacheWritePromptTokens,
                                 UpstreamInferenceCostUsd = resp.UpstreamInferenceCostUsd,
+                                FlatFee = resp.RouterId != null ? resp.FlatFee : null,
                                 TurnIndex = modelTurns,
                                 RequestDurationMs = resp.RequestDurationMs,
                                 QueueDurationMs = resp.QueueDurationMs,

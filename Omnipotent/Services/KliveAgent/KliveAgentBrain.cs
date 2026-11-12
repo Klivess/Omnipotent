@@ -33,6 +33,9 @@ namespace Omnipotent.Services.KliveAgent
 
         private sealed record PromptToolDescriptor(string MethodName, string Description);
 
+        /// <summary>KliveAgent model calls in flight across every run in this process.</summary>
+        private static readonly ModelStateClock.InFlightCounter modelCallsInFlight = new();
+
         private static readonly PromptToolDescriptor[] StarterTools =
         [
             new("ListProjectClasses", "Browse project types by name, namespace, or path."),
@@ -417,7 +420,7 @@ namespace Omnipotent.Services.KliveAgent
             "grep", "read_file", "list_directory", "get_global_path", "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
             "account_list", "account_register", "account_update",
             "klivemail_create_mailbox", "klivemail_list_messages", "klivemail_get_message", "klivemail_wait_for_email",
-            "notify_klives",
+            "notify_klives", "task_ledger",
             "schedule_task", "list_scheduled_tasks", "cancel_scheduled_task"
         };
 
@@ -522,12 +525,15 @@ namespace Omnipotent.Services.KliveAgent
                     "server's context, so it is equally good for general-purpose scripting (computation, parsing, " +
                     "file/data work, HTTP) AND it can read, drive, and control ALL of Omnipotent: every live " +
                     "service, its state, and its methods, via the ScriptGlobals API (GetService, GetTypeSchema, " +
-                    "GetObjectMembers, CallObjectMethod, Log, SearchCode, ReadFile, GetRecentErrors, etc.). " +
-                    "Locals persist across calls within the same turn. `await` any Task-returning call. " +
+                    "GetObjectMembers, CallObjectMethod, Dyn, Log, SearchCode, ReadFile, GetRecentErrors, etc.). " +
+                    "Variables persist across calls within the same conversation. `await` any Task-returning call. " +
                     "Use Log(...) to return observations. Pass RAW C# in the 'code' argument — do NOT wrap it " +
                     "in {{{ }}} or markdown fences. NOTE: memory has its OWN dedicated tools (recall_memories, " +
                     "save_memory, …) — use those, not execute_csharp, for anything memory-related.",
-                    new { type = "object", properties = new { code = new { type = "string", description = "The raw C# script to compile and run." } }, required = new[] { "code" } }),
+                    new { type = "object", properties = new {
+                        code = new { type = "string", description = "The raw C# script to compile and run." },
+                        timeoutSeconds = new { type = "integer", description = "Optional: seconds the script may RUN (default 30, max 300). Compiling is not counted. To wait for something to happen, use wait_for instead." }
+                    }, required = new[] { "code" } }),
 
                 Tool("grep",
                     "Search the codebase CONTENTS and return matching 'path:line' lines. Runs directly — no C#/compile step, so it cannot fail to compile. Use this for content search INSTEAD of calling SearchCode/SearchCodeRegex inside execute_csharp. 'pattern' is a regex (ripgrep-style) by default; set fixedString=true for a literal substring. Scope with 'path' (a file or subfolder, e.g. \"Omnipotent/Services/KliveAgent\").",
@@ -710,6 +716,19 @@ namespace Omnipotent.Services.KliveAgent
                     new { type = "object", properties = new {
                         message = new { type = "string", description = "What to tell him." }
                     }, required = new[] { "message" } }),
+
+                Tool("task_ledger",
+                    "Your working notes for a multi-step task: the plan, which steps are done, and facts you had to find out " +
+                    "(a real method signature, an id, a URL). Long runs lose their early steps when the context is summarised, and a server restart " +
+                    "loses the conversation so far; the ledger survives both and is handed back to you in full. Klives sees it on the run. " +
+                    "op=set_plan with steps[] at the start; op=done with step (its number) as each finishes; op=note with text for a fact worth " +
+                    "not rediscovering; op=show to read it.",
+                    new { type = "object", properties = new {
+                        op = new { type = "string", description = "set_plan | done | reopen | note | show" },
+                        steps = new { type = "array", items = new { type = "string" }, description = "For set_plan: the steps, in order, a short line each." },
+                        step = new { type = "integer", description = "For done / reopen: the step's number." },
+                        text = new { type = "string", description = "For note: the fact. For done: an optional short note on how it ended." }
+                    }, required = new[] { "op" } }),
 
                 Tool("wait_for",
                     "PAUSE until an external event happens, then continue — without ending your turn and without the 30s script limit. " +
@@ -955,6 +974,8 @@ namespace Omnipotent.Services.KliveAgent
                     if (string.IsNullOrWhiteSpace(message)) return "Error: 'message' is required.";
                     return await globals.NotifyKlives(message);
                 }
+                case "task_ledger":
+                    return (globals.RunLedger ??= new AgentRunLedger()).Apply(argsJson);
                 case "recall_memories":
                     return FormatMemoriesResult(await globals.RecallMemories(Str("query") ?? string.Empty, IntOr("maxResults", 10), Str("since"), Str("until")));
                 case "recall_memories_by_tag":
@@ -1126,7 +1147,7 @@ namespace Omnipotent.Services.KliveAgent
         internal static bool IsTaskTool(string toolName) =>
             toolName.StartsWith("computer_", StringComparison.Ordinal)
             || toolName.StartsWith("klivemail_", StringComparison.Ordinal)
-            || toolName is "account_register" or "account_update" or "request_human" or "notify_klives";
+            || toolName is "account_register" or "account_update" or "request_human" or "notify_klives" or "task_ledger";
 
         /// <summary>
         /// What the model is told after a step. A question-answering turn should stop the moment it has
@@ -1144,6 +1165,149 @@ namespace Omnipotent.Services.KliveAgent
             return cleanProgress
                 ? "Those calls succeeded. If they answer the user's question, give the final text-only answer NOW (no scripts/tools) — do NOT run more lookups 'to be safe'. Continue only if a SPECIFIC, named piece of the answer is still genuinely missing."
                 : "If you have what you need, give the final answer now (no scripts). Otherwise run your next script — prefer ONE composite block over several tiny ones.";
+        }
+
+        /// <summary>
+        /// What the model is told when its scripts keep failing: at three in a row, to use the names the
+        /// errors list instead of guessing; at six (and every four after), to change approach. Returns
+        /// null when there is nothing new to say since <paramref name="alreadyNoticed"/>.
+        /// </summary>
+        internal static string? FailureStreakGuidance(int consecutiveFailedScripts, int alreadyNoticed)
+        {
+            if (consecutiveFailedScripts >= 6 && (alreadyNoticed < 6 || consecutiveFailedScripts - alreadyNoticed >= 4))
+                return $"[{consecutiveFailedScripts} scripts in a row failed] This approach is not working. Before your next script, say in one sentence what you will do differently. "
+                    + "Ways out: a dedicated tool instead of a script; Dyn(obj).Member and Dyn(obj).Method(args) instead of reflection or a cast to a type you cannot name; "
+                    + "ONE small discovery script (Log(GetObjectMembers(obj))) before acting; or tell Klives plainly what is blocking you.";
+            if (consecutiveFailedScripts >= 3 && alreadyNoticed < 3)
+                return $"[{consecutiveFailedScripts} scripts in a row failed] Stop guessing names. The errors above list the real members and overloads on the lines starting with →: use those exactly. "
+                    + "If you do not know an object's shape, spend one script finding out (Log(GetObjectMembers(obj)) or Log(Dyn(obj))) and act in the next.";
+            return null;
+        }
+
+        /// <summary>
+        /// The reasoning effort for a step. Errors always raise it. With <paramref name="bySteps"/> (the
+        /// long-standing rule) so does the step number alone: medium from step 6, high from step 12.
+        /// </summary>
+        internal static string ThinkingLevelFor(int iteration, int consecutiveErrorIterations, int consecutiveNoOps,
+            bool forcedFinal, bool bySteps)
+        {
+            if (forcedFinal || consecutiveErrorIterations >= 2 || (bySteps && iteration >= 12)) return "high";
+            if (consecutiveErrorIterations >= 1 || consecutiveNoOps >= 1 || (bySteps && iteration >= 6)) return "medium";
+            return "low";
+        }
+
+        /// <summary>The step at which a task with no ledger yet is asked, once, to start one.</summary>
+        internal const int LedgerNudgeStep = 8;
+
+        /// <summary>How long an interactive run's hold on a model slot lasts without being renewed.</summary>
+        internal static readonly TimeSpan InteractiveReserveTtl = TimeSpan.FromSeconds(90);
+
+        /// <summary>A native or service tool call slower than this is recorded as slow.</summary>
+        internal const long SlowToolMs = 60_000;
+
+        internal const string ToolDeadlineMarker = "so this step stopped waiting for it";
+
+        /// <summary>How long a native tool may run. Tools that wait on purpose bound themselves.</summary>
+        internal static TimeSpan ToolDeadlineFor(string toolName, int deadlineSeconds) =>
+            deadlineSeconds <= 0 || toolName.Contains("wait_for", StringComparison.Ordinal)
+                ? TimeSpan.Zero : TimeSpan.FromSeconds(deadlineSeconds);
+
+        /// <summary>
+        /// Waits for a tool at most <paramref name="deadline"/> (zero: as long as it takes). A call that
+        /// overruns is left to finish on its own and the model is told plainly, so one stuck operation
+        /// costs minutes instead of holding the run for hours with nothing bounding it.
+        /// </summary>
+        internal static async Task<(bool ok, string output)> WithToolDeadlineAsync(Task<(bool ok, string output)> work,
+            string toolName, TimeSpan deadline, CancellationToken stop)
+        {
+            if (deadline <= TimeSpan.Zero) return await work;
+            try
+            {
+                return await work.WaitAsync(deadline, stop);
+            }
+            catch (TimeoutException)
+            {
+                _ = work.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                return (false, $"{toolName} was still running after {FormatElapsed(deadline)}, {ToolDeadlineMarker}. The call itself may still finish: "
+                    + "check what it did before repeating it (a status or list operation of the same tool), and use wait_for when something simply takes long.");
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            {
+                _ = work.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
+                return (false, $"{toolName} was stopped.");
+            }
+        }
+
+        /// <summary>The 'op' (or method/path) of a tool call, so a slow call names its operation, not only its tool.</summary>
+        internal static string? ToolOperationOf(string? argsJson)
+        {
+            if (string.IsNullOrWhiteSpace(argsJson)) return null;
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(argsJson);
+                if (doc.RootElement.ValueKind != System.Text.Json.JsonValueKind.Object) return null;
+                var parts = new List<string>();
+                foreach (var key in new[] { "op", "service", "method", "path" })
+                    if (doc.RootElement.TryGetProperty(key, out var value) && value.ValueKind == System.Text.Json.JsonValueKind.String
+                        && value.GetString() is { Length: > 0 } text)
+                        parts.Add(text.Length <= 80 ? text : text[..80]);
+                return parts.Count == 0 ? null : string.Join(" ", parts);
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// A script's result as the model reads it, with the output starting on the status line.
+        ///
+        /// The first line is all that is left of a result once a long run's context is compacted (KliveLLM
+        /// keeps the first line of each tool result in its digest, and the first 160 characters when it
+        /// stubs old results). The status used to stand alone on that line, so a compacted run remembered
+        /// "[OK | 132ms]" for every script it had run and nothing any of them found.
+        /// </summary>
+        internal static string ScriptOkText(long elapsedMs, string? output) =>
+            string.IsNullOrWhiteSpace(output)
+                ? $"[OK | {elapsedMs}ms] (no output)"
+                : $"[OK | {elapsedMs}ms] {output.Trim()}";
+
+        /// <summary>A failed script's result: the status line carries the failure itself (the first compiler
+        /// diagnostic, or the exception), for the same reason as <see cref="ScriptOkText"/>.</summary>
+        internal static string ScriptErrorText(long elapsedMs, string? error)
+        {
+            string body = (error ?? "").Trim();
+            if (body.Length == 0) return $"[ERROR | {elapsedMs}ms] Unknown error.";
+            string firstLine = body.Split('\n')[0].Trim();
+            string summary = KliveAgentStats.SummariseFailure(body);
+            // The same sentence: start the message on the status line rather than say it twice.
+            return summary.Length == 0 || string.Equals(summary, firstLine, StringComparison.Ordinal)
+                ? $"[ERROR | {elapsedMs}ms] {body}"
+                : $"[ERROR | {elapsedMs}ms] {summary}\n{body}";
+        }
+
+        /// <summary>The line that tells the model its script was fixed before it ran, or null.</summary>
+        internal static string? DescribeRepairs(AgentScriptResult result) =>
+            result.Repairs is { Count: > 0 } repairs
+                ? "[auto-fixed before running, write it this way next time: " + string.Join("; ", repairs) + "]"
+                : null;
+
+        /// <summary>The optional timeoutSeconds of an execute_csharp call.</summary>
+        internal static int? ExtractScriptTimeout(HFWrapper.HFToolCall toolCall)
+        {
+            var args = toolCall?.function?.arguments;
+            if (string.IsNullOrWhiteSpace(args)) return null;
+            try
+            {
+                using var doc = System.Text.Json.JsonDocument.Parse(args);
+                if (doc.RootElement.ValueKind == System.Text.Json.JsonValueKind.Object
+                    && doc.RootElement.TryGetProperty("timeoutSeconds", out var seconds))
+                {
+                    if (seconds.ValueKind == System.Text.Json.JsonValueKind.Number && seconds.TryGetDouble(out double number))
+                        return number > 0 ? (int)Math.Min(number, int.MaxValue) : null;
+                    if (seconds.ValueKind == System.Text.Json.JsonValueKind.String
+                        && int.TryParse(seconds.GetString(), out int parsed) && parsed > 0) return parsed;
+                }
+            }
+            catch { /* not JSON: the whole argument is the code */ }
+            return null;
         }
 
         /// <summary>Truthful closing line for a run that was stopped rather than finished.</summary>
@@ -1338,8 +1502,17 @@ namespace Omnipotent.Services.KliveAgent
             CancellationToken cancellationToken = default,
             AgentChatRunControl? runControl = null,
             Action<AgentSteeringMessage>? onSteeringApplied = null,
-            IReadOnlyList<AgentAttachment>? messageAttachments = null)
+            IReadOnlyList<AgentAttachment>? messageAttachments = null,
+            bool background = false)
         {
+            // While someone is waiting on this run, one of AIRouter's slots is kept clear of background
+            // work (the Projects fleet, an Alpha Lab run). Renewed every step; released when the run ends.
+            string reserveOwner = "kliveagent-run-" + conversation.ConversationId;
+            void HoldInteractiveReserve()
+            {
+                if (!background) KliveLLM.KliveLLM.AIRouterEngageInteractiveReserve(reserveOwner, InteractiveReserveTtl);
+            }
+            HoldInteractiveReserve();
             var performance = new KliveAgentPerformance();
             var preparationTimer = System.Diagnostics.Stopwatch.StartNew();
             bool preparationRecorded = false;
@@ -1387,10 +1560,12 @@ namespace Omnipotent.Services.KliveAgent
                 ITalkListener? TalkNow() => talkHub.GetListener(conversation.ConversationId);
                 TalkNow()?.OnRunStarted();
 
+                // A spoken run is KliveAgent's talk lane on the KliveLLM page (and can be routed apart).
+                var llmCaller = talkAtStart != null ? KliveLLM.LlmConsumerCatalog.Callers.KliveAgentTalk : KliveLLM.LlmConsumerCatalog.Callers.KliveAgentChat;
                 var settingsTask = KliveAgentRunSettings.LoadAsync(agentService);
-                var nativeToolsTask = llm.SupportsNativeToolCallingAsync();
-                var flatFeeTask = llm.IsFlatFeeProviderAsync();
-                _ = llm.WarmUpConnectionAsync(cancellationToken);
+                var nativeToolsTask = llm.SupportsNativeToolCallingAsync(llmCaller);
+                var flatFeeTask = llm.IsFlatFeeProviderAsync(llmCaller);
+                _ = llm.WarmUpConnectionAsync(cancellationToken, llmCaller);
 
                 // Prefer the provider's native structured tool-calling channel: code travels as a JSON
                 // string argument, immune to the {{{ }}} framing leaks and brace-truncation that broke the
@@ -1495,16 +1670,37 @@ namespace Omnipotent.Services.KliveAgent
                 // Thread the per-run cancellation token into ScriptGlobals so a manual Stop or the stall
                 // watchdog also unwinds a script that is mid-execution (ExecuteAsync links this token with
                 // its own per-script timeout).
-                var sharedGlobals = new ScriptGlobals(agentService, cancellationToken)
-                {
-                    ConversationId = conversation.ConversationId,
-                };
-                var scriptSession = scriptEngine.CreateSession(sharedGlobals);
+                //
+                // The session is the conversation's, not the run's: a follow-up message within
+                // KliveAgent_KeepScriptSessionMinutes continues it, so the variables the last turn
+                // computed still exist and the turn does not start with a first compile.
+                var (scriptSession, sharedGlobals, scriptSessionKept) = scriptEngine.AcquireConversationSession(
+                    conversation.ConversationId,
+                    () => new ScriptGlobals(agentService, cancellationToken) { ConversationId = conversation.ConversationId },
+                    new ScriptSessionOptions
+                    {
+                        CompileBudget = TimeSpan.FromSeconds(settings.ScriptCompileBudgetSeconds),
+                        AutoRepair = settings.ScriptAutoRepair,
+                    },
+                    TimeSpan.FromMinutes(settings.KeepScriptSessionMinutes));
+                sharedGlobals.CancellationToken = cancellationToken;
+                sharedGlobals.ConversationId = conversation.ConversationId;
+                // The run's working notes: the model writes them with task_ledger, they are handed back
+                // after a compaction, and a continuation after a restart starts from them.
+                var ledger = runControl?.Ledger ?? new AgentRunLedger();
+                sharedGlobals.RunLedger = ledger;
+                int ledgerVersionSent = ledger.Version;
+                bool ledgerDue = false;
+                bool ledgerNudged = false;
 
-                // Per-script hard timeout. A script that overruns this is abandoned so the agent never
-                // hangs; configurable so a legitimately long-running script can be given more room.
+                // Per-script hard timeout for the RUN (compiling has its own budget). A script that
+                // overruns it is abandoned so the agent never hangs; a script can ask for more with
+                // timeoutSeconds, up to KliveAgentRunSettings.MaxScriptTimeoutSeconds.
                 int scriptTimeoutSec = settings.ScriptTimeoutSeconds;
                 var scriptTimeout = TimeSpan.FromSeconds(scriptTimeoutSec);
+                // Failed scripts in a row, across steps, and the count the model was last told about.
+                int consecutiveFailedScripts = 0;
+                int failureStreakNoticed = 0;
 
                 // Per-role models for adaptive routing (OpenRouter / native tool-calling path). Cheap,
                 // on-track turns take the fast model; turns that escalate reasoning effort take the stronger
@@ -1532,6 +1728,9 @@ namespace Omnipotent.Services.KliveAgent
                     userPrompt = continueTalk
                         ? await BuildTalkTurnAsync(userMessage, senderName, talkNote, talkEpoch!, talkAtStart!, performance)
                         : BuildUserPrompt(conversation, userMessage, senderName, spoken: talkProfile, note: talkNote);
+                if (scriptSessionKept && scriptSession.DescribeVariables() is { Count: > 0 } keptVariables)
+                    userPrompt += "\n[Script session] Variables from your earlier scripts in this conversation still exist: "
+                        + string.Join(", ", keptVariables) + ".";
                 (string text, List<(byte[] data, string mimeType)> images) preparedAttachments;
                 try
                 {
@@ -1566,7 +1765,7 @@ namespace Omnipotent.Services.KliveAgent
                     foreach (string model in modelsToCheck)
                     {
                         var capabilities = await llm.GetModelCapabilitiesAsync(
-                            string.IsNullOrEmpty(model) ? null : model, cancellationToken);
+                            string.IsNullOrEmpty(model) ? null : model, cancellationToken, llmCaller);
                         if (!capabilities.ImageInput)
                             return new AgentChatResponse
                             {
@@ -1582,7 +1781,7 @@ namespace Omnipotent.Services.KliveAgent
                 // and feed observations back via currentPrompt.
                 if (useToolCalling)
                 {
-                    if (!continueTalk) llm.StartToolSession(llmSessionId, systemPrompt);
+                    if (!continueTalk) llm.StartToolSession(llmSessionId, systemPrompt, llmCaller);
                     if (preparedAttachments.images.Count > 0)
                         llm.AppendUserContentToToolSession(llmSessionId, userPrompt, preparedAttachments.images,
                             keepRecentImages: retainedScreenshots, preservePromptPrefix: true);
@@ -1664,10 +1863,20 @@ namespace Omnipotent.Services.KliveAgent
                             NewActivity = newActivity,
                             Frame = frame,
                             Approval = approval,
-                            ComputerContainerId = computerContainerId
+                            ComputerContainerId = computerContainerId,
+                            Ledger = TakeLedgerUpdate()
                         });
                     }
                     catch { }
+                }
+
+                // A copy of the ledger when it changed since the last update, so the run record (and the
+                // page) follows it without the live object ever being serialised mid-change.
+                AgentRunLedger? TakeLedgerUpdate()
+                {
+                    if (ledger.Version == ledgerVersionSent) return null;
+                    ledgerVersionSent = ledger.Version;
+                    return ledger.Copy();
                 }
 
                 // A liveness update that leaves the answer text alone: only phase/status (and an optional
@@ -1698,8 +1907,13 @@ namespace Omnipotent.Services.KliveAgent
                 // evidence the request is alive (queued for a slot, prefilling, reasoning, retrying),
                 // which is what keeps the stall watchdog from killing a healthy-but-silent call.
                 KliveLLM.KliveLLMActivityKind? lastModelActivity = null;
+                // Times each state of the call in flight (queued, awaiting the provider, reasoning, streaming).
+                ModelStateClock? modelClock = null;
                 void OnModelActivity(KliveLLM.KliveLLMActivity activity)
                 {
+                    modelClock?.Observe(activity.Kind);
+                    // A model call can outlast the reserve's lifetime; its pulses keep it held.
+                    HoldInteractiveReserve();
                     int step = Math.Max(1, iterationsDone);
                     string elapsed = activity.Elapsed >= TimeSpan.FromSeconds(1) ? $" · {FormatElapsed(activity.Elapsed)}" : "";
                     bool transition = lastModelActivity != activity.Kind;
@@ -1809,9 +2023,8 @@ namespace Omnipotent.Services.KliveAgent
                     // Spoken turns think at one fixed level: escalating mid-conversation would add seconds
                     // of silent reasoning exactly when Klives is waiting to hear something.
                     if (talkProfile) return talkAtStart!.ThinkingLevel;
-                    if (stuckForceFinal || consecutiveErrorIters >= 2 || iter >= 12) return "high";
-                    if (consecutiveErrorIters >= 1 || consecutiveNoOpResponses >= 1 || iter >= 6) return "medium";
-                    return "low";
+                    return ThinkingLevelFor(iter, consecutiveErrorIters, consecutiveNoOpResponses, stuckForceFinal,
+                        bySteps: settings.ThinkingEscalation != KliveAgentRunSettings.ThinkingByErrors);
                 }
 
                 // Adaptive model routing keyed to the same difficulty signal as the thinking budget: a
@@ -1879,6 +2092,7 @@ namespace Omnipotent.Services.KliveAgent
                     // Steering is a durable inbox on the active run. Consume it only at safe model
                     // boundaries, never by launching another brain against the same provider session.
                     ApplySteering(runControl?.Drain());
+                    HoldInteractiveReserve();
 
                     // Per-run budget guardrail (token/wall-clock). Soft-warn once at 80%; at 100% demand a
                     // final answer this turn and finalize regardless of what the model returns.
@@ -1931,8 +2145,17 @@ namespace Omnipotent.Services.KliveAgent
                     var speculativeTasks = new System.Collections.Concurrent.ConcurrentDictionary<string, Task<(bool ok, string output)>>();
                     async Task<(bool ok, string output)> RunNativeToolMeasuredAsync(string name, string? content)
                     {
+                        var toolTimer = System.Diagnostics.Stopwatch.StartNew();
+                        (bool ok, string output) outcome;
                         using (performance.Measure("nativeTool"))
-                            return await RunNativeToolAsync(sharedGlobals, name, content);
+                            outcome = await WithToolDeadlineAsync(RunNativeToolAsync(sharedGlobals, name, content), name,
+                                ToolDeadlineFor(name, settings.NativeToolDeadlineSeconds), cancellationToken);
+                        // Which operation was slow, on disk: two live calls ran 2 h and 3 h 16 min and nothing
+                        // recorded which they were (the tool audit only lives as long as the process).
+                        if (toolTimer.ElapsedMilliseconds >= SlowToolMs)
+                            agentService.Stats?.RecordSlowTool(name, ToolOperationOf(content), toolTimer.ElapsedMilliseconds,
+                                timedOut: !outcome.ok && outcome.output.Contains(ToolDeadlineMarker, StringComparison.Ordinal));
+                        return outcome;
                     }
                     void OnToolCallComplete(HFWrapper.HFToolCall tc)
                     {
@@ -1962,6 +2185,10 @@ namespace Omnipotent.Services.KliveAgent
                                 if (!string.IsNullOrEmpty(token)) TalkNow()?.OnSpeakable(token);
                             };
                             lastModelActivity = null;
+                            // Where the call's time goes, for every run (first-token time was only ever
+                            // recorded for streamed website runs), and whether other KliveAgent calls were
+                            // in flight when it was sent: the test of "our own runs slow each other down".
+                            using var stateClock = modelClock = new ModelStateClock(performance, modelCallsInFlight);
                             using (performance.Measure("model"))
                             using (KliveLLM.KliveLLM.ObserveActivity(OnModelActivity, streamIdleLimit))
                             {
@@ -1971,7 +2198,14 @@ namespace Omnipotent.Services.KliveAgent
                                     // Klives is sitting there waiting on this one, so it is never parked
                                     // behind autonomous background work.
                                     llmResponse = await llm.QueryToolSessionAsync(llmSessionId, toolDefinitions!, modelOverride: modelForThisCall, cancellationToken: cancellationToken, onToken: streamTokens ? measuredTokenSink : null, thinkingOverride: thinkingForThisCall, onToolCallComplete: OnToolCallComplete,
-                                        workClass: KliveLLM.AIRouterWorkClass.Interactive, honourThinkingOnAIRouter: true);
+                                        // A run nobody is waiting on (Alpha Lab, a scheduled task) queues as agent
+                                        // work, so it no longer competes with a live chat as an equal.
+                                        workClass: background ? KliveLLM.AIRouterWorkClass.Agent : KliveLLM.AIRouterWorkClass.Interactive,
+                                        honourThinkingOnAIRouter: true,
+                                        // The first message after the system prompt is the task. Without this, the
+                                        // first compaction (70K tokens) cut it to 240 characters and the second
+                                        // dropped it: a long run forgot what it had been asked to deliver.
+                                        compactProtectPrefixMessages: 1);
                                 }
                                 else
                                 {
@@ -1984,6 +2218,11 @@ namespace Omnipotent.Services.KliveAgent
                                 }
                             }
                             liveTokens?.Flush();
+                            // What each reasoning level costs per call: the evidence for KliveAgent_ThinkingEscalationMode.
+                            performance.Add("model.think." + thinkingForThisCall, modelTimer.ElapsedMilliseconds);
+                            // Feeds the "provider is slow right now" check (streamed calls only).
+                            if (stateClock.ProviderWaitMs is long providerWaitMs)
+                                agentService.Stats?.RecordModelWait(providerWaitMs);
                             break;
                         }
                         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -2075,6 +2314,8 @@ namespace Omnipotent.Services.KliveAgent
 
                     totalPromptTokens += llmResponse.PromptTokens;
                     totalCompletionTokens += llmResponse.CompletionTokens;
+                    // Older steps were just replaced by a digest: the ledger goes back in with this step's guidance.
+                    if (llmResponse.ContextWasCompacted) ledgerDue = true;
                     billableTokens += BillableTokens(llmResponse.PromptTokens, llmResponse.CachedPromptTokens,
                         llmResponse.CompletionTokens);
                     try { agentService.PromptCache.Record(cacheRunId, iteration + 1, llmResponse); }
@@ -2100,7 +2341,7 @@ namespace Omnipotent.Services.KliveAgent
                                 // Memory / grep tool: dispatched straight to its API, not the script engine.
                                 segments.Add(new ResponseSegment { IsScript = false, ToolName = name, Content = tc.function?.arguments ?? string.Empty, ToolCallId = tc.id });
                             else
-                                segments.Add(new ResponseSegment { IsScript = true, ToolName = "execute_csharp", Content = ExtractCodeFromToolCall(tc), ToolCallId = tc.id });
+                                segments.Add(new ResponseSegment { IsScript = true, ToolName = "execute_csharp", Content = ExtractCodeFromToolCall(tc), ToolCallId = tc.id, TimeoutSeconds = ExtractScriptTimeout(tc) });
                         }
                     }
                     else
@@ -2485,9 +2726,21 @@ namespace Omnipotent.Services.KliveAgent
 
                         scriptCountThisIter++;
 
-                        var result = await WithToolPulse(scriptSession.ExecuteAsync(segment.Content ?? string.Empty, scriptTimeout), "running a C# script");
+                        var runBudget = segment.TimeoutSeconds is int asked
+                            ? TimeSpan.FromSeconds(Math.Clamp(asked, 5, KliveAgentRunSettings.MaxScriptTimeoutSeconds))
+                            : scriptTimeout;
+                        var result = await WithToolPulse(scriptSession.ExecuteAsync(segment.Content ?? string.Empty, runBudget), "running a C# script");
                         performance.Add("script", result.ExecutionTimeMs);
+                        // Compile and run apart: one "script" figure hid a 4.5 s first compile behind 132 ms later ones.
+                        if (result.CompileMs is long compileMs)
+                            performance.Add(result.ColdStart ? "script.coldCompile" : "script.compile", compileMs);
+                        if (result.RunMs is long runMs) performance.Add("script.run", runMs);
                         allScriptsExecuted.Add(result);
+                        consecutiveFailedScripts = result.Success ? 0 : consecutiveFailedScripts + 1;
+                        if (result.Success) failureStreakNoticed = 0;
+                        // The statistics keep a line of each failure's error text, so they get the storable copy
+                        // (secrets masked). `result` itself stays real: the model is shown it below.
+                        agentService.Stats?.RecordScriptOutcome(agentService.SecretGuard.Mask(result)!, consecutiveFailedScripts);
 
                         // Stream the just-completed script (code + output) to the UI as it lands, with a
                         // timeline entry recording success/failure + duration.
@@ -2510,9 +2763,9 @@ namespace Omnipotent.Services.KliveAgent
                                 result.Output ?? string.Empty,
                                 KliveAgentContextBudget.ScriptOutputBudget);
 
-                            scriptObs.AppendLine($"[OK | {result.ExecutionTimeMs}ms]");
-                            if (!string.IsNullOrWhiteSpace(output))
-                                scriptObs.AppendLine(output);
+                            scriptObs.AppendLine(ScriptOkText(result.ExecutionTimeMs, output));
+                            if (DescribeRepairs(result) is { } fixedNote) scriptObs.AppendLine(fixedNote);
+                            if (!string.IsNullOrWhiteSpace(result.SessionNote)) scriptObs.AppendLine($"[{result.SessionNote}]");
                         }
                         else
                         {
@@ -2523,8 +2776,14 @@ namespace Omnipotent.Services.KliveAgent
                             // agent's own GetScriptFailureBreakdown() — no longer a stuck-loop signal.
                             agentService.Stats?.RecordScriptError(ClassifyScriptError(errMsg));
 
-                            scriptObs.AppendLine($"[ERROR | {result.ExecutionTimeMs}ms]");
-                            scriptObs.AppendLine(KliveAgentContextBudget.TruncateToTokens(errMsg, KliveAgentContextBudget.ScriptErrorBudget));
+                            scriptObs.AppendLine(ScriptErrorText(result.ExecutionTimeMs,
+                                KliveAgentContextBudget.TruncateToTokens(errMsg, KliveAgentContextBudget.ScriptErrorBudget)));
+                            // A compile failure lists its own fixes; any other failure ran the fixed script.
+                            if (result.FailureKind != "compile" && DescribeRepairs(result) is { } ranNote) scriptObs.AppendLine(ranNote);
+                            if (!string.IsNullOrWhiteSpace(result.Output))
+                                scriptObs.AppendLine("Output before the failure:\n" + KliveAgentContextBudget.TruncateToTokens(
+                                    result.Output, KliveAgentContextBudget.ScriptOutputBudget / 2));
+                            if (!string.IsNullOrWhiteSpace(result.SessionNote)) scriptObs.AppendLine($"[{result.SessionNote}]");
                         }
 
                         var scriptObsText = scriptObs.ToString().TrimEnd();
@@ -2593,6 +2852,24 @@ namespace Omnipotent.Services.KliveAgent
                     bool madeCleanProgress = hasScripts && errorCountThisIter == 0;
                     string guidance = BuildStepGuidance(stuckForceFinal, madeCleanProgress, taskMode);
                     guidance += nudge;
+                    // Still no ceiling on failures, but a run of them is answered: live runs reached 17
+                    // failed scripts in a row with nothing said, each one a model round trip.
+                    if (FailureStreakGuidance(consecutiveFailedScripts, failureStreakNoticed) is { } streakNote)
+                    {
+                        guidance += "\n\n" + streakNote;
+                        failureStreakNoticed = consecutiveFailedScripts;
+                    }
+                    if (ledgerDue && !ledger.IsEmpty)
+                    {
+                        guidance += "\n\n[Run ledger: your own notes, restated because earlier steps were just summarised]\n" + ledger.Render();
+                        ledgerDue = false;
+                    }
+                    else if (taskMode && !ledgerNudged && ledger.IsEmpty && iteration + 1 >= LedgerNudgeStep)
+                    {
+                        ledgerNudged = true;
+                        guidance += "\n\n[Ledger] This task is running long. Record your plan with task_ledger (op=set_plan), mark steps done as you go, "
+                            + "and note the facts you had to find out: those notes are kept when earlier steps are summarised and when the server restarts.";
+                    }
 
                     if (useToolCalling && anyToolResultsAppended)
                         SendModelPrompt(guidance);
@@ -2631,6 +2908,12 @@ namespace Omnipotent.Services.KliveAgent
                 if (!preparationRecorded) performance.Add("preparation", preparationTimer.ElapsedMilliseconds);
                 try { agentService.Talk.GetListener(conversation.ConversationId)?.OnRunEnded(performance.Outcome == "completed"); }
                 catch { /* speech must never affect the run's outcome */ }
+                // The session's idle time counts from the end of the run, not its start.
+                try { scriptEngine.TouchConversationSession(conversation.ConversationId); } catch { }
+                if (!background)
+                {
+                    try { KliveLLM.KliveLLM.AIRouterReleaseInteractiveReserve(reserveOwner); } catch { }
+                }
                 agentService.Stats.RecordPerformance(performance.Snapshot(iterationsDone, totalPromptTokens, totalCompletionTokens));
             }
         }
@@ -2862,7 +3145,7 @@ namespace Omnipotent.Services.KliveAgent
             var llm = agentService.GetActiveServices().OfType<KliveLLM.KliveLLM>().FirstOrDefault();
             if (llm == null) return;
             bool useToolCalling;
-            try { useToolCalling = await llm.SupportsNativeToolCallingAsync(); }
+            try { useToolCalling = await llm.SupportsNativeToolCallingAsync(KliveLLM.LlmConsumerCatalog.Callers.KliveAgentTalk); }
             catch { return; }
             if (!useToolCalling) return;
 
@@ -2895,7 +3178,7 @@ namespace Omnipotent.Services.KliveAgent
             cancellationToken.ThrowIfCancellationRequested();
 
             llm.ResetSession(sessionId);
-            llm.StartToolSession(sessionId, systemPrompt);
+            llm.StartToolSession(sessionId, systemPrompt, KliveLLM.LlmConsumerCatalog.Callers.KliveAgentTalk);
             llm.AppendUserMessageToToolSession(sessionId, seed);
             agentService.Talk.SetEpoch(conversation.ConversationId, NewTalkEpoch(key, tools, systemPrompt));
             _ = llm.WarmToolSessionPrefixAsync(sessionId, tools, model, cancellationToken);
@@ -3021,6 +3304,9 @@ namespace Omnipotent.Services.KliveAgent
                     sb.AppendLine($"  -> [ERROR] {err}");
                 }
             }
+            // Stored scripts have their secrets masked; say what the marker is so it is not typed back as a value.
+            if (KliveAgentSecretMasker.ContainsPlaceholder(sb.ToString()))
+                sb.AppendLine("  (" + KliveAgentSecretGuard.PlaceholderNote + ")");
             return sb.ToString().TrimEnd();
         }
 
@@ -3354,5 +3640,8 @@ namespace Omnipotent.Services.KliveAgent
         // the C# code) or a memory tool name (then IsScript=false and Content is the raw JSON arguments).
         // Null for text-protocol prose/scripts.
         public string? ToolName { get; set; }
+
+        // execute_csharp's optional timeoutSeconds: how long this script asked to be allowed to run.
+        public int? TimeoutSeconds { get; set; }
     }
 }

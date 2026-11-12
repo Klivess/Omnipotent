@@ -118,8 +118,11 @@ namespace Omnipotent.Services.OmniTrader
         {
             var agent = GetActiveServices().OfType<Omnipotent.Services.KliveAgent.KliveAgent>().FirstOrDefault(s => s.IsServiceActive());
             if (agent == null) return null;
-            var reply = await agent.HandleIncomingMessage(message, AgentSourceChannel.API, conversationId,
-                senderName: "OmniTrader Alpha Lab", cancellationToken: ct);
+            // A real run: watched for stalls, visible on the KliveAgent page while it works, and its
+            // conversation is closed properly if the server restarts under it. It queues for a model
+            // slot as background work, behind anything Klives is waiting on.
+            var reply = await agent.RunDurableAsync(message, conversationId, "OmniTrader Alpha Lab",
+                background: true, cancellationToken: ct);
             if (!reply.Success) throw new InvalidOperationException(reply.ErrorMessage ?? reply.Response ?? "KliveAgent failed");
             return reply.Response ?? "";
         }

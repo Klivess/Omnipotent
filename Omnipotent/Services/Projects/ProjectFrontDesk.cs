@@ -122,7 +122,7 @@ namespace Omnipotent.Services.Projects
             var lease = await parent.Budget.TryAcquireLlmTurnAsync(project.ProjectID, ct);
             if (lease == null) return null;
             string sid = $"projects-instant-reply-{Guid.NewGuid():N}";
-            llm.StartToolSession(sid, system);
+            llm.StartToolSession(sid, system, KliveLLM.LlmConsumerCatalog.Callers.ProjectsFrontDesk.For(project.ProjectID, "instant-reply"));
             try
             {
                 await using (lease)
@@ -146,6 +146,7 @@ namespace Omnipotent.Services.Projects
                                 Source = "commander",
                                 Operation = "instant-reply",
                                 Model = resp.Model ?? routes[0],
+                                FlatFee = resp.RouterId != null ? resp.FlatFee : null,
                                 SourceReference = sid,
                                 Label = "Instant chat reply",
                             }, cachedPromptTokens: resp.CachedPromptTokens);

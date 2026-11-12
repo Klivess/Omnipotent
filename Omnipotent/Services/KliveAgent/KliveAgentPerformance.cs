@@ -62,6 +62,100 @@ public sealed class KliveAgentPerformance
     }
 }
 
+/// <summary>
+/// Splits one model call into the states KliveLLM reports for it, as stages <c>model.queued</c>,
+/// <c>model.awaiting</c>, <c>model.reasoning</c>, <c>model.streaming</c> and <c>model.retrying</c>, and
+/// files the whole call under <c>model.alone</c>, <c>model.with1other</c> or <c>model.with2others</c> by how
+/// many other KliveAgent calls were in flight when it was sent.
+///
+/// The single "model" stage was 66% of all run time and said nothing about why: a 195 s spoken "hello"
+/// and a 3 s one looked the same. Disposing it closes the state that was open.
+/// </summary>
+internal sealed class ModelStateClock : IDisposable
+{
+    /// <summary>Shared count of calls in flight.</summary>
+    internal sealed class InFlightCounter
+    {
+        private int count;
+        public int Enter() => Interlocked.Increment(ref count);
+        public void Leave() => Interlocked.Decrement(ref count);
+        public int Current => Volatile.Read(ref count);
+    }
+
+    private readonly KliveAgentPerformance performance;
+    private readonly InFlightCounter? inFlight;
+    private readonly int concurrentAtStart;
+    private readonly Stopwatch whole = Stopwatch.StartNew();
+    private readonly Stopwatch inState = new();
+    private readonly object gate = new();
+    private Omnipotent.Services.KliveLLM.KliveLLMActivityKind? current;
+    private bool disposed;
+    private long awaitingMs;
+    private bool sawOutput;
+
+    public ModelStateClock(KliveAgentPerformance performance, InFlightCounter? inFlight = null)
+    {
+        this.performance = performance;
+        this.inFlight = inFlight;
+        concurrentAtStart = inFlight?.Enter() ?? 1;
+    }
+
+    /// <summary>
+    /// How long the provider took to start answering, once the call has started producing output. Null
+    /// for a call that never streamed: there "awaiting" covers the whole reply, so it is not a wait for
+    /// the first byte and must not be read as one.
+    /// </summary>
+    public long? ProviderWaitMs
+    {
+        get { lock (gate) return sawOutput ? awaitingMs : null; }
+    }
+
+    public void Observe(Omnipotent.Services.KliveLLM.KliveLLMActivityKind kind)
+    {
+        lock (gate)
+        {
+            if (disposed || current == kind) return;
+            CloseStateLocked();
+            current = kind;
+            if (kind is Omnipotent.Services.KliveLLM.KliveLLMActivityKind.Reasoning
+                or Omnipotent.Services.KliveLLM.KliveLLMActivityKind.Streaming) sawOutput = true;
+            inState.Restart();
+        }
+    }
+
+    private void CloseStateLocked()
+    {
+        if (current is not { } kind) return;
+        long elapsed = inState.ElapsedMilliseconds;
+        if (kind == Omnipotent.Services.KliveLLM.KliveLLMActivityKind.AwaitingProvider) awaitingMs += elapsed;
+        performance.Add(StageName(kind), elapsed);
+        current = null;
+    }
+
+    internal static string StageName(Omnipotent.Services.KliveLLM.KliveLLMActivityKind kind) => kind switch
+    {
+        Omnipotent.Services.KliveLLM.KliveLLMActivityKind.Queued => "model.queued",
+        Omnipotent.Services.KliveLLM.KliveLLMActivityKind.AwaitingProvider => "model.awaiting",
+        Omnipotent.Services.KliveLLM.KliveLLMActivityKind.Reasoning => "model.reasoning",
+        Omnipotent.Services.KliveLLM.KliveLLMActivityKind.Streaming => "model.streaming",
+        Omnipotent.Services.KliveLLM.KliveLLMActivityKind.Retrying => "model.retrying",
+        _ => "model.other",
+    };
+
+    public void Dispose()
+    {
+        lock (gate)
+        {
+            if (disposed) return;
+            disposed = true;
+            CloseStateLocked();
+        }
+        inFlight?.Leave();
+        performance.Add(concurrentAtStart >= 3 ? "model.with2others" : concurrentAtStart == 2 ? "model.with1other" : "model.alone",
+            whole.ElapsedMilliseconds);
+    }
+}
+
 public sealed class PerformanceStage
 {
     public long Count { get; set; }

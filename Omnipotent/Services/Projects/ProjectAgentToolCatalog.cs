@@ -39,7 +39,8 @@ public static class ProjectAgentToolCatalog
         bool projectVisionEnabled,
         ProjectAgentTier tier,
         IReadOnlyList<string> modelRoutes,
-        CancellationToken ct = default)
+        CancellationToken ct = default,
+        KliveLLM.LlmCaller? caller = null)
     {
         ArgumentNullException.ThrowIfNull(llm);
         var routes = modelRoutes
@@ -51,7 +52,7 @@ public static class ProjectAgentToolCatalog
             return false;
 
         return await AllRoutesSupportImageInputAsync(
-            routes, (route, token) => llm.GetModelCapabilitiesAsync(route, token), ct);
+            routes, (route, token) => llm.GetModelCapabilitiesAsync(route, token, caller), ct);
     }
 
     /// <summary>

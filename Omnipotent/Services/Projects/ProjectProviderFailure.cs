@@ -48,6 +48,10 @@ namespace Omnipotent.Services.Projects
                 RemoteLLMFailureKind.InvalidRequest or RemoteLLMFailureKind.ModelUnavailable => ProjectFailureCategory.Configuration,
                 RemoteLLMFailureKind.EmptyResponse or RemoteLLMFailureKind.Network
                     or RemoteLLMFailureKind.Timeout or RemoteLLMFailureKind.ProviderUnavailable => ProjectFailureCategory.Transient,
+                // Refusals set on the KliveLLM page: nothing for the agent to fix, a setting for Klives.
+                RemoteLLMFailureKind.Paused or RemoteLLMFailureKind.SpendingNotAllowed
+                    or RemoteLLMFailureKind.RouterUnavailable => ProjectFailureCategory.Configuration,
+                RemoteLLMFailureKind.BudgetExceeded => ProjectFailureCategory.Capacity,
                 _ => ProjectFailureCategory.Unknown,
             },
             Code = ex.Kind.ToString(),

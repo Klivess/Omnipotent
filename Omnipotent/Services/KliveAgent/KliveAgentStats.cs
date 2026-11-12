@@ -6,7 +6,7 @@ using System.Globalization;
 
 namespace Omnipotent.Services.KliveAgent
 {
-    public class KliveAgentStats
+    public partial class KliveAgentStats
     {
         private readonly object _lock = new();
         private readonly object _saveScheduleLock = new();
@@ -121,6 +121,23 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     if (!string.IsNullOrWhiteSpace(kv.Key)) _scriptErrorCodes[kv.Key] = kv.Value;
                 }
+                foreach (var day in snapshot.ScriptHealth ?? new List<ScriptHealthDay>())
+                {
+                    if (string.IsNullOrWhiteSpace(day.Date)) continue;
+                    day.ColdHistogram = FitHistogram(day.ColdHistogram);
+                    day.WarmHistogram = FitHistogram(day.WarmHistogram);
+                    _scriptHealth[day.Date] = day;
+                }
+                foreach (var kv in snapshot.RepairKinds ?? new Dictionary<string, long>())
+                {
+                    if (!string.IsNullOrWhiteSpace(kv.Key)) _repairKinds[kv.Key] = kv.Value;
+                }
+                lock (_scriptHealthLock)
+                {
+                    _recentScriptFailures.AddRange((snapshot.RecentScriptFailures ?? new()).TakeLast(RecentFailuresKept));
+                    _slowTools.AddRange((snapshot.SlowTools ?? new()).TakeLast(SlowToolsKept));
+                }
+                RestoreWatch(snapshot.WatchScripts, snapshot.WatchScriptAlertAt, snapshot.WatchProviderAlertAt);
                 lock (_performanceLock)
                 {
                     _performanceRuns = snapshot.PerformanceRuns;
@@ -413,8 +430,16 @@ namespace Omnipotent.Services.KliveAgent
                         .OrderByDescending(capability => capability.Executions)
                         .ThenBy(capability => capability.Name, StringComparer.OrdinalIgnoreCase)
                         .ToList(),
-                    ScriptErrorCodes = _scriptErrorCodes.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal)
+                    ScriptErrorCodes = _scriptErrorCodes.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal),
+                    ScriptHealth = _scriptHealth.Values.OrderBy(day => day.Date, StringComparer.Ordinal).Select(Copy).ToList(),
+                    RepairKinds = _repairKinds.ToDictionary(kv => kv.Key, kv => kv.Value, StringComparer.Ordinal)
                 };
+                lock (_scriptHealthLock)
+                {
+                    snapshot.RecentScriptFailures = _recentScriptFailures.ToList();
+                    snapshot.SlowTools = _slowTools.ToList();
+                }
+                (snapshot.WatchScripts, snapshot.WatchScriptAlertAt, snapshot.WatchProviderAlertAt) = WatchState();
                 lock (_performanceLock)
                 {
                     snapshot.PerformanceRuns = _performanceRuns;
@@ -666,6 +691,21 @@ namespace Omnipotent.Services.KliveAgent
             public long PerformanceStopped { get; set; }
             public Dictionary<string, PerformanceStage> PerformanceStages { get; set; } = new();
             public List<PerformanceRunSnapshot> RecentPerformance { get; set; } = new();
+            public List<ScriptHealthDay> ScriptHealth { get; set; } = new();
+            public Dictionary<string, long> RepairKinds { get; set; } = new();
+            public List<ScriptFailureExample> RecentScriptFailures { get; set; } = new();
+            public List<SlowToolCall> SlowTools { get; set; } = new();
+            public List<string> WatchScripts { get; set; } = new();
+            public DateTime? WatchScriptAlertAt { get; set; }
+            public DateTime? WatchProviderAlertAt { get; set; }
+        }
+
+        /// <summary>A stored histogram at today's bucket count, whatever length it was saved with.</summary>
+        private static long[] FitHistogram(long[]? stored)
+        {
+            var fitted = new long[CompileBucketsMs.Length + 1];
+            if (stored != null) Array.Copy(stored, fitted, Math.Min(stored.Length, fitted.Length));
+            return fitted;
         }
 
         /// <summary>Shared metric fields for every time bucket (day/week/month). New fields default to

@@ -41,12 +41,12 @@ namespace Omnipotent.Tests.KliveRAG
         };
 
         [Fact]
-        public void Migrate_ReachesV1_AndFtsAvailable()
+        public void Migrate_ReachesTheCurrentVersion_AndFtsAvailable()
         {
             using var conn = db.Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "PRAGMA user_version;";
-            Assert.Equal(1, Convert.ToInt32(cmd.ExecuteScalar()));
+            Assert.Equal(2, Convert.ToInt32(cmd.ExecuteScalar()));
             // The shipped Microsoft.Data.Sqlite bundle includes FTS5.
             Assert.True(db.FtsAvailable);
         }
@@ -57,6 +57,7 @@ namespace Omnipotent.Tests.KliveRAG
         [InlineData("rag_chunk_embeddings")]
         [InlineData("rag_cursors")]
         [InlineData("rag_web_cache")]
+        [InlineData("rag_counters")]
         [InlineData("rag_chunks_fts")]
         public void Migrate_CreatesTable(string table)
         {

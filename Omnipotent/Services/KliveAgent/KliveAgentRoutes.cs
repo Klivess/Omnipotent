@@ -131,7 +131,10 @@ namespace Omnipotent.Services.KliveAgent
                 KliveAPI.Caching.CacheDeps.MarkUncacheable("live agent start-up state");
                 var (ready, state, progress, message) = service.GetInitializationStatus();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { ready, state, progress, message,
-                    codebase = service.GetCodebaseInitializationStatus() }));
+                    codebase = service.GetCodebaseInitializationStatus(),
+                    // The two rolling checks (scripts failing more than usual, provider slow right now), on
+                    // the route the page already polls. Null until the statistics have loaded.
+                    health = service.Stats?.BuildWatch() }));
             }, HttpMethod.Get, KliveAgentPerms.StatusView);
         }
 
@@ -167,6 +170,8 @@ namespace Omnipotent.Services.KliveAgent
                         conversationId,
                         req.user?.Name ?? "API",
                         body.ClientMessageId, attachments);
+                    // A retried message replays the stored turn, which may predate the secret guard.
+                    service.SecretGuard.MaskResponse(response);
 
                     await req.ReturnResponse(
                         JsonConvert.SerializeObject(response),
@@ -959,6 +964,15 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
                 }
+            }, HttpMethod.Get, KliveAgentPerms.StatusView);
+
+            // Script health: failure classes, what the engine repaired, compile times. A durable route so
+            // the page can show it while the model side is still warming up.
+            await CreateDurableRoute("/kliveagent/stats/scripts", async req =>
+            {
+                KliveAPI.Caching.CacheDeps.MarkUncacheable("live script statistics");
+                int days = int.TryParse(req.userParameters["days"], NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed) ? parsed : 30;
+                await req.ReturnResponse(JsonConvert.SerializeObject(service.Stats.BuildScriptHealth(days)));
             }, HttpMethod.Get, KliveAgentPerms.StatusView);
 
             await CreateRoute("/kliveagent/stats/summary", async (req) =>

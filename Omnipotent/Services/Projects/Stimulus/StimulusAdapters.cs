@@ -312,7 +312,10 @@ namespace Omnipotent.Services.Projects.Stimulus
             armInfo[hook.HookID] = new HookArmInfo(HookArmState.Armed, $"Polling a C# script every {poll}s.");
             return new StimulusScriptAdapter(hook, script, poll,
                 emit: payload => bus.IngestAsync(hook, payload),
-                log: log);
+                log: log,
+                // The script compiles in the background; one that does not compile will never poll.
+                onCompileFailed: error => armInfo[hook.HookID] = new HookArmInfo(HookArmState.Error,
+                    "The script does not compile, so this hook never fires: " + FirstLine(error)));
         }
 
         // ── process-exit (poll a named process / pid; emit on the running→exited edge) ──
@@ -464,6 +467,8 @@ namespace Omnipotent.Services.Projects.Stimulus
         }
 
         private static string Truncate(string s, int max) => string.IsNullOrEmpty(s) ? "" : (s.Length <= max ? s : s[..max] + "…");
+
+        private static string FirstLine(string s) => Truncate((s ?? "").Split('\n')[0].Trim(), 300);
 
         private sealed class NoopToken : IDisposable { public void Dispose() { } }
 

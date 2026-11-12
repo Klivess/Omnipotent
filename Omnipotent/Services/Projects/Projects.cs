@@ -239,7 +239,11 @@ namespace Omnipotent.Services.Projects
             Func<Task<string?>> openRouterCostToken = async () =>
             {
                 var llm = await GetKliveLLM();
-                if (llm == null || !await llm.IsOpenRouterActiveAsync()) return null;
+                if (llm == null) return null;
+                bool anyOnOpenRouter = false;
+                foreach (var lane in ProjectsLlmLanes)
+                    if (await llm.IsOpenRouterActiveAsync(lane)) { anyOnOpenRouter = true; break; }
+                if (!anyOnOpenRouter) return null;
                 return await openRouterToken();
             };
             var costFetcher = new OpenRouterCostFetcher(
@@ -262,7 +266,13 @@ namespace Omnipotent.Services.Projects
             // because the first wakes after a restart are the ones most able to re-collapse the fleet:
             // every conversation is cold, so service time is at its worst exactly when the whole fleet
             // wants to start at once.
-            WakeAdmission = new ProjectWakeAdmission();
+            // The measured conversation budget is AIRouter's: it only governs wakes while the
+            // Commander lane is routed there (unresolved at start-up counts as there, as before).
+            WakeAdmission = new ProjectWakeAdmission(() =>
+                llmForBudget == null
+                || string.Equals(llmForBudget.RouterFor(KliveLLM.LlmConsumerCatalog.Callers.ProjectsCommander), KliveLLM.LlmRouterIds.AIRouter, StringComparison.OrdinalIgnoreCase)
+                    ? KliveLLM.KliveLLM.AIRouterConversationBudget()
+                    : 0);
             _ = Task.Run(async () =>
             {
                 try { await LoadWakeAdmissionOptionsAsync(); }
@@ -279,7 +289,10 @@ namespace Omnipotent.Services.Projects
             // flat-fee router (AIRouter) the ledger must book zero, or a project would warn, pause and
             // defer its wakes against a bill nobody is being sent. The check runs per model turn, so it
             // reads a cached service reference rather than resolving the service each time.
-            Budget.IsFlatFeeProvider = () => llmForBudget?.IsFlatFeeProviderNow() ?? false;
+            // Per-service routing: the budget stops metering only when every Projects lane is on a
+            // router that charges nothing per token; each turn's own booking follows its own router.
+            Budget.IsFlatFeeProvider = () => llmForBudget != null && ProjectsLlmLanes.All(lane => llmForBudget.IsFlatFeeProviderNow(lane));
+            Budget.IsFlatFeeForTurn = (source, operation) => llmForBudget?.IsFlatFeeProviderNow(LaneForSpend(source, operation));
             _ = Task.Run(async () =>
             {
                 try
@@ -288,7 +301,7 @@ namespace Omnipotent.Services.Projects
                     if (llm == null) return;
                     // Force one authoritative settings read so the synchronous check above is never
                     // answering from an unprimed default during the first wake after a restart.
-                    await llm.IsFlatFeeProviderAsync();
+                    await llm.IsFlatFeeProviderAsync(KliveLLM.LlmConsumerCatalog.Callers.ProjectsCommander);
                     llmForBudget = llm;
                 }
                 catch (Exception ex) { await ServiceLogError(ex, "Projects: could not resolve the LLM provider billing mode"); }
@@ -410,7 +423,7 @@ namespace Omnipotent.Services.Projects
                 {
                     var llm = await GetKliveLLM();
                     if (llm == null) return null;
-                    llm.StartToolSession(sid, sys);
+                    llm.StartToolSession(sid, sys, KliveLLM.LlmConsumerCatalog.Callers.ProjectsCouncil.For(pid));
                     llm.AppendUserMessageToToolSession(sid, user);
                     return await RunCouncilTurnAsync(llm, sid, routes, maxTokens, ct,
                         Settings.Get(pid).ParametersForRoute(ProjectSettings.RouteNames.Council));
@@ -2025,7 +2038,8 @@ namespace Omnipotent.Services.Projects
             if (llmServices == null || llmServices.Length == 0) return null;
             var llm = (KliveLLM.KliveLLM)llmServices[0];
             string sid = $"projects-{operation}-{Guid.NewGuid():N}";
-            llm.StartToolSession(sid, null);
+            var utilityLane = KliveLLM.LlmConsumerCatalog.Callers.ProjectsUtility.For(projectID, operation);
+            llm.StartToolSession(sid, null, utilityLane);
             // A throwaway session: dropped on every exit, or each digest rebuild and triage call would
             // stay resident in KliveLLM's session table for the life of the process.
             try
@@ -2038,7 +2052,7 @@ namespace Omnipotent.Services.Projects
                 var settings = Settings.Get(projectID);
                 int utilityMaxTokens = Math.Clamp(settings.UtilityMaxOutputTokens, 256, 8_192);
                 var contextPolicy = await ResolveContextPolicyAsync(
-                    llm, routes, utilityMaxTokens, int.MaxValue, CancellationToken.None);
+                    llm, routes, utilityMaxTokens, int.MaxValue, CancellationToken.None, utilityLane);
                 if (contextPolicy != null)
                     utilityMaxTokens = contextPolicy.MaxOutputTokens;
                 var routeParameters = settings.ParametersForRoute(routeName);
@@ -2069,6 +2083,7 @@ namespace Omnipotent.Services.Projects
                             Source = "utility",
                             Operation = operation,
                             Model = resp.Model ?? routes[0],
+                            FlatFee = resp.RouterId != null ? resp.FlatFee : null,
                             SourceReference = sid,
                             Label = operation == "digest-rebuild"
                                 ? "Project digest rebuild"
@@ -2084,6 +2099,25 @@ namespace Omnipotent.Services.Projects
             => QueryUtilityModelAsync(
                 projectID, prompt, Settings.Get(projectID).UtilityRoutes, "digest-rebuild");
 
+        /// <summary>The KliveLLM lanes Projects calls from, for questions asked of all of them.</summary>
+        internal static readonly KliveLLM.LlmCaller[] ProjectsLlmLanes =
+        {
+            KliveLLM.LlmConsumerCatalog.Callers.ProjectsCommander, KliveLLM.LlmConsumerCatalog.Callers.ProjectsSubAgent,
+            KliveLLM.LlmConsumerCatalog.Callers.ProjectsCouncil, KliveLLM.LlmConsumerCatalog.Callers.ProjectsFrontDesk,
+            KliveLLM.LlmConsumerCatalog.Callers.ProjectsUtility,
+        };
+
+        /// <summary>The lane a ledger entry was spent on, from the source and operation it was booked with.</summary>
+        internal static KliveLLM.LlmCaller LaneForSpend(string? source, string? operation)
+        {
+            if (string.Equals(operation, "instant-reply", StringComparison.OrdinalIgnoreCase)) return KliveLLM.LlmConsumerCatalog.Callers.ProjectsFrontDesk;
+            string s = (source ?? "").ToLowerInvariant();
+            if (s == "commander") return KliveLLM.LlmConsumerCatalog.Callers.ProjectsCommander;
+            if (s.Contains("council")) return KliveLLM.LlmConsumerCatalog.Callers.ProjectsCouncil;
+            if (s.Contains("agent") || s.Contains("worker")) return KliveLLM.LlmConsumerCatalog.Callers.ProjectsSubAgent;
+            return KliveLLM.LlmConsumerCatalog.Callers.ProjectsUtility;
+        }
+
         /// <summary>The KliveLLM service instance, or null when unavailable.</summary>
         private async Task<KliveLLM.KliveLLM?> GetKliveLLM()
         {
@@ -2095,7 +2129,8 @@ namespace Omnipotent.Services.Projects
         /// runner. Route 0 is OpenRouter's primary and later routes are its fallback set for this request.</summary>
         private async Task<CouncilTurn?> RunCouncilTurnAsync(KliveLLM.KliveLLM llm, string sessionId, IReadOnlyList<string> routes, int maxTokens, CancellationToken ct, IReadOnlyDictionary<string, JToken>? routeParameters = null)
         {
-            var contextPolicy = await ResolveContextPolicyAsync(llm, routes, maxTokens, int.MaxValue, ct);
+            var contextPolicy = await ResolveContextPolicyAsync(llm, routes, maxTokens, int.MaxValue, ct,
+                llm.GetToolSessionCaller(sessionId) ?? KliveLLM.LlmConsumerCatalog.Callers.ProjectsCouncil);
             if (contextPolicy != null)
                 maxTokens = contextPolicy.MaxOutputTokens;
             var resp = await llm.QueryToolSessionAsync(sessionId, new List<KliveLLM.HFWrapper.HFTool>(),
@@ -2131,9 +2166,10 @@ namespace Omnipotent.Services.Projects
             IReadOnlyList<string> routes,
             int requestedMaxOutputTokens,
             int configuredWorkSliceTokenBudget,
-            CancellationToken ct)
+            CancellationToken ct,
+            KliveLLM.LlmCaller? lane = null)
         {
-            if (!await llm.IsOpenRouterActiveAsync()) return null;
+            if (!await llm.IsOpenRouterActiveAsync(lane ?? KliveLLM.LlmConsumerCatalog.Callers.ProjectsUtility)) return null;
 
             // ServiceMain normally initializes this before any runner can wake. Keep a fail-safe
             // construction path for recovery/test-created service instances.

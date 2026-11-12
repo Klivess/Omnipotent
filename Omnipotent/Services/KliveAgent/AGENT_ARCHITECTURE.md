@@ -60,8 +60,10 @@ Implemented in [KliveAgentBrain.cs](KliveAgentBrain.cs) `ProcessMessageAsync`:
    tool catalogue. `BuildUserPrompt` adds budget-selected conversation history + the new message.
 2. **Call the model** via KliveLLM (`QueryLLM`), which talks to Local/HuggingFace/OpenRouter.
 3. **Parse** the reply with `ParseLLMResponse` — extract `{{{ ... }}}` (or ```` ```csharp ````) blocks.
-4. **Execute** each script through the Roslyn `KliveAgentScriptEngine`; capture `[OK | ms]` output
-   or `[ERROR | ms]`, truncated to a token budget, into a `[Script Observations]` block.
+4. **Execute** each script through the Roslyn `KliveAgentScriptEngine`; capture `[OK | ms] <output>`
+   or `[ERROR | ms] <failure>`, truncated to a token budget, into a `[Script Observations]` block.
+   A script that fails to compile is repaired first when the fault is mechanical (see "Scripts and
+   long unattended runs").
 5. **Observe & loop** — feed observations back as the next turn. Repeat.
 6. **Stop** when the model replies with no scripts (the final answer). Guardrails (as actually
    implemented): a 2-strike breaker on XML/JSON tool-envelope or empty no-op turns; adaptive
@@ -178,7 +180,116 @@ messaging Klives. What makes that work:
 - **The browser restarts clean.** Every relaunch of the container's Chromium follows a kill, so the
   launcher marks the profile's last exit as clean and passes `--hide-crash-restore-bubble`. Before this,
   a "Restore pages?" bubble took the keyboard and swallowed typing and clicks.
-- **Computer-use reliability (Oct 2026).** See the next section.
+- **Computer-use reliability (Oct 2026).** See the section after next.
+- **Scripts, restarts and compaction (Nov 2026).** See the next section.
+
+## Scripts and long unattended runs (November 2026)
+
+Measured on the live server on 11 Nov 2026, before this work: 44% of scripts failed (380 of 865
+sampled; 224 of those never compiled, and four in ten of the compile failures were the same six
+mechanical slips); the first script of a run took a median 4.5 s to compile against 132 ms for every
+later one; three Alpha Lab runs were cut by a restart and never answered; a run past 70K tokens kept
+240 characters of its task; and two tool calls ran for over two hours with nothing bounding them.
+
+### The script host
+
+- **One reference set.** `OmniScriptReferences` builds the references once from the runtime's own
+  assembly list plus Omnipotent's dependencies, metadata only, and every script host uses it
+  (KliveAgent, Projects work scripts, Projects stimulus hooks). Before, each host referenced
+  "whatever was loaded when it started", which is why three stimulus hooks failed at start-up with
+  `CS0234 'Linq' does not exist in the namespace 'System'`.
+- **A held root.** `KliveAgentScriptEngine` (in `KliveAgentScriptSession.cs`) compiles one empty root
+  script and keeps it. A session's first script is a continuation of that root, so it compiles like
+  any later script instead of paying the cold start.
+- **Kept sessions.** A conversation's script session outlives the run for
+  `KliveAgent_KeepScriptSessionMinutes` (20; at most 6 are kept). A follow-up message finds its
+  variables still there and is told which ones (`[Script session] Variables … still exist`).
+- **Two budgets.** Compiling has its own (`KliveAgent_ScriptCompileBudgetSeconds`, 120). Running keeps
+  `KliveAgent_ScriptTimeoutSeconds` (30), and one script may ask for more with `timeoutSeconds` on
+  `execute_csharp` (up to 300). A slow compile on a busy server is no longer reported as a script
+  that timed out.
+- **Variables survive a throw.** A script that throws keeps what it declared before the throw; the
+  result says which variables exist (`AgentScriptResult.SessionNote`).
+- **Repair before reporting.** `KliveAgentScriptRepair` fixes the mechanical compile errors and
+  compiles again (at most 3 rounds, `KliveAgent_ScriptAutoRepair`): a top-level `using var`, `await (…)`
+  read as a call, a `using` directive below a statement, a type whose namespace is missing and
+  unambiguous, an assignment to a name that was never declared, a member, `foreach`, index or `await`
+  on an `object`, a `Task<T>` used as `T`, an internal type or non-public member, and an untyped lambda
+  passed to a dynamic call. Every fix is listed in the result (`[auto-fixed before running, write it
+  this way next time: …]`) so the model learns the rule. Valid code is never rewritten: repair only
+  runs on a compile failure, and only at the spans the compiler reported.
+- **`Dyn`, `Svc`, `Raw`, `Aw`.** Most Omnipotent types are internal, so a script cannot name them, and
+  `GetService` returns `object`. `Dyn(x)` wraps any value in `KliveAgentDynamic`, which binds members
+  by reflection at run time (public or not), awaits tasks, enumerates, converts on a cast and adapts
+  lambdas to the real delegate type. A missing member answers with the nearest real names and
+  signatures. `Svc("Name")` is `Dyn(GetService("Name"))`; `Raw(x)` unwraps; `Aw(x)` awaits anything.
+- **Errors that say what to write.** `KliveAgentScriptDiagnostics` adds an arrow line under a
+  diagnostic: the nearest real members of the type for CS1061, the real overloads for CS1501/CS1503,
+  the namespace for CS0246. Scripts compile with debug information, so a runtime error names its line.
+- **The result's first line is the finding.** A result reads `[OK | 132ms] <the output…>` or
+  `[ERROR | 77ms] <the first diagnostic>`. Compaction keeps the first line of each tool result (and
+  the first 160 characters when it stubs old ones), so a status alone on that line meant a compacted
+  run remembered that scripts ran and nothing they found. `ScriptRules` tells the model to log its
+  conclusion first for the same reason.
+- **A failure streak is answered.** There is still no ceiling on failures, but 3 failed scripts in a
+  row get the instruction to stop guessing names and look them up, 6 get "say what you will do
+  differently", then every 4 more (`FailureStreakGuidance`).
+
+### Runs that outlive a restart, and their own context
+
+- **Background runs are real runs.** Alpha Lab and scheduled tasks go through `RunDurableAsync`: a run
+  record, the stall watchdog, the live view and a truthful ending, where they used to call the brain
+  directly and vanish with the process. A background run asks for model slots as agent work, so it no
+  longer competes with a waiting Klives as an equal, and a clean finish is recorded without a
+  message. A run someone is waiting on holds AIRouter's interactive reserve while it works.
+  Background runs are deliberately not continued after a restart: their callers already redo what
+  was interrupted (a scheduled task is still due and fires late; Alpha Lab puts the papers back in
+  its queue and, since Nov 2026, hands back the attempt the restart used up), so continuing as well
+  would do the work twice. A run started from the website is continued.
+- **The ledger.** `task_ledger` (plan, done marks, facts) is the run's own working memory
+  (`AgentRunLedger`). It is restated to the model after every compaction, carried into a continuation,
+  kept on the run record and shown on the website with the run. A task run that reaches step 8
+  without one is nudged once.
+- **The task is protected.** KliveAgent passes `compactProtectPrefixMessages: 1`, so the message that
+  holds the task stays verbatim through every compaction.
+- **A continuation is told what happened.** After a restart the continuation message carries the
+  whole task (up to 60,000 characters; it was cut at 4,000 while Alpha Lab briefs are 33 KB), the
+  ledger, the last 60 activity lines and the last 6 scripts with their outcomes. Continuations stop
+  after two that made no progress, not after two in total: a deploy day has a dozen restarts.
+- **Tools are bounded.** A native or service tool call that is still running after
+  `KliveAgent_NativeToolDeadlineSeconds` (600) is reported to the model as timed out and the run moves
+  on. Tools that wait on purpose (`wait_for…`) are exempt. Calls of a minute or more are kept with the
+  statistics, by tool and operation, so a hang can be named after a restart.
+- **A guessed route gets the real ones.** `omni_api` answers a 404 with the nearest registered routes.
+- **Ready sooner.** Stored conversations load four at a time at start-up.
+
+### What is measured
+
+- `GET /kliveagent/stats/scripts?days=N`: outcomes by day and week (compile, runtime, timeout, compile
+  timeout, stopped, repaired), compile-time percentiles for first and later compiles, repairs by rule,
+  the commonest error codes, the latest failures (the compiler's sentence only, never script text) and
+  slow tool calls. Shown on the website under Insights.
+- Run stages: `script.coldCompile`, `script.compile`, `script.run`; `model.queued`, `model.awaiting`,
+  `model.reasoning`, `model.streaming`, `model.retrying` (`ModelStateClock`); `model.alone`,
+  `model.with1other`, `model.with2others` (other KliveAgent calls in flight when the call was sent);
+  `model.think.<level>`. `KliveAgent_ThinkingEscalationMode` (`steps` | `errors`) is the switch those
+  last stages are evidence for; the default is unchanged.
+- **The watch** (`KliveAgentStats.Watch.cs`): two rolling checks that message Klives once and then
+  wait. Fewer than 60% of the last 50 scripts ran (24 h between messages), or the median wait for the
+  provider to start answering was over 30 s across at least 6 streamed calls in 15 minutes (6 h
+  between messages). `KliveAgent_HealthAlerts` turns the messages off. The state is on
+  `/kliveagent/status` as `health`, so the page says "the provider is slow right now" beside the chat.
+
+### Considered and not built
+
+- **Continuing the model session across typed turns** (as talk mode does). Only the first model call
+  of a typed message misses the prompt cache (16% hit; 23 such calls in the week measured), every
+  later call hits 94%, and the change reaches into session ownership in both the brain and KliveLLM.
+  Kept sessions give a follow-up its variables without it.
+- **Resuming from a saved transcript** instead of a summary. The ledger and the fuller continuation
+  message carry what a restart used to lose, without serialising model sessions to disk.
+- **A richer compaction digest inside KliveLLM.** The headline-first result gets the same effect from
+  KliveAgent's side and leaves the digest Projects depends on byte-identical.
 
 ## Computer-use reliability (October 2026)
 

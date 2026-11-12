@@ -25,6 +25,7 @@ namespace Omnipotent.Services.KliveRAG
     public class KliveRAG : OmniService
     {
         public KliveRAGDb Db { get; private set; } = null!;
+        public RagCounters Counters { get; private set; } = null!;
         public RagIndexWriter Writer { get; private set; } = null!;
         public RagEmbedQueue Embed { get; private set; } = null!;
         public HybridRetriever Retriever { get; private set; } = null!;
@@ -66,6 +67,7 @@ namespace Omnipotent.Services.KliveRAG
             Http = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
             Db = new KliveRAGDb();
             Db.Migrate();
+            Counters = new RagCounters(Db);
             Writer = new RagIndexWriter(Db);
             Embed = new RagEmbedQueue(Db, Http, msg => _ = ServiceLog(msg));
             Retriever = new HybridRetriever(Db, Embed);
@@ -104,6 +106,10 @@ namespace Omnipotent.Services.KliveRAG
 
             // Routes up early so the UI/tools can query as soon as the store exists.
             await new KliveRAGRoutes(this).RegisterRoutes();
+
+            // Once per store, after the upgrade that added the counters: count what was already indexed.
+            // Never on the start path, and the stats route does not wait for it.
+            _ = Task.Run(CountExistingRowsAsync);
 
             // Initial backfill: cheap/local sources first, project events last (largest volume).
             _ = Task.Run(async () =>
@@ -336,40 +342,53 @@ namespace Omnipotent.Services.KliveRAG
             return list;
         }
 
-        /// <summary>Per-source counts + health for /kliverag/stats.</summary>
-        public object GetStats()
+        /// <summary>How long a stats request waits for the store before it answers with the previous
+        /// reading. The read is one page, so only a disk too busy to serve it gets this far.</summary>
+        internal static readonly TimeSpan StatsDeadline = TimeSpan.FromSeconds(2);
+
+        /// <summary>The count of existing rows is the least urgent thing the service does, and the minutes
+        /// after a start are when every service is reading its store cold from the same disk.</summary>
+        private static readonly TimeSpan CountExistingStartDelay = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan CountExistingRetryDelay = TimeSpan.FromMinutes(10);
+
+        /// <summary>
+        /// Per-source counts + health for /kliverag/stats, from the counters the store keeps
+        /// (<see cref="RagCounters"/>). It used to count the tables on every call, which read every
+        /// chunk row; now it reads one page, and answers inside <see cref="StatsDeadline"/> regardless.
+        /// </summary>
+        public async Task<RagStats> GetStatsAsync()
         {
-            var perSource = new Dictionary<string, int>();
-            int docs = 0, chunks = 0, embedded = 0;
-            try
+            var reading = await Counters.CurrentAsync(StatsDeadline).ConfigureAwait(false);
+            return RagStats.Compose(reading, Counters.CountingStatus, ready, Db.FtsAvailable, Embed.IsWarm, Searxng.IsReady);
+        }
+
+        /// <summary>Synchronous form of <see cref="GetStatsAsync"/> for callers that cannot await; bounded
+        /// by the same deadline.</summary>
+        public object GetStats() => GetStatsAsync().GetAwaiter().GetResult();
+
+        /// <summary>
+        /// Counts the rows that were indexed before the store kept counts, once, in the background,
+        /// retrying until it lands. On a store that has already been counted (or was created with the
+        /// counters) this returns at once.
+        /// </summary>
+        private async Task CountExistingRowsAsync()
+        {
+            var startAfter = CountExistingStartDelay;
+            while (!cts.IsCancellationRequested)
             {
-                using var conn = Db.Open();
-                using (var cmd = conn.CreateCommand())
+                try
                 {
-                    cmd.CommandText = "SELECT source, COUNT(*) FROM rag_documents GROUP BY source";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read()) { perSource[r.GetString(0)] = r.GetInt32(1); docs += r.GetInt32(1); }
+                    if (await Counters.CountExistingRowsAsync(startAfter, cts.Token) is { } took)
+                        await ServiceLog($"[KliveRAG] Counted the rows already in the index in {took.TotalSeconds:0.0} s; /kliverag/stats is exact from here.");
+                    return;
                 }
-                using (var cmd = conn.CreateCommand())
+                catch (Exception) when (cts.IsCancellationRequested) { return; }
+                catch (Exception ex)
                 {
-                    cmd.CommandText = "SELECT COUNT(*), COUNT(embedded_at) FROM rag_chunks";
-                    using var r = cmd.ExecuteReader();
-                    if (r.Read()) { chunks = r.GetInt32(0); embedded = r.GetInt32(1); }
+                    _ = ServiceLogError(ex, $"[KliveRAG] Counting the rows already in the index failed; trying again in {CountExistingRetryDelay.TotalMinutes:0} minutes");
                 }
+                startAfter = CountExistingRetryDelay;
             }
-            catch { }
-            return new
-            {
-                ready,
-                ftsAvailable = Db.FtsAvailable,
-                embedderWarm = Embed.IsWarm,
-                searxngReady = Searxng.IsReady,
-                documents = docs,
-                chunks,
-                embeddedChunks = embedded,
-                pendingEmbeds = chunks - embedded,
-                perSource,
-            };
         }
     }
 }

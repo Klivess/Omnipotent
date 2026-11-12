@@ -28,9 +28,43 @@ public partial class KliveLLM
                     // safe assumption is yes: an uncounted call can push a chat request into a 429 that
                     // penalises the whole fleet.
                     async () => await GetBoolOmniSetting("AIRouterAudioCountsTowardParallel", true),
-                    message => { try { _ = ServiceLog(message); } catch { } });
+                    message => { try { _ = ServiceLog(message); } catch { } })
+                {
+                    Recorder = RecordAudioCall,
+                };
             }
         }
+    }
+
+    /// <summary>Speech calls go to the ledger as KliveAgent's speech lane: no tokens, but time, size and outcome.</summary>
+    private void RecordAudioCall(AIRouterAudioCall call)
+    {
+        var ledger = Ledger;
+        if (ledger == null) return;
+        long ended = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+        ledger.Enqueue(new Telemetry.LlmCallRecord
+        {
+            Id = ledger.NewId(),
+            StartedMs = ended - call.DurationMs,
+            EndedMs = ended,
+            Service = LlmConsumerCatalog.Callers.KliveAgentSpeech.Service,
+            Lane = LlmConsumerCatalog.Callers.KliveAgentSpeech.Lane,
+            Kind = call.Kind,
+            WorkClass = AIRouterWorkClass.Audio.ToString(),
+            Router = LlmRouterIds.AIRouter,
+            RouterName = "AIRouter",
+            ModelRequested = call.Model,
+            ModelServed = call.Model,
+            Outcome = call.Outcome,
+            HttpStatus = call.Status,
+            Attempts = 1,
+            Billing = "flat",
+            ProviderMs = call.DurationMs,
+            TotalMs = call.DurationMs,
+            RequestBytes = call.BytesIn,
+            Error = Telemetry.LlmCallTrace.Clip(call.Error, 600),
+            AttemptLog = new List<Telemetry.LlmAttempt> { new(LlmRouterIds.AIRouter, call.Outcome, call.Status, 0, call.DurationMs) },
+        });
     }
 
     /// <summary>Hold one AIRouter slot back from background work for a live conversation, until
@@ -92,23 +126,27 @@ public partial class KliveLLM
     public async Task<KliveLLMResponse?> WarmToolSessionPrefixAsync(string sessionId, List<HFWrapper.HFTool> tools,
         string? modelOverride = null, CancellationToken cancellationToken = default)
     {
+        LlmCaller who;
+        List<HFWrapper.HFMessage> snapshot;
+        string epoch;
+        lock (sessions)
+        {
+            if (!sessions.TryGetValue(sessionId, out var session) || session.structuredMessages.Count == 0) return null;
+            snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
+            epoch = session.cacheEpochID;
+            who = session.caller ?? LlmConsumerCatalog.Callers.KliveAgentTalk;
+        }
+        using var call = BeginCall(who, "warm", sessionId, AIRouterWorkClass.Interactive, stream: false);
         try
         {
-            if (await GetActiveProviderAsync() == LLMProvider.Local) return null;
-
-            List<HFWrapper.HFMessage> snapshot;
-            string epoch;
-            lock (sessions)
-            {
-                if (!sessions.TryGetValue(sessionId, out var session) || session.structuredMessages.Count == 0) return null;
-                snapshot = new List<HFWrapper.HFMessage>(session.structuredMessages);
-                epoch = session.cacheEpochID;
-            }
-
-            var remoteProvider = await GetRemoteProviderConfigurationAsync();
-            string model = string.IsNullOrWhiteSpace(modelOverride) ? remoteProvider.Model : modelOverride.Trim();
-            if (remoteProvider.Provider == LLMProvider.AIRouter)
-                model = await ResolveAIRouterModelAsync(model, remoteProvider, cancellationToken);
+            var plan = await PlanCallAsync(who, forceFreeModel: false, toolSession: true);
+            var route = plan.Primary;
+            var remoteProvider = route.Config!;
+            var (model, redirected) = await ChooseModelAsync(route, modelOverride, cancellationToken);
+            call.Trace.ModelRequested = string.IsNullOrWhiteSpace(modelOverride) ? model : modelOverride.Trim();
+            call.Trace.SetRoute(route.Router.Id, route.Router.Name, model, Telemetry.LlmCosting.BillingName(route.Router.Billing));
+            if (redirected) call.Trace.Flags |= Telemetry.LlmCallFlags.Redirected;
+            call.Trace.CacheEpoch = epoch;
 
             var payload = new HFWrapper.HFLLMInferenceRequest
             {
@@ -129,7 +167,8 @@ public partial class KliveLLM
 
             var response = await SendPayloadWithRetryAsync(remoteProvider, payload, cancellationToken,
                 cachePrefixHint: $"{sessionId}#{epoch}", workClass: AIRouterWorkClass.Interactive);
-            return new KliveLLMResponse
+            var record = call.Succeed(response);
+            var result = new KliveLLMResponse
             {
                 Success = true,
                 SessionId = sessionId,
@@ -142,13 +181,17 @@ public partial class KliveLLM
                 ProviderDurationMs = response.provider_duration_ms,
                 CacheEpochID = epoch,
             };
+            Decorate(result, call.Trace, record);
+            return result;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            call.Fail(new OperationCanceledException(), cancelled: true);
             return null;
         }
         catch (Exception ex)
         {
+            call.Fail(ex, cancelled: false);
             try { await ServiceLog($"Prefix warm-up for {sessionId} failed (the next turn will prefill as usual): {ex.Message}"); } catch { }
             return null;
         }

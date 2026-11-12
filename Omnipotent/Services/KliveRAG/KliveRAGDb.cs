@@ -98,7 +98,11 @@ namespace Omnipotent.Services.KliveRAG
             public void Dispose() { }
         }
 
-        public void Migrate()
+        public void Migrate() => Migrate(int.MaxValue);
+
+        /// <summary>Migrates no further than <paramref name="throughVersion"/>, so a test can stand up a
+        /// store as an earlier build left it and then bring it forward.</summary>
+        internal void Migrate(int throughVersion)
         {
             using var conn = Open();
 
@@ -121,11 +125,12 @@ namespace Omnipotent.Services.KliveRAG
                 var migrations = new (int Version, string Sql)[]
                 {
                     (1, SchemaV1),
+                    (2, SchemaV2),
                 };
 
                 foreach (var (version, sql) in migrations)
                 {
-                    if (currentVersion >= version) continue;
+                    if (currentVersion >= version || version > throughVersion) continue;
                     using (var cmd = conn.CreateCommand())
                     {
                         cmd.Transaction = tx;
@@ -213,6 +218,68 @@ CREATE TABLE IF NOT EXISTS rag_web_cache (
     status     INTEGER NOT NULL,
     doc_id     TEXT
 );
+";
+
+        // What the index holds, kept as it changes (read by RagCounters). /kliverag/stats used to count
+        // on every call: SELECT COUNT(*), COUNT(embedded_at) FROM rag_chunks has no index to answer it,
+        // so it read every chunk row, text included, and the whole table is gigabytes once the Projects
+        // event log is in the index.
+        //
+        // The triggers do the counting, so no write path can forget to: cascaded deletes (a document's
+        // chunks), TTL eviction and the embed queue all pass through them. Each one adds a difference,
+        // never a total, which is what lets rows that predate the counters be added in later
+        // (RagCounters.CountExistingRowsAsync, the only other writer); 'counted_existing' is 1 once that
+        // has happened, and an empty store has nothing to add. Every statement here is a primary-key
+        // lookup, so migrating a large store is instant.
+        //
+        // Two things to keep true. A row in either table must not be replaced with INSERT OR REPLACE:
+        // SQLite removes the old row without firing its delete trigger (recursive_triggers is off), so
+        // RagIndexWriter upserts with ON CONFLICT DO UPDATE. And the bodies below create a missing
+        // counter with INSERT ... WHERE NOT EXISTS rather than OR IGNORE, because a conflict policy on
+        // the statement that fires a trigger replaces the trigger's own.
+        private const string SchemaV2 = @"
+CREATE TABLE IF NOT EXISTS rag_counters (
+    name  TEXT PRIMARY KEY,
+    value INTEGER NOT NULL
+) WITHOUT ROWID;
+
+INSERT OR IGNORE INTO rag_counters(name, value) VALUES ('chunks', 0), ('chunks_embedded', 0);
+INSERT OR IGNORE INTO rag_counters(name, value)
+    SELECT 'counted_existing', NOT (EXISTS (SELECT 1 FROM rag_documents) OR EXISTS (SELECT 1 FROM rag_chunks));
+
+CREATE TRIGGER IF NOT EXISTS rag_documents_count_ai AFTER INSERT ON rag_documents BEGIN
+    INSERT INTO rag_counters(name, value) SELECT 'docs:' || new.source, 0
+        WHERE NOT EXISTS (SELECT 1 FROM rag_counters WHERE name = 'docs:' || new.source);
+    UPDATE rag_counters SET value = value + 1 WHERE name = 'docs:' || new.source;
+END;
+CREATE TRIGGER IF NOT EXISTS rag_documents_count_ad AFTER DELETE ON rag_documents BEGIN
+    INSERT INTO rag_counters(name, value) SELECT 'docs:' || old.source, 0
+        WHERE NOT EXISTS (SELECT 1 FROM rag_counters WHERE name = 'docs:' || old.source);
+    UPDATE rag_counters SET value = value - 1 WHERE name = 'docs:' || old.source;
+END;
+CREATE TRIGGER IF NOT EXISTS rag_documents_count_au AFTER UPDATE OF source ON rag_documents
+WHEN old.source <> new.source BEGIN
+    INSERT INTO rag_counters(name, value) SELECT 'docs:' || old.source, 0
+        WHERE NOT EXISTS (SELECT 1 FROM rag_counters WHERE name = 'docs:' || old.source);
+    INSERT INTO rag_counters(name, value) SELECT 'docs:' || new.source, 0
+        WHERE NOT EXISTS (SELECT 1 FROM rag_counters WHERE name = 'docs:' || new.source);
+    UPDATE rag_counters SET value = value - 1 WHERE name = 'docs:' || old.source;
+    UPDATE rag_counters SET value = value + 1 WHERE name = 'docs:' || new.source;
+END;
+
+CREATE TRIGGER IF NOT EXISTS rag_chunks_count_ai AFTER INSERT ON rag_chunks BEGIN
+    UPDATE rag_counters SET value = value + 1 WHERE name = 'chunks';
+    UPDATE rag_counters SET value = value + 1 WHERE name = 'chunks_embedded' AND new.embedded_at IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS rag_chunks_count_ad AFTER DELETE ON rag_chunks BEGIN
+    UPDATE rag_counters SET value = value - 1 WHERE name = 'chunks';
+    UPDATE rag_counters SET value = value - 1 WHERE name = 'chunks_embedded' AND old.embedded_at IS NOT NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS rag_chunks_count_au AFTER UPDATE OF embedded_at ON rag_chunks
+WHEN (old.embedded_at IS NULL) <> (new.embedded_at IS NULL) BEGIN
+    UPDATE rag_counters SET value = value + (CASE WHEN new.embedded_at IS NULL THEN -1 ELSE 1 END)
+        WHERE name = 'chunks_embedded';
+END;
 ";
 
         // External-content FTS5 mirror over rag_chunks.text, kept in sync by triggers. The

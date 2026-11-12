@@ -20,6 +20,36 @@ internal sealed record KliveAgentRunSettings(
     internal const string ComputerTargetHost = "host";
     internal static readonly string[] ComputerTargets = { ComputerTargetAuto, ComputerTargetContainer, ComputerTargetHost };
 
+    /// <summary>Longest a script may ask for with its own timeoutSeconds.</summary>
+    internal const int MaxScriptTimeoutSeconds = 300;
+
+    /// <summary>How long a compile may take before the script is reported as not run. Its own budget:
+    /// nine live "compile took longer than 30 s" failures were really 42 to 377 s of a busy server.</summary>
+    public int ScriptCompileBudgetSeconds { get; init; } = 120;
+
+    /// <summary>Fix the mechanical compile errors before the model is told (KliveAgentScriptRepair).</summary>
+    public bool ScriptAutoRepair { get; init; } = true;
+
+    /// <summary>How long a conversation's script variables outlive a run, so a follow-up message can use
+    /// them and has no cold first compile. 0 gives every run a new session, as before.</summary>
+    public int KeepScriptSessionMinutes { get; init; } = 20;
+
+    /// <summary>Longest one native or service tool call may run before the model is told it timed out.
+    /// Two live calls ran 2 h and 3 h 16 min with nothing bounding them. 0 turns the limit off.</summary>
+    public int NativeToolDeadlineSeconds { get; init; } = 600;
+
+    internal const string ThinkingBySteps = "steps";
+    internal const string ThinkingByErrors = "errors";
+    internal static readonly string[] ThinkingEscalationModes = { ThinkingBySteps, ThinkingByErrors };
+
+    /// <summary>
+    /// What raises the reasoning effort during a run. "steps" (as it has always been): errors, and also
+    /// simply reaching step 6 (medium) and step 12 (high), so a long run thinks at "high" for nearly all
+    /// of its steps. "errors": only a failing step raises it. The stages model.think.low/medium/high
+    /// record what each level costs per call; switch once those say the step rule is buying nothing.
+    /// </summary>
+    public string ThinkingEscalation { get; init; } = ThinkingBySteps;
+
     internal static async Task<KliveAgentRunSettings> LoadAsync(KliveAgent agent)
     {
         var stream = agent.GetBoolOmniSetting("KliveAgent_StreamTokens", true);
@@ -39,12 +69,25 @@ internal sealed record KliveAgentRunSettings(
         var idle = agent.GetIntOmniSetting("KliveAgent_ModelStreamIdleSeconds", 240);
         var target = agent.GetDropdownOmniSetting("KliveAgent_ComputerTarget", ComputerTargetAuto, ComputerTargets);
         var vision = agent.GetBoolOmniSetting("KliveAgent_VisionEnabled", true);
+        var compileBudget = agent.GetIntOmniSetting("KliveAgent_ScriptCompileBudgetSeconds", 120);
+        var autoRepair = agent.GetBoolOmniSetting("KliveAgent_ScriptAutoRepair", true);
+        var keepSession = agent.GetIntOmniSetting("KliveAgent_KeepScriptSessionMinutes", 20);
+        var toolDeadline = agent.GetIntOmniSetting("KliveAgent_NativeToolDeadlineSeconds", 600);
+        var thinking = agent.GetDropdownOmniSetting("KliveAgent_ThinkingEscalationMode", ThinkingBySteps, ThinkingEscalationModes);
         await Task.WhenAll(stream, computer, screenshots, scriptTimeout, fast, reasoning, tokens, minutes, retries,
-            frames, idle, target, vision);
+            frames, idle, target, vision, compileBudget, autoRepair, keepSession, toolDeadline, thinking);
         return new(await stream, await computer, Math.Max(1, await screenshots), Math.Max(1, await scriptTimeout),
             await fast ?? "", await reasoning ?? "", Math.Max(0, await tokens), Math.Max(0, await minutes),
             Math.Clamp(await retries, 0, 20), Math.Max(1, await frames), Math.Clamp(await idle, 30, 1800),
-            NormalizeTarget(await target), await vision);
+            NormalizeTarget(await target), await vision)
+        {
+            ScriptCompileBudgetSeconds = Math.Clamp(await compileBudget, 10, 900),
+            ScriptAutoRepair = await autoRepair,
+            KeepScriptSessionMinutes = Math.Clamp(await keepSession, 0, 240),
+            NativeToolDeadlineSeconds = Math.Clamp(await toolDeadline, 0, 86_400),
+            ThinkingEscalation = string.Equals((await thinking)?.Trim(), ThinkingByErrors, StringComparison.OrdinalIgnoreCase)
+                ? ThinkingByErrors : ThinkingBySteps,
+        };
     }
 
     internal static string NormalizeTarget(string? value)

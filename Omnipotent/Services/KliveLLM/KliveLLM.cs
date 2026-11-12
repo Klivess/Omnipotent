@@ -41,6 +41,14 @@ namespace Omnipotent.Services.KliveLLM
         ModelUnavailable,
         ProviderUnavailable,
         EmptyResponse,
+        /// <summary>Klives paused this service's model calls from the KliveLLM page.</summary>
+        Paused,
+        /// <summary>The service has spent its KliveLLM budget and its policy is to stop.</summary>
+        BudgetExceeded,
+        /// <summary>The service may not spend per token and its router bills per token.</summary>
+        SpendingNotAllowed,
+        /// <summary>The router the service is assigned to does not exist, is switched off or cannot serve it.</summary>
+        RouterUnavailable,
     }
 
     /// <summary>
@@ -273,6 +281,29 @@ namespace Omnipotent.Services.KliveLLM
             public string ApiKey { get; }
             public string Model { get; }
             public string? ServiceTier { get; }
+
+            private string? routerId;
+            /// <summary>The KliveLLM router this configuration sends to (defaults to the provider's built-in router).</summary>
+            public string RouterId
+            {
+                get => routerId ?? Omnipotent.Services.KliveLLM.LlmRouterRegistry.FromProvider(Provider);
+                set => routerId = value;
+            }
+
+            private LlmBilling? billing;
+            /// <summary>What the router charges. AIRouter is flat-fee; everything else per token unless configured otherwise.</summary>
+            public LlmBilling Billing
+            {
+                get => billing ?? (Provider == LLMProvider.AIRouter ? LlmBilling.Flat : LlmBilling.PerToken);
+                set => billing = value;
+            }
+
+            /// <summary>A reasoning ceiling set for this call's lane, in place of the global ThinkingType.</summary>
+            public string? ThinkingCeiling { get; set; }
+
+            /// <summary>Client-side limits of an added router (never set for AIRouter, which has its own envelope).</summary>
+            public int? MaxParallel { get; set; }
+            public int? RequestsPerMinute { get; set; }
         }
 
         public KliveLLM()
@@ -292,6 +323,9 @@ namespace Omnipotent.Services.KliveLLM
 
         protected override async void ServiceMain()
         {
+            // The ledger, the saved routing and the /klivellm routes come up beside the rest of start-up:
+            // none of them may wait on (or be lost to) a slow llama binary download.
+            _ = Task.Run(StartKliveLlmConsoleAsync);
             LLamaBinariesDownloadPath = await GetStringOmniSetting("CustomLLamaBinariesDownloadLink", "https://github.com/Klivess/Omnipotent/raw/refs/heads/master/OldCPULLamaBinaries.zip", false, true);
             ModelDownloadUrl = await GetOmniSetting("LocalLLMGGUFDownloadURL", OmniSettingType.String, false, true);
             huggingFaceToken = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
@@ -414,8 +448,16 @@ namespace Omnipotent.Services.KliveLLM
         // resolution and on the settings-changed event, so it is never more than one turn stale.
         private volatile int cachedActiveProvider = (int)LLMProvider.HuggingFace;
 
+        /// <summary>Test seam: answers RemoteLLMProvider without the settings service.</summary>
+        internal LLMProvider? ActiveProviderOverride { get; set; }
+
         private async Task<LLMProvider> GetActiveProviderAsync()
         {
+            if (ActiveProviderOverride is { } forced)
+            {
+                cachedActiveProvider = (int)forced;
+                return forced;
+            }
             string configuredProvider = await GetDropdownOmniSetting("RemoteLLMProvider", "HuggingFace", ProviderOptions, false, false);
             var provider = ParseProvider(configuredProvider);
             cachedActiveProvider = (int)provider;
@@ -427,11 +469,22 @@ namespace Omnipotent.Services.KliveLLM
         /// cost meter in Omnipotent has to answer before it books spend. Synchronous by design: it
         /// serves the per-turn budget check in Projects, which cannot await a settings read.
         /// </summary>
-        public bool IsFlatFeeProviderNow() => IsFlatFee((LLMProvider)cachedActiveProvider);
+        public bool IsFlatFeeProviderNow(LlmCaller? caller = null)
+        {
+            if (caller == null)
+                return !(RouterById(Routing.Peek.Default.Router ?? DefaultRouterIdNow())?.BillsPerToken ?? !IsFlatFee((LLMProvider)cachedActiveProvider));
+            var decision = ResolveRouteNow(caller);
+            return decision.Primary != null && !decision.Primary.BillsPerToken;
+        }
 
         /// <summary>Authoritative (settings-reading) form of <see cref="IsFlatFeeProviderNow"/>, for
-        /// callers that are already on an async path and want to prime the cache.</summary>
-        public async Task<bool> IsFlatFeeProviderAsync() => IsFlatFee(await GetActiveProviderAsync());
+        /// callers that are already on an async path and want to prime the cache. Answers for the
+        /// router the calling service is routed to.</summary>
+        public async Task<bool> IsFlatFeeProviderAsync(LlmCaller? caller = null, [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
+        {
+            var decision = await ResolveRouteAsync(LlmConsumerCatalog.Resolve(caller, callerFile));
+            return decision.Primary != null && !decision.Primary.BillsPerToken;
+        }
 
         /// <summary>A model setting someone has deliberately emptied or switched off ("nothing", "none", "off"…), not a model ID.</summary>
         internal static bool IsSwitchedOffModelID(string? modelID) =>
@@ -627,6 +680,8 @@ namespace Omnipotent.Services.KliveLLM
         }
 
 
+        /// <param name="caller">Who is asking. Left null it is named from the calling file
+        /// (<paramref name="callerFile"/>), which is right for every call site that serves one lane.</param>
         public async Task<KliveLLMResponse> QueryLLM(
             string prompt,
             string? sessionId = null,
@@ -636,44 +691,78 @@ namespace Omnipotent.Services.KliveLLM
             CancellationToken cancellationToken = default,
             Action<string>? onToken = null,
             string? thinkingOverride = null,
-            bool honourThinkingOnAIRouter = false)
+            bool honourThinkingOnAIRouter = false,
+            LlmCaller? caller = null,
+            [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
         {
-            if (useFreeModel)
+            var who = LlmConsumerCatalog.Resolve(caller, callerFile);
+            using var call = BeginCall(who, "chat", sessionId, AIRouterWorkClass.OneShot, onToken != null);
+            try
             {
-                return await QueryRemoteLLMAsync(
+                // A free-model call goes to OpenRouter's free model unless its service is routed elsewhere;
+                // everything else follows its service's route, which with nothing set is RemoteLLMProvider.
+                var plan = await PlanCallAsync(who, useFreeModel, toolSession: false);
+                using var laneGate = await EnterLaneGateAsync(who, plan.Decision.MaxParallel, call.Trace, cancellationToken);
+                if (plan.IsLocal)
+                {
+                    call.Trace.SetRoute(LlmRouterIds.Local, plan.Primary.Router.Name, "local", "free");
+                    var local = await QueryLocalLLMAsync(
+                        prompt,
+                        sessionId,
+                        maxTokensOverride,
+                        systemPrompt: systemPrompt,
+                        cancellationToken: cancellationToken,
+                        onToken: onToken);
+                    var localRecord = local.Success
+                        ? call.Succeed(LocalUsage(prompt, local.Response), Telemetry.LlmOutcome.Ok)
+                        : call.Succeed(null, Telemetry.LlmOutcome.Model, local.ErrorMessage);
+                    if (localRecord != null) localRecord.Flags |= Telemetry.LlmCallFlags.Estimated;
+                    Decorate(local, call.Trace, localRecord);
+                    return local;
+                }
+
+                var response = await QueryRemoteLLMAsync(
                     prompt,
                     sessionId,
                     maxTokensOverride,
                     systemPrompt,
-                    forceFreeModel: true,
+                    forceFreeModel: useFreeModel,
                     cancellationToken: cancellationToken,
                     onToken: onToken,
                     thinkingOverride: thinkingOverride,
-                    honourThinkingOnAIRouter: honourThinkingOnAIRouter);
+                    honourThinkingOnAIRouter: honourThinkingOnAIRouter,
+                    plan: plan);
+                var record = call.Succeed(null);
+                Decorate(response, call.Trace, record);
+                return response;
             }
-
-            if (await GetActiveProviderAsync() != LLMProvider.Local)
+            catch (Exception ex)
             {
-                var hfResponse = await QueryRemoteLLMAsync(
-                    prompt,
-                    sessionId,
-                    maxTokensOverride,
-                    systemPrompt,
-                    cancellationToken: cancellationToken,
-                    onToken: onToken,
-                    thinkingOverride: thinkingOverride,
-                    honourThinkingOnAIRouter: honourThinkingOnAIRouter);
-
-                return hfResponse;
+                call.Fail(ex, cancellationToken.IsCancellationRequested);
+                throw;
             }
+        }
 
-            return await QueryLocalLLMAsync(
-                prompt,
-                sessionId,
-                maxTokensOverride,
-                systemPrompt: systemPrompt,
-                cancellationToken: cancellationToken,
-                onToken: onToken);
+        /// <summary>The local model reports no usage, so its turns are counted by a characters-per-token estimate.</summary>
+        private static HFWrapper.HFLLMInferenceResponse LocalUsage(string? prompt, string? reply) => new()
+        {
+            model = "local",
+            usage = new HFWrapper.HFLLMInferenceResponse.UsageDetails
+            {
+                prompt_tokens = ((prompt?.Length ?? 0) + 3) / 4,
+                completion_tokens = ((reply?.Length ?? 0) + 3) / 4,
+            },
+        };
+
+        /// <summary>Waits for one of a lane's parallel slots when its routing caps them; the wait is queue time.</summary>
+        private async Task<IDisposable?> EnterLaneGateAsync(LlmCaller caller, int? maxParallel, Telemetry.LlmCallTrace trace, CancellationToken cancellationToken)
+        {
+            if (maxParallel is not > 0) return null;
+            var waited = System.Diagnostics.Stopwatch.StartNew();
+            trace.SetState(Telemetry.LlmCallState.Queued);
+            var gate = await Gates.EnterAsync("lane:" + caller.Key, maxParallel, cancellationToken);
+            trace.AddQueue(waited.ElapsedMilliseconds);
+            return gate;
         }
 
         // ── Native structured tool calling ──
@@ -684,9 +773,25 @@ namespace Omnipotent.Services.KliveLLM
 
         /// <summary>True when the active provider can use native structured tool calling (any remote
         /// provider). The local LLama path has no tool channel and must use the {{{ }}} text protocol.</summary>
-        public async Task<bool> SupportsNativeToolCallingAsync()
+        public async Task<bool> SupportsNativeToolCallingAsync(LlmCaller? caller = null, [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
         {
-            return await GetActiveProviderAsync() != LLMProvider.Local;
+            var decision = await ResolveRouteAsync(LlmConsumerCatalog.Resolve(caller, callerFile));
+            return !decision.IsLocal;
+        }
+
+        /// <summary>The model a router sends when nothing else picks one.</summary>
+        internal async Task<string> RouterDefaultModelAsync(LlmRouterDefinition router)
+        {
+            return router.Id.ToLowerInvariant() switch
+            {
+                LlmRouterIds.OpenRouter => await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true),
+                LlmRouterIds.OpenRouterFree => await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, true),
+                LlmRouterIds.Custom => await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, true),
+                LlmRouterIds.AIRouter => await GetStringOmniSetting("AIRouterModelID", DefaultAIRouterModel, false, true),
+                LlmRouterIds.HuggingFace => await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true),
+                LlmRouterIds.Local => "local",
+                _ => router.DefaultModel ?? "",
+            };
         }
 
         /// <summary>
@@ -697,32 +802,27 @@ namespace Omnipotent.Services.KliveLLM
         /// image/audio/document flags come from the OpenRouter model catalog when reachable, else a
         /// conservative static family table. The result is safe to call on hot paths: the catalog is cached.
         /// </summary>
-        public async Task<ModelCapabilities> GetModelCapabilitiesAsync(string? model = null, CancellationToken cancellationToken = default)
+        public async Task<ModelCapabilities> GetModelCapabilitiesAsync(string? model = null, CancellationToken cancellationToken = default,
+            LlmCaller? caller = null, [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
         {
-            LLMProvider provider = await GetActiveProviderAsync();
-            if (provider == LLMProvider.Local)
-                return new ModelCapabilities(NativeToolCalling: false, ImageInput: false, AudioInput: false, DocumentInput: false, PromptCaching: false, Reasoning: false);
+            var decision = await ResolveRouteAsync(LlmConsumerCatalog.Resolve(caller, callerFile));
+            var router = decision.Primary;
+            if (router == null || router.IsLocal)
+                return new ModelCapabilities(NativeToolCalling: router != null && !router.IsLocal, ImageInput: false, AudioInput: false, DocumentInput: false, PromptCaching: false, Reasoning: false);
 
             string modelId = model?.Trim() ?? string.Empty;
-            if (string.IsNullOrWhiteSpace(modelId))
-            {
-                modelId = provider switch
-                {
-                    LLMProvider.OpenRouter => await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true),
-                    LLMProvider.CustomOpenAI => await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, true),
-                    LLMProvider.AIRouter => await GetStringOmniSetting("AIRouterModelID", DefaultAIRouterModel, false, true),
-                    _ => await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true),
-                };
-            }
+            // A pinned model is what will be sent, whatever the caller names.
+            if (decision.Pin && !string.IsNullOrWhiteSpace(decision.Model)) modelId = decision.Model!;
+            if (string.IsNullOrWhiteSpace(modelId)) modelId = decision.Model ?? await RouterDefaultModelAsync(router);
 
-            if (provider == LLMProvider.OpenRouter)
+            if (router.Kind == "openrouter")
             {
                 var catalog = await GetOpenRouterCapabilityCatalogAsync(cancellationToken);
                 if (catalog != null && catalog.TryGetValue(modelId, out var caps))
                     return caps;
             }
 
-            if (provider == LLMProvider.AIRouter)
+            if (router.Kind == "airouter")
                 return AIRouterModelCapabilities(modelId);
 
             return StaticModelCapabilities(modelId);
@@ -836,24 +936,35 @@ namespace Omnipotent.Services.KliveLLM
 
         /// <summary>Projects uses this to run OpenRouter-specific credit preflight only when its
         /// ordinary wake requests will actually use OpenRouter.</summary>
-        public async Task<bool> IsOpenRouterActiveAsync()
+        public async Task<bool> IsOpenRouterActiveAsync(LlmCaller? caller = null, [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
         {
-            return await GetActiveProviderAsync() == LLMProvider.OpenRouter;
+            var decision = await ResolveRouteAsync(LlmConsumerCatalog.Resolve(caller, callerFile));
+            return decision.Primary?.Kind == "openrouter";
         }
 
         /// <summary>Begin (or reset) a tool-calling session, seeding its structured message log with the
-        /// system prompt. Subsequent turns are appended via AppendUserMessageToToolSession / AppendToolResult.</summary>
-        public void StartToolSession(string sessionId, string? systemPrompt)
+        /// system prompt. Subsequent turns are appended via AppendUserMessageToToolSession / AppendToolResult.
+        /// The session remembers <paramref name="caller"/> (or the calling file's service), so every turn
+        /// of it is routed and attributed to the same lane.</summary>
+        public void StartToolSession(string sessionId, string? systemPrompt, LlmCaller? caller = null,
+            [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
         {
             if (string.IsNullOrWhiteSpace(sessionId)) throw new ArgumentException("sessionId required", nameof(sessionId));
             lock (sessions)
             {
                 var s = new KliveLLMSession(this, false) { sessionId = sessionId };
+                s.caller = LlmConsumerCatalog.Resolve(caller, callerFile);
                 s.structuredMessages.Clear();
                 if (!string.IsNullOrWhiteSpace(systemPrompt))
                     s.structuredMessages.Add(new HFWrapper.HFMessage { role = "system", content = systemPrompt + ThinkingDirective });
                 sessions[sessionId] = s;
             }
+        }
+
+        /// <summary>The lane a tool session belongs to, or null when there is no such session.</summary>
+        public LlmCaller? GetToolSessionCaller(string sessionId)
+        {
+            lock (sessions) return sessions.TryGetValue(sessionId ?? "", out var s) ? s.caller : null;
         }
 
         /// <summary>
@@ -1508,7 +1619,8 @@ namespace Omnipotent.Services.KliveLLM
         /// Off by default so every existing AIRouter caller keeps the provider's default reasoning;
         /// KliveAgent opts in, which is what makes its adaptive low/medium/high real on AIRouter.
         /// </param>
-        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0, AIRouterWorkClass? workClass = null, bool honourThinkingOnAIRouter = false)
+        public async Task<KliveLLMResponse> QueryToolSessionAsync(string sessionId, List<HFWrapper.HFTool> tools, int? maxTokensOverride = null, string? modelOverride = null, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, Action<HFWrapper.HFToolCall>? onToolCallComplete = null, IReadOnlyList<string>? modelRoutes = null, int? compactAboveTokensOverride = null, int? compactKeepRecentMessagesOverride = null, int? contextWindowTokensOverride = null, bool enableOpenRouterContextCompression = false, ModelSamplingParameters? samplingParameters = null, int compactProtectPrefixMessages = 0, AIRouterWorkClass? workClass = null, bool honourThinkingOnAIRouter = false,
+            LlmCaller? caller = null, [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
         {
             KliveLLMSession session;
             List<HFWrapper.HFMessage> snapshot;
@@ -1585,11 +1697,17 @@ namespace Omnipotent.Services.KliveLLM
                         .Sum(EstimateMessageTokens);
             }
 
+            LlmCaller who = caller ?? session.caller ?? LlmConsumerCatalog.FromCallSite(callerFile);
+            using var call = BeginCall(who, "tool", sessionId, workClass, onToken != null);
+            call.Trace.CacheEpoch = cacheEpochID;
+            call.Trace.CacheEpochTurn = cacheEpochTurnIndex;
+            if (contextWasCompacted) call.Trace.Flags |= Telemetry.LlmCallFlags.Compacted;
+
             if (fixedRequestExceedsWindow
                 || (preflightMessageBudget.HasValue
                     && irreducibleSystemTokens > preflightMessageBudget.Value))
             {
-                return new KliveLLMResponse
+                var refused = new KliveLLMResponse
                 {
                     Success = false,
                     ErrorMessage = $"The fixed system prompt, authoritative brief, tool schemas and output reserve cannot fit the configured {contextWindowTokensOverride} token context window.",
@@ -1599,6 +1717,8 @@ namespace Omnipotent.Services.KliveLLM
                     CacheEpochID = cacheEpochID,
                     CacheEpochTurnIndex = cacheEpochTurnIndex,
                 };
+                call.Refuse(refused.ErrorMessage);
+                return refused;
             }
 
             // If local deterministic compaction cannot fit an irreducible system prompt + tool
@@ -1608,7 +1728,7 @@ namespace Omnipotent.Services.KliveLLM
                 && EstimateToolSessionTokens(snapshot) > preflightMessageBudget.Value
                 && !enableOpenRouterContextCompression)
             {
-                return new KliveLLMResponse
+                var refused = new KliveLLMResponse
                 {
                     Success = false,
                     ErrorMessage = $"Tool session cannot fit the configured {contextWindowTokensOverride} token context window after safe compaction.",
@@ -1618,20 +1738,51 @@ namespace Omnipotent.Services.KliveLLM
                     CacheEpochID = cacheEpochID,
                     CacheEpochTurnIndex = cacheEpochTurnIndex,
                 };
+                call.Refuse(refused.ErrorMessage);
+                return refused;
             }
 
-            var response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride,
-                cacheSessionId: sessionId, previousCacheMessageCount: previousCacheMessageCount, modelOverride: modelOverride,
-                cancellationToken: cancellationToken, onToken: onToken,
-                thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete,
-                modelRoutes: modelRoutes,
-                enableOpenRouterContextCompression: enableOpenRouterContextCompression,
-                samplingParameters: samplingParameters,
-                // Session id AND cache epoch: the epoch is what makes a compaction or brief rotation
-                // read as a genuinely new prefix rather than a continuation of one that no longer exists.
-                cachePrefixHint: $"{sessionId}#{cacheEpochID}",
-                workClass: workClass,
-                honourThinkingOnAIRouter: honourThinkingOnAIRouter);
+            HFWrapper.HFLLMInferenceResponse response;
+            try
+            {
+                var plan = await PlanCallAsync(who, forceFreeModel: false, toolSession: true);
+                string plannedRouter = plan.Primary.Router.Id;
+                lock (sessions)
+                {
+                    // A different router never holds this conversation's prefix: start a new cache epoch,
+                    // exactly as a compaction does, so the scheduler and the ledger read it as a cold start.
+                    if (session.lastRouterId != null && !string.Equals(session.lastRouterId, plannedRouter, StringComparison.OrdinalIgnoreCase))
+                    {
+                        session.cacheEpochID = Guid.NewGuid().ToString("N");
+                        session.cacheEpochTurnIndex = 0;
+                        previousCacheMessageCount = 0;
+                        cacheEpochID = session.cacheEpochID;
+                        cacheEpochTurnIndex = 1;
+                        call.Trace.CacheEpoch = cacheEpochID;
+                        call.Trace.CacheEpochTurn = 1;
+                    }
+                }
+                using var laneGate = await EnterLaneGateAsync(who, plan.Decision.MaxParallel, call.Trace, cancellationToken);
+                response = await SendRemoteToolRequestAsync(snapshot, tools, maxTokensOverride,
+                    cacheSessionId: sessionId, previousCacheMessageCount: previousCacheMessageCount, modelOverride: modelOverride,
+                    cancellationToken: cancellationToken, onToken: onToken,
+                    thinkingOverride: thinkingOverride, onToolCallComplete: onToolCallComplete,
+                    modelRoutes: modelRoutes,
+                    enableOpenRouterContextCompression: enableOpenRouterContextCompression,
+                    samplingParameters: samplingParameters,
+                    // Session id AND cache epoch: the epoch is what makes a compaction or brief rotation
+                    // read as a genuinely new prefix rather than a continuation of one that no longer exists.
+                    cachePrefixHint: $"{sessionId}#{cacheEpochID}",
+                    workClass: workClass,
+                    honourThinkingOnAIRouter: honourThinkingOnAIRouter,
+                    plan: plan,
+                    lane: who);
+            }
+            catch (Exception ex)
+            {
+                call.Fail(ex, cancellationToken.IsCancellationRequested);
+                throw;
+            }
             var msg = response.choices[0].message;
             var rawContent = HFWrapper.ContentToText(msg?.content);
             var nativeToolCalls = (msg?.tool_calls != null && msg.tool_calls.Count > 0) ? msg.tool_calls : null;
@@ -1641,7 +1792,8 @@ namespace Omnipotent.Services.KliveLLM
                 // Do not append the raw envelope to the session: a later retry must start from the
                 // last clean user/tool turn, and no caller should mistake provider protocol markup
                 // for prose. Projects resets sessions that do not end at a clean assistant turn.
-                return new KliveLLMResponse
+                var protocolRecord = call.Succeed(response, Telemetry.LlmOutcome.Error, normalized.Error);
+                var protocolFailure = new KliveLLMResponse
                 {
                     Success = false,
                     ErrorMessage = normalized.Error,
@@ -1671,13 +1823,15 @@ namespace Omnipotent.Services.KliveLLM
                     CacheEpochID = cacheEpochID,
                     CacheEpochTurnIndex = cacheEpochTurnIndex,
                 };
+                Decorate(protocolFailure, call.Trace, protocolRecord);
+                return protocolFailure;
             }
 
             var content = normalized.Content;
             var toolCalls = normalized.ToolCalls;
             if (normalized.Adapted && onToolCallComplete != null && toolCalls != null)
-                foreach (var call in toolCalls)
-                    try { onToolCallComplete(call); } catch { }
+                foreach (var toolCall in toolCalls)
+                    try { onToolCallComplete(toolCall); } catch { }
 
             lock (sessions)
             {
@@ -1694,9 +1848,11 @@ namespace Omnipotent.Services.KliveLLM
                 session.lastUpdated = DateTime.UtcNow;
                 session.lastCacheMessageCount = snapshot.Count;
                 session.cacheEpochTurnIndex = cacheEpochTurnIndex;
+                if (!string.IsNullOrEmpty(call.Trace.Router)) session.lastRouterId = call.Trace.Router;
             }
 
-            return new KliveLLMResponse
+            var successRecord = call.Succeed(response);
+            var result = new KliveLLMResponse
             {
                 Response = content,
                 RawResponse = rawContent,
@@ -1728,9 +1884,11 @@ namespace Omnipotent.Services.KliveLLM
                 CacheEpochID = cacheEpochID,
                 CacheEpochTurnIndex = cacheEpochTurnIndex,
             };
+            Decorate(result, call.Trace, successRecord);
+            return result;
         }
 
-        private static string? SelectedOpenRouterProvider(HFWrapper.OpenRouterMetadata? metadata)
+        internal static string? SelectedOpenRouterProvider(HFWrapper.OpenRouterMetadata? metadata)
         {
             string? selected = metadata?.endpoints?.available?
                 .FirstOrDefault(endpoint => endpoint.selected)?.provider;
@@ -1739,7 +1897,7 @@ namespace Omnipotent.Services.KliveLLM
                 .LastOrDefault(attempt => !string.IsNullOrWhiteSpace(attempt.provider))?.provider;
         }
 
-        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, bool honourThinkingOnAIRouter = false)
+        private async Task<KliveLLMResponse> QueryRemoteLLMAsync(string prompt, string? sessionId, int? maxTokensOverride, string? systemPrompt = null, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, bool honourThinkingOnAIRouter = false, LlmCallPlan? plan = null)
         {
             // ensure session
             if (string.IsNullOrEmpty(sessionId))
@@ -1772,7 +1930,7 @@ namespace Omnipotent.Services.KliveLLM
                 }
             }
             session.chatHistory.AddMessage(AuthorRole.User, StampIncoming(prompt));
-            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel, cancellationToken, onToken, thinkingOverride, honourThinkingOnAIRouter);
+            var response = await SendRemoteInferenceRequestAsync(session.chatHistory, maxTokensOverride, forceFreeModel, cancellationToken, onToken, thinkingOverride, honourThinkingOnAIRouter, plan);
             {
                 // Providers occasionally return an assistant turn with null content. Coalesce to an
                 // empty string so it neither crashes downstream parsing nor poisons the session
@@ -1802,13 +1960,16 @@ namespace Omnipotent.Services.KliveLLM
         // real inference call on a turn reuses a warm connection instead of paying the TLS/connect RTT.
         // Meant to be fired fire-and-forget at the START of an agent run so it overlaps with prompt
         // assembly. Errors are swallowed — a failed warm-up must never affect the actual request.
-        public async Task WarmUpConnectionAsync(CancellationToken cancellationToken = default)
+        public async Task WarmUpConnectionAsync(CancellationToken cancellationToken = default, LlmCaller? caller = null,
+            [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
         {
             try
             {
                 if (client == null) return;
-                if (await GetActiveProviderAsync() == LLMProvider.Local) return;
-                RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync();
+                var decision = await ResolveRouteAsync(LlmConsumerCatalog.Resolve(caller, callerFile));
+                if (decision.Primary == null || decision.IsLocal) return;
+                var remoteProvider = await BuildRouterConfigurationAsync(decision.Primary, decision);
+                if (remoteProvider == null) return;
                 using var request = new HttpRequestMessage(HttpMethod.Get, remoteProvider.ChatCompletionsEndpoint);
                 request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", remoteProvider.ApiKey);
                 // We don't care about the status (a GET to the completions endpoint may 404/405) — the
@@ -1818,125 +1979,34 @@ namespace Omnipotent.Services.KliveLLM
             catch { /* warm-up is best-effort */ }
         }
 
+        /// <summary>
+        /// The configuration of the DEFAULT route: what every call used before per-service routing, and
+        /// still what a call with no routing set gets. The free-model flag selects OpenRouter's free model;
+        /// switched off, it falls back to the default router when that is free or flat-fee, as it always has.
+        /// </summary>
         private async Task<RemoteLLMProviderConfiguration> GetRemoteProviderConfigurationAsync(bool forceFreeModel = false)
         {
-            // Free-model fast path: always use OpenRouter with the FreeOpenRouterModelID setting,
-            // regardless of the user's configured RemoteLLMProvider. Token still comes from
-            // OpenRouterLLMToken because OpenRouter requires authentication for every request.
             if (forceFreeModel)
             {
+                var free = await BuildRouterConfigurationAsync(RouterById(LlmRouterIds.OpenRouterFree)!);
+                if (free != null) return free;
                 string freeModel = await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, true);
-                if (IsSwitchedOffModelID(freeModel))
-                {
-                    // Free-model callers (Omniscience profiles, extraction, detective, search, replica) exist to
-                    // spend nothing. With the free route switched off they still cost nothing extra on a
-                    // flat-fee router, so they run there; on a per-token provider they would start billing, so
-                    // they stop with a reason instead. Sending the setting verbatim made every one of them a
-                    // 400 ("nothing is not a valid model ID") — 2026-10-27/28 the whole nightly failed that way.
-                    if (await IsFlatFeeProviderAsync()) return await GetRemoteProviderConfigurationAsync(forceFreeModel: false);
-                    throw new InvalidOperationException(
-                        $"The free model is switched off (FreeOpenRouterModelID = '{freeModel}') and the active provider bills per token, "
-                        + "so free-model work is not run. Set FreeOpenRouterModelID to an OpenRouter free model (e.g. openrouter/free) to resume it.");
-                }
-                string freeToken = await GetOmniSetting("OpenRouterLLMToken", OmniSettingType.String, true, false);
-                if (string.IsNullOrWhiteSpace(freeToken))
-                {
-                    throw new InvalidOperationException("OpenRouterLLMToken is missing (required to use the free OpenRouter model).");
-                }
-                string freeServiceTier = await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
-                return new RemoteLLMProviderConfiguration(
-                    LLMProvider.OpenRouter,
-                    "OpenRouter (free)",
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    freeToken,
-                    freeModel,
-                    freeServiceTier);
+                // Free-model callers (Omniscience profiles, extraction, detective, search, replica) exist to
+                // spend nothing. With the free route switched off they still cost nothing extra on a
+                // flat-fee router, so they run there; on a per-token provider they would start billing, so
+                // they stop with a reason instead. Sending the setting verbatim made every one of them a
+                // 400 ("nothing is not a valid model ID") — 2026-10-27/28 the whole nightly failed that way.
+                if (await IsFlatFeeProviderAsync(LlmConsumerCatalog.Callers.Internal)) return await GetRemoteProviderConfigurationAsync(forceFreeModel: false);
+                throw new InvalidOperationException(
+                    $"The free model is switched off (FreeOpenRouterModelID = '{freeModel}') and the active provider bills per token, "
+                    + "so free-model work is not run. Set FreeOpenRouterModelID to an OpenRouter free model (e.g. openrouter/free) to resume it.");
             }
 
             string configuredProvider = await GetDropdownOmniSetting("RemoteLLMProvider", "HuggingFace", ProviderOptions, false, true);
-
-            if (string.Equals(configuredProvider, "OpenRouter", StringComparison.OrdinalIgnoreCase))
-            {
-                string openRouterToken = await GetOmniSetting("OpenRouterLLMToken", OmniSettingType.String, true, false);
-                string openRouterModel = await GetStringOmniSetting("OpenRouterModelID", DefaultOpenRouterModel, false, true);
-
-                if (string.IsNullOrWhiteSpace(openRouterToken))
-                {
-                    throw new InvalidOperationException("OpenRouterLLMToken is missing.");
-                }
-
-                string openRouterServiceTier = await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
-                return new RemoteLLMProviderConfiguration(
-                    LLMProvider.OpenRouter,
-                    "OpenRouter",
-                    "https://openrouter.ai/api/v1/chat/completions",
-                    openRouterToken,
-                    openRouterModel,
-                    openRouterServiceTier);
-            }
-
-            if (string.Equals(configuredProvider, CustomOpenAIProviderOption, StringComparison.OrdinalIgnoreCase))
-            {
-                string customToken = await GetOmniSetting("CustomOpenAILLMToken", OmniSettingType.String, true, false);
-                string customEndpoint = ResolveChatCompletionsEndpoint(
-                    await GetStringOmniSetting("CustomOpenAIEndpointURL", DefaultCustomOpenAIEndpoint, false, true));
-                string customModel = await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, true);
-
-                if (string.IsNullOrWhiteSpace(customEndpoint))
-                {
-                    throw new InvalidOperationException("CustomOpenAIEndpointURL is missing.");
-                }
-
-                if (string.IsNullOrWhiteSpace(customToken))
-                {
-                    throw new InvalidOperationException("CustomOpenAILLMToken is missing.");
-                }
-
-                return new RemoteLLMProviderConfiguration(
-                    LLMProvider.CustomOpenAI,
-                    CustomOpenAIProviderOption,
-                    customEndpoint,
-                    customToken,
-                    customModel);
-            }
-
-            if (ParseProvider(configuredProvider) == LLMProvider.AIRouter)
-            {
-                string aiRouterToken = await GetOmniSetting("AIRouterLLMToken", OmniSettingType.String, true, false);
-                string aiRouterModel = await GetStringOmniSetting("AIRouterModelID", DefaultAIRouterModel, false, true);
-
-                if (string.IsNullOrWhiteSpace(aiRouterToken))
-                {
-                    throw new InvalidOperationException("AIRouterLLMToken is missing.");
-                }
-
-                return new RemoteLLMProviderConfiguration(
-                    LLMProvider.AIRouter,
-                    AIRouterProviderOption,
-                    ResolveChatCompletionsEndpoint(AIRouterEndpoint),
-                    aiRouterToken,
-                    aiRouterModel);
-            }
-
-            if (string.Equals(configuredProvider, "Local", StringComparison.OrdinalIgnoreCase))
-            {
-                throw new InvalidOperationException("Remote provider configuration was requested while RemoteLLMProvider is set to Local.");
-            }
-
-            string huggingFaceModel = await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true);
-            string huggingFaceApiKey = await GetOmniSetting("HuggingFaceLLMToken", OmniSettingType.String, true, false);
-
-            if (string.IsNullOrWhiteSpace(huggingFaceApiKey))
-            {
-                throw new InvalidOperationException("HuggingFaceLLMToken is missing.");
-            }
-
-            return new RemoteLLMProviderConfiguration(
-                LLMProvider.HuggingFace,
-                "HuggingFace",
-                "https://router.huggingface.co/v1/chat/completions",
-                huggingFaceApiKey,
-                huggingFaceModel);
+            var provider = ParseProvider(configuredProvider);
+            cachedActiveProvider = (int)provider;
+            var router = RouterById(LlmRouterRegistry.FromProvider(provider))!;
+            return (await BuildRouterConfigurationAsync(router))!;
         }
 
         // Bounded retry policy for the remote LLM call. Only transient failures (timeouts,
@@ -2002,7 +2072,9 @@ namespace Omnipotent.Services.KliveLLM
             if (remoteProvider.Provider != LLMProvider.AIRouter) return null;
             var ticket = BuildWorkTicket(cachePrefixHint, workClass, payload.model ?? remoteProvider.Model, intent);
             var acquire = FairUse.AcquireAsync(EstimateRequestTokens(payload), ticket, cancellationToken);
-            if (acquire.IsCompleted || CurrentActivityScope == null) return await acquire;
+            if (acquire.IsCompleted) return await acquire;
+            CurrentTrace?.SetState(Telemetry.LlmCallState.Queued);
+            if (CurrentActivityScope == null) return await acquire;
 
             // A queued request is healthy but silent. Say so, so a caller's stall detector can tell
             // "waiting for one of three shared slots" from "wedged".
@@ -2073,9 +2145,9 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Chooses the model to actually send AIRouter: the caller's, when AIRouter serves it,
         /// otherwise the configured <c>AIRouterModelID</c>. Non-AIRouter providers are untouched.</summary>
         private async Task<string> ResolveAIRouterModelAsync(
-            string? requested, RemoteLLMProviderConfiguration remoteProvider, CancellationToken cancellationToken)
+            string? requested, RemoteLLMProviderConfiguration remoteProvider, CancellationToken cancellationToken, string? fallbackModel = null)
         {
-            string fallback = remoteProvider.Model;
+            string fallback = string.IsNullOrWhiteSpace(fallbackModel) ? remoteProvider.Model : fallbackModel;
             string model = (requested ?? string.Empty).Trim();
             if (model.Length == 0) return fallback;
 
@@ -2186,28 +2258,74 @@ namespace Omnipotent.Services.KliveLLM
             return coolOff;
         }
 
-        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, bool honourThinkingOnAIRouter = false)
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendRemoteInferenceRequestAsync(ChatHistory messages, int? maxTokensOverride, bool forceFreeModel = false, CancellationToken cancellationToken = default, Action<string>? onToken = null, string? thinkingOverride = null, bool honourThinkingOnAIRouter = false, LlmCallPlan? plan = null)
         {
-            RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
-
-            HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
+            plan ??= await PlanCallAsync(LlmConsumerCatalog.Callers.Internal, forceFreeModel, toolSession: false);
+            return await SendWithFallbackAsync(plan, LlmConsumerCatalog.Callers.Internal, cancellationToken, requestedModel: null, async (route, model) =>
             {
-                model = remoteProvider.Model,
-                stream = false,
-                max_tokens = maxTokensOverride,
-            };
-            ApplyServiceTier(ref payload, remoteProvider);
-            ApplyUsageAccounting(ref payload, remoteProvider);
-            ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride, honourThinkingOnAIRouter);
-            payload.BuildMessagesFromChatHistory(messages);
-            ApplyPromptCaching(ref payload, remoteProvider);
+                RemoteLLMProviderConfiguration remoteProvider = route.Config!;
+                HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
+                {
+                    model = model,
+                    stream = false,
+                    max_tokens = maxTokensOverride,
+                };
+                ApplyServiceTier(ref payload, remoteProvider);
+                ApplyUsageAccounting(ref payload, remoteProvider);
+                ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride, honourThinkingOnAIRouter);
+                payload.BuildMessagesFromChatHistory(messages);
+                ApplyPromptCaching(ref payload, remoteProvider);
 
-            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-            var response = await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
-            stopwatch.Stop();
-            response.request_provider = remoteProvider.Provider.ToString();
-            response.request_duration_ms = stopwatch.ElapsedMilliseconds;
-            return response;
+                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                var response = await SendInferencePayloadAsync(remoteProvider, payload, cancellationToken, onToken);
+                stopwatch.Stop();
+                response.request_provider = remoteProvider.Provider.ToString();
+                response.request_duration_ms = stopwatch.ElapsedMilliseconds;
+                return response;
+            });
+        }
+
+        /// <summary>
+        /// Sends one call along its plan: the primary router, then each fallback in turn when the router
+        /// before it failed on its own side (never for a bad request, a cancel, or a stream that already
+        /// produced output). Each router gets a payload built for it, so the primary's request is exactly
+        /// the request this call made before routing existed.
+        /// </summary>
+        private async Task<HFWrapper.HFLLMInferenceResponse> SendWithFallbackAsync(LlmCallPlan plan, LlmCaller lane, CancellationToken cancellationToken,
+            string? requestedModel, Func<LlmPlannedRoute, string, Task<HFWrapper.HFLLMInferenceResponse>> send)
+        {
+            var trace = CurrentTrace;
+            string laneKey = trace?.Caller.Key ?? lane.Key;
+            string service = trace?.Caller.Service ?? lane.Service;
+            for (int i = 0; ; i++)
+            {
+                var route = plan.Routes[i];
+                var (model, redirected) = await ChooseModelAsync(route, requestedModel, cancellationToken);
+                if (trace != null)
+                {
+                    trace.ModelRequested ??= string.IsNullOrWhiteSpace(requestedModel) ? model : requestedModel.Trim();
+                    trace.SetRoute(route.Router.Id, route.Router.Name, model, Telemetry.LlmCosting.BillingName(route.Router.Billing));
+                    if (redirected) trace.Flags |= Telemetry.LlmCallFlags.Redirected;
+                    if (route.Pin) trace.Flags |= Telemetry.LlmCallFlags.Pinned;
+                }
+                try
+                {
+                    var response = await send(route, model);
+                    if (plan.Routes.Count > 1) Circuits.RecordSuccess(laneKey, route.Router.Id);
+                    if (trace != null) trace.LastResponse = response;
+                    return response;
+                }
+                catch (Exception ex) when (i + 1 < plan.Routes.Count && IsFallbackable(ex, cancellationToken))
+                {
+                    Circuits.RecordFailure(laneKey, route.Router.Id, ex.Message);
+                    try { await ServiceLog($"{service}: {route.Router.Name} failed ({ex.Message}); falling back to {plan.Routes[i + 1].Router.Name}."); } catch { }
+                }
+                catch (Exception ex) when (plan.Routes.Count > 1 && IsFallbackable(ex, cancellationToken))
+                {
+                    Circuits.RecordFailure(laneKey, route.Router.Id, ex.Message);
+                    throw;
+                }
+            }
         }
 
         /// <summary>
@@ -2232,56 +2350,59 @@ namespace Omnipotent.Services.KliveLLM
             ModelSamplingParameters? samplingParameters = null,
             string? cachePrefixHint = null,
             AIRouterWorkClass? workClass = null,
-            bool honourThinkingOnAIRouter = false)
+            bool honourThinkingOnAIRouter = false,
+            LlmCallPlan? plan = null,
+            LlmCaller? lane = null)
         {
-            RemoteLLMProviderConfiguration remoteProvider = await GetRemoteProviderConfigurationAsync(forceFreeModel);
+            var who = lane ?? LlmConsumerCatalog.Callers.Internal;
+            plan ??= await PlanCallAsync(who, forceFreeModel, toolSession: true);
 
             // An explicit override pins a route that already succeeded earlier in this wake. Otherwise
             // use the first configured route, then the provider default. Remaining routes become
             // OpenRouter's own fallback list (see ApplyModelFallback) rather than an app-side retry loop.
-            string primaryModel = !string.IsNullOrWhiteSpace(modelOverride)
+            string? requested = !string.IsNullOrWhiteSpace(modelOverride)
                 ? modelOverride.Trim()
                 : (modelRoutes != null && modelRoutes.Count > 0 && !string.IsNullOrWhiteSpace(modelRoutes[0])
                     ? modelRoutes[0].Trim()
-                    : remoteProvider.Model);
+                    : null);
 
-            // AIRouter names its models in its own flat namespace, so a caller's OpenRouter-style
-            // route would 404 there. Redirect to the configured AIRouter model rather than let an
-            // unknown-model failure defer the wake. Every other provider keeps the caller's route.
-            if (remoteProvider.Provider == LLMProvider.AIRouter)
-                primaryModel = await ResolveAIRouterModelAsync(primaryModel, remoteProvider, cancellationToken);
-
-            HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
+            return await SendWithFallbackAsync(plan, who, cancellationToken, requested, async (route, primaryModel) =>
             {
-                model = primaryModel,
-                stream = false,
-                max_tokens = maxTokensOverride,
-                tools = tools,
-            };
-            ApplyOpenRouterSession(ref payload, remoteProvider, cacheSessionId);
-            ApplyModelFallback(ref payload, remoteProvider, modelRoutes);
-            ApplyServiceTier(ref payload, remoteProvider);
-            ApplyUsageAccounting(ref payload, remoteProvider);
-            ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride, honourThinkingOnAIRouter);
-            ApplyContextCompression(ref payload, remoteProvider, enableOpenRouterContextCompression);
-            ApplySamplingParameters(ref payload, remoteProvider, samplingParameters);
-            ApplyTextualToolProtocolStops(ref payload, remoteProvider, structuredMessages);
-            // A raw Gemma call is only half of that model's control-token handshake. Once its tools
-            // have run, fold the synthetic assistant/tool messages into a native tool-response turn
-            // before calling the model again. Ordinary provider-native calls remain byte-for-byte on
-            // the standard OpenAI path.
-            var providerMessages = GemmaToolCallCompatibility.PrepareContinuationMessages(structuredMessages);
-            payload.BuildMessagesFromList(providerMessages);
-            ApplyPromptCaching(ref payload, remoteProvider, previousCacheMessageCount);
+                RemoteLLMProviderConfiguration remoteProvider = route.Config!;
+                HFWrapper.HFLLMInferenceRequest payload = new HFWrapper.HFLLMInferenceRequest()
+                {
+                    model = primaryModel,
+                    stream = false,
+                    max_tokens = maxTokensOverride,
+                    tools = tools,
+                };
+                ApplyOpenRouterSession(ref payload, remoteProvider, cacheSessionId);
+                // A pinned model replaces the caller's whole route list, so OpenRouter is not handed
+                // the caller's backups for a model the policy chose instead.
+                ApplyModelFallback(ref payload, remoteProvider, route.Pin ? null : modelRoutes);
+                ApplyServiceTier(ref payload, remoteProvider);
+                ApplyUsageAccounting(ref payload, remoteProvider);
+                ApplyThinkingPreference(ref payload, remoteProvider, thinkingOverride, honourThinkingOnAIRouter);
+                ApplyContextCompression(ref payload, remoteProvider, enableOpenRouterContextCompression);
+                ApplySamplingParameters(ref payload, remoteProvider, samplingParameters);
+                ApplyTextualToolProtocolStops(ref payload, remoteProvider, structuredMessages);
+                // A raw Gemma call is only half of that model's control-token handshake. Once its tools
+                // have run, fold the synthetic assistant/tool messages into a native tool-response turn
+                // before calling the model again. Ordinary provider-native calls remain byte-for-byte on
+                // the standard OpenAI path.
+                var providerMessages = GemmaToolCallCompatibility.PrepareContinuationMessages(structuredMessages);
+                payload.BuildMessagesFromList(providerMessages);
+                ApplyPromptCaching(ref payload, remoteProvider, previousCacheMessageCount);
 
-            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-            var response = await SendInferencePayloadAsync(
-                remoteProvider, payload, cancellationToken, onToken, onToolCallComplete,
-                cachePrefixHint, workClass);
-            stopwatch.Stop();
-            response.request_provider = remoteProvider.Provider.ToString();
-            response.request_duration_ms = stopwatch.ElapsedMilliseconds;
-            return response;
+                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                var response = await SendInferencePayloadAsync(
+                    remoteProvider, payload, cancellationToken, onToken, onToolCallComplete,
+                    cachePrefixHint, workClass);
+                stopwatch.Stop();
+                response.request_provider = remoteProvider.Provider.ToString();
+                response.request_duration_ms = stopwatch.ElapsedMilliseconds;
+                return response;
+            });
         }
 
         internal static void ApplyOpenRouterSession(
@@ -2574,9 +2695,12 @@ namespace Omnipotent.Services.KliveLLM
         /// ThinkingType (the ceiling); a null/unknown request falls back to the ceiling. This keeps the
         /// user's setting authoritative while letting the agent dial effort DOWN for cheap turns and UP
         /// (toward the ceiling) for hard ones. Returns a canonical lowercase level (off/low/medium/high).</summary>
-        internal string ResolveThinkingLevel(string? requested)
+        internal string ResolveThinkingLevel(string? requested) => ResolveThinkingLevel(requested, null);
+
+        /// <summary>As <see cref="ResolveThinkingLevel(string?)"/>, with a lane's own ceiling in place of ThinkingType.</summary>
+        internal string ResolveThinkingLevel(string? requested, string? ceilingOverride)
         {
-            int ceiling = ThinkingRank(thinkingType);
+            int ceiling = ThinkingRank(string.IsNullOrWhiteSpace(ceilingOverride) ? thinkingType : ceilingOverride);
             if (ceiling < 0) ceiling = ThinkingRank("Medium"); // defensive: unknown setting → Medium
             int want = ThinkingRank(requested);
             int effective = want < 0 ? ceiling : Math.Min(want, ceiling);
@@ -2596,13 +2720,14 @@ namespace Omnipotent.Services.KliveLLM
         {
             if (remoteProvider.Provider == LLMProvider.AIRouter)
             {
-                if (honourThinkingOnAIRouter)
+                // A lane with its own reasoning ceiling has opted in, whatever the caller said.
+                if (honourThinkingOnAIRouter || !string.IsNullOrWhiteSpace(remoteProvider.ThinkingCeiling))
                     payload.reasoning_effort = AIRouterReasoningEffort(payload.model ?? remoteProvider.Model,
-                        ResolveThinkingLevel(thinkingOverride));
+                        ResolveThinkingLevel(thinkingOverride, remoteProvider.ThinkingCeiling));
                 return;
             }
             if (remoteProvider.Provider != LLMProvider.OpenRouter) return;
-            string effective = ResolveThinkingLevel(thinkingOverride);
+            string effective = ResolveThinkingLevel(thinkingOverride, remoteProvider.ThinkingCeiling);
             payload.reasoning = string.Equals(effective, "off", StringComparison.OrdinalIgnoreCase)
                 ? new { enabled = false }
                 : new { effort = effective };
@@ -2718,12 +2843,18 @@ namespace Omnipotent.Services.KliveLLM
             payload.stream = true;
             payload.stream_options = new { include_usage = true };
             string payloadJson = JsonConvert.SerializeObject(payload);
+            var trace = CurrentTrace;
+            if (trace is { CaptureContent: true }) trace.CapturedRequest = payloadJson;
 
             // A streamed generation occupies a parallel slot for its WHOLE duration, not just the
             // request/response round-trip, so the lease is method-scoped: it is released when the SSE
             // body ends. Non-flat-fee providers get null and pass straight through.
             using AIRouterFairUseLease? fairUse = await AcquireFairUseAsync(remoteProvider, payload,
                 cancellationToken, cachePrefixHint, workClass, AIRouterSlotIntent.Turn);
+            using var routerGate = await EnterRouterGateAsync(remoteProvider, trace, cancellationToken);
+            long attemptQueueMs = fairUse?.QueueDurationMs ?? 0;
+            trace?.AddQueue(attemptQueueMs);
+            trace?.SetState(Telemetry.LlmCallState.AwaitingProvider);
             var providerStopwatch = System.Diagnostics.Stopwatch.StartNew();
             // Only an observing caller opts into the idle bound; everyone else keeps the historical
             // unbounded read. The pulse is legitimate only because every wait it covers is bounded:
@@ -2741,10 +2872,22 @@ namespace Omnipotent.Services.KliveLLM
             if (remoteProvider.Provider == LLMProvider.OpenRouter)
                 ApplyOpenRouterHeaders(request);
 
-            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            HttpResponseMessage sent;
+            try
+            {
+                sent = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            }
+            catch (Exception ex) when (!cancellationToken.IsCancellationRequested)
+            {
+                trace?.NoteAttempt(Telemetry.LlmOutcome.Of(ex), null, attemptQueueMs, providerStopwatch.ElapsedMilliseconds);
+                throw;
+            }
+            using var response = sent;
             if (!response.IsSuccessStatusCode)
             {
                 string body = await response.Content.ReadAsStringAsync(cancellationToken);
+                trace?.NoteAttempt(Telemetry.LlmOutcome.OfStatus(response.StatusCode, body), (int)response.StatusCode,
+                    attemptQueueMs, providerStopwatch.ElapsedMilliseconds, GetProviderRetryAfter(response));
                 // The caller falls back to the buffered path on any streaming failure. If this was a
                 // fair-use rejection, hold the shared queue first so that fallback waits out the
                 // cool-off instead of immediately reproducing the same 429.
@@ -2818,6 +2961,7 @@ namespace Omnipotent.Services.KliveLLM
                     }
                     catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && idleLimit.HasValue)
                     {
+                        trace?.NoteAttempt(Telemetry.LlmOutcome.Stalled, (int)response.StatusCode, attemptQueueMs, providerStopwatch.ElapsedMilliseconds);
                         throw new KliveLLMStreamStalledException(idleLimit.Value,
                             contentSb.Length > 0 || toolCallsByIndex.Count > 0);
                     }
@@ -2857,6 +3001,7 @@ namespace Omnipotent.Services.KliveLLM
                         reasoningChars += reasoning.Length;
                         pulse?.Set(KliveLLMActivityKind.Reasoning,
                             () => $"reasoning ({Interlocked.Read(ref reasoningChars):N0} chars so far)");
+                        if (trace != null) { trace.NoteFirstToken(); trace.SetState(Telemetry.LlmCallState.Reasoning); trace.NoteStreamed(reasoning.Length); }
                     }
 
                     if (!string.IsNullOrEmpty(delta.content))
@@ -2864,11 +3009,13 @@ namespace Omnipotent.Services.KliveLLM
                         contentSb.Append(delta.content);
                         try { onToken(delta.content); } catch { }
                         pulse?.Set(KliveLLMActivityKind.Streaming, () => "writing the reply");
+                        if (trace != null) { trace.NoteFirstToken(); trace.SetState(Telemetry.LlmCallState.Streaming); trace.NoteStreamed(delta.content.Length); }
                     }
 
                     if (delta.tool_calls != null)
                     {
                         pulse?.Set(KliveLLMActivityKind.Streaming, () => "writing tool calls");
+                        if (trace != null) { trace.NoteFirstToken(); trace.SetState(Telemetry.LlmCallState.Streaming); }
                         foreach (var tcd in delta.tool_calls)
                         {
                             if (!toolCallsByIndex.TryGetValue(tcd.index, out var tc))
@@ -2920,6 +3067,10 @@ namespace Omnipotent.Services.KliveLLM
             // The final SSE chunk carries usage; reconcile the reservation before returning.
             ReportFairUseUsage(remoteProvider.Provider, fairUse, usage);
             providerStopwatch.Stop();
+            trace?.NoteAttempt(Telemetry.LlmOutcome.Ok, (int)response.StatusCode, attemptQueueMs, providerStopwatch.ElapsedMilliseconds);
+            if (trace is { CaptureContent: true })
+                trace.CapturedResponse = JsonConvert.SerializeObject(new { content = contentSb.ToString(), tool_calls = toolCalls, finish_reason = finishReason, usage },
+                    new JsonSerializerSettings { NullValueHandling = NullValueHandling.Ignore });
 
             return new HFWrapper.HFLLMInferenceResponse
             {
@@ -2999,6 +3150,8 @@ namespace Omnipotent.Services.KliveLLM
             // Serialize once; HttpRequestMessage/StringContent can only be sent once, so build a
             // fresh request per attempt from this cached body.
             string payloadJson = JsonConvert.SerializeObject(payload);
+            var trace = CurrentTrace;
+            if (trace is { CaptureContent: true }) trace.CapturedRequest = payloadJson;
 
             Exception lastError = null;
             bool affordableTokenRetryUsed = false;
@@ -3014,6 +3167,8 @@ namespace Omnipotent.Services.KliveLLM
                 // re-acquired per attempt rather than once per call. The lease holds the parallel slot
                 // only for the HTTP exchange; its window entry outlives disposal for the full minute.
                 AIRouterFairUseLease? fairUse = null;
+                IDisposable? routerGate = null;
+                long attemptQueueMs = 0;
                 System.Diagnostics.Stopwatch? providerStopwatch = null;
                 try
                 {
@@ -3022,7 +3177,11 @@ namespace Omnipotent.Services.KliveLLM
                     fairUse = await AcquireFairUseAsync(remoteProvider, payload, cancellationToken,
                         cachePrefixHint, workClass,
                         attempt > 1 ? AIRouterSlotIntent.Retry : firstAttemptIntent);
-                    totalQueueDurationMs += fairUse?.QueueDurationMs ?? 0;
+                    routerGate = await EnterRouterGateAsync(remoteProvider, trace, cancellationToken);
+                    attemptQueueMs = fairUse?.QueueDurationMs ?? 0;
+                    totalQueueDurationMs += attemptQueueMs;
+                    trace?.AddQueue(attemptQueueMs);
+                    trace?.SetState(Telemetry.LlmCallState.AwaitingProvider);
                     using var request = new HttpRequestMessage(HttpMethod.Post, remoteProvider.ChatCompletionsEndpoint)
                     {
                         Content = new StringContent(payloadJson, Encoding.UTF8, "application/json")
@@ -3058,6 +3217,7 @@ namespace Omnipotent.Services.KliveLLM
                     var kind = ex is TaskCanceledException
                         ? RemoteLLMFailureKind.Timeout
                         : RemoteLLMFailureKind.Network;
+                    trace?.NoteAttempt(Telemetry.LlmOutcome.Of(kind), null, attemptQueueMs, providerStopwatch?.ElapsedMilliseconds ?? 0);
                     var remoteEx = new RemoteLLMException(
                         kind,
                         $"{remoteProvider.DisplayName} network request failed: {ex.Message}",
@@ -3082,6 +3242,7 @@ namespace Omnipotent.Services.KliveLLM
                     // slot back immediately so a queued caller can use it while we parse. The window
                     // entry survives disposal, so the per-minute limits still count this request.
                     fairUse?.Dispose();
+                    routerGate?.Dispose();
                 }
 
                 // TEMP DIAGNOSTIC (harness-leak hunt, Jul 2026): detect Claude-Code / Agent-SDK harness
@@ -3109,6 +3270,8 @@ namespace Omnipotent.Services.KliveLLM
                     if (!response.IsSuccessStatusCode)
                     {
                         int status = (int)response.StatusCode;
+                        trace?.NoteAttempt(Telemetry.LlmOutcome.OfStatus(response.StatusCode, responseContent), status,
+                            attemptQueueMs, providerStopwatch?.ElapsedMilliseconds ?? 0, GetProviderRetryAfter(response));
                         // OpenRouter often surfaces an UPSTREAM rate-limit / anti-abuse block as a top-level
                         // 400 whose body carries the real code (a 429 "temporarily rate-limited upstream", or
                         // Xiaomi/MiMo's 441 "risk_control" for high-frequency requests). A naive status check
@@ -3199,6 +3362,7 @@ namespace Omnipotent.Services.KliveLLM
 
                     if (hfResponse?.choices == null || hfResponse.choices.Count == 0)
                     {
+                        trace?.NoteAttempt(Telemetry.LlmOutcome.Empty, (int)response.StatusCode, attemptQueueMs, providerStopwatch?.ElapsedMilliseconds ?? 0);
                         var emptyEx = new RemoteLLMException(
                             RemoteLLMFailureKind.EmptyResponse,
                             $"{remoteProvider.DisplayName} returned an empty completion payload.",
@@ -3223,6 +3387,8 @@ namespace Omnipotent.Services.KliveLLM
                     hfResponse.latency_breakdown_available = true;
                     hfResponse.request_bytes = Encoding.UTF8.GetByteCount(payloadJson);
                     ReportFairUseUsage(remoteProvider.Provider, fairUse, hfResponse.usage);
+                    trace?.NoteAttempt(Telemetry.LlmOutcome.Ok, (int)response.StatusCode, attemptQueueMs, providerStopwatch?.ElapsedMilliseconds ?? 0);
+                    if (trace is { CaptureContent: true }) trace.CapturedResponse = responseContent;
                     return hfResponse;
                 }
             }
@@ -3388,6 +3554,7 @@ namespace Omnipotent.Services.KliveLLM
                 delay = TimeSpan.FromMilliseconds(ms + Random.Shared.Next(0, 250)); // exp backoff + jitter
             }
             string reason = rateLimited ? "provider rate-limited the request" : "transient provider error";
+            CurrentTrace?.SetState(Telemetry.LlmCallState.Retrying);
             using var pulse = StartActivityPulse(KliveLLMActivityKind.Retrying,
                 () => $"{reason}; retrying in {delay.TotalSeconds:0}s (attempt {attempt + 1})");
             await Task.Delay(delay, cancellationToken);
@@ -3662,6 +3829,22 @@ namespace Omnipotent.Services.KliveLLM
             /// means the reply hit the output cap: its text, and any tool call still being written, are cut off.
             /// Null when the provider did not report one. Only set on tool-session turns.</summary>
             public string? FinishReason { get; set; }
+
+            /// <summary>This call's row in the KliveLLM ledger.</summary>
+            public long CallId { get; set; }
+            /// <summary>The KliveLLM router that served the call (openrouter, airouter, an added router's id…).</summary>
+            public string? RouterId { get; set; }
+            public string? RouterName { get; set; }
+            /// <summary>per_token, flat or free.</summary>
+            public string? Billing { get; set; }
+            /// <summary>The router charges nothing per token (flat fee or free): book zero for this turn.</summary>
+            public bool FlatFee { get; set; }
+            public int ReasoningTokens { get; set; }
+            public long? TimeToFirstTokenMs { get; set; }
+            /// <summary>HTTP attempts, across fallbacks.</summary>
+            public int Attempts { get; set; }
+            /// <summary>The router that failed before a fallback served the call, or null.</summary>
+            public string? FallbackFrom { get; set; }
         }
         public void ResetSession(string? sessionId)
         {
@@ -3922,6 +4105,10 @@ namespace Omnipotent.Services.KliveLLM
             internal int lastCacheMessageCount;
             internal string cacheEpochID = Guid.NewGuid().ToString("N");
             internal int cacheEpochTurnIndex;
+            /// <summary>The lane this session's turns are routed and attributed as.</summary>
+            internal LlmCaller? caller;
+            /// <summary>The router that served the last turn: a different one starts a new cache epoch.</summary>
+            internal string? lastRouterId;
 
 
             //local

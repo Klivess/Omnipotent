@@ -37,6 +37,10 @@ namespace Omnipotent.Services.KliveAgent
         /// <summary>Compatibility self-reference for scripts ported from hosts that expose a Globals object.</summary>
         public dynamic Globals => this;
 
+        /// <summary>The working notes of the run using these globals (set by the brain for each run), which
+        /// the task_ledger tool reads and writes.</summary>
+        internal AgentRunLedger? RunLedger { get; set; }
+
         /// <summary>The owning agent. Internal so the brain's static tool dispatch can reach per-agent
         /// state (the Service Surface bridge) without threading it through every call.</summary>
         internal KliveAgent AgentService => agentService;
@@ -761,6 +765,7 @@ namespace Omnipotent.Services.KliveAgent
         /// </summary>
         public object? GetObjectMember(object? obj, string memberName)
         {
+            obj = KliveAgentDynamic.Unwrap(obj);
             if (obj == null) throw new ArgumentNullException(nameof(obj), "Object is null — check that the previous GetServiceObject/GetObjectMember call succeeded.");
             if (string.IsNullOrWhiteSpace(memberName)) throw new ArgumentException("memberName cannot be empty.");
 
@@ -789,6 +794,7 @@ namespace Omnipotent.Services.KliveAgent
         /// </summary>
         public T? TryGetMember<T>(object? obj, string memberName)
         {
+            obj = KliveAgentDynamic.Unwrap(obj);
             if (obj == null || string.IsNullOrWhiteSpace(memberName)) return default;
 
             var t = obj.GetType();
@@ -814,10 +820,11 @@ namespace Omnipotent.Services.KliveAgent
         /// </summary>
         public async Task<object?> CallObjectMethod(object? obj, string methodName, params object[] args)
         {
+            obj = KliveAgentDynamic.Unwrap(obj);
             if (obj == null) throw new ArgumentNullException(nameof(obj), "Object is null — check that the previous call succeeded.");
             if (string.IsNullOrWhiteSpace(methodName)) throw new ArgumentException("methodName cannot be empty.");
 
-            args ??= Array.Empty<object>();
+            args = (args ?? Array.Empty<object>()).Select(a => KliveAgentDynamic.Unwrap(a)!).ToArray();
             var method = ResolveMethod(obj.GetType(), methodName, DeepFlags, args);
             if (method == null)
                 throw new MissingMethodException($"Method '{methodName}' not found on '{obj.GetType().FullName}'.{SuggestClosestMethods(methodName, obj.GetType())} Use GetObjectMembers(obj, \"{methodName}\", \"method\") to see available methods.");
@@ -842,6 +849,7 @@ namespace Omnipotent.Services.KliveAgent
         /// </summary>
         public string GetObjectTypeInfo(object? obj)
         {
+            obj = KliveAgentDynamic.Unwrap(obj);
             if (obj == null) return "(null)";
             var type = obj.GetType();
             var sb = new StringBuilder();
@@ -888,6 +896,7 @@ namespace Omnipotent.Services.KliveAgent
         /// </summary>
         public string GetObjectTypeInfo(object? obj, string filter, bool membersOnly = false)
         {
+            obj = KliveAgentDynamic.Unwrap(obj);
             if (obj == null) return "(null)";
             var type = obj.GetType();
             var sb = new StringBuilder();
@@ -918,6 +927,7 @@ namespace Omnipotent.Services.KliveAgent
         public List<AgentObjectMember> GetObjectMembers(object? obj, string? filter = null, string? kind = null)
         {
             var result = new List<AgentObjectMember>();
+            obj = KliveAgentDynamic.Unwrap(obj);
             if (obj == null) return result;
             var type = obj.GetType();
 
@@ -1026,6 +1036,58 @@ namespace Omnipotent.Services.KliveAgent
             outputBuffer.AppendLine(message);
         }
 
+        /// <summary>Log any value: a collection prints one item per line, an object without a useful
+        /// ToString prints as compact JSON. (Log used to take only a string, and Log(list) was one of the
+        /// commonest compile errors.)</summary>
+        public void Log(object? value)
+        {
+            outputBuffer.AppendLine(KliveAgentDynamic.Describe(value));
+        }
+
+        // ── Run-time member access ──
+
+        /// <summary>
+        /// Use a value typed <c>object</c> as if you knew its type: members are looked up when the script
+        /// runs, non-public ones included, and a wrong name answers with the closest real ones.
+        /// Use it for anything GetService / GetObjectMember / CallObjectMethod returned, and for
+        /// Omnipotent types a script cannot name (most are internal).
+        /// Example: var store = Dyn(GetService("OmniTumblr")).Store; Log(store.Connections.Count);
+        ///          await store.FlushAsync();   store.Mutate((Action&lt;dynamic&gt;)(s =&gt; s.Paused = true));
+        /// </summary>
+        public dynamic? Dyn(object? value) => KliveAgentDynamic.Wrap(value);
+
+        /// <summary>Dyn(GetService(name)), failing with the closest service names when there is no such service.</summary>
+        public dynamic Svc(string serviceName)
+        {
+            var service = GetService(serviceName);
+            if (service != null) return KliveAgentDynamic.Wrap(service)!;
+            var names = agentService?.GetActiveServices().SelectMany(s => new[] { s.GetType().Name, s.GetName() }) ?? Array.Empty<string>();
+            var close = KliveAgentNames.Closest(serviceName, names, 4);
+            throw new InvalidOperationException($"No active service named '{serviceName}'."
+                + (close.Count > 0 ? $" Did you mean: {string.Join(", ", close)}?" : " ListServices() shows the active ones."));
+        }
+
+        /// <summary>The object behind a Dyn(...) value, for passing to reflection or a typed method.</summary>
+        public object? Raw(object? value) => KliveAgentDynamic.Unwrap(value);
+
+        /// <summary>
+        /// Await helper for scripts. A script reads <c>await (</c> as a call to a method named await, so
+        /// write <c>await Aw((Task&lt;int&gt;)x)</c> rather than <c>await (Task&lt;int&gt;)x</c>. With a value
+        /// typed <c>object</c> it awaits it if it is a task and passes it through otherwise.
+        /// </summary>
+        public Task<T> Aw<T>(Task<T> task) => task;
+
+        /// <inheritdoc cref="Aw{T}(Task{T})"/>
+        public Task Aw(Task task) => task;
+
+        /// <inheritdoc cref="Aw{T}(Task{T})"/>
+        public async Task<dynamic?> Aw(object? value)
+        {
+            if (KliveAgentDynamic.AsTask(value) is not { } task) return value;
+            await task;
+            return KliveAgentDynamic.WrapHidden(KliveAgentDynamic.TaskResult(task, null));
+        }
+
         /// <summary>Get all logged output.</summary>
         public string GetOutput() => outputBuffer.ToString();
 
@@ -1071,11 +1133,12 @@ namespace Omnipotent.Services.KliveAgent
         public Task<string> RunPowerShellAsync(string script, int timeoutSeconds = 120) => RunPowerShell(script, timeoutSeconds);
 
         /// <summary>Convert a boxed scalar/result to a predictable string without compile-time casts.</summary>
-        public string AsString(object? value) => value?.ToString() ?? "";
+        public string AsString(object? value) => KliveAgentDynamic.Unwrap(value)?.ToString() ?? "";
 
         /// <summary>Cycle-tolerant, size-bounded JSON for diagnostic inspection of reflected objects.</summary>
         public string ToSafeJson(object? value, bool indented = true, int maxChars = 20_000)
         {
+            value = KliveAgentDynamic.Unwrap(value);
             string json = Newtonsoft.Json.JsonConvert.SerializeObject(value,
                 indented ? Newtonsoft.Json.Formatting.Indented : Newtonsoft.Json.Formatting.None,
                 new Newtonsoft.Json.JsonSerializerSettings
@@ -2399,339 +2462,6 @@ namespace Omnipotent.Services.KliveAgent
                 return $"Dictionary<{SimplifyTypeName(args[0])}, {SimplifyTypeName(args[1])}>";
             }
             return type.Name;
-        }
-    }
-
-    public class KliveAgentScriptEngine
-    {
-        private readonly KliveAgent agentService;
-        private ScriptOptions scriptOptions = null!;
-
-        public KliveAgentScriptEngine(KliveAgent agentService)
-        {
-            this.agentService = agentService;
-        }
-
-        public void Initialize()
-        {
-            var assemblies = AppDomain.CurrentDomain.GetAssemblies()
-                .Where(a => !a.IsDynamic && !string.IsNullOrEmpty(a.Location))
-                .Where(a => !IsNonScriptReference(a))
-                .ToArray();
-
-            scriptOptions = ScriptOptions.Default
-                .AddReferences(assemblies)
-                .AddImports(
-                    "System",
-                    "System.IO",
-                    "System.Linq",
-                    "System.Text",
-                    "System.Collections.Generic",
-                    "System.Threading.Tasks",
-                    "Omnipotent.Services.KliveAgent",
-                    "Omnipotent.Services.KliveAgent.Models",
-                    "Omnipotent.Service_Manager"
-                );
-        }
-
-        /// <summary>
-        /// Assemblies that user scripts never legitimately name at COMPILE time (the Roslyn/scripting host,
-        /// analyzers, build/IDE tooling). Excluding them trims the reference set Roslyn binds against on the
-        /// first compile of every session, shaving cold-start time. Deliberately conservative: scripts DO
-        /// `new` and reference types across Omnipotent + its real deps (DSharpPlus, Newtonsoft, BouncyCastle,
-        /// the BCL …), so those stay referenced. If a script ever hits a missing-reference error, loosen this.
-        /// </summary>
-        private static bool IsNonScriptReference(Assembly a)
-        {
-            var name = a.GetName().Name ?? string.Empty;
-            return name.StartsWith("Microsoft.CodeAnalysis", StringComparison.Ordinal)   // Roslyn itself
-                || name.StartsWith("Microsoft.VisualStudio", StringComparison.Ordinal)   // IDE/test tooling
-                || name.StartsWith("Microsoft.Build", StringComparison.Ordinal)          // MSBuild
-                || name.StartsWith("Microsoft.TestPlatform", StringComparison.Ordinal)
-                || name.Equals("Microsoft.DiaSymReader", StringComparison.Ordinal);
-        }
-
-        /// <summary>
-        /// Pays Roslyn's one-time cold-start (JIT of the compiler + priming the shared AssemblyMetadata cache
-        /// for the whole reference set) at service boot instead of on the user's first message. Runs a tiny
-        /// throwaway script through BOTH code paths — the initial CSharpScript.Create+Compile+RunAsync and a
-        /// ContinueWithAsync continuation — since they JIT separately. Fire-and-forget; failures are harmless.
-        /// Because every session reuses the same scriptOptions (same MetadataReference objects), the cache this
-        /// primes is shared, so later sessions' first compiles are fast too.
-        /// </summary>
-        public async Task WarmupAsync()
-        {
-            try
-            {
-                var sw = Stopwatch.StartNew();
-                var session = CreateSession(new ScriptGlobals(agentService));
-                await session.ExecuteAsync("1 + 1");   // primes Create + Compile + RunAsync
-                await session.ExecuteAsync("2 + 2");   // primes the ContinueWithAsync path
-                sw.Stop();
-                try { await agentService.ServiceLog($"[KliveAgent] Script engine warmed up in {sw.ElapsedMilliseconds}ms.", appearInConsole: false); } catch { }
-            }
-            catch (Exception ex)
-            {
-                try { await agentService.ServiceLogError(ex, "[KliveAgent] Script engine warmup (non-fatal)."); } catch { }
-            }
-        }
-
-        public ScriptExecutionSession CreateSession(ScriptGlobals globals)
-        {
-            return new ScriptExecutionSession(scriptOptions, globals);
-        }
-
-        public async Task<AgentScriptResult> ExecuteScriptAsync(string code, ScriptGlobals globals, TimeSpan? timeout = null)
-        {
-            var session = CreateSession(globals);
-            return await session.ExecuteAsync(code, timeout);
-        }
-
-        public sealed class ScriptExecutionSession
-        {
-            private readonly ScriptOptions scriptOptions;
-            private readonly ScriptGlobals globals;
-            private ScriptState<object>? state;
-
-            public ScriptExecutionSession(ScriptOptions scriptOptions, ScriptGlobals globals)
-            {
-                this.scriptOptions = scriptOptions;
-                this.globals = globals;
-            }
-
-            public async Task<AgentScriptResult> ExecuteAsync(string code, TimeSpan? timeout = null)
-            {
-                var effectiveTimeout = timeout ?? TimeSpan.FromSeconds(30);
-                var stopwatch = Stopwatch.StartNew();
-                bool compiling = false;
-
-                try
-                {
-                    using var cts = CancellationTokenSource.CreateLinkedTokenSource(globals.CancellationToken);
-                    cts.CancelAfter(effectiveTimeout);
-
-                    globals.TakeOutput();
-
-                    Task<ScriptState<object>> scriptTask;
-                    if (state == null)
-                    {
-                        // First script in the session: compile explicitly to surface structured
-                        // diagnostics before running. ScriptGlobals is the top-level globals type.
-                        var script = CSharpScript.Create(code, scriptOptions, typeof(ScriptGlobals));
-                        compiling = true;
-                        var diagnostics = script.Compile(cts.Token);
-                        compiling = false;
-                        var errors = diagnostics.Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error).ToList();
-                        if (errors.Count > 0)
-                        {
-                            stopwatch.Stop();
-                            return new AgentScriptResult
-                            {
-                                Code = code,
-                                Success = false,
-                                ErrorMessage = FormatCompilationDiagnostics(code, errors),
-                                ExecutionTimeMs = stopwatch.ElapsedMilliseconds
-                            };
-                        }
-
-                        // Run on a worker thread so we can enforce a HARD timeout below.
-                        scriptTask = Task.Run(() => script.RunAsync(globals, catchException: null, cancellationToken: cts.Token), cts.Token);
-                    }
-                    else
-                    {
-                        // Continuation: ContinueWithAsync chains off the prior ScriptState correctly.
-                        // Calling .Compile() on a state.Script.ContinueWith() result triggers a Roslyn
-                        // globals-type mismatch (ScriptState<object> vs ScriptGlobals) that poisons all
-                        // subsequent scripts in the session. ContinueWithAsync avoids this entirely.
-                        scriptTask = Task.Run(() => state.ContinueWithAsync(code, scriptOptions, catchException: null, cancellationToken: cts.Token), cts.Token);
-                    }
-
-                    // HARD wall-clock guard. The cancellation token alone is NOT enough: a script that
-                    // blocks synchronously (infinite loop, Thread.Sleep, a blocking native/IO call, .Result
-                    // on a stuck Task) never observes the token, so awaiting RunAsync directly would hang
-                    // the entire agent turn forever. Race the script against an independent timer (which also
-                    // trips on the per-run Stop/stall token) and ABANDON it if the timer wins — the abandoned
-                    // worker can't be force-killed in .NET, but the agent gets a result and keeps moving.
-                    var watchdog = Task.Delay(effectiveTimeout, globals.CancellationToken);
-                    var completed = await Task.WhenAny(scriptTask, watchdog);
-                    if (!ReferenceEquals(completed, scriptTask))
-                    {
-                        try { cts.Cancel(); } catch { } // nudge well-behaved scripts to unwind
-                        // Keep the abandoned task's eventual exception observed so it can't resurface as an
-                        // UnobservedTaskException. We deliberately do NOT update `state`, so the session
-                        // continues from the last good state.
-                        _ = scriptTask.ContinueWith(t => { _ = t.Exception; }, TaskScheduler.Default);
-
-                        stopwatch.Stop();
-                        bool stopped = globals.CancellationToken.IsCancellationRequested;
-                        return new AgentScriptResult
-                        {
-                            Code = code,
-                            Success = false,
-                            ErrorMessage = stopped
-                                ? "Script was stopped before it finished."
-                                : $"Script execution timed out after {effectiveTimeout.TotalSeconds:0}s and was abandoned — it was still running, most likely an infinite loop or a blocking call that ignores cancellation. Rewrite it to be non-blocking and to honour CancellationToken (e.g. await Task.Delay(ms, CancellationToken), pass a timeout to process/network waits, never use .Result/.Wait()). If you were POLLING or WAITING for something to happen, do NOT loop here — use the wait_for tool (or computer_wait for the screen); those pause without this per-script limit.",
-                            Output = globals.TakeOutput(),
-                            ExecutionTimeMs = stopwatch.ElapsedMilliseconds
-                        };
-                    }
-
-                    state = await scriptTask;
-
-                    stopwatch.Stop();
-
-                    var output = globals.TakeOutput();
-                    if (state.ReturnValue != null)
-                    {
-                        output += (output.Length > 0 ? "\n" : string.Empty) + $"Return: {state.ReturnValue}";
-                    }
-
-                    return new AgentScriptResult
-                    {
-                        Code = code,
-                        Output = output,
-                        Success = true,
-                        ExecutionTimeMs = stopwatch.ElapsedMilliseconds
-                    };
-                }
-                catch (Microsoft.CodeAnalysis.Scripting.CompilationErrorException cex)
-                {
-                    // ContinueWithAsync throws CompilationErrorException on compile failure
-                    // (rather than returning diagnostics like the first-run path does).
-                    stopwatch.Stop();
-                    var errors = cex.Diagnostics
-                        .Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
-                        .ToList();
-                    if (errors.Count == 0) errors = cex.Diagnostics.ToList();
-                    return new AgentScriptResult
-                    {
-                        Code = code,
-                        Success = false,
-                        ErrorMessage = FormatCompilationDiagnostics(code, errors),
-                        Output = globals.TakeOutput(),
-                        ExecutionTimeMs = stopwatch.ElapsedMilliseconds
-                    };
-                }
-                catch (OperationCanceledException)
-                {
-                    stopwatch.Stop();
-                    return new AgentScriptResult
-                    {
-                        Code = code,
-                        Success = false,
-                        // A compile that runs out the clock says nothing about the code: the server was
-                        // busy. Saying "execution timed out" sent the model off rewriting working code.
-                        ErrorMessage = compiling && !globals.CancellationToken.IsCancellationRequested
-                            ? $"Compiling the script took longer than {effectiveTimeout.TotalSeconds:0}s, so nothing ran — the server is busy, not your code. Send the same script again, or use a native tool (no compile step) if one fits."
-                            : $"Script execution timed out after {effectiveTimeout.TotalSeconds}s.",
-                        ExecutionTimeMs = stopwatch.ElapsedMilliseconds
-                    };
-                }
-                catch (Exception ex)
-                {
-                    stopwatch.Stop();
-                    return new AgentScriptResult
-                    {
-                        Code = code,
-                        Success = false,
-                        ErrorMessage = FormatRuntimeException(ex),
-                        Output = globals.TakeOutput(),
-                        ExecutionTimeMs = stopwatch.ElapsedMilliseconds
-                    };
-                }
-            }
-
-            /// <summary>
-            /// Renders compiler diagnostics with the detail the agent needs to self-correct: error id,
-            /// line:col, up to 3 preceding lines of context, the offending source line, and a caret
-            /// underline under the exact token — plus targeted hints for the recurring gotchas
-            /// (string-returning tools iterated as lists, .Length vs .Count, GetTypeName, CS1061 on object).
-            /// </summary>
-            private static string FormatCompilationDiagnostics(string code, IEnumerable<Microsoft.CodeAnalysis.Diagnostic> errors)
-            {
-                var lines = (code ?? string.Empty).Replace("\r\n", "\n").Split('\n');
-                var list = errors.ToList();
-                var sb = new StringBuilder();
-                sb.AppendLine($"Compilation failed — {list.Count} error(s); nothing ran. Fix the exact line(s) below — don't just re-run the same call:");
-
-                const int maxShown = 8;
-                foreach (var d in list.Take(maxShown))
-                {
-                    var span = d.Location.GetLineSpan();
-                    int lineNo = span.StartLinePosition.Line;    // 0-based
-                    int col = span.StartLinePosition.Character;  // 0-based
-                    sb.AppendLine($"[{d.Id}] line {lineNo + 1}:{col + 1} — {d.GetMessage()}");
-
-                    if (d.Location.IsInSource && lineNo >= 0 && lineNo < lines.Length)
-                    {
-                        // Up to 3 preceding lines for context, so the model can see where it formed its
-                        // (wrong) assumption about a variable's type — not just the line that finally broke.
-                        for (int ctx = Math.Max(0, lineNo - 3); ctx < lineNo; ctx++)
-                            sb.AppendLine($"  {(ctx + 1).ToString().PadLeft(4)} | {lines[ctx]}");
-
-                        var srcLine = lines[lineNo];
-                        int spanLen = Math.Max(1, d.Location.SourceSpan.Length);
-                        int caretLen = Math.Min(spanLen, Math.Max(1, srcLine.Length - col));
-                        sb.AppendLine($"  {(lineNo + 1).ToString().PadLeft(4)} | {srcLine}");
-                        sb.AppendLine($"  {new string(' ', 4)} | {new string(' ', Math.Max(0, col))}{new string('^', caretLen)}");
-                    }
-                }
-                if (list.Count > maxShown)
-                    sb.AppendLine($"  … and {list.Count - maxShown} more error(s).");
-
-                if (list.Any(d => d.GetMessage().Contains("'char' to 'string'", StringComparison.Ordinal)))
-                    sb.AppendLine("Hint: the search/read tools (FindFiles, SearchCode, SearchCodeRegex, SearchCodeHybrid, ReadFile, GetRepoMap, GetMethodDocumentation) each return ONE formatted string, not a list — Log() the whole string; do NOT foreach over it (iterating a string yields chars).");
-
-                // Targeted hints for the recurring API-discovery gotchas, keyed off the diagnostic text.
-                bool lengthHint = list.Any(d => d.GetMessage().Contains("does not contain a definition for 'Length'", StringComparison.Ordinal));
-                bool typeNameHint = list.Any(d => d.GetMessage().Contains("does not contain a definition for 'GetTypeName'", StringComparison.Ordinal));
-                if (lengthHint)
-                    sb.AppendLine("Hint: use .Count for List<T>/collections (e.g. schema.Methods.Count); .Length is only for arrays and strings.");
-                if (typeNameHint)
-                    sb.AppendLine("Hint: there is no GetTypeName(); use ex.GetType().Name to get an exception's type name.");
-                if (!lengthHint && !typeNameHint && list.Any(d => d.Id == "CS1061"))
-                    sb.AppendLine("Hint: CS1061 = that member doesn't exist on the variable's compile-time type. If the variable is typed `object` (e.g. from GetObjectMember/CallObjectMethod), use TryGetMember<T>(obj, \"Name\") for a typed read, or GetObjectMembers(obj) to discover the real members first.");
-
-                return sb.ToString().TrimEnd();
-            }
-
-            /// <summary>
-            /// Renders a runtime exception with type, the full inner-exception chain, and the top stack
-            /// frames (script frames appear as "Submission#…"). Reflection invokes wrap the real error in
-            /// TargetInvocationException, so we surface its inner exception as the primary one.
-            /// </summary>
-            private static string FormatRuntimeException(Exception ex)
-            {
-                var primary = (ex is System.Reflection.TargetInvocationException && ex.InnerException != null)
-                    ? ex.InnerException
-                    : ex;
-
-                var sb = new StringBuilder();
-                sb.AppendLine($"Runtime error: {primary.GetType().Name}: {primary.Message}");
-
-                var inner = primary.InnerException;
-                for (int depth = 0; inner != null && depth < 5; depth++)
-                {
-                    sb.AppendLine($"  → caused by {inner.GetType().Name}: {inner.Message}");
-                    inner = inner.InnerException;
-                }
-
-                if (!string.IsNullOrWhiteSpace(primary.StackTrace))
-                {
-                    var frames = primary.StackTrace.Replace("\r\n", "\n").Split('\n')
-                        .Select(f => f.Trim())
-                        .Where(f => f.Length > 0)
-                        .Take(8)
-                        .ToList();
-                    if (frames.Count > 0)
-                    {
-                        sb.AppendLine("Stack:");
-                        foreach (var f in frames) sb.AppendLine($"  {f}");
-                    }
-                }
-
-                return sb.ToString().TrimEnd();
-            }
         }
     }
 }

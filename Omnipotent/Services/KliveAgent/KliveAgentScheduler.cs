@@ -110,8 +110,9 @@ namespace Omnipotent.Services.KliveAgent
                 AgentChatResponse response;
                 try
                 {
-                    response = await service.HandleIncomingMessage(
-                        message, AgentSourceChannel.API, conversationId, senderName: "Scheduler");
+                    // A real run (stall watchdog, live view, a closed conversation if the server restarts
+                    // under it), queued for a model slot as background work.
+                    response = await service.RunDurableAsync(message, conversationId, "Scheduler", background: true);
                 }
                 catch (Exception ex)
                 {

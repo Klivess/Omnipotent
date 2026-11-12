@@ -17,14 +17,37 @@ namespace Omnipotent.Services.Projects.Stimulus
         private readonly StimulusHookRecord hook;
         private readonly Func<string, Task> emit;   // payload → IngestAsync for this hook
         private readonly Action<string> log;
+        private readonly Action<string>? onCompileFailed;
         private readonly CancellationTokenSource cts = new();
 
-        public StimulusScriptAdapter(StimulusHookRecord hook, string scriptBody, int pollSeconds, Func<string, Task> emit, Action<string> log)
+        /// <param name="onCompileFailed">Told why the script did not compile, so the hook can be shown
+        /// as failed instead of "armed": a script that never compiled never polls anything.</param>
+        public StimulusScriptAdapter(StimulusHookRecord hook, string scriptBody, int pollSeconds, Func<string, Task> emit, Action<string> log,
+            Action<string>? onCompileFailed = null)
         {
             this.hook = hook;
             this.emit = emit;
             this.log = log ?? (_ => { });
+            this.onCompileFailed = onCompileFailed;
             _ = Task.Run(() => RunAsync(scriptBody, Math.Max(2, pollSeconds), cts.Token));
+        }
+
+        /// <summary>
+        /// The options a stimulus script compiles with. Until 2026-11-11 these were the scripting defaults
+        /// plus imports: the namespaces were named but their assemblies were not referenced, so every
+        /// script failed with CS0234 "'Linq' does not exist in the namespace 'System'" (three hooks at each
+        /// start) and the only trace was a log line.
+        /// </summary>
+        internal static ScriptOptions BuildOptions() => ScriptOptions.Default
+            .WithReferences(Omnipotent.Services.KliveAgent.OmniScriptReferences.All)
+            .WithImports("System", "System.Linq", "System.Net.Http", "System.Threading", "System.Threading.Tasks", "System.Text.Json");
+
+        /// <summary>Compile errors for a stimulus script, or an empty list when it compiles.</summary>
+        internal static IReadOnlyList<string> CompileErrors(string scriptBody)
+        {
+            var diagnostics = CSharpScript.Create<object>(scriptBody, BuildOptions(), typeof(ScriptGlobals)).Compile();
+            return diagnostics.Where(d => d.Severity == Microsoft.CodeAnalysis.DiagnosticSeverity.Error)
+                .Select(d => d.ToString()).ToList();
         }
 
         /// <summary>The narrow surface a stimulus script may use.</summary>
@@ -45,13 +68,12 @@ namespace Omnipotent.Services.Projects.Stimulus
             ScriptRunner<object>? compiled = null;
             try
             {
-                var options = ScriptOptions.Default
-                    .WithImports("System", "System.Linq", "System.Net.Http", "System.Threading", "System.Threading.Tasks", "System.Text.Json");
-                compiled = CSharpScript.Create<object>(scriptBody, options, typeof(ScriptGlobals)).CreateDelegate();
+                compiled = CSharpScript.Create<object>(scriptBody, BuildOptions(), typeof(ScriptGlobals)).CreateDelegate();
             }
             catch (Exception ex)
             {
                 log($"Stimulus script for hook {hook.HookID} failed to compile: {ex.Message}");
+                try { onCompileFailed?.Invoke(ex.Message); } catch { }
                 return;
             }
 

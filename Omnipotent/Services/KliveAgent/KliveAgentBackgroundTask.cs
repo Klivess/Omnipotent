@@ -57,10 +57,13 @@ namespace Omnipotent.Services.KliveAgent
 
         public string SpawnTask(string description, string code)
         {
+            // The record (a file, and GET /kliveagent/tasks) keeps the script with any secret in it masked;
+            // the task below runs the script as written.
+            var guard = agentService.SecretGuard;
             var taskInfo = new AgentBackgroundTaskInfo
             {
                 Description = description,
-                Code = code,
+                Code = guard.MaskText(code)!,
             };
 
             var cts = new CancellationTokenSource();
@@ -79,8 +82,8 @@ namespace Omnipotent.Services.KliveAgent
                     var result = await scriptEngine.ExecuteScriptAsync(code, globals, TimeSpan.FromHours(24));
 
                     taskInfo.Status = result.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed;
-                    taskInfo.Result = result.Output;
-                    taskInfo.ErrorMessage = result.ErrorMessage;
+                    taskInfo.Result = guard.MaskText(result.Output)!;
+                    taskInfo.ErrorMessage = guard.MaskText(result.ErrorMessage)!;
                     taskInfo.CompletedAt = DateTime.UtcNow;
 
                     // Notify Klives on completion
@@ -101,7 +104,7 @@ namespace Omnipotent.Services.KliveAgent
                 catch (Exception ex)
                 {
                     taskInfo.Status = AgentTaskStatus.Failed;
-                    taskInfo.ErrorMessage = ex.Message;
+                    taskInfo.ErrorMessage = guard.MaskText(ex.Message)!;
                     taskInfo.CompletedAt = DateTime.UtcNow;
                 }
                 finally

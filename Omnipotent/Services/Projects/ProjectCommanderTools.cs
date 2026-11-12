@@ -2836,20 +2836,15 @@ namespace Omnipotent.Services.Projects
         }
 
         // Roslyn needs the referenced ASSEMBLIES, not just the imported namespaces — otherwise
-        // System.Net.Http / System.Text.Json names fail to bind (CS0234). Built once.
-        private static readonly ScriptOptions ScriptOpts = ScriptOptions.Default
-            .AddReferences(
-                typeof(object).Assembly,                       // System.Private.CoreLib
-                typeof(Enumerable).Assembly,                    // System.Linq
-                typeof(System.Net.Http.HttpClient).Assembly,    // System.Net.Http
-                typeof(System.Text.Json.JsonSerializer).Assembly, // System.Text.Json
-                typeof(System.Collections.Generic.List<>).Assembly,
-                typeof(Microsoft.CSharp.RuntimeBinder.Binder).Assembly, // dynamic Globals compatibility
-                typeof(WorkScriptGlobals).Assembly)             // Omnipotent (the globals type)
+        // System.Net.Http / System.Text.Json names fail to bind (CS0234). The set is the one every
+        // script host shares (OmniScriptReferences): it used to be seven assemblies listed here, so a
+        // work script could not name anything outside them. Built on first use, not at type load.
+        private static readonly Lazy<ScriptOptions> ScriptOpts = new(() => ScriptOptions.Default
+            .WithReferences(Omnipotent.Services.KliveAgent.OmniScriptReferences.All)
             .WithImports("System", "System.IO", "System.Linq", "System.Collections", "System.Collections.Generic", "System.Net.Http",
                 "System.Text", "System.Text.Json", "System.Threading", "System.Threading.Tasks",
                 "Omnipotent.Services.KliveAgent", "Omnipotent.Services.KliveAgent.Models",
-                "Omnipotent.Services.Projects");
+                "Omnipotent.Services.Projects"));
 
         private async Task<CommanderToolResult> RunScriptAsync(string code, CancellationToken ct)
         {
@@ -2867,9 +2862,9 @@ namespace Omnipotent.Services.Projects
                 globals.CancellationToken = ct;
                 globals.ConversationId = $"project:{project.ProjectID}:{actingAgentID}";
                 if (session.State == null)
-                    session.State = await CSharpScript.RunAsync<object>(code, ScriptOpts, globals, typeof(WorkScriptGlobals), ct);
+                    session.State = await CSharpScript.RunAsync<object>(code, ScriptOpts.Value, globals, typeof(WorkScriptGlobals), ct);
                 else
-                    session.State = await session.State.ContinueWithAsync<object>(code, ScriptOpts, ct);
+                    session.State = await session.State.ContinueWithAsync<object>(code, ScriptOpts.Value, ct);
                 string output = string.Join("\n", new[] { globals.DrainOutput(), globals.TakeOutput() }
                     .Where(s => !string.IsNullOrWhiteSpace(s)));
                 object? returnValue = await UnwrapScriptValueAsync(session.State.ReturnValue, ct);

@@ -381,6 +381,34 @@ namespace Omnipotent.Service_Manager
             return result;
         }
 
+        /// <summary>
+        /// The plaintext of every sensitive text setting that has a value, so a caller can keep those exact
+        /// values out of what it stores (KliveAgent masks them in saved scripts and their output). For use
+        /// inside the process only: the result must never be serialised, logged or returned by a route.
+        /// A setting that cannot be decrypted is left out. Throws until the settings have loaded, so a
+        /// caller never mistakes "not loaded yet" for "there are none".
+        /// </summary>
+        internal IReadOnlyList<string> SensitiveValuesForRedaction()
+        {
+            if (!settingsLoaded.Task.IsCompletedSuccessfully)
+                throw new InvalidOperationException("Settings have not loaded yet.");
+            var values = new List<string>();
+            foreach (var stored in settings.Values)
+            {
+                if (!stored.Sensitive || !stored.HasValue) continue;
+                if (stored.Type != OmniSettingType.String && stored.Type != OmniSettingType.StringList) continue;
+                try
+                {
+                    string value = DecodeSetting(stored).Value;
+                    if (string.IsNullOrEmpty(value)) continue;
+                    if (stored.Type == OmniSettingType.StringList) values.AddRange(DeserializeStringList(value));
+                    else values.Add(value);
+                }
+                catch { /* nothing readable to mask */ }
+            }
+            return values;
+        }
+
         private OmniSetting? ResolveExisting(string name, string? parentServiceId)
         {
             if (!string.IsNullOrWhiteSpace(parentServiceId))

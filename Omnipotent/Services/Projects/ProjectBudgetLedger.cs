@@ -94,6 +94,13 @@ namespace Omnipotent.Services.Projects
         /// </summary>
         public Func<bool>? IsFlatFeeProvider { get; set; }
 
+        /// <summary>
+        /// Whether the router one booked turn ran on charges nothing per token, from the source and
+        /// operation it is booked under (each Projects lane can have its own router). Null when unknown:
+        /// the ledger then uses <see cref="IsFlatFeeProvider"/>.
+        /// </summary>
+        public Func<string?, string?, bool?>? IsFlatFeeForTurn { get; set; }
+
         private bool FlatFee
         {
             get
@@ -101,6 +108,13 @@ namespace Omnipotent.Services.Projects
                 try { return IsFlatFeeProvider?.Invoke() ?? false; }
                 catch { return false; }
             }
+        }
+
+        private bool? SafeTurnFlatFee(ProjectTokenUsageContext? context)
+        {
+            if (context == null || IsFlatFeeForTurn == null) return null;
+            try { return IsFlatFeeForTurn(context.Source, context.Operation); }
+            catch { return null; }
         }
 
         public ProjectBudgetLedger(ProjectStore projectStore, ProjectEventLogStore eventLog,
@@ -280,7 +294,10 @@ namespace Omnipotent.Services.Projects
             // estimate worth making: the cost IS zero, and it is recorded as authoritative ("actual")
             // rather than provisional so nothing later tries to reconcile it against a per-token
             // pricing endpoint that knows nothing about this generation.
-            bool flatFee = FlatFee;
+            // The turn's own router decides: its response said so, or its lane is asked.
+            bool flatFee = usageContext?.FlatFee
+                ?? SafeTurnFlatFee(usageContext)
+                ?? FlatFee;
             bool haveActual = flatFee
                 || (actualCostUsd.HasValue
                     && double.IsFinite(actualCostUsd.Value)

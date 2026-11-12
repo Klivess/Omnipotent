@@ -22,6 +22,10 @@ namespace Omnipotent.Services.KliveLLM
         double AverageLogProbability,
         bool Detailed);
 
+    /// <summary>One speech call as the KliveLLM ledger records it.</summary>
+    public sealed record AIRouterAudioCall(string Kind, string Model, long DurationMs, long BytesIn, long BytesOut,
+        string Outcome, int? Status, string? Error);
+
     /// <summary>An audio request AIRouter refused or failed. 429s have already penalised the shared queue.</summary>
     public sealed class AIRouterAudioException : Exception
     {
@@ -138,6 +142,44 @@ namespace Omnipotent.Services.KliveLLM
             string? language = null, string? prompt = null, CancellationToken cancellationToken = default)
         {
             if (audio == null || audio.Length == 0) throw new ArgumentException("No audio.", nameof(audio));
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                var transcript = await TranscribeCoreAsync(audio, fileName, mimeType, language, prompt, cancellationToken);
+                Report("stt", TranscriptionModel, timer, audio.Length, Encoding.UTF8.GetByteCount(transcript.Text ?? ""), null, cancellationToken);
+                return transcript;
+            }
+            catch (Exception ex)
+            {
+                Report("stt", TranscriptionModel, timer, audio.Length, 0, ex, cancellationToken);
+                throw;
+            }
+        }
+
+        /// <summary>Called after every speech call with what it cost and how it ended.</summary>
+        public Action<AIRouterAudioCall>? Recorder { get; set; }
+
+        private void Report(string kind, string model, System.Diagnostics.Stopwatch timer, long bytesIn, long bytesOut, Exception? error, CancellationToken cancellationToken)
+        {
+            var recorder = Recorder;
+            if (recorder == null) return;
+            string outcome = error == null ? "ok"
+                : cancellationToken.IsCancellationRequested ? "cancelled"
+                : error is AIRouterAudioException { RateLimited: true } ? "rate_limited"
+                : error is AIRouterAudioException { Status: { } s } && (int)s >= 500 ? "unavailable"
+                : error is AIRouterAudioException { Status: { } a } && ((int)a == 401 || (int)a == 403) ? "auth"
+                : error is AIRouterAudioException { Status: { } b } && (int)b >= 400 ? "invalid_request"
+                : error is TaskCanceledException ? "timeout"
+                : error is HttpRequestException or IOException ? "network"
+                : "error";
+            int? status = error == null ? 200 : (error as AIRouterAudioException)?.Status is { } code ? (int)code : null;
+            try { recorder(new AIRouterAudioCall(kind, model, timer.ElapsedMilliseconds, bytesIn, bytesOut, outcome, status, error?.Message)); }
+            catch { /* recording must never break a speech call */ }
+        }
+
+        private async Task<AIRouterTranscript> TranscribeCoreAsync(byte[] audio, string fileName, string mimeType,
+            string? language, string? prompt, CancellationToken cancellationToken)
+        {
 
             bool wantDetail = Volatile.Read(ref verboseJson) >= 0;
             bool sendPrompt = !string.IsNullOrWhiteSpace(prompt) && Volatile.Read(ref promptField) >= 0;
@@ -228,6 +270,24 @@ namespace Omnipotent.Services.KliveLLM
         /// </summary>
         public async Task<(byte[] Audio, string Format)> SynthesizeAsync(string text, string? voice = null,
             double speed = 1.0, string format = "wav", CancellationToken cancellationToken = default)
+        {
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            long inBytes = Encoding.UTF8.GetByteCount(text ?? "");
+            try
+            {
+                var result = await SynthesizeCoreAsync(text, voice, speed, format, cancellationToken);
+                Report("tts", SpeechModel, timer, inBytes, result.Audio.Length, null, cancellationToken);
+                return result;
+            }
+            catch (Exception ex) when (ex is not ArgumentException)
+            {
+                Report("tts", SpeechModel, timer, inBytes, 0, ex, cancellationToken);
+                throw;
+            }
+        }
+
+        private async Task<(byte[] Audio, string Format)> SynthesizeCoreAsync(string text, string? voice,
+            double speed, string format, CancellationToken cancellationToken)
         {
             string input = (text ?? string.Empty).Trim();
             if (input.Length == 0) throw new ArgumentException("Nothing to say.", nameof(text));

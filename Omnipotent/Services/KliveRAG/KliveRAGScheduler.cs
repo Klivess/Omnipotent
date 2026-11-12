@@ -36,7 +36,7 @@ namespace Omnipotent.Services.KliveRAG
             {
                 await service.ReindexAsync(null);          // reconcile every connector
                 await service.EvictExpiredWebAsync();      // drop expired web docs + stale cache rows
-                _ = service.ServiceLog($"[KliveRAG] nightly sweep complete. {Newtonsoft.Json.JsonConvert.SerializeObject(service.GetStats())}");
+                _ = service.ServiceLog($"[KliveRAG] nightly sweep complete. {Newtonsoft.Json.JsonConvert.SerializeObject(await service.GetStatsAsync())}");
             }
             catch (Exception ex) { _ = service.ServiceLogError(ex, "[KliveRAG] nightly sweep failed"); }
             finally
