@@ -65,6 +65,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         public Omnipotent.Services.OmniscienceV3.Modules.DataControls.DataControlsModule? Data { get; private set; }
         public Omnipotent.Services.OmniscienceV3.Modules.Links.LinksModule? Links { get; private set; }
         public Omnipotent.Services.OmniscienceV3.Modules.Translate.TranslateModule? Translate { get; private set; }
+        public Omnipotent.Services.OmniscienceV3.Modules.Monitors.MonitorsModule? Monitors { get; private set; }
         /// <summary>The stand-in for the internet that the links module asks (only when a test installs the module).</summary>
         public FakeLinkFetcher Fetcher { get; } = new();
         public List<string> Errors { get; } = new();
@@ -72,7 +73,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
 
         /// <param name="utcNow">Defaults to a Monday at 13:00 in Klives's zone (Europe/London), outside quiet hours.</param>
         public static async Task<SignalsHarness> StartAsync(DateTime? utcNow = null, bool explore = false, bool rollups = false, bool classification = false, ISignalReadings? readings = null,
-            bool briefs = false, bool transforms = false, bool insights = false, bool datacontrols = false, bool links = false, bool translate = false)
+            bool briefs = false, bool transforms = false, bool insights = false, bool datacontrols = false, bool links = false, bool translate = false, bool monitors = false)
         {
             var h = new SignalsHarness { Clock = new FixedClock(Instant.FromUtc(utcNow ?? new DateTime(2025, 6, 2, 12, 0, 0, DateTimeKind.Utc))) };
             h.Signals = new SignalsModule(readings ?? h.Readings);
@@ -87,6 +88,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             if (insights) modules.Add(h.Insights = new Omnipotent.Services.OmniscienceV3.Modules.Insights.InsightsModule(h.Signals, () => h.Explore));
             if (transforms) modules.Add(h.Transforms = new Omnipotent.Services.OmniscienceV3.Modules.Transforms.TransformsModule(() => modules));
             if (datacontrols) modules.Add(h.Data = new Omnipotent.Services.OmniscienceV3.Modules.DataControls.DataControlsModule());
+            if (monitors) modules.Add(h.Monitors = new Omnipotent.Services.OmniscienceV3.Modules.Monitors.MonitorsModule(h.Signals));
             if (links) modules.Add(h.Links = new Omnipotent.Services.OmniscienceV3.Modules.Links.LinksModule(h.Fetcher));
             if (explore) modules.Add(h.Explore = new ExploreModule(() => modules));
             h.Runtime = await V3Runtime.StartAsync(new V3RuntimeOptions

@@ -114,6 +114,7 @@ CREATE TABLE brief_runs(
         public override IReadOnlyList<ITactic> Tactics => tactics ??= new ITactic[]
         {
             new SummariseSelectionTactic(this), new TopicSnapshotTactic(this), new ActionItemsTactic(this), new DigestSubscriptionTactic(this),
+            new SlangDecoderTactic(this), new DisputeSidesTactic(this),
         };
 
         private IReadOnlyList<ITactic>? tactics;

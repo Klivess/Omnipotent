@@ -659,6 +659,24 @@ export interface ForgetRunDto {
   finishedAtMs?: number | null;
 }
 
+export interface HealthIssueDto {
+  issueId: string;
+  kind: string;
+  subject?: string | null;
+  severity: string;
+  detail: unknown;
+  firstMs: number;
+  lastMs: number;
+  resolvedMs?: number | null;
+}
+
+export interface HealthListDto {
+  open: HealthIssueDto[];
+  resolved: HealthIssueDto[];
+  enabled: boolean;
+  checkedAtMs?: number | null;
+}
+
 export interface IdentitySummaryDto {
   identityId: string;
   platform: string;
@@ -969,6 +987,53 @@ export interface ModuleHealth {
   lastSucceededMs?: number | null;
   lastFailedMs?: number | null;
   lastError?: string | null;
+}
+
+export interface MonitorEventDto {
+  eventId: string;
+  kind: string;
+  ruleId?: string | null;
+  personId?: string | null;
+  personName?: string | null;
+  guildId?: string | null;
+  conversationId?: string | null;
+  atMs: number;
+  data: unknown;
+  notified: boolean;
+}
+
+export interface MonitorEventPageDto {
+  items: MonitorEventDto[];
+}
+
+export interface MonitorRuleChangedDto {
+  watchId: string;
+  changed: boolean;
+}
+
+export interface MonitorRuleDto {
+  watchId: string;
+  kind: string;
+  name: string;
+  enabled: boolean;
+  definition: unknown;
+  createdAtMs: number;
+  updatedAtMs: number;
+  fired30d: number;
+  lastFiredMs?: number | null;
+}
+
+export interface MonitorRuleEnabledRequest {
+  watchId: string;
+  enabled: boolean;
+}
+
+export interface MonitorRuleListDto {
+  rules: MonitorRuleDto[];
+}
+
+export interface MonitorRuleRequest {
+  watchId: string;
 }
 
 export interface NameSpanDto {
@@ -1745,6 +1810,18 @@ export interface TaskCatalogEntryDto {
 export type TimeBucket = "None" | "Hour" | "Day" | "Week" | "Month" | "Quarter" | "Year" | "HourOfDay" | "DayOfWeek";
 
 export type TimeLens = "Klives" | "Subject" | "Utc";
+
+export interface TopicStatusDto {
+  watchId: string;
+  name: string;
+  last24h: number;
+  usualDay: number;
+  robustZ: number;
+  surging: boolean;
+  threshold: number;
+  days: number[];
+  recentMessageIds: string[];
+}
 
 export interface TranslateRequest {
   messageIds: string[];

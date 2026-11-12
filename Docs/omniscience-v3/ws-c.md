@@ -19,7 +19,8 @@ lands, so a restart can resume from it.
 | Wellbeing check-ins (N14, X44) | 9cb702a | `InsightsModule.Wellbeing.cs`, insights migration 2. |
 | Data controls (N20, X76) | 5bf8ec4 | `Modules/DataControls`, `Storage/Forgotten.cs`, `Storage/AnalysisOff.cs`, `Api/DataControlsRoutes.cs`; analysis off touches the classifier, rollups, signals, briefs, insights, transforms, explore, projections and the tactic runner (a few lines each); the old-database importer honours both. See "For the merge" in its section. |
 | Community pages (N13), similar people and map (N16) | 59c185d | `InsightsModule.Spaces.cs`, `InsightsModule.People.cs`, `Layout2D.cs`; insights migrations 3 and 4; rollups migration 2 (`rollup_scope_day.klives`). |
-| Link intelligence (N15, X23) and translation (N19, X33) | the commit after community pages | `Modules/Links`, `Modules/Translate`, `Api/LinksRoutes.cs`, `Api/TranslateRoutes.cs`, `Kernel/Modules/Translations.cs` (additive). `BriefsModule` now takes the translation layer; in `BuildModules()` it is added after the list for that reason. Looking links up at providers is **off by default** (`links.unfurl.enabled`). |
+| Link intelligence (N15, X23) and translation (N19, X33) | 9beaba8 | `Modules/Links`, `Modules/Translate`, `Api/LinksRoutes.cs`, `Api/TranslateRoutes.cs`, `Kernel/Modules/Translations.cs` (additive). `BriefsModule` now takes the translation layer; in `BuildModules()` it is added after the list for that reason. Looking links up at providers is **off by default** (`links.unfurl.enabled`). |
+| Monitors (X42, X43, X46, X47, X51) and the discourse tactics (X32, X35) | the commit after links and translation | `Modules/Monitors`, `Api/MonitorsRoutes.cs`, `Modules/Briefs/DiscourseTactics.cs`. `MonitorsModule` is handed the signals module (notices). |
 
 ## What the other workstreams integrate against (C-base)
 - **Shared encoder:** `ModuleContext.Encoder` (`IEmbeddingEncoder`, frozen R7 #5). Production: `LazyE5Encoder` from
@@ -341,6 +342,57 @@ who is an adult and whose analysis is on.
   tables, a few seconds on half the cores). A trait that hardly varies between people still counts as much as one that
   does, once standardised. "Personality" here is the mix of readings of someone's messages, nothing more.
 
+## Monitors without a model (X42, X43, X46, X47, X51)
+Module `monitors` (`Modules/Monitors`), routes under `monitors/` (`Api/MonitorsRoutes.cs`). Every finding is recorded once in
+`mon_events` (its id says what it is about, so finding it again is not news) and handed to the signals module's notices,
+which decide the delivery (quiet hours, digest, push). Only messages that **arrived live** raise anything, and only while
+fresh (`monitors.freshness_hours`, 12): backfill and imports are history. Nothing is ever about someone who is, or may be,
+under 18 (not recorded, not told) or whose analysis is switched off; the event list applies both rules again when read.
+
+- **X42 person activity watch** (`x42.person_activity_watch`, watches in `watchlists` kind `person_activity`): the selected
+  people write again after `absenceDays` of silence (told once, with the gap), or post in a selected server (once a day per
+  server). Refused for minors (the tactic declares the person-targeted-alert restriction) and for analysis-off people.
+- **X43 topic surge** (`x43.topic_surge`, kind `topic_surge`): a phrase (FTS, words in order) or a concept taught with X19,
+  everywhere or in selected servers and conversations. Its usual day is the median of the 28 complete days before today
+  (any source); a surge is the live messages of the last 24 hours reaching `minCount` (10) and `factor` (3) times the usual
+  day, with a robust z of at least 3.5. Told once a day per watch. `GET monitors/topic` shows where a topic stands.
+- **X46 new-person radar** (`x46.new_person_radar`, `monitors.new_people.enabled`): someone writes to Klives directly for the
+  first time (and he did not write first), joins his own circle (his N12 community), or is new to a community and rising
+  fast there (from the N13 pages, not when they became as busy everywhere). The first hourly pass learns what is already
+  the case, so installing it does not tell Klives about everyone at once.
+- **X47 sentiment toward Klives** (`x47.klives_tone_watch`, `monitors.klives_tone.*`): in each server or group chat, the
+  live messages of the last `window_hours` (6) that were to or about him and read as negative (or positive), from at least
+  two people, against that community's usual from `rollup_scope_day.klives` (median over 28 days). Target-aware: the tone
+  of the messages about him, not the mood of the place. Direct chats are left to the radar. Negative is "attention",
+  positive "info"; one notice per burst.
+- **X51 data-health alerts** (`x51.data_health`, `monitors.health.*`): a source in a failing status; a busy source (at least
+  20 messages a day over the last week, counted as messages arrive) silent for 12 hours; backfills that have not moved for a
+  day; more than 30% failed model calls in an hour; the model's circuit breaker open (urgent); the prefix-cache efficiency of
+  background model work under 0.5 over six hours (after 20 calls); jobs dead in the last day, per module. Problems open,
+  stay open while they last, close when they go (`GET monitors/health`), and are told again when they come back.
+- Forgetting a person, or switching their analysis off, removes their findings; a finding that listed messages keeps only
+  the ones that still exist.
+- Not exercised: real traffic (thresholds are defaults to tune with live data), and WS-A's real source statuses (the
+  module treats anything but active, ok, connected, idle, running, live and syncing as down, and disabled or paused as deliberate).
+- Still to build: X48 plan/date reminders and X50 standing-question flips need WS-B's extractions and inquiries (at the
+  merge they hand their findings to the same notices).
+
+## Slang decoder (X32) and sides in a dispute (X35)
+Two model tactics in the `briefs` module (`Modules/Briefs/DiscourseTactics.cs`), interactive, with checked output:
+
+- **X32** (`x32.slang_decoder`): the model points at the terms an outsider would not get (only terms really written in the
+  message are kept, at most eight); each term's history is read from the same server (all its channels) or chat by full-text
+  search: its first uses and its latest, how often and by how many people. The model then explains each term from that
+  history and must cite it: a meaning said to come from history that cites nothing it was given is dropped ("unclear"),
+  common slang may be explained as "general". It is told to explain the words, not the people.
+- **X35** (`x35.dispute_sides`): the messages around the selected ones (`contextMinutes`, 120) or a conversation and range.
+  The model sees participants as labels (P1, P2, ...), not names, plus who replied to, mentioned and reacted to whom, and
+  returns two to four positions, each summarised fairly with quotes and the participants who took it; it is told not to
+  judge who is right or guess at motives. A position without a real quote is dropped; unknown participants are dropped.
+  Someone who is, or may be, under 18 is not named or placed on a side, though their words count for the position.
+- Both leave out what analysis-off people wrote (and the summarising tactics X18, X30, X31 now do too: they did not).
+- Not exercised: a real model (the tests script it, including answers it must reject).
+
 ## Link intelligence (N15, X23)
 Module `links` (`Modules/Links`), routes under `links/` (`Api/LinksRoutes.cs`), tactic `x23.link_tracker`.
 
@@ -603,7 +655,9 @@ holds the corpus writer for its duration, seconds on a few million messages).
 | Link intelligence (N15, X23) | done, tested (5 tests: parser rules, fetch guards, collection, opt-in lookups, topics, tracker, forgetting; no real provider) |
 | Translation (N19, X33) | done, tested (4 tests with a scripted model: queue, budget, per-version, shielding, selection, digests) |
 | Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
-| Tactics X17 (merge step), X32, X35; monitors X42, X43, X46–X48, X50–X51 | pending |
+| Monitors X42, X43, X46, X47, X51 | done, tested (5 tests; thresholds are defaults to tune on live data) |
+| Tactics X32 (slang decoder) and X35 (sides in a dispute) | done, tested (2 tests with a scripted model, including answers it must reject) |
+| X17 (merge step with WS-B's extractor), X48 and X50 (need WS-B) | pending |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)

@@ -45,6 +45,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
                 rows = corpus.QueryInWith("SELECT " + Columns + " WHERE m.guild_id IN ({keys}) AND m.sent_at_ms >= $f AND m.sent_at_ms < $t AND " + Readable, guilds, Read, ("$f", from), ("$t", to));
             else
                 rows = corpus.Query(null, "SELECT " + Columns + " WHERE m.sent_at_ms >= $f AND m.sent_at_ms < $t AND " + Readable + " ORDER BY m.sent_at_ms DESC LIMIT $l", Read, ("$f", from), ("$t", to), ("$l", cap + 1));
+            // Analysis switched off for someone (N20): what they wrote is not summarised.
+            var off = Storage.AnalysisOff.Load(ctx.Stores);
+            if (off.Any) rows.RemoveAll(m => off.Author(m.AuthorIdentity));
             int total = rows.Count;
             var kept = rows.OrderByDescending(m => m.AtMs).ThenByDescending(m => m.Id, StringComparer.Ordinal).Take(cap).Reverse().ToList();
             return new Loaded(kept, total);

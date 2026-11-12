@@ -132,6 +132,8 @@ namespace Omnipotent.Services.OmniscienceV3
                 new Modules.DataControls.DataControlsModule(),
                 new Modules.Links.LinksModule(),
                 new Modules.Translate.TranslateModule(),
+                // Monitors hand their findings to the signals module's notices.
+                new Modules.Monitors.MonitorsModule(signals),
             };
             // Digests read a foreign-language message with its stored translation beside it.
             modules.Add(new Modules.Briefs.BriefsModule(() => modules.OfType<Kernel.Modules.ITranslations>().FirstOrDefault()));

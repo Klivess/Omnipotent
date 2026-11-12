@@ -53,6 +53,9 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
                 "signals.watch.policy" => JsonSerializer.Serialize(new { targets_special_category = SensitiveRules.Any(w => user.Contains(w, StringComparison.OrdinalIgnoreCase)) }),
                 "signals.watch.confirm" => Watch(user),
                 "translate.batch" => Translate(user),
+                "discourse.decode.terms" => DecodeTerms(user),
+                "discourse.decode.explain" => DecodeExplain(user),
+                "discourse.sides" => Sides(user),
                 // Links: every link is filed under "other" unless a test says otherwise (Override).
                 "links.categorise" => JsonSerializer.Serialize(new { items = Regex.Matches(user, "<l ref=\"(?<ref>[0-9]+)\"").Select(m => new { @ref = m.Groups["ref"].Value, topic = "other", summary = "A link." }) }),
                 _ => throw new InvalidOperationException($"FakeLlm has no answer for purpose '{request.Purpose}'."),
@@ -64,6 +67,57 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             new(true, null, json, LlmErrorKind.None, null, "stop", "fake-model", "fake", Math.Max(1, prompt.Length / 4), 0, json.Length / 4, prompt.Length, 5);
 
         private static string Decode(string s) => s.Replace("‹", "<").Replace("›", ">");
+
+        /// <summary>The slang the fake decoder recognises.</summary>
+        public static readonly string[] Slang = { "yeet", "gg ez", "the bridge thing" };
+
+        private static readonly Regex TermBlock = new(@"<t id=""(?<id>[^""]+)"" term=""(?<term>[^""]*)"">(?<body>.*?)</t>", RegexOptions.Singleline | RegexOptions.Compiled);
+        private static readonly Regex SideLine = new(@"<m ref=""(?<ref>[^""]+)"" by=""(?<by>[^""]+)""[^>]*>(?<text>.*?)</m>", RegexOptions.Singleline | RegexOptions.Compiled);
+
+        /// <summary>Points at the known slang in each message, and at one term that is in none (which must be dropped).</summary>
+        private static string DecodeTerms(string user)
+        {
+            var terms = new List<object>();
+            foreach (Match m in Any.Matches(user))
+            {
+                string text = Decode(m.Groups["text"].Value);
+                foreach (string word in Slang)
+                    if (text.Contains(word, StringComparison.OrdinalIgnoreCase)) terms.Add(new { term = word, @ref = m.Groups["ref"].Value });
+            }
+            terms.Add(new { term = "HALLUCINATED", @ref = "1" });
+            return JsonSerializer.Serialize(new { terms });
+        }
+
+        /// <summary>Explains a term from its first two earlier uses (plus a ref it was never given); "gg ez" as general slang; anything
+        /// without history as if from history but citing nothing real (which must not be kept).</summary>
+        private static string DecodeExplain(string user)
+        {
+            var items = new List<object>();
+            foreach (Match t in TermBlock.Matches(user))
+            {
+                string id = t.Groups["id"].Value, term = t.Groups["term"].Value;
+                var refs = Any.Matches(t.Groups["body"].Value).Select(m => m.Groups["ref"].Value).ToList();
+                if (refs.Count > 0) items.Add(new { id, meaning = $"used here for getting rid of something, as in {refs[0]}", basis = "history", refs = refs.Take(2).Append("bogus").ToArray() });
+                else if (term == "gg ez") items.Add(new { id, meaning = "good game, easy: a taunt after winning", basis = "general", refs = new[] { "T9.9" } });
+                else items.Add(new { id, meaning = "probably something", basis = "history", refs = new[] { "nope" } });
+            }
+            return JsonSerializer.Serialize(new { items });
+        }
+
+        /// <summary>Two sides by the words FOR and AGAINST, one position nobody can be quoted for, a participant who does not exist,
+        /// and everyone else neutral.</summary>
+        private static string Sides(string user)
+        {
+            var lines = SideLine.Matches(user).Select(m => (Ref: m.Groups["ref"].Value, By: m.Groups["by"].Value, Text: Decode(m.Groups["text"].Value))).ToList();
+            var pro = lines.Where(l => Regex.IsMatch(l.Text, @"\bFOR\b")).ToList();
+            var con = lines.Where(l => Regex.IsMatch(l.Text, @"\bAGAINST\b")).ToList();
+            var positions = new List<object>();
+            if (pro.Count > 0) positions.Add(new { label = "For", summary = "Pineapple belongs on pizza.", refs = pro.Select(l => l.Ref).Append("999").ToArray(), participants = pro.Select(l => l.By).Distinct().ToArray() });
+            if (con.Count > 0) positions.Add(new { label = "Against", summary = "It does not belong there.", refs = con.Select(l => l.Ref).ToArray(), participants = con.Select(l => l.By).Distinct().Append("P99").ToArray() });
+            positions.Add(new { label = "Invented", summary = "Nobody said this.", refs = new[] { "12345" }, participants = new[] { "P1" } });
+            var sided = pro.Concat(con).Select(l => l.By).ToHashSet();
+            return JsonSerializer.Serialize(new { topic = "whether pineapple belongs on pizza", positions, neutral = lines.Select(l => l.By).Where(b => !sided.Contains(b)).Distinct().ToArray(), unresolved = true });
+        }
 
         /// <summary>What the fake translator knows. Anything else comes back unchanged.</summary>
         public static readonly Dictionary<string, string> Phrases = new()
