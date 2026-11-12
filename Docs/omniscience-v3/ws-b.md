@@ -53,7 +53,7 @@ coordinating session works here. Everything below is committed; `219` v3 tests p
 | Identity links, merges, X67 | built; tested: two signals, never merged unasked, merge, undo. **Not tested:** that a merge re-attributes every person-keyed derived row. |
 | Life timeline (N7), plans and dates (N8) | built; run through the kernel loop on the planted corpus (an overdue promise, a birthday, a relocation). **Not tested:** reminders being sent, cancellations and reschedules, Feb 29 beyond the date arithmetic. |
 | Quality Lab (N18) | built; the lab job runs in the kernel loop, the gate and the metrics are unit-tested. **Not tested:** the planted-evaluation job, per-category precision from gold, prompt A/B. |
-| Knowledge routes (`Knowledge/Api/KnowledgeRoutes.cs`, 35 routes) and the Ask router | built, **never exercised**: there is no route test harness (a route needs KliveAPI's request object). They delegate to module methods, most of which are tested above. First real exercise is the shadow run. |
+| Knowledge routes (`Knowledge/Api/KnowledgeRoutes.cs`, 33 routes) and the Ask router | built, **never exercised**: there is no route test harness (a route needs KliveAPI's request object). They delegate to module methods, most of which are tested above. First real exercise is the shadow run. |
 | Traceability | eight rows ticked from tests (F026, F195, F241, F258, F259, F537; F264 and F547 in progress). **The rest of this workstream's rows are not ticked**: do that row by row against the code before the merge. |
 
 ### Defects the tests found (all fixed on this branch)
