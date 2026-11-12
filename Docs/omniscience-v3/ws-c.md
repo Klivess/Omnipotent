@@ -17,7 +17,8 @@ lands, so a restart can resume from it.
 | Transforms without a model (X20–X22, X28, X29, X34, X37–X40) | the commit after digests and briefs | `Modules/Transforms`, `Api/TransformsRoutes.cs`. `TransformsModule` is given the module list (to check saved charts against declared datasets), like Explore. |
 | Notices, relationship dynamics and communities (N12, X36, X45) | the commit after the transforms | `Kernel/Modules/Notices.cs` (additive contract), `Modules/Insights`, `Api/InsightsRoutes.cs`, signals migration 2. `InsightsModule` is given the signals module (its notice sink). |
 | Wellbeing check-ins (N14, X44) | 9cb702a | `InsightsModule.Wellbeing.cs`, insights migration 2. |
-| Data controls (N20, X76) | the commit after wellbeing | `Modules/DataControls`, `Storage/Forgotten.cs`, `Storage/AnalysisOff.cs`, `Api/DataControlsRoutes.cs`; analysis off touches the classifier, rollups, signals, briefs, insights, transforms, explore, projections and the tactic runner (a few lines each); the old-database importer honours both. See "For the merge" in its section. |
+| Data controls (N20, X76) | 5bf8ec4 | `Modules/DataControls`, `Storage/Forgotten.cs`, `Storage/AnalysisOff.cs`, `Api/DataControlsRoutes.cs`; analysis off touches the classifier, rollups, signals, briefs, insights, transforms, explore, projections and the tactic runner (a few lines each); the old-database importer honours both. See "For the merge" in its section. |
+| Community pages (N13), similar people and map (N16) | the commit after data controls | `InsightsModule.Spaces.cs`, `InsightsModule.People.cs`, `Layout2D.cs`; insights migrations 3 and 4; rollups migration 2 (`rollup_scope_day.klives`). |
 
 ## What the other workstreams integrate against (C-base)
 - **Shared encoder:** `ModuleContext.Encoder` (`IEmbeddingEncoder`, frozen R7 #5). Production: `LazyE5Encoder` from
@@ -284,6 +285,61 @@ after the nightly relationship job.
 - Not exercised: the ensemble's `sentiment` and `distress` readings on real messages (the tests write the rollups and the
   labels themselves).
 
+## Community pages (N13): servers and group chats
+Part of the `insights` module (`InsightsModule.Spaces.cs`, table `ins_spaces`). The plan calls a server or group chat a
+"community"; the code calls it a **space**, because N12 already uses "community" for the circles found in who interacts
+with whom. The job `insights/spaces` runs after the nightly relationship job and builds a page for every server and group
+chat with at least `insights.space.min_messages` (200) messages in the window (`insights.space.window_days`, 90), the
+busiest `insights.space.max_spaces` (150) of them. `POST insights/space/refresh` builds one page on request, whatever its
+size. Routes: `GET insights/spaces` (the list), `GET insights/space?scopeKind=guild|conversation&scopeId=`.
+
+A page holds, for the window and compared with the window before it:
+- **Activity**: messages and people, a count per day (Klives's days), the busiest channels of a server.
+- **Core members**: the share of everything written there, the days they were there, and their *devotion* (the part of
+  everything they wrote anywhere that they wrote there), so a member is not "core" only because they write a lot everywhere.
+- **Rising members**: at least 15 messages in the last 30 days and at least twice what their earlier rate predicts;
+  `isNew` when they did not write there before, `everywhere` when they became as much more active everywhere.
+- **Tone**: how the messages read (shares of what the ensemble answered) and the share read as tense, against the window before.
+- **About Klives**: messages to or about him by kind (addressed, mentioned, indirect), the tone of exactly those messages
+  (target-aware, not the mood of the place), and who wrote them. This comes from a new rollup column:
+  `rollup_scope_day.klives` (rollups migration 2), filled when a scope day is built.
+- **Notable days**: a day far busier than its previous four weeks (robust: median and MAD), a day with many tense
+  messages, a wave of members joining or leaving.
+- **Factions**: Leiden on who answers and mentions whom inside the place in the window (edges with at least
+  `insights.space.faction_min_edge` interactions). A faction keeps its id from night to night while it keeps most of its people.
+- **Coverage**: how many of the channels Omniscience knows of it has messages from, how many are read back to their first
+  message, and a sentence that says so. Every figure is about that part only.
+
+People who are or may be under 18 are counted and never named (`peopleLeftOut`); people whose analysis is switched off are
+not in the rollups at all. Both rules are applied again when a page is served, because the page is from last night and the
+rule is from now. When a person is forgotten, they are taken out of every stored page at once; the counts follow at the next
+build. Not exercised: real label volumes and real servers (the tests seed a server of nine people and write the readings
+themselves); topics per community are the digests' (`latestDigestId` points at the newest digest of the place), a topic
+model of its own is not built.
+
+## Similar people and their map (N16)
+Part of the `insights` module (`InsightsModule.People.cs`, `Layout2D.cs`, table `ins_people`). The job `insights/people`
+runs after the nightly relationship job, for everyone with at least `insights.people.min_messages` (50) messages in a year
+who is an adult and whose analysis is on.
+
+- **One vector per person**, four parts: what they write about (the centre of their last 200 message vectors, weight
+  0.35), how their messages read (the share of every label of twelve readings, 0.25), how they write (thirteen ratios:
+  words per message, replies, links, pictures, edits, direct chats, reactions, bursts, ...; 0.2) and when they write (the
+  hour distribution, 0.2). Tone and style are standardised across everyone, each part is unit length, so the cosine of
+  two people is the weighted sum of four cosines. Stored in the vector store (`person` space, model `people-v1`).
+- **`GET insights/similar?personId=`**: the nearest people, each with the four part-similarities, the traits both share
+  (both at least one standard deviation from the average in the same direction: "long messages", "up at night",
+  "often negative (sentiment)", ...) and the servers both are most active in. A person's own strongest traits come with it.
+  Minors are refused; someone whose analysis is off is refused and never offered as a match.
+- **`GET insights/map`**: everyone on a plane, coloured by their N12 community. The `insights.map.max_people` (2000) most
+  active are laid out by an exact t-SNE (cosine distance) started from the principal components; everyone else is placed
+  at the weighted centre of the five people they resemble most. There is no randomness. Each night starts from the
+  previous night's positions and is then turned, mirrored, scaled and shifted onto them (Procrustes), so the map changes
+  only as much as the people did. Stored in the layout's own scale, served fitted to a unit circle.
+- Limits: t-SNE is exact, so time and memory grow with the square of the people it lays out (2,000 people: two 16 MB
+  tables, a few seconds on half the cores). A trait that hardly varies between people still counts as much as one that
+  does, once standardised. "Personality" here is the mix of readings of someone's messages, nothing more.
+
 ## Data controls (N20, X76): two forget levels, retention, backups, export
 Module `datacontrols` (`Modules/DataControls`), routes under `data/` (`Api/DataControlsRoutes.cs`).
 
@@ -471,7 +527,9 @@ holds the corpus writer for its duration, seconds on a few million messages).
 | Relationship dynamics and communities (N12), notices, X36, X45 | done, tested (Leiden on planted graphs; the relationship job on written pair rollups, so the conflict labels it reads are the test's) |
 | Wellbeing check-ins (N14, X44) | done, tested (the rollups and labels it reads are written by the test) |
 | Data controls (N20, X76): erase and "forget what was worked out" with analysis off, tombstones honoured by the importer, retention, encrypted backups with restore and key transfer, per-person export | done, tested (6 tests, 2 importer tests; real sizes and WS-A's ingest hook are not exercised) |
-| Community pages (N13), links (N15), similar people (N16), translation (N19) | pending |
+| Community pages of servers and group chats (N13) | done, tested (2 tests on a seeded server; real volumes not exercised) |
+| Similar people and their map (N16) | done, tested (layout maths on planted clusters; similarity and map on 18 and 60 planted people) |
+| Links (N15), translation (N19) | pending |
 | Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
 | Tactics X17 (merge step), X23, X32, X33, X35; monitors X42, X43, X46–X48, X50–X51 | pending |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |

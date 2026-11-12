@@ -15,8 +15,17 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
         public int Interactions => RepliesOut + RepliesIn + MentionsOut + MentionsIn + DmOut + DmIn + ReactionsOut + ReactionsIn;
     }
 
+    /// <summary>Messages about Klives in a scope on a day: by kind (addressed, mentioned, indirect), by how they read, and by who wrote them.</summary>
+    public sealed class ScopeKlives
+    {
+        public int N { get; set; }
+        public Dictionary<string, int> Kinds { get; set; } = new(StringComparer.Ordinal);
+        public Dictionary<string, int> Sentiment { get; set; } = new(StringComparer.Ordinal);
+        public Dictionary<string, int> Persons { get; set; } = new(StringComparer.Ordinal);
+    }
+
     public sealed record ScopeDayRow(string Day, int Msgs, int Authored, int Deleted, int People, Dictionary<string, int> Persons, Dictionary<string, Dictionary<string, int>> Labels,
-        Dictionary<string, int> Platforms, long? FirstMs, long? LastMs, int? Labelset);
+        Dictionary<string, int> Platforms, long? FirstMs, long? LastMs, int? Labelset, ScopeKlives? Klives = null);
 
     /// <summary>Read API over the rollup tables for projections, analytics and tactics (days are "yyyy-MM-dd", ranges inclusive).</summary>
     public static class RollupReader
@@ -83,11 +92,11 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
 
         public static List<ScopeDayRow> ScopeDays(SqliteConnection intel, string scope, string key, string? fromDay = null, string? toDay = null) =>
             intel.Query(null, """
-                SELECT day, msgs, authored, deleted, people, persons, labels, platforms, first_ms, last_ms, labelset FROM rollup_scope_day
+                SELECT day, msgs, authored, deleted, people, persons, labels, platforms, first_ms, last_ms, labelset, klives FROM rollup_scope_day
                 WHERE scope=$s AND key=$k AND ($a IS NULL OR day >= $a) AND ($b IS NULL OR day <= $b) ORDER BY day
                 """, r => new ScopeDayRow(r.GetString(0), r.GetInt32(1), r.GetInt32(2), r.GetInt32(3), r.GetInt32(4), Parse<Dictionary<string, int>>(r.GetString(5)),
                     Parse<Dictionary<string, Dictionary<string, int>>>(r.GetString(6)), Parse<Dictionary<string, int>>(r.GetString(7)), r.GetInt64OrNull(8), r.GetInt64OrNull(9),
-                    (int?)r.GetInt64OrNull(10)),
+                    (int?)r.GetInt64OrNull(10), r.GetStringOrNull(11) is { Length: > 0 } k ? JsonSerializer.Deserialize<ScopeKlives>(k, Json) : null),
                 ("$s", scope), ("$k", key), ("$a", fromDay), ("$b", toDay));
 
         public static List<ZoneMonth> Zones(SqliteConnection intel, string person) =>

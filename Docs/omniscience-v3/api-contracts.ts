@@ -828,6 +828,15 @@ export interface LlmSummaryRowDto {
   lastAtMs?: number | null;
 }
 
+export interface MapPointDto {
+  personId: string;
+  name?: string | null;
+  x: number;
+  y: number;
+  communityId?: string | null;
+  messages: number;
+}
+
 export interface MeasureDescriptor {
   id: string;
   title: string;
@@ -1036,6 +1045,12 @@ export interface PartnerSummaryDto {
   medianReplyBucketIn?: number | null;
 }
 
+export interface PeopleMapDto {
+  points: MapPointDto[];
+  asOfMs?: number | null;
+  people: number;
+}
+
 export interface PersonActivityDto {
   firstMs?: number | null;
   lastMs?: number | null;
@@ -1114,6 +1129,12 @@ export interface PersonRelationshipsDto {
   relationships: PairSummaryDto[];
   events: PairEventDto[];
   asOfMs: number;
+}
+
+export interface PersonTraitDto {
+  trait: string;
+  text: string;
+  z: number;
 }
 
 export interface Playbook {
@@ -1336,6 +1357,37 @@ export interface SettingDto {
   updatedAtMs?: number | null;
 }
 
+export interface SharedTraitDto {
+  trait: string;
+  text: string;
+  mine: number;
+  theirs: number;
+}
+
+export interface SimilarPeopleDto {
+  personId: string;
+  name?: string | null;
+  messages: number;
+  asOfMs?: number | null;
+  traits: PersonTraitDto[];
+  people: SimilarPersonDto[];
+  note?: string | null;
+}
+
+export interface SimilarPersonDto {
+  personId: string;
+  name?: string | null;
+  similarity: number;
+  content: number;
+  tone: number;
+  style: number;
+  rhythm: number;
+  shared: SharedTraitDto[];
+  sharedPlaces: string[];
+  messages: number;
+  communityId?: string | null;
+}
+
 export type SortOrder = "ScoreDescending" | "ScoreAscending" | "Label" | "Id";
 
 export interface SourceStatusDto {
@@ -1346,6 +1398,143 @@ export interface SourceStatusDto {
   status: string;
   detail?: string | null;
   updatedAtMs: number;
+}
+
+export interface SpaceAboutKlivesDto {
+  messages: number;
+  previousMessages: number;
+  kinds: Record<string, number>;
+  sentiment: Record<string, number>;
+  sentimentAnswered: number;
+  people: SpaceTalkerDto[];
+}
+
+export interface SpaceCardDto {
+  scopeKind: string;
+  scopeId: string;
+  title?: string | null;
+  platform?: string | null;
+  messages: number;
+  previousMessages: number;
+  people: number;
+  aboutKlives: number;
+  lastMessageMs?: number | null;
+  computedAtMs: number;
+}
+
+export interface SpaceChannelDto {
+  conversationId: string;
+  title?: string | null;
+  messages: number;
+  people: number;
+}
+
+export interface SpaceCoverageDto {
+  channelsKnown: number;
+  channelsWithMessages: number;
+  channelsActive: number;
+  channelsFullyBackfilled: number;
+  firstMessageMs?: number | null;
+  lastMessageMs?: number | null;
+  note: string;
+}
+
+export interface SpaceDayDto {
+  day: string;
+  messages: number;
+  people: number;
+}
+
+export interface SpaceEventDto {
+  day: string;
+  kind: string;
+  value: number;
+  baseline: number;
+  text: string;
+}
+
+export interface SpaceFactionDto {
+  factionId: string;
+  size: number;
+  weight: number;
+  members: SpaceFactionMemberDto[];
+}
+
+export interface SpaceFactionMemberDto {
+  personId: string;
+  name?: string | null;
+  strength: number;
+}
+
+export interface SpaceListDto {
+  spaces: SpaceCardDto[];
+  windowDays: number;
+}
+
+export interface SpaceMemberDto {
+  personId: string;
+  name?: string | null;
+  messages: number;
+  share: number;
+  activeDays: number;
+  devotion?: number | null;
+}
+
+export interface SpacePageDto {
+  scopeKind: string;
+  scopeId: string;
+  title?: string | null;
+  platform?: string | null;
+  windowDays: number;
+  fromDay: string;
+  toDay: string;
+  asOfMs: number;
+  messages: number;
+  previousMessages: number;
+  people: number;
+  previousPeople: number;
+  days: SpaceDayDto[];
+  core: SpaceMemberDto[];
+  rising: SpaceRisingDto[];
+  tone: SpaceToneDto;
+  aboutKlives: SpaceAboutKlivesDto;
+  events: SpaceEventDto[];
+  factions: SpaceFactionDto[];
+  factionModularity?: number | null;
+  channels: SpaceChannelDto[];
+  coverage: SpaceCoverageDto;
+  peopleLeftOut: number;
+  latestDigestId?: string | null;
+}
+
+export interface SpaceRefreshRequest {
+  scopeKind: string;
+  scopeId: string;
+}
+
+export interface SpaceRisingDto {
+  personId: string;
+  name?: string | null;
+  recent: number;
+  earlier: number;
+  isNew: boolean;
+  everywhere: boolean;
+  firstDay?: string | null;
+}
+
+export interface SpaceTalkerDto {
+  personId: string;
+  name?: string | null;
+  messages: number;
+}
+
+export interface SpaceToneDto {
+  recent: Record<string, number>;
+  baseline: Record<string, number>;
+  recentAnswered: number;
+  baselineAnswered: number;
+  conflictRecent: number;
+  conflictBaseline: number;
 }
 
 export interface StoreHealthDto {

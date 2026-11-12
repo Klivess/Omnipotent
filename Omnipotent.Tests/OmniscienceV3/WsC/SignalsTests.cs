@@ -132,6 +132,26 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
 
         public static string PersonOf(string identity) => Persons[identity];
 
+        // People a test adds on top of the seeded five.
+        private readonly Dictionary<string, string> extra = new(StringComparer.Ordinal);
+
+        private string PersonFor(string identity) => Persons.TryGetValue(identity, out var p) ? p : extra[identity];
+
+        /// <summary>One more person with one Discord account (identity "discord:&lt;id&gt;").</summary>
+        public async Task AddPersonAsync(string identity, string person, string name)
+        {
+            long start = Clock.NowMs - 400 * 86_400_000L;
+            await Runtime.Stores.Corpus.WriteAsync((c, tx) =>
+            {
+                c.Exec(tx, "INSERT INTO persons(person_id, created_at_ms, display_name, is_self) VALUES($p,$t,$n,0)", ("$p", person), ("$t", start), ("$n", name));
+                c.Exec(tx, "INSERT INTO person_canonical(person_id, canonical_id) VALUES($p,$p)", ("$p", person));
+                c.Exec(tx, "INSERT INTO identities(identity_id, platform, platform_user_id, person_id, kind, first_seen_ms, last_seen_ms) VALUES($i,'discord',$u,$p,'user',$t,$t)",
+                    ("$i", identity), ("$u", identity[8..]), ("$p", person), ("$t", start));
+                c.Exec(tx, "INSERT INTO identity_names(identity_id, name_kind, value, valid_from_ms, source_kind) VALUES($i,'display',$v,$t,'import')", ("$i", identity), ("$v", name), ("$t", start));
+            });
+            extra[identity] = person;
+        }
+
         /// <summary>A message. By default it arrives live, now. <paramref name="mention"/> is a structured @-mention.</summary>
         public async Task<string> PostAsync(string conversation, string author, string text, string source = SourceKinds.Live, long? sentAt = null, long? arrivedAt = null,
             string? replyTo = null, string? mention = null, bool embed = false)
@@ -141,7 +161,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             await Runtime.Stores.Corpus.WriteAsync((c, tx) =>
             {
                 string? guild = c.Scalar<string>(tx, "SELECT guild_id FROM conversations WHERE conversation_id=$c", ("$c", conversation));
-                long seq = ChangeLog.Append(c, tx, arrived, ChangeKinds.MessageInsert, id, Persons[author], conversation, source);
+                long seq = ChangeLog.Append(c, tx, arrived, ChangeKinds.MessageInsert, id, PersonFor(author), conversation, source);
                 c.Exec(tx, """
                     INSERT INTO messages(message_id, platform, platform_message_id, conversation_id, guild_id, author_identity_id, sent_at_ms, time_quality, order_key, is_bot,
                         reply_to_message_id, current_version, content, first_source_kind, best_source_id, best_source_rank, ingested_at_ms, ingest_seq)

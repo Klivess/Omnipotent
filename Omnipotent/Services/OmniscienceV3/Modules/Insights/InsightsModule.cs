@@ -67,6 +67,12 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Insights
                 new SettingDescriptor("insights.wellbeing.close_contacts", SettingTypes.Int, "30", "How many of the people Klives interacts with most are watched, besides those he tracks or pinned.", 0, 500),
                 new SettingDescriptor("insights.wellbeing.threshold", SettingTypes.Number, "2", "How far from their own usual (in robust standard deviations) two weeks running must be.", 1, 6),
                 new SettingDescriptor("insights.wellbeing.crisis_probability", SettingTypes.Number, "0.6", "How sure the ensemble must be that a message says the author is in danger.", 0.3, 0.99),
+                new SettingDescriptor("insights.space.window_days", SettingTypes.Int, "90", "How many days a community page (a server or a group chat) looks back.", 30, 365),
+                new SettingDescriptor("insights.space.min_messages", SettingTypes.Int, "200", "A server or group chat with fewer messages in the window gets no page of its own.", 1, 1000000),
+                new SettingDescriptor("insights.space.max_spaces", SettingTypes.Int, "150", "How many of the busiest servers and group chats get a page each night.", 1, 5000),
+                new SettingDescriptor("insights.people.min_messages", SettingTypes.Int, "50", "Someone needs at least this many messages in a year to be compared with others and put on the map.", 10, 100000),
+                new SettingDescriptor("insights.map.max_people", SettingTypes.Int, "2000", "How many of the most active people the map lays out itself; the rest are placed near who they resemble.", 50, 4000),
+                new SettingDescriptor("insights.space.faction_min_edge", SettingTypes.Int, "2", "Two members need at least this many replies or mentions between them in the window to count as connected.", 1, 1000),
             },
             Datasets = new[]
             {
@@ -167,6 +173,8 @@ INSERT INTO ins_state(name, value) VALUES('change_seq', 0);
 INSERT INTO ins_state(name, value) VALUES('community_seq', 0);
 """),
             WellbeingMigration,
+            SpacesMigration,
+            PeopleMigration,
         };
 
         internal ModuleContext Ctx => Context;
@@ -192,6 +200,8 @@ INSERT INTO ins_state(name, value) VALUES('community_seq', 0);
         {
             RelationshipsKind => await BuildRelationshipsAsync(job).ConfigureAwait(false),
             WellbeingKind => await BuildWellbeingAsync(job).ConfigureAwait(false),
+            SpacesKind or SpaceKind => await BuildSpacesAsync(job).ConfigureAwait(false),
+            PeopleKind => await BuildPeopleAsync(job).ConfigureAwait(false),
             ForgetKind => await ForgetAsync(job).ConfigureAwait(false),
             _ => throw new JobFailureException(ErrorClass.Permanent, $"Unknown insights job kind '{job.Job.Kind}'."),
         };
@@ -211,6 +221,24 @@ INSERT INTO ins_state(name, value) VALUES('community_seq', 0);
                 n += c.Exec(tx, "DELETE FROM ins_pair_events WHERE a=$p OR b=$p OR json_extract(data_json,'$.by')=$p", ("$p", person));
                 n += c.Exec(tx, "DELETE FROM ins_members WHERE person_id=$p", ("$p", person));
                 n += c.Exec(tx, "DELETE FROM ins_wellbeing WHERE person_id=$p", ("$p", person));
+                n += c.Exec(tx, "DELETE FROM ins_people WHERE person_id=$p", ("$p", person));
+                // A community page that names them keeps standing, without them (its counts are corrected by the next rebuild).
+                foreach (var (kind, id, body, factions) in c.Query(tx, "SELECT scope_kind, scope_id, body_json, factions_json FROM ins_spaces WHERE body_json LIKE $l OR factions_json LIKE $l",
+                             r => (r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3)), ("$l", "%" + JsonSerializer.Serialize(person) + "%")))
+                {
+                    var page = JsonSerializer.Deserialize<SpacePageDto>(body, KernelJson.Options)!;
+                    page = page with
+                    {
+                        Core = page.Core.Where(m => m.PersonId != person).ToList(),
+                        Rising = page.Rising.Where(m => m.PersonId != person).ToList(),
+                        AboutKlives = page.AboutKlives with { People = page.AboutKlives.People.Where(m => m.PersonId != person).ToList() },
+                        Factions = page.Factions.Select(f => f with { Members = f.Members.Where(m => m.PersonId != person).ToList() }).ToList(),
+                    };
+                    var members = JsonSerializer.Deserialize<Dictionary<string, string>>(factions, KernelJson.Options) ?? new Dictionary<string, string>();
+                    members.Remove(person);
+                    n += c.Exec(tx, "UPDATE ins_spaces SET body_json=$b, factions_json=$f WHERE scope_kind=$k AND scope_id=$i",
+                        ("$b", JsonSerializer.Serialize(page, KernelJson.Options)), ("$f", JsonSerializer.Serialize(members, KernelJson.Options)), ("$k", kind), ("$i", id));
+                }
                 foreach (var (id, top) in c.Query(tx, "SELECT community_id, top_json FROM ins_communities WHERE top_json LIKE $l", r => (r.GetString(0), r.GetString(1)), ("$l", "%" + person + "%")))
                 {
                     var kept = (JsonSerializer.Deserialize<List<JsonElement>>(top, KernelJson.Options) ?? new List<JsonElement>()).Where(t => t.GetProperty("personId").GetString() != person).ToList();

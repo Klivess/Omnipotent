@@ -26,10 +26,20 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
         /// and no cell of anybody else counts or names them.</summary>
         private AnalysisOffSet off = AnalysisOffSet.None;
 
+        /// <summary>Klives's own accounts, as of the start of the running job (what he writes is not "about Klives").</summary>
+        private HashSet<string> selfIdentities = new(StringComparer.Ordinal);
+
+        private void LoadPolicy()
+        {
+            off = AnalysisOff.Load(Context.Stores);
+            using var corpus = Context.Stores.Corpus.OpenRead();
+            selfIdentities = ClassificationModule.SelfIdentities(corpus);
+        }
+
         private async Task<string?> DrainAsync(JobContext job)
         {
             var ct = job.Cancellation;
-            off = AnalysisOff.Load(Context.Stores);
+            LoadPolicy();
             var sw = Stopwatch.StartNew();
             long cursor = Cursor("changes");
             long maxSeq;
@@ -660,6 +670,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
             var persons = new Dictionary<string, int>(StringComparer.Ordinal);
             var platforms = new Dictionary<string, int>(StringComparer.Ordinal);
             var labelCounts = new Dictionary<string, Dictionary<string, int>>(StringComparer.Ordinal);
+            var klives = new ScopeKlives();
             int authored = 0, deleted = 0;
             foreach (var (m, p) in msgs)
             {
@@ -670,6 +681,14 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                 if (m.Forwarded || l?.NonAuthored == true) continue;
                 authored++;
                 CountLabels(labelCounts, l);
+                // What others wrote to or about Klives, with the tone of exactly those messages.
+                if (l?.Answer(ClassificationTasks.AboutKlives.Id) is { } about && about != "none" && !selfIdentities.Contains(m.Author))
+                {
+                    klives.N++;
+                    klives.Kinds[about] = klives.Kinds.GetValueOrDefault(about) + 1;
+                    if (l.Answer(ClassificationTasks.Sentiment.Id) is { } tone) klives.Sentiment[tone] = klives.Sentiment.GetValueOrDefault(tone) + 1;
+                    if (p != null) klives.Persons[p] = klives.Persons.GetValueOrDefault(p) + 1;
+                }
             }
             long now = Context.Clock.NowMs;
             string dayText = Day(day);
@@ -679,12 +698,12 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                     c.Exec(tx, "DELETE FROM rollup_scope_day WHERE scope=$sc AND key=$k AND day=$d", ("$sc", scope), ("$k", key), ("$d", dayText));
                 else
                     c.Exec(tx, """
-                        INSERT INTO rollup_scope_day(scope, key, day, msgs, authored, deleted, people, persons, labels, platforms, first_ms, last_ms, labelset, source_seq, computed_at_ms)
-                        VALUES($sc,$k,$d,$n,$au,$del,$pp,$ps,$lab,$pl,$f,$l,$ls,$s,$t)
+                        INSERT INTO rollup_scope_day(scope, key, day, msgs, authored, deleted, people, persons, labels, platforms, first_ms, last_ms, labelset, source_seq, computed_at_ms, klives)
+                        VALUES($sc,$k,$d,$n,$au,$del,$pp,$ps,$lab,$pl,$f,$l,$ls,$s,$t,$kl)
                         ON CONFLICT(scope, key, day) DO UPDATE SET msgs=excluded.msgs, authored=excluded.authored, deleted=excluded.deleted, people=excluded.people,
                             persons=excluded.persons, labels=excluded.labels, platforms=excluded.platforms, first_ms=excluded.first_ms, last_ms=excluded.last_ms,
-                            labelset=excluded.labelset, source_seq=excluded.source_seq, computed_at_ms=excluded.computed_at_ms
-                        """, ("$sc", scope), ("$k", key), ("$d", dayText), ("$n", msgs.Count), ("$au", authored), ("$del", deleted), ("$pp", persons.Count),
+                            labelset=excluded.labelset, source_seq=excluded.source_seq, computed_at_ms=excluded.computed_at_ms, klives=excluded.klives
+                        """, ("$kl", klives.N == 0 ? null : Json(klives)), ("$sc", scope), ("$k", key), ("$d", dayText), ("$n", msgs.Count), ("$au", authored), ("$del", deleted), ("$pp", persons.Count),
                         ("$ps", Json(persons)), ("$lab", Json(labelCounts)), ("$pl", Json(platforms)), ("$f", msgs.Min(m => m.M.SentAtMs)), ("$l", msgs.Max(m => m.M.SentAtMs)),
                         ("$ls", labelset), ("$s", seq), ("$t", now));
                 c.Exec(tx, "INSERT INTO rollup_changes(subject_kind, subject_id, day, at_ms) VALUES($sc,$k,$d,$t)", ("$sc", scope), ("$k", key), ("$d", dayText), ("$t", now));
@@ -741,7 +760,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
         private async Task<string?> RelabelAsync(JobContext job)
         {
             var ct = job.Cancellation;
-            off = AnalysisOff.Load(Context.Stores);
+            LoadPolicy();
             int? active = ActiveLabelset();
             if (active == null) return null;
             int marked = await Context.Stores.Intel.WriteAsync((c, tx) =>

@@ -16,6 +16,10 @@ namespace Omnipotent.Services.OmniscienceV3.Api
     [ApiContract]
     public sealed record WellbeingStateDto(string SuggestionId, string State);
 
+    /// <summary><c>scopeKind</c>: guild or conversation (a group chat).</summary>
+    [ApiContract]
+    public sealed record SpaceRefreshRequest(string ScopeKind, string ScopeId);
+
     /// <summary>
     /// Insights routes under <c>/omniscience/v3/insights/</c>: relationship dynamics and communities (N12). The communities
     /// are also read model <c>insights.communities</c>; a person's relationships and a single pair are read from the tables
@@ -48,6 +52,36 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                 string a = q.Required("a", 200), b = q.Required("b", 200);
                 return ApiResponses.OkAsync(req, Guard(() => Insights.Pair(a, b)) ?? throw ApiException.NotFound("These two have too few interactions to be tracked as a relationship."));
             }, ct).ConfigureAwait(false);
+
+            // Community pages (N13): servers and group chats.
+            await Get("insights/spaces", OmnisciencePerms.PersonsRead, req => ApiResponses.OkAsync(req, Insights.Spaces()), ct).ConfigureAwait(false);
+
+            await Get("insights/space", OmnisciencePerms.PersonsRead, req =>
+            {
+                var q = ApiQuery.Of(req);
+                string kind = q.Required("scopeKind", 16), id = q.Required("scopeId", 200);
+                return ApiResponses.OkAsync(req, Insights.Space(kind, id)
+                    ?? throw ApiException.NotFound("There is no community page for this server or chat yet. It is built at night for the busiest ones; ask for it with insights/space/refresh."));
+            }, ct).ConfigureAwait(false);
+
+            await registrar.RouteAsync(V3Routes.Prefix + "/insights/space/refresh", HttpMethod.Post, OmniscienceV3Perms.EngineManage, async req =>
+            {
+                var body = ApiBody.Read<SpaceRefreshRequest>(req);
+                long jobId;
+                try { jobId = await Insights.RequestSpaceAsync(body.ScopeKind ?? "", body.ScopeId ?? "", host.Stopping).ConfigureAwait(false); }
+                catch (KeyNotFoundException ex) { throw ApiException.NotFound(ex.Message); }
+                catch (ArgumentException ex) { throw ApiException.BadRequest(ex.Message); }
+                await ApiResponses.OkAsync(req, new InsightsRefreshDto(jobId), HttpStatusCode.Accepted).ConfigureAwait(false);
+            }, RouteRegistrar.DefaultMaxBodyBytes, ct).ConfigureAwait(false);
+
+            // Similar people and their map (N16).
+            await Get("insights/similar", OmnisciencePerms.PersonsRead, req =>
+            {
+                var q = ApiQuery.Of(req);
+                return ApiResponses.OkAsync(req, Guard(() => Insights.Similar(q.Required("personId", 200), q.Int("limit", 12, 1, 50))));
+            }, ct).ConfigureAwait(false);
+
+            await Get("insights/map", OmnisciencePerms.PersonsRead, req => ApiResponses.OkAsync(req, Insights.PeopleMap(ApiQuery.Of(req).Int("limit", 5000, 1, 20000))), ct).ConfigureAwait(false);
 
             await Get("insights/wellbeing", OmnisciencePerms.PersonsRead, req =>
             {

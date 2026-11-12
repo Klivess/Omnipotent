@@ -187,6 +187,10 @@ CREATE TABLE rollup_state(
   updated_at_ms INTEGER NOT NULL
 );
 """),
+            // What a conversation, a server or everything said about Klives that day: how many messages, of which kind
+            // (addressed to him, naming him, about him without naming him), how they read, and who wrote them. Target-aware:
+            // it is the tone of the messages about him, not the mood of the place (plan N13).
+            new Migration(ModuleId, 2, "what a scope says about Klives", "ALTER TABLE rollup_scope_day ADD COLUMN klives TEXT;"),
         };
 
         /// <summary>Cell kinds in <c>rollup_dirty</c>.</summary>

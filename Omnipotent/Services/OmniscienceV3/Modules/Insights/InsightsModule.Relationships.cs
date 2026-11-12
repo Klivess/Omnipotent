@@ -304,6 +304,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Insights
             await Context.ReadModels.PutAsync(CommunitiesModel, "all", 1, now, seq, Communities(modularity), ct).ConfigureAwait(false);
             int noticed = await NotifyAsync(written, now, ct).ConfigureAwait(false);
             await Context.Jobs.EnqueueAsync(Job(WellbeingKind, "all", "all", priority: 55), ct).ConfigureAwait(false);
+            await Context.Jobs.EnqueueAsync(Job(SpacesKind, "all", "all", priority: 50), ct).ConfigureAwait(false);
+            await Context.Jobs.EnqueueAsync(Job(PeopleKind, "all", "all", priority: 45), ct).ConfigureAwait(false);
             return Json(new { pairs = kept.Count, events = written.Count, communities = groups.Count, people = people.Count, modularity = Math.Round(modularity, 4), noticed });
         }
 
