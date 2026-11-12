@@ -51,7 +51,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             SubscribedChangeKinds = new[]
             {
                 ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete, ChangeKinds.ReactionChange, ChangeKinds.AttachmentAdd,
-                ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge, ChangeKinds.PersonErase, ChangeKinds.PresenceEvent, ChangeKinds.VoiceEvent, ChangeKinds.MemberEvent,
+                ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge, ChangeKinds.PersonErase, ChangeKinds.PersonReanalyse, ChangeKinds.PresenceEvent, ChangeKinds.VoiceEvent,
+                ChangeKinds.MemberEvent,
             },
             Schedules = new[]
             {

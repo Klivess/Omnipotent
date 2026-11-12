@@ -84,6 +84,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             {
                 scopeId = Context.Policy.Canonical(scopeId!);
                 if (MinorGuard.IsRestricted(Context.Policy.BandOf(scopeId, now))) throw new TacticRefusedException(MinorRefusal);
+                RefuseIfOff(scopeId);
             }
             using (var corpus = Context.Stores.Corpus.OpenRead())
             {
@@ -236,6 +237,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
                 total = (int)corpus.Scalar<long>(null, $"SELECT COUNT(*) FROM messages m LEFT JOIN identities i ON i.identity_id=m.author_identity_id WHERE {where}", args.ToArray());
                 // When the period is too large, the newest messages are read (then put back in order).
                 messages = corpus.Query(null, $"SELECT {MessageColumns} WHERE {where} ORDER BY m.sent_at_ms DESC, m.order_key DESC LIMIT $cap", ReadMessage, args.ToArray());
+                // What someone wrote is not summarised while analysis is switched off for them (N20).
+                var off = AnalysisOff.Load(Context.Stores);
+                if (off.Any) total -= messages.RemoveAll(m => off.Author(m.AuthorIdentity));
                 messages.Reverse();
                 names = new Naming(corpus, messages);
                 scopeTitle = row.ScopeKind switch
@@ -375,6 +379,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             long now = Context.Clock.NowMs;
             string? scope = scopeKind == "all" ? null : scopeKind == "person" ? Context.Policy.Canonical(scopeId!.Trim()) : scopeId!.Trim();
             if (scopeKind == "person" && MinorGuard.IsRestricted(Context.Policy.BandOf(scope!, now))) throw new TacticRefusedException(MinorRefusal);
+            if (scopeKind == "person") RefuseIfOff(scope!);
             string id = string.IsNullOrWhiteSpace(subscriptionId) ? "ds" + Guid.NewGuid().ToString("N")[..12] : subscriptionId.Trim();
             string json = Json(new SubscriptionDefinition(scopeKind, scope, cadence, at, cadence == "weekly" ? weekday : null));
             bool existed = false;

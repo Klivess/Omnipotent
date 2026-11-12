@@ -80,7 +80,17 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Signalling
 
         // ── shared reads ─────────────────────────────────────────────────────────
 
-        private static List<Msg> LoadMessages(SqliteConnection corpus, IReadOnlyCollection<string> ids, long notBeforeMs) =>
+        /// <summary>The messages the monitors may look at. Someone whose analysis is switched off (N20) is not watched: nothing
+        /// they write raises an alert or a reminder.</summary>
+        private List<Msg> LoadMessages(SqliteConnection corpus, IReadOnlyCollection<string> ids, long notBeforeMs)
+        {
+            var rows = LoadMessagesRaw(corpus, ids, notBeforeMs);
+            var off = Storage.AnalysisOff.Load(Context.Stores);
+            if (off.Any) rows.RemoveAll(m => off.Author(m.AuthorIdentity));
+            return rows;
+        }
+
+        private static List<Msg> LoadMessagesRaw(SqliteConnection corpus, IReadOnlyCollection<string> ids, long notBeforeMs) =>
             corpus.QueryInWith("""
                 SELECT m.message_id, m.conversation_id, m.guild_id, m.platform, m.author_identity_id, COALESCE(pc.canonical_id, i.person_id),
                        (m.is_bot=1 OR m.is_system=1 OR m.is_webhook=1 OR COALESCE(i.kind,'')='bot'), m.sent_at_ms, m.ingested_at_ms, m.first_source_kind, m.reply_to_message_id,

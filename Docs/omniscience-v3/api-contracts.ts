@@ -79,9 +79,73 @@ export interface AlertStateResultDto {
 
 export type AlertVerdict = "Correct" | "Wrong";
 
+export interface AnalysisOffListDto {
+  people: AnalysisOffPersonDto[];
+}
+
+export interface AnalysisOffPersonDto {
+  personId: string;
+  name?: string | null;
+  sinceMs: number;
+}
+
+export interface AnalysisOnDto {
+  personId: string;
+  changed: boolean;
+}
+
+export interface AnalysisOnRequest {
+  personId: string;
+}
+
 export interface ApiError {
   code: string;
   message: string;
+}
+
+export interface BackupDto {
+  backupId: string;
+  createdAtMs: number;
+  trigger: string;
+  keyId: string;
+  files: BackupFileDto[];
+}
+
+export interface BackupFileDto {
+  store: string;
+  file: string;
+  plainBytes: number;
+  encryptedBytes: number;
+  sha256: string;
+}
+
+export interface BackupKeyDto {
+  keyId: string;
+  exported?: string | null;
+}
+
+export interface BackupKeyExportRequest {
+  passphrase: string;
+}
+
+export interface BackupKeyImportRequest {
+  exported: string;
+  passphrase: string;
+}
+
+export interface BackupListDto {
+  backups: BackupDto[];
+  keyId?: string | null;
+  keep: number;
+  enabled: boolean;
+}
+
+export interface BackupRequestedDto {
+  jobId: number;
+}
+
+export interface BackupRestoreRequest {
+  backupId: string;
 }
 
 export interface BridgeDto {
@@ -430,6 +494,7 @@ export interface DossierDto {
   today: string;
   newestEvidenceMs: number;
   staleEvidence: boolean;
+  analysisOff: boolean;
 }
 
 export interface DossierFactDto {
@@ -552,6 +617,47 @@ export interface ExploreResult {
 export type ExportFormat = "Csv" | "Json" | "Parquet";
 
 export type FilterOp = "Eq" | "NotEq" | "In" | "NotIn" | "Between" | "Gte" | "Lte" | "Contains" | "IsNull" | "IsNotNull";
+
+export interface ForgetConfirmRequest {
+  personId: string;
+  confirmToken: string;
+}
+
+export interface ForgetPreviewDto {
+  personId: string;
+  name?: string | null;
+  persons: number;
+  identities: number;
+  messages: number;
+  directChatMessagesOfKlives: number;
+  directChats: number;
+  attachments: number;
+  mediaFiles: number;
+  mediaFilesLeft: number;
+  reactions: number;
+  events: number;
+  facts: number;
+  includeDirectChats: boolean;
+  level: string;
+  confirmToken: string;
+  expiresAtMs: number;
+  notes: string[];
+}
+
+export interface ForgetPreviewRequest {
+  personId: string;
+  includeDirectChats: boolean;
+  level: string;
+}
+
+export interface ForgetRunDto {
+  runId: string;
+  state: string;
+  counts: Record<string, number>;
+  error?: string | null;
+  startedAtMs: number;
+  finishedAtMs?: number | null;
+}
 
 export interface IdentitySummaryDto {
   identityId: string;
@@ -994,6 +1100,11 @@ export interface PersonCardDto {
   sentiment90?: Record<string, number> | null;
 }
 
+export interface PersonExportRequest {
+  personId: string;
+  format: string;
+}
+
 export interface PersonRelationshipsDto {
   personId: string;
   name?: string | null;
@@ -1115,7 +1226,27 @@ export interface RerunRequest {
   clearAsOf: boolean;
 }
 
+export interface RestoreDto {
+  backupId: string;
+  folder: string;
+  files: string[];
+  note: string;
+}
+
 export type RestrictedCapability = "FaceLabelling" | "Replica" | "PersonTargetedAlert" | "RoutineInference" | "IdentityFacts" | "TrackingSuggestion" | "ReplicaBasedTactic";
+
+export interface RetentionDto {
+  stream: string;
+  keptDays: number;
+  cutoffMs?: number | null;
+  deletedTotal: number;
+  lastDeleted: number;
+  lastRunMs?: number | null;
+}
+
+export interface RetentionListDto {
+  streams: RetentionDto[];
+}
 
 export interface RunActionRequest {
   runId: string;

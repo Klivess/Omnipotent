@@ -282,6 +282,13 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
         private static void ApplyPolicy(SqlParts p, TimeBucket bucket)
         {
             var ds = p.Dataset;
+            // Analysis switched off for a person (N20): no row that names them is in any answer, however the query is phrased
+            // and whatever the dataset. This holds for every dataset, including the ones other modules declare.
+            foreach (var dim in ds.Dimensions.Select(b => b.DimensionId).Where(d => DimensionCatalog.Get(d).EntityType == "person").Distinct(StringComparer.Ordinal).ToList())
+            {
+                string e = p.Expr(dim);
+                p.Where.Add($"({e} IS NULL OR {e} NOT IN (SELECT person_id FROM off_persons))");
+            }
             if (!ds.MinorFiltered) return;
             const string Restricted = "(SELECT person_id FROM restricted_persons)";
             if (p.Bound.Table == ExploreDatasets.Events)

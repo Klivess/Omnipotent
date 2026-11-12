@@ -128,6 +128,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             "CREATE TABLE IF NOT EXISTS mirror_state(key VARCHAR PRIMARY KEY, value BIGINT)",
             "CREATE TABLE IF NOT EXISTS person_map(person_id VARCHAR PRIMARY KEY, canonical_id VARCHAR)",
             "CREATE TABLE IF NOT EXISTS restricted_persons(person_id VARCHAR PRIMARY KEY)",
+            "CREATE TABLE IF NOT EXISTS off_persons(person_id VARCHAR PRIMARY KEY)",
             """
             CREATE TABLE IF NOT EXISTS messages(
               message_id VARCHAR, occurred BIGINT, ingested BIGINT, edited BIGINT, deleted BIGINT, time_quality TINYINT,

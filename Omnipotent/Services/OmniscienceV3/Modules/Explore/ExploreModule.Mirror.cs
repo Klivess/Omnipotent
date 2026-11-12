@@ -56,6 +56,10 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                         EraseMissingPeople();
                         erased = true;
                     }
+                    // Analysis switched off or back on for someone who is still there: their rows are written again, so the
+                    // labels and zone the mirror holds for them are the ones kept now (none while it is off).
+                    foreach (string person in changes.Where(c => c.Kind is ChangeKinds.PersonErase or ChangeKinds.PersonReanalyse).Select(c => c.Entity).Distinct(StringComparer.Ordinal))
+                        messages += RemirrorPerson(person);
                     cursor = changes[^1].Seq;
                     WriteState("changes", cursor);
                     await job.ReportProgressAsync(new { cursor, maxSeq, messages }).ConfigureAwait(false);
@@ -73,7 +77,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                     foreach (var b in bound.Values.Where(b => b.Source != null)) ClearState(SourceState(b.Dataset.Id) + ".whole_at");
                     MirrorSources(ct);
                 }
-                bool policyChanged = RefreshRestricted();
+                bool policyChanged = RefreshRestricted() | RefreshOff();
                 WriteState("as_of", Context.Clock.NowMs);
                 if (messages + events + relations > 0 || mapDirty || policyChanged || erased) Bump();
             }
@@ -95,6 +99,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
         {
             if (ids.Count == 0) return 0;
             var rows = new List<MirrorRow>(ids.Count);
+            // Analysis switched off for someone (N20): a message somebody else wrote to them stays, it just does not name them.
+            var off = AnalysisOff.Load(Context.Stores);
             using (var corpus = Context.Stores.Corpus.OpenRead())
             {
                 var self = ClassificationModule.SelfIdentities(corpus);
@@ -131,6 +137,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                     labels.TryGetValue(x.Id, out var l);
                     string? partner = x.Reply != null && replyPeople.TryGetValue(x.Reply, out var rp) && rp != x.Person ? rp
                         : x.Kind == "dm" && dmPartner.GetValueOrDefault(x.Conv) is { } pair ? pair.Split('|').FirstOrDefault(p => p != x.Person) : null;
+                    if (off.Person(partner)) partner = null;
                     var labelValues = LabelColumns.Select(c => l?.Answer(c)).ToArray();
                     bool aboutKlives = labelValues[^1] is { } k && k != "none";
                     var (zone, offsetMs) = x.Person == null ? (Zones.Utc, 0) : zones.At(x.Person, x.At);
@@ -309,6 +316,48 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             using (var appender = Db.CreateAppender("person_map"))
                 foreach (var (p, c) in map) appender.CreateRow().AppendValue(p).AppendValue(c).EndRow();
             tx.Commit();
+        }
+
+        /// <summary>Writes again every row that is theirs or names them: what they wrote, the replies to it, and their direct chats.</summary>
+        private int RemirrorPerson(string person)
+        {
+            var ids = new HashSet<string>(StringComparer.Ordinal);
+            using (var corpus = Context.Stores.Corpus.OpenRead())
+                foreach (string i in RollupModule.IdentitiesOf(corpus, Context.Policy.Canonical(person)))
+                {
+                    ids.UnionWith(corpus.Query(null, "SELECT message_id FROM messages WHERE author_identity_id=$i", r => r.GetString(0), ("$i", i)));
+                    ids.UnionWith(corpus.Query(null, "SELECT m.message_id FROM messages t JOIN messages m ON m.reply_to_message_id=t.message_id WHERE t.author_identity_id=$i", r => r.GetString(0), ("$i", i)));
+                    ids.UnionWith(corpus.Query(null, """
+                        SELECT m.message_id FROM messages m WHERE m.conversation_id IN (
+                            SELECT cm.conversation_id FROM conversation_members cm JOIN conversations cv ON cv.conversation_id=cm.conversation_id WHERE cv.kind='dm' AND cm.identity_id=$i)
+                        """, r => r.GetString(0), ("$i", i)));
+                }
+            int done = 0;
+            foreach (var chunk in ids.Chunk(Batch)) done += MirrorMessages(chunk);
+            return done;
+        }
+
+        /// <summary>
+        /// The people whose analysis is switched off (N20). The mirror keeps a plain copy of their raw rows, as the archive
+        /// does, but no query ever returns a row that names them (see the engine's policy step).
+        /// </summary>
+        private bool RefreshOff()
+        {
+            var off = AnalysisOff.Load(Context.Stores).Persons.ToHashSet(StringComparer.Ordinal);
+            var current = new HashSet<string>(StringComparer.Ordinal);
+            using (var cmd = Db.CreateCommand())
+            {
+                cmd.CommandText = "SELECT person_id FROM off_persons";
+                using var r = cmd.ExecuteReader();
+                while (r.Read()) current.Add(r.GetString(0));
+            }
+            if (current.SetEquals(off)) return false;
+            using var tx = Db.BeginTransaction();
+            Exec("DELETE FROM off_persons");
+            using (var appender = Db.CreateAppender("off_persons"))
+                foreach (var p in off) appender.CreateRow().AppendValue(p).EndRow();
+            tx.Commit();
+            return true;
         }
 
         /// <summary>Minors and likely minors (MinorGuard) as of now: Klives's marks plus every band the projections computed.</summary>

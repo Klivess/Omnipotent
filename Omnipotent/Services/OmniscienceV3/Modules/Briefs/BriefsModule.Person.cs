@@ -62,6 +62,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             string person = Context.Policy.Canonical(personId);
             // A brief written before the person was known to be a minor is not shown either.
             if (MinorGuard.IsRestricted(Context.Policy.BandOf(person, Context.Clock.NowMs))) throw new TacticRefusedException(MinorRefusal);
+            RefuseIfOff(person);
             using var c = Context.Stores.Intel.OpenRead();
             return c.Query(null, "SELECT state, body_json, as_of_ms, newest_evidence_ms, error, llm_calls, requested_at_ms, finished_at_ms FROM brief_person WHERE person_id=$p",
                 r => ToDto(person, r.GetString(0), r.GetStringOrNull(1), r.GetInt64OrNull(2), r.GetInt64OrNull(3), r.GetStringOrNull(4), r.GetInt32(5), r.GetInt64(6), r.GetInt64OrNull(7)),
@@ -75,6 +76,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             string person = Context.Policy.Canonical(personId.Trim());
             long now = Context.Clock.NowMs;
             if (MinorGuard.IsRestricted(Context.Policy.BandOf(person, now))) throw new TacticRefusedException(MinorRefusal);
+            RefuseIfOff(person);
             using (var corpus = Context.Stores.Corpus.OpenRead())
                 if (corpus.Scalar<long>(null, "SELECT COUNT(*) FROM persons WHERE person_id=$p", ("$p", person)) == 0) throw new KeyNotFoundException($"No person '{personId}'.");
             await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, """
@@ -94,9 +96,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             var ct = job.Cancellation;
             string person = job.Job.SubjectId ?? throw new JobFailureException(ErrorClass.Permanent, "Brief job without a person.");
             long now = Context.Clock.NowMs;
-            if (MinorGuard.IsRestricted(Context.Policy.BandOf(person, now)))
+            if (MinorGuard.IsRestricted(Context.Policy.BandOf(person, now)) || AnalysisOff.IsOff(Context.Stores, person))
             {
-                // Marked as a minor between the request and the run: nothing is written and what was there is removed.
+                // Marked as a minor, or analysis switched off, between the request and the run: nothing is written and what was there is removed.
                 await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "DELETE FROM brief_person WHERE person_id=$p", ("$p", person)), ct).ConfigureAwait(false);
                 await Context.ReadModels.DeleteAsync(PersonModel, person, ct).ConfigureAwait(false);
                 return Json(new { person, refused = "minor" });

@@ -76,8 +76,14 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Insights
             string Week(int back) => current.AddDays(-7 * back).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
             string fromWeek = Week(weeks - 1);
 
+            // Left out: minors (MinorGuard), people whose analysis is switched off, and people who no longer exist (a forgotten
+            // person's rows may still be on their way out of the rollups when this runs).
+            var off = Storage.AnalysisOff.Load(Context.Stores);
+            HashSet<string> alive;
+            using (var corpus = Context.Stores.Corpus.OpenRead())
+                alive = corpus.Query(null, "SELECT person_id FROM persons", r => r.GetString(0)).ToHashSet(StringComparer.Ordinal);
             var restricted = new Dictionary<string, bool>(StringComparer.Ordinal);
-            bool Hidden(string p) => restricted.TryGetValue(p, out bool r) ? r : restricted[p] = Restricted(p, now);
+            bool Hidden(string p) => restricted.TryGetValue(p, out bool r) ? r : restricted[p] = !alive.Contains(p) || off.Person(p) || Restricted(p, now);
             var series = new Dictionary<(string A, string B), Dictionary<string, Cell>>();
             var personWeek = new Dictionary<(string Person, string Week), int>();
             using (var intel = Context.Stores.Intel.OpenRead())

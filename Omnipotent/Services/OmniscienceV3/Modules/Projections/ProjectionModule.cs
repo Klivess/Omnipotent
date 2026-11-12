@@ -47,7 +47,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Projections
             Description = "Builds the dossier, directory, overview, health, conversation and server views the pages read, from the rollups and the knowledge store.",
             DependsOn = new[] { RollupModule.ModuleId },
             SubscribedChangeKinds = new[] { ChangeKinds.IdentityName, ChangeKinds.IdentityUpsert, ChangeKinds.PersonCreate, ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge,
-                ChangeKinds.PersonErase, ChangeKinds.ConversationUpsert, ChangeKinds.GuildUpsert },
+                ChangeKinds.PersonErase, ChangeKinds.PersonReanalyse, ChangeKinds.ConversationUpsert, ChangeKinds.GuildUpsert },
             Schedules = new[]
             {
                 new ScheduleTrigger("outbox", Every: TimeSpan.FromSeconds(30)),
@@ -118,7 +118,7 @@ CREATE TABLE projection_cursors(
                     case ChangeKinds.GuildUpsert: yield return new DirtySubject("guild", c.EntityId); break;
                     default:
                         if (c.PersonId != null) yield return new DirtySubject("person", c.PersonId);
-                        if (c.Kind is ChangeKinds.PersonMerge or ChangeKinds.PersonUnmerge or ChangeKinds.PersonErase or ChangeKinds.PersonCreate)
+                        if (c.Kind is ChangeKinds.PersonMerge or ChangeKinds.PersonUnmerge or ChangeKinds.PersonErase or ChangeKinds.PersonReanalyse or ChangeKinds.PersonCreate)
                             yield return new DirtySubject("person", c.EntityId);
                         break;
                 }

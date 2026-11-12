@@ -45,6 +45,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                 var args = chunk.Select((id, i) => (names[i], (object?)id)).ToArray();
                 result.AddRange(corpus.Query(null, $"SELECT {MessageColumns} {MessageFrom} WHERE m.message_id IN ({string.Join(",", names)})", MapMessage, args));
             }
+            // Analysis switched off for a person (N20): nothing is embedded, labelled, sampled or trained on from what they wrote.
+            var off = AnalysisOff.Load(Context.Stores);
+            if (off.Any) result.RemoveAll(m => off.Author(m.AuthorIdentityId));
             return result;
         }
 
@@ -117,15 +120,22 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                 {
                     changes = cr.Query(null, """
                         SELECT seq, kind, entity_id FROM change_log
-                        WHERE seq > $s AND seq <= $max AND kind IN ('message.insert','message.version','message.delete')
+                        WHERE seq > $s AND seq <= $max AND kind IN ('message.insert','message.version','message.delete','person.reanalyse')
                         ORDER BY seq LIMIT $l
                         """, r => (r.GetInt64(0), r.GetString(1), r.GetString(2)), ("$s", cursor), ("$max", maxSeq), ("$l", DrainBatch));
                 }
                 long upTo = changes.Count < DrainBatch ? maxSeq : changes[^1].Seq;
-                var ids = changes.Where(c => c.Kind != ChangeKinds.MessageDelete).Select(c => c.Entity).Distinct(StringComparer.Ordinal).ToList();
+                var ids = changes.Where(c => c.Kind is ChangeKinds.MessageInsert or ChangeKinds.MessageVersion).Select(c => c.Entity).Distinct(StringComparer.Ordinal).ToList();
                 if (ids.Count > 0)
                 {
                     var (e, l) = await ProcessAsync(ids, includeNext: true, ct).ConfigureAwait(false);
+                    embedded += e;
+                    labelled += l;
+                }
+                // Analysis switched back on for someone: everything they wrote is embedded and labelled again.
+                foreach (string person in changes.Where(c => c.Kind == ChangeKinds.PersonReanalyse).Select(c => c.Entity).Distinct(StringComparer.Ordinal))
+                {
+                    var (e, l) = await ReprocessPersonAsync(person, ct).ConfigureAwait(false);
                     embedded += e;
                     labelled += l;
                 }
@@ -141,6 +151,34 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                 ("$cut", Context.Clock.NowMs - 7 * 86_400_000L)), ct).ConfigureAwait(false);
             await RefreshHealthAsync(ct).ConfigureAwait(false);
             return System.Text.Json.JsonSerializer.Serialize(new { cursor, maxSeq, processed, embedded, labelled, caughtUp = cursor >= maxSeq });
+        }
+
+        /// <summary>Embeds and labels everything one person wrote (after analysis was switched back on for them).</summary>
+        private async Task<(int Embedded, int Labelled)> ReprocessPersonAsync(string person, CancellationToken ct)
+        {
+            List<string> identities;
+            using (var corpus = Context.Stores.Corpus.OpenRead())
+                identities = corpus.Query(null, "SELECT i.identity_id FROM identities i LEFT JOIN person_canonical pc ON pc.person_id=i.person_id WHERE COALESCE(pc.canonical_id, i.person_id)=$p",
+                    r => r.GetString(0), ("$p", Context.Policy.Canonical(person)));
+            int embedded = 0, labelled = 0;
+            foreach (string identity in identities)
+            {
+                string after = "";
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    List<string> ids;
+                    using (var corpus = Context.Stores.Corpus.OpenRead())
+                        ids = corpus.Query(null, "SELECT message_id FROM messages WHERE author_identity_id=$k AND message_id > $after ORDER BY message_id LIMIT 2000", r => r.GetString(0),
+                            ("$k", identity), ("$after", after));
+                    if (ids.Count == 0) break;
+                    after = ids[^1];
+                    var (e, l) = await ProcessAsync(ids, includeNext: true, ct).ConfigureAwait(false);
+                    embedded += e;
+                    labelled += l;
+                }
+            }
+            return (embedded, labelled);
         }
 
         /// <summary>

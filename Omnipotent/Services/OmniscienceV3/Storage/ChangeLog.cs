@@ -31,6 +31,8 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
         public const string PersonMerge = "person.merge";
         public const string PersonUnmerge = "person.unmerge";
         public const string PersonErase = "person.erase";
+        /// <summary>Analysis was switched back on for a person (N20): what is derived from their messages is built again.</summary>
+        public const string PersonReanalyse = "person.reanalyse";
         public const string ConversationUpsert = "conversation.upsert";
         public const string GuildUpsert = "guild.upsert";
         public const string PresenceEvent = "event.presence";

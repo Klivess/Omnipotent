@@ -136,7 +136,8 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
             foreach (var cycle in chains.Cycles) report.Notes.Add($"Merge cycle among persons {string.Join(" → ", cycle)}; resolved to {cycle.Min(StringComparer.Ordinal)}.");
             foreach (var d in chains.DanglingLinks) report.Notes.Add($"Person {d} was merged into a person that does not exist; kept as its own person.");
             ctx.Persons.Clear();
-            foreach (var (_, p) in valid) ctx.Persons[p.Id] = p;
+            foreach (var (_, p) in valid)
+                if (!ctx.PersonForgotten(p.Id)) ctx.Persons[p.Id] = p;
 
             var tr = report.Table(table);
             long now = clock.NowMs;
@@ -160,6 +161,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                         if (Quarantine(c, tx, table, rowid.ToString(), "person without an id", p, now)) bc += new BatchCounts(0, 0, 0, 1);
                         continue;
                     }
+                    if (ctx.PersonForgotten(p.Id)) { bc += new BatchCounts(0, 0, 1, 0); continue; } // forgotten: never brought back
                     string? name = NullIfBlank(p.DisplayName);
                     if (!existing.TryGetValue(p.Id, out var oldName))
                     {
@@ -222,8 +224,16 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
 
             foreach (var (_, i) in rows)
             {
-                if (string.IsNullOrWhiteSpace(i.Id) || string.IsNullOrWhiteSpace(i.Platform) || string.IsNullOrWhiteSpace(i.PlatformUserId) || string.IsNullOrWhiteSpace(i.PersonId)) continue;
-                string v3Id = CorpusIds.Identity(i.Platform, i.PlatformUserId);
+                if (string.IsNullOrWhiteSpace(i.Id)) continue;
+                // A forgotten identity is recognised by its platform id, or by belonging to a forgotten person.
+                bool known = !string.IsNullOrWhiteSpace(i.Platform) && !string.IsNullOrWhiteSpace(i.PlatformUserId);
+                if ((known && ctx.Gone.Identities.Contains(CorpusIds.Identity(i.Platform!, i.PlatformUserId!))) || ctx.PersonForgotten(NullIfBlank(i.PersonId)))
+                {
+                    ctx.ForgottenIdentities.Add(i.Id);
+                    continue;
+                }
+                if (!known || string.IsNullOrWhiteSpace(i.PersonId)) continue;
+                string v3Id = CorpusIds.Identity(i.Platform!, i.PlatformUserId!);
                 ctx.Identities[i.Id] = (v3Id, i.PersonId, i.Platform.Trim().ToLowerInvariant());
                 ctx.PersonByIdentity[v3Id] = i.PersonId;
             }
@@ -264,6 +274,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
 
                 foreach (var (rowid, i) in rows)
                 {
+                    if (ctx.ForgottenIdentities.Contains(i.Id)) { bc += new BatchCounts(0, 0, 1, 0); continue; } // forgotten: no row, no quarantine
                     if (string.IsNullOrWhiteSpace(i.Id) || string.IsNullOrWhiteSpace(i.Platform) || string.IsNullOrWhiteSpace(i.PlatformUserId) || string.IsNullOrWhiteSpace(i.PersonId))
                     {
                         if (Quarantine(c, tx, table, rowid.ToString(), "identity without platform, user id or person", i, now)) bc += new BatchCounts(0, 0, 0, 1);

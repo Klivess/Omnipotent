@@ -77,7 +77,8 @@ CREATE INDEX ix_ins_wellbeing_state ON ins_wellbeing(state, created_at_ms DESC);
                 result.AddRange(c.Query(null, "SELECT CASE WHEN a=$s THEN b ELSE a END FROM ins_pairs WHERE (a=$s OR b=$s) AND interactions >= 20 ORDER BY interactions DESC LIMIT $l", r => r.GetString(0),
                     ("$s", self), ("$l", Context.Settings.Get("insights.wellbeing.close_contacts", 30))));
             }
-            return result.Where(p => p != self).Distinct(StringComparer.Ordinal).Where(p => !Restricted(p, now)).ToList();
+            var off = Storage.AnalysisOff.Load(Context.Stores);
+            return result.Where(p => p != self).Distinct(StringComparer.Ordinal).Where(p => !Restricted(p, now) && !off.Person(p)).ToList();
         }
 
         /// <summary>

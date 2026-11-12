@@ -26,9 +26,11 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
             foreach (var (_, cv) in rows)
             {
                 if (string.IsNullOrWhiteSpace(cv.Id) || string.IsNullOrWhiteSpace(cv.Platform)) continue;
+                ctx.PlatformSpellings.Add(cv.Platform);
                 string platform = cv.Platform.ToLowerInvariant();
                 string v3Id = cv.ChannelId != null ? CorpusIds.Conversation(platform, cv.ChannelId) : cv.Id;
                 string? guild = cv.GuildId != null ? CorpusIds.Guild(platform, cv.GuildId) : null;
+                if (ctx.Gone.Conversations.Contains(v3Id)) { ctx.ForgottenConversations.Add(cv.Id); continue; } // a forgotten person's direct chat
                 ctx.Conversations[cv.Id] = (v3Id, guild, platform);
             }
 
@@ -87,6 +89,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
 
                 foreach (var (rowid, cv) in rows)
                 {
+                    if (ctx.ForgottenConversations.Contains(cv.Id)) { bc += new BatchCounts(0, 0, 1, 0); continue; }
                     if (!ctx.Conversations.TryGetValue(cv.Id, out var mapped))
                     {
                         if (Quarantine(c, tx, table, rowid.ToString(CultureInfo.InvariantCulture), "conversation without id or platform", cv, now)) bc += new BatchCounts(0, 0, 0, 1);
@@ -168,24 +171,30 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 report, progress, ct).ConfigureAwait(false);
         }
 
-        private (List<MessagePlan> Plans, List<(long Rowid, string Reason, LegacyMessage Row)> Rejected) PlanMessages(
+        /// <summary>The "problem" of a row that belongs to a forgotten person: it is skipped, never quarantined.</summary>
+        private const string ForgottenRow = "forgotten";
+
+        private (List<MessagePlan> Plans, List<(long Rowid, string Reason, LegacyMessage Row)> Rejected, int Forgotten) PlanMessages(
             LegacyDatabase legacy, Context ctx, LegacyImportReport report, IReadOnlyList<(long Rowid, LegacyMessage Row)> rows)
         {
-            var edits = LoadEdits(legacy, rows.Select(x => x.Row.Id).Where(id => id.Length > 0).ToList());
+            var edits = LoadEdits(legacy, rows.Where(x => !ctx.RowForgotten(x.Row.AuthorIdentityId, x.Row.ConversationId)).Select(x => x.Row.Id).Where(id => id.Length > 0).ToList());
             var plans = new List<MessagePlan>(rows.Count);
             var rejected = new List<(long, string, LegacyMessage)>();
+            int forgotten = 0;
             foreach (var (rowid, m) in rows)
             {
                 string? problem = PlanMessage(rowid, m, ctx, edits, report, out var plan);
-                if (problem != null) rejected.Add((rowid, problem, m));
+                if (ReferenceEquals(problem, ForgottenRow)) forgotten++;
+                else if (problem != null) rejected.Add((rowid, problem, m));
                 else plans.Add(plan!);
             }
-            return (plans, rejected);
+            return (plans, rejected, forgotten);
         }
 
         private string? PlanMessage(long rowid, LegacyMessage m, Context ctx, IReadOnlyDictionary<string, List<LegacyEdit>> edits, LegacyImportReport report, out MessagePlan? plan)
         {
             plan = null;
+            if (ctx.RowForgotten(m.AuthorIdentityId, m.ConversationId)) return ForgottenRow;
             if (string.IsNullOrWhiteSpace(m.Platform) || string.IsNullOrWhiteSpace(m.PlatformMessageId)) return "message without platform or platform id";
             string platform = m.Platform.Trim().ToLowerInvariant();
             if (m.AuthorIdentityId == null || !ctx.Identities.TryGetValue(m.AuthorIdentityId, out var author)) return "author identity missing from v2";
@@ -238,16 +247,22 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
         }
 
         private static BatchCounts WriteMessages(SqliteConnection c, SqliteTransaction tx,
-            (List<MessagePlan> Plans, List<(long Rowid, string Reason, LegacyMessage Row)> Rejected) batch, Context ctx, long now)
+            (List<MessagePlan> Plans, List<(long Rowid, string Reason, LegacyMessage Row)> Rejected, int Forgotten) batch, Context ctx, long now)
         {
-            var bc = new BatchCounts();
+            var bc = new BatchCounts(0, 0, batch.Forgotten, 0);
             foreach (var (rowid, reason, row) in batch.Rejected)
-                if (Quarantine(c, tx, "messages", rowid.ToString(CultureInfo.InvariantCulture), reason, new { row.Id, row.Platform, row.ConversationId, row.AuthorIdentityId, row.Content }, now))
+                if (Quarantine(c, tx, "messages", rowid.ToString(CultureInfo.InvariantCulture), reason, new
+                    {
+                        row.Id, row.Platform, row.ConversationId, row.AuthorIdentityId,
+                        // The account as v3 names it, so that forgetting its owner also finds what was set aside here.
+                        Author = row.AuthorIdentityId != null && ctx.Identities.TryGetValue(row.AuthorIdentityId, out var who) ? who.IdentityId : null,
+                        row.Content,
+                    }, now))
                     bc += new BatchCounts(0, 0, 0, 1);
 
             var existing = c.QueryIn(tx, "SELECT message_id FROM messages WHERE message_id IN ({keys})", batch.Plans.Select(p => p.MessageId).ToList(), r => r.GetString(0))
                 .ToHashSet(StringComparer.Ordinal);
-            using var w = new MessageWriter(c, tx);
+            using var w = new MessageWriter(c, tx, ctx.Gone);
             var lastByConversation = new Dictionary<string, long>(StringComparer.Ordinal);
             var bots = new HashSet<string>(StringComparer.Ordinal);
             foreach (var p in batch.Plans)
@@ -271,11 +286,13 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
             private readonly SqliteConnection c;
             private readonly SqliteTransaction tx;
             private readonly PreparedStatement message, version, mention, embed, sticker, poll, attachment, reactionCount;
+            private readonly ForgottenSet gone;
 
-            public MessageWriter(SqliteConnection c, SqliteTransaction tx)
+            public MessageWriter(SqliteConnection c, SqliteTransaction tx, ForgottenSet gone)
             {
                 this.c = c;
                 this.tx = tx;
+                this.gone = gone;
                 message = new PreparedStatement(c, tx, """
                     INSERT INTO messages(message_id, platform, platform_message_id, conversation_id, guild_id, author_identity_id, sent_at_ms, time_quality,
                         order_key, type, flags, is_bot, is_system, is_webhook, reply_to_message_id, forwarded_from_json, current_version, content, edited_at_ms,
@@ -314,7 +331,9 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                     p.IngestedAtMs, seq, p.RawJson);
                 foreach (var v in p.Versions) version.Run(p.MessageId, v.Version, v.Content, v.EditedAtMs, p.IngestedAtMs, CorpusIds.LegacySourceId);
                 if (raw == null) return;
-                foreach (var m in raw.Mentions) mention.Run(p.MessageId, m.Kind, m.Target);
+                // Somebody else's message stays, but not the record that it pinged a forgotten person.
+                foreach (var m in raw.Mentions)
+                    if (!(m.Kind == "user" && gone.Identities.Contains(m.Target))) mention.Run(p.MessageId, m.Kind, m.Target);
                 for (int i = 0; i < raw.Embeds.Count; i++)
                 {
                     var e = raw.Embeds[i];
@@ -350,10 +369,12 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 {
                     // Rebuild each affected message's full history from every edit v2 logged for it.
                     var ids = rows.Select(x => x.Row).Where(id => id.Length > 0).Distinct(StringComparer.Ordinal).ToList();
-                    var edits = LoadEdits(legacy, ids);
                     var current = legacy.Connection.QueryIn(null, $"SELECT rowid, {messageColumns} FROM messages WHERE message_id IN ({{keys}})", ids,
                             r => ReadMessage(r))
+                        .Where(m => !ctx.RowForgotten(m.AuthorIdentityId, m.ConversationId))
                         .ToDictionary(m => m.Id, StringComparer.Ordinal);
+                    // Edits of a forgotten person's messages are not even read.
+                    var edits = LoadEdits(legacy, ids.Where(current.ContainsKey).ToList());
                     return ids.Select(id => (Id: CurrentId(id, current), Versions: current.TryGetValue(id, out var m)
                             ? VersionHistory.Rebuild(m.Content, MsOrNull(m.EditedAt), edits.GetValueOrDefault(id) ?? new List<LegacyEdit>(), out _)
                             : null))
@@ -403,9 +424,10 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 (c, tx, plans, now) =>
                 {
                     var bc = new BatchCounts();
-                    using var w = new MessageWriter(c, tx);
+                    using var w = new MessageWriter(c, tx, ctx.Gone);
                     foreach (var (rowid, d, recovery) in plans)
                     {
+                        if (DeleteForgotten(d, ctx)) { bc += new BatchCounts(0, 0, 1, 0); continue; } // v2 kept the deleted text: not v3
                         long? at = MsOrNull(d.DeletedAt);
                         if (at == null || d.MessageId.Length == 0)
                         {
@@ -437,8 +459,18 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 }, report, progress, ct).ConfigureAwait(false);
         }
 
+        /// <summary>A deleted message that a forgotten person wrote, or that was in their direct chat.</summary>
+        private static bool DeleteForgotten(LegacyDelete d, Context ctx)
+        {
+            if (d.AuthorIdentityId != null && ctx.ForgottenIdentities.Contains(d.AuthorIdentityId)) return true;
+            if (d.ChannelId == null || ctx.Gone.Conversations.Count == 0) return false;
+            string platform = d.MessageId.Contains(':') ? d.MessageId[..d.MessageId.IndexOf(':')] : "discord";
+            return ctx.Gone.Conversations.Contains(CorpusIds.Conversation(platform, d.ChannelId));
+        }
+
         private MessagePlan? PlanRecovery(long rowid, LegacyDelete d, Context ctx)
         {
+            if (DeleteForgotten(d, ctx)) return null;
             if (d.Content == null || d.AuthorIdentityId == null || d.ChannelId == null || !ctx.Identities.TryGetValue(d.AuthorIdentityId, out var author)) return null;
             string platform = d.MessageId.Contains(':') ? d.MessageId[..d.MessageId.IndexOf(':')] : "discord";
             string native = CorpusIds.Native(d.MessageId);

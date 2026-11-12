@@ -22,9 +22,14 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
         /// both are drained or the time budget is used. When classification has an active label set, rollups trail its drain
         /// cursor so a cell is not built twice (once without labels, once with).
         /// </summary>
+        /// <summary>People whose analysis is switched off (N20), as of the start of the running job: no cell is built for them,
+        /// and no cell of anybody else counts or names them.</summary>
+        private AnalysisOffSet off = AnalysisOffSet.None;
+
         private async Task<string?> DrainAsync(JobContext job)
         {
             var ct = job.Cancellation;
+            off = AnalysisOff.Load(Context.Stores);
             var sw = Stopwatch.StartNew();
             long cursor = Cursor("changes");
             long maxSeq;
@@ -45,7 +50,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                     changes = cr.Query(null, """
                         SELECT seq, at_ms, kind, entity_id, person_id, conversation_id, source_kind FROM change_log
                         WHERE seq > $s AND seq <= $u AND kind IN ('message.insert','message.version','message.delete','reaction.change','attachment.add',
-                                                                   'person.merge','person.unmerge','person.erase','identity.upsert')
+                                                                   'person.merge','person.unmerge','person.erase','person.reanalyse','identity.upsert')
                         ORDER BY seq LIMIT $l
                         """, r => new ChangeRecord(r.GetInt64(0), r.GetInt64(1), r.GetString(2), r.GetString(3), r.GetStringOrNull(4), r.GetStringOrNull(5), r.GetString(6)),
                         ("$s", cursor), ("$u", upper), ("$l", ChangeBatch));
@@ -125,6 +130,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                     cells.Add((Cells.PersonAll, c.EntityId, "*"));
                     if (c.PersonId != null && c.PersonId != c.EntityId) cells.Add((Cells.PersonAll, c.PersonId, "*"));
                 }
+                // Analysis switched back on: the person's cells, and every cell that left them out, are built again.
+                foreach (var c in changes.Where(c => c.Kind == ChangeKinds.PersonReanalyse)) cells.Add((Cells.PersonAll, Context.Policy.Canonical(c.EntityId), Readmit));
                 foreach (var c in changes.Where(c => c.Kind == ChangeKinds.IdentityUpsert))
                 {
                     // An identity can move between persons: rebuild the person it belongs to now and the one it belonged to before.
@@ -267,9 +274,13 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
         /// the person (or anyone whose pair cells name them) has now plus the days of their current messages; a month
         /// ("yyyy-MM") limits it to one month. Cells of a person who no longer exists are deleted.
         /// </summary>
+        /// <summary>The scope of a person rebuild that also rebuilds the cells of the conversations, servers and people around them.</summary>
+        private const string Readmit = "+";
+
         private async Task ExpandPersonAsync(string person, string scope, long seq, CancellationToken ct)
         {
-            bool monthOnly = scope != "*";
+            bool readmit = scope == Readmit;
+            bool monthOnly = scope != "*" && !readmit;
             // A month scope is a UTC month (zones are per UTC month); its messages can fall on the neighbouring months' edge days locally.
             string? edgeFrom = null, edgeTo = null;
             if (monthOnly)
@@ -290,10 +301,30 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
             }
             bool exists;
             List<string> identities;
+            var scopeCells = new HashSet<(string, string, string)>();
             using (var corpus = Context.Stores.Corpus.OpenRead())
             {
+                // Someone whose analysis is switched off is treated exactly like someone who is gone.
                 exists = corpus.Scalar<long>(null, "SELECT COUNT(*) FROM persons WHERE person_id=$p", ("$p", person)) > 0
-                         && (corpus.Scalar<string>(null, "SELECT canonical_id FROM person_canonical WHERE person_id=$p", ("$p", person)) ?? person) == person;
+                         && (corpus.Scalar<string>(null, "SELECT canonical_id FROM person_canonical WHERE person_id=$p", ("$p", person)) ?? person) == person
+                         && !off.Person(person);
+                if (exists && readmit)
+                {
+                    var tz = Context.Settings.KlivesZone;
+                    foreach (var identity in IdentitiesOf(corpus, person))
+                        foreach (var (conversation, guild, at) in corpus.Query(null, "SELECT conversation_id, guild_id, sent_at_ms FROM messages WHERE author_identity_id=$i",
+                                     r => (r.GetString(0), r.GetStringOrNull(1), r.GetInt64(2)), ("$i", identity)))
+                        {
+                            var local = Zones.LocalDate(at, tz);
+                            foreach (int shift in new[] { -1, 0, 1 })
+                            {
+                                string day = Day(local.AddDays(shift));
+                                scopeCells.Add((Cells.Conversation, conversation, day));
+                                if (guild != null) scopeCells.Add((Cells.Guild, guild, day));
+                                scopeCells.Add((Cells.Global, "all", day));
+                            }
+                        }
+                }
                 identities = exists ? IdentitiesOf(corpus, person) : new List<string>();
                 foreach (var identity in identities)
                 {
@@ -306,7 +337,30 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
             }
             if (!exists)
             {
-                // Merged away or erased: its own cells go; the partners' cells that named it are rebuilt below.
+                // Merged away, erased or switched off: the days of every conversation and server they wrote in name them too (who wrote how
+                // much), so those are rebuilt as well. A person's day is in their own zone and a scope's day in Klives's, so
+                // the day before and after are included.
+                using (var c = Context.Stores.Intel.OpenRead())
+                {
+                    // Every scope day that names them is rebuilt, whoever removed their own rows first (a forget sweeps them
+                    // before this runs, so their own cells cannot be relied on to say where they wrote).
+                    foreach (var cell in c.Query(null, "SELECT scope, key, day FROM rollup_scope_day WHERE persons LIKE $l", r => (r.GetString(0), r.GetString(1), r.GetString(2)),
+                                 ("$l", "%" + JsonSerializer.Serialize(person) + "%")))
+                        scopeCells.Add(cell);
+                    foreach (var (d, conversations, guilds) in c.Query(null, "SELECT day, conversations, guilds FROM rollup_person_day WHERE person_id=$p",
+                                 r => (r.GetString(0), r.GetString(1), r.GetString(2)), ("$p", person)))
+                    {
+                        var date = ParseDay(d);
+                        foreach (int shift in new[] { -1, 0, 1 })
+                        {
+                            string day = Day(date.AddDays(shift));
+                            foreach (string conversation in (JsonSerializer.Deserialize<Dictionary<string, int>>(conversations) ?? new()).Keys) scopeCells.Add((Cells.Conversation, conversation, day));
+                            foreach (string guild in (JsonSerializer.Deserialize<Dictionary<string, int>>(guilds) ?? new()).Keys) scopeCells.Add((Cells.Guild, guild, day));
+                            scopeCells.Add((Cells.Global, "all", day));
+                        }
+                    }
+                }
+                // Its own cells go; the partners' cells that named it are rebuilt below.
                 await Context.Stores.Intel.WriteAsync((c, tx) =>
                 {
                     c.Exec(tx, "DELETE FROM rollup_person_day WHERE person_id=$p", ("$p", person));
@@ -317,7 +371,17 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                 }, ct).ConfigureAwait(false);
                 days.Clear();
             }
-            var cells = new HashSet<(string, string, string)>();
+            var cells = new HashSet<(string, string, string)>(scopeCells);
+            if (exists && readmit)
+            {
+                // The people who wrote in the same conversations on those days: their cells left this person out.
+                using var c = Context.Stores.Intel.OpenRead();
+                foreach (var (kind, key, day) in scopeCells.Where(x => x.Item1 == Cells.Conversation).ToList())
+                    foreach (string json in c.Query(null, "SELECT persons FROM rollup_scope_day WHERE scope=$s AND key=$k AND day=$d", r => r.GetString(0), ("$s", kind), ("$k", key), ("$d", day)))
+                        foreach (string other in (JsonSerializer.Deserialize<Dictionary<string, int>>(json) ?? new()).Keys)
+                            foreach (int shift in new[] { -1, 0, 1 })
+                                cells.Add((Cells.PersonDay, other, Day(ParseDay(day).AddDays(shift))));
+            }
             foreach (var d in days) cells.Add((Cells.PersonDay, person, d));
             foreach (var (actor, d) in actorDays) cells.Add((Cells.PersonDay, actor, d));
             if (exists)
@@ -386,6 +450,17 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
         /// <summary>Rebuilds one person-day cell and all of that person's outgoing pair cells for the day.</summary>
         private async Task BuildPersonDayAsync(string person, DateOnly day, long seq, CancellationToken ct)
         {
+            if (off.Person(person))
+            {
+                // Analysis is switched off for them: the day is not built, and what was there goes.
+                string gone = Day(day);
+                await Context.Stores.Intel.WriteAsync((c, tx) =>
+                {
+                    c.Exec(tx, "DELETE FROM rollup_pair_day WHERE person_id=$p AND day=$d", ("$p", person), ("$d", gone));
+                    c.Exec(tx, "DELETE FROM rollup_person_day WHERE person_id=$p AND day=$d", ("$p", person), ("$d", gone));
+                }, ct).ConfigureAwait(false);
+                return;
+            }
             // Each message belongs to exactly one person-day: its local date in the zone of its own (UTC) month. A zone change
             // between months can make consecutive local days overlap or leave a gap, so the cell reads a widened UTC window
             // (offsets never exceed ±14 h) and keeps only the messages whose own local day is this day.
@@ -551,7 +626,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                         VALUES($p,$q,$d,$r,$m,$dm,$re,$le,$li,$lab,$ls,$s)
                         """, "$p", "$q", "$d", "$r", "$m", "$dm", "$re", "$le", "$li", "$lab", "$ls", "$s");
                     foreach (var (partner, a) in pairs)
-                        put.Run(person, partner, dayText, a.Replies, a.Mentions, a.DmMsgs, a.Reactions, Json(a.Explicit), Json(a.Implicit), Json(a.Labels), labelset, seq);
+                        if (!off.Person(partner)) put.Run(person, partner, dayText, a.Replies, a.Mentions, a.DmMsgs, a.Reactions, Json(a.Explicit), Json(a.Implicit), Json(a.Labels), labelset, seq);
                 }
                 c.Exec(tx, "INSERT INTO rollup_changes(subject_kind, subject_id, day, at_ms) VALUES('person',$p,$d,$t)", ("$p", person), ("$d", dayText), ("$t", now));
             }, ct).ConfigureAwait(false);
@@ -580,7 +655,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
             using (var corpus = Context.Stores.Corpus.OpenRead())
                 msgs = corpus.Query(null, $"""
                     SELECT {RollupColumns}, COALESCE(pc.canonical_id, i.person_id) {RollupFrom} LEFT JOIN person_canonical pc ON pc.person_id=i.person_id WHERE {where}
-                    """, r => (MapRollup(r), r.GetStringOrNull(19)), ("$k", key), ("$a", start), ("$b", end)).Where(x => !x.Item1.Bot && !x.Item1.System).ToList();
+                    """, r => (MapRollup(r), r.GetStringOrNull(19)), ("$k", key), ("$a", start), ("$b", end)).Where(x => !x.Item1.Bot && !x.Item1.System && !off.Person(x.Item2)).ToList();
             var (labels, labelset) = LabelsFor(msgs.Select(m => m.M.MessageId).ToList());
             var persons = new Dictionary<string, int>(StringComparer.Ordinal);
             var platforms = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -623,6 +698,11 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
         /// </summary>
         private async Task BuildSlotsAsync(string person, string month, long seq, CancellationToken ct)
         {
+            if (off.Person(person))
+            {
+                await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "DELETE FROM rollup_slots WHERE person_id=$p AND month=$m", ("$p", person), ("$m", month)), ct).ConfigureAwait(false);
+                return;
+            }
             var first = DateOnly.ParseExact(month + "-01", "yyyy-MM-dd", CultureInfo.InvariantCulture);
             long start = Zones.DayStartUtcMs(first, TimeZoneInfo.Utc), end = Zones.DayStartUtcMs(first.AddMonths(1), TimeZoneInfo.Utc);
             var slots = new int[96];
@@ -661,6 +741,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
         private async Task<string?> RelabelAsync(JobContext job)
         {
             var ct = job.Cancellation;
+            off = AnalysisOff.Load(Context.Stores);
             int? active = ActiveLabelset();
             if (active == null) return null;
             int marked = await Context.Stores.Intel.WriteAsync((c, tx) =>

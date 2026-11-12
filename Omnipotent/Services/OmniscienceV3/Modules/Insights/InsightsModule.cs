@@ -218,6 +218,8 @@ INSERT INTO ins_state(name, value) VALUES('community_seq', 0);
                 }
                 return n;
             }, job.Cancellation).ConfigureAwait(false);
+            // The communities and the served summary still count them: both are rebuilt from what is left.
+            await RefreshAsync(job.Cancellation).ConfigureAwait(false);
             return Json(new { person, removed });
         }
 

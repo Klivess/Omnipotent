@@ -42,7 +42,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
             SubscribedChangeKinds = new[]
             {
                 ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete, ChangeKinds.ReactionChange, ChangeKinds.AttachmentAdd,
-                ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge, ChangeKinds.PersonErase, ChangeKinds.IdentityUpsert,
+                ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge, ChangeKinds.PersonErase, ChangeKinds.PersonReanalyse, ChangeKinds.IdentityUpsert,
             },
             Schedules = new[]
             {

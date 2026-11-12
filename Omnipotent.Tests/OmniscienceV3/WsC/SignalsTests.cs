@@ -46,7 +46,9 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             [Self] = "p-klives", [Ana] = "p-ana", [Ben] = "p-ben", [Cyd] = "p-cyd", [Bot] = "p-bot",
         };
 
-        private readonly string root = Path.Combine(Path.GetTempPath(), "omniv3_signals_" + Guid.NewGuid().ToString("N"));
+        // v3 lives in a "v3" folder of its own home, as in production: the folder above it is the old database's (its media).
+        private readonly string home = Path.Combine(Path.GetTempPath(), "omniv3_signals_" + Guid.NewGuid().ToString("N"));
+        private string root => Path.Combine(home, "v3");
         private int counter;
 
         public FixedClock Clock { get; private set; } = null!;
@@ -60,12 +62,13 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         public Omnipotent.Services.OmniscienceV3.Modules.Briefs.BriefsModule? Briefs { get; private set; }
         public Omnipotent.Services.OmniscienceV3.Modules.Transforms.TransformsModule? Transforms { get; private set; }
         public Omnipotent.Services.OmniscienceV3.Modules.Insights.InsightsModule? Insights { get; private set; }
+        public Omnipotent.Services.OmniscienceV3.Modules.DataControls.DataControlsModule? Data { get; private set; }
         public List<string> Errors { get; } = new();
         public KernelSettings Settings => Runtime.Host.Settings;
 
         /// <param name="utcNow">Defaults to a Monday at 13:00 in Klives's zone (Europe/London), outside quiet hours.</param>
         public static async Task<SignalsHarness> StartAsync(DateTime? utcNow = null, bool explore = false, bool rollups = false, bool classification = false, ISignalReadings? readings = null,
-            bool briefs = false, bool transforms = false, bool insights = false)
+            bool briefs = false, bool transforms = false, bool insights = false, bool datacontrols = false)
         {
             var h = new SignalsHarness { Clock = new FixedClock(Instant.FromUtc(utcNow ?? new DateTime(2025, 6, 2, 12, 0, 0, DateTimeKind.Utc))) };
             h.Signals = new SignalsModule(readings ?? h.Readings);
@@ -78,6 +81,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             if (briefs) modules.Add(h.Briefs = new Omnipotent.Services.OmniscienceV3.Modules.Briefs.BriefsModule());
             if (insights) modules.Add(h.Insights = new Omnipotent.Services.OmniscienceV3.Modules.Insights.InsightsModule(h.Signals, () => h.Explore));
             if (transforms) modules.Add(h.Transforms = new Omnipotent.Services.OmniscienceV3.Modules.Transforms.TransformsModule(() => modules));
+            if (datacontrols) modules.Add(h.Data = new Omnipotent.Services.OmniscienceV3.Modules.DataControls.DataControlsModule());
             if (explore) modules.Add(h.Explore = new ExploreModule(() => modules));
             h.Runtime = await V3Runtime.StartAsync(new V3RuntimeOptions
             {
@@ -227,7 +231,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         {
             await Runtime.DisposeAsync();
             SqliteConnection.ClearAllPools();
-            try { Directory.Delete(root, true); }
+            try { Directory.Delete(home, true); }
             catch (IOException) { /* lingering handle on Windows; unique temp dir */ }
         }
     }

@@ -404,8 +404,12 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.False(h.Insights.Wellbeing(null, 1).Enabled);
             await RebuildAsync(h);
             Assert.Equal("switched off", h.Driver.LastResult(InsightsModule.WellbeingKind)!.Value.GetProperty("skipped").GetString());
+            // As a forget does it: the person goes first, and the change that tells the modules comes last.
             await h.Runtime.Stores.Corpus.WriteAsync((c, tx) =>
-                Omnipotent.Services.OmniscienceV3.Storage.ChangeLog.Append(c, tx, h.Clock.NowMs, Omnipotent.Services.OmniscienceV3.Storage.ChangeKinds.PersonErase, "p-ben", "p-ben", null, Omnipotent.Services.OmniscienceV3.Storage.SourceKinds.Operator));
+            {
+                c.Exec(tx, "DELETE FROM persons WHERE person_id='p-ben'");
+                Omnipotent.Services.OmniscienceV3.Storage.ChangeLog.Append(c, tx, h.Clock.NowMs, Omnipotent.Services.OmniscienceV3.Storage.ChangeKinds.PersonErase, "p-ben", null, null, Omnipotent.Services.OmniscienceV3.Storage.SourceKinds.Operator);
+            });
             await h.Driver.RunUntilIdleAsync(5_000);
             h.Driver.AssertNoFailures();
             foreach (string table in new[] { "ins_wellbeing WHERE person_id='p-ben'", "ins_pairs WHERE a='p-ben' OR b='p-ben'", "ins_pair_week WHERE a='p-ben' OR b='p-ben'", "ins_members WHERE person_id='p-ben'" })

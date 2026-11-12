@@ -66,7 +66,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
             Description = "Embeds every message once with the shared encoder and labels it for sentiment, emotion, toxicity, dialogue act, humour, politeness, " +
                           "formality, self-disclosure, information density, conflict, support, modality, language and references to Klives: heads on the " +
                           "embedding plus context heads, the LLM teacher where it earns its cost, gold corrections, fused and calibrated with abstention.",
-            SubscribedChangeKinds = new[] { ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete },
+            SubscribedChangeKinds = new[] { ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete, ChangeKinds.PersonReanalyse },
             Schedules = new[]
             {
                 new ScheduleTrigger("drain", Every: TimeSpan.FromSeconds(30)),

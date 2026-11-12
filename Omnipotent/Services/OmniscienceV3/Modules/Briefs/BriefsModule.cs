@@ -40,6 +40,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             Title = "Digests and briefs",
             Category = "briefs",
             Description = "Catch-up digests since Klives last looked (per server, chat or person, on demand and scheduled) and one-page person briefs. Every point cites its messages.",
+            SubscribedChangeKinds = new[] { ChangeKinds.PersonErase },
             Schedules = new[] { new ScheduleTrigger("tick", Every: TimeSpan.FromMinutes(5)) },
             DefaultLane = Lane.LlmBackground,
             Settings = new[]
@@ -111,9 +112,93 @@ CREATE TABLE brief_runs(
 
         private IReadOnlyList<ITactic>? tactics;
 
+        public const string ForgetKind = "forget";
+
+        public override IEnumerable<DirtySubject> MapChanges(IReadOnlyList<ChangeRecord> changes) =>
+            changes.Where(c => c.Kind == ChangeKinds.PersonErase).Select(c => new DirtySubject("person", c.EntityId)).Distinct();
+
         public override IEnumerable<JobRequest> Plan(PlanContext context)
         {
             if (context.DueSchedules.Any(s => s.Name == "tick")) yield return Job(TickKind, "schedule", "tick", priority: 120, lane: Lane.Cpu);
+            foreach (var d in context.Dirty.Where(d => d.Kind == "person")) yield return Job(ForgetKind, "person", d.Id, priority: 200, lane: Lane.Cpu);
+        }
+
+        /// <summary>
+        /// A person was forgotten, or analysis was switched off for them: their brief and the digests about them go, and from
+        /// every other digest every point that cites a message which no longer exists or which they wrote (a point about what
+        /// they said is their data too).
+        /// </summary>
+        private async Task<string?> ForgetAsync(JobContext job)
+        {
+            var ct = job.Cancellation;
+            string person = job.Job.SubjectId ?? throw new JobFailureException(ErrorClass.Permanent, "Forget job without a person.");
+            List<(string Id, string Kind, string? Scope, string Body)> digests;
+            using (var c = Context.Stores.Intel.OpenRead())
+                digests = c.Query(null, "SELECT digest_id, scope_kind, scope_id, body_json FROM brief_digests WHERE body_json IS NOT NULL", r => (r.GetString(0), r.GetString(1), r.GetStringOrNull(2), r.GetString(3)));
+            static IEnumerable<string> Cited(System.Text.Json.Nodes.JsonNode? node)
+            {
+                if (node is System.Text.Json.Nodes.JsonObject o)
+                    foreach (var (name, value) in o)
+                    {
+                        if (name is "refs" or "notable" && value is System.Text.Json.Nodes.JsonArray ids)
+                            foreach (var id in ids)
+                                if (id is System.Text.Json.Nodes.JsonValue v && v.TryGetValue<string>(out var s)) yield return s;
+                        foreach (string s in Cited(value)) yield return s;
+                    }
+                else if (node is System.Text.Json.Nodes.JsonArray a)
+                    foreach (var item in a)
+                        foreach (string s in Cited(item)) yield return s;
+            }
+            var parsed = digests.Select(d => (d.Id, d.Kind, d.Scope, Node: System.Text.Json.Nodes.JsonNode.Parse(d.Body))).ToList();
+            var cited = parsed.SelectMany(d => Cited(d.Node)).Distinct(StringComparer.Ordinal).ToList();
+            HashSet<string> exists;
+            var off = AnalysisOff.Load(Context.Stores);
+            using (var corpus = Context.Stores.Corpus.OpenRead())
+                exists = corpus.QueryIn(null, "SELECT message_id, author_identity_id FROM messages WHERE message_id IN ({keys})", cited, r => (r.GetString(0), r.GetString(1)))
+                    .Where(x => !off.Author(x.Item2)).Select(x => x.Item1).ToHashSet(StringComparer.Ordinal);
+            // Removes points (objects with "refs") that cite a message that is gone, and such ids from "notable" lists.
+            bool Scrub(System.Text.Json.Nodes.JsonNode? node)
+            {
+                bool changed = false;
+                if (node is System.Text.Json.Nodes.JsonObject o)
+                {
+                    foreach (var (name, value) in o.ToList())
+                    {
+                        if (name == "notable" && value is System.Text.Json.Nodes.JsonArray notable)
+                            for (int i = notable.Count - 1; i >= 0; i--)
+                                if (notable[i] is System.Text.Json.Nodes.JsonValue v && v.TryGetValue<string>(out var id) && !exists.Contains(id)) { notable.RemoveAt(i); changed = true; }
+                        changed |= Scrub(value);
+                    }
+                }
+                else if (node is System.Text.Json.Nodes.JsonArray a)
+                {
+                    for (int i = a.Count - 1; i >= 0; i--)
+                    {
+                        if (a[i] is System.Text.Json.Nodes.JsonObject point && point["refs"] is System.Text.Json.Nodes.JsonArray refs
+                            && refs.Any(r => r is System.Text.Json.Nodes.JsonValue v && v.TryGetValue<string>(out var id) && !exists.Contains(id)))
+                        {
+                            a.RemoveAt(i);
+                            changed = true;
+                        }
+                        else changed |= Scrub(a[i]);
+                    }
+                }
+                return changed;
+            }
+            var rewritten = parsed.Where(d => !(d.Kind == "person" && d.Scope == person) && Scrub(d.Node)).ToList();
+            int removed = await Context.Stores.Intel.WriteAsync((c, tx) =>
+            {
+                int n = c.Exec(tx, "DELETE FROM brief_person WHERE person_id=$p", ("$p", person));
+                n += c.Exec(tx, "DELETE FROM brief_digests WHERE scope_kind='person' AND scope_id=$p", ("$p", person));
+                foreach (var d in rewritten) n += c.Exec(tx, "UPDATE brief_digests SET body_json=$b WHERE digest_id=$d", ("$b", d.Node!.ToJsonString()), ("$d", d.Id));
+                return n;
+            }, ct).ConfigureAwait(false);
+            await Context.ReadModels.DeleteAsync(PersonModel, person, ct).ConfigureAwait(false);
+            await Context.ReadModels.DeleteAsync(DigestModel, ScopeKey("person", person), ct).ConfigureAwait(false);
+            // The served copy of a rewritten digest is dropped; the next digest of that scope puts a fresh one.
+            foreach (var d in rewritten) await Context.ReadModels.DeleteAsync(DigestModel, ScopeKey(d.Kind, d.Scope), ct).ConfigureAwait(false);
+            await Context.Stores.Operator.WriteAsync((c, tx) => c.Exec(tx, "DELETE FROM last_seen WHERE scope=$s", ("$s", ScopeKey("person", person))), ct).ConfigureAwait(false);
+            return Json(new { removed, rewritten = rewritten.Count });
         }
 
         public override async Task<string?> ExecuteAsync(JobContext job) => job.Job.Kind switch
@@ -121,6 +206,7 @@ CREATE TABLE brief_runs(
             DigestKind => await BuildDigestAsync(job).ConfigureAwait(false),
             PersonKind => await BuildPersonBriefAsync(job).ConfigureAwait(false),
             TickKind => await TickAsync(job).ConfigureAwait(false),
+            ForgetKind => await ForgetAsync(job).ConfigureAwait(false),
             _ => throw new JobFailureException(ErrorClass.Permanent, $"Unknown briefs job kind '{job.Job.Kind}'."),
         };
 
@@ -133,6 +219,14 @@ CREATE TABLE brief_runs(
             m.message_id, m.conversation_id, m.guild_id, m.author_identity_id, COALESCE(pc.canonical_id, i.person_id), m.sent_at_ms, m.content, m.reply_to_message_id
             FROM messages m LEFT JOIN identities i ON i.identity_id=m.author_identity_id LEFT JOIN person_canonical pc ON pc.person_id=i.person_id
             """;
+
+        internal const string OffRefusal = "Analysis is switched off for this person, so nothing is summarised about them. It can be switched back on under Data controls.";
+
+        /// <summary>Refuses anything about a person whose analysis is switched off (N20).</summary>
+        internal void RefuseIfOff(string person)
+        {
+            if (AnalysisOff.IsOff(Context.Stores, person)) throw new TacticRefusedException(OffRefusal);
+        }
 
         /// <summary>Human, undeleted messages with text.</summary>
         internal const string Readable = "m.deleted_at_ms IS NULL AND m.is_bot=0 AND m.is_system=0 AND m.is_webhook=0 AND COALESCE(i.kind,'')<>'bot' AND m.content IS NOT NULL AND length(trim(m.content)) > 0";

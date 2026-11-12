@@ -24,9 +24,47 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 $"attachment_id, message_id, {legacy.ColumnOrNull(table, "kind")}, {legacy.ColumnOrNull(table, "original_url")}, {legacy.ColumnOrNull(table, "local_path")}, " +
                 $"{legacy.ColumnOrNull(table, "mime")}, {legacy.ColumnOrNull(table, "size_bytes")}, {legacy.ColumnOrNull(table, "sha256")}",
                 r => new LegacyAttachment(r.Text(1), r.Text(2), r.Text(3), NullIfBlank(r.Text(4)), NullIfBlank(r.Text(5)), NullIfBlank(r.Text(6)), r.Number(7), NullIfBlank(r.Text(8))?.ToLowerInvariant()),
-                rows => rows.Select(x => PlanAttachment(x.Rowid, x.Row, report)).ToList(),
-                (c, tx, plans, now) => WriteAttachments(c, tx, plans, ctx, now),
+                rows =>
+                {
+                    var gone = ForgottenLegacyMessages(legacy, ctx, rows.Select(x => x.Row.MessageId).OfType<string>());
+                    var kept = rows.Where(x => x.Row.MessageId == null || !gone.Contains(x.Row.MessageId)).ToList();
+                    return (Plans: kept.Select(x => PlanAttachment(x.Rowid, x.Row, report)).ToList(), Forgotten: rows.Count - kept.Count);
+                },
+                (c, tx, batch, now) => WriteAttachments(c, tx, batch.Plans, ctx, now) + new BatchCounts(0, 0, batch.Forgotten, 0),
                 report, progress, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>Which of these v2 message ids belong to a forgotten person (their own messages, and everything in their
+        /// direct chats). Reads v2 only when somebody has been forgotten at all.</summary>
+        private static HashSet<string> ForgottenLegacyMessages(LegacyDatabase legacy, Context ctx, IEnumerable<string> legacyMessageIds)
+        {
+            var result = new HashSet<string>(StringComparer.Ordinal);
+            if (ctx.ForgottenIdentities.Count + ctx.ForgottenConversations.Count == 0 || !legacy.HasTable("messages")) return result;
+            var ids = legacyMessageIds.Where(id => id.Length > 0).Distinct(StringComparer.Ordinal).ToList();
+            foreach (var (id, author, conversation) in legacy.Connection.QueryIn(null, "SELECT message_id, author_identity_id, conversation_id FROM messages WHERE message_id IN ({keys})", ids,
+                         r => (r.Text(0) ?? "", r.Text(1), r.Text(2))))
+                if (ctx.RowForgotten(author, conversation)) result.Add(id);
+            return result;
+        }
+
+        /// <summary>The same question for platform message ids (what v2's reaction log carries), as v3 message ids.</summary>
+        private static HashSet<string> ForgottenPlatformMessages(LegacyDatabase legacy, Context ctx, IEnumerable<(string Platform, string PlatformMessageId)> messages)
+        {
+            var result = new HashSet<string>(StringComparer.Ordinal);
+            if (ctx.ForgottenIdentities.Count + ctx.ForgottenConversations.Count == 0 || !legacy.HasTable("messages")) return result;
+            // v2 indexes messages by (platform, platform id), with the platform spelled as v2 stored it.
+            foreach (var group in messages.Distinct().GroupBy(m => m.Platform, StringComparer.Ordinal))
+                foreach (string spelling in ctx.PlatformSpellings.Where(s => s.Trim().ToLowerInvariant() == group.Key).DefaultIfEmpty(group.Key))
+                    foreach (var chunk in group.Select(m => m.PlatformMessageId).Chunk(400))
+                    {
+                        var args = chunk.Select((id, n) => ("$k" + n.ToString(CultureInfo.InvariantCulture), (object?)id)).Append(("$p", (object?)spelling)).ToArray();
+                        string keys = string.Join(",", chunk.Select((_, n) => "$k" + n.ToString(CultureInfo.InvariantCulture)));
+                        foreach (var (id, author, conversation) in legacy.Connection.Query(null,
+                                     $"SELECT platform_message_id, author_identity_id, conversation_id FROM messages WHERE platform=$p AND platform_message_id IN ({keys})",
+                                     r => (r.Text(0) ?? "", r.Text(1), r.Text(2)), args))
+                            if (ctx.RowForgotten(author, conversation)) result.Add(CorpusIds.Message(group.Key, id));
+                    }
+            return result;
         }
 
         /// <summary>Finds v2's file on disk (outside the writer): its canonical content-addressed place, or the stored path
@@ -151,10 +189,19 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 $"emoji, action, {legacy.ColumnOrNull(table, "count")}, occurred_at",
                 r => new LegacyReaction(NullIfBlank(r.Text(1))?.ToLowerInvariant() ?? "discord", NullIfBlank(r.Text(2)), NullIfBlank(r.Text(3)), NullIfBlank(r.Text(4)),
                     NullIfBlank(r.Text(5)), NullIfBlank(r.Text(6))?.ToLowerInvariant(), r.Number(7), r.Raw(8)),
-                rows => rows.ToList(),
-                (c, tx, rows, now) =>
+                rows =>
                 {
-                    var bc = new BatchCounts();
+                    // Not a forgotten person's reactions, and not anybody's reactions to what a forgotten person wrote.
+                    var gone = ForgottenPlatformMessages(legacy, ctx, rows.Where(x => x.Row.MessageId != null).Select(x => (x.Row.Platform!, x.Row.MessageId!)));
+                    var kept = rows.Where(x => !(x.Row.Reactor != null && ctx.Gone.Identities.Contains(CorpusIds.Identity(x.Row.Platform!, x.Row.Reactor)))
+                                               && !(x.Row.MessageId != null && gone.Contains(CorpusIds.Message(x.Row.Platform!, x.Row.MessageId)))
+                                               && !(x.Row.ChannelId != null && ctx.Gone.Conversations.Contains(CorpusIds.Conversation(x.Row.Platform!, x.Row.ChannelId)))).ToList();
+                    return (Rows: kept, Forgotten: rows.Count - kept.Count);
+                },
+                (c, tx, batch, now) =>
+                {
+                    var rows = batch.Rows;
+                    var bc = new BatchCounts(0, 0, batch.Forgotten, 0);
                     var touched = new Dictionary<string, string?>(StringComparer.Ordinal);
                     foreach (var (rowid, e) in rows)
                     {
@@ -233,6 +280,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                         """, "$i", "$t", "$s", "$a", "$cs", "$src", "$d");
                     foreach (var (rowid, p) in rows)
                     {
+                        if (p.UserId != null && ctx.Gone.Identities.Contains(CorpusIds.Identity(p.Platform, p.UserId))) { bc += new BatchCounts(0, 0, 1, 0); continue; }
                         long? at = MsOrNull(p.At);
                         if (p.UserId == null || at == null)
                         {
@@ -268,6 +316,11 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                         "INSERT OR IGNORE INTO typing_events(identity_id, conversation_id, at_ms, source_id) VALUES($i,$c,$t,$s)", "$i", "$c", "$t", "$s");
                     foreach (var (rowid, t) in rows)
                     {
+                        if (ctx.Gone.Blocks(t.UserId == null ? null : CorpusIds.Identity(t.Platform, t.UserId), t.ChannelId == null ? null : CorpusIds.Conversation(t.Platform, t.ChannelId)))
+                        {
+                            bc += new BatchCounts(0, 0, 1, 0);
+                            continue;
+                        }
                         long? at = MsOrNull(t.At);
                         if (t.UserId == null || t.ChannelId == null || at == null)
                         {
@@ -298,6 +351,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 var touched = new HashSet<string>(StringComparer.Ordinal);
                 foreach (var (rowid, v) in rows)
                 {
+                    if (v.UserId != null && ctx.Gone.Identities.Contains(CorpusIds.Identity(v.Platform, v.UserId))) { bc += new BatchCounts(0, 0, 1, 0); continue; }
                     long? joined = MsOrNull(v.JoinedAt);
                     long? left = MsOrNull(v.LeftAt);
                     if (v.UserId == null || joined == null)
@@ -359,6 +413,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 var bc = new BatchCounts();
                 foreach (var (rowid, x) in rows)
                 {
+                    if (x.Conv != null && ctx.ForgottenConversations.Contains(x.Conv)) { bc += new BatchCounts(0, 0, 1, 0); continue; }
                     if (x.Source == null || x.Conv == null || !ctx.Conversations.TryGetValue(x.Conv, out var conv))
                     {
                         if (Quarantine(c, tx, table, rowid.ToString(CultureInfo.InvariantCulture), "cursor for an unknown source or conversation", x, now)) bc += new BatchCounts(0, 0, 0, 1);

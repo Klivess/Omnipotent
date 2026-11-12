@@ -265,12 +265,14 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Transforms
             string match = "\"" + phrase.Replace("\"", "\"\"") + "\"";
             List<TransformsModule.MessageInfo> uses;
             Dictionary<string, string?> names;
+            // Who uses a phrase is a statement about people: someone whose analysis is switched off is not counted.
+            var off = Storage.AnalysisOff.Load(ctx.Stores);
             using (var corpus = ctx.Stores.Corpus.OpenRead())
             {
                 uses = corpus.Query(null, "SELECT " + TransformsModule.InfoColumns + """
                      JOIN messages_fts f ON f.rowid = m.rowid WHERE messages_fts MATCH $q AND m.deleted_at_ms IS NULL AND m.sent_at_ms <= $asof ORDER BY m.sent_at_ms, m.order_key LIMIT $l
                     """, TransformsModule.ReadInfo, ("$q", match), ("$asof", context.AsOfMs), ("$l", cap + 1))
-                    .Where(m => !m.Bot && scope.Matches(m.Person, m.Conversation, m.Guild, m.AtMs)).ToList();
+                    .Where(m => !m.Bot && !off.Author(m.AuthorIdentity) && scope.Matches(m.Person, m.Conversation, m.Guild, m.AtMs)).ToList();
                 names = TransformsModule.PersonNames(corpus, uses.Select(m => m.Person));
             }
             bool truncated = uses.Count > cap;

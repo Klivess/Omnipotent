@@ -16,6 +16,8 @@ lands, so a restart can resume from it.
 | Digests and briefs (N10, N4, X18, X30, X31, X52) | the commit after Signals | `Modules/Briefs`, `Modules/PersonZones.cs`, `Api/BriefsRoutes.cs`. Reads the rollups, the reply inbox and the frozen `assertions` table when they are there. |
 | Transforms without a model (X20–X22, X28, X29, X34, X37–X40) | the commit after digests and briefs | `Modules/Transforms`, `Api/TransformsRoutes.cs`. `TransformsModule` is given the module list (to check saved charts against declared datasets), like Explore. |
 | Notices, relationship dynamics and communities (N12, X36, X45) | the commit after the transforms | `Kernel/Modules/Notices.cs` (additive contract), `Modules/Insights`, `Api/InsightsRoutes.cs`, signals migration 2. `InsightsModule` is given the signals module (its notice sink). |
+| Wellbeing check-ins (N14, X44) | 9cb702a | `InsightsModule.Wellbeing.cs`, insights migration 2. |
+| Data controls (N20, X76) | the commit after wellbeing | `Modules/DataControls`, `Storage/Forgotten.cs`, `Storage/AnalysisOff.cs`, `Api/DataControlsRoutes.cs`; analysis off touches the classifier, rollups, signals, briefs, insights, transforms, explore, projections and the tactic runner (a few lines each); the old-database importer honours both. See "For the merge" in its section. |
 
 ## What the other workstreams integrate against (C-base)
 - **Shared encoder:** `ModuleContext.Encoder` (`IEmbeddingEncoder`, frozen R7 #5). Production: `LazyE5Encoder` from
@@ -282,7 +284,115 @@ after the nightly relationship job.
 - Not exercised: the ensemble's `sentiment` and `distress` readings on real messages (the tests write the rollups and the
   labels themselves).
 
+## Data controls (N20, X76): two forget levels, retention, backups, export
+Module `datacontrols` (`Modules/DataControls`), routes under `data/` (`Api/DataControlsRoutes.cs`).
+
+**Forgetting a person** has the two levels of plan R3. Both start with a preview that changes nothing, says exactly what
+would go, and returns a token: valid ten minutes, for that person, that level and that choice about direct chats, usable
+once. Klives himself is refused. The confirmation writes the standing mark at once and queues a job that works in batches,
+can be resumed after a crash, and reports what it removed by kind. The audit records that a person was forgotten, at which
+level and by whom, never who. The job is addressed by a run id; who it concerns is kept only until it is done.
+
+- **`erase`** removes everything: their messages with versions, mentions, embeds, polls, reactions to them and attachments;
+  their own reactions and votes; presence, typing, voice and member events; their accounts with names and pictures; their
+  person rows and merges; their direct chats with Klives including what Klives wrote there (unless the preview was taken
+  with `includeDirectChats: false`); the vectors of those messages; every derived row keyed by one of the messages, by the
+  person or by an account, in every table of intel.db whichever module owns it (the sweep reads the schema, so a module
+  added later is covered); read models, tactic runs and stream events that name them; and Klives's own records about
+  them (tier, notes, corrections, dismissals, replica chats, standing questions, saved views, audit rows; watch rules and
+  digest subscriptions lose them from their scope, and are deleted when they were the whole scope, because a rule
+  without its scope would watch everybody; cohorts and case files lose them and their messages, and keep the rest).
+  A stored file goes when nothing else refers to it. Files in the old database's media folder are never touched and are
+  counted as left. Deleted pages are overwritten (`secure_delete`) and the search index is rewritten at the end, so their
+  words do not linger. The run then checks that nothing of theirs is left in the corpus.
+- **`derived`** keeps the archive and forgets what was worked out: the labels and vectors of their messages, statistics,
+  facts, summaries, alerts and reminders, replica chats; watch rules, digests and standing questions aimed at them. They
+  drop to the archive tier and are unpinned. Klives's notes, corrections and case files stay. From then on **analysis is
+  off** for them (below). It can be switched back on (`POST data/analysis/on`), and everything is built again from the
+  archive.
+- The change `person.erase` is appended **last**, when nothing of theirs is left to read, so a module that rebuilds on it
+  cannot rebuild from rows that are about to go. Briefs, insights, rollups, signals, projections and the mirror follow it.
+
+**Tombstones (`Storage/Forgotten.cs`).** After an erase, operator.db keeps the forgotten accounts (platform and user id),
+person ids and direct chats as `dismissals` rows. They are the only way to recognise the person's data when it is offered
+again. The old-database importer honours them on every run: a forgotten person, everyone merged into them, their
+accounts (also one the old database attaches to them later), their direct chats, messages, edits, deleted-message
+archive, attachments, reactions (theirs, and anybody's to their messages), events, and what Klives kept about them are
+skipped without a trace. They are not quarantined either, because a quarantined row keeps its text. A message somebody
+else wrote that pinged them is imported without the record that it pinged them.
+
+**Analysis off (`Storage/AnalysisOff.cs`).** A standing mark on the person; it covers everyone merged with them, so a
+merge cannot switch it back on. While it stands:
+- the classifier does not embed, label, sample or train on what they write;
+- the rollups build no cell for them, and nobody else's cell counts or names them (pair cells; conversation, server and
+  global days);
+- signals raise no alert and no reminder from what they write;
+- digests leave their messages out, and a brief, digest or subscription about them is refused;
+- the tactic runner refuses every tactic with them in its selection (one place, so the tactics of every workstream are
+  covered);
+- the analytics mirror returns no row that names them, whatever the dataset and however the query is phrased; a message
+  somebody else wrote to them stays counted and simply does not name them;
+- relationships, communities and wellbeing leave them out; the phrase tracker does not count them;
+- the dossier carries `analysisOff: true`, so the page can say so instead of looking like a person nothing is known about;
+- the old-database importer keeps importing their messages, but not the tier, pin, watch or replica chats that were removed.
+
+Their messages stay readable and searchable by their words. `GET data/analysis` lists who is off and since when.
+Switching it back on appends `person.reanalyse`: the classifier embeds and labels everything they wrote again, the rollups
+rebuild their cells and the cells of the conversations, servers and people around them, and the mirror writes their rows
+again. Alerts are not raised after the fact for what they wrote while it was off.
+
+**Retention** (`datacontrols/retention`, nightly at 03:30 in Klives's zone): presence, typing and voice events older than
+`datacontrols.retention.{presence,typing,voice}_days` are deleted by when they happened (a call by its end, or by its start
+when it never ended), in slices. 0 (the default) keeps them for ever. Messages are never subject to it. `GET data/retention`
+says per stream how long it is kept, the cutoff, and how many events were removed in total and last night, so the pages can
+say how far back a stream reaches (F519: disclosed, never silent). The rollups keep the counts they made before.
+
+**Backups** (`datacontrols/backup`, nightly unless `datacontrols.backup.enabled` is off, or `POST data/backups/run`): a
+consistent snapshot of corpus.db and operator.db taken with SQLite's online backup while the service runs, encrypted with
+AES-256-GCM in 1 MiB chunks (each chunk is authenticated with its index and whether it is the last, so a cut-off, reordered
+or altered file fails to open). The plain copy is deleted. The key is 256 random bits kept only under Windows DPAPI for the
+service account. `export-key` wraps it with a passphrase of at least 12 characters (PBKDF2-SHA256, 600,000 rounds) for
+another machine; `import-key` installs it there and refuses to replace a different key. `restore` decrypts into a folder
+beside the backup and checks the recorded hash and SQLite's integrity check; it never swaps the live files (that is done
+by hand with the service stopped). The newest `datacontrols.backup.keep` (7) are kept, so erased data ages out of the
+backups; the erase preview says so.
+
+**Export** (`POST data/export/person`, answers with the file): accounts and their names over time, the facts recorded,
+and every message they wrote, as one JSON document or as Markdown, streamed in pages.
+
+Routes: `data/forget/preview`, `data/forget/confirm` (202), `data/forget/run`, `data/analysis`, `data/analysis/on`,
+`data/retention`, `data/backups`, `data/backups/run`, `data/backups/restore`, `data/backups/export-key`,
+`data/backups/import-key`, `data/export/person`. Retention needs the overview permission and the export the data-export
+permission; everything else needs engine management.
+
+**For the merge:**
+- WS-A's ingest writer (gateway, backfill, export imports) must ask `Forgotten.Load(...).Blocks(identity, conversation)`
+  before it stores anything, and skip a forgotten account's events. Its face labels, crops, thumbnails, OCR and caption
+  rows are swept when their tables key by `message_id`, `person_id` or `identity_id`; files it stores outside the CAS need
+  its own handler on `person.erase`. Faces and captions of an analysis-off person are not computed.
+- WS-B's extraction, inquiry and standing questions, and WS-D's replica training, must skip the people in
+  `AnalysisOff.Load(...)` in their background jobs (tactics are refused centrally). An assertion about somebody else that
+  loses its last evidence message to an erase should be retracted by WS-B.
+- KliveRAG's Omniscience connector must drop what it indexed about a person on `person.erase`.
+- A route that sets a person's tier must not be read as switching analysis back on: the mark is what counts, not the tier.
+- `IPolicyOracle` is unchanged (WS-B wraps it).
+
+Tests: `DataControlsTests` (6: an erase across all stores, with a scan proving that none of their words and no account id
+is left anywhere but the block list; the lighter level, what stays off, and switching back on; the mirror; retention;
+backups with damage and key transfer; export) and two more in `LegacyImporterTests` (forgotten people on a snapshot run
+and on the tail; analysis off). What the tests found and this fixed: conversation and server statistics kept naming a
+forgotten person (the rollups only looked at the person's own cells, which the sweep had already removed), the
+communities summary kept their name until the next night, and module state rows keyed by an account were left. Not
+exercised: a real corpus's size (the erase works in batches of 2,000 messages; the final rewrite of the search index
+holds the corpus writer for its duration, seconds on a few million messages).
+
 ## Shared files touched (small, additive)
+- Data controls: `Storage/Forgotten.cs` and `Storage/AnalysisOff.cs` (new); `Storage/ChangeLog.cs` gains the change kind
+  `person.reanalyse`; `Storage/Legacy/LegacyImporter*.cs` honour the tombstones and analysis off (and a quarantined
+  message now also names its author as v3 knows the account); `Kernel/Tactics/TacticRunner.cs` refuses a tactic on an
+  analysis-off person; `DossierDto` gains `AnalysisOff` (optional, last). One line each in `Api/V3Routes.cs` and
+  `OmniscienceV3.BuildModules()`. The test harness (`SignalsHarness`) now keeps v3 in a `v3` folder of its own home, so
+  the old database's media folder is inside the test's folder instead of the system temp folder.
 - `Kernel/Modules/Notices.cs`: `Notice`, `NoticeSeverity`, `INoticeSink` (additive). Insights: one line in `Api/V3Routes.cs`; in `OmniscienceV3.BuildModules()` the signals module is built first and handed to `InsightsModule`.
 - Transforms: one line each in `Api/V3Routes.cs` (`TransformsRoutes`) and `OmniscienceV3.BuildModules()` (`TransformsModule`, before Explore).
 - Briefs: one line each in `Api/V3Routes.cs` (`BriefsRoutes`) and `OmniscienceV3.BuildModules()` (`BriefsModule`).
@@ -360,7 +470,8 @@ after the nightly relationship job.
 | Digests (N10, scheduled X52), person brief (N4), cited summaries; tactics X18, X30, X31 | done, tested (8 tests with a scripted model: what a real model writes is first seen in the shadow run) |
 | Relationship dynamics and communities (N12), notices, X36, X45 | done, tested (Leiden on planted graphs; the relationship job on written pair rollups, so the conflict labels it reads are the test's) |
 | Wellbeing check-ins (N14, X44) | done, tested (the rollups and labels it reads are written by the test) |
-| Community pages (N13), links (N15), similar people (N16), translation (N19), data controls (N20) | pending |
+| Data controls (N20, X76): erase and "forget what was worked out" with analysis off, tombstones honoured by the importer, retention, encrypted backups with restore and key transfer, per-person export | done, tested (6 tests, 2 importer tests; real sizes and WS-A's ingest hook are not exercised) |
+| Community pages (N13), links (N15), similar people (N16), translation (N19) | pending |
 | Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
 | Tactics X17 (merge step), X23, X32, X33, X35; monitors X42, X43, X46–X48, X50–X51 | pending |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |

@@ -45,7 +45,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Projections
             IReadOnlyList<NameSpanDto> Names, IReadOnlyList<IdentitySummaryDto> Identities, PersonActivityDto Activity, IReadOnlyList<DayCountDto> Series, int[]? Hours, int[]? Weekdays,
             ZoneReadingDto? Zone, IReadOnlyList<ZoneReadingDto>? ZoneHistory, LabelMixDto Labels, IReadOnlyList<RankedCountDto> Languages, IReadOnlyList<RankedCountDto> Conversations,
             IReadOnlyList<RankedCountDto> Guilds, IReadOnlyList<PartnerSummaryDto> Partners, IReadOnlyList<DossierFactDto> Facts, DossierCoverageDto Coverage, string Today, long NewestEvidenceMs,
-            bool StaleEvidence);
+            bool StaleEvidence, bool AnalysisOff = false);
         [Api.ApiContract]
         public sealed record PersonCardDto(string PersonId, string DisplayName, bool IsSelf, string Tier, bool Pinned, string AgeBand, IReadOnlyList<string> Platforms,
             long? FirstSeenMs, long? LastSeenMs, long Msgs, long Msgs30, long Msgs90, string? TopGuild, Dictionary<string, double>? Sentiment90);
@@ -176,7 +176,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Projections
             bool stale = newest > 0 && now - newest > 90L * 86_400_000;
             var dossier = new DossierDto(person, displayName, isSelf, tier, pinned, band.ToString(), restricted, names, identities, activity, series, hours, weekdays,
                 zone, zoneHistory, labels, languages, conversations, guilds, partners, facts,
-                new DossierCoverageDto(platforms, allConversations, allGuilds, activity.FirstMs, activity.LastMs), today, newest, stale);
+                new DossierCoverageDto(platforms, allConversations, allGuilds, activity.FirstMs, activity.LastMs), today, newest, stale,
+                // Analysis switched off (N20): the page says so, instead of looking like a person nothing is known about.
+                AnalysisOff: Storage.AnalysisOff.IsOff(Context.Stores, person));
             long seq;
             using (var cr = Context.Stores.Corpus.OpenRead()) seq = ChangeLog.MaxSeq(cr);
             await Context.ReadModels.PutAsync(Dossier, person, 1, now, seq, dossier, ct).ConfigureAwait(false);
