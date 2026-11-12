@@ -101,6 +101,13 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
             return v is DBNull ? null : v;
         }
 
+        /// <summary>Runs the statement as a query. Dispose the reader before running the statement again.</summary>
+        public SqliteDataReader Reader(params object?[] values)
+        {
+            Bind(values);
+            return cmd.ExecuteReader();
+        }
+
         private void Bind(object?[] values)
         {
             if (values.Length != parameters.Length)

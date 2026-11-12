@@ -509,6 +509,20 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
                 catch (Exception ex) { logError("[OmniscienceV3] kernel loop ended with an error during shutdown.", ex); }
             }
             if (workers != null) await workers.DisposeAsync().ConfigureAwait(false);
+            // Modules that hold something of their own (a listener, a loop, a connection) let go of it once no job
+            // can use it any more, in reverse start order.
+            foreach (var module in ordered.AsEnumerable().Reverse())
+            {
+                try
+                {
+                    if (module is IAsyncDisposable asyncDisposable) await asyncDisposable.DisposeAsync().ConfigureAwait(false);
+                    else if (module is IDisposable disposable) disposable.Dispose();
+                }
+                catch (Exception ex)
+                {
+                    logError($"[OmniscienceV3] module '{module.Manifest.Id}' failed to shut down cleanly.", ex);
+                }
+            }
             stopping.Dispose();
             kick.Dispose();
             passGate.Dispose();

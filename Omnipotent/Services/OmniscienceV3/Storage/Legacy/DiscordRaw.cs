@@ -45,6 +45,12 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
         private const long FlagVoiceMessage = 1 << 13;
         private const long AttachmentFlagSpoiler = 1 << 3;
 
+        /// <summary>
+        /// True for message types Discord writes itself (someone joined, a message was pinned, a call started, a
+        /// boost, a poll's result). Ordinary messages, replies, thread starters and command responses are not.
+        /// </summary>
+        public static bool IsSystemType(int type) => type is not (0 or 19 or 20 or 21 or 23);
+
         public static DiscordRawMessage? TryParse(string? json)
         {
             if (string.IsNullOrWhiteSpace(json)) return null;
