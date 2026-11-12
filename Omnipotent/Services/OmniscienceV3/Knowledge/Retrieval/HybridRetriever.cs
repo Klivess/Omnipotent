@@ -97,7 +97,11 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             return (results, new RetrievalCoverage(true, enc != null && candidates > 0, enc?.ModelId, clean.Count, candidates, note));
         }
 
-        /// <summary>An FTS5 query from free text: each word becomes a quoted prefix term, OR-joined; quoted phrases stay phrases.</summary>
+        /// <summary>
+        /// An FTS5 query from free text: quoted phrases stay phrases; every other word becomes a term, OR-joined. A word of five
+        /// letters or more is a prefix term, so its inflections are found ("football" finds "footballer"). A shorter word is
+        /// matched whole, with its plain plural: as a prefix it would find unrelated words ("cat" would find "Catholic").
+        /// </summary>
         public static string? FtsQuery(string text)
         {
             var terms = new List<string>();
@@ -108,7 +112,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             {
                 string w = Clean(word);
                 if (w.Length < 2) continue;
-                terms.Add("\"" + w + "\"*");
+                if (w.Length >= 5) terms.Add("\"" + w + "\"*");
+                else
+                {
+                    terms.Add("\"" + w + "\"");
+                    if (w.Length >= 3 && !w.EndsWith('s')) terms.Add("\"" + w + "s\"");
+                }
             }
             terms = terms.Distinct(StringComparer.OrdinalIgnoreCase).Take(24).ToList();
             return terms.Count == 0 ? null : string.Join(" OR ", terms);

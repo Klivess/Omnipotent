@@ -183,7 +183,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
                 // Verified facts of skill-like attributes whose value shares the need's words.
                 string needNorm = NaturalKeys.Normalize(need);
                 using (var c = ctx.Module.Stores.Intel.OpenRead())
-                    foreach (var (subject, value) in c.Query(null, "SELECT subject_id, value_text FROM kn_assertion_dims d JOIN assertions a ON a.assertion_id=d.assertion_id WHERE d.live=1 AND d.attribute IN ('skill','speaks_language','owns','job','field_of_study','hobby') AND d.status IN ('accepted','confirmed')",
+                    foreach (var (subject, value) in c.Query(null, "SELECT d.subject_id, a.value_text FROM kn_assertion_dims d JOIN assertions a ON a.assertion_id=d.assertion_id WHERE d.live=1 AND d.attribute IN ('skill','speaks_language','owns','job','field_of_study','hobby') AND d.status IN ('accepted','confirmed')",
                                  r => (r.GetString(0), r.GetStringOrNull(1))))
                         if (value != null && NaturalKeys.Normalize(value).Split(' ').Any(w => w.Length > 3 && needNorm.Contains(w, StringComparison.Ordinal))) counts[kit.Corpus.Canonical(subject)] = counts.GetValueOrDefault(kit.Corpus.Canonical(subject)) + 3;
                 return counts.Where(kv => restrict.Count == 0 || restrict.Contains(kv.Key))
@@ -240,6 +240,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
             return Outputs(await RunInquiryAsync(ctx, Request(ctx, InquiryAnswerType.Prediction, "Base the prediction on past behaviour first.") with { ExtraEvidence = extra }).ConfigureAwait(false));
         }
 
+        /// <summary>Messages of one person at most this far apart are one burst.</summary>
+        public const long BurstGapMs = 30 * 60_000L;
+
         /// <summary>Exact behaviour statistics as evidence: plan follow-through and responsiveness to Klives in DMs (last 180 days).</summary>
         public static List<EvidenceItem> Behaviour(KnowledgeKit kit, IReadOnlyList<string> people, long asOfMs)
         {
@@ -257,7 +260,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
                         if (kept + broken + cancelled + past > 0)
                             items.Add(new EvidenceItem("", "behaviour", null, null, p, p, asOfMs,
                                 $"[behaviour statistics] Of their past plans and promises: {kept} kept, {past} went ahead or passed, {cancelled} cancelled, {broken} overdue/not kept.",
-                                "past behaviour", "behaviour", 0.9, false, null, null, null, "plans"));
+                                "past behaviour", InquiryAggregation.Statistic, 0.9, false, null, null, null, "plans"));
                     }
                 }
                 var identities = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(p)).Select(i => i.IdentityId).ToHashSet(StringComparer.Ordinal);
@@ -272,7 +275,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
                     for (int i = 0; i < msgs.Count; i++)
                     {
                         if (!selfIdentities.Contains(msgs[i].AuthorIdentityId)) continue;
-                        if (i + 1 < msgs.Count && selfIdentities.Contains(msgs[i + 1].AuthorIdentityId)) continue; // only the last message of Klives's burst
+                        // Only the last message of a burst of Klives's counts as asking. A burst is messages minutes apart: a message he
+                        // followed up hours later was left unanswered in between, which is exactly what is being counted.
+                        if (i + 1 < msgs.Count && selfIdentities.Contains(msgs[i + 1].AuthorIdentityId) && msgs[i + 1].SentAtMs - msgs[i].SentAtMs <= BurstGapMs) continue;
                         asked++;
                         var reply = msgs.Skip(i + 1).FirstOrDefault(m => identities.Contains(m.AuthorIdentityId));
                         if (reply != null && reply.SentAtMs - msgs[i].SentAtMs <= 86_400_000L) { answered++; latencies.Add((reply.SentAtMs - msgs[i].SentAtMs) / 60_000.0); }
@@ -281,7 +286,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
                 if (asked >= 5)
                     items.Add(new EvidenceItem("", "behaviour", null, null, p, p, asOfMs,
                         $"[behaviour statistics] In DMs over the last 180 days they replied within a day to {answered} of {asked} of Klives's messages; median reply time {(latencies.Count == 0 ? "n/a" : InquiryAggregation.Median(latencies).ToString("0", CultureInfo.InvariantCulture) + " minutes")}.",
-                        "responsiveness", "behaviour", 0.8, false, null, null, null, "DMs"));
+                        "responsiveness", InquiryAggregation.Statistic, 0.8, false, null, null, null, "DMs"));
             }
             return items;
         }
@@ -378,7 +383,11 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
             var engine = kit.Explore ?? throw new TacticRefusedException("The Explore engine is not installed in this build, so chart points cannot be explained yet.");
             string token = ctx.Input.Selections.First(s => s.Kind == SelectionKind.ExploreDrill).Items[0].Id;
             var records = await ctx.StageAsync("records", async ct => (await engine.RecordsAsync(new Kernel.Explore.ExploreRecordsRequest(token, null, 200), _ => true, ct).ConfigureAwait(false)).Records.ToList()).ConfigureAwait(false);
-            var messageIds = records.Select(r => r.ValueKind == JsonValueKind.Object && r.TryGetProperty("messageId", out var m) ? m.GetString() : null).OfType<string>().Take(120).ToList();
+            // Explore's records carry the mirror's column names (message_id); the camel-case spelling is accepted too.
+            var messageIds = records.Select(r => r.ValueKind != JsonValueKind.Object ? null
+                    : r.TryGetProperty("message_id", out var m) && m.ValueKind == JsonValueKind.String ? m.GetString()
+                    : r.TryGetProperty("messageId", out var m2) && m2.ValueKind == JsonValueKind.String ? m2.GetString() : null)
+                .OfType<string>().Distinct(StringComparer.Ordinal).Take(120).ToList();
             var extra = kit.Corpus.Messages(messageIds).Select(m => new EvidenceItem("", "message", m.MessageId, null, m.AuthorPersonId, m.AuthorPersonId, m.SentAtMs,
                 $"{Instant.Iso(m.SentAtMs)[..16]} {EvidenceRenderer.Content(m.Content, _ => null, 500)}", "records", "self", 0.8, false, m.ConversationId, m.GuildId, m.Platform, null)).ToList();
             string question = QuestionOf(ctx.Input) ?? "Explain what drives this data point, with exemplars.";
@@ -406,6 +415,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
     public sealed class IncidentReconstructionTactic : TacticBase
     {
         public const string PromptVersion = "inquiry.incident@1";
+        /// <summary>How close in time two people's messages in a shared channel must be to count as an exchange between them.</summary>
+        public const long ExchangeGapMs = 10 * 60_000L;
 
         public sealed class IncidentAnswer
         {
@@ -448,7 +459,27 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
                 var b = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(people[1])).Select(i => i.IdentityId).ToHashSet(StringComparer.Ordinal);
                 var shared = kit.Corpus.ConversationsOf(a.ToList()).Select(c => c.ConversationId).Intersect(kit.Corpus.ConversationsOf(b.ToList()).Select(c => c.ConversationId)).ToList();
                 var list = new List<CorpusMessage>();
-                foreach (var conv in shared) list.AddRange(kit.Corpus.ConversationRange(conv, from, to, 2_000).Where(m => a.Contains(m.AuthorIdentityId) || b.Contains(m.AuthorIdentityId)));
+                var kinds = kit.Corpus.Conversations(shared);
+                foreach (var conv in shared)
+                {
+                    var theirs = kit.Corpus.ConversationRange(conv, from, to, 2_000).Where(m => a.Contains(m.AuthorIdentityId) || b.Contains(m.AuthorIdentityId)).ToList();
+                    // A conversation of just the two of them is read whole. In a group or a server channel only the parts where
+                    // they are talking to each other count: a reply to the other, or a message within ten minutes of one of
+                    // the other's (what each said to everyone else there is not "between them").
+                    if (kinds.TryGetValue(conv, out var info) && info.Kind == "dm") { list.AddRange(theirs); continue; }
+                    var authorOf = theirs.ToDictionary(m => m.MessageId, m => m.AuthorIdentityId, StringComparer.Ordinal);
+                    for (int i = 0; i < theirs.Count; i++)
+                    {
+                        var m = theirs[i];
+                        bool byA = a.Contains(m.AuthorIdentityId);
+                        var other = byA ? b : a;
+                        bool reply = m.ReplyToMessageId != null && authorOf.TryGetValue(m.ReplyToMessageId, out var parent) && other.Contains(parent);
+                        bool near = false;
+                        for (int k = i - 1; k >= 0 && m.SentAtMs - theirs[k].SentAtMs <= ExchangeGapMs && !near; k--) near = other.Contains(theirs[k].AuthorIdentityId);
+                        for (int k = i + 1; k < theirs.Count && theirs[k].SentAtMs - m.SentAtMs <= ExchangeGapMs && !near; k++) near = other.Contains(theirs[k].AuthorIdentityId);
+                        if (reply || near) list.Add(m);
+                    }
+                }
                 list.AddRange(kit.Corpus.Mentioning(a.ToList(), from, to).Where(m => b.Contains(m.AuthorIdentityId)));
                 list.AddRange(kit.Corpus.Mentioning(b.ToList(), from, to).Where(m => a.Contains(m.AuthorIdentityId)));
                 return Task.FromResult(CorpusReader.Ordered(list.GroupBy(m => m.MessageId).Select(g => g.First())).TakeLast(600).Select(m => m.MessageId).ToList());
@@ -493,7 +524,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
         public override TacticDescriptor Descriptor { get; } = Describe("x14.standing_question", "X14", "Standing question",
             "Keep a question open: it is answered now and re-evaluated whenever new live messages from the people bear on it (debounced and budgeted); a verdict flip raises an alert.",
             InquiryAnswerType.Binary, ReasoningTactics.PersonOrQuestion, 1, 2, new[] { TacticOutputKind.Answer, TacticOutputKind.AlertRule },
-            """{"type":"object","properties":{"question":{"type":"string","maxLength":2000},"minIntervalHours":{"type":"number","minimum":0.25,"maximum":720},"passes":{"type":"integer","minimum":1,"maximum":9}}}""");
+            """{"type":"object","properties":{"question":{"type":"string","maxLength":2000},"minIntervalHours":{"type":"number","minimum":0.25,"maximum":720},"passes":{"type":"integer","minimum":1,"maximum":9}}}""",
+            // A question kept open about one person, alerting when the answer changes, is a person-targeted alert.
+            minor: RestrictedCapability.PersonTargetedAlert);
 
         public override async Task<IReadOnlyList<TacticOutput>> RunAsync(TacticRunContext ctx)
         {

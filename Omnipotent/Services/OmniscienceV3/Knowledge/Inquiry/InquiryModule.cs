@@ -9,6 +9,7 @@ using Omnipotent.Services.OmniscienceV3.Kernel.Jobs;
 using Omnipotent.Services.OmniscienceV3.Kernel.Modules;
 using Omnipotent.Services.OmniscienceV3.Kernel.Tactics;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Evidence;
+using Omnipotent.Services.OmniscienceV3.Knowledge.Policy;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Prompting;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Store;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Tactics;
@@ -134,6 +135,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
             if (!StandingQuestions().TryGetValue(questionId, out var def)) return new { questionId, outcome = "disabled" };
             long now = Context.Clock.NowMs;
             var state = State(questionId);
+            // MinorGuard: no question stays open on someone who is, or has since turned out to be, under 18 (a person-targeted
+            // alert). It is switched off, not just skipped, and says why.
+            if (def.PersonIds.Any(p => !MinorGuard.Allows(RestrictedCapability.PersonTargetedAlert, Context.Policy.BandOf(p, now))))
+            {
+                await Context.Stores.Operator.WriteAsync((c, tx) =>
+                {
+                    c.Exec(tx, "UPDATE standing_questions SET enabled=0, updated_at_ms=$n WHERE question_id=$q", ("$n", now), ("$q", questionId));
+                    c.Exec(tx, "INSERT INTO audit_log(at_ms, actor, action, target, detail_json) VALUES($n,'policy','standing.disable',$q,$d)",
+                        ("$n", now), ("$q", questionId), ("$d", JsonSerializer.Serialize(new { reason = "minor" }, KernelJson.Options)));
+                }, ct).ConfigureAwait(false);
+                return new { questionId, outcome = "disabled_minor" };
+            }
             long interval;
             using (var o = Context.Stores.Operator.OpenRead())
                 interval = o.Scalar<long?>(null, "SELECT min_interval_ms FROM standing_questions WHERE question_id=$q", ("$q", questionId)) ?? (long)(Context.Settings.Get(StandingIntervalSetting, 6.0) * 3_600_000);

@@ -55,11 +55,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                 : InquiryVerdict.Uncertain;
         }
 
-        /// <summary>Independent direct evidence units among the cited items.</summary>
+        /// <summary>
+        /// Independent direct evidence units among the cited items. What one author wrote on one day is one unit, however
+        /// many messages it took (and a fact deduced from that statement is the same unit). A statistic a tactic computed
+        /// from many observations (plans kept, replies given) is a unit of its own per kind of statistic.
+        /// </summary>
         public static int Strength(IEnumerable<EvidenceItem> cited)
         {
+            static string Unit(EvidenceItem i) => i.Reliability == Statistic
+                ? "statistic|" + i.SubjectPersonId + "|" + i.Facet
+                : (i.AuthorPersonId ?? i.AssertionId ?? i.Id) + "|" + (i.AtMs / 86_400_000L);
             int strength = 0;
-            foreach (var unit in cited.GroupBy(i => (i.AuthorPersonId ?? i.AssertionId ?? i.Id) + "|" + (i.AtMs / 86_400_000L)))
+            foreach (var unit in cited.GroupBy(Unit))
             {
                 var best = unit.OrderByDescending(i => Weight(i.Reliability)).First();
                 strength += Weight(best.Reliability);
@@ -67,9 +74,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
             return strength;
         }
 
+        /// <summary>Reliability of an exact statistic over a person's past behaviour (computed, not said).</summary>
+        public const string Statistic = "statistic";
+
         private static int Weight(string reliability) => reliability switch
         {
-            "self" or "fact" => 2,
+            "self" or "fact" or Statistic => 2,
             "behaviour" or "third_party" => 1,
             _ => 0,
         };
