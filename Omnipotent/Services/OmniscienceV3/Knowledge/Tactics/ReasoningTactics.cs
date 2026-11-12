@@ -20,17 +20,19 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
     {
         public const string AskYesNoKey = "x01.ask_yes_no";
 
+        internal const string AskPermission = "omniscience.persons.ask";
+        internal const string ReadPermission = "omniscience.persons.read";
+
+        // Declared before All: static fields are initialised in the order they are written, and every tactic's descriptor
+        // reads this one while All is being built (declared after it, every tactic accepted "null").
+        internal static readonly SelectionKind[] PersonOrQuestion = { SelectionKind.Person, SelectionKind.Question };
+
         public static IReadOnlyList<ITactic> All { get; } = new ITactic[]
         {
             new AskYesNoTactic(), new AskOpenTactic(), new ComparePeopleTactic(), new RankCohortTactic(), new ExpertiseFinderTactic(), new HypothesisTestTactic(),
             new OpinionPredictorTactic(), new BehaviourPredictionTactic(), new ChangeDetectorTactic(), new WhatChangedTactic(), new ExplainMetricTactic(), new FactCheckTactic(),
             new IncidentReconstructionTactic(), new StandingQuestionTactic(), new AskTheCorpusTactic(), new CoverageCheckTactic(),
         };
-
-        internal const string AskPermission = "omniscience.persons.ask";
-        internal const string ReadPermission = "omniscience.persons.read";
-
-        internal static readonly SelectionKind[] PersonOrQuestion = { SelectionKind.Person, SelectionKind.Question };
     }
 
     /// <summary>Shared plumbing of the inquiry-backed tactics.</summary>

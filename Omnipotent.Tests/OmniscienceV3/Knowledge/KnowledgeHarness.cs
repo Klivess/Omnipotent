@@ -60,7 +60,15 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Calls.Enqueue(call);
             if (!handlers.TryGetValue(request.Purpose, out var handler))
                 return Task.FromResult(new LlmResult(false, null, null, LlmErrorKind.Other, $"No fake handler for '{request.Purpose}'.", null, "fake", "fake", 0, 0, 0, 0, 1));
-            string? json = handler(call);
+            string? json;
+            try
+            {
+                json = handler(call);
+            }
+            catch (OutageException)
+            {
+                return Task.FromResult(new LlmResult(false, null, null, LlmErrorKind.Other, "The provider is unavailable.", null, "fake", "fake", 0, 0, 0, 0, 1));
+            }
             if (json == null) return Task.FromResult(new LlmResult(false, null, null, LlmErrorKind.Refused, "refused", "stop", "fake-model", "fake", 100, 0, 0, 10, 1));
             lock (history) history.Add(json);
             int promptTokens = prompt.Length / 4;
@@ -71,6 +79,9 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Task.FromResult(new ModelContextInfo("fake", "fake-model", ContextWindow, MaxOutput, "test", null, 0, null));
 
         public void EndSession(string sessionKey) => sessions.TryRemove(sessionKey, out _);
+
+        /// <summary>Thrown by a handler to make the call fail as a provider outage would (a transient failure, not an answer).</summary>
+        public sealed class OutageException : Exception { }
 
         public int CountPurpose(string purpose) => Calls.Count(c => c.Purpose == purpose);
 
@@ -165,6 +176,9 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         public JobContext Job(string moduleId = "knowledge.deduction", string kind = "test", string? subject = null) =>
             new(new JobRecord(1, moduleId, kind, "person", subject, null, 100, Lane.LlmBackground, JobStates.Leased, 1, 5, 0, "test", null, null, null, null, null, null, Clock.NowMs, Clock.NowMs, null, null, null),
                 Clock, CancellationToken.None, _ => Task.FromResult(true));
+
+        /// <summary>The context a worker would hand a leased job.</summary>
+        public JobContext JobFor(JobRecord job) => new(job, Clock, CancellationToken.None, _ => Task.FromResult(true));
 
         public async ValueTask DisposeAsync()
         {

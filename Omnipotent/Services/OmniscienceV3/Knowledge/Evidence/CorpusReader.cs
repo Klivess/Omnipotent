@@ -134,15 +134,65 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                    ?? NamesOf(new[] { identityId }).OrderByDescending(n => n.ValidFromMs).Select(n => n.Value).FirstOrDefault();
         }
 
-        /// <summary>Persons whose names (any identity, any period) match <paramref name="name"/> case-insensitively.</summary>
+        /// <summary>
+        /// The people a name could mean: persons with a name (any identity, any period) that is the text, or that contains it as
+        /// whole words ("Sam" finds "Sam Carter" and "sam 🌙", never "Samantha"). People are usually asked about by a first name
+        /// or a part of their handle, so a whole-name match alone would find almost nobody. Whole-name matches come first, then
+        /// names that start with the words, then names that contain them; this is exact matching of what was typed against
+        /// what people were called, not a judgement of meaning.
+        /// </summary>
         public IReadOnlyList<(string PersonId, string Name, long ValidFromMs, long? ValidToMs)> FindByName(string name, int limit = 50)
         {
-            using var c = stores.Corpus.OpenRead();
-            return c.Query(null, """
-                SELECT i.person_id, n.value, n.valid_from_ms, n.valid_to_ms FROM identity_names n JOIN identities i ON i.identity_id=n.identity_id
-                WHERE n.value = $n COLLATE NOCASE LIMIT $l
-                """, r => (r.GetString(0), r.GetString(1), r.GetInt64(2), r.GetInt64OrNull(3)), ("$n", name.Trim()), ("$l", limit))
-                .Select(x => (Canonical(x.Item1), x.Item2, x.Item3, x.Item4)).ToList();
+            string needle = name.Trim();
+            var needleWords = NameWords(needle);
+            if (needle.Length == 0) return Array.Empty<(string, string, long, long?)>();
+            List<(string Person, string Value, long From, long? To)> rows;
+            using (var c = stores.Corpus.OpenRead())
+            {
+                // The substring test only narrows the rows; the word test below decides. Two letters are too few to search by part.
+                string like = "%" + needle.Replace(@"\", @"\\").Replace("%", @"\%").Replace("_", @"\_") + "%";
+                rows = c.Query(null, """
+                    SELECT i.person_id, n.value, n.valid_from_ms, n.valid_to_ms FROM identity_names n JOIN identities i ON i.identity_id=n.identity_id
+                    WHERE n.value = $n COLLATE NOCASE OR ($part = 1 AND n.value LIKE $like ESCAPE '\')
+                    ORDER BY n.valid_from_ms DESC LIMIT 5000
+                    """, r => (r.GetString(0), r.GetString(1), r.GetInt64(2), r.GetInt64OrNull(3)), ("$n", needle), ("$part", needle.Length >= 3 && needleWords.Count > 0 ? 1 : 0), ("$like", like));
+            }
+            return rows.Select(x => (Rank: NameRank(x.Value, needle, needleWords), Row: x)).Where(x => x.Rank < 3)
+                .OrderBy(x => x.Rank).ThenByDescending(x => x.Row.From)
+                .Select(x => (Canonical(x.Row.Person), x.Row.Value, x.Row.From, x.Row.To)).Take(limit).ToList();
+        }
+
+        /// <summary>0: the whole name; 1: the name starts with these words; 2: it contains them as whole words; 3: no match.</summary>
+        internal static int NameRank(string value, string needle, IReadOnlyList<string> needleWords)
+        {
+            if (string.Equals(value.Trim(), needle, StringComparison.OrdinalIgnoreCase)) return 0;
+            if (needleWords.Count == 0) return 3;
+            var words = NameWords(value);
+            for (int start = 0; start + needleWords.Count <= words.Count; start++)
+            {
+                bool all = true;
+                for (int k = 0; k < needleWords.Count && all; k++) all = string.Equals(words[start + k], needleWords[k], StringComparison.OrdinalIgnoreCase);
+                if (all) return start == 0 ? 1 : 2;
+            }
+            return 3;
+        }
+
+        /// <summary>The words of a name: runs of letters and digits (so "sam_carter99" is "sam", "carter99").</summary>
+        internal static List<string> NameWords(string text)
+        {
+            var words = new List<string>();
+            int from = -1;
+            for (int i = 0; i <= text.Length; i++)
+            {
+                bool inWord = i < text.Length && char.IsLetterOrDigit(text[i]);
+                if (inWord && from < 0) from = i;
+                else if (!inWord && from >= 0)
+                {
+                    words.Add(text[from..i]);
+                    from = -1;
+                }
+            }
+            return words;
         }
 
         // ── messages ─────────────────────────────────────────────────────────────

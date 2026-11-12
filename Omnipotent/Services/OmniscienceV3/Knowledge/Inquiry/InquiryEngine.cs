@@ -507,8 +507,13 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
             var passes = verified.Where(p => !p.Devil).ToList();
             var devil = verified.FirstOrDefault(p => p.Devil);
             var byId = g.Items.ToDictionary(i => i.Id, StringComparer.OrdinalIgnoreCase);
-            var citedFor = passes.SelectMany(p => p.Answer.EvidenceFor).GroupBy(x => x).OrderByDescending(x => x.Count()).Select(x => byId[x.Key]).ToList();
-            var citedAgainst = passes.SelectMany(p => p.Answer.EvidenceAgainst).GroupBy(x => x).OrderByDescending(x => x.Count()).Select(x => byId[x.Key]).ToList();
+            // Each pass cites what supports and what argues against its own answer. For a yes/no question the report's "for"
+            // means for yes, so a pass that answered no has its two lists swapped: otherwise passes that disagree would put
+            // evidence for both answers under "for".
+            bool yesNo = spec.AnswerType is InquiryAnswerType.Binary or InquiryAnswerType.Prediction;
+            bool Swapped(PassResult p) => yesNo && string.Equals(p.Answer.Answer?.Trim(), "no", StringComparison.OrdinalIgnoreCase);
+            var citedFor = passes.SelectMany(p => Swapped(p) ? p.Answer.EvidenceAgainst : p.Answer.EvidenceFor).GroupBy(x => x).OrderByDescending(x => x.Count()).Select(x => byId[x.Key]).ToList();
+            var citedAgainst = passes.SelectMany(p => Swapped(p) ? p.Answer.EvidenceFor : p.Answer.EvidenceAgainst).GroupBy(x => x).OrderByDescending(x => x.Count()).Select(x => byId[x.Key]).ToList();
             int strength = InquiryAggregation.Strength(citedFor.Concat(citedAgainst));
             int dropped = Math.Max(0, Math.Clamp(req.Passes, 1, 9) - passes.Count);
             string? devilStrength = devil?.Answer.Distribution?.Keys.FirstOrDefault();
