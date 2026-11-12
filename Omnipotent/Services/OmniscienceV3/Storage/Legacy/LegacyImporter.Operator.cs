@@ -57,6 +57,34 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 ? legacy.Connection.Query(null, "SELECT person_id, computed_at FROM target_suggestions WHERE dismissed=1", r => (Person: r.Text(0), At: r.Raw(1)))
                 : new List<(string? Person, object? At)>();
 
+            // Nothing Klives kept about a forgotten person comes back either.
+            if (ctx.Gone.Persons.Count > 0)
+            {
+                bool Named(string? json) => json != null && ctx.Gone.Persons.Any(json.Contains);
+                tracked.RemoveWhere(ctx.PersonForgotten);
+                pins.RemoveAll(x => ctx.PersonForgotten(x.Person));
+                workspaceNotes.RemoveAll(x => ctx.PersonForgotten(x.Row.Person));
+                // A watch scoped to them is dropped whole: without its scope it would watch everybody.
+                watchlists.RemoveAll(x => ctx.PersonForgotten(x.Row.Person));
+                savedQueries.RemoveAll(x => Named(x.Row.Json));
+                chats.RemoveAll(x => ctx.PersonForgotten(x.Row.Person));
+                feedback.RemoveAll(x => ctx.PersonForgotten(x.Row.Person));
+                links.RemoveAll(x => ctx.PersonForgotten(x.Row.A) || ctx.PersonForgotten(x.Row.B));
+                manualFacts.RemoveAll(x => ctx.PersonForgotten(x.Person));
+                dismissedTargets.RemoveAll(x => ctx.PersonForgotten(x.Person));
+            }
+
+            // Analysis switched off for someone (N20): what was removed for that is not imported again while it is off. The old
+            // database still says "tracked" and still holds the simulated chats; v3 decided otherwise.
+            var off = AnalysisOff.Load(stores);
+            if (off.Any)
+            {
+                tracked.RemoveWhere(off.Person);
+                pins.RemoveAll(x => off.Person(x.Person));
+                watchlists.RemoveAll(x => off.Person(x.Row.Person));
+                chats.RemoveAll(x => off.Person(x.Row.Person));
+            }
+
             long now = clock.NowMs;
             var tr = report.Table("operator");
             var counts = await stores.Operator.WriteAsync((c, tx) =>
@@ -68,6 +96,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 var pinned = pins.Where(p => p.Person.Length > 0).ToDictionary(p => p.Person, p => p.At, StringComparer.Ordinal);
                 foreach (var (id, person) in ctx.Persons)
                 {
+                    if (off.Person(id)) continue;
                     string tier = NullIfBlank(person.Tier) ?? (tracked.Contains(id) ? "tracked" : "archive");
                     if (tracked.Contains(id)) tier = "tracked";
                     bool isPinned = pinned.ContainsKey(id);

@@ -85,7 +85,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
                 }
                 finally
                 {
-                    SqliteConnection.ClearAllPools();
+                    // The snapshot was read through an unpooled connection, so its file is closed by now.
                     if (!Context.Settings.Get(KeepSnapshotSetting, false)) TryDelete(snapshot);
                 }
             }

@@ -64,6 +64,41 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Explore
         Task<ExploreRecordsPage> RecordsAsync(ExploreRecordsRequest request, Func<string, bool> mayReadPermission, CancellationToken ct);
     }
 
+    /// <summary>
+    /// How the Explore mirror carries a dataset a module declares in its manifest (plan D4 "self-describing": a new module's
+    /// data is filterable the day it ships). <see cref="Table"/> is the intel.db table or view whose columns are the
+    /// dataset's bound columns; <see cref="KeyColumn"/> identifies a record and <see cref="TimeColumn"/> orders records.
+    /// With <see cref="ChangeColumn"/> — a number that only grows when a row is written (a sequence, a version, an
+    /// updated-at) — the mirror follows the table incrementally. Without it the table is copied whole on every mirror
+    /// pass, which is always correct and suits tables of up to a few hundred thousand rows.
+    /// Column names must be plain identifiers (letters, digits, underscore).
+    /// </summary>
+    public sealed record ExploreSource(string DatasetId, string Table, string KeyColumn, string TimeColumn, string? ChangeColumn = null);
+
+    /// <summary>Implemented by a module whose declared datasets the Explore mirror should carry.</summary>
+    public interface IExploreSourceProvider
+    {
+        IReadOnlyList<ExploreSource> ExploreSources { get; }
+    }
+
+    /// <summary>The values of <see cref="ExploreColumn.Kind"/>: a requested measure, the time-bucket column (id
+    /// <c>@bucket</c>), or a group-by dimension named by its <see cref="DimensionKind"/>.</summary>
+    public static class ExploreColumnKinds
+    {
+        public const string Measure = "Measure";
+        public const string Bucket = "Bucket";
+        /// <summary>A group-by column of a time dimension (UTC epoch ms).</summary>
+        public const string Time = nameof(DimensionKind.Time);
+        public const string Entity = nameof(DimensionKind.Entity);
+        public const string Category = nameof(DimensionKind.Category);
+        public const string Number = nameof(DimensionKind.Number);
+        public const string Flag = nameof(DimensionKind.Flag);
+
+        /// <summary>The pseudo-dimension a drill narrows by to select one row of a bucketed result
+        /// (<c>{"dimension":"@bucket","op":"Eq","values":[the row's bucket value]}</c>).</summary>
+        public const string BucketDimension = "@bucket";
+    }
+
     /// <summary>Checks a query against the declared datasets before any engine sees it.</summary>
     public static class ExploreValidation
     {

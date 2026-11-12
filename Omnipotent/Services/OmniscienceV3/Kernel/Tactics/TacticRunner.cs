@@ -178,7 +178,7 @@ CREATE TABLE tactics_cursors(
         {
             var tactic = Find(tacticKey) ?? throw new KeyNotFoundException($"No tactic '{tacticKey}'.");
             var d = tactic.Descriptor;
-            string? problem = CheckShape(d, input) ?? tactic.Validate(input) ?? CheckMinors(d, input);
+            string? problem = CheckShape(d, input) ?? tactic.Validate(input) ?? CheckMinors(d, input) ?? CheckAnalysisOff(d, input);
             if (problem != null) throw new TacticRefusedException(problem);
 
             long now = Context.Clock.NowMs;
@@ -227,6 +227,19 @@ CREATE TABLE tactics_cursors(
             foreach (var s in input.Selections)
                 if (!d.Accepts.Contains(s.Kind))
                     return $"{d.Title} does not accept a {s.Kind} selection (accepts: {string.Join(", ", d.Accepts)}).";
+            return null;
+        }
+
+        /// <summary>Analysis switched off (N20): no tactic runs on a person Klives asked Omniscience to stop analysing.</summary>
+        private string? CheckAnalysisOff(TacticDescriptor d, TacticInput input)
+        {
+            var persons = input.Selections.Where(s => s.Kind == SelectionKind.Person).SelectMany(s => s.Items).ToList();
+            if (persons.Count == 0) return null;
+            var off = AnalysisOff.Load(Context.Stores);
+            if (!off.Any) return null;
+            foreach (var item in persons)
+                if (off.Person(item.Id) || off.Person(Context.Policy.Canonical(item.Id)))
+                    return $"{d.Title} is not available for {item.Label ?? item.Id}: analysis is switched off for them. It can be switched back on under Data controls.";
             return null;
         }
 

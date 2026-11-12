@@ -63,7 +63,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
         {
             tactics.Release.TrySetResult();
             await rt.DisposeAsync();
-            SqliteConnection.ClearAllPools();
             try { Directory.Delete(root, true); }
             catch (IOException) { /* lingering handle on Windows; unique temp dir */ }
         }
@@ -440,7 +439,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
             await Until(() => engine.GetRun(runId)?.State is "succeeded" or "failed");
             Assert.Equal("succeeded", engine.GetRun(runId)!.State);
             await single.DisposeAsync();
-            SqliteConnection.ClearAllPools();
             try { Directory.Delete(other, true); }
             catch (IOException) { /* lingering handle on Windows; unique temp dir */ }
         }

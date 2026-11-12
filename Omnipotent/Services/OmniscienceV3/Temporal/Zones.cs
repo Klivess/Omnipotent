@@ -125,6 +125,47 @@ namespace Omnipotent.Services.OmniscienceV3.Temporal
             return results;
         }
 
+        private static readonly ConcurrentDictionary<(string Zone, long From, long To), IReadOnlyList<(long FromMs, long OffsetMs)>> segmentCache = new();
+        private const long SegmentGridMs = 30L * 86_400_000;
+
+        /// <summary>
+        /// The UTC offset of <paramref name="zone"/> across [<paramref name="fromMs"/>, <paramref name="toMs"/>] as ordered
+        /// segments: each offset applies from its <c>FromMs</c> (the first is <see cref="long.MinValue"/>) until the next
+        /// segment begins. Lets a set-based engine convert instants to local wall-clock time with plain arithmetic, exactly
+        /// as <see cref="OffsetAt"/> would for each one (transitions are located to the second).
+        /// </summary>
+        public static IReadOnlyList<(long FromMs, long OffsetMs)> OffsetSegments(TimeZoneInfo zone, long fromMs, long toMs)
+        {
+            if (toMs < fromMs) (fromMs, toMs) = (toMs, fromMs);
+            // Snapped outwards to a coarse grid so a slowly growing range reuses its cached answer.
+            long from = Math.Max(0, fromMs) / SegmentGridMs * SegmentGridMs, to = (Math.Max(0, toMs) / SegmentGridMs + 1) * SegmentGridMs;
+            return segmentCache.GetOrAdd((zone.Id, from, to), key =>
+            {
+                long Offset(long sec) => (long)zone.GetUtcOffset(DateTimeOffset.FromUnixTimeSeconds(sec).UtcDateTime).TotalMilliseconds;
+                const long Step = 6 * 3600;
+                long at = key.From / 1000, end = key.To / 1000, offset = Offset(at);
+                var segments = new List<(long FromMs, long OffsetMs)> { (long.MinValue, offset) };
+                while (at < end)
+                {
+                    long next = Math.Min(end, at + Step), nextOffset = Offset(next);
+                    if (nextOffset != offset)
+                    {
+                        long lo = at, hi = next; // lo still has the old offset, hi already the new one
+                        while (hi - lo > 1)
+                        {
+                            long mid = lo + (hi - lo) / 2;
+                            if (Offset(mid) == offset) lo = mid; else hi = mid;
+                        }
+                        segments.Add((hi * 1000, nextOffset));
+                        offset = nextOffset;
+                    }
+                    at = next;
+                }
+                if (segmentCache.Count > 512) segmentCache.Clear();
+                return segments;
+            });
+        }
+
         /// <summary>Local calendar day of an instant.</summary>
         public static DateOnly LocalDate(long utcMs, TimeZoneInfo zone) => DateOnly.FromDateTime(ToLocal(utcMs, zone));
 

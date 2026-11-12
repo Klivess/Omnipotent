@@ -37,7 +37,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         public async Task DisposeAsync()
         {
             await stores.DisposeAsync();
-            SqliteConnection.ClearAllPools();
             try { Directory.Delete(root, true); }
             catch (IOException) { /* lingering handle on Windows; unique temp dir */ }
         }
@@ -194,7 +193,12 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
             return c.Scalar<T>(null, sql, args)!;
         }
 
-        private static string Hash(string path) => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path)));
+        /// <summary>Reads the file while SQLite may still hold it open (a test must not empty every connection pool of the process to read one file).</summary>
+        private static string Hash(string path)
+        {
+            using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+            return Convert.ToHexString(SHA256.HashData(file));
+        }
 
         // ── the full migration ───────────────────────────────────────────────────
 
@@ -202,10 +206,8 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         public async Task Snapshot_MigratesEveryTableFaithfully()
         {
             Seed();
-            SqliteConnection.ClearAllPools();
             string before = Hash(legacyPath);
             var report = await Run(LegacyImportMode.Snapshot);
-            SqliteConnection.ClearAllPools();
             Assert.Equal(before, Hash(legacyPath)); // v2's bytes are never changed
 
             // Messages: 7 imported + 1 recovered from the delete archive; the ghost-author one quarantined.
@@ -312,6 +314,132 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
             // The run is recorded.
             Assert.Equal(1, Corpus<long>("SELECT COUNT(*) FROM import_ledger WHERE format='omniscience-v2'"));
             Assert.True(Importer().SnapshotCompleted());
+        }
+
+        // ── forgotten people (N20) ───────────────────────────────────────────────
+
+        /// <summary>More v2 rows around Alice: a direct chat with Klives, a mention of her, a reaction of hers, a row of hers
+        /// that could not be mapped (and would be quarantined with its text), and a deleted message of hers kept by v2.</summary>
+        private void SeedAroundAlice()
+        {
+            using var c = Legacy();
+            using var tx = c.BeginTransaction();
+            void X(string sql, params (string, object?)[] args) => c.Exec(tx, sql, args);
+            void Msg(string pmid, string conv, string author, long sent, string content, string? raw = null) =>
+                X("INSERT INTO messages(message_id, platform, platform_message_id, conversation_id, author_identity_id, sent_at, content, raw_json, captured_at) VALUES($id,'discord',$pm,$c,$a,$s,$ct,$raw,$cap)",
+                    ("$id", "discord:" + (pmid.Length == 0 ? "x" + sent : pmid)), ("$pm", pmid), ("$c", conv), ("$a", author), ("$s", sent), ("$ct", content), ("$raw", raw), ("$cap", sent + 10_000));
+            X("INSERT INTO conversations(conversation_id, platform, kind, channel_id, first_seen, last_seen) VALUES('discord:650','discord','dm','650',$f,$l)", ("$f", T0 - Day), ("$l", T0));
+            X("INSERT INTO conversation_participants(conversation_id, identity_id) VALUES('discord:650','i-self'),('discord:650','i-alice')");
+            Msg(Snowflake(T0 + 20 * Minute, 1), "discord:650", "i-self", T0 + 20 * Minute, "private words for her");
+            Msg(Snowflake(T0 + 21 * Minute, 1), "discord:650", "i-alice", T0 + 21 * Minute, "her private answer");
+            string m9 = Snowflake(T0 + 22 * Minute, 1);
+            Msg(m9, "discord:500", "i-bob", T0 + 22 * Minute, "hey, are you there?",
+                """{"id":"@M","channel_id":"500","type":0,"author":{"id":"300"},"mentions":[{"id":"200","username":"alice"},{"id":"700"}]}""".Replace("@M", m9));
+            // No platform id: an unmappable row. Of anybody else it is quarantined with its text.
+            Msg("", "discord:500", "i-alice", T0 + 23 * Minute, "words that must not be set aside");
+            Msg(Snowflake(T0 + 24 * Minute, 1), "discord:500", "i-carol", T0 + 24 * Minute, "written under her other account");
+            X("INSERT INTO message_deletes(message_id, channel_id, author_identity_id, content, deleted_at) VALUES($m,'500','i-alice','what she deleted',$t)",
+                ("$m", "discord:" + Snowflake(T0 + 25 * Minute, 1)), ("$t", T0 + 26 * Minute));
+            X("INSERT INTO reaction_events(platform, platform_message_id, channel_id, reactor_platform_user_id, emoji, action, count, occurred_at) VALUES('discord',$m,'500','200','🎉','add',1,$t)", ("$m", M2), ("$t", T0 + 27 * Minute));
+            X("INSERT INTO typing_events(platform, platform_user_id, channel_id, started_at) VALUES('discord','100','650',$t)", ("$t", (T0 + 19 * Minute) / 1000 * 1000));
+            X("INSERT INTO ingest_cursors(source_id, conversation_id, earliest_message_id, latest_message_id, fully_backfilled, last_synced_at) VALUES('s1','discord:650','discord:1','discord:9',1,$t)", ("$t", T0));
+            X("INSERT INTO watchlists(watch_id, label, terms, person_id, enabled, notify, created_at) VALUES('w2','Her plans','plans','p-alice',1,1,$t)", ("$t", T0));
+            X("INSERT INTO workspace_saved_queries(query_id, name, query_json, created_at, updated_at, use_count) VALUES('q2','Her year',$j,$t,$t,1)", ("$j", "{\"person\":\"p-alice\"}"), ("$t", T0));
+            tx.Commit();
+        }
+
+        [Fact]
+        public async Task ForgottenPeople_AreNeverImportedAgain_NotEvenIntoQuarantine()
+        {
+            Seed();
+            SeedAroundAlice();
+            // Alice was forgotten in v3: her accounts, she and everyone merged into her, and her direct chat with Klives.
+            await stores.Operator.WriteAsync((c, tx) => Forgotten.Add(c, tx, new[] { "discord:200", "whatsapp:wa-alice", "discord:400" }, new[] { "p-alice" }, new[] { "discord:650" }, clock.NowMs));
+
+            var report = await Run(LegacyImportMode.Snapshot);
+
+            // Only what other people wrote is imported: Bob's two messages, the bot's, and Bob's message recovered from the delete archive.
+            Assert.Equal(4, Corpus<long>("SELECT COUNT(*) FROM messages"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM messages WHERE author_identity_id IN ('discord:200','whatsapp:wa-alice','discord:400') OR conversation_id='discord:650'"));
+            // She, the people merged into her (Carol, and Dave through Carol) and her accounts do not exist.
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM persons WHERE person_id IN ('p-alice','p-carol','p-dave')"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM person_canonical WHERE person_id IN ('p-alice','p-carol','p-dave') OR canonical_id='p-alice'"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM identities WHERE identity_id IN ('discord:200','whatsapp:wa-alice','discord:400')"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM identity_names WHERE identity_id='discord:200'"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM conversations WHERE conversation_id='discord:650'"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM ingest_cursors WHERE conversation_id='discord:650'"));
+            Assert.Equal("discord:300", Corpus<string>("SELECT group_concat(identity_id) FROM conversation_members WHERE conversation_id='discord:500'"));
+            // Bob's message that pinged her stays, without the record that it pinged her.
+            Assert.Equal("discord:700", Corpus<string>("SELECT group_concat(target_id) FROM message_mentions WHERE target_kind='user'"));
+            // Nobody's reactions to what she wrote, and none of hers; no events of hers; Klives typing in her chat is part of that chat.
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM reactions"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM reaction_counts"));
+            Assert.Equal("discord:999", Corpus<string>("SELECT group_concat(DISTINCT identity_id) FROM presence_events"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM typing_events"));
+            Assert.Equal("discord:300", Corpus<string>("SELECT group_concat(identity_id) FROM voice_sessions"));
+            // Her attachments are not imported and her files are not even looked at.
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM attachments") + Corpus<long>("SELECT COUNT(*) FROM cas_objects"));
+            Assert.Equal((0L, 0L), (report.MediaFilesFound, report.MediaFilesMissing));
+            // Nothing of hers was set aside either: a quarantined row keeps its text. The stranger's message still is.
+            Assert.Equal(1, Corpus<long>("SELECT COUNT(*) FROM quarantine WHERE origin LIKE 'legacy:messages:%'"));
+            Assert.Equal(0, report.Tables["reaction_events"].Quarantined + report.Tables["attachments"].Quarantined + report.Tables["presence_events"].Quarantined + report.Tables["typing_events"].Quarantined);
+            string[] hers =
+            {
+                "discord:200", "wa-alice", "discord:400", "p-alice", "p-carol", "p-dave", "must not be set aside", "her private answer", "private words for her", "what she deleted",
+                "other account", "summer message", "hello @bob",
+            };
+            using (var c = stores.Corpus.OpenRead())
+            {
+                foreach (string table in c.Query(null, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE 'messages_fts_%'", r => r.GetString(0)))
+                    foreach (string row in c.Query(null, $"SELECT * FROM \"{table}\"", r => string.Join("|", Enumerable.Range(0, r.FieldCount).Select(i => Convert.ToString(r.GetValue(i))))))
+                        Assert.True(!hers.Any(row.Contains), table + ": " + row);
+            }
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM change_log WHERE person_id IN ('p-alice','p-carol','p-dave')"));
+
+            // Nothing Klives kept about her comes back: tier and pin, note, the watch aimed at her, the saved view, the replica chat, his decisions.
+            Assert.Equal("p-bob", Operator<string>("SELECT group_concat(person_id) FROM person_settings"));
+            Assert.Equal("v2-note:n1", Operator<string>("SELECT group_concat(note_id) FROM notes"));
+            Assert.Equal("v2-watch:w1", Operator<string>("SELECT group_concat(watch_id) FROM watchlists"));
+            Assert.Equal("v2-query:q1", Operator<string>("SELECT group_concat(view_id) FROM saved_views"));
+            Assert.Equal(0, Operator<long>("SELECT COUNT(*) FROM replica_chats") + Operator<long>("SELECT COUNT(*) FROM replica_chat_messages") + Operator<long>("SELECT COUNT(*) FROM gold_labels"));
+            Assert.Equal(1, Operator<long>("SELECT COUNT(*) FROM dismissals WHERE kind='target.suggestion'"));
+
+            // The old database keeps running beside v3 and keeps seeing her: the tail does not bring her back either.
+            using (var c = Legacy())
+            {
+                void NewMessage(int n, string author, string text) =>
+                    c.Exec(null, "INSERT INTO messages(message_id, platform, platform_message_id, conversation_id, author_identity_id, sent_at, content, captured_at) VALUES($id,'discord',$pm,'discord:500',$a,$s,$ct,$s)",
+                        ("$id", "discord:" + Snowflake(T0 + Hour, n)), ("$pm", Snowflake(T0 + Hour, n)), ("$a", author), ("$s", T0 + Hour), ("$ct", text));
+                NewMessage(1, "i-alice", "a new message of hers");
+                NewMessage(2, "i-bob", "a new message of his");
+                c.Exec(null, "INSERT INTO presence_events(platform, platform_user_id, status, captured_at) VALUES('discord','200','online',$t)", ("$t", T0 + Hour));
+                // A new account v2 attached to her after she was forgotten.
+                c.Exec(null, "INSERT INTO platform_identities(identity_id, person_id, platform, platform_user_id, platform_username, first_seen, last_seen) VALUES('i-alice-new','p-alice','discord','250','alice2',$t,$t)", ("$t", T0 + Hour));
+                NewMessage(3, "i-alice-new", "from her new account");
+            }
+            var tail = await Run(LegacyImportMode.Tail);
+            Assert.Equal(1, tail.Tables["messages"].Imported);
+            Assert.Equal(5, Corpus<long>("SELECT COUNT(*) FROM messages"));
+            Assert.Equal(0, Corpus<long>("SELECT COUNT(*) FROM identities WHERE identity_id IN ('discord:200','discord:250')"));
+            Assert.Equal("discord:999", Corpus<string>("SELECT group_concat(DISTINCT identity_id) FROM presence_events"));
+            Assert.Equal(1, Corpus<long>("SELECT COUNT(*) FROM quarantine WHERE origin LIKE 'legacy:messages:%'"));
+        }
+
+        [Fact]
+        public async Task AnalysisOff_KeepsTheArchiveImported_ButNotWhatWasRemovedForIt()
+        {
+            Seed();
+            // Analysis is switched off for Alice in v3 (the lighter forget level): her messages keep arriving, but v2's "tracked"
+            // tier, its pin and its simulated chats with her are not put back.
+            await stores.Operator.WriteAsync((c, tx) => AnalysisOff.Set(c, tx, new[] { "p-alice" }, clock.NowMs));
+            await Run(LegacyImportMode.Snapshot);
+            Assert.Equal(8, Corpus<long>("SELECT COUNT(*) FROM messages"));
+            Assert.Equal(1, Corpus<long>("SELECT COUNT(*) FROM identities WHERE identity_id='discord:200'"));
+            Assert.Equal("p-bob", Operator<string>("SELECT group_concat(person_id) FROM person_settings"));
+            Assert.Equal(0, Operator<long>("SELECT COUNT(*) FROM replica_chats") + Operator<long>("SELECT COUNT(*) FROM replica_chat_messages"));
+            // His own notes and decisions about her are his, and stay.
+            Assert.Equal(2, Operator<long>("SELECT COUNT(*) FROM notes"));
+            Assert.Equal(3, Operator<long>("SELECT COUNT(*) FROM gold_labels"));
         }
 
         [Fact]
@@ -434,10 +562,8 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         public async Task Snapshot_CopiesTheLiveDatabaseWithoutTouchingIt()
         {
             Seed();
-            SqliteConnection.ClearAllPools();
             string before = Hash(legacyPath);
             string snap = await LegacyDatabase.SnapshotAsync(legacyPath, stores.Paths.LegacySnapshots, clock, default);
-            SqliteConnection.ClearAllPools();
             Assert.Equal(before, Hash(legacyPath));
             using var db = LegacyDatabase.OpenReadOnly(snap);
             Assert.Equal(8, db.Count("messages"));
@@ -449,7 +575,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Storage
         {
             Seed();
             await stores.DisposeAsync();
-            SqliteConnection.ClearAllPools();
             var logs = new System.Collections.Concurrent.ConcurrentQueue<string>();
             await using var rt = await Omnipotent.Services.OmniscienceV3.V3Runtime.StartAsync(new Omnipotent.Services.OmniscienceV3.V3RuntimeOptions
             {

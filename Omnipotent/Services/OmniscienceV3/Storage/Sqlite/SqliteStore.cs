@@ -77,10 +77,22 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
         public SqliteConnection OpenRead()
         {
             EnsureLive();
-            var conn = new SqliteConnection(readOnlyConnectionString);
-            conn.Open();
-            conn.Exec(null, "PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32768; PRAGMA mmap_size=268435456; PRAGMA busy_timeout=10000;");
-            return conn;
+            for (int attempt = 0; ; attempt++)
+            {
+                var conn = new SqliteConnection(readOnlyConnectionString);
+                try
+                {
+                    conn.Open();
+                    conn.Exec(null, "PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32768; PRAGMA mmap_size=268435456; PRAGMA busy_timeout=10000;");
+                    return conn;
+                }
+                catch (ObjectDisposedException) when (attempt < 3)
+                {
+                    // Something else in the process emptied every connection pool (SqliteConnection.ClearAllPools) at the very
+                    // moment this connection was handed out, and closed it under us. It is of no use: take another.
+                    conn.Dispose();
+                }
+            }
         }
 
         public Task<T> WriteAsync<T>(Func<SqliteConnection, SqliteTransaction, T> work, CancellationToken ct = default)

@@ -1,9 +1,252 @@
 // Generated from the C# contract types by TypeScriptContracts. Do not edit by hand.
 // Instants are UTC epoch milliseconds; durations are milliseconds.
 
+export interface AlertDto {
+  alertId: string;
+  kind: string;
+  ruleId?: string | null;
+  ruleName?: string | null;
+  reason: string;
+  messageId: string;
+  conversationId: string;
+  conversationTitle?: string | null;
+  guildId?: string | null;
+  platform: string;
+  personId?: string | null;
+  personName?: string | null;
+  occurredAtMs: number;
+  lastHitMs: number;
+  hitCount: number;
+  hits: AlertHitDto[];
+  probability?: number | null;
+  state: string;
+  delivery: string;
+  sourceDeletedAtMs?: number | null;
+  createdAtMs: number;
+  verdict?: string | null;
+}
+
+export interface AlertFeedbackDto {
+  alertId: string;
+  kind: string;
+  reason: string;
+  messageId: string;
+  verdict: AlertVerdict;
+}
+
+export interface AlertFeedbackRequest {
+  alertId: string;
+  verdict: AlertVerdict;
+  messageId?: string | null;
+  note?: string | null;
+}
+
+export interface AlertFeedbackResultDto {
+  feedback: AlertFeedbackDto;
+  classifierCorrected: boolean;
+}
+
+export interface AlertHitDto {
+  messageId: string;
+  conversationId: string;
+  atMs: number;
+  reason: string;
+  probability?: number | null;
+  personId?: string | null;
+  excerpt?: string | null;
+  deleted: boolean;
+}
+
+export interface AlertPageDto {
+  items: AlertDto[];
+  nextCursor?: string | null;
+  unseen: number;
+}
+
+export type AlertState = "New" | "Seen" | "Dismissed";
+
+export interface AlertStateRequest {
+  state: AlertState;
+  alertIds?: string[] | null;
+  all: boolean;
+  kind?: string | null;
+}
+
+export interface AlertStateResultDto {
+  changed: number;
+  unseen: number;
+}
+
+export type AlertVerdict = "Correct" | "Wrong";
+
+export interface AnalysisOffListDto {
+  people: AnalysisOffPersonDto[];
+}
+
+export interface AnalysisOffPersonDto {
+  personId: string;
+  name?: string | null;
+  sinceMs: number;
+}
+
+export interface AnalysisOnDto {
+  personId: string;
+  changed: boolean;
+}
+
+export interface AnalysisOnRequest {
+  personId: string;
+}
+
 export interface ApiError {
   code: string;
   message: string;
+}
+
+export interface BackupDto {
+  backupId: string;
+  createdAtMs: number;
+  trigger: string;
+  keyId: string;
+  files: BackupFileDto[];
+}
+
+export interface BackupFileDto {
+  store: string;
+  file: string;
+  plainBytes: number;
+  encryptedBytes: number;
+  sha256: string;
+}
+
+export interface BackupKeyDto {
+  keyId: string;
+  exported?: string | null;
+}
+
+export interface BackupKeyExportRequest {
+  passphrase: string;
+}
+
+export interface BackupKeyImportRequest {
+  exported: string;
+  passphrase: string;
+}
+
+export interface BackupListDto {
+  backups: BackupDto[];
+  keyId?: string | null;
+  keep: number;
+  enabled: boolean;
+}
+
+export interface BackupRequestedDto {
+  jobId: number;
+}
+
+export interface BackupRestoreRequest {
+  backupId: string;
+}
+
+export interface BridgeDto {
+  personId: string;
+  name?: string | null;
+  communityId: string;
+  bridgeTo: string;
+  outsideShare: number;
+}
+
+export interface BriefFactDto {
+  assertionId: string;
+  attribute: string;
+  value?: string | null;
+  status: string;
+  recordedAtMs: number;
+}
+
+export interface BriefMoodDto {
+  recent: Record<string, number>;
+  baseline: Record<string, number>;
+  recentAnswered: number;
+  baselineAnswered: number;
+}
+
+export interface BriefOpenThreadDto {
+  itemId: string;
+  kind: string;
+  messageId: string;
+  conversationId: string;
+  sentAtMs: number;
+}
+
+export interface BriefSectionDto {
+  key: string;
+  title: string;
+  points: CitedPoint[];
+}
+
+export interface BriefStyleDto {
+  messages: number;
+  averageWords: number;
+  averageCharacters: number;
+  replyShare: number;
+  directShare: number;
+  languages: string[];
+}
+
+export interface BundleDeleteRequest {
+  bundleId: string;
+}
+
+export interface BundleDeletedDto {
+  bundleId: string;
+  deleted: boolean;
+}
+
+export interface BundleDto {
+  bundleId: string;
+  title: string;
+  note?: string | null;
+  items: BundleItemDto[];
+  createdBy: string;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface BundleExportDto {
+  bundleId: string;
+  format: string;
+  fileName: string;
+  content: string;
+}
+
+export interface BundleItemDto {
+  kind: string;
+  id: string;
+  label?: string | null;
+}
+
+export interface BundleListDto {
+  bundles: BundleDto[];
+}
+
+export interface CitedPoint {
+  text: string;
+  refs: string[];
+}
+
+export interface ClassifyCorrectRequest {
+  messageId: string;
+  task: string;
+  label: string;
+  note?: string | null;
+}
+
+export interface ClassifyCorrectResultDto {
+  messageId: string;
+  task: string;
+  label: string;
+  queued: boolean;
 }
 
 export interface CohortDto {
@@ -17,6 +260,53 @@ export interface CohortDto {
 export interface CohortSelectionDto {
   cohort: CohortDto;
   selection: Selection;
+}
+
+export interface CommunitiesDto {
+  communities: CommunityDto[];
+  bridges: BridgeDto[];
+  people: number;
+  modularity: number;
+  asOfMs: number;
+  note: string;
+}
+
+export interface CommunityDto {
+  communityId: string;
+  size: number;
+  weight: number;
+  top: CommunityMemberDto[];
+}
+
+export interface CommunityMemberDto {
+  personId: string;
+  name?: string | null;
+  strength: number;
+}
+
+export interface ConceptDto {
+  conceptId: string;
+  name: string;
+  description?: string | null;
+  state: string;
+  headVersion?: number | null;
+  threshold?: number | null;
+  hits: number;
+  updatedAtMs: number;
+}
+
+export interface ConceptListDto {
+  concepts: ConceptDto[];
+}
+
+export interface CorpusTotalsDto {
+  messages: number;
+  people: number;
+  identities: number;
+  conversations: number;
+  guilds: number;
+  attachments: number;
+  sources: number;
 }
 
 export interface DatasetCatalogDto {
@@ -34,7 +324,118 @@ export interface DatasetDescriptor {
   minorFiltered: boolean;
 }
 
+export interface DayCountDto {
+  day: string;
+  msgs: number;
+  authored: number;
+}
+
 export type DayOfWeek = "Sunday" | "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday";
+
+export interface DigestDto {
+  digestId: string;
+  scopeKind: string;
+  scopeId?: string | null;
+  scopeTitle?: string | null;
+  fromMs: number;
+  toMs: number;
+  state: string;
+  trigger: string;
+  messages: number;
+  messagesRead: number;
+  conversations: number;
+  people: number;
+  nothingNew: boolean;
+  overall: CitedPoint[];
+  sections: DigestSectionDto[];
+  notable: string[];
+  newFacts: DigestFactDto[];
+  error?: string | null;
+  llmCalls: number;
+  createdAtMs: number;
+  finishedAtMs?: number | null;
+}
+
+export interface DigestFactDto {
+  assertionId: string;
+  personId: string;
+  personName?: string | null;
+  attribute: string;
+  value?: string | null;
+  recordedAtMs: number;
+}
+
+export interface DigestPageDto {
+  items: DigestDto[];
+  nextCursor?: string | null;
+}
+
+export interface DigestRunRequest {
+  scopeKind: string;
+  scopeId?: string | null;
+  fromMs?: number | null;
+  toMs?: number | null;
+}
+
+export interface DigestSectionDto {
+  kind: string;
+  id: string;
+  title: string;
+  messages: number;
+  people: number;
+  lastMessageMs: number;
+  points: CitedPoint[];
+  children: DigestSectionDto[];
+}
+
+export interface DigestSeenDto {
+  scopeKind: string;
+  scopeId?: string | null;
+  seen: boolean;
+}
+
+export interface DigestSeenRequest {
+  scopeKind: string;
+  scopeId?: string | null;
+  atMs?: number | null;
+}
+
+export interface DigestSubscriptionDeleteRequest {
+  subscriptionId: string;
+}
+
+export interface DigestSubscriptionDeletedDto {
+  subscriptionId: string;
+  deleted: boolean;
+}
+
+export interface DigestSubscriptionDto {
+  subscriptionId: string;
+  name: string;
+  scopeKind: string;
+  scopeId?: string | null;
+  cadence: string;
+  at: string;
+  weekday?: number | null;
+  enabled: boolean;
+  lastRunMs?: number | null;
+  createdAtMs: number;
+}
+
+export interface DigestSubscriptionListDto {
+  subscriptions: DigestSubscriptionDto[];
+}
+
+export interface DigestSubscriptionSaveRequest {
+  name: string;
+  scopeKind: string;
+  cadence: string;
+  at: string;
+  subscriptionId?: string | null;
+  scopeId?: string | null;
+  weekday?: number | null;
+  enabled: boolean;
+}
 
 export interface DimensionBinding {
   dimensionId: string;
@@ -50,6 +451,14 @@ export interface DimensionDefinition {
 }
 
 export type DimensionKind = "Time" | "Entity" | "Category" | "Number" | "Flag";
+
+export interface DirectoryPageDto {
+  items: PersonCardDto[];
+  nextCursor?: string | null;
+  asOfMs?: number | null;
+}
+
+export type DirectorySort = "LastSeen" | "Messages" | "Recent" | "Name";
 
 export interface DiscordBackfillRequest {
   channelId: string;
@@ -74,6 +483,73 @@ export interface DiscordBotStatusDto {
   apiRequests: number;
 }
 
+export interface DossierCoverageDto {
+  platforms: string[];
+  conversations: number;
+  guilds: number;
+  firstMs?: number | null;
+  lastMs?: number | null;
+}
+
+export interface DossierDto {
+  personId: string;
+  displayName: string;
+  isSelf: boolean;
+  tier: string;
+  pinned: boolean;
+  ageBand: string;
+  restricted: boolean;
+  names: NameSpanDto[];
+  identities: IdentitySummaryDto[];
+  activity: PersonActivityDto;
+  series: DayCountDto[];
+  hours?: number[] | null;
+  weekdays?: number[] | null;
+  zone?: ZoneReadingDto | null;
+  zoneHistory?: ZoneReadingDto[] | null;
+  labels: LabelMixDto;
+  languages: RankedCountDto[];
+  conversations: RankedCountDto[];
+  guilds: RankedCountDto[];
+  partners: PartnerSummaryDto[];
+  facts: DossierFactDto[];
+  coverage: DossierCoverageDto;
+  today: string;
+  newestEvidenceMs: number;
+  staleEvidence: boolean;
+  analysisOff: boolean;
+}
+
+export interface DossierFactDto {
+  assertionId: string;
+  attribute: string;
+  value?: string | null;
+  status: string;
+  probability?: number | null;
+  validFromEarliestMs?: number | null;
+  validFromLatestMs?: number | null;
+  validToEarliestMs?: number | null;
+  validToLatestMs?: number | null;
+  assertedAtMs?: number | null;
+  recordedAtMs: number;
+  modality?: string | null;
+  sourceKind?: string | null;
+}
+
+export interface EngineHealthDto {
+  modules: ModuleBacklogDto[];
+  stores: StoreSizeDto[];
+  jobsByState: Record<string, number>;
+  llmCallsHour: number;
+  llmFailuresHour: number;
+  llmCacheEfficiencyHour: number;
+  encoder?: unknown | null;
+  messageVectors: number;
+  rollupDirty: number;
+  corpusSeq: number;
+  problems: string[];
+}
+
 export interface ExploreColumn {
   id: string;
   title: string;
@@ -86,6 +562,35 @@ export interface ExploreCoverage {
   toMs?: number | null;
   records: number;
   sampled: boolean;
+}
+
+export interface ExploreExportRequest {
+  format: ExportFormat;
+  drillToken?: string | null;
+  query?: ExploreQuery | null;
+}
+
+export interface ExploreFacetDto {
+  dimension: string;
+  values: ExploreFacetValueDto[];
+}
+
+export interface ExploreFacetValueDto {
+  value: unknown;
+  count: number;
+}
+
+export interface ExploreFacetsDto {
+  dataset: string;
+  facets: ExploreFacetDto[];
+  asOfMs: number;
+}
+
+export interface ExploreFacetsRequest {
+  dataset: string;
+  filters: ExploreFilter[];
+  dimensions: string[];
+  limit: number;
 }
 
 export interface ExploreFilter {
@@ -132,7 +637,76 @@ export interface ExploreResult {
   explain: string;
 }
 
+export type ExportFormat = "Csv" | "Json" | "Parquet";
+
 export type FilterOp = "Eq" | "NotEq" | "In" | "NotIn" | "Between" | "Gte" | "Lte" | "Contains" | "IsNull" | "IsNotNull";
+
+export interface ForgetConfirmRequest {
+  personId: string;
+  confirmToken: string;
+}
+
+export interface ForgetPreviewDto {
+  personId: string;
+  name?: string | null;
+  persons: number;
+  identities: number;
+  messages: number;
+  directChatMessagesOfKlives: number;
+  directChats: number;
+  attachments: number;
+  mediaFiles: number;
+  mediaFilesLeft: number;
+  reactions: number;
+  events: number;
+  facts: number;
+  includeDirectChats: boolean;
+  level: string;
+  confirmToken: string;
+  expiresAtMs: number;
+  notes: string[];
+}
+
+export interface ForgetPreviewRequest {
+  personId: string;
+  includeDirectChats: boolean;
+  level: string;
+}
+
+export interface ForgetRunDto {
+  runId: string;
+  state: string;
+  counts: Record<string, number>;
+  error?: string | null;
+  startedAtMs: number;
+  finishedAtMs?: number | null;
+}
+
+export interface HealthIssueDto {
+  issueId: string;
+  kind: string;
+  subject?: string | null;
+  severity: string;
+  detail: unknown;
+  firstMs: number;
+  lastMs: number;
+  resolvedMs?: number | null;
+}
+
+export interface HealthListDto {
+  open: HealthIssueDto[];
+  resolved: HealthIssueDto[];
+  enabled: boolean;
+  checkedAtMs?: number | null;
+}
+
+export interface IdentitySummaryDto {
+  identityId: string;
+  platform: string;
+  kind: string;
+  firstSeenMs: number;
+  lastSeenMs: number;
+}
 
 export interface ImportFormatDto {
   id: string;
@@ -259,6 +833,52 @@ export interface ImportUploadedDto {
   previewJobId: number;
 }
 
+export type InboxAction = "Dismiss" | "Snooze" | "Reopen";
+
+export interface InboxItemDto {
+  itemId: string;
+  kind: string;
+  messageId: string;
+  conversationId: string;
+  conversationKind?: string | null;
+  conversationTitle?: string | null;
+  guildId?: string | null;
+  platform: string;
+  personId: string;
+  personName?: string | null;
+  sentAtMs: number;
+  waitingMs: number;
+  state: string;
+  reason: string;
+  probability?: number | null;
+  snoozedUntilMs?: number | null;
+  live: boolean;
+  excerpt?: string | null;
+  strength: number;
+  rank: number;
+}
+
+export interface InboxPageDto {
+  items: InboxItemDto[];
+  open: number;
+  asOfMs: number;
+}
+
+export interface InboxResolveRequest {
+  itemIds: string[];
+  action: InboxAction;
+  untilMs?: number | null;
+}
+
+export interface InboxResolveResultDto {
+  changed: number;
+  open: number;
+}
+
+export interface InsightsRefreshDto {
+  jobId: number;
+}
+
 export interface JobActionRequest {
   jobId: number;
 }
@@ -301,6 +921,13 @@ export interface JobRecord {
   runId?: string | null;
 }
 
+export interface LabelMixDto {
+  recent: Record<string, Record<string, number>>;
+  baseline: Record<string, Record<string, number>>;
+  recentAnswered: Record<string, number>;
+  labelset?: number | null;
+}
+
 export type Lane = "Cpu" | "Io" | "LlmBackground" | "LlmInteractive" | "Coordinator";
 
 export interface LaneJobsDto {
@@ -310,6 +937,68 @@ export interface LaneJobsDto {
   succeeded: number;
   dead: number;
   cancelled: number;
+}
+
+export interface LinkCountDto {
+  key: string;
+  label?: string | null;
+  shares: number;
+}
+
+export interface LinkDto {
+  urlId: string;
+  url: string;
+  host: string;
+  site: string;
+  provider?: string | null;
+  kind: string;
+  sensitive: boolean;
+  title?: string | null;
+  author?: string | null;
+  description?: string | null;
+  metaSource?: string | null;
+  metaAtMs?: number | null;
+  topic?: string | null;
+  summary?: string | null;
+  shares: number;
+  sharers: number;
+  firstSharedMs?: number | null;
+  lastSharedMs?: number | null;
+}
+
+export interface LinkSearchDto {
+  items: LinkShareDto[];
+  truncated: boolean;
+}
+
+export interface LinkShareDto {
+  messageId: string;
+  personId?: string | null;
+  personName?: string | null;
+  conversationId: string;
+  conversationTitle?: string | null;
+  guildId?: string | null;
+  atMs: number;
+  reactions: number;
+  link: LinkDto;
+}
+
+export interface LinkTrackDto {
+  target: string;
+  targetKind: string;
+  link?: LinkDto | null;
+  shares: number;
+  sharers: number;
+  reactions: number;
+  firstAtMs?: number | null;
+  lastAtMs?: number | null;
+  first?: LinkShareDto | null;
+  people: LinkCountDto[];
+  places: LinkCountDto[];
+  months: LinkCountDto[];
+  topLinks: LinkDto[];
+  items: LinkShareDto[];
+  truncated: boolean;
 }
 
 export interface LlmCallDto {
@@ -367,12 +1056,48 @@ export interface LlmSummaryRowDto {
   lastAtMs?: number | null;
 }
 
+export interface MapPointDto {
+  personId: string;
+  name?: string | null;
+  x: number;
+  y: number;
+  communityId?: string | null;
+  messages: number;
+}
+
 export interface MeasureDescriptor {
   id: string;
   title: string;
   aggregate: string;
   column?: string | null;
   unit: string;
+}
+
+export interface MessageLabelsDto {
+  messageId: string;
+  labelset: number;
+  itemVersion: number;
+  gate?: string | null;
+  labels: PackedLabelDto[];
+  asOfMs: number;
+}
+
+export interface MessageLabelsPageDto {
+  items: MessageLabelsDto[];
+  activeLabelset?: number | null;
+}
+
+export interface ModuleBacklogDto {
+  moduleId: string;
+  enabled: boolean;
+  watermark: number;
+  backlog: number;
+  dirty: number;
+  queued: number;
+  leased: number;
+  dead: number;
+  lastSucceededMs?: number | null;
+  lastError?: string | null;
 }
 
 export interface ModuleDto {
@@ -410,6 +1135,294 @@ export interface ModuleHealth {
   lastSucceededMs?: number | null;
   lastFailedMs?: number | null;
   lastError?: string | null;
+}
+
+export interface MonitorEventDto {
+  eventId: string;
+  kind: string;
+  ruleId?: string | null;
+  personId?: string | null;
+  personName?: string | null;
+  guildId?: string | null;
+  conversationId?: string | null;
+  atMs: number;
+  data: unknown;
+  notified: boolean;
+}
+
+export interface MonitorEventPageDto {
+  items: MonitorEventDto[];
+}
+
+export interface MonitorRuleChangedDto {
+  watchId: string;
+  changed: boolean;
+}
+
+export interface MonitorRuleDto {
+  watchId: string;
+  kind: string;
+  name: string;
+  enabled: boolean;
+  definition: unknown;
+  createdAtMs: number;
+  updatedAtMs: number;
+  fired30d: number;
+  lastFiredMs?: number | null;
+}
+
+export interface MonitorRuleEnabledRequest {
+  watchId: string;
+  enabled: boolean;
+}
+
+export interface MonitorRuleListDto {
+  rules: MonitorRuleDto[];
+}
+
+export interface MonitorRuleRequest {
+  watchId: string;
+}
+
+export interface NameSpanDto {
+  kind: string;
+  value: string;
+  platform: string;
+  fromMs: number;
+  toMs?: number | null;
+}
+
+export interface NoticeDto {
+  noticeId: string;
+  kind: string;
+  moduleId: string;
+  severity: string;
+  personId?: string | null;
+  personName?: string | null;
+  otherPersonId?: string | null;
+  otherPersonName?: string | null;
+  guildId?: string | null;
+  conversationId?: string | null;
+  occurredAtMs: number;
+  data: unknown;
+  state: string;
+  delivery: string;
+  createdAtMs: number;
+}
+
+export interface NoticePageDto {
+  items: NoticeDto[];
+  nextCursor?: string | null;
+  unseen: number;
+}
+
+export interface NoticeStateRequest {
+  state: AlertState;
+  noticeIds?: string[] | null;
+  all: boolean;
+  kind?: string | null;
+}
+
+export interface NoticeStateResultDto {
+  changed: number;
+  unseen: number;
+}
+
+export interface OverviewDayDto {
+  day: string;
+  msgs: number;
+  people: number;
+}
+
+export interface OverviewDto {
+  totals: CorpusTotalsDto;
+  series: OverviewDayDto[];
+  labels30: Record<string, Record<string, number>>;
+  topPeople30: RankedCountDto[];
+  topGuilds30: RankedCountDto[];
+  topConversations30: RankedCountDto[];
+  sources: SourceStatusDto[];
+  platforms: Record<string, number>;
+  firstMs?: number | null;
+  lastMs?: number | null;
+  labelset?: number | null;
+  today: string;
+  corpusSeq: number;
+}
+
+export interface PackedLabelDto {
+  task: string;
+  label: string;
+  probability: number;
+  abstained: boolean;
+}
+
+export interface PairDetailDto {
+  summary: PairSummaryDto;
+  weeks: PairWeekDto[];
+  events: PairEventDto[];
+  medianReplySecondsFromA?: number | null;
+  medianReplySecondsFromB?: number | null;
+  asOfMs: number;
+}
+
+export interface PairEventDto {
+  eventId: string;
+  a: string;
+  b: string;
+  kind: string;
+  week: string;
+  atMs: number;
+  data: unknown;
+}
+
+export interface PairSummaryDto {
+  a: string;
+  aName?: string | null;
+  b: string;
+  bName?: string | null;
+  interactions: number;
+  recent: number;
+  closeness: number;
+  previousCloseness: number;
+  reciprocity: number;
+  tension: number;
+  trend: string;
+  firstWeek: string;
+  lastWeek: string;
+}
+
+export interface PairWeekDto {
+  week: string;
+  fromA: number;
+  fromB: number;
+  conflict: number;
+  negative: number;
+  positive: number;
+  answered: number;
+  closeness: number;
+}
+
+export interface PartnerSummaryDto {
+  personId: string;
+  name: string;
+  repliesOut: number;
+  repliesIn: number;
+  mentionsOut: number;
+  mentionsIn: number;
+  dmOut: number;
+  dmIn: number;
+  reactionsOut: number;
+  reactionsIn: number;
+  activeDays: number;
+  reciprocity: number;
+  medianReplyBucketOut?: number | null;
+  medianReplyBucketIn?: number | null;
+}
+
+export interface PeopleMapDto {
+  points: MapPointDto[];
+  asOfMs?: number | null;
+  people: number;
+}
+
+export interface PersonActivityDto {
+  firstMs?: number | null;
+  lastMs?: number | null;
+  msgs: number;
+  msgs30: number;
+  msgs90: number;
+  msgs365: number;
+  activeDays: number;
+  activeDays30: number;
+  perActiveDay: number;
+  deleted: number;
+  edited: number;
+  replies: number;
+  attachments: number;
+  links: number;
+  dmShare: number;
+  reactionsGiven: number;
+  mentionsMade: number;
+}
+
+export interface PersonBriefDto {
+  personId: string;
+  name?: string | null;
+  state: string;
+  asOfMs?: number | null;
+  newestEvidenceMs?: number | null;
+  stale: boolean;
+  messages30d: number;
+  messagesPrevious30d: number;
+  activeDays30d: number;
+  messagesRead: number;
+  messagesInWindow: number;
+  sections: BriefSectionDto[];
+  mood?: BriefMoodDto | null;
+  style?: BriefStyleDto | null;
+  facts: BriefFactDto[];
+  openThreads: BriefOpenThreadDto[];
+  error?: string | null;
+  llmCalls: number;
+  requestedAtMs: number;
+  finishedAtMs?: number | null;
+}
+
+export interface PersonBriefRequest {
+  personId: string;
+}
+
+export interface PersonCardDto {
+  personId: string;
+  displayName: string;
+  isSelf: boolean;
+  tier: string;
+  pinned: boolean;
+  ageBand: string;
+  platforms: string[];
+  firstSeenMs?: number | null;
+  lastSeenMs?: number | null;
+  msgs: number;
+  msgs30: number;
+  msgs90: number;
+  topGuild?: string | null;
+  sentiment90?: Record<string, number> | null;
+}
+
+export interface PersonExportRequest {
+  personId: string;
+  format: string;
+}
+
+export interface PersonLinksDto {
+  personId: string;
+  name?: string | null;
+  days: number;
+  shares: number;
+  links: number;
+  kinds: LinkCountDto[];
+  providers: LinkCountDto[];
+  sites: LinkCountDto[];
+  topics: LinkCountDto[];
+  recent: LinkShareDto[];
+}
+
+export interface PersonRelationshipsDto {
+  personId: string;
+  name?: string | null;
+  communityId?: string | null;
+  bridgeTo?: string | null;
+  outsideShare?: number | null;
+  relationships: PairSummaryDto[];
+  events: PairEventDto[];
+  asOfMs: number;
+}
+
+export interface PersonTraitDto {
+  trait: string;
+  text: string;
+  z: number;
 }
 
 export interface Playbook {
@@ -485,6 +1498,12 @@ export interface PlaybookValidationDto {
   nextDueMs?: number | null;
 }
 
+export interface RankedCountDto {
+  id: string;
+  name: string;
+  count: number;
+}
+
 export interface ReadModelCatalogDto {
   models: ReadModelDescriptor[];
 }
@@ -516,7 +1535,27 @@ export interface RerunRequest {
   clearAsOf: boolean;
 }
 
+export interface RestoreDto {
+  backupId: string;
+  folder: string;
+  files: string[];
+  note: string;
+}
+
 export type RestrictedCapability = "FaceLabelling" | "Replica" | "PersonTargetedAlert" | "RoutineInference" | "IdentityFacts" | "TrackingSuggestion" | "ReplicaBasedTactic";
+
+export interface RetentionDto {
+  stream: string;
+  keptDays: number;
+  cutoffMs?: number | null;
+  deletedTotal: number;
+  lastDeleted: number;
+  lastRunMs?: number | null;
+}
+
+export interface RetentionListDto {
+  streams: RetentionDto[];
+}
 
 export interface RunActionRequest {
   runId: string;
@@ -532,6 +1571,28 @@ export interface ScheduleDto {
   name: string;
   dailyAtLocal?: string | null;
   everyMs?: number | null;
+}
+
+export interface ScopeCardDto {
+  id: string;
+  kind: string;
+  title: string;
+  platform?: string | null;
+  guildId?: string | null;
+  guildName?: string | null;
+  nameHistory: NameSpanDto[];
+  msgs: number;
+  msgs30: number;
+  msgs90: number;
+  firstMs?: number | null;
+  lastMs?: number | null;
+  series: DayCountDto[];
+  topPeople90: RankedCountDto[];
+  people90: number;
+  labels90: Record<string, Record<string, number>>;
+  channels?: RankedCountDto[] | null;
+  labelset?: number | null;
+  today: string;
 }
 
 export interface Selection {
@@ -584,7 +1645,185 @@ export interface SettingDto {
   updatedAtMs?: number | null;
 }
 
+export interface SharedTraitDto {
+  trait: string;
+  text: string;
+  mine: number;
+  theirs: number;
+}
+
+export interface SimilarPeopleDto {
+  personId: string;
+  name?: string | null;
+  messages: number;
+  asOfMs?: number | null;
+  traits: PersonTraitDto[];
+  people: SimilarPersonDto[];
+  note?: string | null;
+}
+
+export interface SimilarPersonDto {
+  personId: string;
+  name?: string | null;
+  similarity: number;
+  content: number;
+  tone: number;
+  style: number;
+  rhythm: number;
+  shared: SharedTraitDto[];
+  sharedPlaces: string[];
+  messages: number;
+  communityId?: string | null;
+}
+
 export type SortOrder = "ScoreDescending" | "ScoreAscending" | "Label" | "Id";
+
+export interface SourceStatusDto {
+  sourceId: string;
+  platform: string;
+  kind: string;
+  label?: string | null;
+  status: string;
+  detail?: string | null;
+  updatedAtMs: number;
+}
+
+export interface SpaceAboutKlivesDto {
+  messages: number;
+  previousMessages: number;
+  kinds: Record<string, number>;
+  sentiment: Record<string, number>;
+  sentimentAnswered: number;
+  people: SpaceTalkerDto[];
+}
+
+export interface SpaceCardDto {
+  scopeKind: string;
+  scopeId: string;
+  title?: string | null;
+  platform?: string | null;
+  messages: number;
+  previousMessages: number;
+  people: number;
+  aboutKlives: number;
+  lastMessageMs?: number | null;
+  computedAtMs: number;
+}
+
+export interface SpaceChannelDto {
+  conversationId: string;
+  title?: string | null;
+  messages: number;
+  people: number;
+}
+
+export interface SpaceCoverageDto {
+  channelsKnown: number;
+  channelsWithMessages: number;
+  channelsActive: number;
+  channelsFullyBackfilled: number;
+  firstMessageMs?: number | null;
+  lastMessageMs?: number | null;
+  note: string;
+}
+
+export interface SpaceDayDto {
+  day: string;
+  messages: number;
+  people: number;
+}
+
+export interface SpaceEventDto {
+  day: string;
+  kind: string;
+  value: number;
+  baseline: number;
+  text: string;
+}
+
+export interface SpaceFactionDto {
+  factionId: string;
+  size: number;
+  weight: number;
+  members: SpaceFactionMemberDto[];
+}
+
+export interface SpaceFactionMemberDto {
+  personId: string;
+  name?: string | null;
+  strength: number;
+}
+
+export interface SpaceListDto {
+  spaces: SpaceCardDto[];
+  windowDays: number;
+}
+
+export interface SpaceMemberDto {
+  personId: string;
+  name?: string | null;
+  messages: number;
+  share: number;
+  activeDays: number;
+  devotion?: number | null;
+}
+
+export interface SpacePageDto {
+  scopeKind: string;
+  scopeId: string;
+  title?: string | null;
+  platform?: string | null;
+  windowDays: number;
+  fromDay: string;
+  toDay: string;
+  asOfMs: number;
+  messages: number;
+  previousMessages: number;
+  people: number;
+  previousPeople: number;
+  days: SpaceDayDto[];
+  core: SpaceMemberDto[];
+  rising: SpaceRisingDto[];
+  tone: SpaceToneDto;
+  aboutKlives: SpaceAboutKlivesDto;
+  events: SpaceEventDto[];
+  factions: SpaceFactionDto[];
+  factionModularity?: number | null;
+  channels: SpaceChannelDto[];
+  coverage: SpaceCoverageDto;
+  peopleLeftOut: number;
+  latestDigestId?: string | null;
+}
+
+export interface SpaceRefreshRequest {
+  scopeKind: string;
+  scopeId: string;
+}
+
+export interface SpaceRisingDto {
+  personId: string;
+  name?: string | null;
+  recent: number;
+  earlier: number;
+  isNew: boolean;
+  everywhere: boolean;
+  firstDay?: string | null;
+}
+
+export interface SpaceTalkerDto {
+  personId: string;
+  name?: string | null;
+  messages: number;
+}
+
+export interface SpaceToneDto {
+  recent: Record<string, number>;
+  baseline: Record<string, number>;
+  recentAnswered: number;
+  baselineAnswered: number;
+  conflictRecent: number;
+  conflictBaseline: number;
+}
 
 export interface StoreHealthDto {
   name: string;
@@ -593,6 +1832,13 @@ export interface StoreHealthDto {
   pendingWrites: number;
   committedBatches: number;
   lastCommitMs: number;
+}
+
+export interface StoreSizeDto {
+  name: string;
+  fileBytes: number;
+  walBytes: number;
+  pendingWrites: number;
 }
 
 export interface StreamEventDto {
@@ -695,9 +1941,78 @@ export interface TacticRunStartedDto {
   runId: string;
 }
 
+export interface TaskCatalogDto {
+  tasks: TaskCatalogEntryDto[];
+}
+
+export interface TaskCatalogEntryDto {
+  id: string;
+  title: string;
+  question: string;
+  labels: string[];
+  defaultLabel?: string | null;
+  dimensionId?: string | null;
+  contextMatters: boolean;
+}
+
 export type TimeBucket = "None" | "Hour" | "Day" | "Week" | "Month" | "Quarter" | "Year" | "HourOfDay" | "DayOfWeek";
 
 export type TimeLens = "Klives" | "Subject" | "Utc";
+
+export interface TopicStatusDto {
+  watchId: string;
+  name: string;
+  last24h: number;
+  usualDay: number;
+  robustZ: number;
+  surging: boolean;
+  threshold: number;
+  days: number[];
+  recentMessageIds: string[];
+}
+
+export interface TranslateRequest {
+  messageIds: string[];
+}
+
+export interface TranslateStatusDto {
+  target: string;
+  auto: boolean;
+  queued: number;
+  stored: number;
+  usedThisHour: number;
+  perHour: number;
+}
+
+export interface TranslationDto {
+  messageId: string;
+  version: number;
+  original?: string | null;
+  translation?: string | null;
+  sourceLanguage?: string | null;
+  target: string;
+  state: string;
+  lossy: boolean;
+  note?: string | null;
+}
+
+export interface TranslationHitDto {
+  messageId: string;
+  sourceLanguage?: string | null;
+  snippet: string;
+}
+
+export interface TranslationSearchDto {
+  items: TranslationHitDto[];
+  target: string;
+}
+
+export interface TranslationsDto {
+  items: TranslationDto[];
+  target: string;
+  fromCache: number;
+  translated: number;
+}
 
 export type V3Phase = "Disabled" | "Starting" | "Ready" | "Failed" | "Stopping";
 
@@ -715,4 +2030,91 @@ export interface V3StatusDto {
   llm?: LlmStatusDto | null;
   stream?: StreamStatusDto | null;
   routes: string[];
+}
+
+export interface WatchDefinition {
+  text: string;
+  persons?: string[] | null;
+  conversations?: string[] | null;
+  guilds?: string[] | null;
+}
+
+export interface WatchDeleteRequest {
+  watchId: string;
+}
+
+export interface WatchDeletedDto {
+  watchId: string;
+  deleted: boolean;
+}
+
+export interface WatchEnabledRequest {
+  watchId: string;
+  enabled: boolean;
+}
+
+export interface WatchListDto {
+  rules: WatchRuleDto[];
+}
+
+export interface WatchRuleDto {
+  watchId: string;
+  name: string;
+  definition: WatchDefinition;
+  enabled: boolean;
+  state: string;
+  reason?: string | null;
+  threshold?: number | null;
+  checked: number;
+  matched: number;
+  lastMatchMs?: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface WatchSaveRequest {
+  name: string;
+  text: string;
+  watchId?: string | null;
+  persons?: string[] | null;
+  conversations?: string[] | null;
+  guilds?: string[] | null;
+  enabled: boolean;
+}
+
+export interface WellbeingListDto {
+  suggestions: WellbeingSuggestionDto[];
+  enabled: boolean;
+  asOfMs: number;
+}
+
+export interface WellbeingStateDto {
+  suggestionId: string;
+  state: string;
+}
+
+export interface WellbeingStateRequest {
+  suggestionId: string;
+  state: string;
+}
+
+export interface WellbeingSuggestionDto {
+  suggestionId: string;
+  personId: string;
+  personName?: string | null;
+  kind: string;
+  week: string;
+  state: string;
+  data: unknown;
+  resourceText?: string | null;
+  createdAtMs: number;
+}
+
+export interface ZoneReadingDto {
+  zone?: string | null;
+  offsetMinutes?: number | null;
+  confidence: number;
+  method: string;
+  month: string;
+  alternatives: string[];
 }

@@ -95,6 +95,8 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
     /// <item><b>Never aborts on a row:</b> a row that cannot be mapped is quarantined with its reason.</item>
     /// <item><b>Time:</b> see <see cref="LegacyTime"/>.</item>
     /// </list>
+    /// <para>A forgotten person (N20, <see cref="Forgotten"/>) is never imported again: their rows are skipped without a
+    /// trace, not quarantined (a quarantined row keeps its content).</para>
     /// Derived v2 data (facts, profiles, embeddings, statistics, replica dossiers) is not migrated: v3 re-derives it
     /// from the corpus. Everything Klives authored is (tiers, pins, notes, watchlists, saved queries, replica chats,
     /// review decisions, manual facts).
@@ -136,7 +138,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
             if (legacy.UserVersion is > 0 and < 10)
                 report.Notes.Add($"v2 schema version {legacy.UserVersion} predates the versions this importer was tested against (10–12); columns are probed per table.");
 
-            var ctx = new Context(mode);
+            var ctx = new Context(mode, Forgotten.Load(stores.Operator));
             await ImportSourcesAsync(legacy, ctx, report, ct).ConfigureAwait(false);
             await ImportPersonsAsync(legacy, ctx, report, ct).ConfigureAwait(false);
             await ImportIdentitiesAsync(legacy, ctx, report, progress, ct).ConfigureAwait(false);
@@ -175,9 +177,33 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Legacy
         /// <summary>What a run needs across tables: id maps built from v2's small tables.</summary>
         private sealed class Context
         {
-            public Context(LegacyImportMode mode) => Mode = mode;
+            public Context(LegacyImportMode mode, ForgottenSet gone)
+            {
+                Mode = mode;
+                Gone = gone;
+            }
 
             public LegacyImportMode Mode { get; }
+
+            /// <summary>Forgotten people (N20): nothing of theirs is imported, quarantined or logged, on any run.</summary>
+            public ForgottenSet Gone { get; }
+
+            /// <summary>v2 identity ids (GUIDs) of forgotten identities.</summary>
+            public HashSet<string> ForgottenIdentities { get; } = new(StringComparer.Ordinal);
+
+            /// <summary>The platform names exactly as v2 stored them (its indexes are keyed by that spelling).</summary>
+            public HashSet<string> PlatformSpellings { get; } = new(StringComparer.Ordinal);
+
+            /// <summary>v2 conversation ids of forgotten direct chats.</summary>
+            public HashSet<string> ForgottenConversations { get; } = new(StringComparer.Ordinal);
+
+            /// <summary>A person is forgotten when they are, or when the person they were merged into is.</summary>
+            public bool PersonForgotten(string? personId) =>
+                personId != null && Gone.Persons.Count > 0 && (Gone.Persons.Contains(personId) || (Canonical.TryGetValue(personId, out var root) && Gone.Persons.Contains(root)));
+
+            /// <summary>True when a v2 row by this v2 identity, or in this v2 conversation, belongs to a forgotten person.</summary>
+            public bool RowForgotten(string? legacyIdentityId, string? legacyConversationId) =>
+                (legacyIdentityId != null && ForgottenIdentities.Contains(legacyIdentityId)) || (legacyConversationId != null && ForgottenConversations.Contains(legacyConversationId));
 
             /// <summary>v2 identity id (a GUID) → v3 identity id, v2 person id, platform.</summary>
             public Dictionary<string, (string IdentityId, string PersonId, string Platform)> Identities { get; } = new(StringComparer.Ordinal);

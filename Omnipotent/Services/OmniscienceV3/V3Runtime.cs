@@ -21,6 +21,11 @@ namespace Omnipotent.Services.OmniscienceV3
         public KernelOptions Kernel { get; init; } = new();
         public IReadOnlyList<IIntelModule> Modules { get; init; } = Array.Empty<IIntelModule>();
         public TimeSpan? LockWait { get; init; }
+        /// <summary>A ready encoder (tests pass <see cref="Ml.Encoders.HashingTextEncoder"/>); wins over <see cref="EncoderFactory"/>.</summary>
+        public IEmbeddingEncoder? Encoder { get; init; }
+        /// <summary>Builds the shared encoder once the model store and settings exist (the service passes
+        /// <see cref="Ml.Encoders.SharedEncoder.Production"/>). With neither set, modules see no encoder and say so.</summary>
+        public Func<ModelHub, KernelSettings, IEmbeddingEncoder>? EncoderFactory { get; init; }
     }
 
     /// <summary>
@@ -30,10 +35,12 @@ namespace Omnipotent.Services.OmniscienceV3
     public sealed class V3Runtime : IAsyncDisposable
     {
         private readonly HttpClient modelDownloads;
+        /// <summary>Set when the runtime built the encoder itself (factory), so it also disposes it.</summary>
+        private readonly IDisposable? ownedEncoder;
         private int disposed;
 
         private V3Runtime(OmniscienceStores stores, ModuleHost host, OmniLlm llm, LlmBackgroundGate gate, LiveStreamHub stream, TacticRunner tactics,
-            HttpClient modelDownloads, IClock clock, long startedAtMs)
+            HttpClient modelDownloads, IClock clock, long startedAtMs, IDisposable? ownedEncoder)
         {
             Stores = stores;
             Host = host;
@@ -44,7 +51,14 @@ namespace Omnipotent.Services.OmniscienceV3
             this.modelDownloads = modelDownloads;
             Clock = clock;
             StartedAtMs = startedAtMs;
+            this.ownedEncoder = ownedEncoder;
         }
+
+        /// <summary>The shared text encoder, when this runtime has one.</summary>
+        public IEmbeddingEncoder? Encoder => Host.Services.Encoder;
+
+        /// <summary>vectors.db access.</summary>
+        public Ml.Vectors.VectorStore Vectors => Host.Services.Vectors!;
 
         public OmniscienceStores Stores { get; }
         public ModuleHost Host { get; }
@@ -65,13 +79,24 @@ namespace Omnipotent.Services.OmniscienceV3
             stage?.Invoke("Opening stores");
             var stores = await OmniscienceStores.OpenAsync(options.Paths, options.Clock, ct, options.LockWait).ConfigureAwait(false);
             ModuleHost? host = null;
+            IEmbeddingEncoder? encoder = null;
+            IDisposable? ownedEncoder = null;
             var http = new HttpClient { Timeout = TimeSpan.FromMinutes(30) };
             try
             {
                 var llm = new OmniLlm(options.LlmClient, stores.Intel, options.Clock, new TokenEstimator());
                 var gate = new LlmBackgroundGate(llm);
                 var models = new ModelHub(options.Paths.Models, http, options.Clock, options.Log);
-                host = new ModuleHost(stores, options.Clock, options.Kernel, options.Log, options.LogError, gate, new KernelServices { Llm = llm, Models = models });
+                var vectors = new Ml.Vectors.VectorStore(stores.Vectors, options.Clock);
+                await vectors.InitializeAsync(ct).ConfigureAwait(false);
+                encoder = options.Encoder;
+                if (encoder == null && options.EncoderFactory != null)
+                {
+                    encoder = options.EncoderFactory(models, new KernelSettings(stores.Operator, options.Clock));
+                    ownedEncoder = encoder as IDisposable;
+                }
+                host = new ModuleHost(stores, options.Clock, options.Kernel, options.Log, options.LogError, gate,
+                    new KernelServices { Llm = llm, Models = models, Encoder = encoder, Vectors = vectors });
                 var registered = host;
                 // The tactic runner is a core module: its catalogue is the kernel's tactics plus every module's.
                 var tactics = new TacticRunner(() => BuiltinTactics.All.Concat(registered.Modules.Where(m => m is not TacticRunner).SelectMany(m => m.Tactics)));
@@ -81,11 +106,12 @@ namespace Omnipotent.Services.OmniscienceV3
                 await host.StartAsync(ct).ConfigureAwait(false);
                 _ = tactics.Catalog(); // fail fast on duplicate tactic keys
                 var stream = new LiveStreamHub(host.Events, options.Clock, options.LogError);
-                return new V3Runtime(stores, host, llm, gate, stream, tactics, http, options.Clock, started);
+                return new V3Runtime(stores, host, llm, gate, stream, tactics, http, options.Clock, started, ownedEncoder);
             }
             catch
             {
                 if (host != null) await host.DisposeAsync().ConfigureAwait(false);
+                ownedEncoder?.Dispose();
                 await stores.DisposeAsync().ConfigureAwait(false);
                 http.Dispose();
                 throw;
@@ -97,11 +123,15 @@ namespace Omnipotent.Services.OmniscienceV3
             if (Interlocked.Exchange(ref disposed, 1) != 0) return;
             try
             {
-                // Workers release in-flight jobs (not counted as attempts) and the loop stops before the stores close.
+                // Workers release in-flight jobs (not counted as attempts) and the loop stops before the stores close; then
+                // the host disposes the modules that own resources (the Explore mirror's DuckDB connection, the Discord
+                // feed), once each, in reverse start order.
                 await Host.DisposeAsync().ConfigureAwait(false);
             }
             finally
             {
+                // After the kernel: no job can still be inside an encoder batch.
+                ownedEncoder?.Dispose();
                 await Stores.DisposeAsync().ConfigureAwait(false);
                 modelDownloads.Dispose();
             }
