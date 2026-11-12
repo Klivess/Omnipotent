@@ -110,7 +110,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
             return data.ToArray();
         }
 
-        private async Task<string> AttachAsync(string messageId, byte[] bytes, string filename, string? kind = null)
+        private async Task<string> AttachAsync(string messageId, byte[] bytes, string filename, string? kind = null, string author = "u-ada")
         {
             var stored = await store.PutAsync(new MemoryStream(bytes), null, 1 << 24);
             await stores.Corpus.WriteAsync((c, tx) =>
@@ -118,7 +118,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
                 using var w = new CorpusWriter(c, tx, Source, SourceKinds.Live, clock.NowMs);
                 w.Message(new IngestMessage
                 {
-                    PlatformMessageId = messageId, Conversation = new IngestConversation("testnet", "room", ConversationKinds.GroupDm), Author = new IngestIdentity("testnet", "u-ada"),
+                    PlatformMessageId = messageId, Conversation = new IngestConversation("testnet", "room", ConversationKinds.GroupDm), Author = new IngestIdentity("testnet", author),
                     SentAtMs = T0, OrderKey = T0, Attachments = new[] { new IngestAttachment(filename, MediaKind: kind) { Stored = stored } },
                 });
                 return w.Complete();
@@ -339,6 +339,78 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
                 });
                 await WaitForAsync(() => Labels().Any(l => l.Item == missed && l.Task == MediaTextTasks.Transcript));
                 Assert.Equal("hello there", Labels().Single(l => l.Item == missed).Signals.GetProperty("text").GetString());
+                Assert.Empty(errors);
+            }
+            finally
+            {
+                await rt.DisposeAsync();
+                stores = await OmniscienceStores.OpenAsync(new StorePaths(Path.Combine(root, "v3")), clock);
+            }
+        }
+
+        [Fact]
+        public async Task Sweep_QueuesTheBacklogOfTrackedPeopleFirst_AtAHigherPriority()
+        {
+            await stores.DisposeAsync(); // the runtime owns the stores in this test
+            var errors = new System.Collections.Concurrent.ConcurrentQueue<string>();
+            var module = new MediaTextModule(() => Task.FromResult<ITranscriber?>(speech), ocr, segmenter);
+            var rt = await V3Runtime.StartAsync(new V3RuntimeOptions
+            {
+                Paths = new StorePaths(Path.Combine(root, "v3")), Clock = clock, LlmClient = new NullLlm(), Log = _ => { },
+                LogError = (m, e) => errors.Enqueue(m + " " + e?.Message),
+                Kernel = new KernelOptions { StartWorkers = true, StartLoop = false },
+                Modules = new IIntelModule[] { new MediaModule(), module }, LockWait = TimeSpan.FromSeconds(5),
+            });
+            try
+            {
+                stores = rt.Stores;
+                store = new MediaStore(stores.Paths);
+
+                // Twelve old pictures from someone Klives does not track, then one from someone he does, last in attachment order.
+                for (int i = 1; i <= 12; i++) await AttachAsync($"a{i:00}", Picture(i), "p.png");
+                string theirs = await AttachAsync("z99", Picture(13), "t.png", author: "u-bo");
+                string bo;
+                using (var c = stores.Corpus.OpenRead()) bo = c.Scalar<string>(null, "SELECT person_id FROM identities WHERE platform_user_id='u-bo'")!;
+                await stores.Operator.WriteAsync((c, tx) => c.Exec(tx, "INSERT INTO person_settings(person_id, tier, minor_marked, pinned, updated_at_ms) VALUES($p, 'tracked', 0, 0, $n)",
+                    ("$p", bo), ("$n", clock.NowMs)));
+                await rt.Host.PumpChangesOnceAsync(); // consumed, nothing planned from it: only the sweep can find these
+                await rt.Host.Settings.SetAsync(MediaTextModule.SweepBatchSetting, 10, "test");
+
+                await rt.Host.Jobs.EnqueueAsync(new Omnipotent.Services.OmniscienceV3.Kernel.Jobs.JobRequest
+                {
+                    ModuleId = MediaTextModule.ModuleId, Kind = MediaTextModule.SweepKind, Lane = Omnipotent.Services.OmniscienceV3.Kernel.Jobs.Lane.Io, DedupeKey = "test-sweep",
+                });
+                List<(string Subject, int Priority)> Extracts()
+                {
+                    using var c = stores.Intel.OpenRead();
+                    return c.Query(null, "SELECT subject_id, priority FROM jobs WHERE module_id=$m AND kind=$k ORDER BY job_id",
+                        r => (r.GetString(0), r.GetInt32(1)), ("$m", MediaTextModule.ModuleId), ("$k", MediaTextModule.ExtractKind));
+                }
+                bool SweepDone()
+                {
+                    using var c = stores.Intel.OpenRead();
+                    return c.Scalar<long>(null, "SELECT COUNT(*) FROM jobs WHERE module_id=$m AND kind=$k AND state='succeeded'", ("$m", MediaTextModule.ModuleId), ("$k", MediaTextModule.SweepKind)) == 1;
+                }
+                await WaitForAsync(SweepDone);
+
+                // The budget of ten went to the tracked person's picture first, at the higher priority, then to the oldest nine others.
+                var queued = Extracts();
+                Assert.Equal(10, queued.Count);
+                Assert.Equal((theirs, MediaTextModule.TrackedPriority), queued[0]);
+                Assert.Equal(Enumerable.Range(1, 9).Select(i => $"testnet:a{i:00}#0"), queued.Skip(1).Select(q => q.Subject));
+                Assert.All(queued.Skip(1), q => Assert.Equal(MediaTextModule.BacklogPriority, q.Priority));
+                await WaitForAsync(() => Labels().Count(l => l.Task == MediaTextTasks.Ocr) == 10);
+
+                // The next sweep does not walk the tracked person's media again (nothing of theirs is left) and finishes the rest.
+                await rt.Host.Jobs.EnqueueAsync(new Omnipotent.Services.OmniscienceV3.Kernel.Jobs.JobRequest
+                {
+                    ModuleId = MediaTextModule.ModuleId, Kind = MediaTextModule.SweepKind, Lane = Omnipotent.Services.OmniscienceV3.Kernel.Jobs.Lane.Io, DedupeKey = "test-sweep-2",
+                });
+                // (A job that finishes between the sweep's label check and its enqueue may be queued twice; dedupe covers only
+                // queued and leased jobs, and the second read finds the cached text. So distinct subjects are counted.)
+                await WaitForAsync(() => Extracts().Select(q => q.Subject).Distinct().Count() == 13);
+                Assert.Equal(new[] { "testnet:a10#0", "testnet:a11#0", "testnet:a12#0" }, Extracts().Skip(10).Select(q => q.Subject).Distinct());
+                await WaitForAsync(() => Labels().Count(l => l.Task == MediaTextTasks.Ocr) == 13);
                 Assert.Empty(errors);
             }
             finally

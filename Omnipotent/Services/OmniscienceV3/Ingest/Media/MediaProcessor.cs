@@ -47,14 +47,21 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
         private readonly Func<MediaSettings> settings;
         private readonly Func<TimeZoneInfo> klivesZone;
         private readonly HttpClient http;
+        private readonly Func<IMediaLinkRefresher?> links;
+        private readonly IAvProbe? av;
 
-        public MediaProcessor(OmniscienceStores stores, IClock clock, MediaStore media, Func<MediaSettings> settings, Func<TimeZoneInfo> klivesZone, HttpMessageHandler? handler = null)
+        /// <param name="links">Asks the source platform for a fresh link when one has expired (F403); null result = none can.</param>
+        /// <param name="av">Reads the length and picture size of audio and video; null = not read.</param>
+        public MediaProcessor(OmniscienceStores stores, IClock clock, MediaStore media, Func<MediaSettings> settings, Func<TimeZoneInfo> klivesZone, HttpMessageHandler? handler = null,
+            Func<IMediaLinkRefresher?>? links = null, IAvProbe? av = null)
         {
+            this.av = av;
             this.stores = stores;
             this.clock = clock;
             this.media = media;
             this.settings = settings;
             this.klivesZone = klivesZone;
+            this.links = links ?? (() => null);
             // No automatic redirects: a redirect target has not been checked against the allow-list.
             http = handler != null
                 ? new HttpClient(handler, disposeHandler: false)
@@ -81,30 +88,57 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
         public async Task<DownloadOutcome> DownloadAsync(string attachmentId, CancellationToken ct)
         {
             var cfg = settings();
-            (bool Found, string State, string? Url, string Kind, string? Mime, int Attempts, string SourceKind, string? Person, string Conversation) row;
+            (bool Found, string State, string? Url, string Kind, string? Mime, int Attempts, string SourceKind, string? Person, string Conversation, string Platform,
+                string PlatformMessageId, string? PlatformAttachmentId, int Index) row;
             using (var c = stores.Corpus.OpenRead())
                 row = c.Query(null, """
-                    SELECT a.download_state, a.source_url, a.media_kind, a.mime, a.download_attempts, m.first_source_kind, pc.canonical_id, m.conversation_id
+                    SELECT a.download_state, a.source_url, a.media_kind, a.mime, a.download_attempts, m.first_source_kind, pc.canonical_id, m.conversation_id,
+                           m.platform, m.platform_message_id, a.platform_attachment_id, a.idx
                     FROM attachments a JOIN messages m ON m.message_id=a.message_id
                     LEFT JOIN identities i ON i.identity_id=m.author_identity_id LEFT JOIN person_canonical pc ON pc.person_id=i.person_id
                     WHERE a.attachment_id=$a
-                    """, r => (true, r.GetString(0), r.GetStringOrNull(1), r.GetString(2), r.GetStringOrNull(3), r.GetInt32(4), r.GetString(5), r.GetStringOrNull(6), r.GetString(7)),
+                    """, r => (true, r.GetString(0), r.GetStringOrNull(1), r.GetString(2), r.GetStringOrNull(3), r.GetInt32(4), r.GetString(5), r.GetStringOrNull(6), r.GetString(7),
+                        r.GetString(8), r.GetString(9), r.GetStringOrNull(10), r.GetInt32(11)),
                     ("$a", attachmentId)).FirstOrDefault();
             if (!row.Found) return new DownloadOutcome("missing", "no such attachment");
             if (row.State != DownloadStates.Pending) return new DownloadOutcome(row.State, "nothing to do");
 
             if (RefusalFor(row.Url, cfg.AllowedHosts) is { } refusal) return await FinishAsync(attachmentId, DownloadStates.Unavailable, refusal, ct).ConfigureAwait(false);
 
+            string url = row.Url!;
+            bool refreshed = false;
             HttpResponseMessage response;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(ct);
             timeout.CancelAfter(cfg.Timeout);
-            try
+            while (true)
             {
-                response = await http.GetAsync(row.Url, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
-            }
-            catch (Exception ex) when (ex is HttpRequestException or IOException || (ex is OperationCanceledException && !ct.IsCancellationRequested))
-            {
-                return await RetryOrFailAsync(attachmentId, row.Attempts, cfg, "the download did not complete: " + ex.Message, ct).ConfigureAwait(false);
+                try
+                {
+                    response = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead, timeout.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is HttpRequestException or IOException || (ex is OperationCanceledException && !ct.IsCancellationRequested))
+                {
+                    return await RetryOrFailAsync(attachmentId, row.Attempts, cfg, "the download did not complete: " + ex.Message, ct).ConfigureAwait(false);
+                }
+                int code = (int)response.StatusCode;
+                if (refreshed || code is not (401 or 403 or 404 or 410)) break;
+
+                // Platform media links are signed and expire (F403): the platform is asked once for a fresh link to the
+                // same file, which is recorded on the attachment so a later try starts from it.
+                response.Dispose();
+                string? fresh;
+                try
+                {
+                    fresh = await FreshLinkAsync(attachmentId, row.Platform, row.PlatformMessageId, row.Conversation, row.PlatformAttachmentId, row.Index, url, cfg, ct).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException || !ct.IsCancellationRequested)
+                {
+                    return await RetryOrFailAsync(attachmentId, row.Attempts, cfg, $"the link has expired (HTTP {code}), and asking for a fresh one failed: " + ex.Message, ct).ConfigureAwait(false);
+                }
+                if (fresh == null)
+                    return await FinishAsync(attachmentId, DownloadStates.Unavailable, $"the link has expired or was removed (HTTP {code})", ct).ConfigureAwait(false);
+                url = fresh;
+                refreshed = true;
             }
 
             using (response)
@@ -112,7 +146,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
                 int status = (int)response.StatusCode;
                 // Platform media links expire: the server answers 403 or 404 and always will for this link.
                 if (status is 401 or 403 or 404 or 410)
-                    return await FinishAsync(attachmentId, DownloadStates.Unavailable, $"the link has expired or was removed (HTTP {status})", ct).ConfigureAwait(false);
+                    return await FinishAsync(attachmentId, DownloadStates.Unavailable,
+                        refreshed ? $"the link had expired, and the fresh one was refused too (HTTP {status})" : $"the link has expired or was removed (HTTP {status})", ct).ConfigureAwait(false);
                 if (status is >= 300 and < 400)
                     return await FinishAsync(attachmentId, DownloadStates.Unavailable, $"the link redirects elsewhere (HTTP {status}), which is not followed", ct).ConfigureAwait(false);
                 if (!response.IsSuccessStatusCode)
@@ -151,6 +186,20 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
                 }, ct).ConfigureAwait(false);
                 return new DownloadOutcome(DownloadStates.Done, stored.Sha256);
             }
+        }
+
+        /// <summary>A fresh link for an expired one from the source platform, recorded on the attachment; null when there is none.</summary>
+        private async Task<string?> FreshLinkAsync(string attachmentId, string platform, string platformMessageId, string conversationId, string? platformAttachmentId, int index,
+            string expired, MediaSettings cfg, CancellationToken ct)
+        {
+            if (links() is not { } source) return null;
+            string? fresh = await source.RefreshAsync(new MediaLinkRequest(attachmentId, platform, platformMessageId, CorpusIds.Native(conversationId), platformAttachmentId, index, expired), ct)
+                .ConfigureAwait(false);
+            // Only a different link that passes the same checks as any other: a platform cannot point a download elsewhere.
+            if (string.IsNullOrWhiteSpace(fresh) || fresh == expired || RefusalFor(fresh, cfg.AllowedHosts) != null) return null;
+            await stores.Corpus.WriteAsync((c, tx) => c.Exec(tx, "UPDATE attachments SET source_url=$u WHERE attachment_id=$a AND download_state='pending'",
+                ("$u", fresh), ("$a", attachmentId)), ct).ConfigureAwait(false);
+            return fresh;
         }
 
         private async Task<DownloadOutcome> FinishAsync(string attachmentId, string state, string reason, CancellationToken ct)
@@ -200,6 +249,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
 
             // The kind is what the bytes are, not what the attachment was labelled.
             if (cas.Mime != null && cas.Mime.StartsWith("image/", StringComparison.Ordinal)) kind = MediaKinds.Image;
+            if (kind is MediaKinds.Audio or MediaKinds.Voice or MediaKinds.Video && av != null) return await ProbeAvAsync(sha256, kind, cas, path, now, sourceSeq, ct).ConfigureAwait(false);
             if (kind != MediaKinds.Image)
             {
                 await RecordAsync(sha256, kind, cas, null, MediaObjectStates.Ok, null, null, now, sourceSeq, ct).ConfigureAwait(false);
@@ -234,6 +284,39 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
                     """, ("$w", facts.Width), ("$h", facts.Height), ("$t", takenMs), ("$q", takenMs == null ? null : (int)takenQuality), ("$s", sha256));
             }, ct).ConfigureAwait(false);
             await RecordAsync(sha256, kind, cas, facts, MediaObjectStates.Ok, null, thumb.Sha256, now, sourceSeq, ct).ConfigureAwait(false);
+            return MediaObjectStates.Ok;
+        }
+
+        /// <summary>
+        /// Audio and video: their length and picture size, read with ffprobe, fill what the platform did not say. A file
+        /// ffprobe cannot read is marked unsupported, not damaged (it is still offered to transcription, which decides).
+        /// Without ffprobe installed nothing is recorded, so a later probe can still read it.
+        /// </summary>
+        private async Task<string> ProbeAvAsync(string sha256, string kind, (bool Found, string Path, long Size, string? Mime) cas, string path, long now, long sourceSeq, CancellationToken ct)
+        {
+            AvFacts? facts;
+            try
+            {
+                facts = await av!.ProbeAsync(path, ct).ConfigureAwait(false);
+            }
+            catch (ImageUnreadableException ex)
+            {
+                await RecordAsync(sha256, kind, cas, null, MediaObjectStates.Unsupported, ex.Message, null, now, sourceSeq, ct).ConfigureAwait(false);
+                return MediaObjectStates.Unsupported;
+            }
+            if (facts == null) return "not read";
+            // A "video" with no picture is sound (a voice clip sent as a video file), and is kept as the kind it was given.
+            await stores.Corpus.WriteAsync((c, tx) => c.Exec(tx, """
+                UPDATE attachments SET duration_ms=COALESCE(duration_ms,$d), width=COALESCE(width,$w), height=COALESCE(height,$h) WHERE cas_sha256=$s
+                """, ("$d", facts.DurationMs), ("$w", facts.Width), ("$h", facts.Height), ("$s", sha256)), ct).ConfigureAwait(false);
+            await stores.Intel.WriteAsync((c, tx) => c.Exec(tx, """
+                INSERT INTO media_objects(sha256, media_kind, mime, size_bytes, width, height, frames, orientation, phash, taken_local, taken_offset_min,
+                    thumb_sha256, state, error, probed_at_ms, source_seq)
+                VALUES($s,$k,$m,$n,$w,$h,NULL,NULL,NULL,NULL,NULL,NULL,'ok',NULL,$t,$seq)
+                ON CONFLICT(sha256) DO UPDATE SET media_kind=excluded.media_kind, width=excluded.width, height=excluded.height, state='ok', error=NULL,
+                    probed_at_ms=excluded.probed_at_ms, source_seq=excluded.source_seq
+                """, ("$s", sha256), ("$k", kind), ("$m", cas.Mime), ("$n", cas.Size), ("$w", facts.Width), ("$h", facts.Height), ("$t", now), ("$seq", sourceSeq)), ct)
+                .ConfigureAwait(false);
             return MediaObjectStates.Ok;
         }
 

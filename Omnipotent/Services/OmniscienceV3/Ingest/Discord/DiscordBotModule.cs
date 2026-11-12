@@ -125,6 +125,14 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
 
         private IDiscordBotApi Api { get; set; } = null!;
 
+        private DiscordLinkRefresher? links;
+
+        /// <summary>
+        /// Fresh links for expired Discord attachment links (F403), for the media store. Only while Discord capture is
+        /// switched on and the token is accepted, so shadow mode sends Discord nothing; null before the module starts.
+        /// </summary>
+        public Media.IMediaLinkRefresher? LinkRefresher => links != null && Enabled && !unauthorised ? links : null;
+
         private static IngestSource Source { get; } = new(SourceId, DiscordPayload.Platform, "bot", "KliveBot", IngestSource.PlatformRank);
 
         private static IngestSource RelaySource { get; } = new(RelaySourceId, DiscordPayload.Platform, "bot", "KliveBot (as relayed)", IngestSource.RelayedRank);
@@ -141,6 +149,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Discord
         {
             base.InitializeAsync(context, ct);
             Api = fixedApi ?? (ownedApi = new DiscordBotApi(token, context.Clock));
+            links = new DiscordLinkRefresher(Api);
             History = new DiscordHistory(context.Stores, context.Clock, Api, () => Source, Reader,
                 () => TimeSpan.FromSeconds(Math.Clamp(Context.Settings.Get(LiveWindowSetting, 300), 30, 3600)));
             // The one long-lived loop of the module: owned here, stopped and awaited in DisposeAsync.

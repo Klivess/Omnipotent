@@ -115,22 +115,27 @@ namespace Omnipotent.Services.OmniscienceV3
         }
 
         /// <summary>The modules this build runs. Workstreams add theirs here.</summary>
-        private IReadOnlyList<IIntelModule> BuildModules() => new IIntelModule[]
+        private IReadOnlyList<IIntelModule> BuildModules()
         {
-            // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
-            new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
-            new Ingest.Imports.ImportModule(),
-            new Ingest.Media.MediaModule(),
-            // Speech-to-text comes from KliveLLM's AIRouter audio client, resolved when a transcript is first needed.
-            new Ingest.Media.MediaTextModule(async () =>
-                await ResolveKliveLlmAsync().ConfigureAwait(false) is { } llm ? new Ingest.Media.AiRouterTranscriber(llm.Audio) : null),
             // Discord through the connection the KliveBot service already holds; v3 opens none of its own. Off until cutover.
-            new Ingest.Discord.DiscordBotModule(
+            var discord = new Ingest.Discord.DiscordBotModule(
                 new Ingest.Discord.KliveBotFeed(() => GetActiveServices().OfType<KliveBot_Discord.KliveBotDiscord>().FirstOrDefault()?.Client,
                     Omnipotent.Data_Handling.OmniPaths.KlivesDiscordAccountID.ToString(System.Globalization.CultureInfo.InvariantCulture)),
                 ReadKliveBotTokenAsync,
-                Omnipotent.Data_Handling.OmniPaths.KlivesDiscordAccountID.ToString(System.Globalization.CultureInfo.InvariantCulture)),
-        };
+                Omnipotent.Data_Handling.OmniPaths.KlivesDiscordAccountID.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            return new IIntelModule[]
+            {
+                // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
+                new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
+                new Ingest.Imports.ImportModule(),
+                // An expired Discord link is refreshed through the bot API, only once Discord capture is switched on (F403).
+                new Ingest.Media.MediaModule(links: () => discord.LinkRefresher),
+                // Speech-to-text comes from KliveLLM's AIRouter audio client, resolved when a transcript is first needed.
+                new Ingest.Media.MediaTextModule(async () =>
+                    await ResolveKliveLlmAsync().ConfigureAwait(false) is { } llm ? new Ingest.Media.AiRouterTranscriber(llm.Audio) : null),
+                discord,
+            };
+        }
 
         /// <summary>KliveBot's token, read from where the bot service keeps it, for requests to Discord's bot API only.</summary>
         private async Task<string?> ReadKliveBotTokenAsync() =>

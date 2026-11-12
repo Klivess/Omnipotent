@@ -3,6 +3,7 @@ using System.Text;
 using Microsoft.Data.Sqlite;
 using Omnipotent.Services.OmniscienceV3;
 using Omnipotent.Services.OmniscienceV3.Ingest;
+using Omnipotent.Services.OmniscienceV3.Ingest.Discord;
 using Omnipotent.Services.OmniscienceV3.Ingest.Imports;
 using Omnipotent.Services.OmniscienceV3.Ingest.Media;
 using Omnipotent.Services.OmniscienceV3.Kernel;
@@ -311,6 +312,48 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
             Assert.Equal("missing", await processor.ProbeAsync(new string('0', 64), 1, default));
         }
 
+        private sealed class FakeAv : IAvProbe
+        {
+            public AvFacts? Facts { get; set; } = new(61_500, 1280, 720, HasAudio: true, HasVideo: true);
+            public bool Unreadable { get; set; }
+            public int Calls { get; private set; }
+
+            public Task<AvFacts?> ProbeAsync(string path, CancellationToken ct)
+            {
+                Calls++;
+                if (Unreadable) throw new ImageUnreadableException("ffprobe could not read the file: synthetic", unsupported: true);
+                return Task.FromResult(Facts);
+            }
+        }
+
+        [Fact]
+        public async Task Probe_ReadsTheLengthAndSizeOfVideo_OncePerContent_AndLeavesWhatItCannotRead()
+        {
+            var av = new FakeAv();
+            var processor = new MediaProcessor(stores, clock, store, () => new MediaSettings(), () => Zones.GetOrThrow("Europe/London"), av: av);
+
+            string clip = await AttachAsync("v1", Encoding.ASCII.GetBytes("synthetic video bytes"), "clip.mp4");
+            Assert.Equal(MediaObjectStates.Ok, await processor.ProbeAsync(clip, 3, default));
+            Assert.Equal(61_500L, One<long>(stores.Corpus, "SELECT duration_ms FROM attachments WHERE attachment_id='testnet:v1#0'"));
+            Assert.Equal(1280L, One<long>(stores.Corpus, "SELECT width FROM attachments WHERE attachment_id='testnet:v1#0'"));
+            Assert.Equal(720L, One<long>(stores.Intel, "SELECT height FROM media_objects WHERE sha256=$s", ("$s", clip)));
+            Assert.Equal(MediaObjectStates.Ok, await processor.ProbeAsync(clip, 4, default));
+            Assert.Equal(1, av.Calls); // once per distinct content
+
+            // ffprobe cannot make sense of it: unsupported, not quarantined (transcription may still read its sound).
+            av.Unreadable = true;
+            string odd = await AttachAsync("v2", Encoding.ASCII.GetBytes("other synthetic video"), "odd.mov");
+            Assert.Equal(MediaObjectStates.Unsupported, await processor.ProbeAsync(odd, 5, default));
+            Assert.Equal(DownloadStates.Done, One<string>(stores.Corpus, "SELECT download_state FROM attachments WHERE attachment_id='testnet:v2#0'"));
+
+            // No ffprobe installed: nothing is recorded, so a later probe can still read it.
+            av.Unreadable = false;
+            av.Facts = null;
+            string later = await AttachAsync("v3", Encoding.ASCII.GetBytes("third synthetic video"), "later.mp4");
+            Assert.Equal("not read", await processor.ProbeAsync(later, 6, default));
+            Assert.Equal(0L, One<long>(stores.Intel, "SELECT COUNT(*) FROM media_objects WHERE sha256=$s", ("$s", later)));
+        }
+
         // ── downloading ──────────────────────────────────────────────────────────
 
         private sealed class FakeNet : HttpMessageHandler
@@ -397,6 +440,98 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
             Assert.NotNull(MediaProcessor.RefusalFor("file:///etc/passwd", hosts));
             Assert.NotNull(MediaProcessor.RefusalFor("https://127.0.0.1/a.png", hosts));
             Assert.NotNull(MediaProcessor.RefusalFor(null, hosts));
+        }
+
+        private sealed class FakeLinks : IMediaLinkRefresher
+        {
+            public List<MediaLinkRequest> Asked { get; } = new();
+            public Func<MediaLinkRequest, string?> Answer { get; set; } = _ => null;
+            public Exception? Fails { get; set; }
+
+            public Task<string?> RefreshAsync(MediaLinkRequest request, CancellationToken ct)
+            {
+                Asked.Add(request);
+                if (Fails != null) throw Fails;
+                return Task.FromResult(Answer(request));
+            }
+        }
+
+        [Fact]
+        public async Task Download_AnExpiredLink_IsRefreshedOnceThroughItsSource_AndTheFreshLinkIsKept()
+        {
+            using var picture = Pattern(32, 32, seed: 5);
+            byte[] png = Encode(picture, SKEncodedImageFormat.Png);
+            const string expired = "https://cdn.discordapp.com/attachments/111/222/cat.png?ex=old";
+            const string fresh = "https://cdn.discordapp.com/attachments/111/222/cat.png?ex=new";
+            var net = new FakeNet { Respond = r => r.RequestUri!.ToString() == fresh ? Bytes(png) : new HttpResponseMessage(HttpStatusCode.NotFound) };
+            var links = new FakeLinks { Answer = _ => fresh };
+            var processor = new MediaProcessor(stores, clock, store, () => new MediaSettings(), () => Zones.GetOrThrow("Europe/London"), net, () => links);
+
+            // Expired, refreshed, fetched; the fresh link is kept on the attachment.
+            await PendingAsync("m1", expired);
+            Assert.Equal(DownloadStates.Done, (await processor.DownloadAsync("testnet:m1#0", default)).State);
+            Assert.Equal(new[] { expired, fresh }, net.Requests);
+            var asked = Assert.Single(links.Asked);
+            Assert.Equal(("testnet", "m1", "room", 0, expired), (asked.Platform, asked.PlatformMessageId, asked.PlatformConversationId, asked.Index, asked.ExpiredUrl));
+            Assert.Equal(fresh, One<string>(stores.Corpus, "SELECT source_url FROM attachments WHERE attachment_id='testnet:m1#0'"));
+
+            // The platform has no fresh link (the message is gone): unavailable.
+            await PendingAsync("gone", "https://cdn.discordapp.com/attachments/111/333/gone.png?ex=old");
+            links.Answer = _ => null;
+            Assert.Equal(DownloadStates.Unavailable, (await processor.DownloadAsync("testnet:gone#0", default)).State);
+            Assert.Contains("expired", Attachment("gone").Error);
+
+            // A "fresh" link to another host is never requested: the allow-list holds for refreshed links too.
+            await PendingAsync("elsewhere", "https://cdn.discordapp.com/attachments/111/444/x.png?ex=old");
+            links.Answer = _ => "https://files.example.invalid/x.png";
+            Assert.Equal(DownloadStates.Unavailable, (await processor.DownloadAsync("testnet:elsewhere#0", default)).State);
+            Assert.DoesNotContain(net.Requests, r => r.Contains("example.invalid"));
+
+            // The fresh link refused as well: unavailable, and the platform is asked only once per download.
+            await PendingAsync("twice", "https://cdn.discordapp.com/attachments/111/555/y.png?ex=old");
+            links.Answer = _ => "https://cdn.discordapp.com/attachments/111/555/y.png?ex=also-old";
+            int before = links.Asked.Count;
+            Assert.Equal(DownloadStates.Unavailable, (await processor.DownloadAsync("testnet:twice#0", default)).State);
+            Assert.Equal(before + 1, links.Asked.Count);
+            Assert.Contains("fresh one was refused too", Attachment("twice").Error);
+
+            // Asking failed (the platform was busy): transient, so the job system tries again later.
+            await PendingAsync("busy", "https://cdn.discordapp.com/attachments/111/666/z.png?ex=old");
+            links.Fails = new InvalidOperationException("rate limited");
+            var transient = await Assert.ThrowsAsync<JobFailureException>(() => processor.DownloadAsync("testnet:busy#0", default));
+            Assert.Equal(ErrorClass.Transient, transient.Class);
+            Assert.Equal(DownloadStates.Pending, Attachment("busy").State);
+        }
+
+        [Fact]
+        public async Task DiscordRefresher_FindsTheSameFileInTheMessageReadAgain()
+        {
+            var discord = new FakeDiscord();
+            var refresher = new DiscordLinkRefresher(discord);
+            string id = DiscordFixtures.Snow(T0);
+            discord.Put(DiscordFixtures.General, DiscordFixtures.Message(id, DiscordFixtures.User(DiscordFixtures.Sam, "sam"), "two files", more: m => m["attachments"] = new System.Text.Json.Nodes.JsonArray
+            {
+                new System.Text.Json.Nodes.JsonObject { ["id"] = "600000000000000001", ["filename"] = "a.png", ["url"] = "https://cdn.discordapp.com/attachments/7/1/a.png?ex=new" },
+                new System.Text.Json.Nodes.JsonObject { ["id"] = "600000000000000002", ["filename"] = "b.png", ["url"] = "https://cdn.discordapp.com/attachments/7/2/b.png?ex=new" },
+            }));
+            MediaLinkRequest Ask(string? fileId, int index, string message = "", string channel = DiscordFixtures.General, string platform = "discord") =>
+                new("discord:x#0", platform, message.Length > 0 ? message : id, channel, fileId, index, "https://cdn.discordapp.com/old");
+
+            // By the file's id when it was recorded, by its position otherwise.
+            Assert.Equal("https://cdn.discordapp.com/attachments/7/2/b.png?ex=new", await refresher.RefreshAsync(Ask("600000000000000002", 0), default));
+            Assert.Equal("https://cdn.discordapp.com/attachments/7/1/a.png?ex=new", await refresher.RefreshAsync(Ask(null, 0), default));
+            Assert.Null(await refresher.RefreshAsync(Ask("600000000000000009", 0), default));        // that file was removed from the message
+            Assert.Null(await refresher.RefreshAsync(Ask(null, 0, message: DiscordFixtures.Snow(T0 + 1)), default)); // the message is gone
+            Assert.Null(await refresher.RefreshAsync(Ask(null, 0, platform: "whatsapp"), default));    // not Discord's to refresh
+            Assert.Null(await refresher.RefreshAsync(Ask(null, 0, message: "not-a-snowflake"), default)); // nothing Discord could look up
+            Assert.DoesNotContain(discord.Calls, c => c.Contains("not-a-snowflake"));
+
+            // A channel the bot can no longer read has no fresh link; a refused token is not swallowed.
+            discord.Forbidden[DiscordFixtures.General] = 1;
+            Assert.Null(await refresher.RefreshAsync(Ask(null, 0), default));
+            discord.Forbidden.Clear();
+            discord.Unauthorised = true;
+            await Assert.ThrowsAsync<DiscordApiException>(() => refresher.RefreshAsync(Ask(null, 0), default));
         }
 
         [Fact]

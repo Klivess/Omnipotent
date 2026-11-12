@@ -33,6 +33,11 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
         private TesseractOcr? tesseract;
         private string tesseractLanguages = "";
         private string sweepCursor = "";
+        private string priorityCursor = "", priorityKey = "", priorityDoneKey = "";
+
+        /// <summary>Job priorities of backlog reads (higher runs first): someone Klives tracks or Klives himself, someone he watches, anyone.</summary>
+        public const int TrackedPriority = 185, WatchPriority = 178, BacklogPriority = 170;
+        private const int PageSize = 500, PriorityPagesPerSweep = 200;
 
         /// <param name="transcriber">Resolves the speech service when a transcript is first needed; null result = none available.</param>
         /// <param name="ocr">Replaces Tesseract (tests).</param>
@@ -156,6 +161,8 @@ CREATE TABLE media_text(
         /// Queues stored attachments that have no label for their task yet: media that predates the module, or that
         /// was skipped while its engine was unavailable. A kind whose engine cannot run right now is left out, so an
         /// unavailable engine does not turn every sweep into thousands of jobs that each say "skipped".
+        /// Plan R2: the backlog of the people Klives tracks (and his own) is queued first and runs first, then that of
+        /// the people he watches, then everyone else's in attachment order.
         /// </summary>
         private async Task<object> SweepAsync(CancellationToken ct)
         {
@@ -164,41 +171,106 @@ CREATE TABLE media_text(
             bool sound = cfg.TranscribeEnabled && await transcriber().ConfigureAwait(false) != null;
             if (!images && !sound) return new { queued = 0, reason = "no engine is available" };
 
-            int budget = Math.Clamp(Context.Settings.Get(SweepBatchSetting, 500), 10, 100000), queued = 0;
+            int budget = Math.Clamp(Context.Settings.Get(SweepBatchSetting, 500), 10, 100000), queued = 0, first = 0;
+
+            // 1. The people who come first. One full pass per set of people (and engines): media of theirs that arrives
+            //    later is announced by the change log, so once their backlog has been walked there is nothing left to find.
+            var (authors, key) = PriorityAuthors(images, sound);
+            if (authors.Count > 0 && key != priorityDoneKey)
+            {
+                if (key != priorityKey) { priorityKey = key; priorityCursor = ""; }
+                for (int pages = 0; pages < PriorityPagesPerSweep && queued < budget; pages++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    var page = Page(priorityCursor, images, sound);
+                    var theirs = page.Where(p => p.Author != null && authors.ContainsKey(p.Author)).Select(p => p.Id).ToList();
+                    var labelled = Labelled(theirs);
+                    foreach (var (id, author) in page)
+                    {
+                        priorityCursor = id;
+                        if (author == null || !authors.TryGetValue(author, out int priority) || labelled.Contains(id)) continue;
+                        await Context.Jobs.EnqueueAsync(Job(ExtractKind, "attachment", id, priority: priority), ct).ConfigureAwait(false);
+                        first++;
+                        if (++queued >= budget) break;
+                    }
+                    bool walked = page.Count < PageSize && (page.Count == 0 || priorityCursor == page[^1].Id);
+                    if (walked) { priorityDoneKey = key; priorityCursor = ""; break; }
+                    // Otherwise the budget ran out, or the page was full: the next sweep (or page) resumes from the cursor.
+                }
+            }
+
+            // 2. Everyone, in attachment order, with what is left of the budget.
             bool wrapped = sweepCursor.Length == 0;
             while (queued < budget)
             {
                 ct.ThrowIfCancellationRequested();
-                List<(string Id, string Kind)> page;
-                using (var c = Context.Stores.Corpus.OpenRead())
-                    page = c.Query(null, """
-                        SELECT attachment_id, media_kind FROM attachments
-                        WHERE attachment_id > $after AND download_state='done' AND cas_sha256 IS NOT NULL
-                          AND (($images = 1 AND media_kind = 'image') OR ($sound = 1 AND media_kind IN ('audio', 'voice', 'video')))
-                        ORDER BY attachment_id LIMIT 500
-                        """, r => (r.GetString(0), r.GetString(1)), ("$after", sweepCursor), ("$images", images ? 1 : 0), ("$sound", sound ? 1 : 0));
+                var page = Page(sweepCursor, images, sound);
                 if (page.Count > 0)
                 {
-                    HashSet<string> labelled;
-                    using (var c = Context.Stores.Intel.OpenRead())
-                        labelled = c.QueryIn(null, "SELECT DISTINCT item_id FROM labels WHERE item_kind='attachment' AND task IN ('ocr','transcript') AND item_id IN ({keys})",
-                            page.Select(p => p.Id).ToList(), r => r.GetString(0)).ToHashSet(StringComparer.Ordinal);
+                    var labelled = Labelled(page.Select(p => p.Id).ToList());
                     foreach (var (id, _) in page)
                     {
                         sweepCursor = id;
                         if (labelled.Contains(id)) continue;
-                        await Context.Jobs.EnqueueAsync(Job(ExtractKind, "attachment", id, priority: 170), ct).ConfigureAwait(false);
+                        await Context.Jobs.EnqueueAsync(Job(ExtractKind, "attachment", id, priority: BacklogPriority), ct).ConfigureAwait(false);
                         if (++queued >= budget) break;
                     }
                 }
-                if (page.Count < 500)
+                if (page.Count < PageSize)
                 {
                     sweepCursor = "";
                     if (wrapped) break;
                     wrapped = true;
                 }
             }
-            return new { queued };
+            return new { queued, first };
+        }
+
+        /// <summary>One page of stored media of the kinds an engine can read now, with the identity that posted it.</summary>
+        private List<(string Id, string? Author)> Page(string after, bool images, bool sound)
+        {
+            using var c = Context.Stores.Corpus.OpenRead();
+            return c.Query(null, $"""
+                SELECT a.attachment_id, m.author_identity_id FROM attachments a LEFT JOIN messages m ON m.message_id = a.message_id
+                WHERE a.attachment_id > $after AND a.download_state='done' AND a.cas_sha256 IS NOT NULL
+                  AND (($images = 1 AND a.media_kind = 'image') OR ($sound = 1 AND a.media_kind IN ('audio', 'voice', 'video')))
+                ORDER BY a.attachment_id LIMIT {PageSize}
+                """, r => (r.GetString(0), r.GetStringOrNull(1)), ("$after", after), ("$images", images ? 1 : 0), ("$sound", sound ? 1 : 0));
+        }
+
+        private HashSet<string> Labelled(List<string> ids)
+        {
+            if (ids.Count == 0) return new HashSet<string>(StringComparer.Ordinal);
+            using var c = Context.Stores.Intel.OpenRead();
+            return c.QueryIn(null, "SELECT DISTINCT item_id FROM labels WHERE item_kind='attachment' AND task IN ('ocr','transcript') AND item_id IN ({keys})",
+                ids, r => r.GetString(0)).ToHashSet(StringComparer.Ordinal);
+        }
+
+        /// <summary>
+        /// The identities whose media is read first, each with its job priority (merged people count as the person they
+        /// were merged into), and a key that changes whenever that set or the engines that can run change.
+        /// </summary>
+        private (Dictionary<string, int> Identities, string Key) PriorityAuthors(bool images, bool sound)
+        {
+            var people = new Dictionary<string, int>(StringComparer.Ordinal);
+            void Rank(string person, int priority)
+            {
+                string canonical = Context.Policy.Canonical(person);
+                people[canonical] = Math.Max(people.GetValueOrDefault(canonical), priority);
+            }
+            using (var o = Context.Stores.Operator.OpenRead())
+                foreach (var (person, tier) in o.Query(null, "SELECT person_id, tier FROM person_settings WHERE tier IN ('tracked', 'watch')", r => (r.GetString(0), r.GetString(1))))
+                    Rank(person, tier == "tracked" ? TrackedPriority : WatchPriority);
+            var identities = new Dictionary<string, int>(StringComparer.Ordinal);
+            using (var c = Context.Stores.Corpus.OpenRead())
+            {
+                foreach (string self in c.Query(null, "SELECT person_id FROM persons WHERE is_self=1", r => r.GetString(0))) Rank(self, TrackedPriority);
+                if (people.Count == 0) return (identities, "");
+                foreach (var (identity, person) in c.Query(null, "SELECT identity_id, person_id FROM identities", r => (r.GetString(0), r.GetString(1))))
+                    if (people.TryGetValue(Context.Policy.Canonical(person), out int priority)) identities[identity] = priority;
+            }
+            string key = (images ? "i" : "-") + (sound ? "s" : "-") + "|" + string.Join(",", identities.OrderBy(x => x.Key, StringComparer.Ordinal).Select(x => x.Key + "=" + x.Value));
+            return (identities, key);
         }
     }
 }

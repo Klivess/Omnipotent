@@ -29,10 +29,19 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
         private const string MaxFileSetting = "media.store.max_file_mb";
 
         private readonly HttpMessageHandler? handler;
+        private readonly Func<IMediaLinkRefresher?>? links;
+        private readonly IAvProbe? av;
         private string sweepCursor = "";
 
         /// <param name="handler">Replaces the network in tests.</param>
-        public MediaModule(HttpMessageHandler? handler = null) => this.handler = handler;
+        /// <param name="links">The sources that can hand out a fresh link for an expired one (Discord through KliveBot).</param>
+        /// <param name="av">Replaces ffprobe (tests).</param>
+        public MediaModule(HttpMessageHandler? handler = null, Func<IMediaLinkRefresher?>? links = null, IAvProbe? av = null)
+        {
+            this.handler = handler;
+            this.links = links;
+            this.av = av;
+        }
 
         public override ModuleManifest Manifest { get; } = new()
         {
@@ -91,7 +100,8 @@ CREATE INDEX ix_media_objects_state ON media_objects(state) WHERE state <> 'ok';
         {
             base.InitializeAsync(context, ct);
             Media = new MediaStore(context.Stores.Paths);
-            Processor = new MediaProcessor(context.Stores, context.Clock, Media, ReadSettings, () => context.Settings.KlivesZone, handler);
+            Processor = new MediaProcessor(context.Stores, context.Clock, Media, ReadSettings, () => context.Settings.KlivesZone, handler, links,
+                av ?? new FfprobeAvProbe(Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.FFMpegDirectory)));
             return Task.CompletedTask;
         }
 
