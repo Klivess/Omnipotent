@@ -1,6 +1,84 @@
 // Generated from the C# contract types by TypeScriptContracts. Do not edit by hand.
 // Instants are UTC epoch milliseconds; durations are milliseconds.
 
+export interface AlertDto {
+  alertId: string;
+  kind: string;
+  ruleId?: string | null;
+  ruleName?: string | null;
+  reason: string;
+  messageId: string;
+  conversationId: string;
+  conversationTitle?: string | null;
+  guildId?: string | null;
+  platform: string;
+  personId?: string | null;
+  personName?: string | null;
+  occurredAtMs: number;
+  lastHitMs: number;
+  hitCount: number;
+  hits: AlertHitDto[];
+  probability?: number | null;
+  state: string;
+  delivery: string;
+  sourceDeletedAtMs?: number | null;
+  createdAtMs: number;
+  verdict?: string | null;
+}
+
+export interface AlertFeedbackDto {
+  alertId: string;
+  kind: string;
+  reason: string;
+  messageId: string;
+  verdict: AlertVerdict;
+}
+
+export interface AlertFeedbackRequest {
+  alertId: string;
+  verdict: AlertVerdict;
+  messageId?: string | null;
+  note?: string | null;
+}
+
+export interface AlertFeedbackResultDto {
+  feedback: AlertFeedbackDto;
+  classifierCorrected: boolean;
+}
+
+export interface AlertHitDto {
+  messageId: string;
+  conversationId: string;
+  atMs: number;
+  reason: string;
+  probability?: number | null;
+  personId?: string | null;
+  excerpt?: string | null;
+  deleted: boolean;
+}
+
+export interface AlertPageDto {
+  items: AlertDto[];
+  nextCursor?: string | null;
+  unseen: number;
+}
+
+export type AlertState = "New" | "Seen" | "Dismissed";
+
+export interface AlertStateRequest {
+  state: AlertState;
+  alertIds?: string[] | null;
+  all: boolean;
+  kind?: string | null;
+}
+
+export interface AlertStateResultDto {
+  changed: number;
+  unseen: number;
+}
+
+export type AlertVerdict = "Correct" | "Wrong";
+
 export interface ApiError {
   code: string;
   message: string;
@@ -267,6 +345,48 @@ export interface IdentitySummaryDto {
   kind: string;
   firstSeenMs: number;
   lastSeenMs: number;
+}
+
+export type InboxAction = "Dismiss" | "Snooze" | "Reopen";
+
+export interface InboxItemDto {
+  itemId: string;
+  kind: string;
+  messageId: string;
+  conversationId: string;
+  conversationKind?: string | null;
+  conversationTitle?: string | null;
+  guildId?: string | null;
+  platform: string;
+  personId: string;
+  personName?: string | null;
+  sentAtMs: number;
+  waitingMs: number;
+  state: string;
+  reason: string;
+  probability?: number | null;
+  snoozedUntilMs?: number | null;
+  live: boolean;
+  excerpt?: string | null;
+  strength: number;
+  rank: number;
+}
+
+export interface InboxPageDto {
+  items: InboxItemDto[];
+  open: number;
+  asOfMs: number;
+}
+
+export interface InboxResolveRequest {
+  itemIds: string[];
+  action: InboxAction;
+  untilMs?: number | null;
+}
+
+export interface InboxResolveResultDto {
+  changed: number;
+  open: number;
 }
 
 export interface JobActionRequest {
@@ -909,6 +1029,56 @@ export interface V3StatusDto {
   llm?: LlmStatusDto | null;
   stream?: StreamStatusDto | null;
   routes: string[];
+}
+
+export interface WatchDefinition {
+  text: string;
+  persons?: string[] | null;
+  conversations?: string[] | null;
+  guilds?: string[] | null;
+}
+
+export interface WatchDeleteRequest {
+  watchId: string;
+}
+
+export interface WatchDeletedDto {
+  watchId: string;
+  deleted: boolean;
+}
+
+export interface WatchEnabledRequest {
+  watchId: string;
+  enabled: boolean;
+}
+
+export interface WatchListDto {
+  rules: WatchRuleDto[];
+}
+
+export interface WatchRuleDto {
+  watchId: string;
+  name: string;
+  definition: WatchDefinition;
+  enabled: boolean;
+  state: string;
+  reason?: string | null;
+  threshold?: number | null;
+  checked: number;
+  matched: number;
+  lastMatchMs?: number | null;
+  createdAtMs: number;
+  updatedAtMs: number;
+}
+
+export interface WatchSaveRequest {
+  name: string;
+  text: string;
+  watchId?: string | null;
+  persons?: string[] | null;
+  conversations?: string[] | null;
+  guilds?: string[] | null;
+  enabled: boolean;
 }
 
 export interface ZoneReadingDto {

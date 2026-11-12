@@ -12,6 +12,7 @@ lands, so a restart can resume from it.
 | C-base 2/3: A2 ensembles + X19 | 7621a5b | `Ml/Classification`, `Modules/Classification`. |
 | **C-base 3/3: rollups + read models (C-base complete)** | 2b948cc | `Modules/Rollups`, `Modules/Projections`, `Api/WsCRoutes.cs`, serving filter. **Merge this commit as "C-base".** |
 | Explore engine | the commit after 2b948cc | `Modules/Explore`, `Kernel/Explore/ExploreContracts.cs` (additive), `Temporal/Zones.OffsetSegments` (additive), routes `explore/facets` and `explore/export`. Done by the coordinating session from 2026-11-12 (the workstream's own session stopped mid-way through it). |
+| Signals (radar, watch rules, reply inbox, X41, X49) | the commit after the Explore engine | `Modules/Signalling`, `Api/SignalsRoutes.cs`. Needs nothing from another workstream; reads the classifier's labels and the rollups when they are installed. |
 
 ## What the other workstreams integrate against (C-base)
 - **Shared encoder:** `ModuleContext.Encoder` (`IEmbeddingEncoder`, frozen R7 #5). Production: `LazyE5Encoder` from
@@ -86,7 +87,77 @@ lands, so a restart can resume from it.
 - **Gap 5:** `explore/facets` and `explore/export` exist (above). Export is a `POST` whose response is the file: read it with
   `fetch` and save the blob (the Bearer header is kept).
 
+## Signals: radar, watch rules, reply inbox (plan "Signals, briefs and search", N9, N11, X41, X49)
+Module id `signals`, code in `Modules/Signalling/` (the namespace is `Modules.Signalling` on purpose: a namespace called
+`Signals` hides the classifier's static class `Signals` from every sibling module). Its own intel migration line; tables
+`sig_alerts`, `sig_alert_hits`, `sig_inbox`, `sig_pending`, `sig_watch_state`, `sig_watch_candidates`, `sig_watch_judgements`,
+`sig_state`. Rules, dismissals and Klives's verdicts live in operator.db (`watchlists` kind `semantic`, `dismissals` kind
+`inbox`, `gold_labels` kind `signal`), so they survive a rebuild of the derived store.
+
+**One scan job** (`signals/scan`, CPU lane, planned on message changes and every 30 s) reads the corpus change log and the
+classification label outbox from its own cursors. A message is looked at when it arrives (for what is exact) and again when
+its labels arrive (for what needs meaning). Every write is keyed by the message, so a second look never alerts twice.
+Nothing runs on the ingest path (F050, F366).
+
+- **Live (T5, F047):** a message can alert when its change is `source_kind=live` and arrived within `signals.freshness_hours`
+  (12 h), or, when it is looked at again for its labels, when it first arrived live within that time. An edit alerts only for a
+  message that is itself that young. Backfills and imports never alert, never push, never nudge.
+- **Radar:** a hit is (in this order) a structured @-mention of any of Klives's identities (F049, F531), the ensemble reading
+  `about_klives = mentioned` or `indirect` above its threshold, or a confirmed name matched as a whole word in any script and
+  letter case with code, links and custom emoji removed (F048). A name match is exact about the word, not about who is meant:
+  with a reading the reading decides ("not about him" drops it, "spoken to him" is the inbox's business), without one it waits
+  `signals.radar.reading_grace_seconds` (90 s) and then alerts on the name alone. Only confirmed names can alert (F254, F527):
+  `signals.radar.aliases`, the current names of his own accounts, and whatever the integrator passes as `confirmedAliases`.
+  His own messages, bots, his own direct chats and non-authored text (copypasta, forwards) never alert.
+- **Grouping and delivery:** hits in one server (any of its channels) or one chat within `signals.burst_minutes` (10) join
+  the open alert. A new alert is `pushed` (live stream topic `alert`), `quiet` (inside `signals.quiet_from`–`quiet_to` in
+  Klives's zone) or `digest` (more than `signals.max_pushed_per_hour` already pushed). Held alerts are kept and counted in the
+  read model `signals.summary`. A deleted source message marks its alert (`source_deleted_at_ms`); the alert stays.
+- **Reply inbox (N9, F502):** an item opens for a message said to Klives (his direct chat, a reply to him, an @-mention, or
+  the reading `addressed`) that the ensemble reads as a question or a request, and for a direct chat that ends on the other
+  side (`unanswered`, one item per chat). In a group or a server a question has to be addressed to him. It resolves when he
+  writes later in his direct chat, replies to the message, or writes in that channel or group within
+  `signals.inbox.channel_answer_minutes` (120); or when he dismisses or snoozes it. A newer message from the same person
+  reopens a dismissed item. Items go `stale` after `signals.inbox.stale_days` (30). The list is ranked by how much he talks
+  with the person (rollup pair totals of the last half year) times how long it has waited. **Reading of "live-only":** recent
+  imported or backfilled messages are listed (marked `live = false`) but never push an event and are never nudged.
+- **Nudges (X49):** an open live item older than `signals.inbox.nudge_hours` (24) is pushed once as `nudge`, outside quiet
+  hours. The tactic `x49.reply_nudges` gives the same list on demand.
+- **Watch rules (N11, X41):** a rule is plain text plus an optional scope (people, conversations, servers).
+  1. Policy: a rule scoped to someone who is or may be a minor is refused when saved (MinorGuard, person-targeted alerts);
+     the model then judges the text against the special categories and a rule aimed at one is refused with the standard
+     refusal text. A rule whose scope later includes a minor stops.
+  2. Calibration: the rule text is embedded with the shared encoder; the prefilter's gate starts where 3% of a random
+     sample of message vectors pass, and after five confirmed matches moves just below the least similar confirmed one
+     (kept between where 10% and where 1% pass). Recalibrated weekly and when the encoder changes.
+  3. Prefilter (in the scan, no model): live, authored, in-scope messages at least as similar as the gate become candidates.
+  4. Confirmation (`signals/confirm`, LLM background lane): batches of 25, most similar first, at most
+     `signals.watch.max_checks_per_hour` (120) per rule; the prompt says a negation, a question, a quote or a joke is not
+     a match. A match at `signals.watch.match_confidence` (0.6) or more becomes an alert, grouped like the radar.
+  5. Feedback: Klives's verdict on an alert is gold. A wrong one dismisses the alert, becomes "does not match" in the rule's
+     prompt from then on, and is a judgement the gate learns from. A verdict on a radar alert also corrects the classifier's
+     `about_klives` label through the classification module (done in the route).
+- **Forgetting a person:** on `person.erase` everything here that refers to them or to a message the corpus no longer has is
+  removed, including hits inside other people's grouped alerts and Klives's verdicts on those messages.
+- **Explore:** datasets `signals.alerts` and `signals.inbox` (followed by a change counter), both minor-filtered.
+
+**Routes** (`Api/SignalsRoutes.cs`, all under `signals/`): `GET alerts` (keyset; `state`, `kind`, `rule`, `person`),
+`POST alerts/state` (the named ones, or `all` unseen in one call: F160), `POST alerts/feedback`, `GET watchlists`,
+`POST watchlists/save|enabled|delete`, `GET inbox` (`state`, ranked when open), `POST inbox/resolve` (dismiss, snooze,
+reopen). Reads need `omniscience.persons.read`, changes `omniscience.alerts.manage`. A refusal is a 422 with code
+`refused` and the reason. Rows carry ids; texts, names and titles are read from the corpus when the page is shown (F387).
+
+**For the integrator**
+- `new SignalsModule(confirmedAliases: …)`: pass a function that returns Klives's accepted nicknames from the knowledge
+  store (WS-B). Until then only the settings and his account names are matched.
+- Alerts reach the live stream and the dashboard. Delivery by KliveBot DM (plan N11) is not built: it needs a subscriber on
+  topic `alert` in the service that owns the bot.
+- Role mentions are stored but not attributed to Klives: his role membership is not in the corpus.
+- How well `about_klives` and `dialogue_act` read real messages is measured in the shadow run, not here: the tests give the
+  module its readings.
+
 ## Shared files touched (small, additive)
+- Signals: one line in `Api/V3Routes.cs` registering `SignalsRoutes`, one in `OmniscienceV3.BuildModules()` adding `SignalsModule` (before Explore, which mirrors its datasets). Nothing else shared.
 - `Kernel/Explore/ExploreContracts.cs`: `ExploreSource`, `IExploreSourceProvider`, `ExploreColumnKinds` (additive; the frozen
   records are unchanged). `Temporal/Zones.cs`: `OffsetSegments` (additive).
 - `Kernel/Modules/Datasets.cs`: three more D2 dimensions (`content.event`, `content.activity`, `content.attribute`).
@@ -156,9 +227,10 @@ lands, so a restart can resume from it.
 | Rollups (person/pair/conversation/guild/global days, slots, zones, drift) | done, tested (exact counts, DST, deletes, reactions, backfill, merges, zones, minors) |
 | Read models (dossier, directory, overview, health, conversation/guild cards) + serving filter | done, tested (index-only reads asserted) |
 | Explore engine (DuckDB mirror, lenses, drill, facets, export, other modules' datasets, policy) | done, tested (8 tests + the opt-in 5M-row run) |
-| Analytics modules, radar/watchlists, digests/briefs, reply inbox, N12–N16, N19, N20 | pending |
-| Tactics X17–X40 (except X19 done, X24–X25 WS-A), monitors X41–X52 | pending |
-| Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
+| Signals: radar, semantic watch rules (N11), reply inbox (N9), nudges; tactics X41 and X49; routes; Explore datasets | done, tested (16 tests with supplied readings; the classifier's real readings and KliveBot delivery are not exercised) |
+| Analytics modules, digests/briefs (N4, N10), N12–N16, N19, N20 | pending |
+| Tactics X17–X40 (except X19 done, X24–X25 WS-A), monitors X42–X48 and X50–X52 | pending |
+| Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)
 - The mirror holds no message text; a drill fetches the text of the page it shows from the corpus. Exports therefore carry

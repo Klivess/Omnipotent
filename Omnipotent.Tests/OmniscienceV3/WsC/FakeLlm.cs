@@ -21,6 +21,10 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         public Func<LlmRequest, LlmResult?>? Override { get; set; }
         /// <summary>Concept names the fake policy check treats as special-category.</summary>
         public HashSet<string> SensitiveConcepts { get; } = new(StringComparer.OrdinalIgnoreCase) { "religion talk" };
+        /// <summary>Words that make the fake policy check treat a watch rule as aimed at a special category.</summary>
+        public HashSet<string> SensitiveRules { get; } = new(StringComparer.OrdinalIgnoreCase) { "religion" };
+        /// <summary>The word that makes a message match a watch rule, unless it is negated ("not selling").</summary>
+        public string WatchWord { get; set; } = "selling";
         /// <summary>The word that makes a message match a taught concept.</summary>
         public string ConceptWord { get; set; } = "saffron";
 
@@ -45,6 +49,8 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
                 "classify.teacher" => Teacher(user),
                 "classify.concept.policy" => JsonSerializer.Serialize(new { targets_special_category = SensitiveConcepts.Any(s => user.Contains(s, StringComparison.OrdinalIgnoreCase)) }),
                 "classify.concept.label" => Concept(user),
+                "signals.watch.policy" => JsonSerializer.Serialize(new { targets_special_category = SensitiveRules.Any(w => user.Contains(w, StringComparison.OrdinalIgnoreCase)) }),
+                "signals.watch.confirm" => Watch(user),
                 _ => throw new InvalidOperationException($"FakeLlm has no answer for purpose '{request.Purpose}'."),
             };
             return Task.FromResult(Ok(json, user));
@@ -72,6 +78,17 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         private string Concept(string user)
         {
             var items = Any.Matches(user).Select(m => new { @ref = m.Groups["ref"].Value, match = Decode(m.Groups["text"].Value).Contains(ConceptWord), conf = 0.9 }).ToList();
+            return JsonSerializer.Serialize(new { items });
+        }
+
+        private string Watch(string user)
+        {
+            var items = Any.Matches(user).Select(m =>
+            {
+                string text = Decode(m.Groups["text"].Value);
+                bool match = text.Contains(WatchWord, StringComparison.OrdinalIgnoreCase) && !text.Contains("not " + WatchWord, StringComparison.OrdinalIgnoreCase);
+                return new { @ref = m.Groups["ref"].Value, match, conf = 0.9 };
+            }).ToList();
             return JsonSerializer.Serialize(new { items });
         }
 
