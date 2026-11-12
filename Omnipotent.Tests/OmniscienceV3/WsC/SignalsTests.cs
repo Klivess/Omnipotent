@@ -57,11 +57,13 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         public JobDriver Driver { get; private set; } = null!;
         public SignalsModule Signals { get; private set; } = null!;
         public ExploreModule? Explore { get; private set; }
+        public Omnipotent.Services.OmniscienceV3.Modules.Briefs.BriefsModule? Briefs { get; private set; }
         public List<string> Errors { get; } = new();
         public KernelSettings Settings => Runtime.Host.Settings;
 
         /// <param name="utcNow">Defaults to a Monday at 13:00 in Klives's zone (Europe/London), outside quiet hours.</param>
-        public static async Task<SignalsHarness> StartAsync(DateTime? utcNow = null, bool explore = false, bool rollups = false, bool classification = false, ISignalReadings? readings = null)
+        public static async Task<SignalsHarness> StartAsync(DateTime? utcNow = null, bool explore = false, bool rollups = false, bool classification = false, ISignalReadings? readings = null,
+            bool briefs = false)
         {
             var h = new SignalsHarness { Clock = new FixedClock(Instant.FromUtc(utcNow ?? new DateTime(2025, 6, 2, 12, 0, 0, DateTimeKind.Utc))) };
             h.Signals = new SignalsModule(readings ?? h.Readings);
@@ -70,6 +72,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             if (classification || rollups || explore) modules.Add(new ClassificationModule());
             if (rollups || explore) modules.Add(new RollupModule());
             modules.Add(h.Signals);
+            if (briefs) modules.Add(h.Briefs = new Omnipotent.Services.OmniscienceV3.Modules.Briefs.BriefsModule());
             if (explore) modules.Add(h.Explore = new ExploreModule(() => modules));
             h.Runtime = await V3Runtime.StartAsync(new V3RuntimeOptions
             {

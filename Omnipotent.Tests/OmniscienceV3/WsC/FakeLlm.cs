@@ -44,6 +44,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             lock (Requests) Requests.Add(request);
             if (Override?.Invoke(request) is { } forced) return Task.FromResult(forced);
             string user = request.Turns[^1].Content;
+            if (request.Purpose.StartsWith("briefs.", StringComparison.Ordinal)) return Task.FromResult(Ok(Brief(request), user));
             string json = request.Purpose switch
             {
                 "classify.teacher" => Teacher(user),
@@ -81,6 +82,55 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             return JsonSerializer.Serialize(new { items });
         }
 
+        private static readonly Regex BriefGroup = new(@"<group g=""(?<g>[^""]+)"" title=""(?<title>[^""]*)"">(?<body>.*?)</group>", RegexOptions.Singleline | RegexOptions.Compiled);
+        private static readonly Regex BriefItem = new(@"<(?<tag>m|p) ref=""(?<ref>[^""]+)""(?<attrs>[^>]*)>(?<text>.*?)</\k<tag>>", RegexOptions.Singleline | RegexOptions.Compiled);
+        private static readonly Regex BriefBy = new(@"by=""(?<by>[^""]*)""", RegexOptions.Compiled);
+
+        /// <summary>
+        /// The summariser's oracle: per group one point for every distinct first word of its items, citing those items
+        /// ("3 about pizza"). An item containing FABRICATE makes it add a point that cites something never shown and one that
+        /// cites nothing, which the engine must drop. Items containing "!!!" are notable. For action items it reads promises
+        /// ("I will"), plans ("let's") and questions ("?").
+        /// </summary>
+        private static string Brief(LlmRequest request)
+        {
+            string user = request.Turns[^1].Content;
+            bool overall = !(request.SystemPrompt ?? "").Contains("Leave \"overall\" empty", StringComparison.Ordinal);
+            bool actions = request.Purpose.StartsWith("briefs.actions", StringComparison.Ordinal);
+            var groups = new List<object>();
+            var overallPoints = new List<object>();
+            var notable = new List<string>();
+            foreach (Match g in BriefGroup.Matches(user))
+            {
+                var items = BriefItem.Matches(g.Groups["body"].Value).Select(m => (Ref: m.Groups["ref"].Value, Text: Decode(m.Groups["text"].Value).Trim(),
+                    By: BriefBy.Match(m.Groups["attrs"].Value) is { Success: true } by ? by.Groups["by"].Value : "")).ToList();
+                var points = new List<object>();
+                if (actions)
+                {
+                    foreach (var i in items)
+                    {
+                        if (i.Text.Contains("I will", StringComparison.OrdinalIgnoreCase)) points.Add(new { text = $"Promise: {i.By} said they will do it", refs = new[] { i.Ref } });
+                        else if (i.Text.Contains("let's", StringComparison.OrdinalIgnoreCase)) points.Add(new { text = $"Plan: {i.Text}", refs = new[] { i.Ref } });
+                        else if (i.Text.EndsWith('?')) points.Add(new { text = $"Question: {i.Text}", refs = new[] { i.Ref } });
+                    }
+                }
+                else
+                {
+                    foreach (var cluster in items.GroupBy(i => Regex.Match(i.Text, @"[\p{L}\p{N}\[\]#]+").Value.ToLowerInvariant()))
+                        points.Add(new { text = $"{cluster.Count()} about {cluster.Key}", refs = cluster.Select(c => c.Ref).ToArray() });
+                }
+                if (items.Any(i => i.Text.Contains("FABRICATE", StringComparison.Ordinal)))
+                {
+                    points.Add(new { text = "fabricated from a source that was never shown", refs = new[] { "99999" } });
+                    points.Add(new { text = "fabricated without a source", refs = Array.Empty<string>() });
+                }
+                notable.AddRange(items.Where(i => i.Text.Contains("!!!", StringComparison.Ordinal)).Select(i => i.Ref));
+                groups.Add(new { g = g.Groups["g"].Value, points });
+                if (overall && items.Count > 0) overallPoints.Add(new { text = "overall: " + g.Groups["title"].Value, refs = new[] { items[0].Ref } });
+            }
+            return JsonSerializer.Serialize(new { groups, overall = overallPoints, notable });
+        }
+
         private string Watch(string user)
         {
             var items = Any.Matches(user).Select(m =>
@@ -92,8 +142,11 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             return JsonSerializer.Serialize(new { items });
         }
 
+        /// <summary>The context window the fake reports (tests shrink it to force a summary across several calls).</summary>
+        public int ContextWindow { get; set; } = 260_000;
+
         public Task<ModelContextInfo> GetContextAsync(string? model, CancellationToken ct) =>
-            Task.FromResult(new ModelContextInfo("AIRouter", "fake-model", 260_000, 16_384, "test", null, 0, null));
+            Task.FromResult(new ModelContextInfo("AIRouter", "fake-model", ContextWindow, Math.Min(16_384, ContextWindow / 4), "test", null, 0, null));
 
         public void EndSession(string sessionKey) { }
     }

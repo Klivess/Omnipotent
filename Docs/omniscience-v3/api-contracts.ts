@@ -84,6 +84,49 @@ export interface ApiError {
   message: string;
 }
 
+export interface BriefFactDto {
+  assertionId: string;
+  attribute: string;
+  value?: string | null;
+  status: string;
+  recordedAtMs: number;
+}
+
+export interface BriefMoodDto {
+  recent: Record<string, number>;
+  baseline: Record<string, number>;
+  recentAnswered: number;
+  baselineAnswered: number;
+}
+
+export interface BriefOpenThreadDto {
+  itemId: string;
+  kind: string;
+  messageId: string;
+  conversationId: string;
+  sentAtMs: number;
+}
+
+export interface BriefSectionDto {
+  key: string;
+  title: string;
+  points: CitedPoint[];
+}
+
+export interface BriefStyleDto {
+  messages: number;
+  averageWords: number;
+  averageCharacters: number;
+  replyShare: number;
+  directShare: number;
+  languages: string[];
+}
+
+export interface CitedPoint {
+  text: string;
+  refs: string[];
+}
+
 export interface ClassifyCorrectRequest {
   messageId: string;
   task: string;
@@ -158,6 +201,111 @@ export interface DayCountDto {
 }
 
 export type DayOfWeek = "Sunday" | "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday";
+
+export interface DigestDto {
+  digestId: string;
+  scopeKind: string;
+  scopeId?: string | null;
+  scopeTitle?: string | null;
+  fromMs: number;
+  toMs: number;
+  state: string;
+  trigger: string;
+  messages: number;
+  messagesRead: number;
+  conversations: number;
+  people: number;
+  nothingNew: boolean;
+  overall: CitedPoint[];
+  sections: DigestSectionDto[];
+  notable: string[];
+  newFacts: DigestFactDto[];
+  error?: string | null;
+  llmCalls: number;
+  createdAtMs: number;
+  finishedAtMs?: number | null;
+}
+
+export interface DigestFactDto {
+  assertionId: string;
+  personId: string;
+  personName?: string | null;
+  attribute: string;
+  value?: string | null;
+  recordedAtMs: number;
+}
+
+export interface DigestPageDto {
+  items: DigestDto[];
+  nextCursor?: string | null;
+}
+
+export interface DigestRunRequest {
+  scopeKind: string;
+  scopeId?: string | null;
+  fromMs?: number | null;
+  toMs?: number | null;
+}
+
+export interface DigestSectionDto {
+  kind: string;
+  id: string;
+  title: string;
+  messages: number;
+  people: number;
+  lastMessageMs: number;
+  points: CitedPoint[];
+  children: DigestSectionDto[];
+}
+
+export interface DigestSeenDto {
+  scopeKind: string;
+  scopeId?: string | null;
+  seen: boolean;
+}
+
+export interface DigestSeenRequest {
+  scopeKind: string;
+  scopeId?: string | null;
+  atMs?: number | null;
+}
+
+export interface DigestSubscriptionDeleteRequest {
+  subscriptionId: string;
+}
+
+export interface DigestSubscriptionDeletedDto {
+  subscriptionId: string;
+  deleted: boolean;
+}
+
+export interface DigestSubscriptionDto {
+  subscriptionId: string;
+  name: string;
+  scopeKind: string;
+  scopeId?: string | null;
+  cadence: string;
+  at: string;
+  weekday?: number | null;
+  enabled: boolean;
+  lastRunMs?: number | null;
+  createdAtMs: number;
+}
+
+export interface DigestSubscriptionListDto {
+  subscriptions: DigestSubscriptionDto[];
+}
+
+export interface DigestSubscriptionSaveRequest {
+  name: string;
+  scopeKind: string;
+  cadence: string;
+  at: string;
+  subscriptionId?: string | null;
+  scopeId?: string | null;
+  weekday?: number | null;
+  enabled: boolean;
+}
 
 export interface DimensionBinding {
   dimensionId: string;
@@ -648,6 +796,33 @@ export interface PersonActivityDto {
   dmShare: number;
   reactionsGiven: number;
   mentionsMade: number;
+}
+
+export interface PersonBriefDto {
+  personId: string;
+  name?: string | null;
+  state: string;
+  asOfMs?: number | null;
+  newestEvidenceMs?: number | null;
+  stale: boolean;
+  messages30d: number;
+  messagesPrevious30d: number;
+  activeDays30d: number;
+  messagesRead: number;
+  messagesInWindow: number;
+  sections: BriefSectionDto[];
+  mood?: BriefMoodDto | null;
+  style?: BriefStyleDto | null;
+  facts: BriefFactDto[];
+  openThreads: BriefOpenThreadDto[];
+  error?: string | null;
+  llmCalls: number;
+  requestedAtMs: number;
+  finishedAtMs?: number | null;
+}
+
+export interface PersonBriefRequest {
+  personId: string;
 }
 
 export interface PersonCardDto {

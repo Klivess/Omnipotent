@@ -127,6 +127,7 @@ namespace Omnipotent.Services.OmniscienceV3
                 new Modules.Rollups.RollupModule(),
                 new Modules.Projections.ProjectionModule(),
                 new Modules.Signalling.SignalsModule(),
+                new Modules.Briefs.BriefsModule(),
             };
             // Explore mirrors the datasets of every module in this list that offers them (IExploreSourceProvider).
             modules.Add(new Modules.Explore.ExploreModule(() => modules));

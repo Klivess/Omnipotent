@@ -361,7 +361,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Signalling
                 Request = new LlmRequest
                 {
                     Purpose = "signals.watch.confirm", SessionKey = "omniscience-signals-watch-" + watch.Id, SystemPrompt = system, Turns = new[] { new LlmTurn("user", user) },
-                    MaxOutputTokens = 200 + 25 * refs.Count, WorkClass = AIRouterWorkClass.Burst, OutputSchema = schema, Sampling = new ModelSamplingParameters(Temperature: 0),
+                    MaxOutputTokens = 200 + 25 * refs.Count, WorkClass = AIRouterWorkClass.Background, OutputSchema = schema, Sampling = new ModelSamplingParameters(Temperature: 0),
                 },
             }, ct).ConfigureAwait(false);
             if (!answer.Success) throw new JobFailureException(ErrorClass.Transient, $"The model could not check the candidates of watch rule '{watch.Name}' ({answer.ErrorKind}).");

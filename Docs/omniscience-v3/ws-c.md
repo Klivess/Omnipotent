@@ -13,6 +13,7 @@ lands, so a restart can resume from it.
 | **C-base 3/3: rollups + read models (C-base complete)** | 2b948cc | `Modules/Rollups`, `Modules/Projections`, `Api/WsCRoutes.cs`, serving filter. **Merge this commit as "C-base".** |
 | Explore engine | the commit after 2b948cc | `Modules/Explore`, `Kernel/Explore/ExploreContracts.cs` (additive), `Temporal/Zones.OffsetSegments` (additive), routes `explore/facets` and `explore/export`. Done by the coordinating session from 2026-11-12 (the workstream's own session stopped mid-way through it). |
 | Signals (radar, watch rules, reply inbox, X41, X49) | the commit after the Explore engine | `Modules/Signalling`, `Api/SignalsRoutes.cs`. Needs nothing from another workstream; reads the classifier's labels and the rollups when they are installed. |
+| Digests and briefs (N10, N4, X18, X30, X31, X52) | the commit after Signals | `Modules/Briefs`, `Modules/PersonZones.cs`, `Api/BriefsRoutes.cs`. Reads the rollups, the reply inbox and the frozen `assertions` table when they are there. |
 
 ## What the other workstreams integrate against (C-base)
 - **Shared encoder:** `ModuleContext.Encoder` (`IEmbeddingEncoder`, frozen R7 #5). Production: `LazyE5Encoder` from
@@ -156,7 +157,47 @@ reopen). Reads need `omniscience.persons.read`, changes `omniscience.alerts.mana
 - How well `about_klives` and `dialogue_act` read real messages is measured in the shadow run, not here: the tests give the
   module its readings.
 
+## Digests and briefs (N10, N4, X18, X30, X31, X52)
+Module id `briefs`, code in `Modules/Briefs/`. Tables `brief_digests`, `brief_person`, `brief_runs`. Subscriptions are
+`watchlists` rows of kind `digest`; where Klives last looked is `last_seen` (both operator.db).
+
+- **Cited summaries (`CitedSummarizer`):** groups of items go to the model in as few calls as the real window allows
+  (`ContextPacker.Budget`, at most 6 calls a run). Every item has a ref number and every point cites refs. A ref that was
+  not shown is dropped, and a point left without a ref is dropped with it. A level up (servers over channels, the whole
+  over servers) is the same operation over the points below, whose citations resolve back to message ids. When the input
+  does not fit, each group keeps its newest items in proportion and the result says how many were shown.
+- **Dates:** every message line carries a T3 stamp (author-local when the rollups know the zone). The prompt forbids
+  "today", "yesterday" and the like; points carry message ids, so the page words time relative to when it is read.
+- **Digests (N10):** scope `all`, `guild`, `conversation` or `person`, over [from, to). Without a start it begins where
+  Klives last looked at that scope (`POST digests/seen`), else `briefs.digest.default_hours` back; never further than
+  `briefs.digest.max_days`. A period with no messages is "nothing new" and costs no model call. Normally two calls:
+  one over the conversations, one that merges their points into server points and the overall points. A server with one
+  active channel has that channel's points. `newFacts` lists assertions recorded in the period (person and `all` scopes),
+  with the dossier's filters (MinorGuard attributes, sensitive traits). A digest that cannot be written ends as `failed`
+  with the reason (three attempts), never as "running" for ever.
+- **Scheduled (X52):** a daily catch-up at `briefs.digest.daily_at` (07:30 in Klives's zone; empty switches it off) and
+  subscriptions (daily or weekly at HH:mm). A tick every five minutes runs what came due since its last run; a missed
+  occurrence runs once, late. A scheduled digest covers what happened since its previous run, or since Klives last looked
+  when that is later.
+- **Person brief (N4):** one model call over four groups (the last 7 days, the days before, between them and Klives,
+  messages read as tension or distress) plus what needs no model: activity and style from the rollups, the sentiment mix
+  of the last 30 days against the 60 before, facts (filtered), and what of theirs is waiting in the reply inbox. It is
+  `stale` when the newest message it rests on is older than `briefs.person.stale_days`. **Not in it yet:** upcoming dates
+  and plans, which come from WS-B's N8 after the merge.
+- **MinorGuard:** a digest, a subscription or a brief about one person is refused for someone who is or may be a minor,
+  and a brief written earlier is no longer shown. Server and chat digests include what minors said in those conversations
+  (their conversations stay readable).
+- **Tactics:** `x18.summarise` (messages, conversations, a time range), `x30.topic_snapshot` (a server or conversation and
+  a period), `x31.action_items` (plans, promises, unanswered questions, open loops), `x52.digest_subscription`.
+
+**Routes** (`Api/BriefsRoutes.cs`): `GET digests` (keyset), `GET digests/item`, `POST digests/run` (202),
+`POST digests/seen`, `GET digests/subscriptions`, `POST digests/subscriptions/save|delete`, `GET briefs/person`,
+`POST briefs/person` (202). Reading needs `messages.read` (digests) or `persons.read` (briefs); asking for one needs
+`analysis.run`; subscriptions need `alerts.manage`. The finished item is also read model `briefs.digest` (key `all`,
+`guild:<id>`, `conversation:<id>`, `person:<id>`) and `briefs.person` (key: person id), announced on the live stream.
+
 ## Shared files touched (small, additive)
+- Briefs: one line each in `Api/V3Routes.cs` (`BriefsRoutes`) and `OmniscienceV3.BuildModules()` (`BriefsModule`).
 - Signals: one line in `Api/V3Routes.cs` registering `SignalsRoutes`, one in `OmniscienceV3.BuildModules()` adding `SignalsModule` (before Explore, which mirrors its datasets). Nothing else shared.
 - `Kernel/Explore/ExploreContracts.cs`: `ExploreSource`, `IExploreSourceProvider`, `ExploreColumnKinds` (additive; the frozen
   records are unchanged). `Temporal/Zones.cs`: `OffsetSegments` (additive).
@@ -228,8 +269,9 @@ reopen). Reads need `omniscience.persons.read`, changes `omniscience.alerts.mana
 | Read models (dossier, directory, overview, health, conversation/guild cards) + serving filter | done, tested (index-only reads asserted) |
 | Explore engine (DuckDB mirror, lenses, drill, facets, export, other modules' datasets, policy) | done, tested (8 tests + the opt-in 5M-row run) |
 | Signals: radar, semantic watch rules (N11), reply inbox (N9), nudges; tactics X41 and X49; routes; Explore datasets | done, tested (16 tests with supplied readings; the classifier's real readings and KliveBot delivery are not exercised) |
-| Analytics modules, digests/briefs (N4, N10), N12–N16, N19, N20 | pending |
-| Tactics X17–X40 (except X19 done, X24–X25 WS-A), monitors X42–X48 and X50–X52 | pending |
+| Digests (N10, scheduled X52), person brief (N4), cited summaries; tactics X18, X30, X31 | done, tested (8 tests with a scripted model: what a real model writes is first seen in the shadow run) |
+| Analytics modules, N12–N16, N19, N20 | pending |
+| Tactics X17, X20–X23, X28–X29, X32–X40 (X18, X19, X26, X27, X30, X31 done; X24–X25 WS-A), monitors X42–X48 and X50–X51 | pending |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)
