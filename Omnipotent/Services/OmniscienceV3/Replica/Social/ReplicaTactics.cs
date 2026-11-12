@@ -345,6 +345,10 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                 conversationId = context.ConversationId,
                 replyToMessageId = context.ReplyToMessageId,
                 deepLink = context.DeepLink,
+                // Generated text, marked as such in the data itself (not only in the wording), so no consumer can take a
+                // suggestion for something Klives wrote, and it can never be used as evidence.
+                generated = true,
+                label = "Generated suggestion in your style, not a message",
                 note = "Suggestions only: copy one or open the conversation. Nothing has been or will be sent.",
                 versionId = context.VersionId,
             };

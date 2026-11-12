@@ -4,7 +4,9 @@ Branch `claude/omniscience-v3-ws-d-21c7c3`, cut from the Phase 1 commit `3dc87df
 `Omnipotent/Services/OmniscienceV3/Replica/` (module id `replica`, its own intel migration line `ReplicaSchema`).
 This file is the workstream's progress record: what is done, what is not, and why. It is kept current as work lands.
 
-## Status (in progress)
+## Status (2026-11-12)
+Everything below is committed; 194 v3 tests pass on this branch. The workstream's own session stopped on 2026-11-09; since
+2026-11-12 the coordinating session works here.
 
 | Area | State |
 |---|---|
@@ -16,8 +18,17 @@ This file is the workstream's progress record: what is done, what is not, and wh
 | Persona (dated opinions, relationships, self, interests, jokes; verified), reflex classifier, facts reader | done |
 | Composer (as-of, context, addressee, packed to the real window, cache-shaped prefix) | done |
 | Generator + judge (N candidates, burst sampling, LLM judge on the cached prefix, assistant-voice model) | done |
-| Evaluator + auto-tune, blind test, readiness, versioned trainer, chat, Rehearsal, Group Simulation, tactics | in progress |
-| Routes, registration, api-contracts, tests, traceability | in progress |
+| Versioned trainer, readiness, stale marking and retrain | done; `ReplicaTrainingTests` (14): every stage, refusals with the numbers, single flight, a crash mid-stage reclaimed, encoder failure degrades, the previous version keeps serving, cancel, minors blocked and purged |
+| Fidelity gates | done; `ReplicaFidelityGateTests` (5): zero post-cutoff tokens in an as-of prompt, the holdout never reaches a prompt-visible source, a stable stratified holdout, distinct personas stay distinct, tuning and reporting on separate splits |
+| Chat | done; `ReplicaChatTests` (10) |
+| Rehearsal (X55), drafts in Klives's voice (X57), Group Simulation (X63), social tactics X53, X54, X56, X58–X62, X64, X65 | done; `ReplicaSocialTests` (4): the catalogue is well formed, every tactic runs as a job on the seeded people, simulations and generated drafts are marked as such in their data, minors are refused before anything runs. **These are run-through tests with a scripted model: what each report says is not checked in depth.** |
+| Evaluator, auto-tune, blind test | built; the evaluator is covered by the split test above. **The blind test (Klives guesses real vs replica) has no test.** |
+| Routes (`ReplicaRoutes.cs`) | built, **never exercised** (no route test harness; first real exercise is the shadow run) |
+| Fidelity on real people | **not measured.** The acceptance target (median judge discrimination ≤ 65% for people with ≥ 1,000 replies) can only be checked on the real corpus, in the shadow run. |
+| Traceability | **rows of this workstream are not ticked**: do that row by row against the tests before the merge. |
+
+Defect found by the 2026-11-12 tests and fixed: a draft in Klives's voice (X57) was marked as generated only in its wording;
+its data now says `generated: true`.
 
 ## Decisions (defaults chosen without asking; each is reversible)
 - **Encoder:** the replica codes against `IEmbeddingEncoder` (WS-C). `ReplicaModule` takes an optional encoder resolver;
