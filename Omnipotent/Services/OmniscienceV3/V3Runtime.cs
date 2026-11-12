@@ -125,6 +125,8 @@ namespace Omnipotent.Services.OmniscienceV3
             {
                 // Workers release in-flight jobs (not counted as attempts) and the loop stops before the stores close.
                 await Host.DisposeAsync().ConfigureAwait(false);
+                // Modules that own resources (the Explore mirror's DuckDB connection) close them once no job can use them.
+                foreach (var m in Host.Modules.OfType<IAsyncDisposable>()) await m.DisposeAsync().ConfigureAwait(false);
             }
             finally
             {

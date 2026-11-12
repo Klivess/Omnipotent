@@ -192,9 +192,6 @@ CREATE TABLE projection_cursors(
                 await SetCursorAsync("rollups", cursor, ct).ConfigureAwait(false);
                 await job.ReportProgressAsync(new { cursor, projected }).ConfigureAwait(false);
             }
-            // Consumed outbox rows are trimmed (the outbox is only a queue; the cells themselves are the record).
-            await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "DELETE FROM rollup_changes WHERE seq <= $s AND at_ms < $cut",
-                ("$s", cursor), ("$cut", Context.Clock.NowMs - 86_400_000L)), ct).ConfigureAwait(false);
             return JsonSerializer.Serialize(new { cursor, projected });
         }
 

@@ -309,6 +309,35 @@ namespace Omnipotent.Tests.OmniscienceV3.Temporal
 
         // ── Clock ────────────────────────────────────────────────────────────────
 
+        [Theory]
+        [InlineData("Europe/London")]
+        [InlineData("America/New_York")]
+        [InlineData("Australia/Sydney")]
+        [InlineData("Australia/Lord_Howe")] // half-hour daylight saving
+        [InlineData("Asia/Kathmandu")]      // +05:45, no daylight saving
+        [InlineData("Etc/UTC")]
+        public void OffsetSegments_AgreeWithTheZoneAtEveryInstant(string zoneId)
+        {
+            var zone = Zones.GetOrThrow(zoneId);
+            long from = Instant.FromUtc(new DateTime(2012, 3, 1, 0, 0, 0, DateTimeKind.Utc)), to = Instant.FromUtc(new DateTime(2026, 11, 20, 0, 0, 0, DateTimeKind.Utc));
+            var segments = Zones.OffsetSegments(zone, from, to);
+            Assert.Equal(long.MinValue, segments[0].FromMs);
+            Assert.True(segments.Zip(segments.Skip(1)).All(p => p.First.FromMs < p.Second.FromMs && p.First.OffsetMs != p.Second.OffsetMs));
+            long OffsetFromSegments(long ms) => segments.Last(s => s.FromMs <= ms).OffsetMs;
+            var rng = new Random(11);
+            for (int i = 0; i < 5_000; i++)
+            {
+                long ms = from + (long)(rng.NextDouble() * (to - from));
+                Assert.Equal((long)Zones.OffsetAt(ms, zone).TotalMilliseconds, OffsetFromSegments(ms));
+            }
+            // Exactly at, just before and just after every transition.
+            foreach (var s in segments.Skip(1))
+                foreach (long ms in new[] { s.FromMs - 1000, s.FromMs - 1, s.FromMs, s.FromMs + 1, s.FromMs + 1000 })
+                    Assert.Equal((long)Zones.OffsetAt(ms, zone).TotalMilliseconds, OffsetFromSegments(ms));
+            if (zoneId == "Europe/London") Assert.Equal(31, segments.Count); // 2012 … 2026: the clocks change twice in each of 15 years
+            if (zoneId is "Asia/Kathmandu" or "Etc/UTC") Assert.Single(segments);
+        }
+
         [Fact]
         public void FixedClock_OnlyMovesWhenTold()
         {

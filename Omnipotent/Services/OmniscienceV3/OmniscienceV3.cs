@@ -116,15 +116,21 @@ namespace Omnipotent.Services.OmniscienceV3
         }
 
         /// <summary>The modules this build runs. Workstreams add theirs here.</summary>
-        private static IReadOnlyList<IIntelModule> BuildModules() => new IIntelModule[]
+        private static IReadOnlyList<IIntelModule> BuildModules()
         {
-            // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
-            new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
-            // WS-C: classification, rollups, projections, Explore and signals.
-            new Modules.Classification.ClassificationModule(),
-            new Modules.Rollups.RollupModule(),
-            new Modules.Projections.ProjectionModule(),
-        };
+            var modules = new List<IIntelModule>
+            {
+                // Shadow mode's data source until cutover: v2's database, snapshot then tail (plan R8).
+                new Storage.Legacy.LegacyImportModule(() => Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.OmniscienceDbFile)),
+                // WS-C: classification, rollups, projections, Explore and signals.
+                new Modules.Classification.ClassificationModule(),
+                new Modules.Rollups.RollupModule(),
+                new Modules.Projections.ProjectionModule(),
+            };
+            // Explore mirrors the datasets of every module in this list that offers them (IExploreSourceProvider).
+            modules.Add(new Modules.Explore.ExploreModule(() => modules));
+            return modules;
+        }
 
         private Task<KliveLLM.KliveLLM?> ResolveKliveLlmAsync() =>
             Task.FromResult(GetActiveServices().OfType<KliveLLM.KliveLLM>().FirstOrDefault(s => s.IsServiceActive()));

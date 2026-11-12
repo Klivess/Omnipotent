@@ -184,6 +184,35 @@ export interface ExploreCoverage {
   sampled: boolean;
 }
 
+export interface ExploreExportRequest {
+  format: ExportFormat;
+  drillToken?: string | null;
+  query?: ExploreQuery | null;
+}
+
+export interface ExploreFacetDto {
+  dimension: string;
+  values: ExploreFacetValueDto[];
+}
+
+export interface ExploreFacetValueDto {
+  value: unknown;
+  count: number;
+}
+
+export interface ExploreFacetsDto {
+  dataset: string;
+  facets: ExploreFacetDto[];
+  asOfMs: number;
+}
+
+export interface ExploreFacetsRequest {
+  dataset: string;
+  filters: ExploreFilter[];
+  dimensions: string[];
+  limit: number;
+}
+
 export interface ExploreFilter {
   dimension: string;
   op: FilterOp;
@@ -227,6 +256,8 @@ export interface ExploreResult {
   drillToken?: string | null;
   explain: string;
 }
+
+export type ExportFormat = "Csv" | "Json" | "Parquet";
 
 export type FilterOp = "Eq" | "NotEq" | "In" | "NotIn" | "Between" | "Gte" | "Lte" | "Contains" | "IsNull" | "IsNotNull";
 

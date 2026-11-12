@@ -60,6 +60,10 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
             built += await BuildDirtyAsync(job, ct, Budget - sw.Elapsed).ConfigureAwait(false);
             await job.ReportProgressAsync(new { cursor, upper, marked, built }).ConfigureAwait(false);
             if (built > 0) await KickProjectionsAsync(ct).ConfigureAwait(false);
+            // The outbox is a queue with several consumers (projections, the Explore mirror): rows live a week; a consumer
+            // that falls further behind rebuilds from the cells.
+            await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "DELETE FROM rollup_changes WHERE at_ms < $cut",
+                ("$cut", Context.Clock.NowMs - 7 * 86_400_000L)), ct).ConfigureAwait(false);
             return JsonSerializer.Serialize(new { cursor, upper, marked, built });
         }
 
@@ -464,7 +468,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                 if (m.Attachments > 0) withAttachments++;
                 if (shape.Urls > 0) withLinks++;
                 switch (m.ConversationKind) { case "dm": dm++; break; case "group_dm": group++; break; default: server++; break; }
-                if (m.TimeQuality >= (int)TimeQuality.Day) dayOnly++;
+                // R4: day-precision times have no hour; legacy times of unknown zone have no trustworthy hour. Zone-inferred
+                // imports (WhatsApp) keep their recorded wall-clock hour.
+                if (m.TimeQuality is (int)TimeQuality.Day or (int)TimeQuality.LegacyUnknownZone) dayOnly++;
                 else hours[Zones.ToLocal(m.SentAtMs, ZoneOf(person, m.SentAtMs) ?? TimeZoneInfo.Utc).Hour]++;
                 conversations[m.ConversationId] = conversations.GetValueOrDefault(m.ConversationId) + 1;
                 if (m.GuildId != null) guilds[m.GuildId] = guilds.GetValueOrDefault(m.GuildId) + 1;

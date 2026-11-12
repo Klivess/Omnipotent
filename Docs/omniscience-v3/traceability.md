@@ -68,7 +68,7 @@ Items: 560
 | F058 | Client & infrastructure | TEMPORAL,UI | `useOmniscienceApi.ts:109-116`: `formatDate` uses the browser locale with no zone label or lens. → one timezone-lens formatter with an ISO tooltip. |  |  | planned |
 | F059 | Client & infrastructure | TEMPORAL | `useOmniscienceApi.ts:118-123`: date pickers produce UTC `T00:00Z`/`T23:59:59.999Z` instead of the viewer's day. → boundaries computed in the chosen zone; exclusive `to` + `tz` sent. |  |  | planned |
 | F060 | Client & infrastructure | UI | `useOmniscienceApi.ts:102,109,118`: generic helpers are auto-imported site-wide (`.nuxt/imports.d.ts:42`). → moved to `scripts/` or prefixed. |  |  | planned |
-| F061 | Client & infrastructure | PERF | `useOmniscienceApi.ts:83-94` + BE `Workspace/WorkspaceRoutes.cs:29-33,97-98`: exports are JSON-wrapped strings, double-buffered and capped by the 25 s GET timeout. → streamed file responses (`downloadFile` pattern). |  |  | planned |
+| F061 | Client & infrastructure | PERF | `useOmniscienceApi.ts:83-94` + BE `Workspace/WorkspaceRoutes.cs:29-33,97-98`: exports are JSON-wrapped strings, double-buffered and capped by the 25 s GET timeout. → streamed file responses (`downloadFile` pattern). | Backend: `explore/export` streams a file (Api/WsCRoutes); website download still to be moved onto it (WS-E) | ExploreTests.FacetsExportsAndValidation | in-progress |
 | F062 | Client & infrastructure | UI | `nuxt.config.ts:11-26`: no `ssr:false` rule for `/omniscience*`. → add it. |  |  | planned |
 | F063 | Client & infrastructure | UI | `nuxt.config.ts:54-55`: `main.scss` is listed twice. → dedupe. |  |  | planned |
 | F064 | Client & infrastructure | UI | `nuxt.config.ts:60` + `assets/scss/omniscience.scss`: a separate global `--os-*` design system loads on every page. → `.ot-os`. |  |  | planned |
@@ -155,7 +155,7 @@ Items: 560
 | F145 | Explore & components | CONTEXT | `Investigate.vue:20,24`: the conversation filter is a free-text internal id; platforms are hard-coded. → pickers from facets. |  |  | planned |
 | F146 | Explore & components | UI | `Investigate.vue:35,49-53`: no total, sort, or page-size choice. → DataTable. |  |  | planned |
 | F147 | Explore & components | CONTEXT,TEMPORAL | `Investigate.vue:37-46`: no "open in context" (though `conversations/messages` exists), nothing click-to-filter, zoneless times. → context drawer. |  |  | planned |
-| F148 | Explore & components | CORRECTNESS | `Investigate.vue:172-177`: CSV exports the current form state, not the query behind the results. → export by query fingerprint. |  |  | planned |
+| F148 | Explore & components | CORRECTNESS | `Investigate.vue:172-177`: CSV exports the current form state, not the query behind the results. → export by query fingerprint. | Backend: `explore/export` exports by drill token or query, never by form state (Modules/Explore); website export still to be moved onto it (WS-E) | ExploreTests.FacetsExportsAndValidation | in-progress |
 | F149 | Explore & components | UI | `Investigate.vue:124`: the save name keeps the first query's name. → fixed. |  |  | planned |
 | F150 | Explore & components | CORRECTNESS | `CommandPalette.vue:94` + `Investigate.vue:125,159` + BE `Workspace/WorkspaceStore.cs:62-69`: one palette run adds 2 to `use_count` and writes 3 history rows. → single accounting path. |  |  | planned |
 | F151 | Explore & components | UI | `CommandPalette.vue:67-72`: only four navigation actions; no commands. → tactics palette. |  |  | planned |
@@ -492,8 +492,8 @@ Items: 560
 | F482 | Analytics engine | CORRECTNESS | `Analytics/IPersonAnalyticModule.cs:19-20`: a version bump triggers nothing. → module-version re-plan. | Kernel/ModuleHost.cs version bump | KernelTests.VersionBump_* | fixed |
 | F483 | Analytics engine | CORRECTNESS | `AnalyticsEngine.cs:44-46`: dependencies by list order; possibly a stale timezone row. → DAG. | Kernel/ModuleHost.cs DAG | KernelTests.DependencyCycles_* | fixed |
 | F484 | Analytics engine | TEMPORAL | `Analytics/AnalyticHelpers.cs:81-85`: loads deleted, bot and system messages; no sort tiebreak. → filtered views + (sent_at, seq). |  |  | planned |
-| F485 | Analytics engine | CONTEXT | `Analytics/TemporalWeighting.cs:61`: facets keyed by guild *name*; no per-partner facet. → guild_id + partner dims. |  |  | planned |
-| F486 | Analytics engine | CONTEXT | `TemporalWeighting.cs:89-92,105-114`: top-8 facets only; compaction drops arrays. → Explore over all dims. |  |  | planned |
+| F485 | Analytics engine | CONTEXT | `Analytics/TemporalWeighting.cs:61`: facets keyed by guild *name*; no per-partner facet. → guild_id + partner dims. | Modules/Explore (messages dataset: server by id, `person.partner` dimension) | ExploreTests.Mirror_HoldsEveryHumanMessageOnceAndCountsMatch | fixed |
+| F486 | Analytics engine | CONTEXT | `TemporalWeighting.cs:89-92,105-114`: top-8 facets only; compaction drops arrays. → Explore over all dims. | Modules/Explore: group-by and `explore/facets` over every declared dimension, no top-N cut | ExploreTests.FacetsExportsAndValidation | fixed |
 | F487 | Analytics engine | TEMPORAL | `TemporalWeighting.cs:18-25`: static config read once. → per-run parameters. | Temporal/Windows.cs DecayParameters | TemporalTests.Decay_* | fixed |
 | F488 | Analytics engine | PERF | `Analytics/ActivitySummaryStore.cs:49-90`: full rebuild inside the lock; Ready flag never re-checked. → incremental rollups. |  |  | planned |
 | F489 | Analytics engine | CONTEXT | `ActivitySummaryStore.cs:106-145`: counts include deletes; no per-day/hour/server summaries. → rollups by D2 dims. |  |  | planned |
@@ -560,11 +560,11 @@ Items: 560
 | F550 | Routes | CORRECTNESS | `Deduction/DeductionRoutes.cs:705-763`: link-merge skips the count rebuild and keeps an arbitrary id. → canonical survivor rules. |  |  | planned |
 | F551 | Routes | PERF | `DeductionRoutes.cs:61-79`: alias conclusions computed per request. → projection. |  |  | planned |
 | F552 | Routes | PERF | `Workspace/WorkspaceRoutes.cs:129-134`: synchronous, ungated routes. → async read pool. |  |  | planned |
-| F553 | Routes | PERF | `Workspace/WorkspaceExplorer.cs:173-175,186-187`: date-only scopes do full scans. → Explore engine. |  |  | planned |
+| F553 | Routes | PERF | `Workspace/WorkspaceExplorer.cs:173-175,186-187`: date-only scopes do full scans. → Explore engine. | Modules/Explore (columnar mirror; 5M rows, 3 filters + 2 group-bys: p95 290 ms on the dev machine) | ExploreTests.FiveMillionRows_ThreeFiltersTwoGroupBysUnderBudget (opt-in) | fixed |
 | F554 | Routes | TEMPORAL | `WorkspaceExplorer.cs:237-241`: facts on the timeline at extraction time. → valid/asserted time (T2). |  |  | planned |
-| F555 | Routes | TEMPORAL | `WorkspaceExplorer.cs:283,294`: UTC strftime buckets. → zone lens. |  |  | planned |
+| F555 | Routes | TEMPORAL | `WorkspaceExplorer.cs:283,294`: UTC strftime buckets. → zone lens. | Modules/Explore time lens (Klives, subject, UTC or any IANA zone; DST from Temporal/Zones.OffsetSegments) | ExploreTests.KlivesLens_DaysFollowDstAndUtcLensDiffers; TemporalTests.OffsetSegments_AgreeWithTheZoneAtEveryInstant | fixed |
 | F556 | Routes | PERF | `WorkspaceExplorer.cs:459-462`: heavy health counts per request. → health read model. |  |  | planned |
-| F557 | Routes | CORRECTNESS | `WorkspaceExplorer.cs:501`: CSV silently capped at 200 rows. → streamed full export. |  |  | planned |
+| F557 | Routes | CORRECTNESS | `WorkspaceExplorer.cs:501`: CSV silently capped at 200 rows. → streamed full export. | Modules/Explore.ExportAsync + `POST explore/export` (CSV, JSON lines, Parquet; every record) | ExploreTests.FacetsExportsAndValidation | fixed |
 | F558 | Routes | PERF | `ReplicaRoutes.cs:160,199,241`: LLM generation and era rebuilds on request. → jobs/streams. |  |  | planned |
 | F559 | Routes | TEMPORAL | All route files: mixed epoch-ms and ISO times. → one epoch-ms contract (T1). | Api/TypeScriptContracts (rejects DateTime/TimeSpan members); ApiQuery.Instant (offset required) | ApiTests.Contracts_RejectWallClockTypes; Query_InstantsNeedAnOffsetAndWindowsMustBeOrdered | fixed |
 | F560 | Routes | RELIABILITY | `KliveAPI.cs:1595-1603`: `SameHandler` ignores re-registration, so old closures may answer after an in-process restart (unverified). → test service restart. |  |  | planned |

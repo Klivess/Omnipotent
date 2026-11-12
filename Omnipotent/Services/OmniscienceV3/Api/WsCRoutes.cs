@@ -94,6 +94,45 @@ namespace Omnipotent.Services.OmniscienceV3.Api
 
             await Get("classify/concepts", OmnisciencePerms.OverviewView, req => ApiResponses.OkAsync(req, new ConceptListDto(Module<ClassificationModule>().Concepts()
                 .Select(c => new ConceptDto(c.ConceptId, c.Name, c.Description, c.State, c.HeadVersion, c.Threshold, c.Hits, c.UpdatedAtMs)).ToList())), ct).ConfigureAwait(false);
+
+            var more = new List<Func<CancellationToken, Task>>();
+            RegisterExplore(more);
+            foreach (var register in more) await register(ct).ConfigureAwait(false);
+        }
+
+        private static bool May(UserRequest req, string permissionKey) => PermissionCatalog.Get(permissionKey) is { } p && req.Can(p);
+
+        private void RegisterExplore(List<Func<CancellationToken, Task>> list)
+        {
+            list.Add(ct => Post("explore/facets", OmnisciencePerms.OverviewView, async req =>
+            {
+                var body = ApiBody.Read<Modules.Explore.ExploreFacetsRequest>(req);
+                var engine = Module<Modules.Explore.ExploreModule>();
+                await ApiResponses.OkAsync(req, await engine.FacetsAsync(body, k => May(req, k), host.Stopping).ConfigureAwait(false)).ConfigureAwait(false);
+            }, ct));
+            list.Add(ct => Post("explore/export", OmniscienceV3Perms.DataExport, async req =>
+            {
+                var body = ApiBody.Read<Modules.Explore.ExploreExportRequest>(req);
+                var engine = Module<Modules.Explore.ExploreModule>();
+                string ext = body.Format switch { Modules.Explore.ExportFormat.Csv => "csv", Modules.Explore.ExportFormat.Json => "jsonl", _ => "parquet" };
+                string path = Path.Combine(Path.GetTempPath(), "omniv3-export-" + Guid.NewGuid().ToString("N") + "." + ext);
+                try
+                {
+                    await engine.ExportAsync(body, k => May(req, k), path, host.Stopping).ConfigureAwait(false);
+                    Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("omniscience-v3: export");
+                    var info = new FileInfo(path);
+                    string type = body.Format switch { Modules.Explore.ExportFormat.Csv => "text/csv; charset=utf-8", Modules.Explore.ExportFormat.Json => "application/x-ndjson; charset=utf-8", _ => "application/vnd.apache.parquet" };
+                    var headers = new System.Collections.Specialized.NameValueCollection { ["Content-Disposition"] = $"attachment; filename=\"omniscience-export.{ext}\"", ["Cache-Control"] = "no-store" };
+                    var stream = req.PrepareStreamResponse(type, info.Exists ? info.Length : 0, System.Net.HttpStatusCode.OK, headers);
+                    await using (var file = File.OpenRead(path)) await file.CopyToAsync(stream, host.Stopping).ConfigureAwait(false);
+                    await stream.FlushAsync(host.Stopping).ConfigureAwait(false);
+                }
+                finally
+                {
+                    try { File.Delete(path); }
+                    catch (IOException ex) { System.Diagnostics.Debug.WriteLine("export temp file not deleted: " + ex.Message); }
+                }
+            }, ct, maxBody: RouteRegistrar.DefaultMaxBodyBytes));
         }
 
         private T Module<T>() where T : class =>
@@ -154,7 +193,7 @@ namespace Omnipotent.Services.OmniscienceV3.Api
         private Task Get(string path, PermissionDef permission, Func<UserRequest, Task> handler, CancellationToken ct) =>
             registrar.RouteAsync(V3Routes.Prefix + "/" + path, HttpMethod.Get, permission, handler, RouteRegistrar.DefaultMaxBodyBytes, ct);
 
-        private Task Post(string path, PermissionDef permission, Func<UserRequest, Task> handler, CancellationToken ct) =>
-            registrar.RouteAsync(V3Routes.Prefix + "/" + path, HttpMethod.Post, permission, handler, RouteRegistrar.DefaultMaxBodyBytes, ct);
+        private Task Post(string path, PermissionDef permission, Func<UserRequest, Task> handler, CancellationToken ct, long maxBody = RouteRegistrar.DefaultMaxBodyBytes) =>
+            registrar.RouteAsync(V3Routes.Prefix + "/" + path, HttpMethod.Post, permission, handler, maxBody, ct);
     }
 }
