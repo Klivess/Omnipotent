@@ -19,8 +19,12 @@ public enum LlmStamp
 /// <summary>A JSON schema the model must answer with (forced single tool call).</summary>
 public sealed record LlmOutputSchema(string Name, string Description, JObject Schema);
 
-/// <summary>One conversation turn. Roles: "user" or "assistant".</summary>
-public sealed record LlmTurn(string Role, string Content);
+/// <summary>An image sent with a user turn: encoded bytes (JPEG or PNG) and their media type.</summary>
+public sealed record LlmImage(byte[] Data, string MimeType);
+
+/// <summary>One conversation turn. Roles: "user" or "assistant". Only a user turn may carry <paramref name="Images"/>
+/// (Omniscience v3's captions); the caller keeps them small (AIRouter refuses bodies of about 4 MB).</summary>
+public sealed record LlmTurn(string Role, string Content, IReadOnlyList<LlmImage>? Images = null);
 
 /// <summary>A gateway request. Stateless by default; <see cref="KeepSession"/> enables "prefill once, ask
 /// many": later calls with the same <see cref="SessionKey"/> append to the same prefix.</summary>
@@ -187,20 +191,7 @@ public partial class KliveLLM
         string provider = "", model = request.Model ?? "";
         try
         {
-            foreach (var turn in request.Turns)
-            {
-                if (turn.Role == "assistant") { AppendAssistantMessageToToolSession(sid, turn.Content); continue; }
-                if (turn.Role != "user") throw new ArgumentException($"Unsupported role '{turn.Role}'.", nameof(request));
-                switch (request.Stamp)
-                {
-                    case LlmStamp.Now: AppendUserMessageToToolSession(sid, turn.Content); break;
-                    case LlmStamp.AsOf when request.AsOfMs is long asOf:
-                        var at = DateTimeOffset.FromUnixTimeMilliseconds(asOf).UtcDateTime;
-                        AppendCacheStableWakeSeedToToolSession(sid, $"[as of {TemporalFormat.Stamp(at)}] {turn.Content}");
-                        break;
-                    default: AppendCacheStableWakeSeedToToolSession(sid, turn.Content); break;
-                }
-            }
+            AppendGatewayTurns(sid, request);
 
             var tools = new List<HFWrapper.HFTool>();
             object? toolChoice = null;
@@ -274,6 +265,30 @@ public partial class KliveLLM
 
     /// <summary>Ends a KeepSession conversation (releases its message log).</summary>
     public void EndGatewaySession(string sessionKey) => ResetSession(sessionKey);
+
+    /// <summary>
+    /// Appends a request's turns to its session, stamped as the request says. A user turn with images goes in as one
+    /// message of text and image parts, kept exactly as sent: no older image is flattened, so the prefix stays byte-identical.
+    /// </summary>
+    internal void AppendGatewayTurns(string sid, LlmRequest request)
+    {
+        foreach (var turn in request.Turns)
+        {
+            if (turn.Role == "assistant") { AppendAssistantMessageToToolSession(sid, turn.Content); continue; }
+            if (turn.Role != "user") throw new ArgumentException($"Unsupported role '{turn.Role}'.", nameof(request));
+            string asOfText = request.Stamp == LlmStamp.AsOf && request.AsOfMs is long asOf
+                ? $"[as of {TemporalFormat.Stamp(DateTimeOffset.FromUnixTimeMilliseconds(asOf).UtcDateTime)}] {turn.Content}"
+                : turn.Content;
+            if (turn.Images is { Count: > 0 } images)
+            {
+                AppendUserContentToToolSession(sid, asOfText, images.Select(i => (i.Data, i.MimeType)).ToList(), keepRecentImages: int.MaxValue,
+                    preservePromptPrefix: true, stampReceipt: request.Stamp == LlmStamp.Now);
+                continue;
+            }
+            if (request.Stamp == LlmStamp.Now) AppendUserMessageToToolSession(sid, turn.Content);
+            else AppendCacheStableWakeSeedToToolSession(sid, asOfText);
+        }
+    }
 
     private static LlmResult Fail(LlmErrorKind kind, string? message, KliveLLMResponse r, long latencyMs, string? structured = null) =>
         new(false, r.Response, structured, kind, message, r.FinishReason, r.Model, r.Provider,

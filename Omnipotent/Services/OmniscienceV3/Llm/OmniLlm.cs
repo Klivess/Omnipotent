@@ -60,7 +60,8 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
 
             if (result.Success)
             {
-                Estimator.Calibrate(string.Concat(request.Turns.Select(t => t.Content)) + request.SystemPrompt, result.PromptTokens);
+                // Image tokens are not text: a call that carried images would teach the estimator a wrong ratio.
+                if (!HasImages(request)) Estimator.Calibrate(string.Concat(request.Turns.Select(t => t.Content)) + request.SystemPrompt, result.PromptTokens);
                 return result;
             }
 
@@ -86,13 +87,19 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
             AIRouterWorkClass workClass, string? promptVersion = null, long? jobId = null) =>
             new(this, client, moduleId, purpose, sessionKey, systemPrompt, stablePrefix, workClass, promptVersion, jobId);
 
-        /// <summary>Omniscience's own prefix-cache efficiency over a window (cached / prompt tokens).</summary>
+        private static bool HasImages(LlmRequest request) => request.Turns.Any(t => t.Images is { Count: > 0 });
+
+        /// <summary>
+        /// Omniscience's own prefix-cache efficiency over a window (cached / prompt tokens). Calls that carried images are
+        /// left out: each sends a different picture, which no prefix cache can serve, so they would only drag the measure
+        /// down and pause the background work it guards.
+        /// </summary>
         public (double Efficiency, int Samples) CacheEfficiency(TimeSpan window, string? workClass = null)
         {
             using var c = intel.OpenRead();
             var row = c.Query(null, """
                 SELECT COALESCE(SUM(cached_tokens),0), COALESCE(SUM(prompt_tokens),0), COUNT(*) FROM llm_calls
-                WHERE at_ms >= $since AND outcome='ok' AND ($w IS NULL OR work_class=$w)
+                WHERE at_ms >= $since AND outcome='ok' AND ($w IS NULL OR work_class=$w) AND images = 0
                 """, r => (Cached: r.GetInt64(0), Prompt: r.GetInt64(1), N: r.GetInt32(2)),
                 ("$since", clock.NowMs - (long)window.TotalMilliseconds), ("$w", workClass)).Single();
             return (row.Prompt == 0 ? 1.0 : (double)row.Cached / row.Prompt, row.N);
@@ -101,13 +108,14 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         private Task LogAsync(LlmCall call, LlmRequest request, LlmResult r, CancellationToken ct) =>
             intel.WriteAsync((c, tx) => c.Exec(tx, """
                 INSERT INTO llm_calls(at_ms, module_id, purpose, job_id, model, provider, work_class, prompt_tokens, cached_tokens,
-                                      completion_tokens, request_bytes, latency_ms, outcome, finish_reason, prompt_version, error)
-                VALUES($at,$m,$p,$j,$model,$prov,$wc,$pt,$ct,$cpt,$b,$lat,$o,$fr,$pv,$err)
+                                      completion_tokens, request_bytes, latency_ms, outcome, finish_reason, prompt_version, error, images)
+                VALUES($at,$m,$p,$j,$model,$prov,$wc,$pt,$ct,$cpt,$b,$lat,$o,$fr,$pv,$err,$img)
                 """,
                 ("$at", clock.NowMs), ("$m", call.ModuleId), ("$p", call.Purpose), ("$j", call.JobId), ("$model", r.Model), ("$prov", r.Provider),
                 ("$wc", request.WorkClass.ToString()), ("$pt", r.PromptTokens), ("$ct", r.CachedTokens), ("$cpt", r.CompletionTokens),
                 ("$b", r.RequestBytes), ("$lat", r.LatencyMs), ("$o", r.Success ? "ok" : r.ErrorKind.ToString()), ("$fr", r.FinishReason),
-                ("$pv", call.PromptVersion), ("$err", r.ErrorMessage is { Length: > 2000 } e ? e[..2000] : r.ErrorMessage)), ct);
+                ("$pv", call.PromptVersion), ("$err", r.ErrorMessage is { Length: > 2000 } e ? e[..2000] : r.ErrorMessage),
+                ("$img", request.Turns.Sum(t => t.Images?.Count ?? 0))), ct);
     }
 
     /// <summary>

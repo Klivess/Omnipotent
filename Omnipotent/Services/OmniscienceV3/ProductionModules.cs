@@ -37,6 +37,7 @@ namespace Omnipotent.Services.OmniscienceV3
                 // An expired Discord link is refreshed through the bot API, only once Discord capture is switched on (F403).
                 new Ingest.Media.MediaModule(links: () => discord.LinkRefresher),
                 new Ingest.Media.MediaTextModule(inputs.Transcriber),
+                new Ingest.Media.MediaCaptionModule(),
                 discord,
                 // WS-C: classification, rollups, projections, Explore and signals.
                 new Modules.Classification.ClassificationModule(),

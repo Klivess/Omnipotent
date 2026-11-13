@@ -176,6 +176,10 @@ CREATE TABLE labels(
 );
 CREATE INDEX ix_labels_task_label ON labels(task, label);
 """),
+            // Calls that carried images (captions) are counted apart: no prefix cache can serve a different picture.
+            new Migration(ModuleId, 2, "llm_calls.images", """
+ALTER TABLE llm_calls ADD COLUMN images INTEGER NOT NULL DEFAULT 0;
+"""),
         };
     }
 }
