@@ -100,6 +100,17 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             // An attachment's bytes, by attachment id. Whoever may read messages may see what was attached to them.
             await Get("media/file", OmnisciencePerms.MessagesRead, req => ServeMediaAsync(req, thumbnail: false), ct).ConfigureAwait(false);
             await Get("media/thumb", OmnisciencePerms.MessagesRead, req => ServeMediaAsync(req, thumbnail: true), ct).ConfigureAwait(false);
+            // Visual search (N2): images by how they look and by what their captions and the text in them say.
+            await Get("media/search", OmnisciencePerms.MessagesRead, async req =>
+            {
+                var q = ApiQuery.Of(req);
+                var (from, to) = q.Window();
+                var module = host.Require().Host.Modules.OfType<Ingest.Media.MediaVisualModule>().FirstOrDefault()
+                             ?? throw ApiException.Unavailable(ApiErrors.Unavailable, "Visual search is not part of this build.");
+                var result = await module.SearchAsync(new Ingest.Media.MediaSearchQuery(q.Required("q", 300), q.Str("person", 256), q.Str("conversation", 256), from, to,
+                    q.Int("limit", 40, 1, 100)), host.Stopping).ConfigureAwait(false);
+                await ApiResponses.OkAsync(req, result).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
         }
 
         private async Task ServeMediaAsync(UserRequest req, bool thumbnail)

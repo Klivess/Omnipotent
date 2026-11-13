@@ -38,6 +38,7 @@ namespace Omnipotent.Services.OmniscienceV3
                 new Ingest.Media.MediaModule(links: () => discord.LinkRefresher),
                 new Ingest.Media.MediaTextModule(inputs.Transcriber),
                 new Ingest.Media.MediaCaptionModule(),
+                new Ingest.Media.MediaVisualModule(),
                 discord,
                 // WS-C: classification, rollups, projections, Explore and signals.
                 new Modules.Classification.ClassificationModule(),

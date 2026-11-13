@@ -1560,6 +1560,29 @@ export interface MeasureDescriptor {
   unit: string;
 }
 
+export interface MediaSearchDto {
+  query: string;
+  hits: MediaSearchHitDto[];
+  visualAvailable: boolean;
+  imagesEmbedded: number;
+  note?: string | null;
+}
+
+export interface MediaSearchHitDto {
+  attachmentId: string;
+  messageId: string;
+  conversationId: string;
+  authorPersonId?: string | null;
+  authorName?: string | null;
+  sentAtMs: number;
+  deleted: boolean;
+  caption?: string | null;
+  tags: string[];
+  imageText?: string | null;
+  score: number;
+  why: string[];
+}
+
 export interface MergeRequest {
   personA: string;
   personB: string;
