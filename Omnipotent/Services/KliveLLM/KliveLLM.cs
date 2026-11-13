@@ -1952,6 +1952,8 @@ namespace Omnipotent.Services.KliveLLM
                     CompletionTokens = response.usage?.completion_tokens ?? 0,
                     GenerationId = response.id,
                     CostUsd = response.usage?.cost,
+                    // Without it a caller cannot tell a finished reply from one its max_tokens cut off.
+                    FinishReason = response.choices[0].finish_reason,
                 };
             }
         }
@@ -3827,7 +3829,7 @@ namespace Omnipotent.Services.KliveLLM
 
             /// <summary>The provider's finish_reason for this turn ("stop", "tool_calls", "length"…). "length"
             /// means the reply hit the output cap: its text, and any tool call still being written, are cut off.
-            /// Null when the provider did not report one. Only set on tool-session turns.</summary>
+            /// Null when the provider did not report one, and on the local model.</summary>
             public string? FinishReason { get; set; }
 
             /// <summary>This call's row in the KliveLLM ledger.</summary>

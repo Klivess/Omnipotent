@@ -111,7 +111,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                 var voiceSamples = SampleAcrossEras(allMessages.Where(m => !string.IsNullOrWhiteSpace(m.Content) && m.Content!.Length >= 3).ToList(), MaxMessagesForVoice);
                 dossier.VoiceRulebookMarkdown = await CallLLM(llm,
                     ReplicaPromptBuilder.BuildVoicePrompt(person.DisplayName, person.Handles, voiceSamples.Select(WithEraLabel).ToList()),
-                    ReplicaPromptBuilder.VoiceSystemPrompt, 2048, ct);
+                    ReplicaPromptBuilder.VoiceSystemPrompt, ct);
                 dossier.Stats.MessagesUsedForVoice = voiceSamples.Count;
 
                 // ── Stage 2: opinions ──
@@ -122,7 +122,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                     // We use one shot: feed everything as a single "general" cluster. Topical
                     // clustering is a future improvement; for now the LLM organises the ledger.
                     string opinionPrompt = ReplicaPromptBuilder.BuildOpinionPrompt(person.DisplayName, "all topics combined", opinionSamples.Select(WithEraLabel).ToList());
-                    dossier.OpinionLedgerMarkdown = await CallLLM(llm, opinionPrompt, ReplicaPromptBuilder.OpinionSystemPrompt, 2048, ct);
+                    dossier.OpinionLedgerMarkdown = await CallLLM(llm, opinionPrompt, ReplicaPromptBuilder.OpinionSystemPrompt, ct);
                     dossier.Stats.MessagesUsedForOpinions = opinionSamples.Count;
                 }
 
@@ -141,7 +141,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                 {
                     dossier.RelationalMapMarkdown = await CallLLM(llm,
                         ReplicaPromptBuilder.BuildRelationalPrompt(person.DisplayName, relationalEvidence),
-                        ReplicaPromptBuilder.RelationalSystemPrompt, 2048, ct);
+                        ReplicaPromptBuilder.RelationalSystemPrompt, ct);
                 }
 
                 // ── Stage 6: forbidden patterns ──
@@ -221,7 +221,7 @@ namespace Omnipotent.Services.Omniscience.Replica
                 {
                     string raw = await CallLLM(llm,
                         ReplicaPromptBuilder.BuildReflexClassifierPrompt(pair.StimulusContent!),
-                        ReplicaPromptBuilder.ReflexClassifierSystemPrompt, 32, ct, useFreeModel: true);
+                        ReplicaPromptBuilder.ReflexClassifierSystemPrompt, ct, useFreeModel: true);
                     label = NormaliseReflexLabel(raw);
                 }
                 catch
@@ -773,13 +773,13 @@ namespace Omnipotent.Services.Omniscience.Replica
             return stats;
         }
 
-        private static async Task<string> CallLLM(KliveLLM.KliveLLM llm, string prompt, string systemPrompt, int maxTokens, CancellationToken ct, bool useFreeModel = false)
+        private static async Task<string> CallLLM(KliveLLM.KliveLLM llm, string prompt, string systemPrompt, CancellationToken ct, bool useFreeModel = false)
         {
             ct.ThrowIfCancellationRequested();
-            var resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: maxTokens,
-                systemPrompt: systemPrompt, useFreeModel: useFreeModel, cancellationToken: ct);
+            var resp = await OmniscienceLlm.AskAsync(llm, prompt, systemPrompt, useFreeModel, ct);
             if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response))
-                throw new InvalidOperationException("KliveLLM returned empty/unsuccessful response.");
+                throw new InvalidOperationException("KliveLLM returned empty/unsuccessful response."
+                    + (string.IsNullOrWhiteSpace(resp.ErrorMessage) ? "" : " " + resp.ErrorMessage));
             return resp.Response.Trim();
         }
     }

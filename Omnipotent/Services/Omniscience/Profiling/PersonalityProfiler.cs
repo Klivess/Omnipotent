@@ -130,7 +130,7 @@ namespace Omnipotent.Services.Omniscience.Profiling
             KliveLLM.KliveLLM.KliveLLMResponse resp;
             try
             {
-                resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 2048, systemPrompt: ProfilePromptBuilder.SystemPrompt, useFreeModel: true);
+                resp = await OmniscienceLlm.AskAsync(llm, prompt, ProfilePromptBuilder.SystemPrompt, useFreeModel: true);
             }
             catch (Exception ex)
             {
@@ -163,8 +163,7 @@ namespace Omnipotent.Services.Omniscience.Profiling
             try
             {
                 string bioPrompt = ProfilePromptBuilder.BuildBiographical(displayName, handlesJoined, statsBundle, trimmed);
-                var bioResp = await llm.QueryLLM(bioPrompt, sessionId: null, maxTokensOverride: 1536,
-                    systemPrompt: ProfilePromptBuilder.BiographicalSystemPrompt, useFreeModel: true);
+                var bioResp = await OmniscienceLlm.AskAsync(llm, bioPrompt, ProfilePromptBuilder.BiographicalSystemPrompt, useFreeModel: true);
                 if (bioResp.Success && !string.IsNullOrWhiteSpace(bioResp.Response))
                     biographical = bioResp.Response.Trim();
             }
@@ -229,8 +228,8 @@ namespace Omnipotent.Services.Omniscience.Profiling
                 "List ONLY meaningful changes (new traits, dropped traits, shifted assessments, new facts) as terse markdown bullets. " +
                 "If nothing meaningfully changed, output exactly: no significant changes.\n\n" +
                 "## PREVIOUS\n" + Truncate(previousMarkdown, 5000) + "\n\n## NEW\n" + Truncate(newMarkdown, 5000);
-            var resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 600,
-                systemPrompt: "You diff personality dossiers. Be terse and concrete.", useFreeModel: true);
+            var resp = await OmniscienceLlm.AskAsync(llm, prompt,
+                "You diff personality dossiers. Be terse and concrete.", useFreeModel: true);
             if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response)) return;
             string changes = resp.Response.Trim();
             if (changes.Length < 4) return;
@@ -305,8 +304,7 @@ namespace Omnipotent.Services.Omniscience.Profiling
             var llms = await service.GetServicesByType<KliveLLM.KliveLLM>();
             if (llms == null || llms.Length == 0) return false;
             var llm = (KliveLLM.KliveLLM)llms[0];
-            var resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 1800,
-                systemPrompt: ProfilePromptBuilder.EraSystemPrompt, useFreeModel: true, cancellationToken: ct);
+            var resp = await OmniscienceLlm.AskAsync(llm, prompt, ProfilePromptBuilder.EraSystemPrompt, useFreeModel: true, ct);
             if (!resp.Success || string.IsNullOrWhiteSpace(resp.Response)) return false;
 
             string narrative = resp.Response;
