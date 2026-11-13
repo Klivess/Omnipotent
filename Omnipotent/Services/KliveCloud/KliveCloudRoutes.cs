@@ -2,6 +2,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Profiles;
 using Omnipotent.Profiles.Permissions;
+using Omnipotent.Services.KliveAPI;
 using Omnipotent.Services.KliveAPI.Caching;
 using System.Collections.Specialized;
 using System.Net;
@@ -62,27 +63,16 @@ namespace Omnipotent.Services.KliveCloud
             return Enum.TryParse(rawMode, true, out mode);
         }
 
-        private async Task StreamVideoFile(UserRequest req, CloudItem item)
+        private Task<SendResult> StreamVideoFile(UserRequest req, CloudItem item)
         {
             string filePath = parent.GetFullItemPath(item);
-            await StreamVideoPath(req, filePath, parent.GetVideoMimeType(item));
+            return StreamFileToClient(req, filePath, parent.GetVideoMimeType(item), null);
         }
 
-        private Task StreamVideoPath(UserRequest req, string filePath, string mimeType)
-        {
-            return StreamFileToClient(req, filePath, mimeType, null);
-        }
+        private static string BuildAttachmentDisposition(string fileName) => KliveCloudTransfer.Disposition(fileName, inline: false);
 
-        /// <summary>
-        /// Builds a Content-Disposition that survives a non-ASCII name. The plain
-        /// filename stays for old clients; modern browsers prefer the RFC 5987
-        /// filename* form and get the name exactly as stored.
-        /// </summary>
-        private static string BuildAttachmentDisposition(string fileName)
-        {
-            string ascii = new string(fileName.Select(c => c < 32 || c > 126 || c == '"' ? '_' : c).ToArray());
-            return $"attachment; filename=\"{ascii}\"; filename*=UTF-8''{Uri.EscapeDataString(fileName)}";
-        }
+        /// <summary>What sending a file came to: whether the body started, how much of it left, and why it stopped.</summary>
+        internal readonly record struct SendResult(bool Started, bool Partial, long BytesSent, KliveCloudTransfer.PumpOutcome Outcome);
 
         /// <summary>
         /// Sends a file from disk to the client a buffer at a time, honouring HTTP Range.
@@ -94,111 +84,95 @@ namespace Omnipotent.Services.KliveCloud
         /// at all. Streaming makes time-to-first-byte independent of file size and keeps
         /// server memory flat.
         ///
-        /// Advertising Accept-Ranges is what lets a browser or download manager resume a
-        /// large transfer instead of restarting it from zero when the connection drops.
+        /// Accept-Ranges alone doesn't let a browser resume: it also needs a validator to
+        /// send back in If-Range, so every file goes out with an ETag and Last-Modified.
+        /// Before they were added, an interrupted 241 MB download started again from zero
+        /// five times in a row (8 Nov 2026).
+        ///
+        /// Once the body has started, nothing is thrown or written as an error any more. A
+        /// client that hangs up (the usual way a download ends early) used to reach the
+        /// route's catch, which wrote a 500 into the half-sent response: telemetry counted a
+        /// cancelled download as a server failure and the log took a stack trace for it.
         /// </summary>
-        private async Task StreamFileToClient(
+        private async Task<SendResult> StreamFileToClient(
             UserRequest req, string filePath, string mimeType,
-            string? attachmentFileName)
+            string? fileName, bool inline = false, NameValueCollection? extraHeaders = null)
         {
             if (!File.Exists(filePath))
             {
                 await req.ReturnResponse("FileNotFoundOnDisk", code: HttpStatusCode.NotFound);
-                return;
+                return default;
             }
 
             var fileInfo = new FileInfo(filePath);
             long fileLength = fileInfo.Length;
-            string? rangeHeader = req.req.Headers["Range"];
+            DateTime lastWriteUtc = fileInfo.LastWriteTimeUtc;
+            string etag = KliveCloudTransfer.StrongETag(fileLength, lastWriteUtc);
             bool isHeadRequest = string.Equals(req.req.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase);
+            var plan = KliveCloudTransfer.PlanRange(fileLength, req.req.Headers["Range"], req.req.Headers["If-Range"], etag, lastWriteUtc);
 
-            if (!string.IsNullOrEmpty(rangeHeader) && rangeHeader.StartsWith("bytes="))
+            if (plan.Kind == KliveCloudTransfer.RangeKind.Unsatisfiable)
             {
-                string rangeValue = rangeHeader.Substring("bytes=".Length);
-                string[] parts = rangeValue.Split('-');
-
-                if (parts.Length != 2)
-                {
-                    NameValueCollection rangeErrHeaders = new();
-                    rangeErrHeaders.Add("Accept-Ranges", "bytes");
-                    rangeErrHeaders.Add("Content-Range", $"bytes */{fileLength}");
-                    await req.ReturnBinaryResponse(Array.Empty<byte>(), mimeType, (HttpStatusCode)416, rangeErrHeaders);
-                    return;
-                }
-
-                long start;
-                long end;
-                if (string.IsNullOrEmpty(parts[0]) && long.TryParse(parts[1], out long suffixLength))
-                {
-                    suffixLength = Math.Min(suffixLength, fileLength);
-                    start = fileLength - suffixLength;
-                    end = fileLength - 1;
-                }
-                else
-                {
-                    start = long.TryParse(parts[0], out long parsedStart) ? parsedStart : -1;
-                    end = !string.IsNullOrEmpty(parts[1]) && long.TryParse(parts[1], out long parsedEnd) ? parsedEnd : fileLength - 1;
-                }
-
-                if (start >= fileLength || end >= fileLength || start > end)
-                {
-                    NameValueCollection rangeErrHeaders = new();
-                    rangeErrHeaders.Add("Accept-Ranges", "bytes");
-                    rangeErrHeaders.Add("Content-Range", $"bytes */{fileLength}");
-                    await req.ReturnBinaryResponse(Array.Empty<byte>(), mimeType, (HttpStatusCode)416, rangeErrHeaders);
-                    return;
-                }
-
-                long contentLength = end - start + 1;
-                NameValueCollection rangeHeaders = new();
-                rangeHeaders.Add("Accept-Ranges", "bytes");
-                rangeHeaders.Add("Content-Range", $"bytes {start}-{end}/{fileLength}");
-                if (attachmentFileName != null)
-                {
-                    rangeHeaders.Add("Content-Disposition", BuildAttachmentDisposition(attachmentFileName));
-                }
-
-                using Stream output = req.PrepareStreamResponse(mimeType, contentLength, (HttpStatusCode)206, rangeHeaders);
-                if (isHeadRequest)
-                {
-                    return;
-                }
-
-                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 262144, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                fs.Seek(start, SeekOrigin.Begin);
-                byte[] buffer = new byte[262144];
-                long remaining = contentLength;
-                while (remaining > 0)
-                {
-                    int toRead = (int)Math.Min(buffer.Length, remaining);
-                    int bytesRead = await fs.ReadAsync(buffer, 0, toRead);
-                    if (bytesRead == 0) break;
-                    await output.WriteAsync(buffer, 0, bytesRead);
-                    remaining -= bytesRead;
-                }
+                NameValueCollection rangeErrHeaders = new();
+                rangeErrHeaders.Add("Accept-Ranges", "bytes");
+                rangeErrHeaders.Add("Content-Range", $"bytes */{fileLength}");
+                await req.ReturnBinaryResponse(Array.Empty<byte>(), mimeType, (HttpStatusCode)416, rangeErrHeaders);
+                return default;
             }
-            else
+
+            bool partial = plan.Kind == KliveCloudTransfer.RangeKind.Partial;
+            long start = partial ? plan.Start : 0;
+            long contentLength = partial ? plan.Length : fileLength;
+
+            NameValueCollection headers = new();
+            headers.Add("Accept-Ranges", "bytes");
+            headers.Add("ETag", etag);
+            headers.Add("Last-Modified", KliveCloudTransfer.HttpDate(lastWriteUtc));
+            if (partial) headers.Add("Content-Range", $"bytes {plan.Start}-{plan.End}/{fileLength}");
+            if (fileName != null) headers.Add("Content-Disposition", KliveCloudTransfer.Disposition(fileName, inline));
+            if (extraHeaders != null) headers.Add(extraHeaders);
+
+            // Open the file before the response starts, so one that can't be read still gets a real error.
+            FileStream fs;
+            try
             {
-                NameValueCollection fullHeaders = new();
-                fullHeaders.Add("Accept-Ranges", "bytes");
-                if (attachmentFileName != null)
+                fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, KliveCloudTransfer.BufferBytes, FileOptions.Asynchronous | FileOptions.SequentialScan);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                await Error(req, "FileUnreadable", HttpStatusCode.ServiceUnavailable, "That file can't be read right now. Try again in a moment.");
+                return default;
+            }
+
+            await using (fs)
+            {
+                if (start > 0) fs.Seek(start, SeekOrigin.Begin);
+                Stream output = req.PrepareStreamResponse(mimeType, contentLength, partial ? (HttpStatusCode)206 : HttpStatusCode.OK, headers);
+                var pumped = isHeadRequest
+                    ? new KliveCloudTransfer.PumpResult(0, KliveCloudTransfer.PumpOutcome.Completed, null)
+                    : await KliveCloudTransfer.PumpAsync(fs, output, contentLength);
+
+                bool gone = pumped.Outcome == KliveCloudTransfer.PumpOutcome.ClientGone;
+                try
                 {
-                    fullHeaders.Add("Content-Disposition", BuildAttachmentDisposition(attachmentFileName));
+                    output.Dispose();
+                }
+                catch (Exception ex) when (KliveCloudTransfer.IsClientGone(ex))
+                {
+                    gone = true;
+                }
+                catch (InvalidOperationException)
+                {
+                    // Closing a body that ended short of its Content-Length; the connection is dropped either way.
+                    gone = true;
                 }
 
-                using Stream output = req.PrepareStreamResponse(mimeType, fileLength, HttpStatusCode.OK, fullHeaders);
-                if (isHeadRequest)
+                if (gone && req.Trace != null) req.Trace.ClientDisconnected = true;
+                if (pumped.Outcome == KliveCloudTransfer.PumpOutcome.SourceFailed && pumped.Error != null)
                 {
-                    return;
+                    await parent.ServiceLogError(pumped.Error, $"Reading '{Path.GetFileName(filePath)}' failed after {pumped.BytesSent:N0} of {contentLength:N0} bytes had been sent");
                 }
-
-                using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.Read, 262144, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                byte[] buffer = new byte[262144];
-                int bytesRead;
-                while ((bytesRead = await fs.ReadAsync(buffer, 0, buffer.Length)) > 0)
-                {
-                    await output.WriteAsync(buffer, 0, bytesRead);
-                }
+                return new SendResult(true, partial, pumped.BytesSent, gone ? KliveCloudTransfer.PumpOutcome.ClientGone : pumped.Outcome);
             }
         }
 
@@ -334,13 +308,149 @@ namespace Omnipotent.Services.KliveCloud
             return false;
         }
 
+        /// <summary>
+        /// A folder (or a selection inside it) as one ZIP for a signed-in profile: the share route's
+        /// archive, scoped to what that profile can see rather than to a link's creator.
+        /// </summary>
+        private async Task SendFolderZip(UserRequest req, KMProfile profile, CloudItem folder, string? itemIDs)
+        {
+            var scope = new KliveCloud.ShareLink { ShareCode = "", ItemID = folder.ItemID, CreatedByUserID = profile.UserID };
+            List<CloudItem>? selection = null;
+            if (!string.IsNullOrWhiteSpace(itemIDs))
+            {
+                selection = new List<CloudItem>();
+                foreach (string id in itemIDs.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    var picked = parent.GetItemByID(id);
+                    if (picked == null || !parent.IsDescendantOfFolder(folder.ItemID, picked) || !parent.LinkCanServe(scope, picked))
+                    {
+                        await Error(req, "ItemNotFound", HttpStatusCode.NotFound, "One of those items isn't in that folder any more.");
+                        return;
+                    }
+                    selection.Add(picked);
+                }
+            }
+
+            var plan = parent.PlanShareZip(scope, folder, selection);
+            string archiveName = selection is { Count: 1 } && selection[0].ItemType == CloudItemType.Folder ? selection[0].Name : folder.Name;
+            var headers = new NameValueCollection
+            {
+                { "Content-Disposition", BuildAttachmentDisposition(archiveName + ".zip") },
+                { "Cache-Control", "no-store" },
+                { "X-Content-Type-Options", "nosniff" },
+            };
+            using Stream output = req.PrepareStreamResponse("application/zip", -1, HttpStatusCode.OK, headers);
+            if (string.Equals(req.req.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase)) return;
+            try
+            {
+                await KliveCloud.WriteZipAsync(output, plan);
+            }
+            catch (Exception ex) when (KliveCloudTransfer.IsClientGone(ex))
+            {
+                if (req.Trace != null) req.Trace.ClientDisconnected = true;
+            }
+            catch (Exception ex)
+            {
+                await parent.ServiceLogError(ex, "KliveCloud folder ZIP failed partway");
+            }
+        }
+
+        private static readonly long ProcessStartTicks = Environment.TickCount64 ^ DateTime.UtcNow.Ticks;
+
+        private static bool IsYes(string? value) => value is not null && (value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase) || value.Equals("yes", StringComparison.OrdinalIgnoreCase));
+
+        private static string ShortCode(string code) => code.Length > 6 ? code[..6] + "…" : code;
+
+        private static readonly Dictionary<KliveCloud.ShareLinkProblem, string> ProblemText = new()
+        {
+            [KliveCloud.ShareLinkProblem.Expired] = "Expired: it stops working on the next visit.",
+            [KliveCloud.ShareLinkProblem.ItemDeleted] = "What it shared was deleted.",
+            [KliveCloud.ShareLinkProblem.NoOwner] = "Nobody owns it, and a link only serves what its owner can see.",
+            [KliveCloud.ShareLinkProblem.OwnerLostAccess] = "Its owner can no longer see what it shares.",
+        };
+
+        /// <summary>One row of the link list: the link, what it shares, whether it opens and how much it is used.</summary>
+        private object ShareLinkDto(KliveCloud.ShareLink k, DateTime now)
+        {
+            var item = parent.GetItemByID(k.ItemID);
+            var problem = parent.DiagnoseShareLink(k, now);
+            var usage = parent.ShareStats.Get(k.ShareCode);
+            return new
+            {
+                k.ShareCode,
+                k.ItemID,
+                k.CreatedByUserID,
+                CreatedByName = parent.GetProfile(k.CreatedByUserID)?.Name,
+                k.CreatedDate,
+                k.ExpirationDate,
+                PermissionMode = k.PermissionMode.ToString(),
+                ItemName = item?.Name,
+                ItemType = item?.ItemType.ToString(),
+                ItemPath = item == null ? null : Slash(item.RelativePath),
+                ItemBytes = item?.ItemType == CloudItemType.File ? item.FileSizeBytes : (long?)null,
+                Servable = problem == KliveCloud.ShareLinkProblem.None,
+                Problem = problem == KliveCloud.ShareLinkProblem.None ? null : problem.ToString(),
+                ProblemText = ProblemText.TryGetValue(problem, out var text) ? text : null,
+                Usage = new
+                {
+                    Opens = usage?.Opens ?? 0,
+                    Downloads = usage?.Downloads ?? 0,
+                    BytesServed = usage?.BytesServed ?? 0,
+                    LastOpenedUtc = usage?.LastOpenedUtc,
+                    LastDownloadUtc = usage?.LastDownloadUtc,
+                    CountingSinceUtc = parent.ShareStats.CountingSinceUtc,
+                },
+            };
+        }
+
+        /// <summary>Who is visiting a share, for counting an open once per visitor: hashed in memory, never stored.</summary>
+        private static string Visitor(UserRequest req)
+            => Omnipotent.Services.OmniDefence.OmniDefence.ExtractClientIp(req.req) + "|" + (req.req.UserAgent ?? "");
+
+        /// <summary>A download of a share starting from its first byte (a resume or a seek isn't another download).</summary>
+        private static bool IsFreshDownload(UserRequest req)
+        {
+            if (string.Equals(req.req.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase)) return false;
+            string? range = req.req.Headers["Range"];
+            return string.IsNullOrEmpty(range) || range.StartsWith("bytes=0-", StringComparison.OrdinalIgnoreCase);
+        }
+
         private static Task Json(UserRequest req, object payload, HttpStatusCode code = HttpStatusCode.OK)
             => req.ReturnResponse(JsonConvert.SerializeObject(payload), "application/json", null, code);
 
         private static Task Error(UserRequest req, string error, HttpStatusCode code, string? message = null)
             => req.ReturnResponse(JsonConvert.SerializeObject(new { error, message = message ?? error }), "application/json", null, code);
 
-        private static readonly NameValueCollection PrivatePreviewHeaders = new() { ["Cache-Control"] = "private, max-age=300" };
+        /// <summary>Private and short-lived: a revoked viewer must not keep seeing thumbnails for an hour.</summary>
+        private const string PreviewCacheControl = "private, max-age=300";
+
+        /// <summary>
+        /// A thumbnail with a validator. Before it had one, a page shown again after five minutes
+        /// downloaded every thumbnail again, and the server read (or remade) each one; now an
+        /// unchanged one is a body-less 304. X-KliveCloud-Preview says whether it came from memory,
+        /// disk or ffmpeg, and the trace has the same as spans (preview-memory/disk/queue/make).
+        /// </summary>
+        private async Task SendPreview(UserRequest req, CloudItem item, int maxWidth, int maxHeight)
+        {
+            // Weak: a remade JPEG looks the same but isn't byte-identical. The bytes behind an id never change.
+            string etag = $"W/\"p-{item.ItemID}-{maxWidth}x{maxHeight}-{item.FileSizeBytes:x}\"";
+            if (HttpResponseHelpers.ETagMatches(req.req.Headers["If-None-Match"], etag))
+            {
+                // The loader only runs where a 304 can't be sent (inside /batch).
+                await req.ReturnValidatedBinaryResponse(etag, async () => (await parent.GetPreviewAsync(item, maxWidth, maxHeight)).Data ?? Array.Empty<byte>(),
+                    "image/jpeg", PreviewCacheControl);
+                return;
+            }
+
+            var preview = await parent.GetPreviewAsync(item, maxWidth, maxHeight);
+            if (preview.Data == null)
+            {
+                await req.ReturnResponse("PreviewGenerationFailed", code: HttpStatusCode.InternalServerError);
+                return;
+            }
+            var headers = new NameValueCollection { { "X-KliveCloud-Preview", preview.Source.ToString().ToLowerInvariant() } };
+            await req.ReturnValidatedBinaryResponse(etag, () => Task.FromResult(preview.Data), "image/jpeg", PreviewCacheControl, headers);
+        }
 
         // ───────────────────────────── routes ─────────────────────────────
 
@@ -478,6 +588,23 @@ namespace Omnipotent.Services.KliveCloud
                 {
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
+            }, HttpMethod.Get, KliveCloudPerms.FilesBrowse);
+
+            // A few bytes that change whenever anything a KliveCloud page shows changes (items, access,
+            // links, link usage), so an open page can ask "anything new?" instead of re-reading the
+            // whole tree. The process start is part of it: the counters restart with the process.
+            await parent.CreateAPIRoute("/KliveCloud/Version", async (req) =>
+            {
+                CacheDeps.MarkUncacheable("version probe");
+                long items = CacheDeps.CurrentVersion(KliveCloud.ItemsCacheKey);
+                long links = CacheDeps.CurrentVersion(KliveCloud.ShareLinksCacheKey);
+                long usage = CacheDeps.CurrentVersion(KliveCloudShareStats.CacheKey);
+                await Json(req, new
+                {
+                    Stamp = $"{ProcessStartTicks:x}-{items:x}-{links:x}-{usage:x}",
+                    Items = $"{ProcessStartTicks:x}-{items:x}",
+                    Links = $"{ProcessStartTicks:x}-{links:x}-{usage:x}",
+                });
             }, HttpMethod.Get, KliveCloudPerms.FilesBrowse);
 
             // Get info about a specific item
@@ -917,15 +1044,7 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    byte[] thumbnailData = await parent.GeneratePreview(item, maxWidth, maxHeight);
-                    if (thumbnailData == null)
-                    {
-                        await req.ReturnResponse("PreviewGenerationFailed", code: HttpStatusCode.InternalServerError);
-                        return;
-                    }
-
-                    // Private and short-lived: a revoked viewer must not keep seeing thumbnails for an hour.
-                    await req.ReturnBinaryResponse(thumbnailData, "image/jpeg", HttpStatusCode.OK, new NameValueCollection(PrivatePreviewHeaders));
+                    await SendPreview(req, item, maxWidth, maxHeight);
                 }
                 catch (Exception ex)
                 {
@@ -1020,6 +1139,11 @@ namespace Omnipotent.Services.KliveCloud
                         embedVideoReady = true;
                     }
 
+                    if (string.IsNullOrEmpty(req.user?.UserID))
+                    {
+                        await Error(req, "NoOwner", HttpStatusCode.BadRequest, "A share link must belong to a profile, or it can never open.");
+                        return;
+                    }
                     var shareLink = await parent.CreateShareLink(itemID, req.user.UserID, expirationDate, permissionMode, reuseExisting: !isVideoShare);
 
                     string downloadUrl = $"https://{KliveAPI.KliveAPI.domainName}:{KliveAPI.KliveAPI.apiPORT}/KliveCloud/DownloadShared?code={shareLink.ShareCode}";
@@ -1137,25 +1261,11 @@ namespace Omnipotent.Services.KliveCloud
                 try
                 {
                     bool any = req.Can(KliveCloudPerms.SharingManageAny);
+                    DateTime now = DateTime.Now;
                     var links = parent.ShareLinks
-                        .Where(k => any || k.CreatedByUserID == req.user.UserID)
-                        .Select(k =>
-                        {
-                            var item = parent.GetItemByID(k.ItemID);
-                            return new
-                            {
-                                k.ShareCode,
-                                k.ItemID,
-                                k.CreatedByUserID,
-                                CreatedByName = parent.GetProfile(k.CreatedByUserID)?.Name,
-                                k.CreatedDate,
-                                k.ExpirationDate,
-                                PermissionMode = k.PermissionMode.ToString(),
-                                ItemName = item?.Name,
-                                ItemType = item?.ItemType.ToString(),
-                                Servable = item != null && parent.LinkCanServe(k, item),
-                            };
-                        })
+                        // A link with no creator is nobody's: only someone who manages every link sees it.
+                        .Where(k => any || (!string.IsNullOrEmpty(k.CreatedByUserID) && k.CreatedByUserID == req.user.UserID))
+                        .Select(k => ShareLinkDto(k, now))
                         .ToList();
                     await Json(req, links);
                 }
@@ -1164,6 +1274,274 @@ namespace Omnipotent.Services.KliveCloud
                     await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
                 }
             }, HttpMethod.Get, KliveCloudPerms.SharingManage);
+
+            // Change a link in place (same address): permissionMode, expirationHours ("0" or "never" = no expiry),
+            // adopt=1 (serve your access instead of its creator's, for a link whose creator is gone or lost access).
+            await parent.CreateAPIRoute("/KliveCloud/UpdateShareLink", async (req) =>
+            {
+                try
+                {
+                    bool any = req.Can(KliveCloudPerms.SharingManageAny);
+                    bool all = req.Can(KliveCloudPerms.FilesAll);
+                    string shareCode = req.userParameters.Get("code") ?? string.Empty;
+                    var link = parent.GetShareLinkByCode(shareCode);
+                    if (link == null)
+                    {
+                        await Error(req, "ShareLinkNotFound", HttpStatusCode.NotFound, "That link no longer exists.");
+                        return;
+                    }
+
+                    bool adopt = IsYes(req.userParameters.Get("adopt"));
+                    bool mine = !string.IsNullOrEmpty(link.CreatedByUserID) && link.CreatedByUserID == req.user.UserID;
+                    if (!mine && !any)
+                    {
+                        await Error(req, "NotYourLink", HttpStatusCode.Forbidden, "Only the person who created this link can change it.");
+                        return;
+                    }
+
+                    var item = parent.GetItemByID(link.ItemID);
+                    if (item == null)
+                    {
+                        await Error(req, "SharedItemNotFound", HttpStatusCode.Conflict, "The item this link shared was deleted. Delete the link instead.");
+                        return;
+                    }
+
+                    if (adopt)
+                    {
+                        // The link will serve what the adopter can see, so it needs the reach creating it would.
+                        if (!await RequireLevel(req, item, CloudAccessLevel.Editor, all)) return;
+                        if (parent.FirstNonEditableDescendant(item, req.user, all) != null)
+                        {
+                            await Error(req, "ContainsProtectedItems", HttpStatusCode.Forbidden,
+                                $"“{item.Name}” contains items you can't edit, so you can't take this link over.");
+                            return;
+                        }
+                    }
+
+                    KliveCloud.SharePermissionMode? mode = null;
+                    string? modeText = req.userParameters.Get("permissionMode");
+                    if (!string.IsNullOrWhiteSpace(modeText))
+                    {
+                        if (!TryParseSharePermissionMode(modeText, out var parsed))
+                        {
+                            await Error(req, "InvalidSharePermissionMode", HttpStatusCode.BadRequest, $"'{modeText}' is not ReadOnly, Write or WriteDelete.");
+                            return;
+                        }
+                        if (item.ItemType != CloudItemType.Folder && parsed != KliveCloud.SharePermissionMode.ReadOnly)
+                        {
+                            await Error(req, "WritableShareLinksRequireFolder", HttpStatusCode.BadRequest, "Only a folder's link can let visitors add or delete files.");
+                            return;
+                        }
+                        mode = parsed;
+                    }
+
+                    DateTime? expiry = null;
+                    bool clearExpiry = false;
+                    string? hoursText = req.userParameters.Get("expirationHours");
+                    if (!string.IsNullOrWhiteSpace(hoursText))
+                    {
+                        if (string.Equals(hoursText, "never", StringComparison.OrdinalIgnoreCase)) clearExpiry = true;
+                        else if (double.TryParse(hoursText, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double hours) && hours >= 0 && hours <= 24 * 3650)
+                        {
+                            if (hours == 0) clearExpiry = true;
+                            else expiry = DateTime.Now.AddHours(hours);
+                        }
+                        else
+                        {
+                            await Error(req, "InvalidExpiry", HttpStatusCode.BadRequest, "expirationHours must be a number of hours, 0 or never.");
+                            return;
+                        }
+                    }
+
+                    var updated = await parent.UpdateShareLink(shareCode, mode, expiry, clearExpiry, adopt ? req.user.UserID : null);
+                    if (updated == null)
+                    {
+                        await Error(req, "ShareLinkNotFound", HttpStatusCode.NotFound, "That link no longer exists.");
+                        return;
+                    }
+                    if (adopt) await parent.ServiceLog($"{req.user?.Name} took over the share link for '{item.Name}' ({ShortCode(shareCode)}).");
+                    await Json(req, ShareLinkDto(updated, DateTime.Now));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KliveCloudPerms.SharingManage);
+
+            // Rename a file or folder where it is.
+            await parent.CreateAPIRoute("/KliveCloud/RenameItem", async (req) =>
+            {
+                try
+                {
+                    bool all = req.Can(KliveCloudPerms.FilesAll);
+                    var item = parent.GetItemByID(req.userParameters.Get("itemID"));
+                    if (item == null)
+                    {
+                        await Error(req, "ItemNotFound", HttpStatusCode.NotFound, "That item doesn't exist any more.");
+                        return;
+                    }
+                    if (!await RequireLevel(req, item, CloudAccessLevel.Editor, all)) return;
+
+                    var renamed = await parent.RenameItem(item.ItemID, req.userParameters.Get("name") ?? "", req.user?.Name ?? req.user?.UserID ?? "someone");
+                    if (renamed == null)
+                    {
+                        await Error(req, "ItemNotFound", HttpStatusCode.NotFound, "That item doesn't exist any more.");
+                        return;
+                    }
+                    var level = parent.EffectiveLevel(renamed, req.user, all);
+                    await Json(req, ItemDto(renamed, level, req.user, all, req.Can(KliveCloudPerms.SharingManage) && level == CloudAccessLevel.Editor));
+                }
+                catch (IOException ex)
+                {
+                    await Error(req, "NameTaken", HttpStatusCode.Conflict, ex.Message);
+                }
+                catch (ArgumentException ex)
+                {
+                    await Error(req, "InvalidName", HttpStatusCode.BadRequest, ex.Message);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KliveCloudPerms.FilesOrganize);
+
+            // A short-lived key for opening files without an Authorization header (<img>, <video>, a
+            // download link). itemID, or itemIDs (comma-separated, up to 50). A folder's ticket opens as a ZIP.
+            await parent.CreateAPIRoute("/KliveCloud/Ticket", async (req) =>
+            {
+                try
+                {
+                    bool all = req.Can(KliveCloudPerms.FilesAll);
+                    string? many = req.userParameters.Get("itemIDs");
+                    var ids = (string.IsNullOrWhiteSpace(many) ? new[] { req.userParameters.Get("itemID") ?? "" } : many.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+                        .Where(id => !string.IsNullOrWhiteSpace(id))
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+                    if (ids.Count == 0 || ids.Count > 50)
+                    {
+                        await Error(req, "ItemIDsRequired", HttpStatusCode.BadRequest, "Give one to fifty file ids.");
+                        return;
+                    }
+                    if (string.IsNullOrEmpty(req.user?.UserID))
+                    {
+                        await Error(req, "NoProfile", HttpStatusCode.Forbidden, "Tickets are issued to a profile.");
+                        return;
+                    }
+
+                    DateTime now = DateTime.UtcNow;
+                    var issued = new List<object>();
+                    var refused = new List<string>();
+                    foreach (string id in ids)
+                    {
+                        var item = parent.GetItemByID(id);
+                        if (item == null || parent.EffectiveLevel(item, req.user, all) < CloudAccessLevel.Viewer)
+                        {
+                            refused.Add(id);
+                            continue;
+                        }
+                        var ticket = parent.Tickets.Issue(item.ItemID, req.user.UserID, now);
+                        issued.Add(new
+                        {
+                            item.ItemID,
+                            Ticket = ticket.Token,
+                            Path = $"/KliveCloud/Open?t={ticket.Token}",
+                            Inline = parent.InlineMimeType(item) != null,
+                            ExpiresUtc = ticket.ExpiresUtc,
+                        });
+                    }
+                    if (issued.Count == 0)
+                    {
+                        await Error(req, "ItemNotFound", HttpStatusCode.NotFound, ids.Count == 1 ? "That file doesn't exist or hasn't been shared with you." : "None of those files can be opened by you.");
+                        return;
+                    }
+                    await Json(req, new { Tickets = issued, Refused = refused, LifetimeSeconds = (int)KliveCloudTickets.Lifetime.TotalSeconds });
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Post, KliveCloudPerms.FilesDownload);
+
+            // A file through a ticket. download=1 always saves it; otherwise images, video, audio, PDF and
+            // text open inline (text as plain text) and anything else downloads. as=mp4 plays a video a
+            // browser can't (MKV, AVI...) through the same MP4 a share link's embed uses. A folder's ticket
+            // sends a ZIP of what the profile can see in it (itemIDs narrows it to a selection).
+            await parent.CreateAPIRoute("/KliveCloud/Open", async (req) =>
+            {
+                try
+                {
+                    // The ticket is checked on every use: a cached answer would outlive it.
+                    CacheDeps.MarkUncacheable("ticket");
+                    var ticket = parent.Tickets.Resolve(req.userParameters.Get("t"), DateTime.UtcNow);
+                    var profile = ticket == null ? null : parent.GetProfile(ticket.ProfileId);
+                    var item = ticket == null ? null : parent.GetItemByID(ticket.ItemId);
+                    // Access is checked again on every use: a ticket outlives nothing it was issued against.
+                    bool allowed = profile != null && item != null
+                        && AccessEvaluator.Can(profile, KliveCloudPerms.FilesDownload)
+                        && parent.EffectiveLevel(item, profile, AccessEvaluator.Can(profile, KliveCloudPerms.FilesAll)) >= CloudAccessLevel.Viewer;
+                    if (!allowed)
+                    {
+                        await Error(req, "TicketExpired", HttpStatusCode.NotFound, "This file link has expired. Open the file again from KliveCloud.");
+                        return;
+                    }
+
+                    if (item!.ItemType == CloudItemType.Folder)
+                    {
+                        await SendFolderZip(req, profile!, item, req.userParameters.Get("itemIDs"));
+                        return;
+                    }
+
+                    // as=jpg: the thumbnail (or, with w/h up to 1920, a JPEG of an image a browser can't show).
+                    if (string.Equals(req.userParameters.Get("as"), "jpg", StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (!parent.IsPreviewable(item))
+                        {
+                            await Error(req, "ItemNotPreviewable", HttpStatusCode.BadRequest, "There is no picture of this file.");
+                            return;
+                        }
+                        int width = int.TryParse(req.userParameters.Get("w"), out int w) ? Math.Clamp(w, 16, 1920) : 320;
+                        int height = int.TryParse(req.userParameters.Get("h"), out int h) ? Math.Clamp(h, 16, 1920) : 320;
+                        await SendPreview(req, item, width, height);
+                        return;
+                    }
+
+                    string? path = parent.TryGetReadableFilePath(item);
+                    if (path == null)
+                    {
+                        await Error(req, "FileNotFoundOnDisk", HttpStatusCode.NotFound, "The file is missing from storage.");
+                        return;
+                    }
+
+                    string? inlineType = parent.InlineMimeType(item);
+                    bool download = IsYes(req.userParameters.Get("download")) || inlineType == null;
+                    var safety = new NameValueCollection
+                    {
+                        { "X-Content-Type-Options", "nosniff" },
+                        { "Cache-Control", "private, max-age=600" },
+                        { "Referrer-Policy", "no-referrer" },
+                    };
+                    // Whatever an inline file contains can't script the API's origin (PDF keeps its viewer).
+                    if (!download && inlineType != "application/pdf") safety.Add("Content-Security-Policy", "sandbox; default-src 'none'; img-src 'self' data:; media-src 'self'; style-src 'unsafe-inline'");
+
+                    if (!download && parent.IsVideo(item) && string.Equals(req.userParameters.Get("as"), "mp4", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string? playable = await parent.GetDiscordCompatibleVideoPath(item);
+                        if (string.IsNullOrEmpty(playable))
+                        {
+                            await Error(req, "VideoConversionFailed", HttpStatusCode.InternalServerError, "This video couldn't be converted to play in a browser. Download it instead.");
+                            return;
+                        }
+                        await StreamFileToClient(req, playable, "video/mp4", Path.ChangeExtension(item.Name, ".mp4"), inline: true, extraHeaders: safety);
+                        return;
+                    }
+
+                    await StreamFileToClient(req, path, download ? "application/octet-stream" : inlineType!, item.Name, inline: !download, extraHeaders: safety);
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, Perms.Public);
 
             // Download a file via share link (no authentication required)
             await parent.CreateAPIRoute("/KliveCloud/DownloadShared", async (req) =>
@@ -1207,7 +1585,13 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    await StreamFileToClient(req, sharedFilePath, "application/octet-stream", item.Name);
+                    bool fresh = IsFreshDownload(req);
+                    var sent = await StreamFileToClient(req, sharedFilePath, "application/octet-stream", item.Name);
+                    if (sent.Started)
+                    {
+                        if (fresh) parent.ShareStats.NoteDownload(link.ShareCode, DateTime.UtcNow);
+                        parent.ShareStats.NoteBytes(link.ShareCode, sent.BytesSent);
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1268,12 +1652,25 @@ namespace Omnipotent.Services.KliveCloud
                     streaming = true;
                     using Stream output = req.PrepareStreamResponse("application/zip", -1, HttpStatusCode.OK, headers);
                     if (string.Equals(req.req.HttpMethod, "HEAD", StringComparison.OrdinalIgnoreCase)) return;
-                    await KliveCloud.WriteZipAsync(output, plan);
+                    parent.ShareStats.NoteDownload(link.ShareCode, DateTime.UtcNow);
+                    var counted = new KliveCloudTransfer.CountingStream(output);
+                    try
+                    {
+                        await KliveCloud.WriteZipAsync(counted, plan);
+                    }
+                    finally
+                    {
+                        parent.ShareStats.NoteBytes(link.ShareCode, counted.BytesWritten);
+                    }
                 }
                 catch (Exception ex) when (streaming)
                 {
                     // Headers are gone; all that's left is to stop. Usually the client cancelled.
-                    if (ex is not (HttpListenerException or IOException or ObjectDisposedException))
+                    if (KliveCloudTransfer.IsClientGone(ex))
+                    {
+                        if (req.Trace != null) req.Trace.ClientDisconnected = true;
+                    }
+                    else
                     {
                         await parent.ServiceLogError(ex, "Shared ZIP download failed partway");
                     }
@@ -1293,6 +1690,7 @@ namespace Omnipotent.Services.KliveCloud
                     if (scope == null) return;
 
                     var (link, item) = scope.Value;
+                    parent.ShareStats.NoteOpen(link.ShareCode, Visitor(req), DateTime.UtcNow);
 
                     // Pre-warm Discord-compatible MP4 cache (covers existing share links re-shared into Discord).
                     if (item.ItemType == CloudItemType.File && parent.IsVideo(item))
@@ -1408,7 +1806,8 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    await StreamVideoFile(req, item);
+                    var sent = await StreamVideoFile(req, item);
+                    parent.ShareStats.NoteBytes(link.ShareCode, sent.BytesSent);
                 }
                 catch (Exception ex)
                 {
@@ -1444,7 +1843,8 @@ namespace Omnipotent.Services.KliveCloud
                         return;
                     }
 
-                    await StreamVideoPath(req, compatibleVideoPath, "video/mp4");
+                    var sent = await StreamFileToClient(req, compatibleVideoPath, "video/mp4", null);
+                    parent.ShareStats.NoteBytes(link.ShareCode, sent.BytesSent);
                 }
                 catch (Exception ex)
                 {
@@ -1482,14 +1882,7 @@ namespace Omnipotent.Services.KliveCloud
                     if (!string.IsNullOrEmpty(heightStr) && int.TryParse(heightStr, out int parsedHeight))
                         maxHeight = Math.Clamp(parsedHeight, 16, 1920);
 
-                    byte[] thumbnailData = await parent.GeneratePreview(item, maxWidth, maxHeight);
-                    if (thumbnailData == null)
-                    {
-                        await req.ReturnResponse("PreviewGenerationFailed", code: HttpStatusCode.InternalServerError);
-                        return;
-                    }
-
-                    await req.ReturnBinaryResponse(thumbnailData, "image/jpeg", HttpStatusCode.OK, new NameValueCollection(PrivatePreviewHeaders));
+                    await SendPreview(req, item, maxWidth, maxHeight);
                 }
                 catch (Exception ex)
                 {

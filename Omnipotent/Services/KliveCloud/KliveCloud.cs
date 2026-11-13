@@ -35,6 +35,12 @@ namespace Omnipotent.Services.KliveCloud
         private readonly ConcurrentDictionary<string, SemaphoreSlim> videoEmbedTranscodeLocks = new();
         private KMProfileManager? profileManager;
 
+        /// <summary>Opens, downloads and bytes per share link (see <see cref="KliveCloudShareStats"/>).</summary>
+        public KliveCloudShareStats ShareStats { get; private set; } = new(null);
+
+        /// <summary>Short-lived keys for opening one file without a header (see <see cref="KliveCloudTickets"/>).</summary>
+        public KliveCloudTickets Tickets { get; } = new();
+
         /// <summary>Virtual folder id listing items shared with the caller whose folder they can't see.</summary>
         public const string SharedWithMeFolderID = "shared-with-me";
 
@@ -65,11 +71,31 @@ namespace Omnipotent.Services.KliveCloud
             await LoadMetadata();
             await LoadShareLinks();
             await MigrateLegacyAccessAsync();
+            LoadShareStats(Path.Combine(metadataPath, "share_link_stats.json"));
 
             routes = new KliveCloudRoutes(this);
             routes.CreateRoutes();
 
-            ServiceLog($"KliveCloud service started with {CloudItems.Count} items loaded.");
+            int broken = ShareLinks.Count(link => DiagnoseShareLink(link, DateTime.Now) != ShareLinkProblem.None);
+            ServiceLog($"KliveCloud service started with {CloudItems.Count} items loaded and {ShareLinks.Count} share link(s)"
+                + (broken > 0 ? $", {broken} of which can't open (see the KliveCloud page's Links view)." : "."));
+        }
+
+        private void LoadShareStats(string path)
+        {
+            ShareStats = new KliveCloudShareStats(path);
+            try { ShareStats.Load(); }
+            catch (Exception ex) { ServiceLogError(ex, "Could not read share-link usage; counting starts again."); }
+
+            _ = Task.Run(async () =>
+            {
+                using var timer = new PeriodicTimer(KliveCloudShareStats.FlushEvery);
+                while (await timer.WaitForNextTickAsync())
+                {
+                    try { ShareStats.FlushIfDirty(); }
+                    catch (Exception ex) { await ServiceLogError(ex, "Could not save share-link usage; will retry."); }
+                }
+            });
         }
 
         private async Task LoadMetadata()
@@ -112,10 +138,16 @@ namespace Omnipotent.Services.KliveCloud
             itemsById = index;
         }
 
+        /// <summary>Test seam: where SaveMetadata / SaveShareLinks write instead of the DataUtil queue (path, json).</summary>
+        internal Func<string, string, Task>? PersistForTests;
+
+        private Task Persist(string path, string json)
+            => PersistForTests != null ? PersistForTests(path ?? "", json) : GetDataHandler().WriteToFile(path, json);
+
         public async Task SaveMetadata()
         {
             string json = JsonConvert.SerializeObject(CloudItems, Formatting.Indented);
-            await GetDataHandler().WriteToFile(metadataFilePath, json);
+            await Persist(metadataFilePath, json);
             CacheDeps.Bump(ItemsCacheKey); // after the write is visible
         }
 
@@ -170,7 +202,7 @@ namespace Omnipotent.Services.KliveCloud
         public async Task SaveShareLinks()
         {
             string json = JsonConvert.SerializeObject(ShareLinks, Formatting.Indented);
-            await GetDataHandler().WriteToFile(shareLinksFilePath, json);
+            await Persist(shareLinksFilePath, json);
             CacheDeps.Bump(ShareLinksCacheKey); // revocations/permission changes invalidate cached share responses
         }
 
@@ -423,6 +455,10 @@ namespace Omnipotent.Services.KliveCloud
         /// </summary>
         public async Task<ShareLink> CreateShareLink(string itemID, string createdByUserID, DateTime? expirationDate, SharePermissionMode permissionMode = SharePermissionMode.ReadOnly, bool reuseExisting = true)
         {
+            // A link serves only what its creator can see, so one without a creator can never open.
+            // Eight such links were made in Sep 2026 and stayed listed as if they worked.
+            if (string.IsNullOrWhiteSpace(createdByUserID))
+                throw new ArgumentException("A share link needs the profile creating it.", nameof(createdByUserID));
             await metadataLock.WaitAsync();
             try
             {
@@ -525,7 +561,60 @@ namespace Omnipotent.Services.KliveCloud
                 if (link == null) return false;
                 ShareLinks = ShareLinks.Where(k => k.ShareCode != shareCode).ToList();
                 await SaveShareLinks();
+                ShareStats.Forget(shareCode);
                 return true;
+            }
+            finally { metadataLock.Release(); }
+        }
+
+        /// <summary>Why a link can't open, in the order a visitor would hit them.</summary>
+        public enum ShareLinkProblem
+        {
+            None,
+            /// <summary>Past its expiry; the next visit deletes it.</summary>
+            Expired,
+            /// <summary>The shared item was deleted.</summary>
+            ItemDeleted,
+            /// <summary>No creator, or the creator's profile was deleted: a link serves what its creator can see.</summary>
+            NoOwner,
+            /// <summary>The creator can no longer see the item.</summary>
+            OwnerLostAccess,
+        }
+
+        public ShareLinkProblem DiagnoseShareLink(ShareLink link, DateTime now)
+        {
+            if (link.ExpirationDate.HasValue && link.ExpirationDate.Value < now) return ShareLinkProblem.Expired;
+            var item = GetItemByID(link.ItemID);
+            if (item == null) return ShareLinkProblem.ItemDeleted;
+            bool byLink = link.CreatedByUserID != null && link.CreatedByUserID.StartsWith("shared:", StringComparison.Ordinal);
+            if (!byLink && GetProfile(link.CreatedByUserID) == null) return ShareLinkProblem.NoOwner;
+            return LinkCanServe(link, item) ? ShareLinkProblem.None : ShareLinkProblem.OwnerLostAccess;
+        }
+
+        /// <summary>
+        /// Changes a link in place, keeping its address: what visitors may do, when it expires, and
+        /// (adopting it) whose access it serves. Null leaves that part as it is.
+        /// </summary>
+        public async Task<ShareLink?> UpdateShareLink(string shareCode, SharePermissionMode? mode, DateTime? expiry, bool clearExpiry, string? newOwnerId)
+        {
+            await metadataLock.WaitAsync();
+            try
+            {
+                var current = GetShareLinkByCode(shareCode);
+                if (current == null) return null;
+                // Copy-on-write like every other change, so a reader never sees half of it.
+                var updated = new ShareLink
+                {
+                    ShareCode = current.ShareCode,
+                    ItemID = current.ItemID,
+                    CreatedByUserID = string.IsNullOrWhiteSpace(newOwnerId) ? current.CreatedByUserID : newOwnerId,
+                    CreatedDate = current.CreatedDate,
+                    ExpirationDate = clearExpiry ? null : expiry ?? current.ExpirationDate,
+                    PermissionMode = mode ?? current.PermissionMode,
+                };
+                ShareLinks = ShareLinks.Select(k => k.ShareCode == shareCode ? updated : k).ToList();
+                await SaveShareLinks();
+                return updated;
             }
             finally { metadataLock.Release(); }
         }
@@ -999,10 +1088,12 @@ namespace Omnipotent.Services.KliveCloud
                 PublishItems(CloudItems.Where(k => !removedIds.Contains(k.ItemID)).ToList());
                 await SaveMetadata();
 
-                if (ShareLinks.Any(l => removedIds.Contains(l.ItemID)))
+                var goneLinks = ShareLinks.Where(l => removedIds.Contains(l.ItemID)).Select(l => l.ShareCode).ToList();
+                if (goneLinks.Count > 0)
                 {
                     ShareLinks = ShareLinks.Where(l => !removedIds.Contains(l.ItemID)).ToList();
                     await SaveShareLinks();
+                    foreach (string code in goneLinks) ShareStats.Forget(code);
                 }
             }
             finally { metadataLock.Release(); }
@@ -1015,6 +1106,7 @@ namespace Omnipotent.Services.KliveCloud
         /// <summary>Thumbnails and Discord embeds are derived from an item and go with it.</summary>
         private void DeleteDerivedFiles(string itemID)
         {
+            thumbnailMemory.Forget(itemID);
             try
             {
                 string thumbnailsDir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveCloudThumbnailsDirectory);
@@ -1144,6 +1236,113 @@ namespace Omnipotent.Services.KliveCloud
                 return true;
             }
             finally { metadataLock.Release(); }
+        }
+
+        /// <summary>
+        /// Renames an item where it is, on disk and in metadata (and, for a folder, the paths of
+        /// everything inside it). Access, share links, thumbnails and embeds follow the item's id, so
+        /// they are untouched. Throws IOException when a sibling already has the name.
+        /// </summary>
+        public async Task<CloudItem?> RenameItem(string itemID, string newName, string renamedBy)
+        {
+            newName = (newName ?? "").Trim();
+            ValidateItemName(newName);
+            await metadataLock.WaitAsync();
+            try
+            {
+                var item = GetItemByID(itemID);
+                if (item == null) return null;
+                if (string.Equals(item.Name, newName, StringComparison.Ordinal)) return item;
+
+                string parentKey = item.ParentFolderID ?? "";
+                bool caseOnly = string.Equals(item.Name, newName, StringComparison.OrdinalIgnoreCase);
+                if (!caseOnly && CloudItems.Any(k => k.ItemID != item.ItemID
+                    && string.Equals(k.ParentFolderID ?? "", parentKey, StringComparison.OrdinalIgnoreCase)
+                    && string.Equals(k.Name, newName, StringComparison.OrdinalIgnoreCase)))
+                {
+                    throw new IOException($"Something called '{newName}' is already in this folder.");
+                }
+
+                string parentPath = ParentRelativePath(item.ParentFolderID);
+                string oldRelativePath = item.RelativePath;
+                string newRelativePath = string.IsNullOrEmpty(parentPath) ? newName : Path.Combine(parentPath, newName);
+                string basePath = GetStorageBasePath();
+                string oldFullPath = Path.GetFullPath(Path.Combine(basePath, oldRelativePath));
+                string newFullPath = Path.GetFullPath(Path.Combine(basePath, newRelativePath));
+                if (!newFullPath.StartsWith(basePath + Path.DirectorySeparatorChar))
+                    throw new UnauthorizedAccessException("Access denied: path is outside the cloud storage directory.");
+                if (!caseOnly && (File.Exists(newFullPath) || Directory.Exists(newFullPath)))
+                    throw new IOException($"Something called '{newName}' is already in this folder.");
+
+                bool isFolder = item.ItemType == CloudItemType.Folder;
+                bool onDisk = isFolder ? Directory.Exists(oldFullPath) : File.Exists(oldFullPath);
+                if (onDisk)
+                {
+                    // Windows can't move "a" onto "A": go through a temporary name for a change of case.
+                    string target = caseOnly ? newFullPath + ".renaming-" + Guid.NewGuid().ToString("N")[..8] : newFullPath;
+                    if (isFolder) Directory.Move(oldFullPath, target); else File.Move(oldFullPath, target);
+                    if (caseOnly)
+                    {
+                        if (isFolder) Directory.Move(target, newFullPath); else File.Move(target, newFullPath);
+                    }
+                    DataUtil.NoteExternalFileWrite(oldFullPath);
+                    DataUtil.NoteExternalFileWrite(newFullPath);
+                }
+
+                var descendants = isFolder ? CloudItems.Where(k => IsDescendantOfFolder(itemID, k)).ToList() : new List<CloudItem>();
+                item.Name = newName;
+                item.RelativePath = newRelativePath;
+                item.ModifiedDate = DateTime.Now;
+                foreach (var descendant in descendants)
+                {
+                    string rest = descendant.RelativePath.Length > oldRelativePath.Length
+                        ? descendant.RelativePath.Substring(oldRelativePath.Length).TrimStart('\\', '/')
+                        : "";
+                    descendant.RelativePath = rest.Length == 0 ? newRelativePath : Path.Combine(newRelativePath, rest);
+                }
+
+                PublishItems(CloudItems.ToList());
+                await SaveMetadata();
+                ServiceLog($"Item '{oldRelativePath}' renamed to '{newName}' by {renamedBy}.");
+                return item;
+            }
+            finally { metadataLock.Release(); }
+        }
+
+        /// <summary>
+        /// The type to send a file inline as, or null when it must only ever be downloaded. Only kinds
+        /// a page shows through an element (or reads as text) are inline: an uploaded HTML page served
+        /// inline from the API's origin would run as part of it.
+        /// </summary>
+        public string? InlineMimeType(CloudItem item)
+        {
+            if (item == null || item.ItemType != CloudItemType.File) return null;
+            string ext = Path.GetExtension(item.Name).ToLowerInvariant();
+            if (IsVideo(item)) return GetVideoMimeType(item);
+            return ext switch
+            {
+                ".jpg" or ".jpeg" or ".jfif" => "image/jpeg",
+                ".png" => "image/png",
+                ".gif" => "image/gif",
+                ".webp" => "image/webp",
+                ".bmp" => "image/bmp",
+                ".ico" => "image/x-icon",
+                ".avif" => "image/avif",
+                ".svg" => "image/svg+xml",
+                ".mp3" => "audio/mpeg",
+                ".wav" => "audio/wav",
+                ".flac" => "audio/flac",
+                ".aac" => "audio/aac",
+                ".m4a" => "audio/mp4",
+                ".opus" => "audio/ogg",
+                ".oga" => "audio/ogg",
+                ".pdf" => "application/pdf",
+                ".txt" or ".md" or ".markdown" or ".log" or ".csv" or ".tsv" or ".json" or ".xml" or ".yml" or ".yaml"
+                    or ".toml" or ".ini" or ".cfg" or ".conf" or ".srt" or ".vtt" or ".py" or ".cs" or ".js" or ".ts"
+                    or ".tsx" or ".jsx" or ".vue" or ".css" or ".scss" or ".html" or ".htm" or ".sql" or ".sh" or ".ps1"
+                    or ".bat" or ".java" or ".c" or ".cpp" or ".h" or ".go" or ".rs" or ".rb" or ".php" or ".lua" => "text/plain; charset=utf-8",
+                _ => null,
+            };
         }
 
         /// <summary>
@@ -1314,40 +1513,135 @@ namespace Omnipotent.Services.KliveCloud
         /// </summary>
         private static readonly SemaphoreSlim previewGenerationSlots = new(Math.Max(2, Environment.ProcessorCount / 2));
 
+        /// <summary>
+        /// The thumbnails asked for most recently, in memory. In Nov 2026 not one of 119 thumbnail
+        /// requests in 30 days finished under 29 ms (p50 601 ms), so a repeat view was paying for a
+        /// disk read or a fresh ffmpeg run every time. A file's bytes never change under its id
+        /// (an upload is always a new item), so id, size and box identify a thumbnail.
+        /// </summary>
+        private readonly ThumbnailMemory thumbnailMemory = new(24L * 1024 * 1024);
+
+        /// <summary>Where a preview came from: the response says so (X-KliveCloud-Preview) and so does the trace.</summary>
+        public enum PreviewSource { None, Memory, Disk, Made }
+
+        public readonly record struct PreviewResult(byte[]? Data, PreviewSource Source);
+
+        /// <summary>Kept for callers that only want the bytes.</summary>
         public async Task<byte[]> GeneratePreview(CloudItem item, int maxWidth, int maxHeight)
+            => (await GetPreviewAsync(item, maxWidth, maxHeight)).Data!;
+
+        public async Task<PreviewResult> GetPreviewAsync(CloudItem item, int maxWidth, int maxHeight)
         {
+            string memoryKey = $"{item.ItemID}_{maxWidth}x{maxHeight}";
+            byte[]? remembered = thumbnailMemory.Get(memoryKey, item.FileSizeBytes);
+            if (remembered != null)
+            {
+                using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("preview-memory")) return new PreviewResult(remembered, PreviewSource.Memory);
+            }
+
             string sourcePath = GetFullItemPath(item);
-            if (!File.Exists(sourcePath)) return null;
+            if (!File.Exists(sourcePath)) return new PreviewResult(null, PreviewSource.None);
 
             string cachePath = GetThumbnailCachePath(item.ItemID, maxWidth, maxHeight);
             bool IsCached() => File.Exists(cachePath) && File.GetLastWriteTimeUtc(cachePath) >= File.GetLastWriteTimeUtc(sourcePath);
 
-            if (IsCached())
+            async Task<PreviewResult> FromDisk()
             {
-                return await File.ReadAllBytesAsync(cachePath);
+                byte[] data;
+                using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("preview-disk")) data = await File.ReadAllBytesAsync(cachePath);
+                thumbnailMemory.Put(memoryKey, item.FileSizeBytes, data);
+                return new PreviewResult(data, PreviewSource.Disk);
             }
 
-            await previewGenerationSlots.WaitAsync();
+            if (IsCached()) return await FromDisk();
+
+            using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("preview-queue")) await previewGenerationSlots.WaitAsync();
             try
             {
                 // Whoever held the slot before may have just made this one.
-                if (IsCached())
+                if (IsCached()) return await FromDisk();
+                byte[]? made;
+                using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("preview-make"))
                 {
-                    return await File.ReadAllBytesAsync(cachePath);
+                    made = IsImage(item) ? await GenerateImageThumbnail(sourcePath, cachePath, maxWidth, maxHeight)
+                        : IsVideo(item) ? await GenerateVideoThumbnail(sourcePath, cachePath, maxWidth, maxHeight)
+                        : null;
                 }
-                if (IsImage(item))
-                {
-                    return await GenerateImageThumbnail(sourcePath, cachePath, maxWidth, maxHeight);
-                }
-                else if (IsVideo(item))
-                {
-                    return await GenerateVideoThumbnail(sourcePath, cachePath, maxWidth, maxHeight);
-                }
-                return null;
+                if (made != null) thumbnailMemory.Put(memoryKey, item.FileSizeBytes, made);
+                return new PreviewResult(made, made == null ? PreviewSource.None : PreviewSource.Made);
             }
             finally
             {
                 previewGenerationSlots.Release();
+            }
+        }
+
+        /// <summary>A byte-bounded least-recently-used store of thumbnails.</summary>
+        internal sealed class ThumbnailMemory
+        {
+            private sealed class Entry
+            {
+                public required byte[] Data;
+                public required long Stamp;
+                public long LastUse;
+            }
+
+            private readonly long maxBytes;
+            private readonly Dictionary<string, Entry> entries = new(StringComparer.OrdinalIgnoreCase);
+            private readonly object gate = new();
+            private long bytes;
+            private long clock;
+
+            public ThumbnailMemory(long maxBytes) => this.maxBytes = maxBytes;
+
+            public long Bytes { get { lock (gate) return bytes; } }
+            public int Count { get { lock (gate) return entries.Count; } }
+
+            /// <summary>The thumbnail for <paramref name="key"/> if it was made from the same version (<paramref name="stamp"/>).</summary>
+            public byte[]? Get(string key, long stamp)
+            {
+                lock (gate)
+                {
+                    if (!entries.TryGetValue(key, out var entry)) return null;
+                    if (entry.Stamp != stamp)
+                    {
+                        entries.Remove(key);
+                        bytes -= entry.Data.Length;
+                        return null;
+                    }
+                    entry.LastUse = ++clock;
+                    return entry.Data;
+                }
+            }
+
+            public void Put(string key, long stamp, byte[] data)
+            {
+                if (data == null || data.Length == 0 || data.Length > maxBytes / 8) return;
+                lock (gate)
+                {
+                    if (entries.Remove(key, out var old)) bytes -= old.Data.Length;
+                    entries[key] = new Entry { Data = data, Stamp = stamp, LastUse = ++clock };
+                    bytes += data.Length;
+                    while (bytes > maxBytes && entries.Count > 1)
+                    {
+                        var oldest = entries.MinBy(pair => pair.Value.LastUse);
+                        entries.Remove(oldest.Key);
+                        bytes -= oldest.Value.Data.Length;
+                    }
+                }
+            }
+
+            /// <summary>Drops every size of one item's thumbnail (it was deleted).</summary>
+            public void Forget(string itemId)
+            {
+                lock (gate)
+                {
+                    foreach (string key in entries.Keys.Where(k => k.StartsWith(itemId + "_", StringComparison.OrdinalIgnoreCase)).ToList())
+                    {
+                        bytes -= entries[key].Data.Length;
+                        entries.Remove(key);
+                    }
+                }
             }
         }
 
