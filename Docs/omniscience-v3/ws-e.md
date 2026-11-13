@@ -12,6 +12,9 @@ Repository: `klives-management-website`, branch `omniscience-v3`, worktree
    which merges into `omniscience-v3`) adds the people directory, the dossier body, briefs, digests, signals, insights
    (relationships, community pages, similar people, the people map, check-ins), links, translation, monitors and data controls.
    `scripts/omniscience/contracts.ts` is now a copy of that file. Pages that need WS-A, WS-B or WS-D DTOs still wait (below).
+3. **2026-11-13, the merged contract.** After the backend merge, `contracts.ts` is a copy of `api-contracts.ts` on
+   `omniscience-v3` with every workstream in it (`5cde727`), so WS-A's, WS-B's and WS-D's DTOs are typed now. The notice
+   list has sentences for plan reminders and standing-question flips (`0d518cd`). Their pages are the next slice.
 
 ## Built
 Pages live under `pages/omniscience-v3/` (routes `/omniscience-v3/*`) so the legacy pages keep working until cutover, mirroring
@@ -20,7 +23,7 @@ turn the legacy page into a parent route.
 
 | Piece | Where | What |
 |---|---|---|
-| Contract types | `scripts/omniscience/contracts.ts` | A copy of WS-C's `api-contracts.ts`. Re-copy when the backend contract changes; never edit the types here. |
+| Contract types | `scripts/omniscience/contracts.ts` | A copy of the backend's `api-contracts.ts` (branch `omniscience-v3`, all workstreams merged). Re-copy when the backend contract changes; never edit the types here. |
 | Data client | `scripts/omniscience/api.ts` | `omniGet` / `omniPost` / `omniPostText` (a POST whose answer is a file) / `omniStream` (NDJSON) / `omniStreamUrl`. One client, no retry layer of its own, an abort signal on every call, errors classified as `OmniApiError.kind` (disabled, starting, failed, unavailable, forbidden, not_built, not_found, bad_request, refused, confirmation_required, network, internal). |
 | Time and formatting | `scripts/omniscience/format.ts` | Lens formatter on `Intl` (Klives's zone or UTC), `omniZonedToMs` (wall-clock → UTC with DST gap and overlap rules), ages, durations, bytes, CSV. |
 | Findings in words | `scripts/omniscience/findings.ts` | One sentence per notice, monitor finding and data-health problem, written from its data (person back after a silence, first direct message, topic surge, tone toward Klives, silent source, dead jobs, …); an unknown kind shows its name. |

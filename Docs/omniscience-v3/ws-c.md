@@ -225,8 +225,9 @@ MinorGuard: X28, X29, X34 and X37 are refused when a selected person is or may b
 rankings, comparisons and member lists (counted, never named). `Stats.cs` holds the tests (Mann–Whitney with tie and
 continuity correction, chi-square with its exact tail, Benjamini–Hochberg), checked against textbook values.
 
-**Not built here:** X17 (extract from a selection) calls WS-B's extractor and is a merge step; X23 (link tracker) comes
-with link intelligence (N15); X32, X33, X35 and X36 are pending.
+**Not built here:** X17 (extract from a selection) calls WS-B's extractor, so it was built at the merge, in WS-B's
+deduction module (`Knowledge/Tactics/ExtractFromSelectionTactic.cs`, `9afcf26`); X23 (link tracker) comes with link
+intelligence (N15); X32, X33, X35 and X36 are pending.
 
 ## Relationship dynamics and communities (N12, X36, X45) and notices
 Module id `insights`, code in `Modules/Insights/`; tables `ins_pair_week`, `ins_pairs`, `ins_pair_events`,
@@ -262,7 +263,9 @@ module implements the sink, table `sig_notices`, routes `GET signals/notices`, `
 is listed only, `attention` follows quiet hours and the hourly cap, `urgent` is pushed at once. A finding older than 48
 hours when handed in is listed, never pushed. A person-targeted notice about a possible minor is not recorded.
 **For the integrator:** WS-B's standing-question flips (X50) and WS-A's source health can hand their findings to the same
-sink: pass the `SignalsModule` instance to them in `BuildModules()`.
+sink: pass the `SignalsModule` instance to them in `BuildModules()`. Done at the merge for WS-B (`0ac131f`): the
+integration module puts the sink on the knowledge kit (`KnowledgeKit.Notices`); plan reminders are kind `plan_reminder`,
+flips `standing_question`, and a flip is no longer also pushed as its own alert. WS-A's source health is not wired.
 
 ## Wellbeing check-ins (N14, X44)
 Part of the `insights` module (`InsightsModule.Wellbeing.cs`, table `ins_wellbeing`); the job `insights/wellbeing` runs
@@ -374,8 +377,9 @@ under 18 (not recorded, not told) or whose analysis is switched off; the event l
   the ones that still exist.
 - Not exercised: real traffic (thresholds are defaults to tune with live data), and WS-A's real source statuses (the
   module treats anything but active, ok, connected, idle, running, live and syncing as down, and disabled or paused as deliberate).
-- Still to build: X48 plan/date reminders and X50 standing-question flips need WS-B's extractions and inquiries (at the
-  merge they hand their findings to the same notices).
+- X48 plan/date reminders and X50 standing-question flips were built at the merge (`0ac131f`, tests in
+  `MergeWiringTests` and `ReasoningTacticsTests`): they hand their findings to the same notices. A reminder whose plan has
+  gone or is held back by the minor guard is cancelled, not fired.
 
 ## Slang decoder (X32) and sides in a dispute (X35)
 Two model tactics in the `briefs` module (`Modules/Briefs/DiscourseTactics.cs`), interactive, with checked output:
@@ -451,7 +455,9 @@ Module `translate` (`Modules/Translate`), routes under `translate/` (`Api/Transl
 - Forgetting a person removes their translations with their messages, out of the search index too (the index follows the
   table by triggers).
 - For the merge: WS-B's extraction and search should read `ITranslations.Cached` the way digests do (the general search
-  can union `translate/search`). "Multilingual embeddings" is the encoder's property (C-base), not this module's.
+  can union `translate/search`). Done at the merge for what WS-B reads (`621d1e4`): the evidence assembler shows a stored
+  translation of the same message version beside the original, as a reading aid to quote the original by. The general
+  search does not union `translate/search` yet. "Multilingual embeddings" is the encoder's property (C-base), not this module's.
 - Not exercised: a real model's translations, and real language readings (the tests write the readings and script the model).
 
 ## Data controls (N20, X76): two forget levels, retention, backups, export
@@ -535,15 +541,20 @@ Routes: `data/forget/preview`, `data/forget/confirm` (202), `data/forget/run`, `
 `data/backups/import-key`, `data/export/person`. Retention needs the overview permission and the export the data-export
 permission; everything else needs engine management.
 
-**For the merge:**
+**For the merge** (status on 2026-11-13 after each item):
 - WS-A's ingest writer (gateway, backfill, export imports) must ask `Forgotten.Load(...).Blocks(identity, conversation)`
   before it stores anything, and skip a forgotten account's events. Its face labels, crops, thumbnails, OCR and caption
   rows are swept when their tables key by `message_id`, `person_id` or `identity_id`; files it stores outside the CAS need
   its own handler on `person.erase`. Faces and captions of an analysis-off person are not computed.
+  **Done** for the writer (`621d1e4`: every write site passes the tombstones; an import does not store a forgotten
+  message's files). Faces and captions are not built.
 - WS-B's extraction, inquiry and standing questions, and WS-D's replica training, must skip the people in
   `AnalysisOff.Load(...)` in their background jobs (tactics are refused centrally). An assertion about somebody else that
-  loses its last evidence message to an erase should be retracted by WS-B.
-- KliveRAG's Omniscience connector must drop what it indexed about a person on `person.erase`.
+  loses its last evidence message to an erase should be retracted by WS-B. **Done** (`621d1e4`, `9afcf26`): the knowledge
+  reader leaves out what they wrote and reloads the set at once after a switch; claims and rows citing a forgotten message
+  go, and the people they were about are consolidated again (change kind `evidence.removed`).
+- KliveRAG's Omniscience connector must drop what it indexed about a person on `person.erase`. **Open, for cutover:** the
+  connector reads the v2 database only; a v3 connector must purge on `person.erase` and leave out analysis-off people.
 - A route that sets a person's tier must not be read as switching analysis back on: the mark is what counts, not the tier.
 - `IPolicyOracle` is unchanged (WS-B wraps it).
 
@@ -657,7 +668,7 @@ holds the corpus writer for its duration, seconds on a few million messages).
 | Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
 | Monitors X42, X43, X46, X47, X51 | done, tested (5 tests; thresholds are defaults to tune on live data) |
 | Tactics X32 (slang decoder) and X35 (sides in a dispute) | done, tested (2 tests with a scripted model, including answers it must reject) |
-| X17 (merge step with WS-B's extractor), X48 and X50 (need WS-B) | pending |
+| X17 (merge step with WS-B's extractor), X48 and X50 (need WS-B) | done at the merge (`0ac131f`, `9afcf26`), tested (X17: 3 tests with a scripted model; X48, X50: one each) |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)
