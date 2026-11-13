@@ -50,7 +50,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         private readonly OmniscienceStores stores;
         private readonly IPolicyOracle policy;
         private readonly ConcurrentDictionary<string, (bool IsSelf, long AtMs)> selfCache = new(StringComparer.Ordinal);
-        private (AnalysisOffSet Set, long LoadedTicks) off = (AnalysisOffSet.None, long.MinValue);
+        private (AnalysisOffSet Set, long LoadedTicks, long Changes) off = (AnalysisOffSet.None, long.MinValue, -1);
         private const long OffRefreshMs = 15_000;
 
         public CorpusReader(OmniscienceStores stores, IPolicyOracle policy)
@@ -62,18 +62,20 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         public OmniscienceStores Stores => stores;
 
         /// <summary>
-        /// The people whose analysis is switched off (N20), re-read at most every few seconds. What they wrote never reaches
-        /// the knowledge layer: every message read here leaves theirs out, so nothing is extracted, inferred or quoted from it.
+        /// The people whose analysis is switched off (N20). What they wrote never reaches the knowledge layer: every message read
+        /// here leaves theirs out, so nothing is extracted, inferred or quoted from it. Re-read at once after a switch in this
+        /// process (<see cref="Storage.AnalysisOff.Changes"/>), and every few seconds for what a switch does not announce (a
+        /// merge into someone whose analysis is off).
         /// </summary>
         public AnalysisOffSet AnalysisOff
         {
             get
             {
                 var current = off;
-                long nowTicks = Environment.TickCount64;
-                if (current.LoadedTicks != long.MinValue && nowTicks - current.LoadedTicks < OffRefreshMs) return current.Set;
+                long nowTicks = Environment.TickCount64, changes = Storage.AnalysisOff.Changes; // read before loading: a switch during the load reloads next time
+                if (current.LoadedTicks != long.MinValue && current.Changes == changes && nowTicks - current.LoadedTicks < OffRefreshMs) return current.Set;
                 var set = Storage.AnalysisOff.Load(stores);
-                off = (set, nowTicks);
+                off = (set, nowTicks, changes);
                 return set;
             }
         }

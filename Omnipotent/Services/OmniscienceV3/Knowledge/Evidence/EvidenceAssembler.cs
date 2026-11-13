@@ -135,6 +135,43 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         }
 
         /// <summary>
+        /// X17: the subject's anchors among chosen messages only — what they wrote, what replies to them, what they replied to
+        /// and what @-mentions them — so a targeted run reads the selection, not their whole history. A chosen message that is
+        /// none of these is not evidence about this subject (another subject of the same run may read it).
+        /// </summary>
+        public IReadOnlyList<EvidenceAnchor> AnchorsAmong(IReadOnlyCollection<string> messageIds, IReadOnlyCollection<string> identityIds, long asOfMs)
+        {
+            if (messageIds.Count == 0 || identityIds.Count == 0) return Array.Empty<EvidenceAnchor>();
+            var own = identityIds.ToHashSet(StringComparer.Ordinal);
+            var chosen = messageIds.Distinct(StringComparer.Ordinal).ToList();
+            using var c = Stores.Corpus.OpenRead();
+            var rows = c.QueryIn(null, """
+                SELECT m.message_id, m.current_version, m.sent_at_ms, m.order_key, m.conversation_id, m.ingest_seq, m.author_identity_id, p.author_identity_id
+                FROM messages m LEFT JOIN messages p ON p.message_id = m.reply_to_message_id
+                WHERE m.message_id IN ({keys})
+                """, chosen, r => (Anchor: new EvidenceAnchor(r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4), r.GetInt64(5), EvidenceRelation.Authored),
+                    Author: r.GetStringOrNull(6), ParentAuthor: r.GetStringOrNull(7)));
+            var mentioning = c.QueryIn(null, "SELECT message_id, target_id FROM message_mentions WHERE target_kind='user' AND message_id IN ({keys})", chosen,
+                    r => (Message: r.GetString(0), Target: r.GetString(1)))
+                .Where(x => own.Contains(x.Target)).Select(x => x.Message).ToHashSet(StringComparer.Ordinal);
+            var answeredBySubject = c.QueryIn(null, "SELECT reply_to_message_id, author_identity_id FROM messages WHERE reply_to_message_id IN ({keys})", chosen,
+                    r => (Parent: r.GetString(0), Author: r.GetStringOrNull(1)))
+                .Where(x => x.Author != null && own.Contains(x.Author)).Select(x => x.Parent).ToHashSet(StringComparer.Ordinal);
+            var anchors = new List<EvidenceAnchor>();
+            foreach (var (anchor, author, parentAuthor) in rows)
+            {
+                if (anchor.SentAtMs > asOfMs) continue;
+                EvidenceRelation? relation = author != null && own.Contains(author) ? EvidenceRelation.Authored
+                    : parentAuthor != null && own.Contains(parentAuthor) ? EvidenceRelation.ReplyToSubject
+                    : answeredBySubject.Contains(anchor.MessageId) ? EvidenceRelation.RepliedBySubject
+                    : mentioning.Contains(anchor.MessageId) ? EvidenceRelation.Mention
+                    : null;
+                if (relation is { } rel) anchors.Add(anchor with { Relation = rel });
+            }
+            return anchors.OrderBy(a => a.SentAtMs).ThenBy(a => a.OrderKey).ThenBy(a => a.IngestSeq).ThenBy(a => a.MessageId, StringComparer.Ordinal).ToList();
+        }
+
+        /// <summary>
         /// Messages that mention the subject by name or alias without an @ (plan "every message mentioning them by @, name or alias"),
         /// scoped to the conversations the subject belongs to (names are community-scoped: another "Sam" elsewhere is not them),
         /// excluding the subject's own messages. The model decides relevance; this only widens what it reads.

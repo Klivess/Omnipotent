@@ -38,6 +38,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         public int Refusals { get; set; }
         public int Splits { get; set; }
         public bool Pending { get; set; }
+        /// <summary>Anchors this prompt version had already read at the same message version (skipped: coverage).</summary>
+        public int AlreadyRead { get; set; }
         public string? Model { get; set; }
         public Dictionary<string, int> Rejections { get; } = new(StringComparer.Ordinal);
         public HashSet<string> TouchedSubjects { get; } = new(StringComparer.Ordinal);
@@ -76,6 +78,11 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
 
         private OmniLlm Llm => kit.Context.Llm ?? throw new JobFailureException(ErrorClass.Transient, "The LLM gateway is not available in this engine.");
 
+        /// <summary>What one reading runs under: cancellation, the job its model calls are audited against (none for a tactic
+        /// run), and the class AIRouter schedules them in (background for the continuous pipeline; interactive when Klives asked
+        /// and is waiting).</summary>
+        private sealed record SliceRun(CancellationToken Ct, long? JobId, AIRouterWorkClass WorkClass);
+
         public async Task<ExtractionRunStats> RunAsync(string personId, JobContext job)
         {
             var ct = job.Cancellation;
@@ -98,11 +105,44 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             anchors.AddRange(assembler.NameMentions(names, conversations, identities, asOf).Where(a => seen.Add(a.MessageId)));
             anchors = anchors.OrderBy(a => a.SentAtMs).ThenBy(a => a.OrderKey).ThenBy(a => a.IngestSeq).ThenBy(a => a.MessageId, StringComparer.Ordinal).ToList();
             var uncovered = assembler.Uncovered(canonical, anchors, ExtractionPrompt.Version);
+            stats.AlreadyRead = anchors.Count - uncovered.Count;
+            await ReadAsync(canonical, asOf, uncovered, stats, new SliceRun(ct, job.Job.JobId, AIRouterWorkClass.Background), job.ReportProgressAsync).ConfigureAwait(false);
+            await RecordRunAsync(stats, job.Job.JobId, started, kit.Context.Clock.NowMs, ct).ConfigureAwait(false);
+            return stats;
+        }
+
+        /// <summary>
+        /// X17 (extract from a selection): the same reading, limited to chosen messages — the subject's anchors among them
+        /// (<see cref="EvidenceAssembler.AnchorsAmong"/>), less what this prompt version already read at the same message
+        /// version. Everything after the anchors is the continuous pipeline's: whole-conversation slices, two readings,
+        /// adjudication, deterministic verification, the critic, MinorGuard before anything is written, and one commit per slice.
+        /// A resumed run keeps its run id (<paramref name="runKey"/>), and coverage keeps it from reading anything twice.
+        /// </summary>
+        public async Task<ExtractionRunStats> RunSelectedAsync(string personId, IReadOnlyCollection<string> messageIds, string runKey, CancellationToken ct, Func<object, Task> progress)
+        {
+            string canonical = kit.Corpus.Canonical(personId);
+            var stats = new ExtractionRunStats { RunId = NaturalKeys.Id("xr", canonical + "|selection|" + runKey, 20), PersonId = canonical };
+            long started = kit.Context.Clock.NowMs;
+            await RecordRunAsync(stats, null, started, null, ct).ConfigureAwait(false);
+            var identities = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(canonical)).Select(i => i.IdentityId).ToList();
+            long asOf = kit.Context.Clock.NowMs;
+            var anchors = assembler.AnchorsAmong(messageIds, identities, asOf);
+            var uncovered = assembler.Uncovered(canonical, anchors, ExtractionPrompt.Version);
+            stats.AlreadyRead = anchors.Count - uncovered.Count;
+            await ReadAsync(canonical, asOf, uncovered, stats, new SliceRun(ct, null, AIRouterWorkClass.Interactive), progress).ConfigureAwait(false);
+            await RecordRunAsync(stats, null, started, kit.Context.Clock.NowMs, ct).ConfigureAwait(false);
+            return stats;
+        }
+
+        /// <summary>Reads uncovered anchors: plans them oldest first, packs whole-conversation slices into the model's window
+        /// and processes at most <see cref="ExtractionOptions.MaxSlicesPerJob"/> of them (the rest stay pending).</summary>
+        private async Task ReadAsync(string canonical, long asOf, IReadOnlyList<EvidenceAnchor> uncovered, ExtractionRunStats stats, SliceRun run, Func<object, Task> progress)
+        {
+            var ct = run.Ct;
             if (uncovered.Count == 0)
             {
                 stats.Outcome = "nothing_new";
-                await RecordRunAsync(stats, job.Job.JobId, started, kit.Context.Clock.NowMs, ct).ConfigureAwait(false);
-                return stats;
+                return;
             }
             var planned = uncovered.Take(options.Assembly.MaxAnchorsPerJob).ToList();
             var segments = assembler.Segments(planned);
@@ -125,19 +165,17 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     stats.Pending = true;
                     break;
                 }
-                await ProcessSliceAsync(canonical, slice, profile, budget, estimator, stats, job, sourceSeq, 0).ConfigureAwait(false);
+                await ProcessSliceAsync(canonical, slice, profile, budget, estimator, stats, run, sourceSeq, 0).ConfigureAwait(false);
                 done++;
-                await job.ReportProgressAsync(new { person = canonical, slice = done, slices = slices.Count, claims = stats.ClaimsVerified, rejected = stats.ClaimsRejected }).ConfigureAwait(false);
+                await progress(new { person = canonical, slice = done, slices = slices.Count, claims = stats.ClaimsVerified, rejected = stats.ClaimsRejected }).ConfigureAwait(false);
             }
             if (uncovered.Count > planned.Count) stats.Pending = true;
-            await RecordRunAsync(stats, job.Job.JobId, started, kit.Context.Clock.NowMs, ct).ConfigureAwait(false);
-            return stats;
         }
 
         private async Task ProcessSliceAsync(string subject, EvidenceSlice slice, string profile, int budget, TokenEstimator estimator, ExtractionRunStats stats,
-            JobContext job, long sourceSeq, int depth)
+            SliceRun run, long sourceSeq, int depth)
         {
-            var ct = job.Cancellation;
+            var ct = run.Ct;
             string subjectHandle = slice.Roster.HandleFor(subject);
             var extra = slice.Roster.Entries.Where(e => e.Role != RosterRole.Subject && e.Tracked).Select(e => e.Handle).ToList();
             string prefix = ExtractionPrompt.Prefix(slice, subjectHandle, profile, extra);
@@ -145,15 +183,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
 
             // Pass A: its own session.
             StructuredAnswer<ExtractionAnswer> a;
-            using (var s1 = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, AIRouterWorkClass.Background,
-                       ExtractionPrompt.Version, job.Job.JobId))
+            using (var s1 = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
+                       ExtractionPrompt.Version, run.JobId))
             {
                 a = await StructuredLlm.AskAsync<ExtractionAnswer>(s1, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(1), ExtractionPrompt.Validate, ct).ConfigureAwait(false);
                 stats.LlmCalls += a.Calls;
             }
             if (a.Outcome is StructuredOutcome.Overflow or StructuredOutcome.Truncated)
             {
-                await SplitAsync(subject, slice, profile, budget, estimator, stats, job, sourceSeq, depth).ConfigureAwait(false);
+                await SplitAsync(subject, slice, profile, budget, estimator, stats, run, sourceSeq, depth).ConfigureAwait(false);
                 return;
             }
             if (a.Outcome == StructuredOutcome.Refused)
@@ -170,8 +208,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             List<(RawClaim Claim, string Agreement)> agreed;
             var verified = new List<VerifiedClaim>();
             var rejected = new List<RejectedClaim>();
-            using (var s2 = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, AIRouterWorkClass.Background,
-                       ExtractionPrompt.Version, job.Job.JobId))
+            using (var s2 = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
+                       ExtractionPrompt.Version, run.JobId))
             {
                 var b = await StructuredLlm.AskAsync<ExtractionAnswer>(s2, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(2), ExtractionPrompt.Validate, ct).ConfigureAwait(false);
                 stats.LlmCalls += b.Calls;
@@ -269,18 +307,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             return AgeBands.Stricter(band, AgeBands.Evaluate(existing.Concat(fresh).ToList(), now));
         }
 
-        private async Task SplitAsync(string subject, EvidenceSlice slice, string profile, int budget, TokenEstimator estimator, ExtractionRunStats stats, JobContext job,
+        private async Task SplitAsync(string subject, EvidenceSlice slice, string profile, int budget, TokenEstimator estimator, ExtractionRunStats stats, SliceRun run,
             long sourceSeq, int depth)
         {
             stats.Splits++;
             if (depth >= MaxSplitDepth || (slice.Segments.Count <= 1 && slice.Segments.Sum(s => s.Messages.Count) <= 1))
             {
                 // Cannot shrink further: record it honestly and move on (the Quality Lab shows these as "too large").
-                await CommitAsync(slice, subject, "too_large", new List<VerifiedClaim>(), new List<RejectedClaim>(), new List<AgeEvidenceRow>(), stats, sourceSeq, job.Cancellation).ConfigureAwait(false);
+                await CommitAsync(slice, subject, "too_large", new List<VerifiedClaim>(), new List<RejectedClaim>(), new List<AgeEvidenceRow>(), stats, sourceSeq, run.Ct).ConfigureAwait(false);
                 return;
             }
             foreach (var part in assembler.Pack(subject, slice.Segments, Math.Max(1_000, budget / 2), estimator))
-                await ProcessSliceAsync(subject, part with { Index = slice.Index * 10 + part.Index + 1 }, profile, budget / 2, estimator, stats, job, sourceSeq, depth + 1).ConfigureAwait(false);
+                await ProcessSliceAsync(subject, part with { Index = slice.Index * 10 + part.Index + 1 }, profile, budget / 2, estimator, stats, run, sourceSeq, depth + 1).ConfigureAwait(false);
         }
 
         private async Task CommitAsync(EvidenceSlice slice, string subject, string outcome, List<VerifiedClaim> verified, List<RejectedClaim> rejected,
@@ -390,7 +428,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             return sb.ToString().TrimEnd();
         }
 
-        private Task RecordRunAsync(ExtractionRunStats s, long jobId, long startedMs, long? finishedMs, CancellationToken ct) =>
+        private Task RecordRunAsync(ExtractionRunStats s, long? jobId, long startedMs, long? finishedMs, CancellationToken ct) =>
             kit.Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, """
                 INSERT INTO kn_extraction_runs(run_id, person_id, job_id, prompt_version, model, slices, messages, claims_raw, claims_agreed, claims_verified, claims_rejected,
                     rejections_json, llm_calls, outcome, started_at_ms, finished_at_ms)
@@ -400,7 +438,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     rejections_json=excluded.rejections_json, llm_calls=excluded.llm_calls, outcome=excluded.outcome, finished_at_ms=excluded.finished_at_ms
                 """, ("$r", s.RunId), ("$p", s.PersonId), ("$j", jobId), ("$pv", ExtractionPrompt.Version), ("$m", s.Model), ("$s", s.Slices), ("$msg", s.Messages),
                 ("$raw", s.ClaimsRaw), ("$agr", s.ClaimsAgreed), ("$ver", s.ClaimsVerified), ("$rej", s.ClaimsRejected),
-                ("$rj", JsonSerializer.Serialize(new { s.Rejections, s.Refusals, s.Splits, pending = s.Pending }, KernelJson.Options)), ("$calls", s.LlmCalls),
+                ("$rj", JsonSerializer.Serialize(new { s.Rejections, s.Refusals, s.Splits, pending = s.Pending, alreadyRead = s.AlreadyRead }, KernelJson.Options)), ("$calls", s.LlmCalls),
                 ("$o", finishedMs == null ? "running" : s.Outcome), ("$st", startedMs), ("$fin", finishedMs)), ct);
     }
 }

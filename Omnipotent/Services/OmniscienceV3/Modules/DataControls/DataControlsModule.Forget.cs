@@ -174,6 +174,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                 c.Exec(tx, "INSERT INTO audit_log(at_ms, actor, action, target, detail_json) VALUES($t,$a,'person.forget.start',NULL,$d)", ("$t", now), ("$a", actor),
                     ("$d", Json(new { runId, level = target.Level, identities = target.Identities.Count, directChats = target.DirectChats.Count })));
             }, ct).ConfigureAwait(false);
+            if (target.Level != LevelErase) AnalysisOff.Changed(); // committed: cached readers reload
             await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "INSERT INTO dc_forget(run_id, state, target_json, started_at_ms) VALUES($r,'queued',$t,$n)",
                 ("$r", runId), ("$t", Json(target)), ("$n", now)), ct).ConfigureAwait(false);
             await Context.Jobs.EnqueueAsync(new JobRequest
@@ -756,6 +757,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                     c.Exec(tx, "INSERT INTO audit_log(at_ms, actor, action, target, detail_json) VALUES($t,$a,'person.analysis.on',$p,NULL)", ("$t", now), ("$a", actor), ("$p", person));
                 return n;
             }, ct).ConfigureAwait(false);
+            AnalysisOff.Changed(); // committed: cached readers reload
             if (cleared == 0) return false;
             await Context.Stores.Corpus.WriteAsync((c, tx) => ChangeLog.Append(c, tx, now, ChangeKinds.PersonReanalyse, person, person, null, SourceKinds.Operator), ct).ConfigureAwait(false);
             return true;

@@ -8,6 +8,7 @@ using Omnipotent.Services.OmniscienceV3.Knowledge.Api;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Entities;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Policy;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Store;
+using Omnipotent.Services.OmniscienceV3.Knowledge.Tactics;
 using Omnipotent.Services.OmniscienceV3.ReadModels;
 using Omnipotent.Services.OmniscienceV3.Storage;
 using Omnipotent.Services.OmniscienceV3.Storage.Sqlite;
@@ -47,6 +48,14 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         private KnowledgeKit kit = null!;
         private ClaimStore claims = null!;
         private ReviewQueue review = null!;
+        private IReadOnlyList<ITactic>? tactics;
+
+        /// <summary>The slices one X17 run reads for each person, at most (the continuous job's fair rotation does not apply:
+        /// Klives asked and is waiting).</summary>
+        public const int SelectionSlicesPerPerson = 12;
+
+        /// <summary>X17: the pipeline on chosen messages.</summary>
+        public override IReadOnlyList<ITactic> Tactics => tactics ??= new ITactic[] { new ExtractFromSelectionTactic(this) };
 
         /// <summary>The datasets this module declares, offered to the Explore mirror (integration, Phase 3).</summary>
         public IReadOnlyList<Kernel.Explore.ExploreSource> ExploreSources => Store.KnowledgeSchema.ExploreSourcesOf(Manifest.Datasets);
@@ -236,6 +245,83 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             });
         }
 
+        /// <summary>X17 (extract from a selection): see <see cref="ExtractFromSelectionTactic"/>.</summary>
+        internal async Task<IReadOnlyList<TacticOutput>> ExtractSelectedAsync(TacticRunContext context)
+        {
+            // The Quality Lab's regression gate holds here too: a prompt version it blocked never extracts (N18).
+            if (Quality.QualityModule.LatestGate(Context.Stores, "deduction.extract", ExtractionPrompt.Version) is { Decision: "block" } gate)
+                throw new TacticRefusedException($"Extraction prompt {ExtractionPrompt.Version} is blocked by the Quality Lab gate: {string.Join(" ", gate.Reasons)}");
+            if (Context.Llm == null) throw new TacticRefusedException("Reading messages for facts needs the LLM gateway, which this engine does not have.");
+            var input = context.Input;
+            var chosen = input.Selections.Where(s => s.Kind == SelectionKind.Message).SelectMany(s => s.Items.Select(i => i.Id)).Distinct(StringComparer.Ordinal).ToList();
+            var named = input.Selections.Where(s => s.Kind == SelectionKind.Person).SelectMany(s => s.Items.Select(i => kit.Corpus.Canonical(i.Id)))
+                .Distinct(StringComparer.Ordinal).ToList();
+            int maxPeople = Math.Clamp(input.Param<int?>("maxPeople") ?? ExtractFromSelectionTactic.DefaultMaxPeople, 1, 20);
+
+            // Who the messages are evidence about: the people Klives chose, or else whoever wrote them, most messages first.
+            // Klives's own messages are read for facts about him only when he chooses himself. Messages of people whose analysis
+            // is switched off are not visible here at all, and those people are never read.
+            var visible = kit.Corpus.Messages(chosen);
+            var self = kit.Corpus.SelfPersonIds().Select(kit.Corpus.Canonical).ToHashSet(StringComparer.Ordinal);
+            var written = visible.Where(m => m.AuthorPersonId != null).GroupBy(m => kit.Corpus.Canonical(m.AuthorPersonId!), StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Count(), StringComparer.Ordinal);
+            var candidates = (named.Count > 0 ? named : written.Keys.Where(p => !self.Contains(p)).ToList())
+                .Where(p => kit.Corpus.PersonExists(p) && !kit.Corpus.AnalysisOff.Person(p))
+                .OrderByDescending(p => written.GetValueOrDefault(p)).ThenBy(p => p, StringComparer.Ordinal).ToList();
+            var subjects = candidates.Take(maxPeople).ToList();
+            if (subjects.Count == 0)
+                throw new TacticRefusedException(named.Count > 0 ? "None of the chosen people can be read: they are unknown, or analysis is switched off for them."
+                    : written.Keys.Any(self.Contains) ? "The chosen messages are yours. Choose yourself as a person too, to read them for facts about you."
+                    : "None of the chosen messages can be read: they are gone, or analysis is switched off for the people who wrote them.");
+
+            var pipeline = new ExtractionPipeline(kit, claims, ExtractionSettings() with { MaxSlicesPerJob = SelectionSlicesPerPerson });
+            var outcomes = new List<SelectionOutcome>();
+            foreach (var person in subjects)
+                outcomes.Add(await context.StageAsync("extract:" + person, async ct =>
+                {
+                    var stats = await pipeline.RunSelectedAsync(person, chosen, context.RunId, ct, context.ReportAsync).ConfigureAwait(false);
+                    if (stats.Slices > 0 || stats.TouchedSubjects.Count > 0)
+                    {
+                        await ConsolidateAndProjectAsync(person, null, kit.Corpus.MaxSeq(), ct).ConfigureAwait(false);
+                        foreach (var other in stats.TouchedSubjects.Where(s => s != person))
+                            await Context.Jobs.EnqueueAsync(Job(ConsolidateKind, "person", other, 120), ct).ConfigureAwait(false);
+                    }
+                    return new SelectionOutcome(person, kit.Corpus.DisplayName(person), stats.RunId, stats.Messages, stats.AlreadyRead, stats.ClaimsVerified, stats.ClaimsRejected,
+                        stats.Refusals, stats.Pending, stats.Outcome, new Dictionary<string, int>(stats.Rejections, StringComparer.Ordinal));
+                }).ConfigureAwait(false));
+
+            // What came of it: the messages the verified claims cite, and the live facts that now rest on them.
+            List<string> cited;
+            using (var c = Context.Stores.Intel.OpenRead())
+                cited = c.QueryIn(null, """
+                        SELECT DISTINCT m.message_id FROM kn_claims k JOIN kn_claim_messages m ON m.claim_id=k.claim_id
+                        WHERE k.run_id IN ({keys}) AND k.verdict='verified' AND k.superseded=0
+                        """, outcomes.Select(o => o.RunId).ToList(), r => r.GetString(0))
+                    .Distinct(StringComparer.Ordinal).ToList();
+            var facts = cited.SelectMany(kit.Assertions.CitingMessage).Distinct(StringComparer.Ordinal).ToList();
+
+            int read = outcomes.Sum(o => o.Messages), before = outcomes.Sum(o => o.AlreadyRead), verified = outcomes.Sum(o => o.Verified), rejected = outcomes.Sum(o => o.Rejected);
+            var leftOut = candidates.Skip(maxPeople).ToList();
+            string names = string.Join(", ", outcomes.Select(o => o.Name ?? o.PersonId));
+            var summary = new System.Text.StringBuilder();
+            summary.Append(read == 0 && before > 0
+                ? $"Nothing new to read for {names}: the {before} chosen message{(before == 1 ? " had" : "s had")} already been read."
+                : $"Read {read} message{(read == 1 ? "" : "s")} for {names}: {verified} claim{(verified == 1 ? "" : "s")} verified, {rejected} rejected{(before > 0 ? $"; {before} had already been read" : "")}.");
+            if (facts.Count > 0) summary.Append($" {facts.Count} fact{(facts.Count == 1 ? " rests" : "s rest")} on them.");
+            if (outcomes.Any(o => o.Refusals > 0)) summary.Append(" The model declined part of it.");
+            if (outcomes.Any(o => o.Pending)) summary.Append(" More is left: run it again to read the rest.");
+            if (leftOut.Count > 0) summary.Append($" Not read for {leftOut.Count} more {(leftOut.Count == 1 ? "person" : "people")} (raise maxPeople).");
+
+            var outputs = new List<TacticOutput>();
+            if (facts.Count > 0)
+                outputs.Add(new TacticOutput(TacticOutputKind.FactSet, Selection.Of(SelectionKind.Assertion, facts, "x17:" + context.RunId), Summary: "Facts resting on the chosen messages"));
+            if (cited.Count > 0)
+                outputs.Add(new TacticOutput(TacticOutputKind.MessageSet, Selection.Of(SelectionKind.Message, cited, "x17:" + context.RunId), Summary: "Messages the verified claims cite"));
+            outputs.Add(new TacticOutput(TacticOutputKind.Report,
+                Data: JsonSerializer.SerializeToElement(new { people = outcomes, leftOut, facts = facts.Count, cited = cited.Count }, KernelJson.Options), Summary: summary.ToString()));
+            return outputs;
+        }
+
         private async Task<string?> ConsolidateJobAsync(JobContext job)
         {
             string person = kit.Corpus.Canonical(Subject(job));
@@ -245,10 +331,13 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
 
         /// <summary>The one pipeline after any change: consolidate, aliases, entities, the profile read model, then queue the
         /// detective (debounced) and the timeline/plans projections.</summary>
-        internal async Task<ConsolidationResult> ConsolidateAndProjectAsync(string person, JobContext job, long seq)
+        internal Task<ConsolidationResult> ConsolidateAndProjectAsync(string person, JobContext job, long seq) =>
+            ConsolidateAndProjectAsync(person, job.Job.JobId, seq, job.Cancellation);
+
+        /// <param name="jobId">The job the work is audited against; none for a tactic run (X17).</param>
+        internal async Task<ConsolidationResult> ConsolidateAndProjectAsync(string person, long? jobId, long seq, CancellationToken ct)
         {
-            var ct = job.Cancellation;
-            var result = await NewConsolidator().ConsolidateAsync(person, job.Job.JobId, seq, ct).ConfigureAwait(false);
+            var result = await NewConsolidator().ConsolidateAsync(person, jobId, seq, ct).ConfigureAwait(false);
             var verified = claims.LoadVerified(kit.Corpus.PersonIdsOf(person));
             await new AliasEngine(kit, review).RebuildAsync(person, verified, seq, ct).ConfigureAwait(false);
             await new EntityResolver(kit).RebuildAsync(person, verified, seq, ct).ConfigureAwait(false);

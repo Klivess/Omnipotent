@@ -33,6 +33,18 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
         /// <summary>operator.db <c>dismissals.kind</c>; the key is a person id.</summary>
         public const string Kind = "analysis_off";
 
+        private static long changes;
+
+        /// <summary>
+        /// Grows with every switch made in this process, so a reader that caches the set (the knowledge layer's) reloads at
+        /// once instead of reading someone for a while after their analysis was switched off. <see cref="Set"/> and
+        /// <see cref="Clear"/> count it inside their transaction; whoever commits one counts it again with
+        /// <see cref="Changed"/>, so a reader that reloaded in between cannot keep the old set.
+        /// </summary>
+        public static long Changes => Interlocked.Read(ref changes);
+
+        public static void Changed() => Interlocked.Increment(ref changes);
+
         public static AnalysisOffSet Load(OmniscienceStores stores)
         {
             List<string> marked;
@@ -61,12 +73,14 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
         {
             foreach (string person in persons)
                 c.Exec(tx, "INSERT OR IGNORE INTO dismissals(kind, key, until_ms, at_ms) VALUES($k,$p,NULL,$n)", ("$k", Kind), ("$p", person), ("$n", nowMs));
+            Changed();
         }
 
         public static int Clear(SqliteConnection c, SqliteTransaction tx, IEnumerable<string> persons)
         {
             int n = 0;
             foreach (string person in persons) n += c.Exec(tx, "DELETE FROM dismissals WHERE kind=$k AND key=$p", ("$k", Kind), ("$p", person));
+            Changed();
             return n;
         }
     }
