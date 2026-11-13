@@ -172,7 +172,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             using (var c = h.Runtime.Stores.Intel.OpenRead())
                 Assert.Equal(0, c.Scalar<long>(null, "SELECT COUNT(*) FROM link_urls WHERE url LIKE '%SECRET123%' OR url LIKE '%token%' OR url LIKE '%user=%'"));
 
-            // Looking things up is off until Klives switches it on.
+            // Switched off (the harness starts with lookups off), nothing is looked up.
             await RunAsync(h, minutes: 6);
             Assert.Empty(h.Fetcher.Asked);
             await h.Settings.SetAsync("links.unfurl.enabled", true, "test");

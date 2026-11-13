@@ -99,6 +99,8 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
                 Encoder = h.Encoder,
             });
             h.Driver = new JobDriver(h.Runtime, h.Clock);
+            // Provider lookups are on by default; the tests switch them on themselves when they mean to.
+            if (links) await h.Settings.SetAsync("links.unfurl.enabled", false, "test");
             await h.SeedAsync();
             return h;
         }

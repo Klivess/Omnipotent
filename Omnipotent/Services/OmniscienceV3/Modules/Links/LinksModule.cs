@@ -63,8 +63,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Links
             MinorRestricted = true,
             Settings = new[]
             {
-                new SettingDescriptor("links.unfurl.enabled", SettingTypes.Bool, "false",
-                    "Ask a provider's own metadata endpoint (YouTube, Spotify, Reddit, Steam and a few more) about a public link that came without a preview. Off: only the previews stored with the messages are used and nothing is requested."),
+                new SettingDescriptor("links.unfurl.enabled", SettingTypes.Bool, "true",
+                    "Ask a provider's own metadata endpoint (YouTube, Spotify, Reddit, Steam and a few more) about a public link that came without a preview (on since 2026-11-13, Klives's decision). Off: only the previews stored with the messages are used and nothing is requested."),
                 new SettingDescriptor("links.unfurl.per_run", SettingTypes.Int, "20", "How many links are looked up every five minutes at most.", 1, 200),
                 new SettingDescriptor("links.categorise.enabled", SettingTypes.Bool, "true", "File links under a topic and give each a one-line summary, from their title and description."),
                 new SettingDescriptor("links.categorise.per_run", SettingTypes.Int, "60", "How many links are filed every half hour at most.", 1, 600),
@@ -132,7 +132,7 @@ CREATE TABLE link_state(
         public override IEnumerable<JobRequest> Plan(PlanContext context)
         {
             if (context.Dirty.Count > 0 || context.VersionChanged || context.DueSchedules.Any(s => s.Name == "scan")) yield return Job(ScanKind, "stream", "messages", priority: 90);
-            if (context.DueSchedules.Any(s => s.Name == "unfurl") && Context.Settings.Get("links.unfurl.enabled", false)) yield return Job(UnfurlKind, "stream", "pending", priority: 40, lane: Lane.Io);
+            if (context.DueSchedules.Any(s => s.Name == "unfurl") && Context.Settings.Get("links.unfurl.enabled", true)) yield return Job(UnfurlKind, "stream", "pending", priority: 40, lane: Lane.Io);
             if (context.DueSchedules.Any(s => s.Name == "categorise") && Context.Settings.Get("links.categorise.enabled", true) && Context.Llm != null)
                 yield return Job(CategoriseKind, "stream", "untopic", priority: 35, lane: Lane.LlmBackground);
         }
@@ -307,7 +307,7 @@ CREATE TABLE link_state(
         private async Task<string?> UnfurlAsync(JobContext job)
         {
             var ct = job.Cancellation;
-            if (!Context.Settings.Get("links.unfurl.enabled", false)) return Json(new { skipped = "switched off" });
+            if (!Context.Settings.Get("links.unfurl.enabled", true)) return Json(new { skipped = "switched off" });
             var fetcher = injected ?? (owned ??= new HttpLinkFetcher());
             List<(string Id, string Url)> pending;
             using (var c = Context.Stores.Intel.OpenRead())
