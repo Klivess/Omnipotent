@@ -27,6 +27,12 @@ namespace Omnipotent.Services.OmniscienceV3
     {
         public const string ShadowEnabledSetting = "OmniscienceV3_ShadowEnabled";
 
+        /// <summary>
+        /// Whether v3 feeds KliveRAG's "omniscience" source instead of v2 (off in shadow mode; on at cutover). The engine that
+        /// does not feed it has its documents removed from the index (KliveRAG's <c>OmniscienceV3Connector</c>).
+        /// </summary>
+        public const string FeedsKliveRagSetting = "OmniscienceV3_FeedsKliveRag";
+
         private readonly V3Host host = new();
         private readonly RouteRegistrar registrar;
         private int routesRegistered;

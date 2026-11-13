@@ -34,8 +34,12 @@ namespace Omnipotent.Services.KliveRAG
         private ProjectsEventConnector projectsEvents = null!;
         private KliveAgentConnector agentFiles = null!;
         private OmniscienceConnector omniscience = null!;
+        private OmniscienceV3Connector omniscienceV3 = null!;
         private OmniLogConnector omniLogs = null!;
         private OmniscienceFederation federation = null!;
+        private OmniscienceV3Federation federationV3 = null!;
+        /// <summary>Whether Omniscience v3 feeds the "omniscience" source (its switch; v2 is then not read).</summary>
+        private Func<Task<bool>> v3Feeds = () => Task.FromResult(false);
 
         /// <summary>Sources kept OUT of the auto-injected prompt block (too noisy to inject), but still
         /// reachable via the explicit search_knowledge tool.</summary>
@@ -73,8 +77,12 @@ namespace Omnipotent.Services.KliveRAG
             // Connectors. Projects/Omniscience are resolved lazily (they may start after us).
             Func<Task<Projects.Projects?>> resolveProjects = async () =>
                 (await GetServicesByType<Projects.Projects>()).FirstOrDefault() as Projects.Projects;
-            Func<Task<Omniscience.Omniscience?>> resolveOmni = async () =>
+            // Omniscience v3 feeds the "omniscience" source instead of v2 once its switch is on (cutover): v2 is then not read.
+            v3Feeds = () => GetBoolOmniSetting(Omnipotent.Services.OmniscienceV3.OmniscienceV3.FeedsKliveRagSetting, false);
+            Func<Task<Omniscience.Omniscience?>> resolveOmni = async () => await v3Feeds() ? null :
                 (await GetServicesByType<Omniscience.Omniscience>()).FirstOrDefault() as Omniscience.Omniscience;
+            Func<Task<Omnipotent.Services.OmniscienceV3.V3Runtime?>> resolveV3 = async () =>
+                (await GetServicesByType<Omnipotent.Services.OmniscienceV3.OmniscienceV3>()).FirstOrDefault() is Omnipotent.Services.OmniscienceV3.OmniscienceV3 v3 ? v3.Host.Runtime : null;
             Func<Task<Omnipotent.Logging.OmniLogging?>> resolveLogs = async () =>
                 (await GetServicesByType<Omnipotent.Logging.OmniLogging>()).FirstOrDefault() as Omnipotent.Logging.OmniLogging;
 
@@ -82,8 +90,10 @@ namespace Omnipotent.Services.KliveRAG
             projectsEvents = new ProjectsEventConnector(Writer, msg => _ = ServiceLog(msg), resolveProjects);
             agentFiles = new KliveAgentConnector(Writer, msg => _ = ServiceLog(msg));
             omniscience = new OmniscienceConnector(Writer, msg => _ = ServiceLog(msg), resolveOmni);
+            omniscienceV3 = new OmniscienceV3Connector(Writer, msg => _ = ServiceLog(msg), resolveV3, v3Feeds);
             omniLogs = new OmniLogConnector(Writer, msg => _ = ServiceLog(msg), resolveLogs);
             federation = new OmniscienceFederation(resolveOmni, msg => _ = ServiceLog(msg));
+            federationV3 = new OmniscienceV3Federation(resolveV3, msg => _ = ServiceLog(msg));
 
             // Web stack: lazy container (started on first web_search), plus fetch/extract/cache.
             Searxng = new SearxngContainerManager(Http, msg => _ = ServiceLog(msg));
@@ -111,6 +121,7 @@ namespace Omnipotent.Services.KliveRAG
                 await RunConnectorSafe(repoDocs, cts.Token);
                 await RunConnectorSafe(agentFiles, cts.Token);
                 await RunConnectorSafe(omniscience, cts.Token);
+                await RunConnectorSafe(omniscienceV3, cts.Token);
                 await RunConnectorSafe(projectsEvents, cts.Token); // also wires the live EventAppended push
                 await RunConnectorSafe(omniLogs, cts.Token);
             });
@@ -119,6 +130,7 @@ namespace Omnipotent.Services.KliveRAG
             _ = PeriodicLoop(repoDocs, TimeSpan.FromHours(6));
             _ = PeriodicLoop(agentFiles, TimeSpan.FromMinutes(15));
             _ = PeriodicLoop(omniscience, TimeSpan.FromMinutes(30));
+            _ = PeriodicLoop(omniscienceV3, TimeSpan.FromMinutes(15)); // also removes what v3 no longer allows
             _ = PeriodicLoop(projectsEvents, TimeSpan.FromMinutes(10));
             _ = PeriodicLoop(omniLogs, TimeSpan.FromMinutes(5)); // errors are ephemeral in-memory — capture often
 
@@ -156,7 +168,8 @@ namespace Omnipotent.Services.KliveRAG
             var hits = await Retriever.SearchAsync(query, opts, ct);
             if (opts.IncludeMessages && federation != null)
             {
-                var msgHits = await federation.SearchAsync(query, Math.Min(4, Math.Max(1, opts.MaxResults)), ct);
+                int wanted = Math.Min(4, Math.Max(1, opts.MaxResults));
+                var msgHits = await v3Feeds() ? await federationV3.SearchAsync(query, wanted, ct) : await federation.SearchAsync(query, wanted, ct);
                 // Internal knowledge first, then federated messages; dedupe and cap.
                 var seen = new HashSet<string>(hits.Select(h => h.DocId), StringComparer.Ordinal);
                 foreach (var m in msgHits)
@@ -305,7 +318,11 @@ namespace Omnipotent.Services.KliveRAG
                 if (source == null || source == RagSource.RepoDocs) await RunConnectorSafe(repoDocs, cts.Token);
                 if (source == null || source == RagSource.AgentConversations || source == RagSource.AgentMemories)
                     await RunConnectorSafe(agentFiles, cts.Token);
-                if (source == null || source == RagSource.Omniscience) await RunConnectorSafe(omniscience, cts.Token);
+                if (source == null || source == RagSource.Omniscience)
+                {
+                    await RunConnectorSafe(omniscience, cts.Token);
+                    await RunConnectorSafe(omniscienceV3, cts.Token);
+                }
                 if (source == null || source == RagSource.ProjectsEvents || source == RagSource.ProjectsDigests)
                     await RunConnectorSafe(projectsEvents, cts.Token);
                 if (source == null || source == RagSource.OmniLogs) await RunConnectorSafe(omniLogs, cts.Token);
