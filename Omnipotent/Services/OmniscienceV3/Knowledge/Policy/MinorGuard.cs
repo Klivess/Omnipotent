@@ -74,5 +74,20 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
 
         public static bool AllowsAttribute(string attribute, AgeBand band) =>
             !IsRestricted(band) || !RestrictedAttributes.Contains(attribute);
+
+        /// <summary>
+        /// The age band of whoever a fact names (null when it names nobody), looked up once per person. A fact about an
+        /// adult can still be an identity fact about a minor ("her brother is ..."), so reads check both ends.
+        /// </summary>
+        public static Func<string?, AgeBand?> NamedBands(IPolicyOracle policy, long atMs)
+        {
+            var seen = new Dictionary<string, AgeBand>(StringComparer.Ordinal);
+            return personId =>
+            {
+                if (string.IsNullOrEmpty(personId)) return null;
+                if (!seen.TryGetValue(personId, out var band)) seen[personId] = band = policy.BandOf(policy.Canonical(personId), atMs);
+                return band;
+            };
+        }
     }
 }

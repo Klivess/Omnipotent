@@ -217,6 +217,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
         public static bool IsBlockedFor(string attribute, AgeBand band) =>
             MinorGuard.IsRestricted(band) && (Get(attribute).Sensitivity == AttributeSensitivity.RestrictedForMinors || MinorGuard.RestrictedAttributes.Contains(attribute));
 
+        /// <summary>
+        /// MinorGuard on the read side, for one stored assertion. It is not shown when its attribute is restricted for its
+        /// subject or for the person it names, or when it is an inference about someone the guard covers. Writing refuses
+        /// these already; this covers what was stored before a band became restricted: an inference stays live until the
+        /// next detective run and stays in the history after it, and a fact that names someone stays until its subject
+        /// is consolidated again.
+        /// </summary>
+        public static bool IsShownFor(string attribute, string status, AgeBand subjectBand, AgeBand? namedBand = null) =>
+            !IsBlockedFor(attribute, subjectBand)
+            && (namedBand is not { } named || !IsBlockedFor(attribute, named))
+            && (status != AssertionStatus.Inferred || MinorGuard.Allows(RestrictedCapability.RoutineInference, subjectBand));
+
         public static bool IsSensitive(string attribute) =>
             Get(attribute).Sensitivity == AttributeSensitivity.SensitiveTrait || SensitiveTraits.IsSensitive(attribute);
     }

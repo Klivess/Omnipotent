@@ -1,3 +1,4 @@
+using Omnipotent.Services.OmniscienceV3.Knowledge.Api;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Deduction;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Entities;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Evidence;
@@ -169,6 +170,78 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.NotNull(birth);
             Assert.Equal(Utc(2004, 2, 29), birth!.Value.EarliestMs); // 2004 is the only leap year in the interval
             Assert.True(birth.Value.WidthMs < 86_400_000L);
+        }
+
+        // ── MinorGuard on the read side ───────────────────────────────────────────
+
+        private static KnowledgeFactDto ShownFact(string id, string attribute, string status = AssertionStatus.Accepted, string? names = null) =>
+            new(id, attribute, attribute, "home", "x", Polarity.Affirmed, names, status, 0.9, 0.9, true, null, null, null, null, null, null, 0,
+                ClaimSource.SelfDisclosure, "normal", Producers.Extract);
+
+        private sealed class Bands : IPolicyOracle
+        {
+            public int Lookups;
+            public AgeBand BandOf(string personId, long atMs) { Lookups++; return personId == "p-kid" ? AgeBand.Minor : AgeBand.Adult; }
+            public string Canonical(string personId) => personId == "p-kid-old" ? "p-kid" : personId;
+        }
+
+        [Fact]
+        public void AStoredFact_IsNotShown_WhenItIsRestrictedForEitherPerson_OrIsAnInferenceAboutAMinor()
+        {
+            // An adult's ordinary fact, and an inference about an adult, are shown.
+            Assert.True(Attributes.IsShownFor("pet", AssertionStatus.Accepted, AgeBand.Adult));
+            Assert.True(Attributes.IsShownFor("pet", AssertionStatus.Inferred, AgeBand.Unknown));
+            // Nothing is inferred about a minor, so an inference made before they were known to be one is not shown either.
+            Assert.False(Attributes.IsShownFor("pet", AssertionStatus.Inferred, AgeBand.Minor));
+            Assert.False(Attributes.IsShownFor("pet", AssertionStatus.Inferred, AgeBand.LikelyMinor));
+            Assert.True(Attributes.IsShownFor("pet", AssertionStatus.Accepted, AgeBand.Minor));
+            // A restricted identity fact is hidden from both ends: the minor's own page, and the adult's it is stored under.
+            Assert.False(Attributes.IsShownFor("sibling", AssertionStatus.Accepted, AgeBand.Minor));
+            Assert.False(Attributes.IsShownFor("sibling", AssertionStatus.Accepted, AgeBand.Adult, AgeBand.LikelyMinor));
+            Assert.True(Attributes.IsShownFor("sibling", AssertionStatus.Accepted, AgeBand.Adult, AgeBand.Adult));
+            Assert.True(Attributes.IsShownFor("pet", AssertionStatus.Accepted, AgeBand.Adult, AgeBand.Minor)); // naming a minor is not the restriction; the attribute is
+        }
+
+        [Fact]
+        public void TheBandOfWhoeverAFactNames_IsResolvedThroughMerges_AndLookedUpOncePerPerson()
+        {
+            var policy = new Bands();
+            var named = MinorGuard.NamedBands(policy, 0);
+            Assert.Null(named(null));
+            Assert.Null(named(""));
+            Assert.Equal(AgeBand.Minor, named("p-kid-old")); // an id that was merged away answers for the person it became
+            Assert.Equal(AgeBand.Minor, named("p-kid-old"));
+            Assert.Equal(AgeBand.Adult, named("p-grown"));
+            Assert.Equal(2, policy.Lookups);
+        }
+
+        [Fact]
+        public void AStoredProfile_IsFilteredAsItIsServed_WhenABandBecameRestrictedAfterItWasBuilt()
+        {
+            var profile = new KnowledgeProfileDto("p-adult", 0, false,
+                new[]
+                {
+                    new KnowledgeCategoryDto("family", new[] { ShownFact("a1", "sibling", names: "p-kid"), ShownFact("a2", "sibling", names: "p-grown") }),
+                    new KnowledgeCategoryDto("home", new[] { ShownFact("a3", "pet") }),
+                },
+                new[] { ShownFact("a4", "pet", AssertionStatus.Inferred) }, 10, null, false, "v");
+            var named = MinorGuard.NamedBands(new Bands(), 0);
+
+            // Nothing to withhold: the stored profile is served exactly as it was built.
+            var plain = profile with { Categories = new[] { profile.Categories[1] } };
+            Assert.Same(plain, KnowledgeRoutes.Withhold(plain, AgeBand.Adult, named));
+
+            // A sibling who turned out to be under 18 is no longer named on the adult's page; everything else stays.
+            var served = KnowledgeRoutes.Withhold(profile, AgeBand.Adult, named);
+            Assert.Equal(new[] { "a2", "a3" }, served.Categories.SelectMany(c => c.Facts).Select(f => f.AssertionId));
+            Assert.Equal("a4", Assert.Single(served.Inferences).AssertionId);
+            Assert.False(served.MinorRestricted);
+
+            // The person themself turned out to be under 18: no inferences, no restricted facts, and the profile says so.
+            var minor = KnowledgeRoutes.Withhold(profile, AgeBand.LikelyMinor, named);
+            Assert.Equal(new[] { "a3" }, minor.Categories.SelectMany(c => c.Facts).Select(f => f.AssertionId));
+            Assert.Empty(minor.Inferences);
+            Assert.True(minor.MinorRestricted);
         }
 
         // ── aggregation and calibration ───────────────────────────────────────────

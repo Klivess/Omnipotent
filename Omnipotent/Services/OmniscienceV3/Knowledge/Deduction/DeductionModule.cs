@@ -602,16 +602,17 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             using (var c = Context.Stores.Intel.OpenRead())
                 coverage = c.Query(null, "SELECT covered_messages, last_extract_ms, pending FROM kn_person_state WHERE person_id=$p",
                     r => (r.GetInt32(0), r.GetInt64OrNull(1), r.GetInt32(2) == 1), ("$p", person)).FirstOrDefault();
+            // MinorGuard: nothing restricted about this person or about someone a fact names, and no inference about a minor.
+            var named = MinorGuard.NamedBands(Context.Policy, now);
+            var shown = facts.Where(f => Attributes.IsShownFor(f.Record.Attribute, f.Record.Status, band, named(f.Record.ObjectId))).ToList();
             var body = new KnowledgeProfileDto(
                 person,
                 now,
                 MinorGuard.IsRestricted(band),
-                facts.Where(f => f.Record.Status != AssertionStatus.Inferred && !Attributes.IsBlockedFor(f.Record.Attribute, band))
+                shown.Where(f => f.Record.Status != AssertionStatus.Inferred)
                     .GroupBy(f => f.Definition.Category, StringComparer.Ordinal)
                     .Select(g => new KnowledgeCategoryDto(g.Key, g.Select(ToFactDto).ToList())).OrderBy(c => c.Category, StringComparer.Ordinal).ToList(),
-                MinorGuard.Allows(RestrictedCapability.RoutineInference, band)
-                    ? facts.Where(f => f.Record.Status == AssertionStatus.Inferred).Select(ToFactDto).ToList()
-                    : new List<KnowledgeFactDto>(),
+                shown.Where(f => f.Record.Status == AssertionStatus.Inferred).Select(ToFactDto).ToList(),
                 coverage.Covered, coverage.LastExtract, coverage.Pending, ExtractionPrompt.Version);
             await Context.ReadModels.PutAsync(ProfileReadModel, person, 1, now, seq, body, ct).ConfigureAwait(false);
         }

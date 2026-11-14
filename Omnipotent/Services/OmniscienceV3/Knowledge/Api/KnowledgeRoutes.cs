@@ -66,12 +66,14 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                 };
                 var statuses = q.List("status", 10);
                 var band = Rt.Host.Policy.BandOf(person, Rt.Clock.NowMs);
+                var named = MinorGuard.NamedBands(Rt.Host.Policy, Rt.Clock.NowMs);
+                // Every mode, the history included: what was believed once is still not shown about someone who is now covered by the guard.
                 var views = kit.Assertions.Query(new AssertionQuery
                 {
                     SubjectIds = kit.Corpus.PersonIdsOf(person), AtMs = at, Mode = mode, Attribute = q.Str("attribute", 64), Category = q.Str("category", 64),
                     Statuses = statuses.Count == 0 ? null : statuses, IncludeInferred = q.Bool("inferred") ?? true, Limit = 5_000,
                     EvidenceCutoffMs = q.Bool("knownByThen") == true ? at : null,
-                }).Where(v => !Attributes.IsBlockedFor(v.Record.Attribute, band)).ToList();
+                }).Where(v => Attributes.IsShownFor(v.Record.Attribute, v.Record.Status, band, named(v.Record.ObjectId))).ToList();
                 string? cursor = q.Str("cursor", 128);
                 int limit = q.Int("limit", 200, 1, 1_000);
                 var after = cursor == null ? views : views.SkipWhile(v => v.Record.AssertionId != cursor).Skip(1).ToList();
@@ -86,7 +88,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                 var got = kit.Assertions.Get(ApiQuery.Of(req).Required("id", 128)) ?? throw ApiException.NotFound("No such fact.");
                 var r = got.Record;
                 var band = Rt.Host.Policy.BandOf(kit.Corpus.Canonical(r.SubjectId), Rt.Clock.NowMs);
-                if (Attributes.IsBlockedFor(r.Attribute, band)) throw ApiException.NotFound("No such fact.");
+                if (!Attributes.IsShownFor(r.Attribute, r.Status, band, MinorGuard.NamedBands(Rt.Host.Policy, Rt.Clock.NowMs)(r.ObjectId))) throw ApiException.NotFound("No such fact.");
                 var def = Attributes.Get(r.Attribute);
                 var view = new AssertionView(r, def, Confidence.Effective(def, r.Probability ?? 0, r.AssertedAtMs, Rt.Clock.NowMs));
                 var gold = kit.Gold.ActiveFor(GoldKinds.Assertion, r.NaturalKey);
@@ -111,18 +113,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
             {
                 string person = Kit.Corpus.Canonical(ApiQuery.Of(req).Required("person", 256));
                 var band = Rt.Host.Policy.BandOf(person, Rt.Clock.NowMs);
-                if (!MinorGuard.IsRestricted(band)) return ServeReadModel(req, DeductionModule.ProfileReadModel, person);
-                // Defence in depth: a profile built before the band became restricted is filtered at serialization too.
                 var row = Rt.Host.ReadModels.Get(DeductionModule.ProfileReadModel, person)
                           ?? throw new ApiException(HttpStatusCode.NotFound, "not_built", "This view has not been built yet; it is computed in the background.");
+                // Defence in depth: a profile built before a band became restricted (the person's own, or that of someone one
+                // of its facts names) is filtered at serialization too.
                 var body = JsonSerializer.Deserialize<KnowledgeProfileDto>(row.BodyJson, KernelJson.Options)!;
-                var filtered = body with
-                {
-                    MinorRestricted = true, Inferences = Array.Empty<KnowledgeFactDto>(),
-                    Categories = body.Categories.Select(c => c with { Facts = c.Facts.Where(f => !Attributes.IsBlockedFor(f.Attribute, band)).ToList() }).Where(c => c.Facts.Count > 0).ToList(),
-                };
+                var shown = Withhold(body, band, MinorGuard.NamedBands(Rt.Host.Policy, Rt.Clock.NowMs));
+                if (ReferenceEquals(shown, body)) return Serve(req, row);
                 return ApiResponses.OkAsync(req, new { model = row.ModelId, key = row.Key, version = row.Version, schemaVersion = row.SchemaVersion, asOfMs = row.AsOfMs, sourceSeq = row.SourceSeq,
-                    computedAtMs = row.ComputedAtMs, body = filtered });
+                    computedAtMs = row.ComputedAtMs, body = shown });
             }, ct).ConfigureAwait(false);
 
             // ── review queue ────────────────────────────────────────────────────
@@ -418,11 +417,28 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
 
         // ── helpers ──────────────────────────────────────────────────────────────
 
-        private Task ServeReadModel(UserRequest req, string model, string key)
+        private Task ServeReadModel(UserRequest req, string model, string key) =>
+            Serve(req, Rt.Host.ReadModels.Get(model, key)
+                       ?? throw new ApiException(HttpStatusCode.NotFound, "not_built", "This view has not been built yet; it is computed in the background."));
+
+        private static Task Serve(UserRequest req, ReadModelRow row) =>
+            req.ReturnResponse(DataRoutesEnvelope(row), ApiResponses.JsonContentType, null!, HttpStatusCode.OK);
+
+        /// <summary>
+        /// A stored profile as it may be served now (MinorGuard): without inferences and restricted facts when the person is
+        /// covered by the guard, and without a restricted fact that names someone who is. The same instance when nothing is withheld.
+        /// </summary>
+        internal static KnowledgeProfileDto Withhold(KnowledgeProfileDto body, AgeBand band, Func<string?, AgeBand?> named)
         {
-            var row = Rt.Host.ReadModels.Get(model, key)
-                      ?? throw new ApiException(HttpStatusCode.NotFound, "not_built", "This view has not been built yet; it is computed in the background.");
-            return req.ReturnResponse(DataRoutesEnvelope(row), ApiResponses.JsonContentType, null!, HttpStatusCode.OK);
+            bool Shown(KnowledgeFactDto f) => Attributes.IsShownFor(f.Attribute, f.Status, band, named(f.ObjectPersonId));
+            bool restricted = MinorGuard.IsRestricted(band);
+            if (!restricted && body.Inferences.All(Shown) && body.Categories.All(c => c.Facts.All(Shown))) return body;
+            return body with
+            {
+                MinorRestricted = body.MinorRestricted || restricted,
+                Inferences = restricted ? Array.Empty<KnowledgeFactDto>() : body.Inferences.Where(Shown).ToList(),
+                Categories = body.Categories.Select(c => c with { Facts = c.Facts.Where(Shown).ToList() }).Where(c => c.Facts.Count > 0).ToList(),
+            };
         }
 
         private static string DataRoutesEnvelope(ReadModelRow row) =>
