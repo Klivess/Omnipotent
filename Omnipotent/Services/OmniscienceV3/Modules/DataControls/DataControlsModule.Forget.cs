@@ -175,6 +175,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                     ("$d", Json(new { runId, level = target.Level, identities = target.Identities.Count, directChats = target.DirectChats.Count })));
             }, ct).ConfigureAwait(false);
             if (target.Level != LevelErase) AnalysisOff.Changed(); // committed: cached readers reload
+            // Whoever holds something about people outside this engine lets go now, not when the run has finished.
+            await Context.Events.PublishAsync(ForgettingTopic, new { runId, level = target.Level }, ct).ConfigureAwait(false);
             await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "INSERT INTO dc_forget(run_id, state, target_json, started_at_ms) VALUES($r,'queued',$t,$n)",
                 ("$r", runId), ("$t", Json(target)), ("$n", now)), ct).ConfigureAwait(false);
             await Context.Jobs.EnqueueAsync(new JobRequest
@@ -200,7 +202,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
 
         private static readonly System.Text.RegularExpressions.Regex JsonString = new("\"((?:[^\"\\\\]|\\\\.)*)\"", System.Text.RegularExpressions.RegexOptions.Compiled);
 
-        private static bool TableExists(SqliteConnection c, SqliteTransaction tx, string table) =>
+        private static bool TableExists(SqliteConnection c, SqliteTransaction? tx, string table) =>
             c.Scalar<long>(tx, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=$t", ("$t", table)) > 0;
 
         /// <summary>
@@ -240,6 +242,34 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                     n += c.Exec(tx, $"DELETE FROM {table} WHERE rowid IN ({string.Join(",", chunk)})");
             }
             return n;
+        }
+
+        /// <summary>Live topic raised when a forget is confirmed (the person is blocked from then on; the run follows).
+        /// It says that someone was forgotten and at which level, never who.</summary>
+        public const string ForgettingTopic = "data.forgetting";
+        /// <summary>Live topic raised when a forget run has finished removing.</summary>
+        public const string ForgottenTopic = "data.forgotten";
+
+        /// <summary>
+        /// The other people named together with <paramref name="persons"/> in stored knowledge: the subject of a fact about
+        /// them ("sibling of …"), the other side of a plan or an identity link. Their rows naming the forgotten are removed by
+        /// the sweep; what is projected from those rows (profile, timeline, plans) is rebuilt without them.
+        /// </summary>
+        private static HashSet<string> NamedWith(SqliteConnection c, IReadOnlyList<string> persons, Dictionary<string, List<string>> tables)
+        {
+            var named = new HashSet<string>(StringComparer.Ordinal);
+            if (persons.Count == 0) return named;
+            named.UnionWith(c.QueryIn(null, "SELECT DISTINCT subject_id FROM assertions WHERE subject_kind='person' AND object_kind='person' AND object_id IN ({keys})", persons, r => r.GetString(0)));
+            var columnsOf = new Dictionary<string, List<string>>(StringComparer.Ordinal);
+            foreach (string column in PersonColumns)
+                foreach (string table in tables[column].Where(t => t.StartsWith("kn_", StringComparison.Ordinal)))
+                    (columnsOf.TryGetValue(table, out var list) ? list : columnsOf[table] = new()).Add(column);
+            foreach (var (table, columns) in columnsOf.Where(kv => kv.Value.Count > 1))
+                foreach (string theirs in columns)
+                    foreach (string other in columns.Where(o => o != theirs))
+                        named.UnionWith(c.QueryIn(null, $"SELECT DISTINCT {other} FROM {table} WHERE {other} IS NOT NULL AND {theirs} IN ({{keys}})", persons, r => r.GetString(0)));
+            named.ExceptWith(persons);
+            return named;
         }
 
         /// <summary>Columns that hold a person id, beyond <c>person_id</c>: the knowledge tables name people by role (WS-B).</summary>
@@ -369,7 +399,10 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                     }
                 }
 
-                // 3. What is keyed by the person or their identities, in any derived table, and in the kernel's own.
+                // 3. What is keyed by the person or their identities, in any derived table, and in the kernel's own. First, who
+                //    else those rows name: the sweep removes the rows, and those people's projections are rebuilt without them.
+                using (var intel = Context.Stores.Intel.OpenRead())
+                    lostEvidence.UnionWith(TableExists(intel, null, "assertions") ? NamedWith(intel, target.Persons, tables) : new HashSet<string>(StringComparer.Ordinal));
                 if (Context.Vectors != null) Add("vectors", await Context.Vectors.DeleteEverywhereAsync(VectorSpaces.Person, target.Persons, ct).ConfigureAwait(false));
                 Add("derived rows", await Context.Stores.Intel.WriteAsync((c, tx) => DeleteDerived(c, tx, target, tables), ct).ConfigureAwait(false));
                 foreach (string p in target.Persons) await Context.ReadModels.DeleteAsync(Projections.ProjectionModule.Dossier, p, ct).ConfigureAwait(false);
@@ -383,8 +416,11 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                 await Context.Stores.Corpus.WriteAsync((c, tx) =>
                 {
                     foreach (string person in target.Persons) ChangeLog.Append(c, tx, Context.Clock.NowMs, ChangeKinds.PersonErase, person, null, null, SourceKinds.Operator);
-                    // Others whose facts rested on what was removed are consolidated again from what is left (WS-B listens).
-                    foreach (string person in lostEvidence.Where(p => !target.Persons.Contains(p)).OrderBy(p => p, StringComparer.Ordinal))
+                    // Others whose facts rested on what was removed, or named them, are consolidated again from what is left and
+                    // their projections rebuilt (WS-B listens). Only people still known: a role column can hold other ids.
+                    var others = lostEvidence.Where(p => !target.Persons.Contains(p)).OrderBy(p => p, StringComparer.Ordinal).ToList();
+                    var known = c.QueryIn(tx, "SELECT person_id FROM persons WHERE person_id IN ({keys})", others, r => r.GetString(0)).ToHashSet(StringComparer.Ordinal);
+                    foreach (string person in others.Where(known.Contains))
                         ChangeLog.Append(c, tx, Context.Clock.NowMs, ChangeKinds.EvidenceRemoved, person, person, null, SourceKinds.Operator);
                 }, ct).ConfigureAwait(false);
 
@@ -406,7 +442,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                 await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "UPDATE dc_forget SET state='done', target_json=NULL, counts_json=$c, error=NULL, finished_at_ms=$n WHERE run_id=$r",
                     ("$c", Json(counts)), ("$n", now), ("$r", runId)), ct).ConfigureAwait(false);
                 await Kernel.OperatorAudit.WriteAsync(Context.Stores.Operator, Context.Clock, "datacontrols", "person.forget.done", null, new { runId, level = target.Level, counts }, ct).ConfigureAwait(false);
-                await Context.Events.PublishAsync("data.forgotten", new { runId, level = target.Level, counts }, ct).ConfigureAwait(false);
+                await Context.Events.PublishAsync(ForgottenTopic, new { runId, level = target.Level, counts }, ct).ConfigureAwait(false);
                 return Json(new { runId, level = target.Level, counts });
             }
             catch (Exception ex) when (ex is not OperationCanceledException && job.Job.Attempts >= job.Job.MaxAttempts)

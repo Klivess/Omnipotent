@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Omnipotent.Services.OmniscienceV3;
@@ -17,11 +18,14 @@ namespace Omnipotent.Services.KliveRAG.Connectors
     /// engine's forgetting cannot reach:
     /// <list type="bullet">
     /// <item>Switched on (at cutover): v2's documents are removed (and v2's cursors reset, so it re-reads everything if the
-    /// switch goes back); every pass first deletes whatever v3 no longer allows, then indexes the profiles rebuilt since its
-    /// watermark.</item>
+    /// switch goes back); every pass first deletes whatever v3 no longer allows, rebuilds the documents that named someone it
+    /// no longer allows, then indexes the profiles rebuilt since its watermark.</item>
     /// <item>Switched off (shadow mode): this connector removes what it had indexed and resets its watermark; v2 feeds as before.</item>
     /// </list>
-    /// While v3 is not running nothing is changed: nobody can be forgotten or switched off without it.
+    /// A pass runs every few minutes, and at once when v3 says someone was forgotten or had their analysis switched off.
+    /// Between passes nothing stale is shown either: every read asks <see cref="Withheld"/> first, and v3 answers from the
+    /// moment the forget is confirmed. While v3 is not running its documents are not shown at all: nobody is there to say
+    /// they may still be held.
     /// </summary>
     public sealed class OmniscienceV3Connector : RagConnector
     {
@@ -33,6 +37,7 @@ namespace Omnipotent.Services.KliveRAG.Connectors
 
         private readonly Func<Task<V3Runtime?>> resolveRuntime;
         private readonly Func<Task<bool>> feeds;
+        private readonly SemaphoreSlim gate = new(1, 1); // one pass at a time: a pass asked for by a forget waits for the one running
 
         public OmniscienceV3Connector(RagIndexWriter writer, Action<string> log, Func<Task<V3Runtime?>> resolveRuntime, Func<Task<bool>> feeds)
             : base(writer, log)
@@ -43,13 +48,48 @@ namespace Omnipotent.Services.KliveRAG.Connectors
 
         public override string Name => RagSource.Omniscience;
 
+        public static bool IsV3Document(string docId) => docId.StartsWith(KnowledgeFeed.DocPrefix, StringComparison.Ordinal);
+
+        public static bool IsV2Document(string docId) => V2Prefixes.Any(p => docId.StartsWith(p, StringComparison.Ordinal));
+
+        /// <summary>What a stored document says about itself: whom else it names (<see cref="KnowledgeFeed.FeedDocument.Names"/>).</summary>
+        private sealed record DocMeta(string Person, List<string> Names);
+
+        private static string Meta(KnowledgeFeed.FeedDocument d) => JsonSerializer.Serialize(new DocMeta(d.PersonId, d.Names.ToList()));
+
+        /// <summary>The people a stored document names; null when it does not say (indexed before documents said so).</summary>
+        private static List<string>? NamesOf(string? metaJson)
+        {
+            if (string.IsNullOrEmpty(metaJson)) return null;
+            try
+            {
+                return JsonSerializer.Deserialize<DocMeta>(metaJson)?.Names;
+            }
+            catch (JsonException)
+            {
+                return null; // unreadable: treated like a document that does not say
+            }
+        }
+
         public override async Task RunIncrementalAsync(CancellationToken ct)
         {
-            var held = Writer.GetDocIdsForSource(Name);
+            await gate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                await PassAsync(ct).ConfigureAwait(false);
+            }
+            finally
+            {
+                gate.Release();
+            }
+        }
+
+        private async Task PassAsync(CancellationToken ct)
+        {
+            var held = Writer.GetDocMetaForSource(Name);
             if (!await feeds().ConfigureAwait(false))
             {
-                foreach (var id in held.Where(d => d.StartsWith(KnowledgeFeed.DocPrefix, StringComparison.Ordinal)))
-                    await Writer.DeleteAsync(id, ct).ConfigureAwait(false);
+                foreach (var id in held.Keys.Where(IsV3Document)) await Writer.DeleteAsync(id, ct).ConfigureAwait(false);
                 if (GetCursor(Cursor) is { } c && c != "0") await SetCursorAsync(Cursor, "0", ct).ConfigureAwait(false);
                 return;
             }
@@ -60,7 +100,7 @@ namespace Omnipotent.Services.KliveRAG.Connectors
 
             // v3 feeds the source: v2's documents go (v2 re-reads from scratch if the switch goes back).
             int removedV2 = 0;
-            foreach (var id in held.Where(d => V2Prefixes.Any(p => d.StartsWith(p, StringComparison.Ordinal))))
+            foreach (var id in held.Keys.Where(IsV2Document))
             {
                 await Writer.DeleteAsync(id, ct).ConfigureAwait(false);
                 removedV2++;
@@ -71,10 +111,28 @@ namespace Omnipotent.Services.KliveRAG.Connectors
                 Log($"[KliveRAG] Omniscience v3 feeds the index now: removed {removedV2} document(s) from v2.");
             }
 
-            // What v3 no longer allows goes first: forgotten, merged away, analysis off, possibly a minor.
-            foreach (var id in held.Where(d => d.StartsWith(KnowledgeFeed.DocPrefix, StringComparison.Ordinal)))
+            // What is held, by the person it is about.
+            var byPerson = new Dictionary<string, HashSet<string>>(StringComparer.Ordinal);
+            var refresh = new HashSet<string>(StringComparer.Ordinal);
+            int letGo = 0;
+            foreach (var (id, meta) in held.Where(kv => IsV3Document(kv.Key)))
+            {
+                // What v3 no longer allows goes first: forgotten, merged away, analysis off, possibly a minor.
                 if (KnowledgeFeed.PersonOf(id) is not { } person || !feed.MayHold(person, now))
+                {
                     await Writer.DeleteAsync(id, ct).ConfigureAwait(false);
+                    letGo++;
+                    continue;
+                }
+                (byPerson.TryGetValue(person, out var ids) ? ids : byPerson[person] = new(StringComparer.Ordinal)).Add(id);
+                // A document that names someone v3 no longer allows (or does not say whom it names) is rebuilt from the
+                // person's profile as it stands, which leaves such facts out.
+                if (NamesOf(meta) is not { } names || !names.All(n => feed.MayHold(n, now))) refresh.Add(person);
+            }
+            foreach (var person in refresh)
+                await ReplaceAsync(byPerson, person, feed.DocumentsFor(person), ct).ConfigureAwait(false);
+            if (letGo + refresh.Count > 0)
+                Log($"[KliveRAG] Omniscience v3: let go of {letGo} document(s), rebuilt what {refresh.Count} person/people's documents named.");
 
             // Then the profiles rebuilt since the watermark.
             long watermark = long.TryParse(GetCursor(Cursor), NumberStyles.Integer, CultureInfo.InvariantCulture, out var w) ? w : 0;
@@ -83,28 +141,77 @@ namespace Omnipotent.Services.KliveRAG.Connectors
                 ct.ThrowIfCancellationRequested();
                 var changed = feed.ChangedSince(watermark);
                 if (changed.People.Count == 0) break;
-                var current = Writer.GetDocIdsForSource(Name);
                 foreach (var person in changed.People)
-                {
-                    var keep = changed.Documents.Where(d => d.PersonId == person).Select(d => d.DocId).ToHashSet(StringComparer.Ordinal);
-                    foreach (var id in current.Where(d => KnowledgeFeed.PersonOf(d) == person && !keep.Contains(d)))
-                        await Writer.DeleteAsync(id, ct).ConfigureAwait(false);
-                }
-                foreach (var d in changed.Documents)
-                    await Writer.UpsertAsync(new RagDocument
-                    {
-                        DocId = d.DocId,
-                        Source = RagSource.Omniscience,
-                        Title = d.Title,
-                        Content = d.Text,
-                        ContentHash = RagChunker.Hash(d.Text),
-                        CreatedAtUnixMs = d.ChangedAtMs,
-                        SingleChunk = true,
-                    }, ct).ConfigureAwait(false);
+                    await ReplaceAsync(byPerson, person, changed.Documents.Where(d => d.PersonId == person).ToList(), ct).ConfigureAwait(false);
                 watermark = changed.Watermark;
                 await SetCursorAsync(Cursor, watermark.ToString(CultureInfo.InvariantCulture), ct).ConfigureAwait(false);
                 if (!changed.More) break;
             }
+        }
+
+        /// <summary>Makes what is held about one person exactly <paramref name="documents"/>.</summary>
+        private async Task ReplaceAsync(Dictionary<string, HashSet<string>> byPerson, string person, IReadOnlyList<KnowledgeFeed.FeedDocument> documents, CancellationToken ct)
+        {
+            var keep = documents.Select(d => d.DocId).ToHashSet(StringComparer.Ordinal);
+            if (byPerson.TryGetValue(person, out var had))
+                foreach (var id in had.Where(d => !keep.Contains(d)).ToList())
+                    await Writer.DeleteAsync(id, ct).ConfigureAwait(false);
+            foreach (var d in documents)
+                await Writer.UpsertAsync(new RagDocument
+                {
+                    DocId = d.DocId,
+                    Source = RagSource.Omniscience,
+                    Title = d.Title,
+                    Content = d.Text,
+                    // Whom it names is part of what makes the stored document current: the same words naming fewer people is a change.
+                    ContentHash = RagChunker.Hash(d.Text + "\n" + string.Join(",", d.Names)),
+                    CreatedAtUnixMs = d.ChangedAtMs,
+                    MetaJson = Meta(d),
+                    SingleChunk = true,
+                }, ct).ConfigureAwait(false);
+            byPerson[person] = keep;
+        }
+
+        /// <summary>
+        /// The "omniscience" documents among <paramref name="docIds"/> that may not be shown now, for every read path (search,
+        /// prompt injection, reading a document) to drop before answering:
+        /// <list type="bullet">
+        /// <item>documents of the engine that does not feed the source (they are on their way out of the index);</item>
+        /// <item>a v3 document about, or naming, someone v3 no longer allows, from the moment the forget is confirmed;</item>
+        /// <item>every v3 document while v3 is not running, or cannot answer: nobody can say they may still be held.</item>
+        /// </list>
+        /// </summary>
+        public HashSet<string> Withheld(IReadOnlyCollection<string> docIds, bool v3Feeds, V3Runtime? runtime)
+        {
+            var withheld = new HashSet<string>(StringComparer.Ordinal);
+            var v3 = docIds.Where(IsV3Document).Distinct(StringComparer.Ordinal).ToList();
+            if (!v3Feeds)
+            {
+                withheld.UnionWith(v3);
+                return withheld;
+            }
+            withheld.UnionWith(docIds.Where(IsV2Document));
+            if (v3.Count == 0) return withheld;
+            if (runtime == null)
+            {
+                withheld.UnionWith(v3);
+                return withheld;
+            }
+            try
+            {
+                var feed = new KnowledgeFeed(runtime);
+                long now = runtime.Host.Context.Clock.NowMs;
+                var meta = Writer.GetDocMeta(v3);
+                foreach (var id in v3)
+                    if (!meta.TryGetValue(id, out var m) || NamesOf(m) is not { } names || !feed.MayServe(id, names, now))
+                        withheld.Add(id);
+            }
+            catch (Exception ex) when (ex is ObjectDisposedException or InvalidOperationException or Microsoft.Data.Sqlite.SqliteException)
+            {
+                // v3 is stopping or restarting under us: it cannot vouch for anything right now.
+                withheld.UnionWith(v3);
+            }
+            return withheld;
         }
     }
 

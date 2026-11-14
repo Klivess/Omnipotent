@@ -31,6 +31,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         public const int ModuleVersion = 1;
         public const string ExtractKind = "extract";
         public const string ConsolidateKind = "consolidate";
+        /// <summary>Consolidate, then rebuild everything projected from the person's facts whether or not the consolidation
+        /// changed anything: a forget run has already removed rows from under them, so the consolidation itself sees no change.</summary>
+        public const string ReprojectKind = "reproject";
         public const string DetectiveKind = "detective";
         public const string HypothesesKind = "hypotheses";
         public const string ReverifyKind = "reverify";
@@ -130,9 +133,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                         if (c.PersonId != null) yield return new DirtySubject("merge", c.PersonId);
                         yield return new DirtySubject("merge", c.EntityId);
                         break;
-                    // A forgotten person's messages took claims with them (N20): the facts they supported are consolidated again.
+                    // A forgotten person took claims, or facts naming them, with them (N20): what is left is consolidated again
+                    // and the profile, timeline and plans built from it are rebuilt.
                     case ChangeKinds.EvidenceRemoved:
-                        yield return new DirtySubject("consolidate", c.EntityId);
+                        yield return new DirtySubject("reproject", c.EntityId);
                         break;
                 }
             }
@@ -174,6 +178,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     case "consolidate":
                         jobs.Add(Job(ConsolidateKind, "person", kit.Corpus.Canonical(d.Id), 160));
                         break;
+                    case "reproject":
+                        jobs.Add(Job(ReprojectKind, "person", kit.Corpus.Canonical(d.Id), 170));
+                        break;
                     case "merge":
                     {
                         string canonical = kit.Corpus.Canonical(d.Id);
@@ -201,6 +208,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         {
             ExtractKind => await ExtractAsync(job).ConfigureAwait(false),
             ConsolidateKind => await ConsolidateJobAsync(job).ConfigureAwait(false),
+            ReprojectKind => await ReprojectJobAsync(job).ConfigureAwait(false),
             DetectiveKind => await DetectiveAsync(job).ConfigureAwait(false),
             HypothesesKind => await HypothesesAsync(job).ConfigureAwait(false),
             ReverifyKind => await ReverifyAsync(job).ConfigureAwait(false),
@@ -334,8 +342,17 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         internal Task<ConsolidationResult> ConsolidateAndProjectAsync(string person, JobContext job, long seq) =>
             ConsolidateAndProjectAsync(person, job.Job.JobId, seq, job.Cancellation);
 
+        private async Task<string?> ReprojectJobAsync(JobContext job)
+        {
+            string person = kit.Corpus.Canonical(Subject(job));
+            if (!kit.Corpus.PersonExists(person)) return Result(new { person, outcome = "unknown_person" });
+            var result = await ConsolidateAndProjectAsync(person, job.Job.JobId, kit.Corpus.MaxSeq(), job.Cancellation, projectAlways: true).ConfigureAwait(false);
+            return Result(new { person, result.Claims, result.Reconcile.Inserted, result.Reconcile.Superseded, result.Reconcile.Retracted, reprojected = true });
+        }
+
         /// <param name="jobId">The job the work is audited against; none for a tactic run (X17).</param>
-        internal async Task<ConsolidationResult> ConsolidateAndProjectAsync(string person, long? jobId, long seq, CancellationToken ct)
+        /// <param name="projectAlways">Queue the timeline and plans projections even when the consolidation changed nothing.</param>
+        internal async Task<ConsolidationResult> ConsolidateAndProjectAsync(string person, long? jobId, long seq, CancellationToken ct, bool projectAlways = false)
         {
             var result = await NewConsolidator().ConsolidateAsync(person, jobId, seq, ct).ConfigureAwait(false);
             var verified = claims.LoadVerified(kit.Corpus.PersonIdsOf(person));
@@ -344,7 +361,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             await SetStateAsync(person, tracked: null, pending: null, consolidated: true, error: null, ct: ct).ConfigureAwait(false);
             await WriteProfileAsync(person, seq, ct).ConfigureAwait(false);
             await FlagAgeConflictsAsync(person, seq, ct).ConfigureAwait(false);
-            if (result.Reconcile.Changed)
+            if (result.Reconcile.Changed || projectAlways)
             {
                 await Context.Jobs.EnqueueAsync(new JobRequest
                 {
@@ -356,7 +373,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     ModuleId = KnowledgeSchema.PlansModule, Kind = "project", SubjectKind = "person", SubjectId = person, Lane = Lane.Cpu, Priority = 90,
                     DedupeKey = JobRequest.KeyFor(KnowledgeSchema.PlansModule, "project", "person", person),
                 }, ct).ConfigureAwait(false);
-                if (DetectiveDue(person))
+                if (result.Reconcile.Changed && DetectiveDue(person))
                     await Context.Jobs.EnqueueAsync(Job(DetectiveKind, "person", person, 60), ct).ConfigureAwait(false);
             }
             await Context.Jobs.EnqueueAsync(Job(HypothesesKind, "person", person, 55), ct).ConfigureAwait(false);

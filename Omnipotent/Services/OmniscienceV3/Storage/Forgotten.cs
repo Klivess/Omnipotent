@@ -42,6 +42,13 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
 
         public static HashSet<string> Persons(SqliteStore operatorStore) => Load(operatorStore).Persons;
 
+        /// <summary>Whether this person is forgotten. True from the moment the forget is confirmed, before its run has removed anything.</summary>
+        public static bool IsPerson(SqliteStore operatorStore, string personId)
+        {
+            using var c = operatorStore.OpenRead();
+            return c.Scalar<long>(null, "SELECT COUNT(*) FROM dismissals WHERE kind=$k AND key=$p", ("$k", PersonKind), ("$p", personId)) > 0;
+        }
+
         public static ForgottenSet Load(SqliteStore operatorStore)
         {
             var set = new ForgottenSet(new(StringComparer.Ordinal), new(StringComparer.Ordinal), new(StringComparer.Ordinal));

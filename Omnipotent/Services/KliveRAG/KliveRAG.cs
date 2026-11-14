@@ -22,7 +22,7 @@ namespace Omnipotent.Services.KliveRAG
     /// brute-force cosine — fine at personal scale). Every consumer-facing call fails soft: a query
     /// that can't run returns empty rather than throwing into a prompt build.
     /// </summary>
-    public class KliveRAG : OmniService
+    public partial class KliveRAG : OmniService
     {
         public KliveRAGDb Db { get; private set; } = null!;
         public RagIndexWriter Writer { get; private set; } = null!;
@@ -165,7 +165,7 @@ namespace Omnipotent.Services.KliveRAG
         {
             if (!ready) return new List<RagHit>();
             opts.Deadline ??= ToolSearchDeadline;
-            var hits = await Retriever.SearchAsync(query, opts, ct);
+            var hits = await ServableAsync(await Retriever.SearchAsync(query, opts, ct));
             if (opts.IncludeMessages && federation != null)
             {
                 int wanted = Math.Min(4, Math.Max(1, opts.MaxResults));
@@ -220,7 +220,7 @@ namespace Omnipotent.Services.KliveRAG
                 RecentWindow = InjectionRecentWindow,
             };
             var search = Task.Run(() => Retriever.SearchAsync(query, opts, cts.Token));
-            try { return await search.WaitAsync(timeout + InjectionOverrun); }
+            try { return await ServableAsync(await search.WaitAsync(timeout + InjectionOverrun)); }
             catch
             {
                 _ = search.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
@@ -241,6 +241,7 @@ namespace Omnipotent.Services.KliveRAG
         public string? GetDoc(string docId, int maxTokens)
         {
             if (!ready || string.IsNullOrEmpty(docId)) return null;
+            if (WithheldNow(docId)) return null; // Omniscience no longer allows it (KliveRAG.OmniscienceGuard.cs)
             using var conn = Db.Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = "SELECT source, title, uri, content FROM rag_documents WHERE doc_id=$id";

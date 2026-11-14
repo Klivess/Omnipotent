@@ -151,6 +151,41 @@ VALUES($cid,$did,$seq,$src,$created,$text,$hash,$tok,NULL)";
             return ids;
         }
 
+        /// <summary>The stored metadata of every document of a source (id → <c>meta_json</c>, null when it has none).</summary>
+        public Dictionary<string, string?> GetDocMetaForSource(string source)
+        {
+            var meta = new Dictionary<string, string?>(StringComparer.Ordinal);
+            using var conn = db.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT doc_id, meta_json FROM rag_documents WHERE source=$s";
+            cmd.Parameters.AddWithValue("$s", source);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) meta[r.GetString(0)] = r.IsDBNull(1) ? null : r.GetString(1);
+            return meta;
+        }
+
+        /// <summary>The stored metadata of the given documents (id → <c>meta_json</c>); a document that is not stored is absent.</summary>
+        public Dictionary<string, string?> GetDocMeta(IReadOnlyCollection<string> docIds)
+        {
+            var meta = new Dictionary<string, string?>(StringComparer.Ordinal);
+            if (docIds.Count == 0) return meta;
+            using var conn = db.Open();
+            foreach (var chunk in docIds.Distinct(StringComparer.Ordinal).Chunk(400))
+            {
+                using var cmd = conn.CreateCommand();
+                var names = new List<string>();
+                for (int i = 0; i < chunk.Length; i++)
+                {
+                    names.Add("$d" + i);
+                    cmd.Parameters.AddWithValue("$d" + i, chunk[i]);
+                }
+                cmd.CommandText = $"SELECT doc_id, meta_json FROM rag_documents WHERE doc_id IN ({string.Join(",", names)})";
+                using var r = cmd.ExecuteReader();
+                while (r.Read()) meta[r.GetString(0)] = r.IsDBNull(1) ? null : r.GetString(1);
+            }
+            return meta;
+        }
+
         /// <summary>Reads a connector's persisted watermark (null if never run).</summary>
         public string? GetCursor(string connector)
         {

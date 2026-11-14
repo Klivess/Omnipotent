@@ -29,6 +29,12 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
             return c.Scalar<long>(null, sql, args);
         }
 
+        private static List<string> Rows(SqliteStore store, string sql, params (string, object?)[] args)
+        {
+            using var c = store.OpenRead();
+            return c.Query(null, sql, r => r.GetString(0), args);
+        }
+
         // ── WS-A ← WS-C: the corpus writer stores nothing of a forgotten person ──────────────────────────────────────
 
         [Fact]
@@ -176,6 +182,54 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
             // The person whose facts lost evidence is told to consolidate them again (the knowledge module listens).
             Assert.Equal(1, Count(stores.Corpus, "SELECT COUNT(*) FROM change_log WHERE kind=$k AND entity_id='p-ben'", ("$k", ChangeKinds.EvidenceRemoved)));
             Assert.Equal(0, Count(stores.Corpus, "SELECT COUNT(*) FROM change_log WHERE kind=$k AND entity_id='p-ana'", ("$k", ChangeKinds.EvidenceRemoved)));
+        }
+
+        [Fact]
+        public async Task Forget_TellsItsHoldersAtConfirmation_AndRebuildsWhatNamedThem()
+        {
+            await using var h = await SignalsHarness.StartAsync(datacontrols: true);
+            var stores = h.Runtime.Stores;
+            await stores.Intel.ApplyMigrationsAsync(KnowledgeSchema.Deduction.Concat(KnowledgeSchema.Identity).Concat(KnowledgeSchema.Timeline).Concat(KnowledgeSchema.Plans).ToList());
+            await h.PostAsync(SignalsHarness.General, SignalsHarness.Ana, "synthetic words");
+            await h.PostAsync(SignalsHarness.General, SignalsHarness.Ben, "more synthetic words");
+            await h.PostAsync(SignalsHarness.General, SignalsHarness.Cyd, "and some more");
+            long t = h.Clock.NowMs;
+            await stores.Intel.WriteAsync((c, tx) =>
+            {
+                void Fact(string id, string subject, string? other) => c.Exec(tx, """
+                    INSERT INTO assertions(assertion_id, natural_key, subject_kind, subject_id, attribute, attr_class, value_json, value_text, object_kind, object_id, recorded_at_ms, status,
+                        module_id, module_version, source_seq)
+                    VALUES($id,$id,'person',$s,'friend','relationship','{}','synthetic',$ok,$o,$t,'accepted','knowledge.deduction',1,1)
+                    """, ("$id", id), ("$s", subject), ("$ok", other == null ? null : "person"), ("$o", other), ("$t", t));
+                Fact("f-ben-names-her", "p-ben", "p-ana"); // Ben's fact names her: it goes, and Ben's projections are rebuilt
+                Fact("f-ben-own", "p-ben", null);
+                Fact("f-cyd-own", "p-cyd", null);          // Cyd has nothing to do with her: left alone
+                c.Exec(tx, """
+                    INSERT INTO kn_plans(plan_id, kind, owner_person_id, counterparty_person_id, involves_klives, klives_promised, title, all_day, firmness, status,
+                        natural_key, evidence_json, created_at_ms, updated_at_ms, source_seq)
+                    VALUES('plan-cyd-with-her','plan','p-cyd','p-ana',0,0,'synthetic lunch',0,'firm','scheduled','k','[]',$t,$t,1)
+                    """, ("$t", t));
+            });
+
+            var data = h.Data!;
+            var preview = data.PreviewForget("p-ana");
+            long before = h.Runtime.Host.Events.Bounds().LatestEver;
+            await data.StartForgetAsync("p-ana", preview.ConfirmToken, "tester", default);
+            // At confirmation, before the run: holders outside the engine are told (never who), and she counts as forgotten.
+            var started = h.Runtime.Host.Events.Replay(before, 100).Where(e => e.Topic == Omnipotent.Services.OmniscienceV3.Modules.DataControls.DataControlsModule.ForgettingTopic).ToList();
+            Assert.Single(started);
+            Assert.DoesNotContain("p-ana", started[0].PayloadJson);
+            Assert.True(Forgotten.IsPerson(stores.Operator, "p-ana"));
+            Assert.False(Forgotten.IsPerson(stores.Operator, "p-ben"));
+
+            await h.Driver.RunUntilIdleAsync(3_000);
+            h.Driver.AssertNoFailures();
+            Assert.Equal(0, Count(stores.Intel, "SELECT COUNT(*) FROM assertions WHERE assertion_id='f-ben-names-her'"));
+            Assert.Equal(2, Count(stores.Intel, "SELECT COUNT(*) FROM assertions"));
+            Assert.Equal(0, Count(stores.Intel, "SELECT COUNT(*) FROM kn_plans"));
+            // Ben (a fact named her) and Cyd (a plan with her) have what is projected from their knowledge rebuilt; nobody else.
+            Assert.Equal(new[] { "p-ben", "p-cyd" }, Rows(stores.Corpus, "SELECT entity_id FROM change_log WHERE kind=$k ORDER BY entity_id", ("$k", ChangeKinds.EvidenceRemoved)));
+            Assert.Single(h.Runtime.Host.Events.Replay(before, 500), e => e.Topic == Omnipotent.Services.OmniscienceV3.Modules.DataControls.DataControlsModule.ForgottenTopic);
         }
 
         // ── WS-D ← WS-C: no replica of someone whose analysis is off ──────────────────────────────────────────────────

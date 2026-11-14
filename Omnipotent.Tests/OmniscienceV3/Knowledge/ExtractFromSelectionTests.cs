@@ -2,7 +2,9 @@ using System.Globalization;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 using Omnipotent.Services.KliveLLM;
+using Omnipotent.Services.OmniscienceV3.Kernel.Jobs;
 using Omnipotent.Services.OmniscienceV3.Kernel.Tactics;
+using Omnipotent.Services.OmniscienceV3.Knowledge.Deduction;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Policy;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Store;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Tactics;
@@ -146,6 +148,27 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             await InquiryTests.DriveAsync(h);
             Assert.Equal(TacticRunStates.Failed, h.Runtime.Tactics.Get(offRun)!.State);
             Assert.Empty(Cities(h, Ben));
+        }
+
+        [Fact]
+        public async Task KnowledgeRemovedFromUnderSomeone_RebuildsTheirProfile_AndWhatIsProjectedFromIt()
+        {
+            var (h, _) = await StartAsync();
+            await using var _h = h;
+            // A forget run removed rows from under Ana (a claim that cited the forgotten person, or a fact that named them).
+            await h.Stores.Corpus.WriteAsync((c, tx) => ChangeLog.Append(c, tx, h.Clock.NowMs, ChangeKinds.EvidenceRemoved, Ana, Ana, null, SourceKinds.Operator));
+            await h.Runtime.Host.PumpChangesOnceAsync();
+            await h.Runtime.Host.PlanOnceAsync();
+            var job = Assert.Single(h.Runtime.Host.Jobs.List(JobStates.Queued, DeductionModule.Id, 20), j => j.Kind == DeductionModule.ReprojectKind);
+            Assert.Equal(Ana, job.SubjectId);
+
+            await h.Module<DeductionModule>().ExecuteAsync(h.JobFor(job));
+            // Nothing changed in the consolidation itself (the rows were already gone), yet the profile is written again and
+            // the timeline and plans are projected again: they may still show what was removed.
+            using var c = h.Stores.Intel.OpenRead();
+            Assert.Equal(1L, c.Scalar<long>(null, "SELECT COUNT(*) FROM read_models WHERE model_id=$m AND key=$k", ("$m", DeductionModule.ProfileReadModel), ("$k", Ana)));
+            foreach (string module in new[] { KnowledgeSchema.TimelineModule, KnowledgeSchema.PlansModule })
+                Assert.Single(h.Runtime.Host.Jobs.List(JobStates.Queued, module, 20), j => j.Kind == "project" && j.SubjectId == Ana);
         }
 
         [Fact]
