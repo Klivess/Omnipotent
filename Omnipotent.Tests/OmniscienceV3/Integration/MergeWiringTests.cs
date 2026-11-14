@@ -232,6 +232,29 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
             Assert.Single(h.Runtime.Host.Events.Replay(before, 500), e => e.Topic == Omnipotent.Services.OmniscienceV3.Modules.DataControls.DataControlsModule.ForgottenTopic);
         }
 
+        [Fact]
+        public async Task PeopleNames_AnswerForKnownPeople_AndForTheMergedUnderWhoTheyAreNow()
+        {
+            await using var h = await SignalsHarness.StartAsync();
+            await h.PostAsync(SignalsHarness.General, SignalsHarness.Ana, "synthetic words");
+            await h.PostAsync(SignalsHarness.General, SignalsHarness.Ben, "more synthetic words");
+            var stores = h.Runtime.Stores;
+            string ana, ben;
+            using (var c = stores.Corpus.OpenRead())
+            {
+                ana = c.Scalar<string>(null, "SELECT display_name FROM persons WHERE person_id='p-ana'")!;
+                ben = c.Scalar<string>(null, "SELECT display_name FROM persons WHERE person_id='p-ben'")!;
+            }
+            var names = Omnipotent.Services.OmniscienceV3.Api.WsCRoutes.NamesOf(stores, new[] { "p-ana", "p-ben", "p-nobody", "p-ana" });
+            Assert.Equal(new[] { "p-ana", "p-ben" }, names.Keys.OrderBy(k => k));
+            Assert.Equal(ana, names["p-ana"]);
+
+            // Ben merged into Ana: an old link to Ben shows who that is now.
+            await stores.Corpus.WriteAsync((c, tx) => c.Exec(tx, "UPDATE person_canonical SET canonical_id='p-ana' WHERE person_id='p-ben'"));
+            Assert.Equal(ana, Omnipotent.Services.OmniscienceV3.Api.WsCRoutes.NamesOf(stores, new[] { "p-ben" })["p-ben"]);
+            Assert.NotEqual(ana, ben);
+        }
+
         // ── WS-D ← WS-C: no replica of someone whose analysis is off ──────────────────────────────────────────────────
 
         [Fact]

@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using Omnipotent.Services.OmniscienceV3.Api;
 using Omnipotent.Services.OmniscienceV3.Kernel.Jobs;
 using Omnipotent.Services.OmniscienceV3.Kernel.Modules;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Deduction;
@@ -10,9 +11,17 @@ using Omnipotent.Services.OmniscienceV3.Storage.Sqlite;
 namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
 {
     /// <summary>One measured value with its interval and sample size.</summary>
+    [ApiContract]
     public sealed record QualityMetric(string Scope, string Metric, double? Value, double? CiLow, double? CiHigh, int N, string? PromptVersion = null, string? Model = null);
 
+    [ApiContract]
     public sealed record GateDecision(string Subject, string Candidate, string? Baseline, string Decision, IReadOnlyList<string> Reasons, long DecidedAtMs);
+
+    /// <summary>The Quality Lab's read model (<c>knowledge.quality</c>, key "lab"): the latest measurements against Klives's own
+    /// decisions (<paramref name="Gold"/>) and against the planted-fact corpus (<paramref name="Planted"/>), and the latest gate
+    /// decision on the extraction prompt in use.</summary>
+    [ApiContract]
+    public sealed record QualityLabDto(long AsOfMs, string PromptVersion, IReadOnlyList<QualityMetric> Gold, IReadOnlyList<QualityMetric> Planted, GateDecision? Gate);
 
     /// <summary>
     /// The regression gate (N18: "blocks a prompt/model version whose precision drops beyond the CI"). A candidate passes when,
@@ -284,14 +293,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
             var planted = LatestMetrics("planted", null);
             var gate = LatestGate(Context.Stores, "deduction.extract", ExtractionPrompt.Version);
             long now = Context.Clock.NowMs;
-            await Context.ReadModels.PutAsync(ReadModel, "lab", 1, now, kit.Corpus.MaxSeq(), new
-            {
-                asOfMs = now,
-                promptVersion = ExtractionPrompt.Version,
-                gold = lab,
-                planted,
-                gate,
-            }, ct).ConfigureAwait(false);
+            await Context.ReadModels.PutAsync(ReadModel, "lab", 1, now, kit.Corpus.MaxSeq(),
+                new QualityLabDto(now, ExtractionPrompt.Version, lab, planted, gate), ct).ConfigureAwait(false);
         }
     }
 }

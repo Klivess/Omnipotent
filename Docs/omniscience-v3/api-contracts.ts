@@ -912,6 +912,15 @@ export interface ForgetRunDto {
   finishedAtMs?: number | null;
 }
 
+export interface GateDecision {
+  subject: string;
+  candidate: string;
+  baseline?: string | null;
+  decision: string;
+  reasons: string[];
+  decidedAtMs: number;
+}
+
 export interface GenerationConfig {
   temperature: number;
   topP: number;
@@ -1949,6 +1958,10 @@ export interface PersonLinksDto {
   recent: LinkShareDto[];
 }
 
+export interface PersonNamesDto {
+  names: Record<string, string>;
+}
+
 export interface PersonRelationshipsDto {
   personId: string;
   name?: string | null;
@@ -2068,6 +2081,25 @@ export type PlaybookTriggerKind = "Manual" | "Daily" | "Weekly" | "Every" | "Eve
 export interface PlaybookValidationDto {
   problems: string[];
   nextDueMs?: number | null;
+}
+
+export interface QualityLabDto {
+  asOfMs: number;
+  promptVersion: string;
+  gold: QualityMetric[];
+  planted: QualityMetric[];
+  gate?: GateDecision | null;
+}
+
+export interface QualityMetric {
+  scope: string;
+  metric: string;
+  value?: number | null;
+  ciLow?: number | null;
+  ciHigh?: number | null;
+  n: number;
+  promptVersion?: string | null;
+  model?: string | null;
 }
 
 export interface QualityRunRequest {

@@ -43,6 +43,11 @@ namespace Omnipotent.Services.OmniscienceV3.Api
     [ApiContract]
     public sealed record ConceptListDto(IReadOnlyList<ConceptDto> Concepts);
 
+    /// <summary>Display names by person id, for a page that lists people by id (plans, review items, links, past answers).
+    /// An id that is unknown, or was forgotten, is simply absent.</summary>
+    [ApiContract]
+    public sealed record PersonNamesDto(IReadOnlyDictionary<string, string> Names);
+
     /// <summary>
     /// WS-C routes under <c>/omniscience/v3/</c> (classification, directory, signals, Explore exports). Page views are read models
     /// (<c>GET rm?model=…</c>); these routes are the lists and commands around them. Every list is keyset-paged.
@@ -58,9 +63,31 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             this.registrar = registrar;
         }
 
+        /// <summary>The display name of each known person among <paramref name="ids"/>. Someone merged into another person
+        /// answers under that person's name, so a page holding an old id still shows who it is now.</summary>
+        public static Dictionary<string, string> NamesOf(Storage.OmniscienceStores stores, IReadOnlyCollection<string> ids)
+        {
+            var names = new Dictionary<string, string>(StringComparer.Ordinal);
+            using var c = stores.Corpus.OpenRead();
+            foreach (string id in ids.Distinct(StringComparer.Ordinal))
+            {
+                string? name = c.Scalar<string>(null,
+                    "SELECT display_name FROM persons WHERE person_id = COALESCE((SELECT canonical_id FROM person_canonical WHERE person_id=$p), $p)", ("$p", id));
+                if (!string.IsNullOrWhiteSpace(name)) names[id] = name;
+            }
+            return names;
+        }
+
         public async Task RegisterAsync(CancellationToken ct)
         {
             await Get("people", OmnisciencePerms.PersonsRead, req => ApiResponses.OkAsync(req, Directory(ApiQuery.Of(req))), ct).ConfigureAwait(false);
+
+            await Get("people/names", OmnisciencePerms.PersonsRead, req =>
+            {
+                var ids = ApiQuery.Of(req).List("ids", 200);
+                if (ids.Count == 0) throw ApiException.BadRequest("'ids' is required (comma-separated, at most 200).");
+                return ApiResponses.OkAsync(req, new PersonNamesDto(NamesOf(host.Require().Stores, ids)));
+            }, ct).ConfigureAwait(false);
 
             await Get("classify/tasks", OmnisciencePerms.OverviewView, req => ApiResponses.OkAsync(req, new TaskCatalogDto(ClassificationTasks.All
                 .Select(t => new TaskCatalogEntryDto(t.Id, t.Title, t.Question, t.LabelIds, t.DefaultLabel, t.DimensionId, t.ContextMatters)).ToList())), ct).ConfigureAwait(false);
