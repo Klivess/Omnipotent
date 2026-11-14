@@ -221,11 +221,30 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
-                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealRunForKlives(pendingResponse, req.Can(AccountsPerms.SecretsReveal))), headers: new WebHeaderCollection
+                    bool reveal = req.Can(AccountsPerms.SecretsReveal);
+                    var view = service.RevealRunForKlives(pendingResponse, reveal)!;
+                    // A requestId poll is the page's long-poll, merged into its last copy: leave out what it holds.
+                    // activity=append: the page appends activity at activityFrom instead of replacing it.
+                    bool appendActivity = string.Equals(req.userParameters["activity"], "append", StringComparison.OrdinalIgnoreCase);
+                    var trimmed = string.IsNullOrWhiteSpace(requestId)
+                        ? new KliveAgentRunTrimmer.Trimmed(Array.Empty<string>(), null)
+                        : service.RunTrimmer.Trim(view, requestId + (reveal ? "|reveal" : "|masked"), afterSequence, appendActivity);
+                    var headers = new WebHeaderCollection
                     {
                         ["Cache-Control"] = "no-store",
                         ["X-Klive-Pending-Wait"] = "supported"
-                    });
+                    };
+                    if (trimmed.Omitted.Count > 0) headers["X-Klive-Pending-Unchanged"] = string.Join(",", trimmed.Omitted);
+                    string body;
+                    if (trimmed.ActivityFrom is int activityFrom)
+                    {
+                        // In the body, not a header: a credentialed cross-origin page cannot read a header exposed by "*".
+                        var json = Newtonsoft.Json.Linq.JObject.FromObject(view);
+                        json["activityFrom"] = activityFrom;
+                        body = json.ToString(Formatting.None);
+                    }
+                    else body = JsonConvert.SerializeObject(view);
+                    await req.ReturnResponse(body, headers: headers);
                 }
                 catch (Exception ex)
                 {

@@ -437,6 +437,17 @@ namespace Omnipotent.Services.OmniTrader.Persistence.Schema
                               '$.Analysis.Alpha', '$.StrategyErrors') END
                 FROM backtest_jobs;
                 CREATE INDEX idx_backtest_job_list_queued ON backtest_job_list(queued_utc);
+            "),
+
+            // ── v8: equity series covering index ──────────────────────────────────
+            // equity_ticks rows are written one bar at a time by every running deployment, so one
+            // deployment's rows are spread over the whole table and the (deployment_id, ts) key index
+            // costs a table-page read per row. On the server an equity series of a 15-minute paper
+            // deployment timed out at 60 s (143 rows took 915 ms). With every selected column in the
+            // index, a series is read from consecutive index pages.
+            (8, @"
+                CREATE INDEX IF NOT EXISTS idx_equity_ticks_series
+                    ON equity_ticks(deployment_id, ts, equity, mark_price, quote_balance, base_balance);
             ")
         };
     }

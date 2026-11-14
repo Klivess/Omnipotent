@@ -52,6 +52,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             await RegisterStudioAsync();
             await RegisterLabAsync();
             await RegisterAlphaAsync();
+            await RegisterDeployAsync();
         }
 
         // ── market data ──────────────────────────────────────────────────────────

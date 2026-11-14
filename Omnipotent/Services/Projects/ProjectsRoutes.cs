@@ -55,6 +55,9 @@ namespace Omnipotent.Services.Projects
         /// <summary>How long a lifecycle route waits for its action before answering that it is still settling.</summary>
         internal static TimeSpan LifecycleWait { get; set; } = TimeSpan.FromSeconds(8);
 
+        /// <summary>How long an analytics request waits for a report never built before answering 202 {pending}.</summary>
+        internal static TimeSpan AnalyticsWait { get; set; } = TimeSpan.FromSeconds(6);
+
         private ProjectActionTrace NewTrace(string action) => new(action, message => _ = parent.ServiceLog(message));
 
         /// <summary>
@@ -929,6 +932,22 @@ namespace Omnipotent.Services.Projects
                 catch (Exception ex) { await Err(req, ex); }
             }, HttpMethod.Get, ProjectsPerms.DetailsRead);
 
+            // Analytics answers never hold a request for a cold scan (see ProjectAnalyticsService.ReadPortfolioAsync):
+            // the last report at once (stale: true while one background build replaces it), or 202 {pending}.
+            static async Task ReturnAnalyticsRead(Services.KliveAPI.KliveAPI.UserRequest req, object? value, bool stale, bool building)
+            {
+                CacheDeps.MarkUncacheable("analytics answered from a background build");
+                if (value == null)
+                {
+                    await req.ReturnResponse(Json(new { pending = true, retryAfterSeconds = 4 }), code: HttpStatusCode.Accepted);
+                    return;
+                }
+                var body = Newtonsoft.Json.Linq.JObject.FromObject(value, Newtonsoft.Json.JsonSerializer.Create(CamelCase));
+                body["stale"] = stale;
+                body["rebuilding"] = building;
+                await req.ReturnResponse(body.ToString(Newtonsoft.Json.Formatting.None));
+            }
+
             // Server-side analytics keep the browser from paging/scanning every project's raw log.
             // Lifetime ledger totals remain authoritative; the response also describes the coverage
             // of historical per-wake attribution for older records.
@@ -939,15 +958,9 @@ namespace Omnipotent.Services.Projects
                     if (!RequireProject(req, out var project)) return;
                     string range = req.userParameters?.Get("range") ?? "30d";
                     bool fresh = string.Equals(req.userParameters?.Get("fresh"), "1", StringComparison.Ordinal);
-                    var snapshot = parent.Analytics.GetProject(project!.ProjectID, range, forceRefresh: fresh,
-                        fromUtc: req.userParameters?.Get("from"), toUtc: req.userParameters?.Get("to"),
-                        bucket: req.userParameters?.Get("bucket"));
-                    if (snapshot == null)
-                    {
-                        await req.ReturnResponse("unknown projectID", code: HttpStatusCode.NotFound);
-                        return;
-                    }
-                    await req.ReturnResponse(Json(snapshot));
+                    var read = await parent.Analytics.ReadProjectAsync(project!.ProjectID, range, fresh,
+                        req.userParameters?.Get("from"), req.userParameters?.Get("to"), req.userParameters?.Get("bucket"), AnalyticsWait);
+                    await ReturnAnalyticsRead(req, read.Value, read.Stale, read.Building);
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }
@@ -959,9 +972,9 @@ namespace Omnipotent.Services.Projects
                 {
                     string range = req.userParameters?.Get("range") ?? "30d";
                     bool fresh = string.Equals(req.userParameters?.Get("fresh"), "1", StringComparison.Ordinal);
-                    await req.ReturnResponse(Json(parent.Analytics.GetPortfolio(range, forceRefresh: fresh,
-                        fromUtc: req.userParameters?.Get("from"), toUtc: req.userParameters?.Get("to"),
-                        bucket: req.userParameters?.Get("bucket"))));
+                    var read = await parent.Analytics.ReadPortfolioAsync(range, fresh,
+                        req.userParameters?.Get("from"), req.userParameters?.Get("to"), req.userParameters?.Get("bucket"), AnalyticsWait);
+                    await ReturnAnalyticsRead(req, read.Value, read.Stale, read.Building);
                 }
                 catch (ArgumentException ex) { await req.ReturnResponse(ex.Message, code: HttpStatusCode.BadRequest); }
                 catch (Exception ex) { await Err(req, ex); }

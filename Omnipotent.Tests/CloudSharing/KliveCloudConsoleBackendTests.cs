@@ -434,6 +434,38 @@ public sealed class KliveCloudConsoleBackendTests : IDisposable
         return item;
     }
 
+    // ───────────────────────────── thumbnails of files that are gone ─────────────────────────────
+
+    /// <summary>
+    /// 13 Nov 2026: a delete and two moves while the page listed the old folder left 6 thumbnail
+    /// requests in one second answered 500 in 0.3 ms (the source was simply not on disk). That is
+    /// "missing", which the route now answers 404, not a failure to make a thumbnail.
+    /// </summary>
+    [Fact]
+    public async Task Preview_OfAFileNoLongerOnDisk_IsMissing_NotAFailure()
+    {
+        Corner();
+        var photo = OnDisk("gone", "screenshot.png", null, CloudItem.CloudItemType.File);
+        System.IO.File.Delete(Path.Combine(storage, photo.RelativePath));
+
+        var preview = await cloud.GetPreviewAsync(photo, 320, 320);
+
+        Assert.Null(preview.Data);
+        Assert.Equal(CloudService.PreviewSource.Missing, preview.Source);
+    }
+
+    [Fact]
+    public async Task Preview_OfAFileWithNoPicture_IsUnsupported_WithoutQueueing()
+    {
+        Corner();
+        var notes = OnDisk("notes", "notes.txt", null, CloudItem.CloudItemType.File);
+
+        var preview = await cloud.GetPreviewAsync(notes, 320, 320);
+
+        Assert.Null(preview.Data);
+        Assert.Equal(CloudService.PreviewSource.Unsupported, preview.Source);
+    }
+
     [Fact]
     public async Task Rename_MovesTheFolderOnDisk_AndEveryPathInside()
     {

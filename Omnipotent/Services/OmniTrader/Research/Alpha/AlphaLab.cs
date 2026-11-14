@@ -502,6 +502,9 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
 
         // ── papers ───────────────────────────────────────────────────────────────
 
+        /// <summary>Changes whenever any paper is written (ingest, analysis, verdicts, stars).</summary>
+        public long PapersVersion => papers.Version;
+
         public Task<ResearchPaper?> GetPaperAsync(string id, CancellationToken ct = default) => papers.GetAsync(id, ct);
 
         public Task<List<ResearchPaper>> ListPapersAsync(string? status = null, string? text = null, double? minRelevance = null,
@@ -691,6 +694,9 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
             if (settings.AutoEvaluate) evaluations.Writer.TryWrite(c.Id);
             return c;
         }
+
+        /// <summary>Changes whenever any candidate is written: readers can keep what they read until it moves.</summary>
+        public long CandidatesVersion => candidates.Version;
 
         public Task<AlphaCandidate?> GetCandidateAsync(string id, CancellationToken ct = default) => candidates.GetAsync(id, ct);
 

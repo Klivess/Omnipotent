@@ -21,6 +21,8 @@ namespace Omnipotent.Services.OmniDefence
         private readonly object gate = new();
         // Never removed from, so it enumerates (and serializes) in the order the steps ran.
         private readonly Dictionary<string, long> stepMs = new();
+        /// <summary>What a step says about where its time went ("IP records": slot wait, open, pages read).</summary>
+        private readonly Dictionary<string, string> stepDetail = new();
         private DateTimeOffset? startedUtc;
         private DateTimeOffset? readyUtc;
         private string step = "";
@@ -39,7 +41,14 @@ namespace Omnipotent.Services.OmniDefence
                 error = null;
                 step = "";
                 stepMs.Clear();
+                stepDetail.Clear();
             }
+        }
+
+        /// <summary>Attaches a line to a step saying where its time went; served with the timings.</summary>
+        public void Detail(string name, string detail)
+        {
+            lock (gate) stepDetail[name] = detail;
         }
 
         public async Task Step(string name, Func<Task> run)
@@ -116,6 +125,8 @@ namespace Omnipotent.Services.OmniDefence
                     // Every step in the order it ran, in milliseconds; those after "routes" ran
                     // once the service was already answering.
                     steps = new Dictionary<string, long>(stepMs),
+                    // Where a step's time went, for the steps that can say.
+                    details = new Dictionary<string, string>(stepDetail),
                     error,
                 };
             }

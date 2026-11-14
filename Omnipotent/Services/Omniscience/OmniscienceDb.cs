@@ -121,8 +121,28 @@ namespace Omnipotent.Services.Omniscience
                 }
             }
 
+            // Read-path indexes added without a schema version, so user_version stays 12: the
+            // Omniscience v3 importer reads this database and is tested against versions 10–12.
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = ReadIndexes;
+                cmd.ExecuteNonQuery();
+            }
+
             tx.Commit();
         }
+
+        // The directory's total counted every row of persons on each call (1,173 pages for 46k people in
+        // DirectoryCostTests); this covers that count, with or without a tier filter, in a fraction of it.
+        // "tier >= ''" (true for any text) is in the WHERE on purpose: a query must say it to use the index.
+        // Without it every "merged_into_person_id IS NULL" query became an index walk plus one row lookup
+        // per person, nearly twice the pages of reading the table (4,383 vs 2,361). "tier IS NOT NULL" would
+        // not do: SQLite drops that term from a query on a NOT NULL column, so no query could match it.
+        // merged_into_person_id is a column so the count never has to visit the table.
+        private const string ReadIndexes = @"
+CREATE INDEX IF NOT EXISTS idx_persons_live_tier ON persons(tier, merged_into_person_id) WHERE merged_into_person_id IS NULL AND tier >= '';
+";
 
         // ── Migration: v12 (O(1) directory activity summaries) ──
         // The directory used to GROUP BY every message for each request. These small

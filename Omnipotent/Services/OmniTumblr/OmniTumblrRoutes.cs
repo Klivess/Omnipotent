@@ -285,6 +285,7 @@ namespace Omnipotent.Services.OmniTumblr
                     Available = service.TagResearch?.CanLookUp ?? false,
                     TagsKnown = s.Tags.Count,
                 },
+                Store = Store.Stats,
             };
         }
 
@@ -312,22 +313,30 @@ namespace Omnipotent.Services.OmniTumblr
 
         private async Task Overview(UserRequest req)
         {
-            bool ai = await AiAvailableAsync();
+            bool ai;
+            using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("tumblr-ai-check")) ai = await AiAvailableAsync();
             bool reels = service.ContentSources?.CatalogReady ?? false;
             DateTime now = DateTime.UtcNow;
-            var dto = Store.Read(s => new
+            var gate = service.EdgeGate?.Snapshot();
+            var dto = Store.Read(s =>
             {
-                NowUtc = now,
-                Engine = EngineDto(s, ai),
-                App = AppDto(s.App),
-                Connections = s.Connections.Values.OrderBy(c => c.UserName).Select(c => ConnectionDto(s, c)).ToList(),
-                Kpis = OmniTumblrViews.FleetKpis(s, now),
-                Blogs = s.Blogs.Values.OrderBy(b => b.Name, StringComparer.OrdinalIgnoreCase).Select(b => OmniTumblrViews.BlogSummary(s, b, now)).ToList(),
-                Upcoming = s.AllPosts().Where(p => p.IsPending).OrderBy(p => p.ScheduledUtc).Take(16).Select(p => OmniTumblrViews.Summary(p, s.Blog(p.BlogId))).ToList(),
-                RecentlyPublished = s.AllPosts().Where(p => p.Status == PostStatus.Published).OrderByDescending(p => p.PublishedUtc).Take(12)
-                    .Select(p => OmniTumblrViews.Summary(p, s.Blog(p.BlogId))).ToList(),
-                Attention = OmniTumblrViews.Attention(s, now, service.PublishingEnabled, ai, reels, service.EdgeGate?.Snapshot()),
-                Events = s.Events.AsEnumerable().Reverse().Take(40).Select(e => EventDto(s, e)).ToList(),
+                var edgeHistory = OmniTumblrFleetPulse.EdgeHistory(s.Events, now, gate);
+                return new
+                {
+                    NowUtc = now,
+                    Engine = EngineDto(s, ai),
+                    App = AppDto(s.App),
+                    Connections = s.Connections.Values.OrderBy(c => c.UserName).Select(c => ConnectionDto(s, c)).ToList(),
+                    Kpis = OmniTumblrViews.FleetKpis(s, now),
+                    Blogs = s.Blogs.Values.OrderBy(b => b.Name, StringComparer.OrdinalIgnoreCase).Select(b => OmniTumblrViews.BlogSummary(s, b, now)).ToList(),
+                    Upcoming = s.AllPosts().Where(p => p.IsPending).OrderBy(p => p.ScheduledUtc).Take(16).Select(p => OmniTumblrViews.Summary(p, s.Blog(p.BlogId))).ToList(),
+                    RecentlyPublished = s.AllPosts().Where(p => p.Status == PostStatus.Published).OrderByDescending(p => p.PublishedUtc).Take(12)
+                        .Select(p => OmniTumblrViews.Summary(p, s.Blog(p.BlogId))).ToList(),
+                    Attention = OmniTumblrViews.Attention(s, now, service.PublishingEnabled, ai, reels, gate, edgeHistory),
+                    Events = s.Events.AsEnumerable().Reverse().Take(40).Select(e => EventDto(s, e)).ToList(),
+                    EdgeHistory = edgeHistory,
+                    Week = OmniTumblrFleetPulse.Week(s, now),
+                };
             });
             await Respond(req, dto);
         }
@@ -339,6 +348,9 @@ namespace Omnipotent.Services.OmniTumblr
             var dto = Store.Read(s =>
             {
                 var k = OmniTumblrViews.FleetKpis(s, now);
+                var gate = service.EdgeGate?.Snapshot();
+                var attention = OmniTumblrViews.Attention(s, now, service.PublishingEnabled, true, true, gate, OmniTumblrFleetPulse.EdgeHistory(s.Events, now, gate))
+                    .Where(a => a.Level != "info").ToList();
                 return new
                 {
                     TotalAccounts = s.Blogs.Count,
@@ -355,7 +367,10 @@ namespace Omnipotent.Services.OmniTumblr
                     AvgNotes30d = k.AvgNotes30d,
                     NextPostUtc = k.NextPostUtc,
                     NextPostBlog = k.NextPostBlog,
-                    AttentionCount = OmniTumblrViews.Attention(s, now, service.PublishingEnabled, true, true, service.EdgeGate?.Snapshot()).Count(a => a.Level != "info"),
+                    AwaitingApproval = k.AwaitingApproval,
+                    AttentionCount = attention.Count,
+                    // What the count is about, so the home page can say it without the full overview.
+                    Attention = attention.Take(3).Select(a => new { a.Level, a.Title }).ToList(),
                 };
             });
             await Respond(req, dto);
@@ -398,24 +413,41 @@ namespace Omnipotent.Services.OmniTumblr
             });
 
             object runway;
+            using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("tumblr-runway"))
+                runway = RunwayFor(blogId, data.Strategy, data.Excluded, now);
+            await Respond(req, new { data.Dto.NowUtc, data.Dto.Summary, data.Dto.Blog, data.Dto.Connection, data.Dto.Pending, data.Dto.History, data.Dto.Events, data.Dto.Activity, Runway = runway });
+        }
+
+        /// <summary>How long a blog's content runway is reused: the page polls the blog every 30–60 s and the answer moves by a post a day.</summary>
+        internal static readonly TimeSpan RunwayReuse = TimeSpan.FromSeconds(60);
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (DateTime At, string Key, object Runway)> runways = new(StringComparer.Ordinal);
+
+        private object RunwayFor(string blogId, OmniTumblrStrategy strategy, IReadOnlySet<string> excluded, DateTime now)
+        {
+            // Same strategy, same number of used keys: the same answer (an upload to the library shows within a minute).
+            string key = OmniTumblrScheduleMath.Fnv1a(JsonConvert.SerializeObject(strategy)).ToString("x8") + ":" + excluded.Count;
+            if (runways.TryGetValue(blogId, out var known) && known.Key == key && now - known.At < RunwayReuse) return known.Runway;
+            object runway;
             try
             {
-                var (eligible, next) = service.ContentSources!.Runway(data.Strategy, blogId, data.Excluded, now, 12);
-                int perWeek = OmniTumblrScheduleMath.SlotsPerWeek(data.Strategy);
+                var (eligible, next) = service.ContentSources!.Runway(strategy, blogId, excluded, now, 12);
+                int perWeek = OmniTumblrScheduleMath.SlotsPerWeek(strategy);
                 runway = new
                 {
                     Eligible = eligible,
                     SlotsPerWeek = perWeek,
                     WeeksOfContent = perWeek > 0 ? Math.Round(eligible / (double)perWeek, 1) : (double?)null,
                     Next = next.Select(CandidateDto).ToList(),
-                    Source = data.Strategy.Source,
+                    Source = strategy.Source,
+                    CheckedUtc = now,
                 };
             }
             catch (Exception ex)
             {
-                runway = new { Error = ex.Message };
+                return new { Error = ex.Message };
             }
-            await Respond(req, new { data.Dto.NowUtc, data.Dto.Summary, data.Dto.Blog, data.Dto.Connection, data.Dto.Pending, data.Dto.History, data.Dto.Events, data.Dto.Activity, Runway = runway });
+            runways[blogId] = (now, key, runway);
+            return runway;
         }
 
         private async Task Analytics(UserRequest req)
@@ -548,30 +580,72 @@ namespace Omnipotent.Services.OmniTumblr
             var info = new FileInfo(path);
             if (info.Length > 200L * 1024 * 1024) throw Bad("The file is too large to preview.");
             string type = full ? media.MimeType : OmniTumblrMediaTools.MimeFor(path);
-            await req.ReturnBinaryResponse(await File.ReadAllBytesAsync(path), type);
+            // A validator always (an unchanged file is a 304), and a long life when the URL names the post's
+            // version: 1,379 thumbnail downloads in 30 days, every visit fetching every picture again.
+            await req.ReturnFileResponse(path, type, MediaCaching(full, Query(req, "v") != null));
         }
+
+        internal static string MediaCaching(bool full, bool versioned) =>
+            full ? "private, max-age=300" : versioned ? "private, max-age=604800, immutable" : "private, max-age=300";
+
+        /// <summary>
+        /// Content previews made with ffmpeg, two at a time. The runway grid asks for eight to twelve at once; each used
+        /// to start its own ffmpeg, so ten together took 26 s each and some ran into the 45 s limit (34 of 144 in 30 days
+        /// answered 404 "is FFmpeg installed?"). A request that can't get a slot in 20 s is told to come back.
+        /// </summary>
+        private static readonly SemaphoreSlim PreviewSlots = new(2, 2);
+        internal static readonly TimeSpan PreviewSlotWait = TimeSpan.FromSeconds(20);
+        private const string ContentThumbCaching = "private, max-age=86400";
 
         private async Task ContentThumb(UserRequest req)
         {
             string blogId = RequiredQuery(req, "blogId");
             string key = RequiredQuery(req, "key");
             var strategy = Store.Read(s => OmniTumblrStore.Clone((s.Blog(blogId) ?? throw NotFound("No such blog.")).Strategy));
-            var candidate = service.ContentSources!.Resolve(strategy, blogId, key, DateTime.UtcNow) ?? throw NotFound("No such content.");
+            ContentCandidate candidate;
+            using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("tumblr-resolve"))
+                candidate = service.ContentSources!.Resolve(strategy, blogId, key, DateTime.UtcNow) ?? throw NotFound("No such content.");
+
+            // MemeScraper keeps a frame of most reels already.
+            if (service.ContentSources!.ExistingThumbnail(candidate) is string existing)
+            {
+                await req.ReturnFileResponse(existing, "image/jpeg", ContentThumbCaching, new System.Collections.Specialized.NameValueCollection { { "X-OmniTumblr-Preview", "memescraper" } });
+                return;
+            }
+
             string cachePath = Path.Combine(Store.FramesCacheDirectory, $"cand-{OmniTumblrScheduleMath.Fnv1a(key):x8}-{key.Length}.jpg");
+            string origin = "disk";
             if (!File.Exists(cachePath))
             {
-                bool ok = await service.MediaTools!.CreateThumbnailAsync(candidate.FilePath, cachePath, null, CancellationToken.None);
+                origin = "made";
+                bool ok;
+                using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("tumblr-preview-queue"))
+                {
+                    if (!await PreviewSlots.WaitAsync(PreviewSlotWait))
+                        throw new RouteException(HttpStatusCode.ServiceUnavailable, "Previews are being made two at a time; try again in a moment.");
+                }
+                try
+                {
+                    using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("tumblr-preview-make"))
+                        ok = File.Exists(cachePath) || await service.MediaTools!.CreateThumbnailAsync(candidate.FilePath, cachePath, null, CancellationToken.None);
+                }
+                finally
+                {
+                    PreviewSlots.Release();
+                }
                 if (!ok)
                 {
                     if (OmniTumblrMediaTools.IsImage(candidate.FilePath))
                     {
-                        await req.ReturnBinaryResponse(await File.ReadAllBytesAsync(candidate.FilePath), OmniTumblrMediaTools.MimeFor(candidate.FilePath));
+                        await req.ReturnFileResponse(candidate.FilePath, OmniTumblrMediaTools.MimeFor(candidate.FilePath), ContentThumbCaching);
                         return;
                     }
-                    throw NotFound("A preview could not be made (is FFmpeg installed?).");
+                    throw NotFound(File.Exists(candidate.FilePath)
+                        ? "ffmpeg could not make a preview of this file (unreadable, or it took over 45 s)."
+                        : "The file is no longer on disk.");
                 }
             }
-            await req.ReturnBinaryResponse(await File.ReadAllBytesAsync(cachePath), "image/jpeg");
+            await req.ReturnFileResponse(cachePath, "image/jpeg", ContentThumbCaching, new System.Collections.Specialized.NameValueCollection { { "X-OmniTumblr-Preview", origin } });
         }
 
         private async Task Library(UserRequest req)

@@ -485,7 +485,8 @@ namespace Omnipotent.Services.OmniTrader.Studio
                 DefaultInterval = draft.DefaultInterval ?? TimeInterval.OneDay
             };
             string className = "studio:" + temp.Id;
-            var check = RegisterAs(temp, className, 1, updateRecord: false);
+            StudioCheck check;
+            using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("studio-compile")) check = RegisterAs(temp, className, 1, updateRecord: false);
             if (!check.Ok) return (check, null, "Compile failed");
             try
             {

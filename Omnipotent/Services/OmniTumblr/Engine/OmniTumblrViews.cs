@@ -56,6 +56,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public string? OriginalCaption { get; set; }
         public long? ContentViews { get; set; }
         public string TumblrState { get; set; } = "";
+        /// <summary>Changes whenever the post does: the website puts it on thumbnail URLs so the browser may keep them.</summary>
+        public string MediaVersion { get; set; } = "";
         // ── A reblog: whose post, and how it was doing when picked ──
         public string? ReblogOf { get; set; }
         public string? ReblogUrl { get; set; }
@@ -285,6 +287,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 OriginalCaption = p.Content?.OriginalCaption,
                 ContentViews = p.Content?.Views,
                 TumblrState = p.TumblrState.ToString(),
+                MediaVersion = p.UpdatedUtc.Ticks.ToString("x"),
                 ReblogOf = p.Reblog?.ParentBlogName,
                 ReblogUrl = p.Reblog?.ParentUrl,
                 ReblogSummary = p.Reblog?.Summary,
@@ -438,9 +441,13 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         }
 
         public static List<AttentionItemDto> Attention(OmniTumblrState s, DateTime now, bool publishingEnabled, bool aiAvailable, bool memeScraperReady,
-            TumblrEdgeGateStatus? edge = null)
+            TumblrEdgeGateStatus? edge = null, EdgeHistoryDto? edgeHistory = null)
         {
             var items = new List<AttentionItemDto>();
+            // How often, not only whether: a block that comes back every half hour is a different problem from one bad afternoon.
+            string rate = edgeHistory?.AnsweredPct7d is double answered && answered < 90
+                ? $" Over the last 7 days it refused the server {100 - answered:0}% of the time ({edgeHistory.Blocks7d} blocks)."
+                : "";
             if (edge is { Blocked: true, BlockedSinceUtc: DateTime since })
             {
                 int waiting = s.AllPosts().Count(p => p.Status == PostStatus.Ready && p.ScheduledUtc <= now);
@@ -449,8 +456,18 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     Level = "error",
                     Title = "Tumblr is refusing this server's requests",
                     Detail = $"Since {since:HH:mm} UTC every call gets an HTML 403 from Tumblr's edge (nginx) before it reaches the API — the server's network or IP, not the accounts or posts. " +
-                        $"{(waiting > 0 ? $"{waiting} due post(s) are waiting and" : "Posts")} will go out one at a time, spaced across the blogs, when it lifts; next check {edge.NextCheckUtc:HH:mm} UTC. " +
-                        "If it keeps happening, route Tumblr traffic through a proxy with the OmniSetting OmniTumblr_Proxy.",
+                        $"{(waiting > 0 ? $"{waiting} due post(s) are waiting and" : "Posts")} will go out one at a time, spaced across the blogs, when it lifts; next check {edge.NextCheckUtc:HH:mm} UTC." + rate +
+                        " If it keeps happening, route Tumblr traffic through a proxy with the OmniSetting OmniTumblr_Proxy.",
+                    Action = "settings",
+                });
+            }
+            else if (rate.Length > 0)
+            {
+                items.Add(new AttentionItemDto
+                {
+                    Level = "warning",
+                    Title = "Tumblr keeps refusing this server",
+                    Detail = $"Tumblr is answering right now.{rate} Posts wait out each block, so they go out late. A proxy (OmniSetting OmniTumblr_Proxy) is the way round it.",
                     Action = "settings",
                 });
             }

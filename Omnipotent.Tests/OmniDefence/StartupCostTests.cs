@@ -213,6 +213,43 @@ namespace Omnipotent.Tests.OmniDefence
             Assert.Equal(new[] { "IP records", "routes", "fingerprinting" }, ((JObject)after["steps"]!).Properties().Select(p => p.Name));
         }
 
+        /// <summary>
+        /// "IP records" took 53 s on 11 Nov 2026 and 182 s on 13 Nov for about 6,000 small rows. The
+        /// load now says how long it waited for a read slot, how long the open took, and how many
+        /// pages it read, and start-up serves that beside the step's time.
+        /// </summary>
+        [Fact]
+        public async Task IpRecordLoad_SaysWhereItsTimeWent_AndStartupServesIt()
+        {
+            var store = await NewStoreAsync();
+            var records = Enumerable.Range(1, 300).Select(i => new IpRecord
+            {
+                Ip = $"198.51.{i / 250}.{i % 250}", FirstSeen = 1000 + i, LastSeen = 2000 + i, TotalRequests = i, Status = "Normal",
+                Country = "GB", City = new string('c', 40), Notes = new string('n', 120),
+            }).ToList();
+            await store.UpsertIpRecordsAsync(records);
+            SqliteConnection.ClearAllPools(); // a cold connection, as at start-up
+
+            var tracker = new IpThreatTracker(store);
+            var cost = await tracker.LoadAsync();
+            Assert.Equal(300, cost.Rows);
+            Assert.Equal(300, tracker.All().Count());
+            Assert.True(cost.PagesRead > 0, cost.ToString());
+            Assert.True(cost.SlotWaitMs >= 0 && cost.OpenMs >= 0 && cost.ReadMs >= 0, cost.ToString());
+
+            var trace = new OmniDefenceStartupTrace();
+            trace.Begin();
+            await trace.Step("IP records", () => Task.CompletedTask);
+            trace.Detail("IP records", cost.ToString());
+            var status = JObject.FromObject(trace.Status());
+            Assert.Contains("300 rows", status["details"]!.Value<string>("IP records"));
+            Assert.Contains("pages read", status["details"]!.Value<string>("IP records"));
+
+            trace.Begin(); // a restart starts a clean trace
+            Assert.Empty((JObject)JObject.FromObject(trace.Status())["details"]!);
+            await store.ShutdownAsync();
+        }
+
         [Fact]
         public async Task OpeningTheStore_ReportsItsThreeSteps_SoTheSlowOneCanBeNamed()
         {

@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
 using Omnipotent.Services.KliveAPI.Caching;
+using Omnipotent.Services.KliveAPI.Telemetry;
 using Omnipotent.Services.OmniTrader.Backtesting;
 using Omnipotent.Services.OmniTrader.Contracts;
 using System.Globalization;
@@ -311,7 +312,10 @@ namespace Omnipotent.Services.OmniTrader.Persistence
                 count.CommandText = $"SELECT COUNT(*) FROM backtest_jobs j {clause}";
                 foreach (SqliteParameter prm in cmd.Parameters) count.Parameters.AddWithValue(prm.ParameterName, prm.Value);
                 filter.Limit = Math.Clamp(filter.Limit, 1, 1000);
-                var total = Convert.ToInt32(await count.ExecuteScalarAsync(ct));
+                // Spans bt-count / bt-rows / bt-parse: /lab/backtests ran p50 2.4 s, p95 8 s over 207 calls in
+                // 30 days, bimodal (37 under 100 ms); they say whether the count, the row reads or parsing is slow.
+                int total;
+                using (RequestTrace.AmbientSpan("bt-count")) total = Convert.ToInt32(await count.ExecuteScalarAsync(ct));
                 cmd.CommandText = $"{SummarySelect} {clause} ORDER BY l.queued_utc DESC LIMIT $l OFFSET $o";
                 cmd.Parameters.AddWithValue("$l", filter.Limit);
                 cmd.Parameters.AddWithValue("$o", Math.Max(0, filter.Offset));
@@ -321,10 +325,14 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         private static async Task<List<BacktestJobSummaryRow>> ReadSummariesAsync(SqliteCommand cmd, CancellationToken ct)
         {
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            SqliteDataReader opened;
+            using (RequestTrace.AmbientSpan("bt-rows")) opened = await cmd.ExecuteReaderAsync(ct);
+            await using var reader = opened;
             var output = new List<BacktestJobSummaryRow>();
-            while (await reader.ReadAsync(ct))
+            while (true)
             {
+                using (RequestTrace.AmbientSpan("bt-rows")) { if (!await reader.ReadAsync(ct)) break; }
+                using var parse = RequestTrace.AmbientSpan("bt-parse");
                 var config = JsonConvert.DeserializeObject<BacktestConfig>(reader.GetString(2))
                     ?? throw new InvalidOperationException("Bad config_json in backtest_jobs row");
                 bool hasResult = reader.GetBoolean(11);

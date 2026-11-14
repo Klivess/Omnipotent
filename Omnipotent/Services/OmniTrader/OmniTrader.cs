@@ -202,7 +202,8 @@ namespace Omnipotent.Services.OmniTrader
                     MarketData, StrategyRegistry,
                     DeploymentRepo, OrderRepo, FillRepo, EquityRepo,
                     () => krakenRouter,
-                    Log, Err);
+                    Log, Err,
+                    new PaperBookStore(Db));
 
                 BacktestQueue = new BacktestJobQueue(BacktestJobRepo, MarketData, StrategyRegistry,
                     UniverseRepo, Log, Err);

@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Microsoft.Data.Sqlite;
+using Omnipotent.Services.KliveAPI.Telemetry;
 
 namespace Omnipotent.Profiles.Activity
 {
@@ -56,6 +57,14 @@ namespace Omnipotent.Profiles.Activity
     /// The profile directory (list / get) asks for "requests in the last 24 h" and "last seen" per
     /// profile on every call. Those are kept in memory, fed by <see cref="WriteBatch"/> and seeded
     /// once from the database in the background, so the directory never touches the database.
+    ///
+    /// Summaries read hourly rollups, not raw rows. On the server a page read is slow and the
+    /// owner's rows fill most pages, so a quieter profile's rows sit one to a page: a 30-day summary
+    /// read tens of thousands of pages (p95 22.9 s live, max 48.7 s) and "refused only" walked every
+    /// row of the profile (11.2 s live). The rollups are clustered by profile and hour
+    /// (WITHOUT ROWID), so a summary reads a few hundred rows that sit together. They are written
+    /// with every batch; rows from before they existed are rolled up once, in the background,
+    /// resuming where a restart left off.
     /// </summary>
     public sealed class ProfileActivityStore : IDisposable
     {
@@ -64,16 +73,22 @@ namespace Omnipotent.Profiles.Activity
         private static readonly TimeSpan BatchWindow = TimeSpan.FromMilliseconds(250);
 
         private const long MinuteMs = 60_000;
+        private const long HourMs = 3_600_000;
         private static readonly TimeSpan TallyWindow = TimeSpan.FromHours(24);
         /// <summary>More minutes than the window holds, so two minutes inside the window never share a slot.</summary>
         private const int TallySlots = 1500;
         private static readonly TimeSpan SummaryFresh = TimeSpan.FromSeconds(15);
         private static readonly TimeSpan SummaryStale = TimeSpan.FromMinutes(5);
+        /// <summary>Raw rows rolled up per transaction by the backfill (keeps the write lock short).</summary>
+        internal int BackfillChunk { get; set; } = 5_000;
+        /// <summary>Off in tests that drive the index build and backfill by hand.</summary>
+        internal bool AutoUpgrade { get; set; } = true;
 
         private readonly ConcurrentDictionary<string, RequestTally> tallies = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<string, long> lastSeen = new(StringComparer.Ordinal);
         private readonly ConcurrentDictionary<(string Profile, TimeSpan Range), SummaryEntry> summaries = new();
         private Task? seeding;
+        private Task? upgrading;
 
         private readonly string dbPath;
         private readonly Action<string> log;
@@ -87,6 +102,11 @@ namespace Omnipotent.Profiles.Activity
         private Task? writer;
         private Task? retention;
         private volatile bool ready;
+        private volatile bool indexesReady;
+        private volatile bool rollupsReady;
+        private long rollupUptoId;
+        private long rollupThroughId;
+        private long rollupsSinceMs;
 
         /// <summary>Raw rows are kept this long; daily rollups and events are kept longer.</summary>
         public int RetentionDays { get; set; } = 90;
@@ -111,6 +131,15 @@ namespace Omnipotent.Profiles.Activity
 
         public bool IsReady => ready;
 
+        /// <summary>The indexes behind "refused only" and the service filter exist.</summary>
+        public bool IndexesReady => indexesReady;
+
+        /// <summary>Every raw row is in the rollups (summaries no longer read raw rows).</summary>
+        public bool RollupsReady => rollupsReady;
+
+        /// <summary>How far the one-off backfill has got: rows rolled up so far out of the rows that predate the rollups.</summary>
+        public (long Through, long Upto) RollupProgress => (Interlocked.Read(ref rollupThroughId), Interlocked.Read(ref rollupUptoId));
+
         public void Start()
         {
             try
@@ -120,13 +149,26 @@ namespace Omnipotent.Profiles.Activity
                 using (var conn = Open())
                 {
                     Exec(conn, "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;");
+                    // Tables and indexes on empty tables only: anything that has to read the request
+                    // log runs in the background, so a big log never delays the profile routes.
                     foreach (string ddl in Schema) Exec(conn, ddl);
                     seedUpToId = Scalar<long>(conn, "SELECT COALESCE(MAX(id), 0) FROM requests;");
+                    // The first start with rollups: everything up to here predates them and is
+                    // rolled up by the backfill; every later row is rolled up as it is written.
+                    Exec(conn, "INSERT OR IGNORE INTO meta (k, v) VALUES ('rollup_upto_id', $m);", ("$m", seedUpToId));
+                    Exec(conn, "INSERT OR IGNORE INTO meta (k, v) VALUES ('rollup_since_ms', $t);", ("$t", DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
+                    Exec(conn, "INSERT OR IGNORE INTO meta (k, v) VALUES ('rollup_through_id', 0);");
+                    rollupUptoId = Scalar<long>(conn, "SELECT v FROM meta WHERE k = 'rollup_upto_id';");
+                    rollupThroughId = Scalar<long>(conn, "SELECT v FROM meta WHERE k = 'rollup_through_id';");
+                    rollupsSinceMs = Scalar<long>(conn, "SELECT v FROM meta WHERE k = 'rollup_since_ms';");
+                    rollupsReady = rollupThroughId >= rollupUptoId;
+                    indexesReady = SlowIndexes.All(ix => Scalar<long>(conn, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = $n;", ("$n", ix.Name)) > 0);
                 }
                 ready = true;
                 // Rows written from here on (ids above seedUpToId) are counted live by WriteBatch;
                 // the seed counts only what was already there, so nothing is counted twice.
                 seeding = Task.Run(() => Seed(seedUpToId));
+                if (AutoUpgrade) upgrading = Task.Run(Upgrade);
                 writer = Task.Run(WriterLoop);
                 retention = Task.Run(RetentionLoop);
             }
@@ -186,6 +228,46 @@ namespace Omnipotent.Profiles.Activity
                 last_ts_ms INTEGER NOT NULL,
                 PRIMARY KEY (profile_id, day, perm_key)
             );",
+            // One row per profile, hour, route, method and credential kind (password = no session).
+            // Service and permission follow from the route and method; the latest seen wins.
+            @"CREATE TABLE IF NOT EXISTS activity_hourly (
+                profile_id TEXT NOT NULL,
+                hour_ms INTEGER NOT NULL,
+                route TEXT NOT NULL,
+                method TEXT NOT NULL,
+                password INTEGER NOT NULL,
+                service TEXT NOT NULL,
+                perm_key TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                denied INTEGER NOT NULL,
+                errors INTEGER NOT NULL,
+                last_ts_ms INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, hour_ms, route, method, password)
+            ) WITHOUT ROWID;",
+            @"CREATE TABLE IF NOT EXISTS activity_hourly_ips (
+                profile_id TEXT NOT NULL,
+                hour_ms INTEGER NOT NULL,
+                ip TEXT NOT NULL,
+                count INTEGER NOT NULL,
+                first_ts_ms INTEGER NOT NULL,
+                last_ts_ms INTEGER NOT NULL,
+                PRIMARY KEY (profile_id, hour_ms, ip)
+            ) WITHOUT ROWID;",
+            "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);",
+        };
+
+        /// <summary>
+        /// Indexes over the request log (and the daily rollup) that a long log takes a while to build,
+        /// so they are built after start-up. Until they exist, reads fall back to the plain queries.
+        /// </summary>
+        internal static readonly (string Name, string Ddl)[] SlowIndexes =
+        {
+            // "Refused only" and the summary's recent refusals: a small partial index, so a profile
+            // that is rarely refused costs a handful of rows instead of every row it ever made.
+            ("ix_req_denied", "CREATE INDEX IF NOT EXISTS ix_req_denied ON requests(profile_id, ts_ms DESC) WHERE status IN (401, 403);"),
+            ("ix_req_profile_service_ts", "CREATE INDEX IF NOT EXISTS ix_req_profile_service_ts ON requests(profile_id, service, ts_ms DESC);"),
+            // Usage reads (count, denied, last) per permission: covering, in the order it groups by.
+            ("ix_ru_profile_perm", "CREATE INDEX IF NOT EXISTS ix_ru_profile_perm ON daily_rollup(profile_id, perm_key, last_ts_ms, count, denied);"),
         };
 
         // ───────────────────────────── writes ─────────────────────────────
@@ -232,7 +314,7 @@ namespace Omnipotent.Profiles.Activity
                         try { if (!await reader.WaitToReadAsync(wait.Token)) break; }
                         catch (OperationCanceledException) { break; }
                     }
-                    if (batch.Count > 0) WriteBatch(batch);
+                    if (batch.Count > 0) await WriteBatchWhenFreeAsync(batch);
                 }
                 catch (OperationCanceledException) { break; }
                 catch (Exception ex)
@@ -240,6 +322,27 @@ namespace Omnipotent.Profiles.Activity
                     log("KMProfiles: failed to write profile activity (batch dropped): " + ex.Message);
                 }
                 finally { batch.Clear(); }
+            }
+        }
+
+        /// <summary>
+        /// Writes a batch, waiting out a busy database (the one-off index build after an upgrade can
+        /// hold the write lock for longer than the 30 s busy timeout) instead of dropping it.
+        /// </summary>
+        private async Task WriteBatchWhenFreeAsync(IReadOnlyList<object> items)
+        {
+            int[] waitsSeconds = { 5, 15, 40, 90 };
+            for (int attempt = 0; ; attempt++)
+            {
+                try
+                {
+                    WriteBatch(items);
+                    return;
+                }
+                catch (SqliteException ex) when ((ex.SqliteErrorCode == 5 || ex.SqliteErrorCode == 6) && attempt < waitsSeconds.Length)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(waitsSeconds[attempt]), stop.Token);
+                }
             }
         }
 
@@ -264,6 +367,7 @@ namespace Omnipotent.Profiles.Activity
             var ep = AddParams(evCmd, "$p", "$t", "$k", "$a", "$an", "$ip", "$d");
 
             var rollup = new Dictionary<(string, string, string), (int Count, int Denied, long Last)>();
+            var hourly = new HourlyAggregate();
             foreach (var item in items)
             {
                 switch (item)
@@ -276,6 +380,7 @@ namespace Omnipotent.Profiles.Activity
                         var key = (r.ProfileId, day, r.PermKey ?? "");
                         rollup.TryGetValue(key, out var agg);
                         rollup[key] = (agg.Count + 1, agg.Denied + (IsDenied(r.Status) ? 1 : 0), Math.Max(agg.Last, r.TsMs));
+                        hourly.Add(r.ProfileId, r.TsMs, r.Route, r.Method, r.SessionId == null, r.Service, r.PermKey, r.Status, r.Ip);
                         break;
                     case ActivityPageView v:
                         Set(pp, v.ProfileId, v.SessionId, v.TsMs, Trim(v.Path, 512), Trim(v.Title, 256), v.DwellMs);
@@ -302,11 +407,70 @@ namespace Omnipotent.Profiles.Activity
                     ruCmd.ExecuteNonQuery();
                 }
             }
+            hourly.Write(conn, tx);
             tx.Commit();
 
             foreach (var item in items)
             {
                 if (item is ActivityRequest r) NoteRequest(r);
+            }
+        }
+
+        /// <summary>Requests folded into the hourly rollups in memory, then upserted once per key.</summary>
+        private sealed class HourlyAggregate
+        {
+            private readonly Dictionary<(string Profile, long Hour, string Route, string Method, int Password), (string Service, string Perm, long Count, long Denied, long Errors, long Last)> routes = new();
+            private readonly Dictionary<(string Profile, long Hour, string Ip), (long Count, long First, long Last)> ips = new();
+
+            public int Count => routes.Count;
+
+            public void Add(string profileId, long tsMs, string? route, string? method, bool password, string? service, string? permKey, int status, string? ip)
+            {
+                long hour = tsMs / HourMs * HourMs;
+                var key = (profileId, hour, route ?? "", method ?? "", password ? 1 : 0);
+                routes.TryGetValue(key, out var r);
+                routes[key] = (service ?? "Other", permKey ?? "", r.Count + 1, r.Denied + (IsDenied(status) ? 1 : 0),
+                    r.Errors + (status >= 500 ? 1 : 0), Math.Max(r.Last, tsMs));
+                if (string.IsNullOrEmpty(ip)) return;
+                var ipKey = (profileId, hour, ip);
+                if (ips.TryGetValue(ipKey, out var u)) ips[ipKey] = (u.Count + 1, Math.Min(u.First, tsMs), Math.Max(u.Last, tsMs));
+                else ips[ipKey] = (1, tsMs, tsMs);
+            }
+
+            public void Write(SqliteConnection conn, SqliteTransaction tx)
+            {
+                if (routes.Count > 0)
+                {
+                    using var cmd = conn.CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = @"INSERT INTO activity_hourly (profile_id, hour_ms, route, method, password, service, perm_key, count, denied, errors, last_ts_ms)
+                        VALUES ($p, $h, $r, $m, $pw, $s, $k, $c, $d, $e, $l)
+                        ON CONFLICT(profile_id, hour_ms, route, method, password) DO UPDATE SET count = count + excluded.count,
+                        denied = denied + excluded.denied, errors = errors + excluded.errors,
+                        service = CASE WHEN excluded.last_ts_ms >= last_ts_ms THEN excluded.service ELSE service END,
+                        perm_key = CASE WHEN excluded.last_ts_ms >= last_ts_ms THEN excluded.perm_key ELSE perm_key END,
+                        last_ts_ms = MAX(last_ts_ms, excluded.last_ts_ms);";
+                    var ps = AddParams(cmd, "$p", "$h", "$r", "$m", "$pw", "$s", "$k", "$c", "$d", "$e", "$l");
+                    foreach (var ((profile, hour, route, method, password), v) in routes)
+                    {
+                        Set(ps, profile, hour, route, method, password, v.Service, v.Perm, v.Count, v.Denied, v.Errors, v.Last);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
+                if (ips.Count > 0)
+                {
+                    using var cmd = conn.CreateCommand();
+                    cmd.Transaction = tx;
+                    cmd.CommandText = @"INSERT INTO activity_hourly_ips (profile_id, hour_ms, ip, count, first_ts_ms, last_ts_ms) VALUES ($p, $h, $ip, $c, $f, $l)
+                        ON CONFLICT(profile_id, hour_ms, ip) DO UPDATE SET count = count + excluded.count,
+                        first_ts_ms = MIN(first_ts_ms, excluded.first_ts_ms), last_ts_ms = MAX(last_ts_ms, excluded.last_ts_ms);";
+                    var ps = AddParams(cmd, "$p", "$h", "$ip", "$c", "$f", "$l");
+                    foreach (var ((profile, hour, ip), v) in ips)
+                    {
+                        Set(ps, profile, hour, ip, v.Count, v.First, v.Last);
+                        cmd.ExecuteNonQuery();
+                    }
+                }
             }
         }
 
@@ -355,6 +519,88 @@ namespace Omnipotent.Profiles.Activity
         /// <summary>Blocks until the background seed has finished (tests, diagnostics).</summary>
         internal bool WaitUntilSeeded(TimeSpan timeout) => seeding?.Wait(timeout) ?? true;
 
+        /// <summary>Blocks until the background index build and rollup backfill have finished (tests).</summary>
+        internal bool WaitUntilUpgraded(TimeSpan timeout) => upgrading?.Wait(timeout) ?? true;
+
+        /// <summary>
+        /// The background half of start-up: builds the indexes a long log takes a while to index,
+        /// then rolls up the rows that predate the rollups, a chunk per transaction, recording how
+        /// far it got so a restart carries on instead of starting again.
+        /// </summary>
+        private void Upgrade()
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            try
+            {
+                if (!indexesReady)
+                {
+                    using var conn = Open();
+                    foreach (var (_, ddl) in SlowIndexes)
+                    {
+                        if (stop.IsCancellationRequested) return;
+                        Exec(conn, ddl);
+                    }
+                    indexesReady = true;
+                    log($"KMProfiles: activity indexes built in {clock.Elapsed.TotalSeconds:0.0} s.");
+                }
+                if (!rollupsReady) Backfill();
+            }
+            catch (Exception ex)
+            {
+                log("KMProfiles: could not finish preparing the activity store (summaries read raw rows until the next start): " + ex.Message);
+            }
+        }
+
+        /// <summary>Builds the indexes a long log takes a while to index (tests call it directly).</summary>
+        internal void BuildSlowIndexes()
+        {
+            using var conn = Open();
+            foreach (var (_, ddl) in SlowIndexes) Exec(conn, ddl);
+            indexesReady = true;
+        }
+
+        /// <summary>Rolls up raw rows with ids in (rollup_through_id, rollup_upto_id], at most <paramref name="maxChunks"/> chunks.</summary>
+        internal void Backfill(int maxChunks = int.MaxValue)
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            long upto = Interlocked.Read(ref rollupUptoId);
+            long rows = 0;
+            for (int chunk = 0; chunk < maxChunks && !stop.IsCancellationRequested; chunk++)
+            {
+                long through = Interlocked.Read(ref rollupThroughId);
+                if (through >= upto) break;
+                long next = Math.Min(upto, through + BackfillChunk);
+                using var conn = Open();
+                using var tx = conn.BeginTransaction();
+                var hourly = new HourlyAggregate();
+                using (var cmd = Command(conn, "SELECT profile_id, ts_ms, route, session_id IS NULL, service, perm_key, status, ip, method FROM requests WHERE id > $a AND id <= $b;",
+                    ("$a", through), ("$b", next)))
+                {
+                    cmd.Transaction = tx;
+                    using var r = cmd.ExecuteReader();
+                    while (r.Read())
+                    {
+                        hourly.Add(r.GetString(0), r.GetInt64(1), Str(r, 2), Str(r, 8), r.GetInt64(3) == 1, Str(r, 4), Str(r, 5), r.IsDBNull(6) ? 0 : r.GetInt32(6), Str(r, 7));
+                        rows++;
+                    }
+                }
+                hourly.Write(conn, tx);
+                using (var mark = Command(conn, "UPDATE meta SET v = $v WHERE k = 'rollup_through_id';", ("$v", next)))
+                {
+                    mark.Transaction = tx;
+                    mark.ExecuteNonQuery();
+                }
+                tx.Commit();
+                Interlocked.Exchange(ref rollupThroughId, next);
+            }
+            if (Interlocked.Read(ref rollupThroughId) >= upto)
+            {
+                rollupsReady = true;
+                foreach (var entry in summaries.Values) lock (entry.Gate) entry.ComputedUtc = DateTime.MinValue;
+                if (rows > 0) log($"KMProfiles: rolled up {rows:N0} earlier request(s) in {clock.Elapsed.TotalSeconds:0.0} s; summaries now read the rollups.");
+            }
+        }
+
         /// <summary>Requests and denials per minute for one profile, over a ring that covers the last 24 hours.</summary>
         private sealed class RequestTally
         {
@@ -400,6 +646,25 @@ namespace Omnipotent.Profiles.Activity
                 }
                 return (total, deniedTotal);
             }
+
+            /// <summary>Requests per hour for the <paramref name="hours"/> hours ending with the one containing <paramref name="nowMs"/>, oldest first.</summary>
+            public long[] Hourly(long nowMs, int hours)
+            {
+                var result = new long[hours];
+                long lastHour = nowMs / HourMs;
+                long firstHour = lastHour - hours + 1;
+                lock (gate)
+                {
+                    for (int i = 0; i < TallySlots; i++)
+                    {
+                        if (requests[i] == 0) continue;
+                        long hour = minutes[i] * MinuteMs / HourMs;
+                        if (hour < firstHour || hour > lastHour) continue;
+                        result[hour - firstHour] += requests[i];
+                    }
+                }
+                return result;
+            }
         }
 
         private async Task RetentionLoop()
@@ -425,6 +690,9 @@ namespace Omnipotent.Profiles.Activity
             Exec(conn, "DELETE FROM requests WHERE ts_ms < $c;", ("$c", rawCutoff));
             Exec(conn, "DELETE FROM page_views WHERE ts_ms < $c;", ("$c", rawCutoff));
             Exec(conn, "DELETE FROM events WHERE ts_ms < $c;", ("$c", eventCutoff));
+            // The hourly rollups only ever answer windows of the last 30 days; keep them as long as raw rows.
+            Exec(conn, "DELETE FROM activity_hourly WHERE hour_ms < $c;", ("$c", rawCutoff));
+            Exec(conn, "DELETE FROM activity_hourly_ips WHERE hour_ms < $c;", ("$c", rawCutoff));
         }
 
         // ───────────────────────────── reads ─────────────────────────────
@@ -452,6 +720,18 @@ namespace Omnipotent.Profiles.Activity
             public string? SessionId { get; set; }
         }
 
+        /// <summary>The timeline's request query: the index matching the filter, once it exists.</summary>
+        internal string TimelineRequestSql(bool service, bool deniedOnly)
+        {
+            string index = !indexesReady ? "" : deniedOnly ? " INDEXED BY ix_req_denied" : service ? " INDEXED BY ix_req_profile_service_ts" : "";
+            return $@"SELECT ts_ms, method, route, perm_key, service, status, duration_ms, ip, page, deny_reason, via_batch, session_id
+                    FROM requests{index} WHERE profile_id = $p AND ts_ms < $b AND ts_ms >= $s"
+                + (service ? " AND service = $svc" : "")
+                // Written exactly as the partial index's WHERE, which is how SQLite knows it applies.
+                + (deniedOnly ? " AND status IN (401, 403)" : "")
+                + " ORDER BY ts_ms DESC LIMIT $l;";
+        }
+
         /// <param name="types">Any of request, page, event (null = all).</param>
         /// <param name="beforeMs">Cursor: only items strictly older than this.</param>
         public List<TimelineItem> GetTimeline(string profileId, long? beforeMs, long? sinceMs, int limit,
@@ -466,14 +746,10 @@ namespace Omnipotent.Profiles.Activity
 
             if (types == null || types.Contains("request"))
             {
-                string sql = @"SELECT ts_ms, method, route, perm_key, service, status, duration_ms, ip, page, deny_reason, via_batch, session_id
-                    FROM requests WHERE profile_id = $p AND ts_ms < $b AND ts_ms >= $s"
-                    + (service != null ? " AND service = $svc" : "")
-                    + (deniedOnly ? " AND status IN (401, 403)" : "")
-                    + " ORDER BY ts_ms DESC LIMIT $l;";
+                using var span = RequestTrace.AmbientSpan(deniedOnly ? "activity-refused" : service != null ? "activity-service" : "activity-requests");
                 var args = new List<(string, object?)> { ("$p", profileId), ("$b", before), ("$s", since), ("$l", limit) };
                 if (service != null) args.Add(("$svc", service));
-                using var cmd = Command(conn, sql, args.ToArray());
+                using var cmd = Command(conn, TimelineRequestSql(service != null, deniedOnly), args.ToArray());
                 using var r = cmd.ExecuteReader();
                 while (r.Read())
                 {
@@ -488,6 +764,7 @@ namespace Omnipotent.Profiles.Activity
             }
             if ((types == null || types.Contains("page")) && service == null && !deniedOnly)
             {
+                using var span = RequestTrace.AmbientSpan("activity-pages");
                 using var cmd = Command(conn, @"SELECT ts_ms, path, title, dwell_ms, session_id FROM page_views
                     WHERE profile_id = $p AND ts_ms < $b AND ts_ms >= $s ORDER BY ts_ms DESC LIMIT $l;",
                     ("$p", profileId), ("$b", before), ("$s", since), ("$l", limit));
@@ -499,6 +776,7 @@ namespace Omnipotent.Profiles.Activity
             }
             if ((types == null || types.Contains("event")) && service == null && !deniedOnly)
             {
+                using var span = RequestTrace.AmbientSpan("activity-events");
                 using var cmd = Command(conn, @"SELECT ts_ms, kind, actor_id, actor_name, ip, detail_json FROM events
                     WHERE profile_id = $p AND ts_ms < $b AND ts_ms >= $s ORDER BY ts_ms DESC LIMIT $l;",
                     ("$p", profileId), ("$b", before), ("$s", since), ("$l", limit));
@@ -520,17 +798,22 @@ namespace Omnipotent.Profiles.Activity
             public long FromMs { get; set; }
             public long ToMs { get; set; }
             public long BucketMs { get; set; }
+            /// <summary>"rollup" (hourly rollups, window starts on the hour) or "rows" (raw rows, while the backfill runs).</summary>
+            public string Source { get; set; } = "rows";
             public List<string> Services { get; set; } = new();
             /// <summary>One entry per bucket: start time and request count per service.</summary>
             public List<SummaryBucket> Buckets { get; set; } = new();
             public long Requests { get; set; }
             public long Denied { get; set; }
             public long Errors { get; set; }
+            /// <summary>Requests made with a password instead of a session (scripts, devices, the old site).</summary>
+            public long PasswordRequests { get; set; }
             public int DistinctRoutes { get; set; }
             public long PageViews { get; set; }
             public int ActiveDays { get; set; }
             public List<KeyCount> TopPermissions { get; set; } = new();
             public List<KeyCount> TopPages { get; set; } = new();
+            public List<KeyCount> TopRoutes { get; set; } = new();
             public List<IpUse> Ips { get; set; } = new();
             public List<TimelineItem> RecentDenials { get; set; } = new();
             public List<TimelineItem> Logins { get; set; } = new();
@@ -559,53 +842,89 @@ namespace Omnipotent.Profiles.Activity
             public long LastMs { get; set; }
         }
 
+        /// <summary>
+        /// A profile's activity over <paramref name="range"/>: from the hourly rollups once every raw
+        /// row is in them (the window then starts on the hour), from raw rows until then.
+        /// </summary>
         public ActivitySummary GetSummary(string profileId, TimeSpan range, DateTimeOffset? nowUtc = null)
+            => rollupsReady ? GetSummaryFromRollups(profileId, range, nowUtc) : GetSummaryFromRows(profileId, range, nowUtc);
+
+        /// <summary>Fills one summary from a stream of (ts, route, password, service, perm, count, denied, errors, last) facts.</summary>
+        private sealed class SummaryBuilder
+        {
+            private readonly ActivitySummary summary;
+            private readonly SortedDictionary<long, SummaryBucket> buckets = new();
+            private readonly HashSet<string> services = new(StringComparer.Ordinal);
+            private readonly HashSet<string> paths = new(StringComparer.Ordinal);
+            private readonly Dictionary<string, long> routes = new(StringComparer.Ordinal);
+            private readonly Dictionary<string, KeyCount> permissions = new(StringComparer.Ordinal);
+
+            public SummaryBuilder(ActivitySummary summary)
+            {
+                this.summary = summary;
+                for (long t = summary.FromMs / summary.BucketMs * summary.BucketMs; t <= summary.ToMs; t += summary.BucketMs) buckets[t] = new SummaryBucket { T = t };
+            }
+
+            public void Add(long ts, string? route, string? method, bool password, string service, string permKey, long count, long denied, long errors, long lastMs)
+            {
+                long b = ts / summary.BucketMs * summary.BucketMs;
+                if (!buckets.TryGetValue(b, out var sb)) buckets[b] = sb = new SummaryBucket { T = b };
+                sb.ByService[service] = sb.ByService.GetValueOrDefault(service) + count;
+                sb.Denied += denied;
+                services.Add(service);
+                summary.Requests += count;
+                summary.Denied += denied;
+                summary.Errors += errors;
+                if (password) summary.PasswordRequests += count;
+                if (route != null)
+                {
+                    paths.Add(route);
+                    string label = string.IsNullOrEmpty(method) ? route : method + " " + route;
+                    routes[label] = routes.GetValueOrDefault(label) + count;
+                }
+
+                if (!permissions.TryGetValue(permKey, out var pc)) permissions[permKey] = pc = new KeyCount { Key = permKey };
+                pc.Count += count;
+                pc.Denied += denied;
+                if (lastMs > pc.LastMs) pc.LastMs = lastMs;
+            }
+
+            public void Finish()
+            {
+                summary.Buckets = buckets.Values.ToList();
+                summary.Services = services.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToList();
+                summary.DistinctRoutes = paths.Count;
+                summary.TopRoutes = routes.OrderByDescending(r => r.Value).ThenBy(r => r.Key, StringComparer.Ordinal).Take(10)
+                    .Select(r => new KeyCount { Key = r.Key, Count = r.Value }).ToList();
+                summary.TopPermissions = permissions.Values.OrderByDescending(k => k.Count).ThenBy(k => k.Key, StringComparer.Ordinal).Take(15).ToList();
+            }
+        }
+
+        private static long BucketFor(TimeSpan range) => range <= TimeSpan.FromDays(7) ? HourMs : 86_400_000L;
+
+        /// <summary>The summary from raw rows: one pass over every request of the window.</summary>
+        internal ActivitySummary GetSummaryFromRows(string profileId, TimeSpan range, DateTimeOffset? nowUtc = null)
         {
             DateTimeOffset now = nowUtc ?? DateTimeOffset.UtcNow;
             long to = now.ToUnixTimeMilliseconds();
             long from = now.Subtract(range).ToUnixTimeMilliseconds();
-            long bucket = range <= TimeSpan.FromDays(7) ? 3_600_000L : 86_400_000L;
-            var summary = new ActivitySummary { FromMs = from, ToMs = to, BucketMs = bucket };
+            var summary = new ActivitySummary { FromMs = from, ToMs = to, BucketMs = BucketFor(range), Source = "rows" };
             if (!ready) return summary;
 
             using var conn = Open();
-            var buckets = new SortedDictionary<long, SummaryBucket>();
-            for (long t = from / bucket * bucket; t <= to; t += bucket) buckets[t] = new SummaryBucket { T = t };
-            var services = new HashSet<string>(StringComparer.Ordinal);
-            var routes = new HashSet<string>(StringComparer.Ordinal);
-            var permissions = new Dictionary<string, KeyCount>(StringComparer.Ordinal);
+            var builder = new SummaryBuilder(summary);
             var ips = new Dictionary<string, IpUse>(StringComparer.Ordinal);
-
-            // One pass over the profile's requests feeds every breakdown below. They used to be five
-            // separate queries, each re-reading the same rows from disk.
-            using (var cmd = Command(conn, "SELECT ts_ms, service, status, route, perm_key, ip FROM requests WHERE profile_id = $p AND ts_ms >= $f;",
+            using (RequestTrace.AmbientSpan("summary-rows"))
+            using (var cmd = Command(conn, "SELECT ts_ms, service, status, route, perm_key, ip, session_id IS NULL, method FROM requests WHERE profile_id = $p AND ts_ms >= $f;",
                 ("$p", profileId), ("$f", from)))
             using (var r = cmd.ExecuteReader())
             {
                 while (r.Read())
                 {
                     long ts = r.GetInt64(0);
-                    string svc = r.IsDBNull(1) ? "Other" : r.GetString(1);
                     int status = r.IsDBNull(2) ? 0 : r.GetInt32(2);
-                    bool denied = IsDenied(status);
-
-                    long b = ts / bucket * bucket;
-                    if (!buckets.TryGetValue(b, out var sb)) buckets[b] = sb = new SummaryBucket { T = b };
-                    sb.ByService[svc] = sb.ByService.GetValueOrDefault(svc) + 1;
-                    if (denied) sb.Denied++;
-                    services.Add(svc);
-                    summary.Requests++;
-                    if (denied) summary.Denied++;
-                    if (status >= 500) summary.Errors++;
-
-                    if (!r.IsDBNull(3)) routes.Add(r.GetString(3));
-
-                    string permKey = r.IsDBNull(4) ? "" : r.GetString(4);
-                    if (!permissions.TryGetValue(permKey, out var pc)) permissions[permKey] = pc = new KeyCount { Key = permKey };
-                    pc.Count++;
-                    if (denied) pc.Denied++;
-                    if (ts > pc.LastMs) pc.LastMs = ts;
-
+                    builder.Add(ts, Str(r, 3), Str(r, 7), r.GetInt64(6) == 1, r.IsDBNull(1) ? "Other" : r.GetString(1), r.IsDBNull(4) ? "" : r.GetString(4),
+                        1, IsDenied(status) ? 1 : 0, status >= 500 ? 1 : 0, ts);
                     if (!r.IsDBNull(5))
                     {
                         string ip = r.GetString(5);
@@ -619,30 +938,75 @@ namespace Omnipotent.Profiles.Activity
                     }
                 }
             }
-            summary.Buckets = buckets.Values.ToList();
-            summary.Services = services.OrderBy(s => s, StringComparer.OrdinalIgnoreCase).ToList();
-            summary.DistinctRoutes = routes.Count;
-            summary.TopPermissions = permissions.Values.OrderByDescending(k => k.Count).ThenBy(k => k.Key, StringComparer.Ordinal).Take(15).ToList();
+            builder.Finish();
             summary.Ips = ips.Values.OrderByDescending(i => i.LastMs).ThenBy(i => i.Ip, StringComparer.Ordinal).Take(20).ToList();
+            FillSummaryExtras(conn, profileId, summary);
+            return summary;
+        }
 
-            summary.PageViews = Scalar<long>(conn, "SELECT COUNT(*) FROM page_views WHERE profile_id = $p AND ts_ms >= $f;",
-                ("$p", profileId), ("$f", from));
-            summary.ActiveDays = Scalar<int>(conn, "SELECT COUNT(DISTINCT day) FROM daily_rollup WHERE profile_id = $p AND day >= $d;",
-                ("$p", profileId), ("$d", DayOf(from)));
+        /// <summary>The summary from the hourly rollups: a few hundred rows that sit together.</summary>
+        internal ActivitySummary GetSummaryFromRollups(string profileId, TimeSpan range, DateTimeOffset? nowUtc = null)
+        {
+            DateTimeOffset now = nowUtc ?? DateTimeOffset.UtcNow;
+            long to = now.ToUnixTimeMilliseconds();
+            long from = now.Subtract(range).ToUnixTimeMilliseconds() / HourMs * HourMs;
+            var summary = new ActivitySummary { FromMs = from, ToMs = to, BucketMs = BucketFor(range), Source = "rollup" };
+            if (!ready) return summary;
 
-            using (var cmd = Command(conn, @"SELECT COALESCE(path, ''), COUNT(*), SUM(dwell_ms), MAX(ts_ms) FROM page_views
-                    WHERE profile_id = $p AND ts_ms >= $f GROUP BY 1 ORDER BY 3 DESC LIMIT 10;",
-                ("$p", profileId), ("$f", from)))
-            using (var r = cmd.ExecuteReader())
+            using var conn = Open();
+            var builder = new SummaryBuilder(summary);
+            using (RequestTrace.AmbientSpan("summary-rollup"))
             {
+                using (var cmd = Command(conn, @"SELECT hour_ms, route, password, service, perm_key, count, denied, errors, last_ts_ms, method
+                    FROM activity_hourly WHERE profile_id = $p AND hour_ms >= $f;", ("$p", profileId), ("$f", from)))
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read())
+                    {
+                        string route = r.GetString(1);
+                        builder.Add(r.GetInt64(0), route.Length == 0 ? null : route, r.GetString(9), r.GetInt64(2) == 1, r.GetString(3), r.GetString(4),
+                            r.GetInt64(5), r.GetInt64(6), r.GetInt64(7), r.GetInt64(8));
+                    }
+                }
+                using (var cmd = Command(conn, @"SELECT ip, SUM(count), MIN(first_ts_ms), MAX(last_ts_ms) FROM activity_hourly_ips
+                    WHERE profile_id = $p AND hour_ms >= $f GROUP BY ip;", ("$p", profileId), ("$f", from)))
+                using (var r = cmd.ExecuteReader())
+                {
+                    while (r.Read()) summary.Ips.Add(new IpUse { Ip = r.GetString(0), Count = r.GetInt64(1), FirstMs = r.GetInt64(2), LastMs = r.GetInt64(3) });
+                }
+            }
+            builder.Finish();
+            summary.Ips = summary.Ips.OrderByDescending(i => i.LastMs).ThenBy(i => i.Ip, StringComparer.Ordinal).Take(20).ToList();
+            FillSummaryExtras(conn, profileId, summary);
+            return summary;
+        }
+
+        /// <summary>Page views, active days, recent refusals and sign-ins: small reads both summaries share.</summary>
+        private void FillSummaryExtras(SqliteConnection conn, string profileId, ActivitySummary summary)
+        {
+            long from = summary.FromMs;
+            using (RequestTrace.AmbientSpan("summary-pages"))
+            {
+                summary.PageViews = Scalar<long>(conn, "SELECT COUNT(*) FROM page_views WHERE profile_id = $p AND ts_ms >= $f;",
+                    ("$p", profileId), ("$f", from));
+                using var cmd = Command(conn, @"SELECT COALESCE(path, ''), COUNT(*), SUM(dwell_ms), MAX(ts_ms) FROM page_views
+                        WHERE profile_id = $p AND ts_ms >= $f GROUP BY 1 ORDER BY 3 DESC LIMIT 10;",
+                    ("$p", profileId), ("$f", from));
+                using var r = cmd.ExecuteReader();
                 while (r.Read()) summary.TopPages.Add(new KeyCount { Key = r.GetString(0), Count = r.GetInt64(1), Denied = r.IsDBNull(2) ? 0 : r.GetInt64(2), LastMs = r.GetInt64(3) });
             }
-
-            summary.RecentDenials = GetTimeline(profileId, null, from, 20, new HashSet<string> { "request" }, null, deniedOnly: true);
+            using (RequestTrace.AmbientSpan("summary-days"))
+            {
+                summary.ActiveDays = Scalar<int>(conn, "SELECT COUNT(DISTINCT day) FROM daily_rollup WHERE profile_id = $p AND day >= $d;",
+                    ("$p", profileId), ("$d", DayOf(from)));
+            }
+            using (RequestTrace.AmbientSpan("summary-refused"))
+            {
+                summary.RecentDenials = GetTimeline(profileId, null, from, 20, new HashSet<string> { "request" }, null, deniedOnly: true);
+            }
             summary.Logins = GetTimeline(profileId, null, from, 40, new HashSet<string> { "event" })
                 .Where(e => e.Kind != null && (e.Kind.StartsWith("login", StringComparison.Ordinal) || e.Kind.StartsWith("session", StringComparison.Ordinal)))
                 .Take(20).ToList();
-            return summary;
         }
 
         private sealed class SummaryEntry
@@ -654,10 +1018,9 @@ namespace Omnipotent.Profiles.Activity
         }
 
         /// <summary>
-        /// <see cref="GetSummary"/> for the profile console, off the caller's thread. A 30-day summary
-        /// reads every request the profile made, so the result is kept: younger than 15 s is served
-        /// as is, up to 5 minutes old is served at once while one background pass refreshes it, and
-        /// only the first look (or one after a long gap) waits for the computation.
+        /// <see cref="GetSummary"/> for the profile console, off the caller's thread. The result is
+        /// kept: younger than 15 s is served as is, up to 5 minutes old is served at once while one
+        /// background pass refreshes it, and only the first look (or one after a long gap) waits.
         /// </summary>
         public Task<ActivitySummary> GetSummaryAsync(string profileId, TimeSpan range)
         {
@@ -692,14 +1055,18 @@ namespace Omnipotent.Profiles.Activity
             }
         }
 
+        /// <summary>The usage query: covering index, in the order it groups by, once it exists.</summary>
+        internal string UsageSql => $@"SELECT perm_key, SUM(count), SUM(denied), MAX(last_ts_ms) FROM daily_rollup{(indexesReady ? " INDEXED BY ix_ru_profile_perm" : "")}
+                WHERE profile_id = $p AND perm_key <> '' GROUP BY perm_key;";
+
         /// <summary>For each key the profile has used: how often and when last (all retained history).</summary>
         public List<KeyCount> GetPermissionUsage(string profileId)
         {
             var list = new List<KeyCount>();
             if (!ready) return list;
+            using var span = RequestTrace.AmbientSpan("usage");
             using var conn = Open();
-            using var cmd = Command(conn, @"SELECT perm_key, SUM(count), SUM(denied), MAX(last_ts_ms) FROM daily_rollup
-                WHERE profile_id = $p AND perm_key <> '' GROUP BY perm_key;", ("$p", profileId));
+            using var cmd = Command(conn, UsageSql, ("$p", profileId));
             using var r = cmd.ExecuteReader();
             while (r.Read()) list.Add(new KeyCount { Key = r.GetString(0), Count = r.GetInt64(1), Denied = r.GetInt64(2), LastMs = r.GetInt64(3) });
             return list;
@@ -736,6 +1103,90 @@ namespace Omnipotent.Profiles.Activity
             using var r = cmd.ExecuteReader();
             while (r.Read()) map[r.GetString(0)] = (r.GetInt64(1), r.GetInt64(2));
             return map;
+        }
+
+        // ───────────────────────────── insights (the directory's review) ─────────────────────────────
+
+        /// <summary>Requests per hour over the last <paramref name="hours"/> hours (oldest first), from memory.</summary>
+        public long[] GetHourly(string profileId, int hours = 24, long? nowMs = null)
+        {
+            hours = Math.Clamp(hours, 1, 24);
+            return tallies.TryGetValue(profileId, out var tally)
+                ? tally.Hourly(nowMs ?? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(), hours)
+                : new long[hours];
+        }
+
+        public sealed class AuthMix
+        {
+            public long Session { get; set; }
+            public long Password { get; set; }
+            public long? LastPasswordMs { get; set; }
+            public long? LastSessionMs { get; set; }
+        }
+
+        /// <summary>
+        /// How a profile's requests were signed since <paramref name="sinceMs"/>: with a session, or
+        /// with the password itself. Read from the rollups, so it reaches back to when they started
+        /// (<see cref="RollupsSinceMs"/>) until the backfill finishes, then over the whole window.
+        /// </summary>
+        public AuthMix GetAuthMix(string profileId, long sinceMs)
+        {
+            var mix = new AuthMix();
+            if (!ready) return mix;
+            using var conn = Open();
+            using var cmd = Command(conn, "SELECT password, SUM(count), MAX(last_ts_ms) FROM activity_hourly WHERE profile_id = $p AND hour_ms >= $f GROUP BY password;",
+                ("$p", profileId), ("$f", sinceMs / HourMs * HourMs));
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                if (r.GetInt64(0) == 1) { mix.Password = r.GetInt64(1); mix.LastPasswordMs = r.GetInt64(2); }
+                else { mix.Session = r.GetInt64(1); mix.LastSessionMs = r.GetInt64(2); }
+            }
+            return mix;
+        }
+
+        /// <summary>When the rollups (and so the credential split) began, before the backfill finishes.</summary>
+        public long RollupsSinceMs => Interlocked.Read(ref rollupsSinceMs);
+
+        /// <summary>Permission keys the profile used (successfully or not) since <paramref name="sinceMs"/>, with when last.</summary>
+        public Dictionary<string, long> GetKeysUsedSince(string profileId, long sinceMs)
+        {
+            var map = new Dictionary<string, long>(StringComparer.Ordinal);
+            if (!ready) return map;
+            using var conn = Open();
+            using var cmd = Command(conn, $@"SELECT perm_key, MAX(last_ts_ms) FROM daily_rollup{(indexesReady ? " INDEXED BY ix_ru_profile_perm" : "")}
+                WHERE profile_id = $p AND perm_key <> '' AND last_ts_ms >= $f GROUP BY perm_key;", ("$p", profileId), ("$f", sinceMs));
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) map[r.GetString(0)] = r.GetInt64(1);
+            return map;
+        }
+
+        /// <summary>How many of each event kind each profile has had since <paramref name="sinceMs"/> (the events table is small).</summary>
+        public Dictionary<string, Dictionary<string, long>> GetEventCountsSince(long sinceMs, IReadOnlyCollection<string> kinds)
+        {
+            var map = new Dictionary<string, Dictionary<string, long>>(StringComparer.Ordinal);
+            if (!ready || kinds.Count == 0) return map;
+            using var conn = Open();
+            var names = kinds.Select((_, i) => "$k" + i).ToList();
+            var args = new List<(string, object?)> { ("$f", sinceMs) };
+            args.AddRange(kinds.Select((k, i) => ("$k" + i, (object?)k)));
+            using var cmd = Command(conn, $"SELECT profile_id, kind, COUNT(*) FROM events WHERE ts_ms >= $f AND kind IN ({string.Join(", ", names)}) GROUP BY profile_id, kind;", args.ToArray());
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                if (!map.TryGetValue(r.GetString(0), out var byKind)) map[r.GetString(0)] = byKind = new Dictionary<string, long>(StringComparer.Ordinal);
+                byKind[r.GetString(1)] = r.GetInt64(2);
+            }
+            return map;
+        }
+
+        /// <summary>The oldest request still kept: "last seen" means nothing before it.</summary>
+        public long? GetTrackingSinceMs()
+        {
+            if (!ready) return null;
+            using var conn = Open();
+            long ms = Scalar<long>(conn, "SELECT COALESCE(MIN(ts_ms), 0) FROM requests;");
+            return ms > 0 ? ms : null;
         }
 
         // ───────────────────────────── plumbing ─────────────────────────────
@@ -789,6 +1240,7 @@ namespace Omnipotent.Profiles.Activity
             try { queue.Writer.TryComplete(); } catch { }
             try { writer?.Wait(TimeSpan.FromSeconds(3)); } catch { }
             try { seeding?.Wait(TimeSpan.FromSeconds(3)); } catch { }
+            try { upgrading?.Wait(TimeSpan.FromSeconds(10)); } catch { }
         }
     }
 }

@@ -11,11 +11,16 @@ namespace Omnipotent.Services.Omniscience.Workspace
     {
         private readonly OmniscienceDb db;
         private readonly Func<ActivitySummaryStatus>? getActivityStatus;
-        public WorkspaceExplorer(Omniscience service) : this(service.Db, () => service.ActivitySummaries.GetStatus()) { }
-        public WorkspaceExplorer(OmniscienceDb db, Func<ActivitySummaryStatus>? getActivityStatus = null)
+        private readonly Func<Replica.ReplicaReadinessCounts> getReadiness;
+        public WorkspaceExplorer(Omniscience service) : this(service.Db, () => service.ActivitySummaries.GetStatus(), () => service.ReplicaReadiness) { }
+        public WorkspaceExplorer(OmniscienceDb db, Func<ActivitySummaryStatus>? getActivityStatus = null) : this(db, getActivityStatus, null) { }
+        internal WorkspaceExplorer(OmniscienceDb db, Func<ActivitySummaryStatus>? getActivityStatus,
+            Func<Replica.ReplicaReadinessCounts>? getReadiness)
         {
             this.db = db;
             this.getActivityStatus = getActivityStatus;
+            var own = new Lazy<Replica.ReplicaReadinessCounts>(() => Replica.ReplicaReadinessCounts.ForDatabase(db));
+            this.getReadiness = getReadiness ?? (() => own.Value);
         }
 
         public JObject Capabilities() => new()
@@ -33,9 +38,22 @@ namespace Omnipotent.Services.Omniscience.Workspace
         public JObject Directory(string? search, string? tier, string? platform, bool pinnedOnly,
             string? sort, int limit, int offset)
         {
+            using var conn = db.Open();
+            return Directory(conn, search, tier, platform, pinnedOnly, sort, limit, offset);
+        }
+
+        /// <summary>
+        /// One page of the people directory. The page's ids are chosen first, reading only what the
+        /// sort needs, and the identities, flags and completeness are then read for those ids alone.
+        /// Through 6285052 one statement computed every column for every person (45,969 live, two
+        /// identity subqueries each) before sorting and keeping 48: 0.4 s warm, 16–72 s for the first
+        /// load of each visit in the week to 13 Nov 2026, when those rows had to come off the disk.
+        /// </summary>
+        internal JObject Directory(SqliteConnection conn, string? search, string? tier, string? platform, bool pinnedOnly,
+            string? sort, int limit, int offset)
+        {
             limit = Math.Clamp(limit, 1, 200);
             offset = Math.Clamp(offset, 0, 10000);
-            using var conn = db.Open();
             var where = new List<string> { "p.merged_into_person_id IS NULL" };
             var parameters = new List<(string Name, object Value)>();
             if (!string.IsNullOrWhiteSpace(search))
@@ -52,22 +70,39 @@ namespace Omnipotent.Services.Omniscience.Workspace
             }
             if (pinnedOnly) where.Add("EXISTS(SELECT 1 FROM workspace_pins w WHERE w.person_id=p.person_id)");
             string whereSql = string.Join(" AND ", where);
+            // A filter that has to look at every person anyway gains nothing from an index walk.
+            bool narrowed = !string.IsNullOrWhiteSpace(search) || (!string.IsNullOrWhiteSpace(platform) && platform != "all") || pinnedOnly;
             long total;
             using (var count = conn.CreateCommand())
             {
-                count.CommandText = "SELECT COUNT(*) FROM persons p WHERE " + whereSql;
+                // Unfiltered or by tier, the total is read off idx_persons_live_tier, which only a query
+                // saying "tier >= ''" can use (always true: tier is NOT NULL text).
+                count.CommandText = narrowed
+                    ? "SELECT COUNT(*) FROM persons p WHERE " + whereSql
+                    : "SELECT COUNT(*) FROM persons p INDEXED BY idx_persons_live_tier WHERE p.tier >= '' AND " + whereSql;
                 Bind(count, parameters);
                 total = Convert.ToInt64(count.ExecuteScalar() ?? 0);
             }
-            string order = sort switch
+            bool byMessages = sort is not ("name" or "recent" or "completeness" or "pinned");
+            List<string> ids = byMessages && !narrowed
+                ? PageByMessages(conn, whereSql, parameters, limit, offset)
+                : PageBySort(conn, whereSql, parameters, sort, limit, offset);
+            var items = new JArray();
+            foreach (var person in ReadDirectoryRows(conn, ids)) items.Add(person);
+            return new JObject
             {
-                "name" => "p.display_name COLLATE NOCASE ASC",
-                "recent" => "COALESCE(c.last_message_at,0) DESC, p.display_name COLLATE NOCASE",
-                "completeness" => "COALESCE(json_extract(ps.payload_json,'$.completeness_score'),0) DESC, COALESCE(c.message_count,0) DESC",
-                "pinned" => "COALESCE(w.sort_order,999999), COALESCE(c.message_count,0) DESC",
-                _ => "COALESCE(c.message_count,0) DESC, COALESCE(c.last_message_at,0) DESC",
+                ["items"] = items, ["total"] = total, ["limit"] = limit, ["offset"] = offset,
+                ["has_more"] = offset + items.Count < total, ["activity_counts"] = ActivityPayload(),
             };
+        }
+
+        /// <summary>The directory's columns for <paramref name="ids"/>, in that order.</summary>
+        private static List<JObject> ReadDirectoryRows(SqliteConnection conn, List<string> ids)
+        {
+            if (ids.Count == 0) return new List<JObject>();
             using var cmd = conn.CreateCommand();
+            var idNames = new List<string>();
+            for (int i = 0; i < ids.Count; i++) { idNames.Add("$id" + i); cmd.Parameters.AddWithValue("$id" + i, ids[i]); }
             cmd.CommandText = $@"SELECT p.person_id,p.display_name,COALESCE(p.tier,'archive'),p.created_at,p.updated_at,
                 COALESCE(c.message_count,0),c.first_message_at,c.last_message_at,
                 (SELECT GROUP_CONCAT(platform||':'||COALESCE(platform_username,''),'|') FROM platform_identities WHERE person_id=p.person_id),
@@ -75,13 +110,9 @@ namespace Omnipotent.Services.Omniscience.Workspace
                 EXISTS(SELECT 1 FROM person_profile_targets t WHERE t.person_id=p.person_id AND t.enabled=1),
                 EXISTS(SELECT 1 FROM workspace_pins w WHERE w.person_id=p.person_id),ps.payload_json
                 FROM persons p LEFT JOIN person_message_counts c ON c.person_id=p.person_id
-                LEFT JOIN workspace_pins w ON w.person_id=p.person_id
                 LEFT JOIN person_statistics ps ON ps.person_id=p.person_id AND ps.module_name='deduction_summary'
-                WHERE {whereSql} ORDER BY {order} LIMIT $limit OFFSET $offset";
-            Bind(cmd, parameters);
-            cmd.Parameters.AddWithValue("$limit", limit);
-            cmd.Parameters.AddWithValue("$offset", offset);
-            var items = new JArray();
+                WHERE p.person_id IN ({string.Join(",", idNames)})";
+            var byId = new Dictionary<string, JObject>(StringComparer.Ordinal);
             using var r = cmd.ExecuteReader();
             while (r.Read())
             {
@@ -89,7 +120,7 @@ namespace Omnipotent.Services.Omniscience.Workspace
                 try { identities = JArray.Parse(r.IsDBNull(9) ? "[]" : r.GetString(9)); } catch { identities = new(); }
                 double? completeness = null;
                 if (!r.IsDBNull(12)) { try { completeness = JObject.Parse(r.GetString(12)).Value<double?>("completeness_score"); } catch { } }
-                items.Add(new JObject
+                byId[r.GetString(0)] = new JObject
                 {
                     ["person_id"] = r.GetString(0), ["display_name"] = r.GetString(1), ["tier"] = r.GetString(2),
                     ["created_at"] = r.GetInt64(3), ["updated_at"] = r.GetInt64(4), ["message_count"] = r.GetInt64(5),
@@ -98,13 +129,76 @@ namespace Omnipotent.Services.Omniscience.Workspace
                     ["handles"] = r.IsDBNull(8) ? "" : r.GetString(8), ["identities"] = identities,
                     ["profile_targeted"] = r.GetInt32(10) == 1, ["pinned"] = r.GetInt32(11) == 1,
                     ["completeness"] = completeness,
-                });
+                };
             }
-            return new JObject
+            var rows = new List<JObject>(ids.Count);
+            foreach (string id in ids) if (byId.TryGetValue(id, out var row)) rows.Add(row);
+            return rows;
+        }
+
+        /// <summary>
+        /// The default order (most messages, then most recent) read off <c>idx_person_counts_activity</c>,
+        /// stopping once the page is full. People with no message count, which that order puts last in
+        /// no particular order, follow by name.
+        /// </summary>
+        private static List<string> PageByMessages(SqliteConnection conn, string whereSql,
+            List<(string Name, object Value)> parameters, int limit, int offset)
+        {
+            var ids = ReadIds(conn, $@"SELECT c.person_id FROM person_message_counts c INDEXED BY idx_person_counts_activity
+                JOIN persons p ON p.person_id=c.person_id
+                WHERE {whereSql} ORDER BY c.message_count DESC, c.last_message_at DESC LIMIT $limit OFFSET $offset",
+                parameters, limit, offset);
+            if (ids.Count == limit) return ids;
+
+            // Past everyone with a count: where the uncounted people start in the full order.
+            long counted = ids.Count > 0 ? offset + ids.Count : Scalar(conn,
+                $"SELECT COUNT(*) FROM person_message_counts c JOIN persons p ON p.person_id=c.person_id WHERE {whereSql}", parameters);
+            ids.AddRange(ReadIds(conn, $@"SELECT p.person_id FROM persons p
+                WHERE {whereSql} AND NOT EXISTS(SELECT 1 FROM person_message_counts c WHERE c.person_id=p.person_id)
+                ORDER BY p.display_name COLLATE NOCASE, p.person_id LIMIT $limit OFFSET $offset",
+                parameters, limit - ids.Count, (int)Math.Max(0, offset + ids.Count - counted)));
+            return ids;
+        }
+
+        /// <summary>Any other order: ids only, so nothing but the sort keys is read for the people not shown.</summary>
+        private static List<string> PageBySort(SqliteConnection conn, string whereSql,
+            List<(string Name, object Value)> parameters, string? sort, int limit, int offset)
+        {
+            string order = sort switch
             {
-                ["items"] = items, ["total"] = total, ["limit"] = limit, ["offset"] = offset,
-                ["has_more"] = offset + items.Count < total, ["activity_counts"] = ActivityPayload(),
+                "name" => "p.display_name COLLATE NOCASE ASC",
+                "recent" => "COALESCE(c.last_message_at,0) DESC, p.display_name COLLATE NOCASE",
+                "completeness" => "COALESCE(json_extract(ps.payload_json,'$.completeness_score'),0) DESC, COALESCE(c.message_count,0) DESC",
+                "pinned" => "COALESCE(w.sort_order,999999), COALESCE(c.message_count,0) DESC",
+                _ => "COALESCE(c.message_count,0) DESC, COALESCE(c.last_message_at,0) DESC",
             };
+            string joins = "LEFT JOIN person_message_counts c ON c.person_id=p.person_id"
+                + (sort == "pinned" ? " LEFT JOIN workspace_pins w ON w.person_id=p.person_id" : "")
+                + (sort == "completeness" ? " LEFT JOIN person_statistics ps ON ps.person_id=p.person_id AND ps.module_name='deduction_summary'" : "");
+            return ReadIds(conn, $"SELECT p.person_id FROM persons p {joins} WHERE {whereSql} ORDER BY {order} LIMIT $limit OFFSET $offset",
+                parameters, limit, offset);
+        }
+
+        private static List<string> ReadIds(SqliteConnection conn, string sql, List<(string Name, object Value)> parameters, int limit, int offset)
+        {
+            var ids = new List<string>();
+            if (limit <= 0) return ids;
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            Bind(cmd, parameters);
+            cmd.Parameters.AddWithValue("$limit", limit);
+            cmd.Parameters.AddWithValue("$offset", offset);
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) ids.Add(r.GetString(0));
+            return ids;
+        }
+
+        private static long Scalar(SqliteConnection conn, string sql, List<(string Name, object Value)> parameters)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = sql;
+            Bind(cmd, parameters);
+            return Convert.ToInt64(cmd.ExecuteScalar() ?? 0L);
         }
 
         public JObject CommandSearch(string query, int limit)
@@ -456,10 +550,27 @@ namespace Omnipotent.Services.Omniscience.Workspace
                 try { using var cmd = conn.CreateCommand(); cmd.CommandText = sql; return Convert.ToInt64(cmd.ExecuteScalar() ?? 0); }
                 catch { return 0; }
             }
-            long messages = Scalar("SELECT COUNT(*) FROM messages");
+            // Through 6285052 this route counted every message and joined every embedding to its message
+            // and author on each call; it did not answer in 60 s (14 Nov 2026). The total now comes from the
+            // per-conversation counts once their backfill has run (messages are never deleted or moved), and
+            // the tracked embeddings from the per-person counts the Replica panel keeps, summed when all known.
+            bool summariesReady = Scalar($"SELECT COUNT(*) FROM omniscience_meta WHERE key='{ActivitySummaryStore.BackfillMetaKey}'") > 0;
+            long messages = Scalar(summariesReady
+                ? "SELECT COALESCE(SUM(message_count),0) FROM conversation_message_counts"
+                : "SELECT COUNT(*) FROM messages");
             long trackedMessages = Scalar("SELECT COALESCE(SUM(c.message_count),0) FROM person_message_counts c JOIN persons p ON p.person_id=c.person_id WHERE p.tier='tracked' AND p.merged_into_person_id IS NULL");
-            long trackedEmbedded = Scalar(@"SELECT COUNT(*) FROM message_embeddings e JOIN messages m ON m.message_id=e.message_id
-                JOIN platform_identities i ON i.identity_id=m.author_identity_id JOIN persons p ON p.person_id=i.person_id WHERE p.tier='tracked'");
+            var tracked = new List<string>();
+            Read(conn, "SELECT person_id FROM persons WHERE tier='tracked' AND merged_into_person_id IS NULL", _ => { }, r => tracked.Add(r.GetString(0)));
+            var readiness = getReadiness();
+            long embeddedSum = 0;
+            bool allCounted = true;
+            foreach (string personId in tracked)
+            {
+                var known = readiness.Peek(personId).Value;
+                if (known == null) allCounted = false;
+                else embeddedSum += known.Embedded;
+            }
+            long? trackedEmbedded = allCounted ? embeddedSum : null;
             long failedJobs = Scalar("SELECT COUNT(*) FROM replica_training_jobs WHERE status='failed' AND started_at >= " + DateTimeOffset.UtcNow.AddDays(-7).ToUnixTimeMilliseconds());
             var sources = new JArray();
             Read(conn, "SELECT source_id,platform,label,status,last_status_message,last_event_at,last_full_sync_at FROM harvest_sources ORDER BY platform,label", _ => { }, r =>
@@ -473,13 +584,17 @@ namespace Omnipotent.Services.Omniscience.Workspace
             var warnings = new JArray();
             if (!activity.Value<bool>("ready")) warnings.Add(activity.Value<bool>("running") ? "Activity summaries are warming" : "Activity summaries need a rebuild");
             if (sources.Count == 0) warnings.Add("No dedicated harvest sources configured; linked live feeds may still be active");
-            if (trackedMessages > 0 && trackedEmbedded < trackedMessages / 2) warnings.Add("Tracked-message embeddings are below 50%");
+            if (trackedMessages > 0 && trackedEmbedded is long embeddedNow && embeddedNow < trackedMessages / 2) warnings.Add("Tracked-message embeddings are below 50%");
             if (failedJobs > 0) warnings.Add($"{failedJobs} replica training jobs failed in the last 7 days");
             var metrics = new JObject
             {
                 ["persons"] = Scalar("SELECT COUNT(*) FROM persons WHERE merged_into_person_id IS NULL"),
                 ["messages"] = messages, ["tracked_messages"] = trackedMessages, ["tracked_embedded"] = trackedEmbedded,
-                ["tracked_embedding_coverage_pct"] = trackedMessages == 0 ? 0 : Math.Round(trackedEmbedded * 100.0 / trackedMessages, 1),
+                // null while any tracked person's first count is still running (the page shows "counting").
+                ["tracked_embedding_coverage_pct"] = trackedEmbedded is long embeddedTotal
+                    ? (double?)(trackedMessages == 0 ? 0 : Math.Round(embeddedTotal * 100.0 / trackedMessages, 1))
+                    : null,
+                ["tracked_embedding_counting"] = !allCounted,
                 ["stimulus_reply_pairs"] = Scalar("SELECT COUNT(*) FROM stimulus_reply_pairs"),
                 ["replica_eras"] = Scalar("SELECT COUNT(*) FROM replica_era_profiles"),
                 ["replicas_ready"] = Scalar("SELECT COUNT(*) FROM replicas WHERE status IN ('ready','stale')"),

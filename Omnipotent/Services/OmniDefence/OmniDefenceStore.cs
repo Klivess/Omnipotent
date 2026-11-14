@@ -1187,6 +1187,46 @@ namespace Omnipotent.Services.OmniDefence
             return list;
         });
 
+        /// <summary>What one read cost: waiting for a read slot, opening a connection, reading; the rows and the database pages read.</summary>
+        public sealed record ReadCost(long SlotWaitMs, long OpenMs, long ReadMs, long Rows, int PagesRead)
+        {
+            public override string ToString() =>
+                $"{Rows:N0} rows, {PagesRead:N0} pages read in {ReadMs:N0} ms; {SlotWaitMs:N0} ms waiting for a read slot, {OpenMs:N0} ms opening";
+        }
+
+        /// <summary>
+        /// Every IP record, with what the read cost. Start-up's "IP records" step took 53 s on
+        /// 11 Nov 2026 and 182 s on 13 Nov for about 6,000 small rows, which no amount of row work
+        /// explains; the split (slot, open, pages read) is what pins it on the next start.
+        /// </summary>
+        public async Task<(List<IpRecord> Records, ReadCost Cost)> LoadAllIpRecordsMeasuredAsync()
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            await readGate.WaitAsync();
+            long waited = clock.ElapsedMilliseconds;
+            try
+            {
+                using var conn = new SqliteConnection(readConnectionString);
+                await conn.OpenAsync();
+                long opened = clock.ElapsedMilliseconds;
+                // Page-cache misses on this connection = pages that had to come from the file.
+                SQLitePCL.raw.sqlite3_db_status(conn.Handle, SQLitePCL.raw.SQLITE_DBSTATUS_CACHE_MISS, out _, out _, 1);
+                var list = new List<IpRecord>();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT * FROM ip_records";
+                    using var rdr = await cmd.ExecuteReaderAsync();
+                    while (await rdr.ReadAsync()) list.Add(ReadIpRecord(rdr));
+                }
+                SQLitePCL.raw.sqlite3_db_status(conn.Handle, SQLitePCL.raw.SQLITE_DBSTATUS_CACHE_MISS, out int pages, out _, 0);
+                return (list, new ReadCost(waited, opened - waited, clock.ElapsedMilliseconds - opened, list.Count, pages));
+            }
+            finally
+            {
+                readGate.Release();
+            }
+        }
+
         public Task<List<IpRecord>> LoadAllIpRecordsAsync() => WithReadAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();

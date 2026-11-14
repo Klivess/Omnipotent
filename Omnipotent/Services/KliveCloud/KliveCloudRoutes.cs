@@ -445,8 +445,20 @@ namespace Omnipotent.Services.KliveCloud
             var preview = await parent.GetPreviewAsync(item, maxWidth, maxHeight);
             if (preview.Data == null)
             {
-                await req.ReturnResponse("PreviewGenerationFailed", code: HttpStatusCode.InternalServerError);
-                return;
+                // Only a thumbnail that could not be made is the server's fault. A file that was moved or
+                // deleted under the page, or one with no picture to show, is not: those were 500s before.
+                switch (preview.Source)
+                {
+                    case KliveCloud.PreviewSource.Missing:
+                        await Error(req, "SourceMissing", HttpStatusCode.NotFound, "The file is no longer on disk (moved or deleted).");
+                        return;
+                    case KliveCloud.PreviewSource.Unsupported:
+                        await Error(req, "NoPreview", HttpStatusCode.UnsupportedMediaType, "Only images and videos have thumbnails.");
+                        return;
+                    default:
+                        await req.ReturnResponse("PreviewGenerationFailed", code: HttpStatusCode.InternalServerError);
+                        return;
+                }
             }
             var headers = new NameValueCollection { { "X-KliveCloud-Preview", preview.Source.ToString().ToLowerInvariant() } };
             await req.ReturnValidatedBinaryResponse(etag, () => Task.FromResult(preview.Data), "image/jpeg", PreviewCacheControl, headers);

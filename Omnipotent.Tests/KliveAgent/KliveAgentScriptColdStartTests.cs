@@ -58,6 +58,44 @@ namespace Omnipotent.Tests.KliveAgent
         }
 
         [Fact]
+        public async Task AScriptArrivingWhileTheEngineStarts_WaitsOutsideItsCompileBudget()
+        {
+            // 13 Nov 2026: the first scripts after a restart built the shared host inside their 120 s compile
+            // budget, under start-up load, and timed out. Here the host "takes" 4 s against a 3 s budget.
+            Assert.True((await NewSession().ExecuteAsync("var ready = 1;", TimeSpan.FromMinutes(2))).Success); // the real host, built
+            var engine = new KliveAgentScriptEngine(null!)
+            {
+                HostReadyOverride = () => false,
+                WaitForHostOverride = ct => Task.Delay(4000, ct),
+            };
+            var session = engine.CreateSession(new ScriptGlobals(null!), new ScriptSessionOptions { CompileBudget = TimeSpan.FromSeconds(3) });
+
+            var result = await session.ExecuteAsync(Typical, TimeSpan.FromMinutes(1));
+
+            Assert.True(result.Success, result.ErrorMessage);
+            Assert.True(result.HostWaitMs >= 3900, $"host wait {result.HostWaitMs} ms");
+            Assert.True(result.CompileMs < result.HostWaitMs, $"compile {result.CompileMs} ms must not include the {result.HostWaitMs} ms wait");
+        }
+
+        [Fact]
+        public async Task OnceTheEngineIsUp_NoHostWaitIsRecorded()
+        {
+            var session = NewSession();
+            var first = await session.ExecuteAsync(Typical, TimeSpan.FromMinutes(2));
+            Assert.True(first.Success, first.ErrorMessage);
+            var second = await NewSession().ExecuteAsync(Typical + " // again", TimeSpan.FromMinutes(2));
+            Assert.Null(second.HostWaitMs);
+        }
+
+        [Fact]
+        public void TheWarmupIsNotHeldToAScriptsCompileBudget()
+        {
+            // Its compile timed out at 120 s on 13 Nov and it logged "failed" for a server that was only busy.
+            Assert.True(KliveAgentScriptEngine.WarmupOptions.CompileBudget >= TimeSpan.FromMinutes(10));
+            Assert.True(KliveAgentScriptEngine.WarmupOptions.CompileBudget > ScriptSessionOptions.Default.CompileBudget);
+        }
+
+        [Fact]
         public async Task CompileHasItsOwnBudget_SoASlowCompileIsNotARunTimeout()
         {
             // A run budget far smaller than any compile: the old engine counted the compile against it and

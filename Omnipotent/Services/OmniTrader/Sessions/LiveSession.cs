@@ -80,14 +80,31 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             Risk = new RiskGate(config.Caps ?? new RiskCaps());
             ledger = new LiveLedger(startingQuote ?? config.InitialQuoteBalance, startingBase ?? config.InitialBaseBalance);
 
+            // Equity = cash + base at the last mark (the host used to report cash alone; see PaperSession).
             var host = new StrategyHost(deploymentId, config.Mode, config.Symbol, config.Interval,
                 SubmitOrderAsync, CancelByIntentAsync,
                 () => ledger.Position, () => ledger.QuoteBalance, () => ledger.BaseBalance,
                 m => log($"[{deploymentId}] {m}"), (m, e) => err($"[{deploymentId}] {m}", e),
-                config.Margin.ClampedLeverage);
+                config.Margin.ClampedLeverage,
+                equityFunc: GetEquity);
             context = new StrategyContext { Host = host };
             strategy.Attach(context);
         }
+
+        private readonly DateTime startedUtc = DateTime.UtcNow;
+        private DateTime? lastBarSeenUtc;
+        private int barsThisRun;
+
+        public SessionPulse Pulse() => new()
+        {
+            Kind = "single",
+            StartedUtc = startedUtc,
+            LastBarUtc = lastCandleTs,
+            LastBarSeenUtc = lastBarSeenUtc,
+            BarsThisRun = barsThisRun,
+            BarsTotal = barsThisRun,
+            SymbolsTracked = 1,
+        };
 
         public void Arm() { IsArmed = true; Risk.Reset(); }
         public void Disarm() => IsArmed = false;
@@ -239,6 +256,8 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                     if (lastCandleTs.HasValue && candle.Timestamp <= lastCandleTs.Value) continue;
                     lastCandleTs = candle.Timestamp;
                     lastMarkPrice = candle.Close;
+                    lastBarSeenUtc = DateTime.UtcNow;
+                    barsThisRun++;
                     context.CandleHistory.Add(candle);
                     if (context.CandleHistory.Count > 5000) context.CandleHistory.RemoveAt(0);
 

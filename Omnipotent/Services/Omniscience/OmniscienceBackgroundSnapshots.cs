@@ -23,6 +23,7 @@ internal sealed class OmniscienceBackgroundSnapshots : IDisposable
         public readonly SemaphoreSlim Wake = new(0, 1);
         public Snapshot? Current;
         public DateTimeOffset LastAttemptUtc;
+        public DateTimeOffset LastOverAgeReportUtc;
     }
 
     private readonly ConcurrentDictionary<string, Slot> slots = new(StringComparer.Ordinal);
@@ -92,6 +93,7 @@ internal sealed class OmniscienceBackgroundSnapshots : IDisposable
             slot.LastAttemptUtc = observedFromUtc;
             string payload = await Task.Run(slot.Build, ct);
             JToken.Parse(payload); // never publish a malformed response
+            ReportIfBornExpired(key, slot, utcNow() - observedFromUtc);
             var snapshot = new Snapshot(observedFromUtc, payload);
             Volatile.Write(ref slot.Current, snapshot);
             try { await SaveAsync(slot.Path, snapshot, ct); }
@@ -99,6 +101,23 @@ internal sealed class OmniscienceBackgroundSnapshots : IDisposable
             catch (Exception ex) { onError?.Invoke(key, ex); }
         }
         finally { slot.BuildGate.Release(); }
+    }
+
+    /// <summary>
+    /// A snapshot is dated from when its build started, so a build slower than the slot's max age
+    /// publishes something <see cref="TryGet"/> already refuses: no exception, and every read is busy.
+    /// That is how the briefing preview answered 503 for a week without one logged error (13 Nov 2026).
+    /// Reported at most once an hour per slot.
+    /// </summary>
+    private void ReportIfBornExpired(string key, Slot slot, TimeSpan took)
+    {
+        if (took <= slot.MaxAge) return;
+        DateTimeOffset now = utcNow();
+        if (now - slot.LastOverAgeReportUtc < TimeSpan.FromHours(1)) return;
+        slot.LastOverAgeReportUtc = now;
+        onError?.Invoke(key, new TimeoutException(
+            $"Snapshot {key} took {took.TotalMinutes:0.0} min to build, longer than its {slot.MaxAge.TotalMinutes:0.#} min max age, " +
+            "so it was out of date before it was published and readers are being told the route is busy."));
     }
 
     private async Task RefreshLoopAsync(string key, Slot slot, CancellationToken ct)

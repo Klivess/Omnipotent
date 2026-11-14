@@ -6,6 +6,7 @@ using Newtonsoft.Json.Linq;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using System.Net.Sockets;
@@ -19,6 +20,9 @@ namespace Omnipotent.Services.KliveTechHub
         private const int MaximumConnectionAttempts = 5;
         private const int MaximumActionDiscoveryAttempts = 10;
         private static readonly TimeSpan DiscoveryInterval = TimeSpan.FromSeconds(5);
+        /// <summary>Between scans when nothing is missing: every remembered Bluetooth gadget is connected
+        /// and nobody may enrol, so a scan can only find a device to list as nearby.</summary>
+        private static readonly TimeSpan IdleDiscoveryInterval = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan DiscoveryTimeout = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan ConnectionAttemptTimeout = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan ResponseTimeout = TimeSpan.FromSeconds(10);
@@ -243,6 +247,7 @@ namespace Omnipotent.Services.KliveTechHub
             connectionsInProgress.Clear();
             pendingRequests.Clear();
             ResetStreamableRuntime();
+            ResetHubStatus(bluetoothAvailable);
             sendQueue = Channel.CreateUnbounded<OutboundCommand>(new UnboundedChannelOptions
             {
                 SingleReader = true,
@@ -380,6 +385,7 @@ namespace Omnipotent.Services.KliveTechHub
         {
             while (!serviceToken.IsCancellationRequested)
             {
+                Stopwatch scanTimer = Stopwatch.StartNew();
                 try
                 {
                     BluetoothClient activeDiscoveryClient = discoveryClient
@@ -389,6 +395,11 @@ namespace Omnipotent.Services.KliveTechHub
                             () => activeDiscoveryClient.DiscoverDevices(),
                             CancellationToken.None)
                         .WaitAsync(DiscoveryTimeout, serviceToken);
+                    RecordDiscoveryScan(
+                        scanTimer.ElapsedMilliseconds,
+                        devices.Length,
+                        devices.Count(candidate => (candidate.DeviceName ?? string.Empty)
+                            .StartsWith("klivetech", StringComparison.OrdinalIgnoreCase)));
 
                     foreach (BluetoothDeviceInfo device in devices)
                     {
@@ -405,8 +416,11 @@ namespace Omnipotent.Services.KliveTechHub
                             bool isRemembered = rememberedDevices.TryGetValue(
                                 address,
                                 out RememberedGadget? remembered);
-                            if (!isRemembered && !allowNewDevices)
+                            if (!isRemembered && !MayEnrol(address))
                             {
+                                // Enrolment is off. This used to be a bare `continue`: a new gadget
+                                // sat beside the server and nothing anywhere said so.
+                                RecordNearbyDevice(address, deviceName);
                                 continue;
                             }
 
@@ -441,6 +455,7 @@ namespace Omnipotent.Services.KliveTechHub
                 }
                 catch (Exception ex)
                 {
+                    RecordDiscoveryFailure(ex, scanTimer.ElapsedMilliseconds);
                     await ServiceLogError(ex, "KliveTech Bluetooth discovery failed; retrying.");
                     try { discoveryClient?.Close(); } catch { }
                     discoveryClient = new BluetoothClient();
@@ -448,7 +463,7 @@ namespace Omnipotent.Services.KliveTechHub
 
                 try
                 {
-                    await Task.Delay(DiscoveryInterval, serviceToken);
+                    await Task.Delay(CurrentDiscoveryInterval(), serviceToken);
                 }
                 catch (OperationCanceledException)
                 {
@@ -461,7 +476,7 @@ namespace Omnipotent.Services.KliveTechHub
         {
             ArgumentNullException.ThrowIfNull(device);
             string address = NormalizeAddress(device.DeviceAddress.ToString());
-            if (!allowNewDevices && !rememberedDevices.ContainsKey(address))
+            if (!MayEnrol(address) && !rememberedDevices.ContainsKey(address))
             {
                 return Task.CompletedTask;
             }
@@ -585,6 +600,13 @@ namespace Omnipotent.Services.KliveTechHub
                             }
                         }, connectionToken);
 
+                        RecordConnectionAttempt(
+                            address,
+                            gadget.name,
+                            error: null,
+                            attempt,
+                            MaximumConnectionAttempts,
+                            gadget);
                         await ServiceLog($"Connected to KliveTech gadget: {gadget.name}.");
                         _ = NotifyGadgetConnected(gadget.name);
                         return true;
@@ -595,6 +617,12 @@ namespace Omnipotent.Services.KliveTechHub
                     }
                     catch (Exception ex)
                     {
+                        RecordConnectionAttempt(
+                            address,
+                            remembered?.name ?? device.DeviceName ?? FormatAddress(address),
+                            ex,
+                            attempt,
+                            MaximumConnectionAttempts);
                         await ServiceLogError(
                             ex,
                             $"Could not connect to KliveTech device at '{device.DeviceAddress}' " +
@@ -1182,7 +1210,9 @@ namespace Omnipotent.Services.KliveTechHub
 
         private void MarkGadgetOffline(KliveTechGadget gadget, Exception reason)
         {
+            bool wasOnline = gadget.isOnline;
             gadget.DisconnectDevice();
+            RecordGadgetOffline(gadget, reason, wasOnline);
             foreach ((int id, PendingRequest pending) in pendingRequests.ToArray())
             {
                 if (ReferenceEquals(pending.Gadget, gadget) &&

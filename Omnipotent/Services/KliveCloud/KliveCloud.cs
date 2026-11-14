@@ -1522,7 +1522,13 @@ namespace Omnipotent.Services.KliveCloud
         private readonly ThumbnailMemory thumbnailMemory = new(24L * 1024 * 1024);
 
         /// <summary>Where a preview came from: the response says so (X-KliveCloud-Preview) and so does the trace.</summary>
-        public enum PreviewSource { None, Memory, Disk, Made }
+        /// <summary>
+        /// Where a thumbnail came from, or why there isn't one. None = making it failed. Missing = the file
+        /// is not on disk (it was moved or deleted, often while the page still listed it: on 13 Nov 2026 a
+        /// delete and two moves left 6 thumbnail requests in one second answered 500). Unsupported = not an
+        /// image or a video.
+        /// </summary>
+        public enum PreviewSource { None, Memory, Disk, Made, Missing, Unsupported }
 
         public readonly record struct PreviewResult(byte[]? Data, PreviewSource Source);
 
@@ -1540,7 +1546,9 @@ namespace Omnipotent.Services.KliveCloud
             }
 
             string sourcePath = GetFullItemPath(item);
-            if (!File.Exists(sourcePath)) return new PreviewResult(null, PreviewSource.None);
+            if (!File.Exists(sourcePath)) return new PreviewResult(null, PreviewSource.Missing);
+            // Nothing to make: answer before taking one of the two generation slots.
+            if (!IsImage(item) && !IsVideo(item)) return new PreviewResult(null, PreviewSource.Unsupported);
 
             string cachePath = GetThumbnailCachePath(item.ItemID, maxWidth, maxHeight);
             bool IsCached() => File.Exists(cachePath) && File.GetLastWriteTimeUtc(cachePath) >= File.GetLastWriteTimeUtc(sourcePath);
@@ -1568,7 +1576,9 @@ namespace Omnipotent.Services.KliveCloud
                         : null;
                 }
                 if (made != null) thumbnailMemory.Put(memoryKey, item.FileSizeBytes, made);
-                return new PreviewResult(made, made == null ? PreviewSource.None : PreviewSource.Made);
+                // A file moved or deleted while it was queued or being made is missing, not a failure.
+                if (made == null) return new PreviewResult(null, File.Exists(sourcePath) ? PreviewSource.None : PreviewSource.Missing);
+                return new PreviewResult(made, PreviewSource.Made);
             }
             finally
             {
@@ -1664,7 +1674,8 @@ namespace Omnipotent.Services.KliveCloud
             }
             catch (Exception ex)
             {
-                ServiceLogError(ex, $"Failed to generate image thumbnail for {sourcePath}");
+                // Gone while ffmpeg worked on it (moved or deleted): the caller says so, nothing failed.
+                if (File.Exists(sourcePath)) ServiceLogError(ex, $"Failed to generate image thumbnail for {sourcePath}");
             }
             return null;
         }
@@ -1694,7 +1705,7 @@ namespace Omnipotent.Services.KliveCloud
             }
             catch (Exception ex)
             {
-                ServiceLogError(ex, $"Failed to generate video thumbnail for {sourcePath}");
+                if (File.Exists(sourcePath)) ServiceLogError(ex, $"Failed to generate video thumbnail for {sourcePath}");
             }
             return null;
         }

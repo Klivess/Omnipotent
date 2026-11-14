@@ -180,8 +180,12 @@ namespace Omnipotent.Services.OmniTrader.Backtesting
             if (declaration.IsUniverse && config.Momentum != null)
                 return await new MomentumBacktestRunner(universeRepo, log).RunAsync(config, onProgress, cancellationCheck, ct);
 
-            var data = await PrepareAsync(config, strategy, ct);
-            return await RunPreparedAsync(config, data, strategy, onProgress, cancellationCheck, ct);
+            // Spans for request-driven runs (the Studio's quick test hit its 90 s cap at p95): fetching the
+            // bars versus running the strategy. Background jobs have no request trace, so these cost nothing there.
+            PreparedData data;
+            using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("bt-data")) data = await PrepareAsync(config, strategy, ct);
+            using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("bt-run"))
+                return await RunPreparedAsync(config, data, strategy, onProgress, cancellationCheck, ct);
         }
 
         /// <summary>Fetch the bars a config needs. Universe strategies resolve their universe here.</summary>

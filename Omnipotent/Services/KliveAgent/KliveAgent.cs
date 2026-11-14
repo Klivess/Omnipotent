@@ -39,6 +39,8 @@ namespace Omnipotent.Services.KliveAgent
         /// <summary>Keeps literal secrets out of what a run stores and serves. See KliveAgentSecretGuard.</summary>
         public KliveAgentSecretGuard SecretGuard =>
             LazyInitializer.EnsureInitialized(ref secretGuard, () => KliveAgentSecretGuard.ForService(this));
+        /// <summary>Leaves out of a pending-run poll what the caller already holds. See KliveAgentRunTrimmer.</summary>
+        internal KliveAgentRunTrimmer RunTrimmer { get; } = new();
 
         /// <summary>Talk mode: which conversations have a live spoken session attached, and the warm
         /// model session behind each.</summary>

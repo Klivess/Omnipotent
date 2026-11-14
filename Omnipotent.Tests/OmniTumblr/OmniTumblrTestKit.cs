@@ -199,8 +199,11 @@ namespace Omnipotent.Tests.OmniTumblr
         public List<ReelInfo> Reels { get; } = new();
         public Dictionary<string, IReadOnlyList<string>> Niches { get; } = new(StringComparer.OrdinalIgnoreCase);
         public bool IsReady { get; set; } = true;
+        /// <summary>Post id → a preview MemeScraper already made for that reel.</summary>
+        public Dictionary<string, string> Thumbnails { get; } = new(StringComparer.Ordinal);
         public IReadOnlyList<ReelInfo> GetReels() => Reels;
         public IReadOnlyDictionary<string, IReadOnlyList<string>> GetSourceNiches() => Niches;
+        public string? ExistingThumbnail(string postId) => Thumbnails.TryGetValue(postId, out var path) ? path : null;
     }
 
     /// <summary>

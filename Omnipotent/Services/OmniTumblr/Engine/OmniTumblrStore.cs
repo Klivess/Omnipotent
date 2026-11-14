@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Omnipotent.Services.OmniTumblr.Models;
+using System.Diagnostics;
 
 namespace Omnipotent.Services.OmniTumblr.Engine
 {
@@ -145,22 +146,53 @@ namespace Omnipotent.Services.OmniTumblr.Engine
 
         public T Read<T>(Func<OmniTumblrState, T> reader)
         {
-            lock (gate) return reader(State);
+            long asked = Stopwatch.GetTimestamp();
+            lock (gate)
+            {
+                NoteGateWait(asked);
+                return reader(State);
+            }
         }
 
         public T Mutate<T>(Func<OmniTumblrState, T> mutator)
         {
             T result;
-            lock (gate) result = mutator(State);
+            long asked = Stopwatch.GetTimestamp();
+            lock (gate)
+            {
+                NoteGateWait(asked);
+                result = mutator(State);
+            }
             SignalFlush();
             return result;
         }
 
         public void Mutate(Action<OmniTumblrState> mutator)
         {
-            lock (gate) mutator(State);
+            long asked = Stopwatch.GetTimestamp();
+            lock (gate)
+            {
+                NoteGateWait(asked);
+                mutator(State);
+            }
             SignalFlush();
         }
+
+        /// <summary>
+        /// Every route reads through the one lock, so a long hold anywhere shows up as a wait everywhere (the
+        /// overview's 19 s and dashboard-stats' 10 s maxima in Nov 2026 had no work of their own to explain
+        /// them). Waits past 2 ms go on the request's trace as "tumblr-lock" and into <see cref="Stats"/>.
+        /// </summary>
+        private void NoteGateWait(long askedTimestamp)
+        {
+            long waited = Stopwatch.GetTimestamp() - askedTimestamp;
+            if (waited < Stopwatch.Frequency / 500) return;
+            Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.Current?.AddSpan("tumblr-lock", askedTimestamp, waited);
+            stats.NoteWait(waited * 1000.0 / Stopwatch.Frequency);
+        }
+
+        /// <summary>Lock waits and background saves: what the Settings view shows as the store's health.</summary>
+        public OmniTumblrStoreStats Stats => stats.Snapshot();
 
         /// <summary>A detached deep copy, safe to use outside the lock.</summary>
         public static T Clone<T>(T value) =>
@@ -284,7 +316,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                         await flushSignal.WaitAsync(token);
                         await Task.Delay(250, token); // coalesce bursts of mutations into one write
                         while (flushSignal.CurrentCount > 0) flushSignal.Wait(0);
-                        await FlushAsync();
+                        await FlushAsync(background: true);
                     }
                     catch (OperationCanceledException) { break; }
                     catch (Exception ex)
@@ -303,29 +335,71 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             await FlushAsync();
         }
 
-        /// <summary>Writes every dirty document now.</summary>
-        public async Task FlushAsync()
+        /// <summary>
+        /// How often a background save may rewrite fingerprints.json. Every newly fingerprinted clip used to
+        /// rewrite the whole file (up to <see cref="OmniTumblrFingerprints.MaxStored"/> × ~10 KB of base64) a
+        /// quarter of a second later; it is a cache, so a crash costs at most this long of recomputation.
+        /// </summary>
+        internal TimeSpan FingerprintSaveInterval { get; set; } = TimeSpan.FromSeconds(60);
+
+        private readonly OmniTumblrStoreStatsRecorder stats = new();
+        private DateTime lastFingerprintSaveUtc = DateTime.MinValue;
+        private int deferredFlushScheduled;
+
+        /// <summary>Writes every dirty document now (fingerprints included).</summary>
+        public Task FlushAsync() => FlushAsync(background: false);
+
+        private async Task FlushAsync(bool background)
         {
             await writeLock.WaitAsync();
             try
             {
+                var total = Stopwatch.StartNew();
                 List<(string Path, string Json)> writes = new();
                 List<OmniTumblrEvent> events;
+                Dictionary<string, MediaFingerprint>? fingerprints = null;
+                bool deferFingerprints = false;
+                double gateMs;
                 lock (gate)
                 {
+                    var held = Stopwatch.StartNew();
                     foreach (string key in dirty)
                     {
+                        if (key == "fingerprints") continue;
                         var write = Serialize(key);
                         if (write != null) writes.Add(write.Value);
                     }
+                    if (dirty.Contains("fingerprints"))
+                    {
+                        deferFingerprints = background && DateTime.UtcNow - lastFingerprintSaveUtc < FingerprintSaveInterval;
+                        // A copy of the references only: a stored fingerprint is never changed after it is added,
+                        // so the large serialisation below can run without the lock every route reads through.
+                        if (!deferFingerprints) fingerprints = new Dictionary<string, MediaFingerprint>(State.Fingerprints, StringComparer.Ordinal);
+                    }
                     dirty.Clear();
+                    if (deferFingerprints) dirty.Add("fingerprints");
                     events = pendingEventAppends.ToList();
                     pendingEventAppends.Clear();
+                    gateMs = held.Elapsed.TotalMilliseconds;
                 }
 
+                double fingerprintMs = 0;
+                if (fingerprints != null)
+                {
+                    var serialising = Stopwatch.StartNew();
+                    writes.Add((FingerprintsPath, JsonConvert.SerializeObject(fingerprints, Formatting.None, JsonSettings)));
+                    fingerprintMs = serialising.Elapsed.TotalMilliseconds;
+                    lastFingerprintSaveUtc = DateTime.UtcNow;
+                }
+
+                long bytes = 0;
                 foreach (var (path, json) in writes)
                 {
-                    try { WriteAtomic(path, json); }
+                    try
+                    {
+                        WriteAtomic(path, json);
+                        bytes += json.Length;
+                    }
                     catch (Exception ex)
                     {
                         log($"OmniTumblr: failed to save {path}: {ex.Message}");
@@ -334,11 +408,31 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 }
 
                 if (events.Count > 0) AppendEvents(events);
+                if (deferFingerprints) ScheduleDeferredFlush();
+                if (writes.Count > 0 || events.Count > 0)
+                    stats.NoteFlush(total.Elapsed.TotalMilliseconds, gateMs, bytes, writes.Count,
+                        fingerprints?.Count, fingerprints != null ? writes[^1].Json.Length : null, fingerprintMs);
             }
             finally
             {
                 writeLock.Release();
             }
+        }
+
+        /// <summary>Makes sure fingerprints held back by <see cref="FingerprintSaveInterval"/> are written once it passes.</summary>
+        private void ScheduleDeferredFlush()
+        {
+            if (Interlocked.Exchange(ref deferredFlushScheduled, 1) == 1) return;
+            TimeSpan wait = lastFingerprintSaveUtc + FingerprintSaveInterval - DateTime.UtcNow;
+            _ = Task.Run(async () =>
+            {
+                try { await Task.Delay(wait > TimeSpan.Zero ? wait : TimeSpan.Zero); }
+                finally
+                {
+                    Interlocked.Exchange(ref deferredFlushScheduled, 0);
+                    SignalFlush();
+                }
+            });
         }
 
         private (string Path, string Json)? Serialize(string key)

@@ -187,6 +187,49 @@ namespace Omnipotent.Profiles.Sessions
             return targets.Count;
         }
 
+        /// <summary>
+        /// Revokes a profile's live browser sessions that have not been used since
+        /// <paramref name="idleSinceUtc"/> (a sliding 30-day lifetime keeps an abandoned device
+        /// signed in for weeks), optionally keeping one (the caller's own).
+        /// </summary>
+        public int RevokeIdle(string profileId, DateTime idleSinceUtc, string? revokedById, string reason, string? exceptSessionId = null)
+        {
+            DateTime now = DateTime.UtcNow;
+            var targets = byId.Values
+                .Where(s => s.ProfileId == profileId && s.Kind == SessionKind.Browser && s.IsActive(now)
+                    && s.LastSeenUtc < idleSinceUtc && s.SessionId != exceptSessionId)
+                .ToList();
+            foreach (var s in targets)
+            {
+                s.RevokedUtc = now;
+                s.RevokedById = revokedById;
+                s.RevokeReason = reason;
+            }
+            if (targets.Count > 0) SaveNow();
+            foreach (var s in targets)
+            {
+                try { Revoked?.Invoke(s); } catch { }
+            }
+            return targets.Count;
+        }
+
+        /// <summary>Live browser sessions of a profile, and how many of them have been unused since <paramref name="idleSinceUtc"/>.</summary>
+        public (int Active, int Idle, DateTime? OldestIdleSeenUtc) IdleSummary(string profileId, DateTime idleSinceUtc)
+        {
+            DateTime now = DateTime.UtcNow;
+            int active = 0, idle = 0;
+            DateTime? oldest = null;
+            foreach (var s in byId.Values)
+            {
+                if (s.ProfileId != profileId || s.Kind != SessionKind.Browser || !s.IsActive(now)) continue;
+                active++;
+                if (s.LastSeenUtc >= idleSinceUtc) continue;
+                idle++;
+                if (oldest == null || s.LastSeenUtc < oldest) oldest = s.LastSeenUtc;
+            }
+            return (active, idle, oldest);
+        }
+
         /// <summary>Writes pending "last seen" updates. Called periodically by the profile manager.</summary>
         public void FlushIfDirty()
         {

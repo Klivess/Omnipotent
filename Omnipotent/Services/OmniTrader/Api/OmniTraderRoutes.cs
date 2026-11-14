@@ -62,6 +62,16 @@ namespace Omnipotent.Services.OmniTrader.Api
                 if (row == null) { await req.ReturnResponse("Not found", code: HttpStatusCode.NotFound); return; }
                 var orders = await parent.OrderRepo.ListByDeploymentAsync(id, 100);
                 var fills = await parent.FillRepo.ListByDeploymentAsync(id, 200);
+                var summaries = await parent.OrderRepo.SummariesAsync();
+                summaries.TryGetValue(id, out var summary);
+                var pulse = parent.SessionManager.PulseOf(id);
+                bool armed = parent.SessionManager.IsDeploymentArmed(id);
+                Sessions.PaperBook? book = null;
+                if (row.Mode == SessionMode.Paper && parent.SessionManager.Books is { } books)
+                {
+                    try { book = await books.GetAsync(id); } catch { }
+                }
+                var descriptor = parent.StrategyRegistry.Resolve(row.StrategyClass);
                 await req.ReturnResponse(JsonConvert.SerializeObject(new
                 {
                     Deployment = new
@@ -78,6 +88,20 @@ namespace Omnipotent.Services.OmniTrader.Api
                         row.PausedUtc,
                         row.Error
                     },
+                    StrategyName = row.Config.Origin?.StrategyName ?? descriptor?.Name ?? row.StrategyClass,
+                    Interval = row.Config.Interval.ToString(),
+                    Execution = (row.Config.Execution ?? ExecutionTiming.SignalClose).ToString(),
+                    Armed = armed,
+                    Health = Sessions.DeploymentHealth.Assess(row, pulse, summary, armed, DateTime.UtcNow),
+                    Pulse = pulse,
+                    Book = book == null ? null : new
+                    {
+                        book.Quote,
+                        book.UpdatedUtc,
+                        book.Fees,
+                        Holdings = book.Holdings().ToList(),
+                    },
+                    Trades = DeploymentTrades(orders, fills),
                     Orders = orders,
                     Fills = fills
                 }));
@@ -89,7 +113,10 @@ namespace Omnipotent.Services.OmniTrader.Api
                 if (string.IsNullOrWhiteSpace(id)) { await req.ReturnResponse("Missing id", code: HttpStatusCode.BadRequest); return; }
                 DateTime? from = ParseUtc(req.userParameters.Get("from"));
                 DateTime? to = ParseUtc(req.userParameters.Get("to"));
-                var series = await parent.EquityRepo.GetSeriesAsync(id, from, to);
+                // Thinned to 1,500 points unless asked otherwise (points=0 for every row): a 15-minute
+                // deployment running for months returned every bar and timed out at 60 s.
+                int points = int.TryParse(req.userParameters.Get("points"), out var p) ? p : 1500;
+                var series = await parent.EquityRepo.GetSeriesAsync(id, from, to, maxPoints: points > 0 ? Math.Clamp(points, 50, 20_000) : null);
                 await req.ReturnResponse(JsonConvert.SerializeObject(series));
             }, HttpMethod.Get, OmniTraderPerms.DeploymentsRead);
 
@@ -215,6 +242,10 @@ namespace Omnipotent.Services.OmniTrader.Api
                     var dto = JsonConvert.DeserializeObject<CreateDeploymentDto>(req.userMessageContent ?? "")
                         ?? throw new Exception("Invalid body");
                     var config = dto.ToDeploymentConfig();
+                    // Live strategy deployments only ever reach Kraken spot; an equity or FX symbol would be
+                    // created, armed and then refused order by order.
+                    if (config.Mode == SessionMode.Live && MarketData.MarketDataRouter.UsesEquityFeed(config.Symbol, Venues.AssetClass.Unknown))
+                        throw new InvalidOperationException($"Live deployments trade on Kraken spot only; {config.Symbol} is not a Kraken pair. Trade it by ticket from Execution.");
                     string id = await parent.SessionManager.CreateDeploymentAsync(config);
                     NotifyDeploymentMutation();
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { Id = id, Mode = config.Mode.ToString() }));
@@ -365,6 +396,36 @@ namespace Omnipotent.Services.OmniTrader.Api
             }, HttpMethod.Post, OmniTraderPerms.SignalsSubmit);
         }
 
+        /// <summary>
+        /// Orders with what filled: quantity, average price and fees. The old drawer read Quantity, Price and
+        /// Timestamp, which an order row does not have, so every line was blank.
+        /// </summary>
+        internal static List<object> DeploymentTrades(IReadOnlyList<Persistence.OrderRecord> orders, IReadOnlyList<Persistence.FillRecord> fills)
+        {
+            var byOrder = fills.GroupBy(f => f.OrderId).ToDictionary(g => g.Key, g => g.ToList());
+            return orders.Select(o =>
+            {
+                byOrder.TryGetValue(o.Id, out var fs);
+                decimal filled = fs?.Sum(f => f.Qty) ?? 0m;
+                decimal? price = filled > 0m ? fs!.Sum(f => f.Qty * f.Price) / filled : null;
+                return (object)new
+                {
+                    o.Id,
+                    o.Symbol,
+                    Side = o.Side.ToLowerInvariant(),
+                    o.Type,
+                    o.Qty,
+                    FilledQty = filled,
+                    Price = price,
+                    Fee = fs?.Sum(f => f.Fee) ?? 0m,
+                    FilledUtc = fs?.Max(f => f.FilledUtc),
+                    o.Status,
+                    o.PlacedUtc,
+                    o.Error,
+                };
+            }).ToList();
+        }
+
         // Forward-fill merge of several equity series into a single total-value series. At each
         // distinct timestamp, every series contributes its last-known equity (0 before it starts).
         // Downsamples to keep the payload light.
@@ -435,6 +496,12 @@ namespace Omnipotent.Services.OmniTrader.Api
         public int? MaxOrdersPerHour { get; set; }
         public List<string>? AllowedSymbols { get; set; }
         public Dictionary<string, object?>? Parameters { get; set; }
+        /// <summary>SignalClose | NextOpen (multi-asset paper sessions honour it).</summary>
+        public string? Execution { get; set; }
+        /// <summary>Bars to preload at start (50–3000).</summary>
+        public int? HistoryBars { get; set; }
+        /// <summary>Provenance and expectations from a deploy plan.</summary>
+        public DeploymentOrigin? Origin { get; set; }
 
         public DeploymentConfig ToDeploymentConfig()
         {
@@ -463,7 +530,10 @@ namespace Omnipotent.Services.OmniTrader.Api
                 SlippageFraction = SlippageFraction,
                 Margin = new MarginSettings { Leverage = Math.Clamp(Leverage, 1m, 10m) },
                 Caps = caps,
-                Parameters = Parameters
+                Parameters = Parameters,
+                Execution = Enum.TryParse<ExecutionTiming>(Execution, true, out var timing) ? timing : null,
+                HistoryBars = HistoryBars is int h ? Math.Clamp(h, 50, 3000) : null,
+                Origin = Origin,
             };
         }
     }

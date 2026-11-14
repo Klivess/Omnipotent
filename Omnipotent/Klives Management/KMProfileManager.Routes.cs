@@ -104,6 +104,15 @@ namespace Omnipotent.Profiles
         private static bool? Bool(JObject body, string name) => body.TryGetValue(name, StringComparison.OrdinalIgnoreCase, out var v) && v.Type == JTokenType.Boolean ? v.Value<bool>() : null;
         private static int? Int(JObject body, string name) => body.TryGetValue(name, StringComparison.OrdinalIgnoreCase, out var v) && (v.Type == JTokenType.Integer || v.Type == JTokenType.Float) ? v.Value<int>() : null;
 
+        /// <summary>"Sign out devices unused for N days": 1–365, or null when not asked for.</summary>
+        private static int? IdleDays(JObject body)
+        {
+            if (!body.ContainsKey("idleDays") || body["idleDays"]?.Type == JTokenType.Null) return null;
+            int days = Int(body, "idleDays") ?? throw Bad("idleDays must be a number of days.");
+            if (days is < 1 or > 365) throw Bad("idleDays must be between 1 and 365.");
+            return days;
+        }
+
         private static string ClientIp(UserRequest req)
         {
             try { return Omnipotent.Services.OmniDefence.OmniDefence.ExtractClientIp(req.req); }
@@ -304,6 +313,7 @@ namespace Omnipotent.Profiles
                 await CreatePermissionRoutes();
                 await CreateAccessControlRoutes();
                 await CreateActivityRoutes();
+                await CreateInsightRoutes();
                 await CreateLegacyRoutes();
                 await CreateLiveRoutes();
                 ServiceLog("Profile routes registered.");
@@ -429,6 +439,7 @@ namespace Omnipotent.Profiles
                 var me = Actor(req);
                 var body = Body(req);
                 string? sessionId = Str(body, "sessionId");
+                int? idleDays = IdleDays(body);
                 int revoked;
                 if (!string.IsNullOrEmpty(sessionId))
                 {
@@ -436,11 +447,16 @@ namespace Omnipotent.Profiles
                     if (s == null || s.ProfileId != me.UserID) throw NotFound("Session not found.");
                     revoked = Sessions.Revoke(sessionId, me.UserID, "Signed out from another device") ? 1 : 0;
                 }
+                else if (idleDays is int days)
+                {
+                    revoked = Sessions.RevokeIdle(me.UserID, DateTime.UtcNow.AddDays(-days), me.UserID, $"Unused for {days}+ days", req.session?.SessionId);
+                }
                 else
                 {
                     revoked = Sessions.RevokeAll(me.UserID, me.UserID, "Signed out everywhere else", req.session?.SessionId);
                 }
-                RecordEvent(me.UserID, "session.revoked", me, new { revoked, sessionId }, ClientIp(req));
+                InvalidateInsights();
+                RecordEvent(me.UserID, "session.revoked", me, new { revoked, sessionId, idleDays }, ClientIp(req));
                 await Ok(req, new { revoked });
             });
 
@@ -869,6 +885,7 @@ namespace Omnipotent.Profiles
                 var target = RequireProfile(Str(body, "id"));
                 EnsureCanManage(actor, target);
                 string? sessionId = Str(body, "sessionId");
+                int? idleDays = IdleDays(body);
                 string reason = $"Signed out by {actor.Name}";
                 int revoked;
                 if (!string.IsNullOrEmpty(sessionId))
@@ -877,12 +894,17 @@ namespace Omnipotent.Profiles
                     if (s == null || s.ProfileId != target.UserID) throw NotFound("Session not found.");
                     revoked = Sessions.Revoke(sessionId, actor.UserID, reason) ? 1 : 0;
                 }
+                else if (idleDays is int days)
+                {
+                    revoked = Sessions.RevokeIdle(target.UserID, DateTime.UtcNow.AddDays(-days), actor.UserID, $"{reason}: unused for {days}+ days");
+                }
                 else
                 {
                     revoked = Sessions.RevokeAll(target.UserID, actor.UserID, reason);
                 }
-                RecordEvent(target.UserID, "session.revoked", actor, new { revoked, sessionId }, ClientIp(req));
-                Audit(actor, "Access", "RevokeSessions", new { target.UserID, target.Name, revoked }, ClientIp(req));
+                InvalidateInsights();
+                RecordEvent(target.UserID, "session.revoked", actor, new { revoked, sessionId, idleDays }, ClientIp(req));
+                Audit(actor, "Access", "RevokeSessions", new { target.UserID, target.Name, revoked, idleDays }, ClientIp(req));
                 await Ok(req, new { revoked });
             });
 

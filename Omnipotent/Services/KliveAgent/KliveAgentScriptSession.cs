@@ -58,6 +58,19 @@ namespace Omnipotent.Services.KliveAgent
 
         private static readonly Lazy<Host> sharedHost = new(BuildHost, LazyThreadSafetyMode.ExecutionAndPublication);
 
+        /// <summary>Builds <see cref="sharedHost"/> on a worker, once, so callers can wait for it with a limit.</summary>
+        private static readonly Lazy<Task> hostBuild = new(() => Task.Run(() => { _ = sharedHost.Value; }), LazyThreadSafetyMode.ExecutionAndPublication);
+
+        /// <summary>How long a script waits for the shared host to finish building before giving up.</summary>
+        internal static readonly TimeSpan HostWaitLimit = TimeSpan.FromMinutes(10);
+
+        /// <summary>The warm-up runs off every request path, so its compile may take as long as start-up does.</summary>
+        internal static readonly ScriptSessionOptions WarmupOptions = new() { CompileBudget = TimeSpan.FromMinutes(15), AutoRepair = false };
+
+        /// <summary>Test seams: how sessions this engine creates see and wait for the shared host.</summary>
+        internal Func<bool>? HostReadyOverride { get; set; }
+        internal Func<CancellationToken, Task>? WaitForHostOverride { get; set; }
+
         private static Host BuildHost()
         {
             var options = ScriptOptions.Default
@@ -93,7 +106,9 @@ namespace Omnipotent.Services.KliveAgent
             try
             {
                 var sw = Stopwatch.StartNew();
-                var session = CreateSession(new ScriptGlobals(agentService));
+                await hostBuild.Value;
+                long hostMs = sw.ElapsedMilliseconds;
+                var session = CreateSession(new ScriptGlobals(agentService), WarmupOptions);
                 var first = await session.ExecuteAsync(WarmupScript);
                 await session.ExecuteAsync("2 + 2");
                 Types.EnsureBuilt();
@@ -102,8 +117,8 @@ namespace Omnipotent.Services.KliveAgent
                 try
                 {
                     await agentService.ServiceLog(
-                        $"[KliveAgent] Script engine warmed up in {sw.ElapsedMilliseconds}ms ({OmniScriptReferences.Count} references, "
-                        + $"{OmniScriptReferences.MetadataBytes / 1048576.0:0.0} MB of metadata).{note}", appearInConsole: false);
+                        $"[KliveAgent] Script engine warmed up in {sw.ElapsedMilliseconds}ms (host {hostMs} ms, first script compiled in {first.CompileMs ?? -1} ms; "
+                        + $"{OmniScriptReferences.Count} references, {OmniScriptReferences.MetadataBytes / 1048576.0:0.0} MB of metadata).{note}", appearInConsole: false);
                 }
                 catch { }
             }
@@ -127,7 +142,7 @@ namespace Omnipotent.Services.KliveAgent
 
         public ScriptExecutionSession CreateSession(ScriptGlobals globals, ScriptSessionOptions? options = null)
         {
-            return new ScriptExecutionSession(globals, options ?? ScriptSessionOptions.Default);
+            return new ScriptExecutionSession(globals, options ?? ScriptSessionOptions.Default, HostReadyOverride, WaitForHostOverride);
         }
 
         public async Task<AgentScriptResult> ExecuteScriptAsync(string code, ScriptGlobals globals, TimeSpan? timeout = null)
@@ -192,10 +207,16 @@ namespace Omnipotent.Services.KliveAgent
             private ScriptState<object>? state;
             private Dictionary<string, string> knownVariables = new(StringComparer.Ordinal);
 
-            internal ScriptExecutionSession(ScriptGlobals globals, ScriptSessionOptions options)
+            private readonly Func<bool> hostReady;
+            private readonly Func<CancellationToken, Task> waitForHost;
+
+            internal ScriptExecutionSession(ScriptGlobals globals, ScriptSessionOptions options,
+                Func<bool>? hostReady = null, Func<CancellationToken, Task>? waitForHost = null)
             {
                 this.globals = globals;
                 Options = options;
+                this.hostReady = hostReady ?? (() => sharedHost.IsValueCreated);
+                this.waitForHost = waitForHost ?? (_ => hostBuild.Value);
             }
 
             internal ScriptSessionOptions Options { get; set; }
@@ -225,6 +246,30 @@ namespace Omnipotent.Services.KliveAgent
                 }
 
                 globals.TakeOutput();
+
+                // ── the shared host, outside the compile budget ──
+                // The first script after a restart used to build the host (every reference, ~80 MB of
+                // metadata) inside its own 120 s compile budget. Under start-up load on 13 Nov 2026 that took
+                // minutes: the warm-up ran 352 s and its compile timed out. Waiting for the host is the
+                // server starting, not this script compiling, so it has its own (longer) limit and its own figure.
+                if (!hostReady())
+                {
+                    var waited = Stopwatch.StartNew();
+                    try { await waitForHost(stop).WaitAsync(HostWaitLimit, stop).ConfigureAwait(false); }
+                    catch (OperationCanceledException) when (stop.IsCancellationRequested)
+                    {
+                        result.HostWaitMs = waited.ElapsedMilliseconds;
+                        return Finish("stopped", "Script was stopped while the script engine was still starting.");
+                    }
+                    catch (TimeoutException)
+                    {
+                        result.HostWaitMs = waited.ElapsedMilliseconds;
+                        return Finish("compile-timeout",
+                            $"The script engine is still starting after {HostWaitLimit.TotalMinutes:0} minutes (the server is busy starting up), so nothing ran. Send the same script again shortly, or use a native tool (no compile step) if one fits.");
+                    }
+                    catch { /* a host that failed to build fails again, with its reason, in the compile below */ }
+                    result.HostWaitMs = waited.ElapsedMilliseconds;
+                }
 
                 // ── compile, on its own budget ──
                 Compiled compiled;

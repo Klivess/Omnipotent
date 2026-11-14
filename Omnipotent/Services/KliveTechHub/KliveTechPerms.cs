@@ -11,6 +11,10 @@ namespace Omnipotent.Profiles.Permissions
         public static readonly PermissionDef GadgetsAct = G.Define("gadgets.act", "Gadgets", PermissionTier.Act,
             "Operate gadgets", "Run gadget actions.", ProfileRank.Klives, implies: new[] { "gadgets.read" });
 
+        public static readonly PermissionDef GadgetsManage = G.Define("gadgets.manage", "Gadgets", PermissionTier.Critical,
+            "Enrol and forget gadgets", "Let a nearby gadget enrol, and forget a remembered one.", ProfileRank.Klives,
+            implies: new[] { "gadgets.act", "gadgets.read" });
+
         public static readonly PermissionDef StreamablesRead = G.Define("streamables.read", "Streamables", PermissionTier.Read,
             "View live telemetry", "Streamable values, their history and the live feed.", ProfileRank.Klives);
 

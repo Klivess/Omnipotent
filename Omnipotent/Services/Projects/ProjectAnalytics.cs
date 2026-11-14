@@ -213,6 +213,32 @@ public sealed class ProjectAnalyticsService
         return portfolio;
     }
 
+    // ───────────────────────────── reads that never wait for a cold scan ─────────────────────────────
+
+    private StaleWhileRebuilding<PortfolioAnalyticsSnapshot>? portfolioReads;
+    private StaleWhileRebuilding<ProjectAnalyticsSnapshot>? projectReads;
+    private StaleWhileRebuilding<PortfolioAnalyticsSnapshot> PortfolioReads => portfolioReads ??= new(log);
+    private StaleWhileRebuilding<ProjectAnalyticsSnapshot> ProjectReads => projectReads ??= new(log);
+
+    /// <summary>
+    /// The fleet report for the analytics page. Live (30 d to 13 Nov 2026): 17 requests, p50 77 s,
+    /// p95 732 s, 16 abandoned by the browser before an answer came, because every visit after a
+    /// five-minute boundary rebuilt every project's snapshot from its event log on the request. Now
+    /// the last report is answered at once (flagged stale while a single background build replaces
+    /// it); with nothing built yet the request waits <paramref name="wait"/>, then says it is building.
+    /// </summary>
+    public Task<StaleWhileRebuilding<PortfolioAnalyticsSnapshot>.Read> ReadPortfolioAsync(
+        string? rangeKey, bool forceRefresh, string? fromUtc, string? toUtc, string? bucket, TimeSpan wait)
+        => PortfolioReads.ReadAsync($"{rangeKey}|{fromUtc}|{toUtc}|{bucket}",
+            () => GetPortfolio(rangeKey, null, forceRefresh, fromUtc, toUtc, bucket), forceRefresh, wait);
+
+    /// <summary>One project's report, read the same way (30 d to 13 Nov 2026: p95 183 s).</summary>
+    public Task<StaleWhileRebuilding<ProjectAnalyticsSnapshot>.Read> ReadProjectAsync(
+        string projectID, string? rangeKey, bool forceRefresh, string? fromUtc, string? toUtc, string? bucket, TimeSpan wait)
+        => ProjectReads.ReadAsync($"{projectID}|{rangeKey}|{fromUtc}|{toUtc}|{bucket}",
+            () => GetProject(projectID, rangeKey, null, forceRefresh, fromUtc, toUtc, bucket)
+                ?? throw new ArgumentException("unknown projectID"), forceRefresh, wait);
+
     internal static string SnapshotCacheKey(string projectID, AnalyticsRange range)
         // ToUtc moves continuously and is intentionally quantized by SnapshotTtl, but FromUtc is
         // part of the question. It changes at UTC midnight for rolling windows and differs between
@@ -268,6 +294,84 @@ public sealed class ProjectAnalyticsService
             .Take(excess)
             .Select(entry => entry.Key))
             cache.TryRemove(key, out _);
+    }
+}
+
+/// <summary>
+/// Answers a question from the last result built for it: at once while that result is fresh (the
+/// same five-minute bucket as <see cref="ProjectAnalyticsService.SnapshotTtl"/>), at once but
+/// flagged stale while one background build replaces it, and only for a question never answered
+/// does a request wait, for a bounded time, before being told the result is still building.
+/// </summary>
+public sealed class StaleWhileRebuilding<T> where T : class
+{
+    public readonly record struct Read(T? Value, bool Stale, bool Building, DateTime? BuiltUtc);
+
+    private readonly ConcurrentDictionary<string, (T Value, DateTime BuiltUtc)> last = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Lazy<Task<T>>> builds = new(StringComparer.Ordinal);
+    private readonly Action<string> log;
+    private readonly Func<DateTime> clock;
+    private readonly int keep;
+
+    public StaleWhileRebuilding(Action<string> log, Func<DateTime>? clock = null, int keep = 64)
+    {
+        this.log = log;
+        this.clock = clock ?? (() => DateTime.UtcNow);
+        this.keep = keep;
+    }
+
+    /// <summary>Builds running now (tests, diagnostics).</summary>
+    internal int Running => builds.Count;
+
+    public async Task<Read> ReadAsync(string question, Func<T> build, bool force, TimeSpan wait)
+    {
+        DateTime now = clock();
+        bool known = last.TryGetValue(question, out var previous);
+        if (known && !force && ProjectAnalyticsService.SnapshotTimeBucket(previous.BuiltUtc) == ProjectAnalyticsService.SnapshotTimeBucket(now))
+            return new Read(previous.Value, false, false, previous.BuiltUtc);
+
+        Task<T> running = Start(question, build);
+        if (known) return new Read(previous.Value, true, true, previous.BuiltUtc);
+
+        if (await Task.WhenAny(running, Task.Delay(wait)) != running) return new Read(null, false, true, null);
+        T value = await running; // a failed first build surfaces to this caller; the next one tries again
+        return new Read(value, false, false, last.TryGetValue(question, out var built) ? built.BuiltUtc : now);
+    }
+
+    private Task<T> Start(string question, Func<T> build)
+        => builds.GetOrAdd(question, q => new Lazy<Task<T>>(() =>
+        {
+            // Nothing ambient (request trace, response-cache scope) may follow the build past the response.
+            using (ExecutionContext.SuppressFlow())
+            {
+                return Task.Run(() =>
+                {
+                    try
+                    {
+                        T value = build();
+                        last[q] = (value, clock());
+                        Trim();
+                        return value;
+                    }
+                    catch (Exception ex)
+                    {
+                        log($"Projects analytics build failed for {q}: {ex.Message}");
+                        throw;
+                    }
+                    finally
+                    {
+                        builds.TryRemove(q, out _);
+                    }
+                });
+            }
+        })).Value;
+
+    private void Trim()
+    {
+        int excess = last.Count - keep;
+        if (excess <= 0) return;
+        foreach (string key in last.OrderBy(pair => pair.Value.BuiltUtc).Take(excess).Select(pair => pair.Key).ToList())
+            last.TryRemove(key, out _);
     }
 }
 

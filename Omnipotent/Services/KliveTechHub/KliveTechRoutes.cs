@@ -2,6 +2,7 @@ using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Profiles;
 using System.Collections.Specialized;
+using System.Diagnostics;
 using System.Globalization;
 using System.Net;
 using Omnipotent.Profiles.Permissions;
@@ -24,6 +25,30 @@ namespace Omnipotent.Services.KliveTechHub
                 GetAllGadgets,
                 HttpMethod.Get,
                 KliveTechPerms.GadgetsRead);
+
+            await parent.CreateAPIRoute(
+                "/klivetech/status",
+                GetHubStatus,
+                HttpMethod.Get,
+                KliveTechPerms.GadgetsRead);
+
+            await parent.CreateAPIRoute(
+                "/klivetech/gadgets/reconnect",
+                ReconnectGadget,
+                HttpMethod.Post,
+                KliveTechPerms.GadgetsAct);
+
+            await parent.CreateAPIRoute(
+                "/klivetech/gadgets/enrol",
+                EnrolGadget,
+                HttpMethod.Post,
+                KliveTechPerms.GadgetsManage);
+
+            await parent.CreateAPIRoute(
+                "/klivetech/gadgets/forget",
+                ForgetGadget,
+                HttpMethod.Post,
+                KliveTechPerms.GadgetsManage);
 
             await parent.CreateAPIRoute(
                 "/klivetech/executegadgetaction",
@@ -99,6 +124,123 @@ namespace Omnipotent.Services.KliveTechHub
 
             await parent.RegisterRelayRouteAsync();
             await parent.RegisterStreamableLiveRouteAsync();
+        }
+
+        private async Task GetHubStatus(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
+        {
+            try
+            {
+                // Live device state: what a gadget is doing changes without any store being written.
+                Omnipotent.Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("live KliveTech hub state");
+                int events = 100;
+                string? suppliedEvents = request.userParameters.Get("events");
+                if (!string.IsNullOrWhiteSpace(suppliedEvents) &&
+                    !int.TryParse(suppliedEvents, NumberStyles.Integer, CultureInfo.InvariantCulture, out events))
+                {
+                    await ReturnJsonError(request, "events must be an integer.", HttpStatusCode.BadRequest);
+                    return;
+                }
+                await request.ReturnResponse(
+                    JsonConvert.SerializeObject(parent.BuildHubStatus(events)),
+                    "application/json");
+            }
+            catch (Exception ex)
+            {
+                await ReturnError(request, ex);
+            }
+        }
+
+        private async Task ReconnectGadget(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
+        {
+            try
+            {
+                JObject body = ParseJsonBody(request);
+                string? gadgetId = body.Value<string>("gadgetID") ?? request.userParameters.Get("gadgetID");
+                string state = parent.RetryRememberedGadget(gadgetId, request.user?.Name ?? "unknown");
+                await request.ReturnResponse(
+                    JsonConvert.SerializeObject(new { state }),
+                    "application/json",
+                    new NameValueCollection(),
+                    state == "online" ? HttpStatusCode.OK : HttpStatusCode.Accepted);
+            }
+            catch (JsonException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.BadRequest);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.NotFound);
+            }
+            catch (InvalidOperationException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.Conflict);
+            }
+            catch (Exception ex)
+            {
+                await ReturnError(request, ex);
+            }
+        }
+
+        private async Task EnrolGadget(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
+        {
+            try
+            {
+                JObject body = ParseJsonBody(request);
+                string? address = body.Value<string>("address") ?? request.userParameters.Get("address");
+                string state = parent.AllowEnrolment(address, request.user?.Name ?? "unknown");
+                await parent.ServiceLog(
+                    $"{request.user?.Name ?? "unknown"} allowed KliveTech device {KliveTechHub.FormatAddress(address)} to enrol.");
+                await request.ReturnResponse(
+                    JsonConvert.SerializeObject(new { state }),
+                    "application/json",
+                    new NameValueCollection(),
+                    HttpStatusCode.Accepted);
+            }
+            catch (JsonException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.BadRequest);
+            }
+            catch (InvalidDataException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.BadRequest);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.NotFound);
+            }
+            catch (Exception ex)
+            {
+                await ReturnError(request, ex);
+            }
+        }
+
+        private async Task ForgetGadget(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
+        {
+            try
+            {
+                JObject body = ParseJsonBody(request);
+                string? gadgetId = body.Value<string>("gadgetID") ?? request.userParameters.Get("gadgetID");
+                string name = await parent.ForgetGadgetAsync(gadgetId, request.user?.Name ?? "unknown");
+                await request.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = true, name }),
+                    "application/json");
+            }
+            catch (JsonException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.BadRequest);
+            }
+            catch (KeyNotFoundException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.NotFound);
+            }
+            catch (InvalidOperationException ex)
+            {
+                await ReturnJsonError(request, ex.Message, HttpStatusCode.Conflict);
+            }
+            catch (Exception ex)
+            {
+                await ReturnError(request, ex);
+            }
         }
 
         private async Task GetStreamables(
@@ -466,8 +608,9 @@ namespace Omnipotent.Services.KliveTechHub
         {
             try
             {
-                await parent.ServiceLog(
-                    $"Request from {request.user?.Name ?? "unknown"} to get all KliveTech gadgets.");
+                // No log line here: the page reads this every few seconds, and one line per read
+                // pushed every other service's history out of the shared log buffer. Telemetry
+                // already records who asked.
                 await request.ReturnResponse(
                     JsonConvert.SerializeObject(parent.connectedGadgets),
                     "application/json");
@@ -543,13 +686,37 @@ namespace Omnipotent.Services.KliveTechHub
                     return;
                 }
 
+                string by = request.user?.Name ?? "unknown";
                 await parent.ServiceLog(
-                    $"Request from {request.user?.Name ?? "unknown"} to execute " +
-                    $"gadget '{gadget.name}' action '{action.name}'.");
+                    $"Request from {by} to execute gadget '{gadget.name}' action '{action.name}'.");
 
-                bool executed = await parent.ExecuteActionByName(gadget, action.name, actionParameter);
+                string described = DescribeActionRun(action, actionParameter);
+                Stopwatch timer = Stopwatch.StartNew();
+                bool executed;
+                try
+                {
+                    executed = await parent.ExecuteActionByName(gadget, action.name, actionParameter);
+                }
+                catch (Exception ex) when (ex is TimeoutException or IOException or OperationCanceledException)
+                {
+                    parent.RecordHubEvent(
+                        "action-failed",
+                        "crit",
+                        $"{described} failed after {timer.ElapsedMilliseconds} ms: " +
+                        (ex is TimeoutException ? "the gadget timed out." : "the gadget is unavailable."),
+                        gadget,
+                        by);
+                    throw;
+                }
+
                 if (!executed)
                 {
+                    parent.RecordHubEvent(
+                        "action-failed",
+                        "crit",
+                        $"{described}: the gadget did not acknowledge it.",
+                        gadget,
+                        by);
                     await ReturnJsonError(
                         request,
                         "The gadget did not acknowledge the action.",
@@ -557,8 +724,10 @@ namespace Omnipotent.Services.KliveTechHub
                     return;
                 }
 
+                long elapsed = timer.ElapsedMilliseconds;
+                parent.RecordHubEvent("action", "ok", $"{described} ({elapsed} ms).", gadget, by);
                 await request.ReturnResponse(
-                    JsonConvert.SerializeObject(new { success = true }),
+                    JsonConvert.SerializeObject(new { success = true, ms = elapsed }),
                     "application/json");
             }
             catch (TimeoutException ex)
@@ -580,6 +749,19 @@ namespace Omnipotent.Services.KliveTechHub
             {
                 await ReturnError(request, ex);
             }
+        }
+
+        /// <summary>"Set light → true": what was run, short enough for one line of history.</summary>
+        internal static string DescribeActionRun(KliveTechActions.KliveTechAction action, string parameter)
+        {
+            if (action.parameters == KliveTechActions.ActionParameterType.None)
+            {
+                return action.name;
+            }
+            string shown = parameter.Length > 40 ? parameter[..39] + "…" : parameter;
+            return action.parameters == KliveTechActions.ActionParameterType.String
+                ? $"{action.name} → \"{shown}\""
+                : $"{action.name} → {shown}";
         }
 
         private static bool IsValidParameter(

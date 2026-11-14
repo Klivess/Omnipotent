@@ -173,6 +173,8 @@ namespace Omnipotent.Services.OmniTumblr
         {
             string message = status.Blocked
                 ? $"Tumblr's edge is refusing this server's requests (an HTML 403 from nginx, before the API) — the server's network, not the accounts or posts. Posts and sync wait; next check {status.NextCheckUtc:HH:mm} UTC."
+                  // Named so the history can say which calls set blocks off (OmniTumblrFleetPulse.TriggerOf reads it).
+                  + (string.IsNullOrWhiteSpace(status.LastDetail) ? "" : $" First refused: {status.LastDetail}.")
                 : $"Tumblr is answering this server again after {OmniTumblrPublisher.Describe(TimeSpan.FromMinutes(status.LastBlockMinutes ?? 0))}; waiting posts are going out one at a time, spaced across the blogs.";
             try { Store?.Mutate(s => s.AddEvent(status.Blocked ? EventLevel.Warning : EventLevel.Success, status.Blocked ? "tumblr.edge-blocked" : "tumblr.edge-cleared", message)); } catch { }
             _ = ServiceLog("[OmniTumblr] " + message, false);

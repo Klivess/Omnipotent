@@ -280,6 +280,11 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("compileMs", NullValueHandling = NullValueHandling.Ignore)]
         public long? CompileMs { get; set; }
 
+        /// <summary>How long the script waited for the script engine to finish starting (first scripts after a
+        /// restart only), kept out of <see cref="CompileMs"/>. Null when the engine was already up.</summary>
+        [JsonProperty("hostWaitMs", NullValueHandling = NullValueHandling.Ignore)]
+        public long? HostWaitMs { get; set; }
+
         /// <summary>How long the compiled script ran. Null when nothing ran.</summary>
         [JsonProperty("runMs", NullValueHandling = NullValueHandling.Ignore)]
         public long? RunMs { get; set; }

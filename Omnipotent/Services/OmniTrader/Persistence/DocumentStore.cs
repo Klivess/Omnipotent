@@ -1,6 +1,7 @@
 using Microsoft.Data.Sqlite;
 using Newtonsoft.Json;
 using Omnipotent.Services.KliveAPI.Caching;
+using Omnipotent.Services.KliveAPI.Telemetry;
 
 namespace Omnipotent.Services.OmniTrader.Persistence
 {
@@ -56,6 +57,9 @@ namespace Omnipotent.Services.OmniTrader.Persistence
 
         public string Collection => collection;
 
+        /// <summary>Bumped by every write to this collection (in this process); equal versions mean nothing changed.</summary>
+        public long Version => CacheDeps.CurrentVersion(cacheKey);
+
         public Task UpsertAsync(T doc, CancellationToken ct = default) => db.WithWriteLockAsync(async conn =>
         {
             await UpsertCoreAsync(conn, null, doc, ct);
@@ -106,15 +110,24 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             await cmd.ExecuteNonQueryAsync(ct);
         }
 
+        // Spans: doc-open (connection), doc-read (SQLite), doc-parse (JSON). On the server a single-document
+        // read (studio/get) ran p95 11 s and a candidate list p95 19 s over 30 days with nothing saying which.
         public async Task<T?> GetAsync(string docId, CancellationToken ct = default)
         {
             CacheDeps.NoteRead(cacheKey);
-            await using var conn = await db.OpenAsync(ct);
-            await using var cmd = conn.CreateCommand();
-            cmd.CommandText = "SELECT json FROM documents WHERE collection=$c AND id=$id";
-            cmd.Parameters.AddWithValue("$c", collection);
-            cmd.Parameters.AddWithValue("$id", docId);
-            return await cmd.ExecuteScalarAsync(ct) is string json ? Read(json) : null;
+            SqliteConnection conn;
+            using (RequestTrace.AmbientSpan("doc-open")) conn = await db.OpenAsync(ct);
+            await using (conn)
+            {
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = "SELECT json FROM documents WHERE collection=$c AND id=$id";
+                cmd.Parameters.AddWithValue("$c", collection);
+                cmd.Parameters.AddWithValue("$id", docId);
+                object? raw;
+                using (RequestTrace.AmbientSpan("doc-read")) raw = await cmd.ExecuteScalarAsync(ct);
+                if (raw is not string json) return null;
+                using (RequestTrace.AmbientSpan("doc-parse")) return Read(json);
+            }
         }
 
         public async Task<bool> DeleteAsync(string docId, CancellationToken ct = default) => await db.WithWriteLockAsync(async conn =>
@@ -132,7 +145,9 @@ namespace Omnipotent.Services.OmniTrader.Persistence
         {
             query ??= new DocumentQuery();
             CacheDeps.NoteRead(cacheKey);
-            await using var conn = await db.OpenAsync(ct);
+            SqliteConnection opened;
+            using (RequestTrace.AmbientSpan("doc-open")) opened = await db.OpenAsync(ct);
+            await using var conn = opened;
             await using var cmd = conn.CreateCommand();
             var where = new List<string> { "collection=$c" };
             cmd.Parameters.AddWithValue("$c", collection);
@@ -148,9 +163,22 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             cmd.Parameters.AddWithValue("$lim", Math.Clamp(query.Limit, 1, 10_000));
             cmd.Parameters.AddWithValue("$off", Math.Max(0, query.Offset));
             var list = new List<T>();
-            await using var reader = await cmd.ExecuteReaderAsync(ct);
-            while (await reader.ReadAsync(ct))
-                if (Read(reader.GetString(0)) is { } d) list.Add(d);
+            SqliteDataReader reader;
+            using (RequestTrace.AmbientSpan("doc-read")) reader = await cmd.ExecuteReaderAsync(ct);
+            await using (reader)
+            {
+                while (true)
+                {
+                    string json;
+                    using (RequestTrace.AmbientSpan("doc-read"))
+                    {
+                        if (!await reader.ReadAsync(ct)) break;
+                        json = reader.GetString(0);
+                    }
+                    using (RequestTrace.AmbientSpan("doc-parse"))
+                        if (Read(json) is { } d) list.Add(d);
+                }
+            }
             return list;
         }
 

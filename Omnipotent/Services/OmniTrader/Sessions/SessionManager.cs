@@ -8,6 +8,17 @@ using System.Collections.Concurrent;
 
 namespace Omnipotent.Services.OmniTrader.Sessions
 {
+    /// <summary>Which session runs a strategy, decided by what it declares it trades.</summary>
+    public enum SessionKind
+    {
+        /// <summary>One symbol: <see cref="PaperSession"/> / <see cref="LiveSession"/> (OnCandleClose).</summary>
+        Single,
+        /// <summary>A fixed list of symbols: <see cref="MultiAssetSession"/> over exactly that list (OnUniverseBar).</summary>
+        Basket,
+        /// <summary>A dynamic top-N universe: <see cref="MultiAssetSession"/> resolving it (OnUniverseBar).</summary>
+        Universe,
+    }
+
     public sealed class SessionManager
     {
         // In-memory live/armed state that deployment routes read alongside the tracked
@@ -24,6 +35,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         private readonly Func<IOrderRouter?> krakenFactory;
         private readonly Action<string> log;
         private readonly Action<string, Exception?> err;
+        private readonly PaperBookStore? books;
 
         private readonly ConcurrentDictionary<string, PaperSession> paperSessions = new();
         private readonly ConcurrentDictionary<string, LiveSession> liveSessions = new();
@@ -39,7 +51,8 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             EquityRepository equityRepo,
             Func<IOrderRouter?> krakenFactory,
             Action<string> log,
-            Action<string, Exception?> err)
+            Action<string, Exception?> err,
+            PaperBookStore? books = null)
         {
             this.marketData = marketData;
             this.registry = registry;
@@ -50,7 +63,10 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             this.krakenFactory = krakenFactory;
             this.log = log;
             this.err = err;
+            this.books = books;
         }
+
+        public PaperBookStore? Books => books;
 
         public IReadOnlyCollection<string> ActiveDeploymentIds
         {
@@ -60,6 +76,24 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 return paperSessions.Keys.Concat(liveSessions.Keys).Concat(multiSessions.Keys).ToList();
             }
         }
+
+        /// <summary>
+        /// The session a declaration needs. The backtester already ran any strategy declaring more than one
+        /// fixed symbol on the portfolio engine (BacktestJobQueue.RunPreparedAsync); deployments only looked
+        /// at <see cref="StrategySymbols.IsUniverse"/>, so a fixed basket was given a single-symbol session
+        /// whose OnCandleClose a basket strategy never implements, and it could not place a single order.
+        /// </summary>
+        public static SessionKind KindOf(StrategySymbols declaration)
+            => declaration.IsUniverse ? SessionKind.Universe
+             : (declaration.Fixed?.Count ?? 1) > 1 ? SessionKind.Basket
+             : SessionKind.Single;
+
+        public static string ShapeName(SessionKind kind) => kind switch
+        {
+            SessionKind.Basket => "basket",
+            SessionKind.Universe => "universe",
+            _ => "single",
+        };
 
         private static DeploymentConfig WithSymbol(DeploymentConfig c, string symbol) => new()
         {
@@ -74,6 +108,9 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             Margin = c.Margin,
             Caps = c.Caps,
             Parameters = c.Parameters,
+            Execution = c.Execution,
+            HistoryBars = c.HistoryBars,
+            Origin = c.Origin,
         };
 
         public bool TryGetPaper(string id, out PaperSession? session)
@@ -97,6 +134,15 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             return ok;
         }
 
+        /// <summary>What the running session for a deployment reports; null when none runs in this process.</summary>
+        public SessionPulse? PulseOf(string id)
+        {
+            if (paperSessions.TryGetValue(id, out var p)) return p.Pulse();
+            if (multiSessions.TryGetValue(id, out var m)) return m.Pulse();
+            if (liveSessions.TryGetValue(id, out var l)) return l.Pulse();
+            return null;
+        }
+
         public async Task<string> CreateDeploymentAsync(DeploymentConfig config, CancellationToken ct = default)
         {
             var descriptor = registry.Resolve(config.StrategyClass)
@@ -110,11 +156,13 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 pars["TradeSymbol"] = config.Symbol;
             Strategy.Params.StrategyParams.Apply(strategy, pars);
             var declaration = strategy.DeclareSymbols();
-            bool isUniverse = declaration.IsUniverse;
-            if (!isUniverse && !string.IsNullOrWhiteSpace(declaration.Primary) && declaration.Primary != config.Symbol)
+            var kind = KindOf(declaration);
+            if (kind == SessionKind.Single && !string.IsNullOrWhiteSpace(declaration.Primary) && declaration.Primary != config.Symbol)
                 config = WithSymbol(config, declaration.Primary);
-            else if (isUniverse)
+            else if (kind == SessionKind.Universe)
                 config = WithSymbol(config, declaration.Universe!.RegimeSymbol);
+            else if (kind == SessionKind.Basket && declaration.Primary != config.Symbol)
+                config = WithSymbol(config, declaration.Primary);
             string id = Guid.NewGuid().ToString("N");
 
             // Live deployments start paused; user must call ArmLive to activate.
@@ -134,20 +182,21 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             };
             await deploymentRepo.InsertAsync(row, ct);
 
-            if (isUniverse)
+            if (kind != SessionKind.Single)
             {
                 IOrderRouter? exchange = config.Mode == SessionMode.Live
                     ? krakenFactory() ?? throw new InvalidOperationException("Kraken credentials not configured")
                     : null;
                 var session = new MultiAssetSession(id, config, strategy, config.Mode, marketData, universeProvider,
-                    exchange, orderRepo, fillRepo, equityRepo, deploymentRepo, log, err);
+                    exchange, orderRepo, fillRepo, equityRepo, deploymentRepo, log, err,
+                    basket: kind == SessionKind.Basket ? declaration.Fixed : null, books: books);
                 if (multiSessions.TryAdd(id, session))
                     await session.StartAsync(ct);
             }
             else if (config.Mode == SessionMode.Paper)
             {
                 var session = new PaperSession(id, config, strategy, marketData,
-                    orderRepo, fillRepo, equityRepo, deploymentRepo, log, err);
+                    orderRepo, fillRepo, equityRepo, deploymentRepo, log, err, books: books);
                 if (paperSessions.TryAdd(id, session))
                     await session.StartAsync(ct);
             }
@@ -212,18 +261,22 @@ namespace Omnipotent.Services.OmniTrader.Sessions
 
             var strategy = registry.CreateInstance(row.StrategyClass);
             Strategy.Params.StrategyParams.Apply(strategy, row.Config.Parameters);
-            if (strategy.DeclareSymbols().IsUniverse)
+            var declaration = strategy.DeclareSymbols();
+            var kind = KindOf(declaration);
+            var book = await LoadBookAsync(id, ct);
+            if (kind != SessionKind.Single)
             {
                 var session = new MultiAssetSession(id, row.Config, strategy, SessionMode.Paper, marketData,
                     universeProvider, null, orderRepo, fillRepo, equityRepo, deploymentRepo, log, err,
-                    startingQuote: row.EquityCurrent);
+                    startingQuote: row.EquityCurrent,
+                    basket: kind == SessionKind.Basket ? declaration.Fixed : null, books: books, restore: book);
                 if (multiSessions.TryAdd(id, session)) { await session.StartAsync(ct); await deploymentRepo.UpdateStatusAsync(id, DeploymentStatus.Running, ct: ct); }
                 CacheDeps.Bump(CacheKey);
                 return true;
             }
             var paper = new PaperSession(id, row.Config, strategy, marketData,
                 orderRepo, fillRepo, equityRepo, deploymentRepo, log, err,
-                startingQuote: row.EquityCurrent);
+                startingQuote: row.EquityCurrent, books: books, restore: book);
             if (paperSessions.TryAdd(id, paper))
             {
                 await paper.StartAsync(ct);
@@ -257,19 +310,33 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 await paper.DisposeAsync();
                 killed = true;
             }
-            if (killed)
+            if (!killed)
             {
-                await deploymentRepo.UpdateStatusAsync(id, DeploymentStatus.Stopped, ct: ct);
-                CacheDeps.Bump(CacheKey);
+                // A paused paper deployment, or one that errored or failed to recover, has no session in
+                // memory. Stopping it used to answer 404 "Action failed", so it could only be resumed or
+                // deleted. Stopping is a status change on the row.
+                var row = await deploymentRepo.GetAsync(id, ct);
+                if (row == null) return false;
+                if (row.Status == DeploymentStatus.Stopped) return true;
             }
-            return killed;
+            await deploymentRepo.UpdateStatusAsync(id, DeploymentStatus.Stopped, ct: ct);
+            CacheDeps.Bump(CacheKey);
+            return true;
         }
 
         public async Task<bool> DeleteAsync(string id, CancellationToken ct = default)
         {
             await KillAsync(id, ct);
             await deploymentRepo.DeleteAsync(id, ct);
+            if (books != null) { try { await books.DeleteAsync(id, ct); } catch { } }
             return true;
+        }
+
+        private async Task<PaperBook?> LoadBookAsync(string id, CancellationToken ct)
+        {
+            if (books == null) return null;
+            try { return await books.GetAsync(id, ct); }
+            catch (Exception ex) { err($"Paper book for {id} could not be read; continuing from its equity alone", ex); return null; }
         }
 
         public async Task RecoverAsync(CancellationToken ct = default)
@@ -281,22 +348,27 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 {
                     var strategy = registry.CreateInstance(row.StrategyClass);
                     Strategy.Params.StrategyParams.Apply(strategy, row.Config.Parameters);
-                    bool isUniverse = strategy.DeclareSymbols().IsUniverse;
+                    var declaration = strategy.DeclareSymbols();
+                    var kind = KindOf(declaration);
+                    var basket = kind == SessionKind.Basket ? declaration.Fixed : null;
 
                     if (row.Mode == SessionMode.Paper && row.Status == DeploymentStatus.Running)
                     {
-                        if (isUniverse)
+                        // The saved book carries positions across the restart; without one (older rows) the
+                        // deployment restarts from its equity as cash, as before.
+                        var book = await LoadBookAsync(row.Id, ct);
+                        if (kind != SessionKind.Single)
                         {
                             var session = new MultiAssetSession(row.Id, row.Config, strategy, SessionMode.Paper, marketData,
                                 universeProvider, null, orderRepo, fillRepo, equityRepo, deploymentRepo, log, err,
-                                startingQuote: row.EquityCurrent);
+                                startingQuote: row.EquityCurrent, basket: basket, books: books, restore: book);
                             if (multiSessions.TryAdd(row.Id, session)) await session.StartAsync(ct);
                         }
                         else
                         {
                             var session = new PaperSession(row.Id, row.Config, strategy, marketData,
                                 orderRepo, fillRepo, equityRepo, deploymentRepo, log, err,
-                                startingQuote: row.EquityCurrent);
+                                startingQuote: row.EquityCurrent, books: books, restore: book);
                             if (paperSessions.TryAdd(row.Id, session))
                                 await session.StartAsync(ct);
                         }
@@ -310,11 +382,11 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                             err($"Cannot recover live deployment {row.Id} — Kraken not configured", null);
                             continue;
                         }
-                        if (isUniverse)
+                        if (kind != SessionKind.Single)
                         {
                             var session = new MultiAssetSession(row.Id, row.Config, strategy, SessionMode.Live, marketData,
                                 universeProvider, exchange, orderRepo, fillRepo, equityRepo, deploymentRepo, log, err,
-                                startingQuote: row.EquityCurrent);
+                                startingQuote: row.EquityCurrent, basket: basket);
                             if (multiSessions.TryAdd(row.Id, session))
                             {
                                 await session.StartAsync(ct);

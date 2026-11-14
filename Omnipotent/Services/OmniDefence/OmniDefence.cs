@@ -112,7 +112,9 @@ namespace Omnipotent.Services.OmniDefence
 
                 tracker = new IpThreatTracker(store) { AutoEscalated = OnAutoEscalated };
                 await startup.Step("settings", LoadSettingsAsync);
-                await startup.Step("IP records", () => tracker.LoadAsync());
+                OmniDefenceStore.ReadCost? ipCost = null;
+                await startup.Step("IP records", async () => ipCost = await tracker.LoadAsync());
+                if (ipCost != null) startup.Detail("IP records", ipCost.ToString());
 
                 await startup.Step("honeypot routes", async () =>
                 {
@@ -132,7 +134,7 @@ namespace Omnipotent.Services.OmniDefence
                     RefreshBlockedRegionSnapshot();
                 });
 
-                await ServiceLog($"OmniDefence active. Loaded {tracker.All().Count()} IP records, {honeypotRoutes.Count} honeypot routes, {blockedRegions.Count} blocked regions.");
+                await ServiceLog($"OmniDefence active. Loaded {tracker.All().Count()} IP records ({ipCost}), {honeypotRoutes.Count} honeypot routes, {blockedRegions.Count} blocked regions.");
 
                 await startup.Step("snapshots", () =>
                 {

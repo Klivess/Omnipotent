@@ -37,22 +37,57 @@ namespace Omnipotent.Services.OmniTrader.Api
         {
             DateTime observedFromUtc = DateTime.UtcNow;
             var deployments = await parent.DeploymentRepo.ListAllAsync(cancellationToken);
-            var dtos = deployments.Select(d => new
+            Dictionary<string, Persistence.OrderSummary> orders;
+            try { orders = await parent.OrderRepo.SummariesAsync(cancellationToken); }
+            catch { orders = new(); }
+            var now = DateTime.UtcNow;
+            var dtos = deployments.Select(d =>
             {
-                d.Id,
-                d.StrategyClass,
-                d.Config.Symbol,
-                Interval = d.Config.Interval.ToString(),
-                Mode = d.Mode.ToString(),
-                Status = d.Status.ToString(),
-                Armed = parent.SessionManager.IsDeploymentArmed(d.Id),
-                d.EquityInitial,
-                d.EquityCurrent,
-                PnLPercent = d.EquityInitial == 0 ? 0 : (d.EquityCurrent - d.EquityInitial) / d.EquityInitial * 100m,
-                d.CreatedUtc,
-                d.ArmedLiveUtc,
-                d.PausedUtc,
-                d.Error
+                bool armed = parent.SessionManager.IsDeploymentArmed(d.Id);
+                orders.TryGetValue(d.Id, out var summary);
+                var origin = d.Config.Origin;
+                var descriptor = parent.StrategyRegistry.Resolve(d.StrategyClass);
+                return new
+                {
+                    d.Id,
+                    d.StrategyClass,
+                    StrategyName = origin?.StrategyName ?? descriptor?.Name ?? d.StrategyClass,
+                    Label = origin?.Label,
+                    d.Config.Symbol,
+                    Interval = d.Config.Interval.ToString(),
+                    Mode = d.Mode.ToString(),
+                    Status = d.Status.ToString(),
+                    Armed = armed,
+                    d.EquityInitial,
+                    d.EquityCurrent,
+                    PnLPercent = d.EquityInitial == 0 ? 0 : (d.EquityCurrent - d.EquityInitial) / d.EquityInitial * 100m,
+                    d.CreatedUtc,
+                    d.ArmedLiveUtc,
+                    d.PausedUtc,
+                    d.Error,
+                    Shape = origin?.Shape,
+                    Origin = origin == null ? null : new
+                    {
+                        origin.Source,
+                        origin.CandidateId,
+                        origin.CandidateStatus,
+                        origin.Score,
+                        origin.StrategyId,
+                        origin.StrategyVersion,
+                        origin.BarsPerTrade,
+                        Evaluated = origin.Evaluated == null ? null : new
+                        {
+                            Interval = origin.Evaluated.Interval.ToString(),
+                            origin.Evaluated.ReturnPct,
+                            origin.Evaluated.CagrPct,
+                            origin.Evaluated.Sharpe,
+                            origin.Evaluated.MaxDrawdownPct,
+                            origin.Evaluated.Trades,
+                            origin.Evaluated.Bars,
+                        },
+                    },
+                    Health = Sessions.DeploymentHealth.Assess(d, parent.SessionManager.PulseOf(d.Id), summary, armed, now),
+                };
             }).ToList();
             return new SnapshotBuild(JsonConvert.SerializeObject(dtos), observedFromUtc);
         }

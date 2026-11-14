@@ -60,13 +60,15 @@ namespace Omnipotent.Services.OmniDefence
             this.store = store;
         }
 
-        public async Task LoadAsync()
+        /// <summary>Loads every IP record into the cache and says what the read cost (start-up reports it).</summary>
+        public async Task<OmniDefenceStore.ReadCost> LoadAsync()
         {
-            var all = await store.LoadAllIpRecordsAsync();
+            var (all, cost) = await store.LoadAllIpRecordsMeasuredAsync();
             foreach (var r in all)
             {
                 cache[r.Ip] = r;
             }
+            return cost;
         }
 
         /// <summary>Audit-row ids covered by one read of a profile-link pass, so no read holds a read slot for long.</summary>

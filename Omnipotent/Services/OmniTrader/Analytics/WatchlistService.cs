@@ -123,8 +123,23 @@ namespace Omnipotent.Services.OmniTrader.Analytics
         public async Task<List<MarketRow>> EvaluateAsync(IEnumerable<string> instrumentIds,
             TimeInterval interval = TimeInterval.OneHour, CancellationToken ct = default)
         {
-            var rows = new List<MarketRow>();
-            foreach (var instrumentId in instrumentIds.Distinct())
+            // Instruments are read side by side (six at a time) and returned in the watchlist's order. One
+            // after another, with two candle fetches each, the Markets page took 4 s at the median and 45 s
+            // at p95 on the server (19 loads in 30 days).
+            var ids = instrumentIds.Distinct().ToList();
+            var rows = new MarketRow[ids.Count];
+            using var gate = new SemaphoreSlim(6, 6);
+            await Task.WhenAll(ids.Select(async (instrumentId, index) =>
+            {
+                await gate.WaitAsync(ct);
+                try { rows[index] = await EvaluateOneAsync(instrumentId, interval, ct); }
+                finally { gate.Release(); }
+            }));
+            return rows.ToList();
+        }
+
+        private async Task<MarketRow> EvaluateOneAsync(string instrumentId, TimeInterval interval, CancellationToken ct)
+        {
             {
                 ct.ThrowIfCancellationRequested();
                 var instrument = instruments.Resolve(instrumentId);
@@ -141,7 +156,7 @@ namespace Omnipotent.Services.OmniTrader.Analytics
 
                 if (candles.Count == 0)
                 {
-                    rows.Add(new MarketRow
+                    return new MarketRow
                     {
                         InstrumentId = instrument?.Id ?? instrumentId,
                         DisplayName = instrument?.DisplayName ?? instrumentId,
@@ -149,8 +164,7 @@ namespace Omnipotent.Services.OmniTrader.Analytics
                         Stale = true,
                         DataIssue = "no candles available for this instrument",
                         TradableOn = instrument?.Venues.Select(v => v.Venue.ToString()).ToList() ?? new List<string>()
-                    });
-                    continue;
+                    };
                 }
 
                 // The bar's own stamp, plus the cadence it arrives at. Without the cadence an hourly
@@ -180,7 +194,7 @@ namespace Omnipotent.Services.OmniTrader.Analytics
                 decimal change24h = ComputeChange(candles, BarsPerDay(interval));
                 var freshness = instruments.GetFreshness(instrument?.Id ?? instrumentId);
 
-                rows.Add(new MarketRow
+                return new MarketRow
                 {
                     InstrumentId = instrument?.Id ?? instrumentId,
                     DisplayName = instrument?.DisplayName ?? instrumentId,
@@ -203,26 +217,28 @@ namespace Omnipotent.Services.OmniTrader.Analytics
                     MarketClosed = freshness.MarketLikelyClosed,
                     DataIssue = freshness.Issue,
                     Spark = Downsample(candles.Select(c => c.Close).ToList(), 48)
-                });
+                };
             }
-            return rows;
         }
 
         /// <summary>Breadth over an evaluated set — the participation measure for the Markets page.</summary>
         public async Task<BreadthReading> BreadthAsync(IEnumerable<string> instrumentIds,
             TimeInterval interval = TimeInterval.OneDay, CancellationToken ct = default)
         {
-            var series = new Dictionary<string, IReadOnlyList<OHLCCandle>>(StringComparer.OrdinalIgnoreCase);
-            foreach (var instrumentId in instrumentIds.Distinct())
+            var series = new System.Collections.Concurrent.ConcurrentDictionary<string, IReadOnlyList<OHLCCandle>>(StringComparer.OrdinalIgnoreCase);
+            using var gate = new SemaphoreSlim(6, 6);
+            await Task.WhenAll(instrumentIds.Distinct().Select(async instrumentId =>
             {
+                await gate.WaitAsync(ct);
                 try
                 {
                     string engineSymbol = instruments.EngineSymbolFor(instrumentId);
-                    series[instrumentId] = await marketData.GetHistoricalCandlesAsync(engineSymbol, interval, 120);
+                    series[instrumentId] = await marketData.GetHistoricalCandlesAsync(engineSymbol, interval, 120, ct);
                 }
                 catch { }
-            }
-            return MarketAnalytics.AnalyseBreadth(series);
+                finally { gate.Release(); }
+            }));
+            return MarketAnalytics.AnalyseBreadth(new Dictionary<string, IReadOnlyList<OHLCCandle>>(series, StringComparer.OrdinalIgnoreCase));
         }
 
         /// <summary>

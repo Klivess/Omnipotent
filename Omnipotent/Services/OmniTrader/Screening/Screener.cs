@@ -102,6 +102,26 @@ namespace Omnipotent.Services.OmniTrader.Screening
         public static List<ScreenColumn> DefaultColumns() => new[] { "price", "chg1d", "chg1m", "chg6m", "rsi14", "relvol", "atrpct", "dist52h" }
             .Select(k => { var f = Fields.First(x => x.Key == k); return new ScreenColumn { Key = k, Label = f.Label, Expr = k, Format = f.Format }; }).ToList();
 
+        /// <summary>
+        /// Fills in what a request body can leave null or blank: lists, a column's expression, inputs, the
+        /// universe. Every step of a run dereferences them; on 9 Nov 2026 a screen run failed in 0.6 s with
+        /// "Object reference not set to an instance of an object." (3 of 5 runs in 30 days failed).
+        /// </summary>
+        public static ScreenDefinition Normalise(ScreenDefinition def)
+        {
+            def.Filters = (def.Filters ?? new()).Where(f => !string.IsNullOrWhiteSpace(f)).ToList();
+            def.Columns = (def.Columns ?? new())
+                .Where(c => c != null && !string.IsNullOrWhiteSpace(c.Expr))
+                .Select(c => { if (string.IsNullOrWhiteSpace(c.Key)) c.Key = c.Expr.Trim(); c.Format ??= "number"; return c; })
+                .ToList();
+            def.Symbols = (def.Symbols ?? new()).Where(x => !string.IsNullOrWhiteSpace(x)).Select(x => x.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            def.Inputs = def.Inputs == null ? new(StringComparer.OrdinalIgnoreCase) : new(def.Inputs, StringComparer.OrdinalIgnoreCase);
+            if (string.IsNullOrWhiteSpace(def.Universe)) def.Universe = def.Symbols.Count > 0 ? "" : "megacaps";
+            if (string.IsNullOrWhiteSpace(def.Id)) def.Id = Guid.NewGuid().ToString("N");
+            if (string.IsNullOrWhiteSpace(def.Name)) def.Name = "Untitled screen";
+            return def;
+        }
+
         /// <summary>Validate every formula without running anything.</summary>
         public static List<string> Validate(ScreenDefinition def)
         {

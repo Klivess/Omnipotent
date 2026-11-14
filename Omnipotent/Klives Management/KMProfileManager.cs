@@ -404,6 +404,7 @@ namespace Omnipotent.Profiles
                 mutationLock.Release();
             }
             CacheDeps.Bump("kmprofiles");
+            InvalidateInsights();
             if (accessChanged)
             {
                 CacheDeps.Bump(AccessDependencyKey(userId));

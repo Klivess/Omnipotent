@@ -76,6 +76,32 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             return output;
         }
 
+        /// <summary>Per deployment: orders placed, filled and rejected, and the newest order's time.</summary>
+        public async Task<Dictionary<string, OrderSummary>> SummariesAsync(CancellationToken ct = default)
+        {
+            CacheDeps.NoteRead(CacheKey);
+            var map = new Dictionary<string, OrderSummary>(StringComparer.Ordinal);
+            await using var conn = await db.OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT deployment_id, COUNT(*),
+                                       SUM(CASE WHEN status='Filled' THEN 1 ELSE 0 END),
+                                       SUM(CASE WHEN status='Rejected' THEN 1 ELSE 0 END),
+                                       MAX(placed_utc)
+                                FROM orders GROUP BY deployment_id";
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                map[reader.GetString(0)] = new OrderSummary
+                {
+                    Orders = reader.GetInt32(1),
+                    Filled = reader.IsDBNull(2) ? 0 : reader.GetInt32(2),
+                    Rejected = reader.IsDBNull(3) ? 0 : reader.GetInt32(3),
+                    LastPlacedUtc = reader.IsDBNull(4) ? null : DateTime.Parse(reader.GetString(4)).ToUniversalTime(),
+                };
+            }
+            return map;
+        }
+
         public async Task<bool> ExistsByIntentAsync(string deploymentId, string intentId, CancellationToken ct = default)
         {
             await using var conn = await db.OpenAsync(ct);
@@ -102,6 +128,14 @@ namespace Omnipotent.Services.OmniTrader.Persistence
             ExchangeOrderId = r.IsDBNull(r.GetOrdinal("exchange_order_id")) ? null : r.GetString(r.GetOrdinal("exchange_order_id")),
             Error = r.IsDBNull(r.GetOrdinal("error")) ? null : r.GetString(r.GetOrdinal("error"))
         };
+    }
+
+    public sealed class OrderSummary
+    {
+        public int Orders { get; init; }
+        public int Filled { get; init; }
+        public int Rejected { get; init; }
+        public DateTime? LastPlacedUtc { get; init; }
     }
 
     public sealed class OrderRecord
