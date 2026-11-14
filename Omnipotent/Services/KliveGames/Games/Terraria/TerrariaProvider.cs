@@ -120,6 +120,12 @@ namespace Omnipotent.Services.KliveGames.Games.Terraria
 
         public string GetGracefulStopCommand() => "exit";
 
+        // "save" prints "Saving world data: 100%" and then "Backing up world file".
+        private static readonly BackupSaveHooks SaveHooks = new(null, "save",
+            new Regex(@"Backing up world file|Saving world data: 100%", RegexOptions.IgnoreCase | RegexOptions.Compiled), null);
+
+        public BackupSaveHooks? GetBackupSaveHooks() => SaveHooks;
+
         public bool TryParseStarted(string line)
             => line.Contains("Server started", StringComparison.OrdinalIgnoreCase)
             || line.Contains("Listening on", StringComparison.OrdinalIgnoreCase);

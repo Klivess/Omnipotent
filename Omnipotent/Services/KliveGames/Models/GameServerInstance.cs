@@ -66,6 +66,22 @@ namespace Omnipotent.Services.KliveGames.Models
         // ---- Timestamps ----
         public DateTime CreatedUtc { get; set; } = DateTime.UtcNow;
         public DateTime? LastStartedUtc { get; set; }
+        /// <summary>When the process last ended: a stop, a kill or a crash.</summary>
+        public DateTime? LastStoppedUtc { get; set; }
+        public int? LastExitCode { get; set; }
+        /// <summary>Seconds from launch to the game's own "ready" line on the last start.</summary>
+        public double? LastStartupSeconds { get; set; }
+        /// <summary>When <see cref="LastError"/> was set. Null on records written before it existed.</summary>
+        public DateTime? LastErrorUtc { get; set; }
+
+        // ---- Backups ----
+        /// <summary>Scheduled backup interval in hours; 0 = no schedule. A stopped server that has not run
+        /// since its last backup is skipped, so an idle server does not pile up identical zips.</summary>
+        public int BackupEveryHours { get; set; }
+        /// <summary>How many scheduled backups to keep (older ones are deleted); manual backups are never
+        /// pruned. 0 = keep all.</summary>
+        public int BackupKeep { get; set; } = 7;
+        public DateTime? LastBackupUtc { get; set; }
 
         // ---- Live runtime state (recomputed by the monitor loop; included in API responses).
         //      Persisted too, but never trusted across an app restart — Status is reconciled on boot. ----
