@@ -383,7 +383,9 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             var all = s.AllPosts().ToList();
             var published30 = all.Where(p => p.Status == PostStatus.Published && !p.IsReblog && p.PublishedUtc > now.AddDays(-30)).ToList();
             int failed30 = all.Count(p => p.Status == PostStatus.Failed && !p.IsReblog && p.UpdatedUtc > now.AddDays(-30));
-            var next = all.Where(p => p.IsPending).OrderBy(p => p.ScheduledUtc).FirstOrDefault();
+            // The next post that will go out by itself: one waiting for approval only goes when someone
+            // approves it, so it isn't "next" (it showed as a next post a day in the past).
+            var next = all.Where(p => p.IsPending && p.Status != PostStatus.AwaitingApproval).OrderBy(p => p.ScheduledUtc).FirstOrDefault();
             var kpis = new FleetKpisDto
             {
                 Blogs = s.Blogs.Count,

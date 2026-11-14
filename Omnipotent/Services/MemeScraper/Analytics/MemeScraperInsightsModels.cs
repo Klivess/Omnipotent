@@ -440,5 +440,14 @@ namespace Omnipotent.Services.MemeScraper.Analytics
         public DateTime? LastDownloadUtc { get; set; }
         /// <summary>Last 14 local days, keyed yyyy-MM-dd (the shape the old analytics route used).</summary>
         public Dictionary<string, int> MemesDownloadedPerDay { get; set; } = new();
+
+        // The schedule, so a reader can tell "nothing today" from "stalled": with a 24 h interval a quiet
+        // morning is normal, a scrape due hours ago is not.
+        /// <summary>Earliest scrape due across the reel sources.</summary>
+        public DateTime? NextScrapeDueUtc { get; set; }
+        public double? ScrapeIntervalHours { get; set; }
+        public bool? Paused { get; set; }
+        public string? SchedulerState { get; set; }
+        public DateTime? LastSchedulerTickUtc { get; set; }
     }
 }

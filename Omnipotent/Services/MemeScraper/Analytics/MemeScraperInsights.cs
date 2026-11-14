@@ -924,6 +924,7 @@ namespace Omnipotent.Services.MemeScraper.Analytics
                 TotalInstagramSources = list.Count,
                 ReelSources = list.Count(s => s.DownloadReels),
                 FailingSources = list.Count(s => s.DownloadReels && s.ConsecutiveScrapeFailures > 0),
+                NextScrapeDueUtc = list.Where(s => s.DownloadReels && s.NextScrapeDueUtc != null).Select(s => s.NextScrapeDueUtc).Min(),
             };
             var perDay = new int[14];
             foreach (var reel in reels)
