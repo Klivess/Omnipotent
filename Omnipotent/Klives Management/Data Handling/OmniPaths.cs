@@ -92,6 +92,8 @@ namespace Omnipotent.Data_Handling
             public static string MemeScraperPostsDataDirectory = $"{MemeScraperInstagramDirectory}/Posts";
             public static string MemeScraperThumbnailsDirectory = $"{MemeScraperInstagramDirectory}/Thumbnails";
             public static string MemeScraperScrapeHistoryFile = $"{MemeScraperDirectory}/ScrapeHistory.jsonl";
+            // Every reel record in one file, read at start-up instead of one file per reel (MemeScraperReelIndex).
+            public static string MemeScraperReelIndexFile = $"{MemeScraperDirectory}/ReelIndex.json.gz";
 
             //KliveChat
             public static string KliveChatDirectory = $"{SavedDataDirectory}/KliveChat";

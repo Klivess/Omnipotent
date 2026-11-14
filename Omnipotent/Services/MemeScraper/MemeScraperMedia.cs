@@ -1,22 +1,53 @@
 using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using System.Security.Cryptography;
+using Stamp = Omnipotent.Services.MemeScraper.MemeScraperReelIndex.Stamp;
 
 namespace Omnipotent.Services.MemeScraper
 {
     public class MemeScraperMedia
     {
-        MemeScraper parent;
+        MemeScraper? parent;
         private readonly object gate = new();
         private List<InstagramScrapeUtilities.InstagramReel> reels = new();
         private readonly HashSet<string> knownPostIds = new();
         private readonly HashSet<string> knownShortCodes = new();
         private readonly Dictionary<string, InstagramScrapeUtilities.InstagramReel> byPostId = new(StringComparer.Ordinal);
 
+        // The file each reel was read from (or saved to), as the directory listing describes it. Keyed by the reel
+        // object: the index writes these, and the start-up check reads only files whose stamp no longer matches.
+        private readonly Dictionary<InstagramScrapeUtilities.InstagramReel, Stamp> stamps = new(ReferenceEqualityComparer.Instance);
+        private readonly MemeScraperReelIndex index;
+        private readonly TimeSpan writeDelay;
+        private readonly SemaphoreSlim writeLock = new(1, 1);
+        private int writeScheduled;
+        private Task reconciled = Task.CompletedTask;
+
+        /// <summary>How the reels were loaded at start-up (index or every file), with timings.</summary>
+        public MemeScraperReelIndex.LoadReport? LastLoad { get; private set; }
+        /// <summary>The background check of the index against the reel directory, once it has finished.</summary>
+        public MemeScraperReelIndex.ReconcileReport? LastReconcile { get; private set; }
+        public MemeScraperReelIndex.WriteReport? LastIndexWrite { get; private set; }
+        public string? LastIndexWriteError { get; private set; }
+        /// <summary>Completes when the index has been checked against the directory (at once after a full read).</summary>
+        public Task Reconciled => reconciled;
+        /// <summary>Files read so far / to read, while a full read is running.</summary>
+        public (int Done, int Total) LoadProgress => index.Progress;
+
         /// <summary>Cheap: call <see cref="LoadAllScrapedInstagramReels"/> to populate.</summary>
         public MemeScraperMedia(MemeScraper parent)
+            : this(parent, new MemeScraperReelIndex(
+                OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory),
+                OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelIndexFile)), TimeSpan.FromSeconds(30))
+        {
+        }
+
+        /// <summary>Test seam: any reel directory and index file, no running service.</summary>
+        internal MemeScraperMedia(MemeScraper? parent, MemeScraperReelIndex index, TimeSpan writeDelay)
         {
             this.parent = parent;
+            this.index = index;
+            this.writeDelay = writeDelay;
         }
 
         /// <summary>
@@ -54,23 +85,32 @@ namespace Omnipotent.Services.MemeScraper
         {
             lock (gate)
             {
-                if (IsKnownLocked(reel)) return false;
+                if (IsKnownLocked(reel))
+                {
+                    stamps.Remove(reel);
+                    return false;
+                }
                 reels.Add(reel);
                 Index(reel);
-                return true;
             }
+            MarkIndexDirty();
+            return true;
         }
 
         public List<InstagramScrapeUtilities.InstagramReel> RemoveReels(Func<InstagramScrapeUtilities.InstagramReel, bool> predicate)
         {
+            List<InstagramScrapeUtilities.InstagramReel> removed;
             lock (gate)
             {
-                var removed = reels.Where(predicate).ToList();
+                removed = reels.Where(predicate).ToList();
                 if (removed.Count == 0) return removed;
-                reels = reels.Except(removed).ToList();
+                var gone = new HashSet<InstagramScrapeUtilities.InstagramReel>(removed, ReferenceEqualityComparer.Instance);
+                reels = reels.Where(r => !gone.Contains(r)).ToList();
+                foreach (var reel in removed) stamps.Remove(reel);
                 RebuildIndexLocked();
-                return removed;
             }
+            MarkIndexDirty();
+            return removed;
         }
 
         private bool IsKnownLocked(InstagramScrapeUtilities.InstagramReel reel) =>
@@ -95,26 +135,166 @@ namespace Omnipotent.Services.MemeScraper
             foreach (var reel in reels) Index(reel);
         }
 
+        /// <summary>
+        /// Loads every reel: from the reel index when it has one (one file), otherwise from every reel file. After an
+        /// index load, call <see cref="StartReconcile"/> once the reels are published, to pick up what changed on disk.
+        /// </summary>
         public async Task LoadAllScrapedInstagramReels()
         {
-            var result = await JsonDirectoryLoader.LoadAsync<InstagramScrapeUtilities.InstagramReel>(
-                OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory));
+            var (items, report) = await index.LoadAsync();
             lock (gate)
             {
-                reels = result.Items;
+                reels = items.Select(i => i.Reel).ToList();
+                stamps.Clear();
+                foreach (var (reel, stamp) in items) stamps[reel] = stamp;
                 RebuildIndexLocked();
             }
-            if (result.Failures > 0)
+            LastLoad = report;
+            if (report.Failures > 0)
             {
-                _ = parent.ServiceLogError($"Couldn't load {result.Failures} reel file(s), e.g. {result.FirstError}");
+                _ = parent?.ServiceLogError($"Couldn't load {report.Failures} reel file(s), e.g. {report.FirstError}");
+            }
+            if (report.Via == "files")
+            {
+                // Every file was just read, so nothing is left to check; write the index the next start will use.
+                reconciled = Task.CompletedTask;
+                MarkIndexDirty(TimeSpan.Zero);
             }
         }
+
+        /// <summary>Checks the loaded index against the reel directory in the background (no-op after a full read).</summary>
+        public Task StartReconcile()
+        {
+            if (LastLoad?.Via != "index") return reconciled;
+            reconciled = Task.Run(ReconcileCoreAsync);
+            return reconciled;
+        }
+
+        private async Task ReconcileCoreAsync()
+        {
+            // Only what the index described is checked: a reel downloaded while this runs has its own fresh stamp and
+            // must not be "removed" because the listing was taken before its file was written.
+            var known = new Dictionary<string, Stamp>(StringComparer.OrdinalIgnoreCase);
+            var byFile = new Dictionary<string, InstagramScrapeUtilities.InstagramReel>(StringComparer.OrdinalIgnoreCase);
+            lock (gate)
+            {
+                foreach (var reel in reels)
+                {
+                    if (!stamps.TryGetValue(reel, out var stamp) || !known.TryAdd(stamp.File, stamp)) continue;
+                    byFile[stamp.File] = reel;
+                }
+            }
+            MemeScraperReelIndex.ReconcileResult result;
+            try
+            {
+                result = await index.ReconcileAsync(known);
+            }
+            catch (Exception ex)
+            {
+                _ = parent?.ServiceLogError(ex, "MemeScraper couldn't check its reel index against the reel files; the index's reels stay loaded.");
+                return;
+            }
+
+            bool changed = false;
+            lock (gate)
+            {
+                foreach (var file in result.Removed)
+                {
+                    var reel = byFile[file];
+                    // A source deletion may already have taken it out.
+                    if (stamps.Remove(reel))
+                    {
+                        reels.Remove(reel);
+                        changed = true;
+                    }
+                }
+                foreach (var (file, fresh, stamp) in result.Changed)
+                {
+                    var old = byFile[file];
+                    int at = reels.IndexOf(old);
+                    if (at < 0) continue;
+                    reels[at] = fresh;
+                    stamps.Remove(old);
+                    stamps[fresh] = stamp;
+                    changed = true;
+                }
+                if (result.Added.Count > 0)
+                {
+                    var held = new HashSet<string>(stamps.Values.Select(s => s.File), StringComparer.OrdinalIgnoreCase);
+                    foreach (var (fresh, stamp) in result.Added)
+                    {
+                        // Already in memory: downloaded (and stamped) after the listing began.
+                        if (!held.Add(stamp.File)) continue;
+                        reels.Add(fresh);
+                        stamps[fresh] = stamp;
+                        changed = true;
+                    }
+                }
+                if (changed) RebuildIndexLocked();
+            }
+            LastReconcile = result.Report;
+            if (result.Report.Failures > 0)
+            {
+                _ = parent?.ServiceLogError($"Couldn't read {result.Report.Failures} changed reel file(s) while checking the reel index, e.g. {result.Report.FirstError}");
+            }
+            if (changed) MarkIndexDirty(TimeSpan.Zero);
+        }
+
+        /// <summary>Rewrites the reel index soon (several changes in a row are written once).</summary>
+        public void MarkIndexDirty(TimeSpan? delay = null)
+        {
+            if (Interlocked.Exchange(ref writeScheduled, 1) == 1) return;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var wait = delay ?? writeDelay;
+                    if (wait > TimeSpan.Zero) await Task.Delay(wait);
+                }
+                finally
+                {
+                    Interlocked.Exchange(ref writeScheduled, 0);
+                }
+                await WriteIndexAsync();
+            });
+        }
+
+        /// <summary>Writes the reel index now. Never throws: the per-reel files stay the source of truth.</summary>
+        public async Task WriteIndexAsync()
+        {
+            await writeLock.WaitAsync();
+            try
+            {
+                List<MemeScraperReelIndex.Entry> entries;
+                lock (gate)
+                {
+                    entries = reels.Select(reel => stamps.TryGetValue(reel, out var stamp)
+                        ? new MemeScraperReelIndex.Entry { File = stamp.File, Length = stamp.Length, WriteTicks = stamp.WriteTicks, Reel = reel }
+                        // No stamp (should not happen): a length of -1 never matches, so the next start reads that file.
+                        : new MemeScraperReelIndex.Entry { File = FileNameFor(reel), Length = -1, WriteTicks = 0, Reel = reel }).ToList();
+                }
+                LastIndexWrite = await index.WriteAsync(entries);
+                LastIndexWriteError = null;
+            }
+            catch (Exception ex)
+            {
+                LastIndexWriteError = ex.Message;
+                _ = parent?.ServiceLogError(ex, "MemeScraper couldn't write its reel index; the next start reads every reel file instead.", false);
+            }
+            finally
+            {
+                writeLock.Release();
+            }
+        }
+
+        private static string FileNameFor(InstagramScrapeUtilities.InstagramReel reel) =>
+            !string.IsNullOrWhiteSpace(reel.InstagramReelInfoFilePath) ? Path.GetFileName(reel.InstagramReelInfoFilePath) : $"Reel{reel.PostID}.json";
 
         public async Task SaveInstagramReel(InstagramScrapeUtilities.InstagramReel reel)
         {
             try
             {
-                string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory);
+                string path = index.ReelsDirectory;
                 if (!Directory.Exists(path))
                 {
                     Directory.CreateDirectory(path);
@@ -125,17 +305,19 @@ namespace Omnipotent.Services.MemeScraper
                 string temp = filePath + ".tmp";
                 await File.WriteAllTextAsync(temp, json);
                 File.Move(temp, filePath, overwrite: true);
+                var stamp = Stamp.Of(new FileInfo(filePath));
+                lock (gate) stamps[reel] = stamp;
             }
             catch (Exception ex)
             {
-                parent.ServiceLogError(ex, "Error saving Instagram reel");
+                _ = parent?.ServiceLogError(ex, "Error saving Instagram reel");
                 throw;
             }
         }
 
         public async Task RemoveDuplicateReelsByVideoContentAsync()
         {
-            var path = OmniPaths.GetPath(OmniPaths.GlobalPaths.MemeScraperReelsDataDirectory);
+            var path = index.ReelsDirectory;
             var hashToReel = new Dictionary<string, InstagramScrapeUtilities.InstagramReel>();
             var duplicateReels = new List<InstagramScrapeUtilities.InstagramReel>();
 
@@ -157,7 +339,7 @@ namespace Omnipotent.Services.MemeScraper
                 }
                 catch (Exception ex)
                 {
-                    parent.ServiceLogError(ex, $"Error hashing video file: {videoFilePath}");
+                    _ = parent?.ServiceLogError(ex, $"Error hashing video file: {videoFilePath}");
                     continue;
                 }
 
@@ -188,7 +370,7 @@ namespace Omnipotent.Services.MemeScraper
                 }
                 catch (Exception ex)
                 {
-                    parent.ServiceLogError(ex, $"Error deleting duplicate reel file for PostID: {reel.PostID}");
+                    _ = parent?.ServiceLogError(ex, $"Error deleting duplicate reel file for PostID: {reel.PostID}");
                 }
             }
         }

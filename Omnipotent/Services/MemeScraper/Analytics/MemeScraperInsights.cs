@@ -20,6 +20,11 @@ namespace Omnipotent.Services.MemeScraper.Analytics
         public const int MaxDays = 3660;
         /// <summary>A source whose scrapes work but which has produced nothing for this long has gone quiet.</summary>
         public const int QuietAfterDays = 14;
+        /// <summary>
+        /// A source that has been scraped this long and never found a reel is "empty". On 13 Nov 2026, 9 of 30 sources had
+        /// returned 0 reels in all 270 of their scrapes since 13 Oct, and were shown as quiet, like a busy account taking a week off.
+        /// </summary>
+        public const int EmptyAfterDays = 3;
         public const long ViralViews = 1_000_000;
         public const string OtherKey = "Other";
         public const string NoNiche = "(no niche)";
@@ -406,6 +411,7 @@ namespace Omnipotent.Services.MemeScraper.Analytics
                     MedianEngagementPct = Median(inRange.Where(f => f.EngagementPct.HasValue).Select(f => f.EngagementPct!.Value)),
                     FirstDownloadUtc = ever.Select(f => f.DownloadedUtc).Where(d => d.HasValue).Min(),
                     LastDownloadUtc = ever.Select(f => f.DownloadedUtc).Where(d => d.HasValue).Max(),
+                    LastPostedUtc = ever.Select(f => f.PostedUtc).Where(d => d.HasValue).Max(),
                     Spark = spark,
                     Scrapes = ranReports.Count,
                     ScrapeFailures = ranReports.Count(r => !string.IsNullOrEmpty(r.Error)),
@@ -446,6 +452,7 @@ namespace Omnipotent.Services.MemeScraper.Analytics
                 .ThenByDescending(s => s.TotalReels)
                 .ThenBy(s => s.Username, StringComparer.OrdinalIgnoreCase)
                 .ToList();
+            view.Library.EmptySources = view.Sources.Count(s => s.State == "empty");
 
             // ── Niches ──
             var nicheNames = registered.SelectMany(NicheNames).Concat(cur.SelectMany(f => f.Niches))
@@ -535,8 +542,19 @@ namespace Omnipotent.Services.MemeScraper.Analytics
             if (row.ConsecutiveScrapeFailures > 0) return ("warn", $"Last scrape failed: {row.LastScrapeError}");
             if (row.LastScrapeDownloadFailures > 0) return ("warn", $"{row.LastScrapeDownloadFailures} download(s) failed last time; they are retried next scrape.");
             if (row.LastSuccessfulScrapeUtc == null) return ("idle", "Not scraped yet.");
+            if (row.TotalReels == 0 && row.LastScrapeReelsFound == 0
+                && (row.AddedUtc is not DateTime added || nowUtc - added >= TimeSpan.FromDays(EmptyAfterDays)))
+            {
+                string since = row.AddedUtc is DateTime a ? $"since it was added on {a:d MMM}" : "so far";
+                return ("empty", $"Every scrape {since} found no reels: the account has none to give, or hides them. Each scrape still costs a browser run.");
+            }
             if (row.LastDownloadUtc is DateTime last && nowUtc - last > TimeSpan.FromDays(QuietAfterDays))
+            {
+                // The post date says whether the account stopped posting (nothing to fix) or the scraper stopped seeing it.
+                if (row.LastPostedUtc is DateTime posted && posted <= last)
+                    return ("quiet", $"Scrapes work. The account's newest reel was posted {(int)(nowUtc - posted).TotalDays} days ago, so it has stopped posting.");
                 return ("quiet", $"Scrapes work, but no new reel for {(int)(nowUtc - last).TotalDays} days: the account has gone quiet.");
+            }
             if (row.LastDownloadUtc == null) return ("quiet", "Scrapes work, but no reel has been downloaded from this account yet.");
             return ("ok", "Scraping normally.");
         }
@@ -606,6 +624,18 @@ namespace Omnipotent.Services.MemeScraper.Analytics
                         : $"{string.Join(", ", quiet.Take(4).Select(s => $"@{s.Username} ({(int)(nowUtc - s.LastDownloadUtc!.Value).TotalDays} d)"))}{(quiet.Count > 4 ? $" and {quiet.Count - 4} more" : "")}: scrapes succeed but nothing new is posted.")
                         + " Consider replacing them with more active accounts.",
                     Sources = quiet.Select(s => s.Username).ToList(),
+                });
+            }
+            var empty = reelSources.Where(s => s.State == "empty").OrderBy(s => s.Username, StringComparer.OrdinalIgnoreCase).ToList();
+            if (empty.Count > 0)
+            {
+                list.Add(new Insight
+                {
+                    Level = "warn",
+                    Title = empty.Count == 1 ? $"@{empty[0].Username} has never had a reel" : $"{empty.Count} sources have never had a reel",
+                    Detail = $"{string.Join(", ", empty.Take(4).Select(s => "@" + s.Username))}{(empty.Count > 4 ? $" and {empty.Count - 4} more" : "")} "
+                             + $"{(empty.Count == 1 ? "has" : "have")} found no reels in any scrape, yet each is still scraped every day. Pause or replace {(empty.Count == 1 ? "it" : "them")}.",
+                    Sources = empty.Select(s => s.Username).ToList(),
                 });
             }
 

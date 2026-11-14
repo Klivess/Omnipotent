@@ -243,6 +243,8 @@ namespace Omnipotent.Services.MemeScraper.Analytics
         public double? MedianEngagementPct { get; set; }
         public DateTime? FirstDownloadUtc { get; set; }
         public DateTime? LastDownloadUtc { get; set; }
+        /// <summary>When the account posted the newest reel the library holds from it. Tells a dormant account from a scraper fault.</summary>
+        public DateTime? LastPostedUtc { get; set; }
         /// <summary>Downloads across the window, folded to at most <see cref="MemeScraperInsights.SparkPoints"/> points.</summary>
         public int[] Spark { get; set; } = Array.Empty<int>();
         public int Scrapes { get; set; }
@@ -257,7 +259,7 @@ namespace Omnipotent.Services.MemeScraper.Analytics
         public int LastScrapeReelsFound { get; set; }
         public int LastScrapeReelsDownloaded { get; set; }
         public int LastScrapeDownloadFailures { get; set; }
-        /// <summary>ok, quiet, idle, warn, bad, paused or removed.</summary>
+        /// <summary>ok, quiet, empty, idle, warn, bad, paused or removed.</summary>
         public string State { get; set; } = "ok";
         public string StateReason { get; set; } = "";
     }
@@ -334,6 +336,8 @@ namespace Omnipotent.Services.MemeScraper.Analytics
         public int ReelSources { get; set; }
         public int PausedSources { get; set; }
         public int FailingSources { get; set; }
+        /// <summary>Reel sources whose scrapes work but have never found a reel (state "empty").</summary>
+        public int EmptySources { get; set; }
         public int Niches { get; set; }
         public DateTime? FirstDownloadUtc { get; set; }
         public DateTime? LastDownloadUtc { get; set; }

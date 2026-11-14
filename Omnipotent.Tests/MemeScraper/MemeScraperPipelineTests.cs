@@ -204,6 +204,42 @@ namespace Omnipotent.Tests.MemeScraper
         }
 
         [Fact]
+        public async Task AnAccountWithNoReelsNeverBenchesAWorkingPrimary()
+        {
+            // Live 13 Nov 2026: inflact answered "HTTP 200: Something went wrong" for 8 accounts that have no reels, and
+            // Instagram confirmed none. Three of those scraped back to back used to bench inflact for 6 hours.
+            var primary = new FakeProvider("inflact", r => r.Username.StartsWith("empty") ? Throws("[inflact] reels API failed: HTTP 200: Something went wrong") : Found("inflact", "EEEEE1"));
+            var fallback = new FakeProvider("instagram", _ => new ReelDiscoveryResult { Provider = "instagram", PagesFetched = 1 });
+            var chain = new InstagramScrapeUtilities(primary, fallback);
+
+            for (int i = 0; i < InstagramScrapeUtilities.FailuresBeforeBench + 1; i++)
+            {
+                var outcome = await chain.DiscoverReelsAsync($"empty{i}", _ => false, 10, CancellationToken.None);
+                Assert.Empty(outcome.Reels);
+                Assert.Contains(outcome.Attempts, a => a.Contains("failure not counted"));
+            }
+            var health = chain.GetProviderHealth().Single(h => h.Name == "inflact");
+            Assert.Equal(0, health.ConsecutiveFailures);
+            Assert.Null(health.BenchedUntil);
+
+            // The next real account still goes to inflact first.
+            var real = await chain.DiscoverReelsAsync("memes", _ => false, 10, CancellationToken.None);
+            Assert.Equal("inflact", real.SucceededVia);
+        }
+
+        [Fact]
+        public async Task APrimaryErrorStillCountsWhenTheFallbackFailsToo()
+        {
+            var primary = new FakeProvider("inflact", _ => Throws("Just a moment..."));
+            var fallback = new FakeProvider("instagram", _ => Throws("login wall"));
+            var chain = new InstagramScrapeUtilities(primary, fallback);
+
+            await Assert.ThrowsAsync<ReelProviderException>(() => chain.DiscoverReelsAsync("user", _ => false, 10, CancellationToken.None));
+
+            Assert.All(chain.GetProviderHealth(), h => Assert.Equal(1, h.ConsecutiveFailures));
+        }
+
+        [Fact]
         public async Task SameReelFromBothProvidersIsMergedByShortCode()
         {
             var primary = new FakeProvider("inflact", _ => new ReelDiscoveryResult { Provider = "inflact" });

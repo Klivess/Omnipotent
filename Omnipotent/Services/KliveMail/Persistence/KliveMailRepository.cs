@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -26,7 +27,25 @@ namespace Omnipotent.Services.KliveMail.Persistence
 
         private readonly KliveMailDb db;
 
+        // Lists served from memory between writes. On 13 Nov 2026, 101 of 122 list calls in a day were the mail page
+        // re-polling the same first page (inside /batch). Each opened SQLite on the server's D: volume, which is slow per
+        // read under load (MemeScraper listed 20k files there in 61 s the same afternoon): p50 0.7 ms, p95 4.0 s, max 16 s.
+        // Every write below goes through Changed(), which moves the version on, so a list is never older than the store.
+        private long listVersion;
+        private readonly ConcurrentDictionary<string, (long Version, List<MessageSummary> Rows)> listMemo = new(StringComparer.Ordinal);
+        private const int ListMemoMax = 64;
+        /// <summary>Lists that had to run their SQL (the rest came from memory). For tests and the health line.</summary>
+        internal long ListQueries;
+
         public KliveMailRepository(KliveMailDb db) { this.db = db; }
+
+        /// <summary>Something messages or digests depend on changed: drop the remembered lists and bump the response cache.</summary>
+        private void Changed()
+        {
+            Interlocked.Increment(ref listVersion);
+            listMemo.Clear();
+            CacheDeps.Bump(CacheKey);
+        }
 
         // ─────────────────────────── Ingestion ───────────────────────────
 
@@ -106,7 +125,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 await tx.CommitAsync(ct);
                 return true;
             }, ct);
-            CacheDeps.Bump(CacheKey);
+            Changed();
         }
 
         private static void AddDigestInsert(SqliteCommand cmd, string messageId, KliveMailDigest.Digest digest)
@@ -161,7 +180,15 @@ namespace Omnipotent.Services.KliveMail.Persistence
             int page = Math.Max(1, q.Page);
             int pageSize = Math.Clamp(q.PageSize, 1, 200);
 
+            string key = string.Join("|", NormalizeAddress(q.Mailbox ?? ""), q.UnreadOnly, q.HasAttachmentOnly, q.CodesOnly, q.Trash, page, pageSize);
+            long version = Interlocked.Read(ref listVersion);
+            if (listMemo.TryGetValue(key, out var held) && held.Version == version)
+            {
+                using (RequestTrace.AmbientSpan("mail-memo")) return new List<MessageSummary>(held.Rows);
+            }
+
             var list = new List<MessageSummary>();
+            Interlocked.Increment(ref ListQueries);
             await using var conn = await OpenTracedAsync(ct);
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = ListSql(q);
@@ -174,7 +201,13 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 await using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct)) list.Add(MapSummary(reader));
             }
-            return list;
+            // Kept only if nothing was written while it ran; a write after this moves the version on, so it is never served.
+            if (Interlocked.Read(ref listVersion) == version)
+            {
+                if (listMemo.Count >= ListMemoMax) listMemo.Clear();
+                listMemo[key] = (version, list);
+            }
+            return new List<MessageSummary>(list);
         }
 
         internal const string ThreadSql = @"SELECT " + SummaryColumns + @"
@@ -323,7 +356,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 cmd.Parameters.AddWithValue("$v", value ? 1 : 0);
                 rows = await cmd.ExecuteNonQueryAsync(ct);
             }, ct);
-            if (rows > 0) CacheDeps.Bump(CacheKey);
+            if (rows > 0) Changed();
             return rows;
         }
 
@@ -341,7 +374,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 if (box) cmd.Parameters.AddWithValue("$mb", NormalizeAddress(mailbox!));
                 rows = await cmd.ExecuteNonQueryAsync(ct);
             }, ct);
-            if (rows > 0) CacheDeps.Bump(CacheKey);
+            if (rows > 0) Changed();
             return rows;
         }
 
@@ -375,7 +408,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 cmd.Parameters.AddWithValue("$c", DateTime.UtcNow.ToString("o"));
                 rows = await cmd.ExecuteNonQueryAsync(ct);
             }, ct);
-            if (rows > 0) CacheDeps.Bump(CacheKey);
+            if (rows > 0) Changed();
             return rows > 0;
         }
 
@@ -390,7 +423,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 cmd.Parameters.AddWithValue("$a", address);
                 rows = await cmd.ExecuteNonQueryAsync(ct);
             }, ct);
-            if (rows > 0) CacheDeps.Bump(CacheKey);
+            if (rows > 0) Changed();
             return rows > 0;
         }
 
@@ -546,7 +579,7 @@ namespace Omnipotent.Services.KliveMail.Persistence
                 built += digests.Count;
                 if (batch.Count < batchSize) break;
             }
-            if (built > 0) CacheDeps.Bump(CacheKey);
+            if (built > 0) Changed();
             return built;
         }
 
