@@ -15,6 +15,9 @@ Repository: `klives-management-website`, branch `omniscience-v3`, worktree
 3. **2026-11-13, the merged contract.** After the backend merge, `contracts.ts` is a copy of `api-contracts.ts` on
    `omniscience-v3` with every workstream in it (`5cde727`), so WS-A's, WS-B's and WS-D's DTOs are typed now. The notice
    list has sentences for plan reminders and standing-question flips (`0d518cd`). Their pages are the next slice.
+4. **2026-11-14, the pages for those routes** (`74aec4a`, `29d1eb4`): what is known about a person, the review queue,
+   asking, the agenda, the Quality Lab, replicas, sources and imports, and image search. Two small backend additions went
+   with them (`7be4506`): `GET people/names` and contract types for the Quality Lab's read model.
 
 ## Built
 Pages live under `pages/omniscience-v3/` (routes `/omniscience-v3/*`) so the legacy pages keep working until cutover, mirroring
@@ -46,8 +49,17 @@ turn the legacy page into a parent route.
 | Communities | `communities.vue` | Places (N13): the busiest servers and group chats, each with its trend, who carries it, who is rising, tone against its usual, what it says about Klives, what changed, factions, channels and coverage; rebuild one. Circles (N12) with bridges. The people map (N16) as an SVG scatter, coloured by circle, sized by messages, each point linking to the person. |
 | Links | `links.vue` | Search shared links by words, kind, topic and site; private links are marked and never looked up; follow a link or a site: first share, who passed it on, where, when, every share. |
 | Data controls | `data.vue` | Forget a person at either level (switch analysis off, or erase everything with or without Klives's side of their direct chats): a preview with counts and notes, a typed confirmation word (FORGET or ERASE), the run followed to its end. The analysis-off list with "switch back on". Retention per stream. Encrypted backups: list, back up now, restore into a folder, export the key under a passphrase, import a key. Export one person as JSON or Markdown (needs `data.export`). |
+| Person: what is known | `people/[id].vue` (tabs), `PersonKnowledge.vue`, `FactDrawer.vue` | The knowledge profile (`knowledge/profile`): stated facts by category with status, confidence, the period they held ("about" when it is only known as a range) and how it is known; what was only inferred, labelled as such; open guesses; the names people use for them (confirm, reject); what they mention; the age band with its statements (confirm, reject) and what follows from it. A fact opens with its quoted evidence, its earlier versions and Klives's own decision; confirm, reject or correct it. "Read their messages again now". |
+| Person: timeline, audit | `PersonTimeline.vue`, `PersonAudit.vue`, `PlanList.vue` | Dated life events with the range each could have happened in, and their plans. How it was worked out: reading runs, claims with the reason each was rejected, and merges with undo. |
+| Ask | `ask.vue`, `InquiryReport.vue`, `InquiryEvidence.vue` | A question with optional people, an as-of time and "keep watching"; a preview of how it would be answered (`knowledge/ask/plan`); the run followed live, then the answer: verdict, probability with its band, evidence for and against in the people's own words, what was read and left out, what would change it. Right/wrong marks. Past answers with a "Which person did you mean?" hand-back. Questions being watched, on and off. |
+| Review | `review.vue` | The queue by state, kind and order, each kind explained and pointed at where it is decided; settle or dismiss. "Same person?": suggested identity links with their independent signs; a yes merges only after a confirmation and with `sources.manage`, and can be undone. Merge two people by hand. |
+| Agenda | `agenda.vue` | Coming up, overdue and Klives's own promises from the agenda read model; every recorded plan with filters. |
+| Quality Lab | `quality.vue`, `QualityTable.vue` | The gate decision on the extraction prompt in use, measurements against Klives's decisions and against the planted-fact corpus with their intervals; start either measurement. |
+| Replicas | `replicas/index.vue`, `replicas/[id].vue`, `ReplicaChat.vue` | Status and the list; what there is to learn from, the version in use and how often a judge tells it apart, a build with its stages, auto-rebuild; chats with replies streamed as they are written (`omniPostStream`), every written line marked as a simulation, ratings; versions with style, periods and the settings tried; test replies beside the real ones; a blind test. Group simulations. Someone under 18 has no replica and the page says so. |
+| Sources | `sources.vue` | The Discord connection and reading a channel's history now; the import inbox: upload (`omniUpload`, a streamed PUT), "look inside" (a job, followed to its result), the question it cannot answer by itself (a WhatsApp export's time zone), import, and what was imported before. |
+| Images | `images.vue`, `Media.vue` | Search by description with poster, conversation and date filters; thumbnails loaded as blobs (the media routes need the auth header); a drawer with the image, its caption, tags, the text in it and why it was found. |
 | Health | `health.vue` | Open data-health problems in words with links to jobs or model calls, resolved ones, the monitors (person activity, topic surge) with on/off and delete and a topic's 28-day status, what the monitors found, translation status. Polls every minute. |
-| Registration | `nuxt.config.ts`, `scripts/pageAccess.ts`, `layouts/navbar.vue`, `Shell.vue` | `ssr:false` rules, access rules (playbooks `tactics.run`; cohorts, people, communities, signals `persons.read`; links, digests `messages.read`; health `overview.view`; data controls `engine.manage`), nav groups Work / People / Watch / Engine. |
+| Registration | `nuxt.config.ts`, `scripts/pageAccess.ts`, `layouts/navbar.vue`, `Shell.vue` | `ssr:false` rules, access rules (playbooks `tactics.run`; cohorts, people, communities, signals, ask, review, agenda `persons.read`; links, digests, images `messages.read`; replicas `replica.read`; sources `sources.view`; health, quality `overview.view`; data controls `engine.manage`), nav groups Work / People / Knowledge / Watch / Engine. |
 
 Rules followed: instants are epoch ms and only formatted in `format.ts`; every list is keyset-paged; nothing is computed in the
 browser beyond sums of what the server returned; every panel names its state (never a blank widget); every action is gated with
@@ -70,6 +82,16 @@ person-targeted is shown about someone under 18 (the server withholds it; the pa
   (9 new, 18 from slice 1). The domain mock is `tests/e2e/fixtures/omniscience-v3-domain.ts`: typed against the contract,
   synthetic people only, plugged into the engine mock so an unknown route still fails the test.
 
+2026-11-14 (slice 3):
+- `npx vue-tsc --noEmit`: only the same two errors from `master`.
+- `npx playwright test tests/e2e/omniscience-v3*.spec.ts --project=chromium`: 37 passed (10 new in
+  `omniscience-v3-knowledge.spec.ts`; its mock is `tests/e2e/fixtures/omniscience-v3-knowledge.ts`, with the server's own
+  value sets: fact statuses, inquiry states, job states, replica statuses).
+- Every first page load of the three specs goes through `loadPage` (in the shared fixture). With several dev servers
+  running, one test in 37 failed per run, a different one each time, on `net::ERR_NO_BUFFER_SPACE`: a module could not be
+  served, the app never mounted and the test waited on a blank page. `loadPage` loads the page again when that happens.
+- `npm run build` was not run for this slice.
+
 - **Not verified against a running backend.** Nothing here has been clicked through against a real `OmniscienceV3` service.
 
 Running the tests: let Playwright start the dev server from the worktree on its own port —
@@ -78,20 +100,22 @@ main folder's server, and the session's preview tool starts the main folder's si
 the first navigation is a full load (`go()` in the specs): repeated full loads of the dev server exhaust socket buffers on Windows.
 
 ## Not built, and why
-- **Pages that need WS-A, WS-B or WS-D DTOs** — conversations and the message view, search, ask, faces, the knowledge graph and
-  review queues, replicas, sources and their backfills: their routes are not in WS-C's contract.
+- **Conversations and the message view, message search, faces, the knowledge graph.** There is no route that returns
+  messages (see gap 10), faces are not built on the backend, and no graph route exists.
 - **Citations open nothing yet.** Briefs and digests cite message ids; there is no v3 route that returns messages by id, so a
   point shows how many messages back it, not the messages.
 - **Primitives that only those pages need** — context-menu tactics on a selection, jobs / tactics tray, virtualised list with
   multi-select, saved-views manager, network graph (cytoscape), image viewer with face boxes, dataset-driven global filter bar
   shared across pages, the global as-of picker.
-- **Ask bar** (natural language → tactic + parameters): no route.
+- **Ask bar in the shell** (natural language → tactic + parameters, from any page): the Ask page uses `knowledge/ask/plan`
+  for this; the shell's palette does not.
 - **Outbound tactics** (X77–X81) cannot be started: see contract gap 2. The UI says so and disables Run.
 
 ## Contract gaps for the other workstreams and Phase 3
 1. **Read-model bodies need contract types.** Mark each read model's body record `[ApiContract]` so it lands in
-   `api-contracts.ts`; WS-E builds the domain pages on those types. `person.dossier` is now typed (`DossierDto`); the page casts
-   `ReadModelDto.body` to it, because `rm` itself still answers `body: unknown`.
+   `api-contracts.ts`; WS-E builds the domain pages on those types. Typed so far: `person.dossier` (`DossierDto`),
+   `knowledge.profile`, `knowledge.timeline`, `knowledge.agenda` and, since `7be4506`, `knowledge.quality` (`QualityLabDto`).
+   The pages cast `ReadModelDto.body` to them, because the envelope itself still answers `body: unknown`.
 2. **Outbound confirmation has no route.** `POST tactics/run` answers `confirmation_required` when `confirmationToken` is
    missing, but nothing issues a token. Needed: a preview route that returns what would be sent plus a token (`OutboundPolicy`).
 3. **Explore drill-down by time bucket.** The UI narrows a drilled row by its split dimensions (`narrow` filters). A time-bucket
@@ -107,8 +131,9 @@ the first navigation is a full load (`go()` in the specs): repeated full loads o
 8. **Finding payloads are untyped.** `NoticeDto.data`, `MonitorEventDto.data`, `HealthIssueDto.detail` and
    `MonitorRuleDto.definition` are `unknown`; `findings.ts` writes sentences from the keys the modules use today. Either type each
    kind (`[ApiContract]` records) or send the sentence, so a renamed key cannot silently degrade a notice to its kind's name.
-9. **No pickers for places.** Watch rules, digests and subscriptions take server, chat and person ids typed by hand. Needed: a
-   lookup route (guilds, conversations and people by name, minor-filtered) for pickers.
+9. **No pickers for places.** Watch rules, digests and subscriptions take server and chat ids typed by hand. People have a
+   picker now (`PersonPick.vue`, on the directory search) and ids are shown as names (`GET people/names`, `useOmniNames`);
+   the older pages do not use them yet. Still needed: a lookup route for servers and conversations by name.
 10. **Messages by id.** See "Citations open nothing yet": `messages/get?ids=` (minor- and analysis-off-aware) would let every
     cited point, alert hit and inbox item open its message.
 

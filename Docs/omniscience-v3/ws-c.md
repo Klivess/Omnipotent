@@ -19,7 +19,7 @@ lands, so a restart can resume from it.
 | Wellbeing check-ins (N14, X44) | 9cb702a | `InsightsModule.Wellbeing.cs`, insights migration 2. |
 | Data controls (N20, X76) | 5bf8ec4 | `Modules/DataControls`, `Storage/Forgotten.cs`, `Storage/AnalysisOff.cs`, `Api/DataControlsRoutes.cs`; analysis off touches the classifier, rollups, signals, briefs, insights, transforms, explore, projections and the tactic runner (a few lines each); the old-database importer honours both. See "For the merge" in its section. |
 | Community pages (N13), similar people and map (N16) | 59c185d | `InsightsModule.Spaces.cs`, `InsightsModule.People.cs`, `Layout2D.cs`; insights migrations 3 and 4; rollups migration 2 (`rollup_scope_day.klives`). |
-| Link intelligence (N15, X23) and translation (N19, X33) | 9beaba8 | `Modules/Links`, `Modules/Translate`, `Api/LinksRoutes.cs`, `Api/TranslateRoutes.cs`, `Kernel/Modules/Translations.cs` (additive). `BriefsModule` now takes the translation layer; in `BuildModules()` it is added after the list for that reason. Looking links up at providers is **off by default** (`links.unfurl.enabled`). |
+| Link intelligence (N15, X23) and translation (N19, X33) | 9beaba8 | `Modules/Links`, `Modules/Translate`, `Api/LinksRoutes.cs`, `Api/TranslateRoutes.cs`, `Kernel/Modules/Translations.cs` (additive). `BriefsModule` now takes the translation layer; in `BuildModules()` it is added after the list for that reason. Looking links up at providers (`links.unfurl.enabled`) was off by default; it is **on by default since `077e481`** (Klives's decision, 2026-11-13). |
 | Monitors (X42, X43, X46, X47, X51) and the discourse tactics (X32, X35) | the commit after links and translation | `Modules/Monitors`, `Api/MonitorsRoutes.cs`, `Modules/Briefs/DiscourseTactics.cs`. `MonitorsModule` is handed the signals module (notices). |
 
 ## What the other workstreams integrate against (C-base)
@@ -410,8 +410,8 @@ Module `links` (`Modules/Links`), routes under `links/` (`Api/LinksRoutes.cs`), 
   itself the permission to read a private file (Google Docs, Dropbox, OneDrive, Discord invites, …) is kept **without its
   query**, marked, and never looked up anywhere.
 - **Where the description comes from.** First the preview stored with the message (`message_embeds`): no request at all,
-  stamped with when the message arrived. Only when a link has none, **and only when `links.unfurl.enabled` is switched on
-  (it is off by default)**, the provider's own metadata endpoint is asked: eight fixed hosts (`LinkParser.EndpointHosts`),
+  stamped with when the message arrived. Only when a link has none, **and only while `links.unfurl.enabled` is on
+  (the default since `077e481`; Klives's decision on 2026-11-13)**, the provider's own metadata endpoint is asked: eight fixed hosts (`LinkParser.EndpointHosts`),
   about a public link, never the shared address itself. The fetcher (`HttpLinkFetcher`) allows only https, those hosts,
   default port and no credentials; resolves the host itself and refuses private, loopback and link-local addresses, then
   connects to exactly the address it checked; follows at most two redirects, each through the same checks; sends no
@@ -553,8 +553,10 @@ permission; everything else needs engine management.
   loses its last evidence message to an erase should be retracted by WS-B. **Done** (`621d1e4`, `9afcf26`): the knowledge
   reader leaves out what they wrote and reloads the set at once after a switch; claims and rows citing a forgotten message
   go, and the people they were about are consolidated again (change kind `evidence.removed`).
-- KliveRAG's Omniscience connector must drop what it indexed about a person on `person.erase`. **Open, for cutover:** the
-  connector reads the v2 database only; a v3 connector must purge on `person.erase` and leave out analysis-off people.
+- KliveRAG's Omniscience connector must drop what it indexed about a person on `person.erase`. **Done** (`892d22b`,
+  `2437c28`): KliveRAG has a v3 connector behind the switch `OmniscienceV3_FeedsKliveRag` (off until cutover). It holds
+  nothing about someone forgotten, with analysis off or possibly under 18; every read drops such documents from the
+  moment the forget is confirmed, and the events `data.forgetting` and `data.forgotten` make it purge at once.
 - A route that sets a person's tier must not be read as switching analysis back on: the mark is what counts, not the tier.
 - `IPolicyOracle` is unchanged (WS-B wraps it).
 

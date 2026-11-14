@@ -29,8 +29,8 @@ Another live session commits and pushes on master from the main folder, so never
 |---|---|---|
 | 0 | Branch, docs, contracts | done |
 | 1 | Foundations: temporal ✓, storage ✓, kernel ✓, LLM gateway ✓, ML runtime ✓, policy ✓, API skeleton ✓, legacy importer ✓, synthetic corpus + perf harness ✓ | done (contracts to freeze) |
-| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | built on every branch (2026-11-12) and merged into `omniscience-v3` (2026-11-13). Not built: captions, visual search and faces (WS-A, waiting on decisions); website pages for the WS-A/B/D routes (their DTOs are typed in the merged contract now) |
-| 3 | Integration, shadow run, parity gates, cutover | integration done on `omniscience-v3` (2026-11-13; "Next" item 2): merged A → C → B → D, the open wiring done, X17, X48 and X50 built, 474 of 479 v3 tests pass. Shadow run, parity gates and cutover not started |
+| 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | built on every branch (2026-11-12) and merged into `omniscience-v3` (2026-11-13). Captions and visual search (WS-A) and the website pages for the WS-A/B/D routes followed on 2026-11-13/14. Not built: faces (WS-A: the face stack and its model files are still to be chosen) |
+| 3 | Integration, shadow run, parity gates, cutover | integration done on `omniscience-v3` ("Next" items 2 and 3): merged A → C → B → D, the open wiring done, X17, X48 and X50 built, KliveRAG fed by v3 behind a switch. Shadow run, parity gates and cutover not started |
 
 ## Log
 - 2026-11-06:
@@ -188,11 +188,25 @@ Another live session commits and pushes on master from the main folder, so never
    Tests: 474 of 479 v3 tests pass, twice in a row (5 opt-in skipped). The whole suite: 4,028 of 4,064 pass, 33 skipped, 3 fail, all outside v3. `KliveLLM.BriefContinuityTests.MultiWakeReplay…` fails the same way at the branch point `b270cc7` (master's, as noted on 2026-11-06; checked in a throwaway worktree). `KliveAPI.Telemetry.TelemetryEngineTests.InstantResponses_AtScale` and `Projects.StimulusQueueTests.UnavailableDestinationCannotDeadlock…` failed under the full run's load and pass on their own (outside its own folders the branch changes only KliveLLM's gateway files, `Program.cs` and the project file).
    Website: `vue-tsc` shows only master's two errors; the 27 v3 e2e tests pass.
 
-   Not done at the merge: KliveRAG's Omniscience connector reads the v2 database only, so a v3 connector (purging on
-   `person.erase`, leaving out analysis-off people) belongs to cutover. The general search does not union
-   `translate/search` yet. WS-A's source health does not hand findings to the notices.
-3. Still to do: website pages for the WS-A, WS-B and WS-D routes (knowledge and review queues, inquiries, replicas, sources and
-   backfills, media), now that the merged contract types them; the shadow run on live data (`OmniscienceV3_ShadowEnabled=true`
-   on the server); parity gates, Quality Lab gates, cutover, and then the website branch. Decisions still open for Klives:
-   the cutover itself; downloading model files (faces, visual search); image input for captions; whether link provider
-   lookups (`links.unfurl.enabled`, off) should be on; the Discord user-token gateway (not built).
+   Not done at the merge: the v3 connector for KliveRAG (built since: item 3). Still open: the general search does not
+   union `translate/search`, and WS-A's source health does not hand findings to the notices.
+3. **After the merge, 2026-11-13/14** (Klives: "Do all of these", then "Yes, finish it").
+
+   | Commit | What |
+   |---|---|
+   | `892d22b` | KliveRAG fed by v3 (`Integration/KnowledgeFeed.cs`, `KliveRAG/Connectors/OmniscienceV3Connector.cs`). One switch, `OmniscienceV3_FeedsKliveRag` (off), says which engine feeds KliveRAG's "omniscience" source; the other engine's documents are removed. A document is one person and category of current stated facts that are accepted or confirmed by Klives: never message text, an inference or a sensitive attribute, and never about someone forgotten, merged away, with analysis off, or who is or may be under 18. The message-search leg leaves the same people out. |
+   | `077e481` | Link previews from providers (`links.unfurl.enabled`) are on by default: Klives's decision on 2026-11-13. |
+   | `5d597e0` | Image captions (N2, module `media.caption`): a user turn in the LLM gateway can carry images (`LlmTurn.Images`); calls with images are logged as such and kept out of the prefix-cache measure that pauses background work; a daily budget (300); tracked, watched and Klives's own images first. Nothing is captioned for someone under 18 or with analysis off, and a caption never says who anyone is. |
+   | `7b2eeb5` | Visual search (N2, module `media.visual`, `GET media/search`): a local CLIP model (ViT-B/32, MIT licence, each file pinned by SHA-256; Klives agreed to the download). Images are ranked by how they look and by the words in their caption and OCR text, and each hit says why it was found. The image pivot X24 is not built. |
+   | `2437c28` | KliveRAG lets go at once. Every KliveRAG read (search, prompt injection, `read_knowledge_doc`) drops what v3 no longer allows before it answers, from the moment a forget is confirmed (`KnowledgeFeed.MayHold` reads the tombstone). The forget raises `data.forgetting` at confirmation and `data.forgotten` at the end; KliveRAG runs a pass on both. Documents say whom they name, and one naming someone no longer allowed is rebuilt without waiting for the profile. The forget run also has the people named together with the forgotten person consolidated again, and that path (job kind `reproject`) rebuilds their profile, timeline and plans. While v3 is not running, none of its documents are shown. |
+   | `7be4506` | `GET people/names` (display names for person ids) and contract types for the Quality Lab's read model (`QualityLabDto`). |
+   | website `74aec4a`, `29d1eb4` | WS-E slice 3: a person's knowledge, timeline and audit tabs, Review, Ask, Agenda, Quality Lab, Replicas, Sources and Images ([ws-e.md](ws-e.md)). Every first page load of the three v3 e2e specs goes through `loadPage`, which loads the page again when the dev machine runs out of socket buffers. |
+
+   Tests: 516 of 522 v3, KliveRAG and gateway tests pass (6 opt-in skipped). The whole suite: 4,044 of 4,081 pass, 34 skipped, 3 fail, the same three as on 2026-11-13 and all outside v3: `KliveLLM.BriefContinuityTests.MultiWakeReplay…` (fails the same way at the branch point, so it is master's), and `KliveAPI.Telemetry.TelemetryEngineTests.InstantResponses_AtScale` and `Projects.StimulusQueueTests.UnavailableDestinationCannotDeadlock…`, which fail under the full run's load and pass on their own.
+   Website: `vue-tsc` shows only master's two errors; all 37 v3 e2e tests pass (10 new).
+4. Still to do: faces (N1) and the image pivot X24; the shadow run on live data (`OmniscienceV3_ShadowEnabled=true` on the
+   server); parity gates, Quality Lab gates, and cutover, which switches `OmniscienceV3_FeedsKliveRag` and
+   `ingest.discord_bot.enabled` on; then the website branch. Smaller open items: the general search does not union
+   `translate/search`; WS-A's source health does not hand findings to the notices; no page opens a cited message
+   (ws-e.md gap 10). Decisions still open for Klives: the cutover itself; the face stack and its model files; the Discord
+   user-token gateway (not built).
