@@ -21,6 +21,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         Task<string?> ListOnCSFloatAsync(PurchasedListing position, int priceCents, CancellationToken ct);
         Task<bool> RepriceOnCSFloatAsync(PurchasedListing position, int priceCents, CancellationToken ct);
         Task DelistFromCSFloatAsync(PurchasedListing position, CancellationToken ct);
+        /// <summary>Reads what CSFloat says became of the position's relist and whether its unit is still in the inventory.</summary>
+        Task<RelistFacts> InspectRelistAsync(PurchasedListing position, CancellationToken ct);
         Task SaveAsync(PurchasedListing position);
         Task NotifyAsync(PurchasedListing position, string title, string message);
         Task AlertAsync(string key, string title, string message);
@@ -63,6 +65,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
 
         private readonly IExitHost host;
         private readonly Func<DateTime> utcNow;
+        private (string? ListingId, DateTime AtUtc, RelistFacts? Facts) lastInspection;
 
         public ExitManager(IExitHost host, Func<DateTime>? utcNow = null)
         {
@@ -206,8 +209,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         public async Task<string> ReviewListingAsync(PurchasedListing p, CancellationToken ct)
         {
             if (p.CurrentStrategicStage != StrategicStages.WaitingForCSFloatResale || string.IsNullOrEmpty(p.CSFloatResaleListingID)) return "skip";
-            if (p.ResaleSoldAtUtc != default || p.LastTradeState is "resale:queued" or "resale:pending") return "skip"; // a buyer has it
             DateTime now = utcNow();
+            // A sale the bot inferred from the listing (its trade never showed up) is checked again until the unit
+            // leaves (completed) or the sale lapses (sell it again); a sale the trade monitor follows is left to it.
+            if (p.LastTradeState == RelistReconciliation.InferredSoldState)
+            {
+                if (await SettleRelistAsync(p, now, ct) is string settled) return settled;
+                if (p.LastTradeState == RelistReconciliation.InferredSoldState) return await PostponeAsync(p, now + RelistReconciliation.SoldRecheck, "sold");
+                // Listed again: review it like any other live listing.
+            }
+            if (p.ResaleSoldAtUtc != default || p.LastTradeState is "resale:queued" or "resale:pending") return "skip"; // a buyer has it
             var environment = host.ExitEnvironment;
             if (environment.CSFloatSellingPaused)
             {
@@ -220,8 +231,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             AccrueExposure(p, now);
             if (p.RelistTotalExposure >= OverdueExpectedSales)
             {
-                // The market keeps buying this item but not ours: usually the listing itself (hidden, wrong item,
-                // trade hold) rather than the price. That needs a person, not another re-price.
+                // The market keeps buying this item but not ours: usually the listing itself (sold with its trade out of
+                // sight, taken down, hidden) rather than the price. Ask CSFloat first; only a listing it still shows as
+                // live needs a person.
+                if (await SettleRelistAsync(p, now, ct) is string settled) return settled;
                 await host.AlertAsync("relist-overdue:" + p.CSFloatListingID, "CS2 Arbitrage — relist overdue",
                     $"**{p.ItemMarketHashName}** has been listed {(now - p.ListedOnCSFloatAtUtc).TotalDays:F1} days (now ${p.CSFloatResalePriceCents / 100.0:F2}) " +
                     $"and should have sold ~{p.RelistTotalExposure:F0} times by now at the rates CSFloat shows. Check the listing is live and visible: https://csfloat.com/item/{p.CSFloatResaleListingID}");
@@ -266,6 +279,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 int from = p.CSFloatResalePriceCents;
                 if (!await host.RepriceOnCSFloatAsync(p, best.Price, ct))
                 {
+                    // Refused: find out why (sold, taken down) instead of retrying the same change every hour for ever.
+                    if (await SettleRelistAsync(p, now, ct) is string settled) return settled;
                     p.NextExitReviewUtc = now + FailedChangeRetry;
                     await host.SaveAsync(p);
                     return "failed";
@@ -304,6 +319,82 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             p.NextExitReviewUtc = now + ReviewInterval(best?.ExpectedDaysToSell ?? 7);
             if (outcome is "reprice" or "capped" || p.ExitHistory.Count == 0 || p.ExitHistory[^1].AtUtc < now.AddHours(-24))
                 p.RecordExitDecision(ExitDecision.From(plan, "review", outcome, depthBid, anchor));
+            await host.SaveAsync(p);
+            return outcome;
+        }
+
+        /// <summary>
+        /// Asks CSFloat what became of the relist (and the inventory whether its unit is still there) and settles the
+        /// position when the answer says it is no longer a live listing. Returns the outcome when the position moved on
+        /// ("sold", "completed", "relist-gone", "left-inventory"), or null when it is still a live listing or nothing could be read.
+        /// </summary>
+        public async Task<string?> SettleRelistAsync(PurchasedListing p, DateTime now, CancellationToken ct)
+        {
+            RelistFacts facts;
+            // One review can ask twice (overdue, then a refused re-price): the first answer serves both.
+            var earlier = lastInspection;
+            if (earlier.ListingId == p.CSFloatResaleListingID && earlier.AtUtc == now && earlier.Facts != null) facts = earlier.Facts;
+            else
+            {
+                try { facts = await host.InspectRelistAsync(p, ct); }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    host.Log($"Couldn't read what became of the relist of {p.ItemMarketHashName}: {ex.Message}");
+                    return null;
+                }
+                lastInspection = (p.CSFloatResaleListingID, now, facts);
+            }
+            var verdict = RelistReconciliation.Decide(facts, p, now);
+            bool wasInferredSale = p.LastTradeState == RelistReconciliation.InferredSoldState;
+            string listing = p.CSFloatResaleListingID;
+            if (verdict is RelistVerdict.Unknown or RelistVerdict.StillListed)
+            {
+                if (verdict == RelistVerdict.StillListed && wasInferredSale)
+                {
+                    // Back on the market (the buyer's purchase was cancelled and CSFloat relisted it): the clock resumes.
+                    p.ResaleSoldAtUtc = default;
+                    p.LastTradeState = "resale:listed";
+                    p.RelistExposureUpdatedUtc = now;
+                    await host.SaveAsync(p);
+                }
+                return null;
+            }
+            if (verdict == RelistVerdict.SoldAwaitingTrade && wasInferredSale)
+            {
+                RelistReconciliation.Apply(verdict, facts, p, now, host.GbpPerUsd, host.Settings.Exit.SellerFee);
+                await host.SaveAsync(p);
+                return "sold";
+            }
+
+            string? note = RelistReconciliation.Apply(verdict, facts, p, now, host.GbpPerUsd, host.Settings.Exit.SellerFee);
+            await host.SaveAsync(p);
+            host.Log($"{p.ItemMarketHashName}: {note}");
+            switch (verdict)
+            {
+                case RelistVerdict.SoldAwaitingTrade:
+                    await host.AlertAsync("relist-sold-unseen:" + listing, "CS2 Arbitrage — relist sold, send the trade",
+                        $"CSFloat shows the relist of **{p.ItemMarketHashName}** (${p.CSFloatResalePriceCents / 100.0:F2}) as sold, but its trade isn't among the recent trades. " +
+                        $"If CSFloat's Trades page shows it waiting, send it (2-hour deadline): https://csfloat.com/item/{listing}");
+                    return "sold";
+                case RelistVerdict.SoldAndDelivered:
+                    await host.NotifyAsync(p, "CS2 arbitrage completed ✓ (inferred)",
+                        $"**{p.ItemMarketHashName}** sold on CSFloat for ${p.CSFloatResalePriceCents / 100.0:F2} and has left the inventory: " +
+                        $"profit £{p.ActualAbsoluteProfitInPounds:F2} ({p.ActualProfitPercentage:F1}%). The trade itself was never seen, so this is worked out from the listing price.");
+                    return "completed";
+                case RelistVerdict.BackToSale:
+                    await host.NotifyAsync(p, "CS2 relist is no longer up — selling again",
+                        $"CSFloat shows the relist of **{p.ItemMarketHashName}** as {facts.ListingState} and the unit is still in the inventory, so the bot will decide its exit again.");
+                    return "relist-gone";
+                default:
+                    await host.NotifyAsync(p, "CS2 position closed",
+                        $"The relist of **{p.ItemMarketHashName}** is {facts.ListingState} on CSFloat and the unit has left the inventory (sold or moved outside the bot).");
+                    return "left-inventory";
+            }
+        }
+
+        private async Task<string> PostponeAsync(PurchasedListing p, DateTime nextReviewUtc, string outcome)
+        {
+            p.NextExitReviewUtc = nextReviewUtc;
             await host.SaveAsync(p);
             return outcome;
         }

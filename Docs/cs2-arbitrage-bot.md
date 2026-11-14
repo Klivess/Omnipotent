@@ -200,22 +200,28 @@ Settings are re-read every minute; no restart is needed.
 | Route | Permission | Purpose |
 |---|---|---|
 | `GET /cs2arbitragebot/status` | Guest | Engine state, budgets, conversion model, exit model (settings, the measured trade-lock timeline, converter hold risk, wallet room, away mode, market drift, calibration), positions with their last exit decision, recent errors (answers during startup) |
-| `GET /cs2arbitragebot/getscanalytics` | Guest | KM analytics DTO (aggregate; O(1) regardless of history) |
+| `GET /cs2arbitragebot/getscanalytics[?compact=1]` | Guest | KM analytics DTO (aggregate; O(1) regardless of history), with the funnel counters `ModelChecked` / `ModelConfirmed` / `Blocked` / `BlockReasons` / `FunnelSinceUtc` and the same per day. `compact=1` drops the Steam order books copied into every purchase and all but the last three exit decisions (`ExitHistoryCount` keeps the count) |
 | `GET /cs2arbitragebot/opportunities?limit=` | Guest | Recent notable evaluations (within 10 points of a bar, or bought) |
 | `GET /cs2arbitragebot/scanresults` | Guest | Recent poll/sweep/structural cycle summaries (bounded) |
-| `GET /cs2arbitragebot/latestliquidityplan` | Guest | Conversion plan |
-| `GET /cs2arbitragebot/balanceHistory` | Guest | Daily balance records |
+| `GET /cs2arbitragebot/latestliquidityplan` | Guest | Conversion plan (503 until the conversion model has run once) |
+| `GET /cs2arbitragebot/balanceHistory` | Guest | Daily balance records (kept in memory after the first read) |
 | `POST /cs2arbitragebot/scanNow` | Manager | Run a sweep and structural scan now |
+| `POST /cs2arbitragebot/steam/login` | Klives (`cs2.positions.manage`) | Ask Klives to approve a Steam login now: a Discord prompt and a sign-in request in the Steam app. Not held back by the 6-hour prompt cooldown. 202, or 200 `{open:true}` while one is waiting |
+| `POST /cs2arbitragebot/positions/recheck` `{id}` | Klives | Ask CSFloat what became of a relist and settle the position (see "Relists the bot can no longer follow") |
+| `POST /cs2arbitragebot/positions/close` `{id, soldForCents?, note?}` | Klives | Close a position settled outside the bot: with a price, completed with that result; without, closed with no result. Does not touch CSFloat |
 
-The KM page (`/schemery/cs2arbitragebot`) is built on these routes. Its **Exit model & trade locks** panel shows:
+`/status` also carries `startupSteps` (how long each start-up step took), `steam.knownMisses` / `missSkips` / `backedOff` (items Steam has no book for), `steamSession.refreshTokenRejectedUtc`, `trades.sellerSideUtc`, and per relist `listingId`, `totalExposure`, `soldUtc` and `overdue`.
 
-- the measured lock timeline, including when a purchase made now could first be sold,
-- account limits,
-- the model's economics,
-- market drift and forecast calibration,
-- the bot's track record.
+### Relists the bot can no longer follow
 
-Each position shows where it is in its locks ("Trade-locked · sellable in 3d 4h"), its latest exit decision with the evidence behind it, and, for relists, the unsold evidence and next review. Attention flags overdue relists, items still locked after their unlock, away mode and a wallet near its cap. The page's e2e spec is `tests/e2e/cs2-arbitrage.spec.ts` in the website repo.
+Live on 2026-11-13 a $2.94 relist had sat "waiting for a buyer" for 25 days while CSFloat refused every re-price ("you can only modify listed contracts", 14 times in 13.7 h). The trade monitor reads only the newest 100 `/me/trades`, which on this account were all purchases, so a relist's sale could fall outside them. Now:
+
+- the trade monitor also reads `/me/trades?role=seller` (every 5 minutes at most) while any relist is open;
+- when a re-price is refused, or a relist is overdue (≥ 8 expected sales passed), the review reads the listing itself (`GET /listings/{id}`) and, when it is not live, the inventory, then settles the position (`Engine/RelistReconciliation.cs`): sold and the unit gone → completed, profit inferred from the listing price (`LastTradeState` `resale:inferred`); sold but the unit still there → `resale:sold`, checked again every 6 hours (an alert says to send the trade), sold again if the unit is still there after 2 days; delisted/missing and the unit there → back to the sale scheduler; delisted and the unit gone → `LeftInventory`. Nothing settles on a half-read answer.
+
+Discord alert cooldowns are kept in `alert-cooldowns.json` (Labs), so a restart no longer re-sends every standing alert.
+
+The KM page (`/schemery/cs2arbitragebot`, rebuilt Nov 2026 as its own console, `.cs2x`) is built on these routes: a verdict line and everything that needs Klives (each with its action), the day's funnel, the deal flow with the screen's and the exit model's value side by side, positions with a sheet per position (shareable `?pos=`), the funnel over 14/30/90 days with why confirmed deals were not bought, balances with carried-forward Steam values marked, the engine's loops and budgets, the exit model, conversion and the track record. The page's e2e spec is `tests/e2e/cs2-arbitrage.spec.ts` (fixture `tests/e2e/fixtures/cs2-api.ts`) in the website repo.
 
 ## Operating notes
 
@@ -231,6 +237,8 @@ Each position shows where it is in its locks ("Trade-locked · sellable in 3d 4h
   - Sending the trade when a relisted item sells on CSFloat.
   - Converting the Steam wallet back via the plan.
 - **Pre-rewrite positions** whose sale date passed more than 30 days ago, and positions that failed to sell 5 times, are not auto-sold; Discord asks for a manual look.
+- **A refused Steam login is not retried every 10 minutes.** When Steam answers AccessDenied for the saved refresh token, background checks skip that token for 6 hours (a new token, or Klives asking from the page, is tried at once), and "not logged in" is logged once per problem. Live it had been 164 errors in 13.7 h, 61% of the platform's errors.
+- **Items Steam has no book for are backed off** (15 minutes, doubling to 12 hours) instead of fetched on every sweep; they do not count as Steam failures. Pre-purchase re-checks always ask Steam.
 
 ## Verifying after Steam or CSFloat changes
 

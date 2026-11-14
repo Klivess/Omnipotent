@@ -77,11 +77,21 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private volatile TradeTimeline tradeTimeline = new();
         private (DateTime At, ExitCalibrationSnapshot Value) exitCalibration = (DateTime.MinValue, ExitCalibrationSnapshot.Neutral);
         private readonly ConcurrentDictionary<string, byte> reviewsInFlight = new();
+        // Discord alert cooldowns, kept on disk so a restart doesn't send every standing alert again (see AlertLedger).
+        private AlertLedger alertLedger = new(null);
+        // How long each start-up step took: the live start took 237 s to "running" with nothing saying where.
+        private readonly List<(string Step, long Ms)> startupSteps = new();
+        private string? startupStepName;
+        private long startupStepStartedMs;
+        // When the trade monitor last read the seller side of /me/trades, and what it last said.
+        private DateTime lastSellerTradesUtc;
+        private string? lastSellerTradesError;
 
         private sealed class JsonSnapshot
         {
             public DateTime GeneratedAtUtc { get; set; }
             public string? Json { get; set; }
+            [JsonIgnore] public string? CompactJson { get; set; }
         }
         private JsonSnapshot? analyticsSnapshot;
         private JsonSnapshot? balanceHistorySnapshot;
@@ -157,30 +167,55 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             _ = Task.Run(() => HealthLoopAsync(ct));
             if (await GetTimeManagerService().GetTask("RecordCSFloatAndSteamBalance") == null) _ = RecordDailyBalancesAsync();
             startupState = "running";
-            await ServiceLog($"CS2ArbitrageBot running {startupClock.ElapsedMilliseconds} ms after start (k = {CurrentConversionCoefficient:F3}).");
+            StartupStep(null);
+            await ServiceLog($"CS2ArbitrageBot running {startupClock.ElapsedMilliseconds} ms after start (k = {CurrentConversionCoefficient:F3}); " +
+                             $"steps: {string.Join(", ", StartupStepsSnapshot().Select(s => $"{s.Step} {s.Ms / 1000.0:0.0} s"))}.");
+        }
+
+        /// <summary>Closes the step in progress (timing it) and opens the next; null just closes.</summary>
+        private void StartupStep(string? name)
+        {
+            long now = startupClock.ElapsedMilliseconds;
+            lock (startupSteps)
+            {
+                if (startupStepName != null) startupSteps.Add((startupStepName, now - startupStepStartedMs));
+                startupStepName = name;
+                startupStepStartedMs = now;
+            }
+            if (name != null) startupState = name;
+        }
+
+        private List<(string Step, long Ms)> StartupStepsSnapshot()
+        {
+            lock (startupSteps) return new List<(string, long)>(startupSteps);
         }
 
         private async Task InitialiseAsync()
         {
-            startupState = "loading settings";
+            StartupStep("loading settings");
             engineSettings = await LoadEngineSettingsAsync();
             string apiKey = await GetStringOmniSetting("CSFloatAPIKey", null!, sensitive: true, askKlivesForFulfillment: true);
             if (string.IsNullOrWhiteSpace(apiKey)) throw new InvalidOperationException("CSFloatAPIKey setting is empty.");
             csFloatWrapper = new CSFloatWrapper(this, apiKey);
+            alertLedger = new AlertLedger(Path.Combine(LabsDirectory, "alert-cooldowns.json"));
+            alertLedger.Load();
 
-            startupState = "loading exchange rates";
+            StartupStep("loading exchange rates");
             await RefreshExchangeRatesAsync(throwOnFailure: false);
 
-            startupState = "loading data";
+            StartupStep("loading positions and scan history");
             steamAPIWrapper = new SteamAPIWrapper(this, TimeSpan.FromMilliseconds(engineSettings.SteamRequestSpacingMs));
             scanalytics = new Scanalytics(this);
             await scanalytics.LoadAsync();
+            StartupStep("loading saved models");
             await LoadSnapshotsAsync();
             exitSignals = new ExitSignalsProvider(csFloatWrapper, steamAPIWrapper.Market);
             Engine = new SnipeEngine(this);
             Exits = new ExitManager(this);
+            StartupStep("reading the CSFloat balance");
             try { await RefreshBalanceAsync(true, cancellationToken.Token); }
             catch (Exception ex) { await ServiceLogError(ex, "Couldn't read the CSFloat balance at startup.", false); }
+            StartupStep("starting loops");
             QueueAnalyticsRefresh();
         }
 
@@ -424,13 +459,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             catch (HttpRequestException ex) when (ex.StatusCode == System.Net.HttpStatusCode.UnprocessableEntity)
             {
                 // CSFloat only re-prices a live listing ("you can only modify listed contracts"), so the listing has
-                // sold or been taken down. A sale is settled by the trade monitor; a listing removed by hand needs a
-                // person. One alert a day, not an error every review.
+                // sold or been taken down. The exit manager now asks CSFloat which (ExitManager.SettleRelistAsync) and
+                // settles the position, saying so itself; only a listing CSFloat still shows as live is alerted.
                 await ServiceLog($"CSFloat refused to re-price {position.ItemMarketHashName}: {ex.Message}", false);
-                await AlertKlivesAsync("relist-not-live:" + position.CSFloatListingID, "CS2 Arbitrage — relist is no longer live",
-                    $"CSFloat refused to re-price **{position.ItemMarketHashName}** because the listing is no longer live. " +
-                    $"If it sold, the trade monitor records the sale; if it was taken down, relist or sell it by hand: https://csfloat.com/item/{position.CSFloatResaleListingID}",
-                    TimeSpan.FromHours(24));
                 return false;
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
@@ -442,6 +473,51 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         async Task IExitHost.DelistFromCSFloatAsync(PurchasedListing position, CancellationToken ct) =>
             await csFloatWrapper.DelistAsync(position.CSFloatResaleListingID, ct);
+
+        Task<RelistFacts> IExitHost.InspectRelistAsync(PurchasedListing position, CancellationToken ct) => InspectRelistAsync(position, ct);
+
+        /// <summary>
+        /// The relist's own state on CSFloat (one single-listing request) and, when it is not live, whether the unit is
+        /// still in the inventory (read through CSFloat, so no Steam login is needed). Unreadable parts stay null.
+        /// </summary>
+        private async Task<RelistFacts> InspectRelistAsync(PurchasedListing p, CancellationToken ct)
+        {
+            if (string.IsNullOrEmpty(p.CSFloatResaleListingID)) return RelistFacts.Unknown;
+            string? state = null;
+            int? price = null;
+            try
+            {
+                var listing = await csFloatWrapper.GetListingAsync(p.CSFloatResaleListingID, ct);
+                if (listing == null) state = "missing";
+                else
+                {
+                    state = string.IsNullOrWhiteSpace(listing.State) ? null : listing.State.Trim().ToLowerInvariant();
+                    price = listing.PriceCents > 0 ? listing.PriceCents : null;
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                await ServiceLog($"Couldn't read CSFloat listing {p.CSFloatResaleListingID} ({p.ItemMarketHashName}): {ex.Message}", false);
+            }
+
+            bool? inInventory = null;
+            if (state is not null and not "listed")
+            {
+                try
+                {
+                    var inventory = await csFloatWrapper.GetInventoryAsync(ct);
+                    // An empty answer is likelier a hiccup than an emptied inventory: never settle on it.
+                    if (inventory.Count > 0) inInventory = PositionsWithoutAUnit(new[] { p }, inventory).Count == 0;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    await ServiceLog($"Couldn't read the inventory while checking the relist of {p.ItemMarketHashName}: {ex.Message}", false);
+                }
+            }
+            var facts = new RelistFacts(state, price, inInventory);
+            await ServiceLog($"Relist check for {p.ItemMarketHashName} ({p.CSFloatResaleListingID}): listing {state ?? "unreadable"}, unit {(inInventory == null ? "unknown" : inInventory.Value ? "still in the inventory" : "gone")}.", false);
+            return facts;
+        }
 
         public async Task RefreshBalanceAsync(bool force, CancellationToken ct)
         {
@@ -677,6 +753,22 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private async Task PollTradesOnceAsync(List<PurchasedListing> purchases, CancellationToken ct)
         {
             JArray trades = await csFloatWrapper.GetTradesAsync(100, ct);
+            // While a relist is open, the seller side too: the newest 100 trades were all purchases on the live account,
+            // so a relist's sale could sit outside them and never be followed (salesObserved 0 on 2026-11-13).
+            if (purchases.Any(p => p.CurrentStrategicStage == StrategicStages.WaitingForCSFloatResale) && DateTime.UtcNow - lastSellerTradesUtc >= TimeSpan.FromMinutes(5))
+            {
+                lastSellerTradesUtc = DateTime.UtcNow;
+                try
+                {
+                    trades = MergeTrades(trades, await csFloatWrapper.GetTradesAsync(100, ct, role: "seller"));
+                    lastSellerTradesError = null;
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException and not CSFloatAuthException)
+                {
+                    if (lastSellerTradesError != ex.Message) await ServiceLog($"Couldn't read the seller side of the CSFloat trades: {ex.Message}", false);
+                    lastSellerTradesError = ex.Message;
+                }
+            }
             // The same trades measure the locks and holds every exit decision depends on.
             var measured = tradeTimeline.Clone();
             measured.Measure(trades, DateTime.UtcNow);
@@ -715,6 +807,22 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 await scanalytics.UpdatePurchasedListing(purchase);
                 if (transition != TradeTransition.None) await NotifyTradeTransitionAsync(purchase, transition);
             }
+        }
+
+        /// <summary>Both pages of trades as one newest-first list, each trade once (by id).</summary>
+        internal static JArray MergeTrades(JArray first, JArray second)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var all = new List<JObject>();
+            foreach (var trade in first.OfType<JObject>().Concat(second.OfType<JObject>()))
+            {
+                string id = trade.Value<string>("id") ?? trade.ToString(Formatting.None);
+                if (seen.Add(id)) all.Add(trade);
+            }
+            return new JArray(all
+                .Select((t, i) => (Trade: t, Index: i, At: TradeProgress.ReadUtc(t["created_at"]) ?? DateTime.MinValue))
+                .OrderByDescending(x => x.At).ThenBy(x => x.Index)
+                .Select(x => x.Trade));
         }
 
         private async Task NotifyTradeTransitionAsync(PurchasedListing p, TradeTransition transition)
@@ -1187,7 +1295,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
 
         private async Task AlertKlivesAsync(string key, string title, string message, TimeSpan cooldown)
         {
-            if (!TryTakeCooldown("alert:" + key, cooldown)) return;
+            DateTime now = DateTime.UtcNow;
+            if (!alertLedger.TryTake(key, cooldown, now, title)) return;
+            try { await alertLedger.SaveIfChangedAsync((path, json) => GetDataHandler().WriteToFile(path, json), now); }
+            catch (Exception ex) { await ServiceLogError(ex, "Couldn't save the CS2 alert ledger; an alert may repeat after a restart.", false); }
             await ServiceLogError($"{title}: {message}", false);
             await SendEmbedAsync(title, message, DiscordColor.Red, null);
         }
@@ -1276,6 +1387,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     Engine.RequestScanNow();
                     await request.ReturnResponse(JsonConvert.SerializeObject(new { queued = true }), code: HttpStatusCode.Accepted);
                 }, HttpMethod.Post, Cs2Perms.ScansRun, true),
+                ("/cs2arbitragebot/steam/login", SteamLoginRoute, HttpMethod.Post, Cs2Perms.Manage, true),
+                ("/cs2arbitragebot/positions/recheck", RecheckPositionRoute, HttpMethod.Post, Cs2Perms.Manage, true),
+                ("/cs2arbitragebot/positions/close", ClosePositionRoute, HttpMethod.Post, Cs2Perms.Manage, true),
             };
 
             int registered = 0;
@@ -1298,7 +1412,9 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         {
             try
             {
-                if (needsData && !initialised.Task.IsCompleted) await Task.WhenAny(initialised.Task, Task.Delay(TimeSpan.FromSeconds(20)));
+                // A short wait: start-up takes minutes (237 s live), and every gated request used to hang 20 s before its
+                // 503. The page reads /status (not gated) for the start-up state.
+                if (needsData && !initialised.Task.IsCompleted) await Task.WhenAny(initialised.Task, Task.Delay(TimeSpan.FromSeconds(3)));
                 if (needsData && !initialised.Task.IsCompletedSuccessfully)
                 {
                     string why = initialised.Task.IsFaulted ? "CS2ArbitrageBot failed to start: " + initialised.Task.Exception?.GetBaseException().Message : "CS2ArbitrageBot is still starting (" + startupState + ").";
@@ -1317,13 +1433,215 @@ namespace Omnipotent.Services.CS2ArbitrageBot
         private async Task AnalyticsRoute(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
         {
             CacheDeps.NoteTimeBucket(TimeSpan.FromSeconds(30));
+            bool compact = request.userParameters["compact"] is "1" or "true";
             var snapshot = Volatile.Read(ref analyticsSnapshot);
             if (snapshot == null || DateTime.UtcNow - snapshot.GeneratedAtUtc > TimeSpan.FromSeconds(30))
             {
-                snapshot = new JsonSnapshot { GeneratedAtUtc = DateTime.UtcNow, Json = JsonConvert.SerializeObject(scanalytics.BuildAnalytics(CurrentConversionCoefficient)) };
+                string json = JsonConvert.SerializeObject(scanalytics.BuildAnalytics(CurrentConversionCoefficient));
+                snapshot = new JsonSnapshot { GeneratedAtUtc = DateTime.UtcNow, Json = json, CompactJson = CompactAnalyticsJson(json) };
                 Volatile.Write(ref analyticsSnapshot, snapshot);
             }
-            await request.ReturnResponse(snapshot.Json!, code: HttpStatusCode.OK);
+            await request.ReturnResponse((compact ? snapshot.CompactJson : null) ?? snapshot.Json!, code: HttpStatusCode.OK);
+        }
+
+        /// <summary>
+        /// The analytics without what the page never draws: the Steam order books and listing details copied into every
+        /// purchase, all but the last three exit decisions of each position (the count is kept), unset fields, and the
+        /// purchase-latency list. The page fetched the full 526 KB every minute (563 times in 30 days); on that captured
+        /// payload this is 42% of the size (30 KB against 87 KB gzipped).
+        /// </summary>
+        internal static string CompactAnalyticsJson(string fullJson)
+        {
+            var root = JObject.Parse(fullJson);
+            root.Remove("TimeTakenToPurchaseAllPurchasedItems");
+            if (root["AllPurchasedItems"] is JArray items)
+            {
+                foreach (var item in items.OfType<JObject>())
+                {
+                    if (item["comparison"] is JObject c)
+                    {
+                        var listing = c["CSFloatListing"] as JObject;
+                        var steam = c["SteamListing"] as JObject;
+                        item["comparison"] = new JObject
+                        {
+                            ["CSFloatURL"] = c["CSFloatURL"],
+                            ["CSFloatListing"] = listing == null ? null : new JObject
+                            {
+                                ["PriceText"] = listing["PriceText"],
+                                ["PriceInPounds"] = listing["PriceInPounds"],
+                                ["ImageURL"] = listing["ImageURL"],
+                            },
+                            ["SteamListing"] = steam == null ? null : new JObject
+                            {
+                                ["PriceText"] = steam["PriceText"],
+                                ["HighestBuyOrderPriceInPounds"] = steam["HighestBuyOrderPriceInPounds"],
+                            },
+                        };
+                    }
+                    if (item["ExitHistory"] is JArray history)
+                    {
+                        item["ExitHistoryCount"] = history.Count;
+                        if (history.Count > 3) item["ExitHistory"] = new JArray(history.Skip(history.Count - 3));
+                    }
+                    // Unset fields (null, "", never-happened dates, empty lists) repeated across every position were most of
+                    // what was left; numbers and flags are kept, so stage 0 and a zero result still read as such.
+                    foreach (var property in item.Properties().ToList())
+                        if (IsEmptyValue(property.Value)) property.Remove();
+                }
+            }
+            return root.ToString(Formatting.None);
+        }
+
+        private static bool IsEmptyValue(JToken value) => value.Type switch
+        {
+            JTokenType.Null or JTokenType.Undefined => true,
+            JTokenType.String => value.Value<string>() is not { Length: > 0 } s || s.StartsWith("0001-01-01", StringComparison.Ordinal),
+            JTokenType.Date => value.Value<DateTime>() == DateTime.MinValue,
+            JTokenType.Array => !value.HasValues,
+            _ => false,
+        };
+
+        private static JObject ReadBody(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
+        {
+            try { return string.IsNullOrWhiteSpace(request.userMessageContent) ? new JObject() : JObject.Parse(request.userMessageContent); }
+            catch (JsonException) { return new JObject(); }
+        }
+
+        private Task Reply(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request, object body, HttpStatusCode code) =>
+            request.ReturnResponse(JsonConvert.SerializeObject(body), code: code);
+
+        /// <summary>
+        /// Klives asks for a Steam login from the page: one Discord prompt and a sign-in request in his Steam app. The
+        /// bot otherwise asks only when a sale is waiting for Steam, so a dead login with nothing to sell (live: since
+        /// 28 Oct) was never put to him at all.
+        /// </summary>
+        private async Task SteamLoginRoute(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
+        {
+            CacheDeps.MarkUncacheable("cs2 action");
+            var profile = automationEnabled ? steamAPIWrapper?.profileWrapper : null;
+            if (profile == null)
+            {
+                await Reply(request, new { error = "Steam logins are only handled where the bot's automation runs (the server)." }, HttpStatusCode.Conflict);
+                return;
+            }
+            if (profile.LoginPromptOpen || profile.InteractiveLoginRunning)
+            {
+                await Reply(request, new { requested = false, open = true, message = "A login request is already waiting for approval in the Steam app." }, HttpStatusCode.OK);
+                return;
+            }
+            string who = request.user?.Name ?? "Klives";
+            await ServiceLog($"{who} asked for a Steam login from the KM page.");
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    bool ok = await profile.RequestInteractiveLoginAsync($"{who} asked from the KM CS2 Arbitrage page.", askedByKlives: true);
+                    await ServiceLog(ok ? "Steam login approved; selling on Steam works again." : $"The Steam login asked for from the page did not complete ({profile.SessionProblem ?? profile.LastLoginPromptOutcome ?? "no answer"}).");
+                }
+                catch (Exception ex) { await ServiceLogError(ex, "Asking for a Steam login from the page failed.", false); }
+            }, CancellationToken.None);
+            await Reply(request, new { requested = true, message = "Approve the sign-in request in the Steam app (a Discord message explains it)." }, HttpStatusCode.Accepted);
+        }
+
+        private PurchasedListing? FindPosition(JObject body)
+        {
+            string id = body.Value<string>("id") ?? "";
+            return string.IsNullOrEmpty(id) ? null : scanalytics.PurchasesSnapshot().FirstOrDefault(p => p.CSFloatListingID == id);
+        }
+
+        /// <summary>Asks CSFloat now what became of a relist and settles the position if it is no longer live.</summary>
+        private async Task RecheckPositionRoute(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
+        {
+            CacheDeps.MarkUncacheable("cs2 action");
+            var p = FindPosition(ReadBody(request));
+            if (p == null) { await Reply(request, new { error = "No position with that id." }, HttpStatusCode.NotFound); return; }
+            if (p.CurrentStrategicStage != StrategicStages.WaitingForCSFloatResale || string.IsNullOrEmpty(p.CSFloatResaleListingID))
+            {
+                await Reply(request, new { error = "Only a position relisted on CSFloat can be checked there." }, HttpStatusCode.Conflict);
+                return;
+            }
+            if (!reviewsInFlight.TryAdd(p.CSFloatListingID, 0))
+            {
+                await Reply(request, new { error = "A review of this relist is running right now; try again in a moment." }, HttpStatusCode.Conflict);
+                return;
+            }
+            try
+            {
+                string? outcome = await Exits!.SettleRelistAsync(p, DateTime.UtcNow, cancellationToken.Token);
+                string message = outcome switch
+                {
+                    null => p.LastTradeState == "resale:listed" || p.CurrentStrategicStage == StrategicStages.WaitingForCSFloatResale
+                        ? "CSFloat still shows the listing as live (or couldn't be read); nothing changed."
+                        : "Nothing changed.",
+                    "sold" => "CSFloat shows it sold; its trade isn't among the recent trades. Send it from CSFloat's Trades page if it's waiting.",
+                    "completed" => "Sold and delivered: the position is closed with the profit worked out from the listing price.",
+                    "relist-gone" => "The listing is no longer up and the unit is still in the inventory: the bot will decide its exit again.",
+                    _ => "The listing is gone and so is the unit: the position is closed.",
+                };
+                await Reply(request, new { outcome = outcome ?? "unchanged", message, stage = p.CurrentStrategicStage.ToString(), lastTradeState = p.LastTradeState }, HttpStatusCode.OK);
+            }
+            finally { reviewsInFlight.TryRemove(p.CSFloatListingID, out _); }
+        }
+
+        /// <summary>
+        /// Closes a position Klives settled himself. With a sale price (USD cents on CSFloat) it is recorded as completed
+        /// with that result; without one it is closed as having left the bot (no result). The note says who closed it.
+        /// </summary>
+        private async Task ClosePositionRoute(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
+        {
+            CacheDeps.MarkUncacheable("cs2 action");
+            var body = ReadBody(request);
+            var p = FindPosition(body);
+            if (p == null) { await Reply(request, new { error = "No position with that id." }, HttpStatusCode.NotFound); return; }
+            if (!IsOpen(p)) { await Reply(request, new { error = "That position is already closed." }, HttpStatusCode.Conflict); return; }
+            if (salesInFlight.ContainsKey(p.CSFloatListingID) || reviewsInFlight.ContainsKey(p.CSFloatListingID))
+            {
+                await Reply(request, new { error = "The bot is selling or reviewing this position right now; try again in a moment." }, HttpStatusCode.Conflict);
+                return;
+            }
+            int? soldCents = body["soldForCents"]?.Type is JTokenType.Integer or JTokenType.Float ? (int?)Math.Round(body.Value<double>("soldForCents")) : null;
+            if (soldCents is <= 0 or > 10_000_000) { await Reply(request, new { error = "soldForCents must be a positive price in US cents." }, HttpStatusCode.BadRequest); return; }
+            string note = (body.Value<string>("note") ?? "").Trim();
+            if (note.Length > 300) note = note[..300];
+            string who = request.user?.Name ?? "Klives";
+            DateTime now = DateTime.UtcNow;
+            string summary = ClosePositionByHand(p, soldCents, note, who, now, ExchangeRate ?? 0, csfloatAccountInformation?.Fee is double fee and > 0 and < 0.5 ? fee : engineSettings.Exit.SellerFee);
+            await scanalytics.UpdatePurchasedListing(p);
+            await ServiceLog($"{who} closed the position {p.ItemMarketHashName} ({p.CSFloatListingID}) by hand: {summary}");
+            await Reply(request, new { closed = true, stage = p.CurrentStrategicStage.ToString(), message = summary }, HttpStatusCode.OK);
+        }
+
+        /// <summary>Applies a by-hand close (pure apart from the position; unit-tested).</summary>
+        internal static string ClosePositionByHand(PurchasedListing p, int? soldForCents, string note, string who, DateTime nowUtc, double gbpPerUsd, double sellerFee)
+        {
+            string summary;
+            if (soldForCents is int cents)
+            {
+                double netPounds = ArbitrageMath.CSFloatNetProceedsCents(cents, sellerFee) * gbpPerUsd / 100.0;
+                double costPounds = p.PurchaseCostPence > 0 ? p.PurchaseCostPence / 100.0 : p.comparison?.CSFloatListing.PriceInPounds ?? 0;
+                if (gbpPerUsd > 0)
+                {
+                    p.ActualAbsoluteProfitInPounds = (float)(netPounds - costPounds);
+                    p.ActualAbsoluteProfitInPence = (float)Math.Round((netPounds - costPounds) * 100);
+                    p.ActualProfitPercentage = costPounds > 0 ? (float)((netPounds / costPounds - 1) * 100) : 0;
+                }
+                p.CSFloatResalePriceCents = cents;
+                p.TimeOfCollectedRevenue = nowUtc;
+                if (p.ResaleSoldAtUtc == default) p.ResaleSoldAtUtc = nowUtc;
+                p.LastTradeState = "closed:sold";
+                p.CurrentStrategicStage = StrategicStages.StrategyCompleted;
+                summary = $"sold for ${cents / 100.0:F2}" + (gbpPerUsd > 0 ? $" (profit £{p.ActualAbsoluteProfitInPounds:F2})" : "");
+            }
+            else
+            {
+                p.LastTradeState = "closed:gone";
+                p.CurrentStrategicStage = StrategicStages.LeftInventory;
+                summary = "closed with no recorded result";
+            }
+            p.WaitingForSteamLoginSinceUtc = default;
+            string line = $"Closed by hand by {who} {nowUtc:u}: {summary}" + (string.IsNullOrEmpty(note) ? "." : $" — {note}");
+            p.Notes = string.IsNullOrEmpty(p.Notes) ? line : p.Notes + Environment.NewLine + line;
+            return summary;
         }
 
         private async Task BalanceHistoryRoute(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest request)
@@ -1373,6 +1691,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     market.Requests, market.Successes, market.Failures, market.FallbackUses, market.CacheHits,
                     market.ConsecutiveFailures, market.LastSuccessUtc, market.LastFailureUtc, market.LastError,
                     cachedBooks = market.CachedCount,
+                    misses = market.Misses,
+                    missSkips = market.MissSkips,
+                    knownMisses = market.KnownMisses,
+                    backedOff = market.BackedOffItems(5).Select(m => new { name = m.Name, untilUtc = m.UntilUtc, misses = m.Count }),
                     pacerIntervalMs = market.Pacer.CurrentInterval.TotalMilliseconds,
                     pacerQueue = market.Pacer.QueueLength,
                     pacerPausedUntilUtc = market.Pacer.PausedUntilUtc > DateTime.UtcNow ? market.Pacer.PausedUntilUtc : (DateTime?)null,
@@ -1383,16 +1705,22 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                     lastPollUtc = lastTradePollUtc,
                     lastError = lastTradePollError,
                     pollRunningSinceUtc = tradePollInFlight is { IsCompleted: false } ? tradePollStartedUtc : (DateTime?)null,
+                    sellerSideUtc = lastSellerTradesUtc == default ? (DateTime?)null : lastSellerTradesUtc,
+                    sellerSideError = lastSellerTradesError,
                 },
+                startupSteps = StartupStepsSnapshot().Select(s => new { step = s.Step, ms = s.Ms }),
+                // The Discord alerts the bot sent (last 31 days, newest first): each standing one is sent once per cooldown.
+                alerts = alertLedger.Recent(10).Select(a => new { key = a.Key, atUtc = a.AtUtc, title = a.Title }),
                 steamSession = !ready || steamAPIWrapper?.profileWrapper is not { } profile ? null : new
                 {
                     problem = profile.SessionProblem,
                     problemSinceUtc = profile.SessionProblemSinceUtc,
                     lastWorkedUtc = profile.SessionOkUtc,
                     checkedUtc = profile.SessionCheckedUtc,
-                    loginPromptOpen = profile.LoginPromptOpen,
+                    loginPromptOpen = profile.LoginPromptOpen || profile.InteractiveLoginRunning,
                     lastLoginPromptUtc = profile.LastLoginPromptUtc,
                     lastLoginPromptOutcome = profile.LastLoginPromptOutcome,
+                    refreshTokenRejectedUtc = profile.RefreshTokenRejectedUtc,
                 },
                 inventoryCheck = new
                 {
@@ -1412,7 +1740,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot
                 {
                     p.ItemMarketHashName, p.CSFloatListingID, stage = p.CurrentStrategicStage.ToString(), p.PlannedExit, p.PredictedTimeToBeResoldOnSteam, p.LastTradeState,
                     relist = p.CurrentStrategicStage == StrategicStages.WaitingForCSFloatResale
-                        ? new { priceCents = p.CSFloatResalePriceCents, listedUtc = p.ListedOnCSFloatAtUtc, p.RelistRepriceCount, expectedDaysToSell = p.RelistBaseDaysToSell, p.RelistModelExposure, nextReviewUtc = p.NextExitReviewUtc }
+                        ? new
+                        {
+                            priceCents = p.CSFloatResalePriceCents, listedUtc = p.ListedOnCSFloatAtUtc, p.RelistRepriceCount, expectedDaysToSell = p.RelistBaseDaysToSell,
+                            p.RelistModelExposure, totalExposure = p.RelistTotalExposure, nextReviewUtc = p.NextExitReviewUtc, listingId = p.CSFloatResaleListingID,
+                            soldUtc = p.ResaleSoldAtUtc == default ? (DateTime?)null : p.ResaleSoldAtUtc,
+                            overdue = p.ResaleSoldAtUtc == default && p.RelistTotalExposure >= ExitManager.OverdueExpectedSales,
+                        }
                         : null,
                     saleDeferrals = p.SaleDeferrals,
                     saleAttempts = p.SaleAttempts,

@@ -472,6 +472,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 // evidence: does the item actually sell on CSFloat and how fast, what buyers really pay, how
                 // volatile it is over the hold, the market's drift, and the bot's own track record.
                 evaluation = await ConfirmWithExitModelAsync(listing, evaluation, book, ct);
+                host.Analytics.RecordModelVerdict(evaluation);
                 if (!evaluation.ShouldBuy)
                 {
                     // The host records the skip (once per listing): logging it here as well doubled every line.
@@ -482,6 +483,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 string? blocker = await PurchaseBlockerAsync(listing, evaluation, settings, ct);
                 if (blocker != null)
                 {
+                    host.Analytics.RecordBlocked(blocker);
                     await host.OnOpportunityNotBoughtAsync(listing, evaluation, blocker);
                     return false;
                 }
@@ -491,6 +493,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
                 host.Analytics.RecordPurchaseOutcome(result.Success);
                 if (!result.Success)
                 {
+                    host.Analytics.RecordBlocked($"purchase rejected ({(int)result.StatusCode})");
                     await host.OnOpportunityNotBoughtAsync(listing, evaluation, $"purchase rejected ({(int)result.StatusCode}): {result.Message}");
                     return false;
                 }

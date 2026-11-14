@@ -63,6 +63,16 @@ internal sealed class FakeExitHost : IExitHost
         return Task.CompletedTask;
     }
 
+    /// <summary>What CSFloat and the inventory say became of a relist (unknown by default: nothing settles).</summary>
+    public RelistFacts Relist { get; set; } = RelistFacts.Unknown;
+    public int Inspections { get; private set; }
+
+    public Task<RelistFacts> InspectRelistAsync(PurchasedListing position, CancellationToken ct)
+    {
+        Inspections++;
+        return Task.FromResult(Relist);
+    }
+
     public Task SaveAsync(PurchasedListing position) { Saves++; return Task.CompletedTask; }
     public Task NotifyAsync(PurchasedListing position, string title, string message) { Notifications.Add(title + ": " + message); return Task.CompletedTask; }
     public Task AlertAsync(string key, string title, string message) { Alerts.Add(title + ": " + message); return Task.CompletedTask; }
@@ -337,5 +347,134 @@ public class ExitManagerTests
         p.LastTradeState = "resale:pending";
         Assert.Equal("skip", await new ExitManager(host, () => T0.AddDays(10)).ReviewListingAsync(p, CancellationToken.None));
         Assert.Single(host.Actions);
+    }
+
+    // ── Relists the bot can no longer follow (live 2026-11-13: one sat 25 days, re-price refused 14 times in 13.7 h) ──
+
+    /// <summary>Relists the unit at T0 and returns it with Steam paying so little that the review wants a re-price.</summary>
+    private static async Task<(FakeExitHost Host, PurchasedListing P)> RelistedPosition()
+    {
+        var host = new FakeExitHost(CSFloat(), Steam(bid: 60));
+        var p = Position();
+        await new ExitManager(host, () => T0).RunSaleAsync(p, CancellationToken.None);
+        Assert.Equal(StrategicStages.WaitingForCSFloatResale, p.CurrentStrategicStage);
+        host.Actions.Clear();
+        host.Notifications.Clear();
+        return (host, p);
+    }
+
+    [Fact]
+    public async Task ARefusedRepriceOfADelistedRelistHandsTheUnitBackToTheSaleScheduler()
+    {
+        var (host, p) = await RelistedPosition();
+        host.RepriceAccepted = false;
+        host.Relist = new RelistFacts("delisted", 380, UnitInInventory: true);
+
+        DateTime review = T0.AddDays(10);
+        Assert.Equal("relist-gone", await new ExitManager(host, () => review).ReviewListingAsync(p, CancellationToken.None));
+        Assert.Equal(StrategicStages.JustRetrieved, p.CurrentStrategicStage);
+        Assert.Equal("", p.CSFloatResaleListingID);
+        Assert.Equal(review, p.PredictedTimeToBeResoldOnSteam); // due for the sale scheduler at once
+        Assert.Contains("relist-1", p.Notes);                     // the old listing id is kept in the notes
+        Assert.Contains(host.Notifications, n => n.Contains("no longer up"));
+    }
+
+    [Fact]
+    public async Task AnOverdueRelistCSFloatShowsSoldAndGoneClosesWithTheInferredProfit()
+    {
+        var (host, p) = await RelistedPosition();
+        p.RelistTotalExposure = 54; // the live position: "should have sold ~54 times by now"
+        host.Relist = new RelistFacts("sold", 294, UnitInInventory: false);
+
+        Assert.Equal("completed", await new ExitManager(host, () => T0.AddDays(25)).ReviewListingAsync(p, CancellationToken.None));
+        Assert.Equal(StrategicStages.StrategyCompleted, p.CurrentStrategicStage);
+        Assert.Equal(RelistReconciliation.InferredDeliveredState, p.LastTradeState);
+        Assert.Equal(294, p.CSFloatResalePriceCents);
+        // $2.94 less the 2% fee at £0.75/$ = £2.16, bought for £2.50.
+        Assert.InRange(p.ActualAbsoluteProfitInPounds, -0.35f, -0.33f);
+        Assert.Empty(host.Actions);                                     // nothing re-priced
+        Assert.DoesNotContain(host.Alerts, a => a.Contains("relist overdue")); // settled, so no "check the listing" alert
+    }
+
+    [Fact]
+    public async Task AnOverdueRelistCSFloatStillShowsAsListedIsStillAlerted()
+    {
+        var (host, p) = await RelistedPosition();
+        p.RelistTotalExposure = 20;
+        host.Relist = new RelistFacts("listed", 380, UnitInInventory: null);
+
+        await new ExitManager(host, () => T0.AddDays(10)).ReviewListingAsync(p, CancellationToken.None);
+        Assert.Equal(StrategicStages.WaitingForCSFloatResale, p.CurrentStrategicStage);
+        Assert.Contains(host.Alerts, a => a.Contains("relist overdue"));
+    }
+
+    [Fact]
+    public async Task UnreadableFactsNeverSettleAPosition()
+    {
+        var (host, p) = await RelistedPosition();
+        host.RepriceAccepted = false; // facts stay Unknown
+        DateTime review = T0.AddDays(10);
+        Assert.Equal("failed", await new ExitManager(host, () => review).ReviewListingAsync(p, CancellationToken.None));
+        Assert.Equal(StrategicStages.WaitingForCSFloatResale, p.CurrentStrategicStage);
+        Assert.Equal("relist-1", p.CSFloatResaleListingID);
+        Assert.Equal(review + ExitManager.FailedChangeRetry, p.NextExitReviewUtc);
+        Assert.Equal(1, host.Inspections);
+    }
+
+    [Fact]
+    public async Task ASaleWhoseTradeIsNeverSeenIsCheckedUntilTheUnitLeavesOrTheSaleLapses()
+    {
+        var (host, p) = await RelistedPosition();
+        host.RepriceAccepted = false;
+        host.Relist = new RelistFacts("sold", 380, UnitInInventory: true);
+
+        DateTime first = T0.AddDays(10);
+        Assert.Equal("sold", await new ExitManager(host, () => first).ReviewListingAsync(p, CancellationToken.None));
+        Assert.Equal(RelistReconciliation.InferredSoldState, p.LastTradeState);
+        Assert.Equal(first, p.ResaleSoldAtUtc);
+        Assert.Contains(host.Alerts, a => a.Contains("send the trade"));
+        Assert.Equal(first + RelistReconciliation.SoldRecheck, p.NextExitReviewUtc);
+
+        // Six hours on, still in the inventory: the trade may still be pending; nothing changes and nothing is re-priced.
+        host.Actions.Clear();
+        Assert.Equal("sold", await new ExitManager(host, () => first.AddHours(6)).ReviewListingAsync(p, CancellationToken.None));
+        Assert.Equal(StrategicStages.WaitingForCSFloatResale, p.CurrentStrategicStage);
+        Assert.Empty(host.Actions);
+
+        // Two days on and the unit never left: the buyer's purchase fell through, so the unit is sold again.
+        Assert.Equal("relist-gone", await new ExitManager(host, () => first.AddDays(2)).ReviewListingAsync(p, CancellationToken.None));
+        Assert.Equal(StrategicStages.JustRetrieved, p.CurrentStrategicStage);
+        Assert.Equal(default, p.ResaleSoldAtUtc);
+    }
+
+    [Fact]
+    public async Task AnInferredSaleThatLeavesTheInventoryCompletes()
+    {
+        var (host, p) = await RelistedPosition();
+        host.RepriceAccepted = false;
+        host.Relist = new RelistFacts("sold", 380, UnitInInventory: true);
+        await new ExitManager(host, () => T0.AddDays(10)).ReviewListingAsync(p, CancellationToken.None);
+
+        host.Relist = new RelistFacts("sold", 380, UnitInInventory: false);
+        Assert.Equal("completed", await new ExitManager(host, () => T0.AddDays(10).AddHours(6)).ReviewListingAsync(p, CancellationToken.None));
+        Assert.Equal(StrategicStages.StrategyCompleted, p.CurrentStrategicStage);
+        Assert.True(p.ActualAbsoluteProfitInPounds > 0);
+    }
+
+    [Theory]
+    [InlineData(null, null, RelistVerdict.Unknown)]
+    [InlineData("listed", null, RelistVerdict.StillListed)]
+    [InlineData("LISTED", true, RelistVerdict.StillListed)]
+    [InlineData("sold", null, RelistVerdict.SoldAwaitingTrade)]
+    [InlineData("sold", true, RelistVerdict.SoldAwaitingTrade)]
+    [InlineData("sold", false, RelistVerdict.SoldAndDelivered)]
+    [InlineData("delisted", true, RelistVerdict.BackToSale)]
+    [InlineData("refunded", true, RelistVerdict.BackToSale)]
+    [InlineData("missing", false, RelistVerdict.LeftInventory)]
+    [InlineData("delisted", null, RelistVerdict.Unknown)] // never settle on half the facts
+    public void TheVerdictNeedsBothTheListingAndTheInventory(string? state, bool? inInventory, RelistVerdict expected)
+    {
+        var p = Position();
+        Assert.Equal(expected, RelistReconciliation.Decide(new RelistFacts(state, null, inInventory), p, T0));
     }
 }

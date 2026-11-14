@@ -120,6 +120,24 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             }
         }
 
+        public void RecordModelVerdict(OpportunityEvaluation evaluation)
+        {
+            lock (historyLock)
+            {
+                aggregate.RecordModelVerdict(evaluation.ShouldBuy, evaluation.BestRoi, evaluation.EvaluatedAtUtc == default ? DateTime.UtcNow : evaluation.EvaluatedAtUtc);
+                aggregateDirty = true;
+            }
+        }
+
+        public void RecordBlocked(string reason)
+        {
+            lock (historyLock)
+            {
+                aggregate.RecordBlocked(reason, DateTime.UtcNow);
+                aggregateDirty = true;
+            }
+        }
+
         public void RecordPurchaseOutcome(bool purchased)
         {
             lock (historyLock)
@@ -241,10 +259,36 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
 
         // ───────────────────────────── Balances ─────────────────────────────
 
+        // The daily records are read from disk once and then kept: re-reading 104 small files for every request made
+        // /cs2arbitragebot/balanceHistory take p50 1.0 s, p95 19.2 s on the server (30 days to 2026-11-13).
+        private List<CSFloatAndSteamBalance>? balanceRecords;
+        private readonly SemaphoreSlim balanceLoad = new(1, 1);
+
         public async Task<List<CSFloatAndSteamBalance>> GetAllLogsOfCSFloatAndSteamBalance()
         {
-            var balances = await JsonFiles<CSFloatAndSteamBalance>(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory));
-            return balances.OrderBy(b => b.DateTimeOfBalanceRecord).ToList();
+            var cached = Volatile.Read(ref balanceRecords);
+            if (cached != null) lock (historyLock) return new List<CSFloatAndSteamBalance>(cached);
+            await balanceLoad.WaitAsync();
+            try
+            {
+                cached = Volatile.Read(ref balanceRecords);
+                if (cached == null)
+                {
+                    var loaded = await JsonFiles<CSFloatAndSteamBalance>(OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory));
+                    cached = loaded.OrderBy(b => b.DateTimeOfBalanceRecord).ToList();
+                    Volatile.Write(ref balanceRecords, cached);
+                }
+            }
+            finally { balanceLoad.Release(); }
+            lock (historyLock) return new List<CSFloatAndSteamBalance>(cached);
+        }
+
+        /// <summary>Adds a record to the kept list: one file per day, so a second record that day replaces the first.</summary>
+        internal static void MergeBalanceRecord(List<CSFloatAndSteamBalance> records, CSFloatAndSteamBalance record)
+        {
+            records.RemoveAll(b => b.DateTimeOfBalanceRecord.Date == record.DateTimeOfBalanceRecord.Date);
+            records.Add(record);
+            records.Sort((a, b) => a.DateTimeOfBalanceRecord.CompareTo(b.DateTimeOfBalanceRecord));
         }
 
         /// <summary>Records today's balances. A missing Steam balance carries the last known value forward.</summary>
@@ -281,6 +325,8 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             string path = OmniPaths.GetPath(OmniPaths.GlobalPaths.CS2ArbitrageBotDailyAccountInfoDirectory);
             string filename = string.Join("-", $"AccountInfo{DateTime.Now:yyyy-MM-dd}.json".Split(Path.GetInvalidFileNameChars()));
             await parent.GetDataHandler().WriteToFile(Path.Combine(path, filename), JsonConvert.SerializeObject(info, Formatting.Indented));
+            var kept = Volatile.Read(ref balanceRecords);
+            if (kept != null) lock (historyLock) MergeBalanceRecord(kept, info);
             await parent.ServiceLog($"Recorded account info: £{info.CSFloatUsableBalanceInPounds:F2} CSFloat, £{info.SteamUsableBalanceInPounds:F2} Steam{(info.SteamBalanceCarriedForward ? " (carried forward)" : "")}.");
         }
 
@@ -640,14 +686,69 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public long Purchases { get; set; }
             public long SteamExitBest { get; set; }
             public long RelistExitBest { get; set; }
+            // ── The exit model's verdicts (counted from 2026-11-13) ──
+            // "Qualified" is the quick screen's verdict, taken before the exit model looks: live, 4,543 "qualified" and
+            // 174 on 13 Nov alone, with nothing bought since 9 Oct, because the model rejected every one. These count
+            // what happened next, so the page can show the whole funnel.
+            public long ModelChecked { get; set; }
+            public long ModelConfirmed { get; set; }
+            /// <summary>Confirmed by the model but not bought (purchasing off, balance, limits…).</summary>
+            public long Blocked { get; set; }
+            public Dictionary<string, long> BlockReasons { get; set; } = new();
+            /// <summary>When the exit-model counters started (absent on aggregates written before then).</summary>
+            public DateTime? FunnelSinceUtc { get; set; }
             public Dictionary<string, DailyCounts> Daily { get; set; } = new();
 
             public class DailyCounts
             {
                 public long Evaluated { get; set; }
+                /// <summary>Passed the quick screen (before the exit model).</summary>
                 public long Qualified { get; set; }
                 public long Purchased { get; set; }
                 public double BestRoi { get; set; } = -1;
+                public long ModelChecked { get; set; }
+                public long ModelConfirmed { get; set; }
+                public long Blocked { get; set; }
+                /// <summary>Best value the exit model gave any listing that day (null before it ran that day).</summary>
+                public double? BestModelRoi { get; set; }
+            }
+
+            /// <summary>Short, countable key for why a confirmed opportunity was not bought.</summary>
+            public static string BlockReasonKey(string reason)
+            {
+                if (string.IsNullOrWhiteSpace(reason)) return "other";
+                string r = reason.ToLowerInvariant();
+                if (r.StartsWith("purchasing is disabled")) return "buying off";
+                if (r.StartsWith("already holding")) return "holding the limit";
+                if (r.StartsWith("daily spend limit")) return "daily limit";
+                if (r.Contains("balance unknown")) return "balance unknown";
+                if (r.StartsWith("insufficient csfloat balance")) return "not enough balance";
+                if (r.StartsWith("above the per-item cap")) return "per-item cap";
+                if (r.StartsWith("purchase rejected")) return "CSFloat refused";
+                return "other";
+            }
+
+            /// <summary>The exit model ran on a screen-passer: confirmed (worth buying) or not.</summary>
+            public void RecordModelVerdict(bool confirmed, double modelRoi, DateTime atUtc)
+            {
+                FunnelSinceUtc ??= atUtc;
+                ModelChecked++;
+                var day = Day(atUtc);
+                day.ModelChecked++;
+                if (double.IsFinite(modelRoi) && (day.BestModelRoi == null || modelRoi > day.BestModelRoi)) day.BestModelRoi = modelRoi;
+                if (!confirmed) return;
+                ModelConfirmed++;
+                day.ModelConfirmed++;
+            }
+
+            /// <summary>A model-confirmed opportunity that was not bought, and why.</summary>
+            public void RecordBlocked(string reason, DateTime atUtc)
+            {
+                FunnelSinceUtc ??= atUtc;
+                Blocked++;
+                Day(atUtc).Blocked++;
+                string key = BlockReasonKey(reason);
+                BlockReasons[key] = (BlockReasons.TryGetValue(key, out long n) ? n : 0) + 1;
             }
 
             public static int BucketOf(double roi) => roi < 0 ? 0 : roi < 0.05 ? 1 : roi < 0.10 ? 2 : roi < 0.20 ? 3 : 4;
@@ -761,6 +862,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
             public long PurchaseAttempts { get; set; }
             public long Purchases { get; set; }
             public Dictionary<string, ScanAggregate.DailyCounts> Daily { get; set; } = new();
+            // v3: what the exit model said about screen-passers, and why confirmed ones were not bought
+            public long ModelChecked { get; set; }
+            public long ModelConfirmed { get; set; }
+            public long Blocked { get; set; }
+            public Dictionary<string, long> BlockReasons { get; set; } = new();
+            public DateTime? FunnelSinceUtc { get; set; }
 
             [JsonConstructor]
             public ScannedComparisonAnalytics() { }
@@ -834,6 +941,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBotLabs
                 PurchaseAttempts = a.PurchaseAttempts;
                 Purchases = a.Purchases;
                 Daily = a.Daily;
+                ModelChecked = a.ModelChecked;
+                ModelConfirmed = a.ModelConfirmed;
+                Blocked = a.Blocked;
+                BlockReasons = a.BlockReasons;
+                FunnelSinceUtc = a.FunnelSinceUtc;
                 TimeTakenToPurchaseAllPurchasedItems = purchasedListings
                     .Where(p => p.comparison != null && p.comparison.CSFloatListing.DateTimeListingCreated != default && p.TimeOfPurchase != default)
                     .Select(p => p.TimeOfPurchase.ToUniversalTime() - p.comparison.CSFloatListing.DateTimeListingCreated.ToUniversalTime())

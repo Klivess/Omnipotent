@@ -44,14 +44,43 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         /// <summary>True only once a request has proved the session works and nothing has failed since.</summary>
         public bool SessionKnownGood => sessionProblem == null && sessionOkUtc != default;
         public bool LoginPromptOpen => loginPromptOpen;
+        /// <summary>True while an interactive login (Klives's approval) is being asked for.</summary>
+        public bool InteractiveLoginRunning => Volatile.Read(ref interactiveLoginRunning) != 0;
         public DateTime? LastLoginPromptUtc { get; private set; }
         public string? LastLoginPromptOutcome { get; private set; }
+
+        // ── A refresh token Steam has refused ──
+        // Live (2026-11-13): Steam answered AccessDenied for the saved refresh token, and the 10-minute wallet probe opened a
+        // new Steam connection to try the same token again every time: 81 "Failed generating Steam access token" plus 83
+        // "Not logged in" errors in 13.7 h, 61% of every error the platform logged that day. A refused token is now tried
+        // again only after RejectedTokenRetry (or at once when the token on disk changes, or when Klives asks for a login).
+        public static readonly TimeSpan RejectedTokenRetry = TimeSpan.FromHours(6);
+        private string? rejectedTokenFingerprint;
+        private DateTime rejectedTokenAtUtc;
+        private string? lastLoggedBalanceProblem;
+        public DateTime? RefreshTokenRejectedUtc => rejectedTokenFingerprint == null ? null : rejectedTokenAtUtc;
+
+        internal static string? TokenFingerprint(string? token)
+        {
+            if (string.IsNullOrWhiteSpace(token)) return null;
+            byte[] hash = System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(token));
+            return Convert.ToHexString(hash, 0, 8);
+        }
+
+        /// <summary>Whether a background check should skip trying <paramref name="currentToken"/> because Steam refused it recently.</summary>
+        internal static bool ShouldSkipRejectedToken(string? currentToken, string? rejectedFingerprint, DateTime rejectedAtUtc, DateTime nowUtc) =>
+            rejectedFingerprint != null
+            && TokenFingerprint(currentToken) == rejectedFingerprint
+            && nowUtc - rejectedAtUtc < RejectedTokenRetry
+            && rejectedAtUtc <= nowUtc.AddMinutes(5);
 
         private void MarkSessionWorking()
         {
             sessionOkUtc = sessionCheckedUtc = DateTime.UtcNow;
             sessionProblemSinceUtc = default;
             sessionProblem = null;
+            rejectedTokenFingerprint = null;
+            lastLoggedBalanceProblem = null;
         }
 
         private void MarkSessionDown(string problem)
@@ -416,7 +445,13 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
             if (!await CheckIfCommunityCookieStringWorks())
             {
-                parent.parent.ServiceLogError("Not logged in, so can't get steam balance.");
+                // Once per problem, not on every 10-minute probe (the status route and the page carry the live state).
+                string problem = SessionProblem ?? "not logged in";
+                if (problem != lastLoggedBalanceProblem)
+                {
+                    lastLoggedBalanceProblem = problem;
+                    parent.parent.ServiceLogError($"Not logged in, so can't get steam balance ({problem}). Not repeated until the problem changes.");
+                }
                 return null;
             }
             try
@@ -510,13 +545,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         /// <see cref="LoginPromptCooldown"/> — across restarts, since the time is saved. A prompt that was still open
         /// when the process stopped can't be answered any more, so that one is re-sent. Returns whether the session works now.
         /// </summary>
-        public async Task<bool> RequestInteractiveLoginAsync(string reason)
+        public async Task<bool> RequestInteractiveLoginAsync(string reason, bool askedByKlives = false)
         {
             if (Interlocked.CompareExchange(ref interactiveLoginRunning, 1, 0) != 0) return false;
             try
             {
                 await LoadLoginPromptStateAsync();
-                if (LastLoginPromptUtc is DateTime last && LastLoginPromptOutcome != "open" && DateTime.UtcNow - last < LoginPromptCooldown) return false;
+                // The cooldown keeps background work from nagging; Klives asking from the page is never refused by it.
+                if (!askedByKlives && LastLoginPromptUtc is DateTime last && LastLoginPromptOutcome != "open" && DateTime.UtcNow - last < LoginPromptCooldown) return false;
                 loginPromptReason = reason;
                 return await EnsureSteamAuthAsync(forceRefresh: true, interactive: true) && await CheckIfCommunityCookieStringWorks(reLogin: false);
             }
@@ -564,6 +600,12 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                     }
                     if (!await AcquireRefreshTokenProgrammatically()) return false;
                     loggedInNow = true;
+                }
+
+                if (!loggedInNow && !interactive && ShouldSkipRejectedToken(steamRefreshToken, rejectedTokenFingerprint, rejectedTokenAtUtc, DateTime.UtcNow))
+                {
+                    MarkSessionDown("Steam rejected the saved login; it needs approving in the Steam app");
+                    return false;
                 }
 
                 if (!loggedInNow && !await TryGenerateAccessTokenFromRefreshToken(steamId64))
@@ -668,6 +710,18 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
 
                 authenticatedSteamId64 = TryExtractSteamIdFromJwt(steamAccessToken) ?? TryExtractSteamIdFromJwt(steamRefreshToken) ?? steamId64;
                 return true;
+            }
+            catch (AuthenticationException ex)
+            {
+                // A definite refusal (AccessDenied: revoked or expired): remember it so background checks stop retrying it.
+                string? fingerprint = TokenFingerprint(steamRefreshToken);
+                bool firstTime = fingerprint != rejectedTokenFingerprint;
+                rejectedTokenFingerprint = fingerprint;
+                rejectedTokenAtUtc = DateTime.UtcNow;
+                if (firstTime)
+                    parent.parent.ServiceLogError(ex, $"Steam refused the saved refresh token ({ex.Result}); background checks retry it every {RejectedTokenRetry.TotalHours:0} h until Klives approves a new login.");
+                steamAccessToken = null;
+                return false;
             }
             catch (Exception ex)
             {

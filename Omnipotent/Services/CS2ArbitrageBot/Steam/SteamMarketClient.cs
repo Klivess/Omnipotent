@@ -47,6 +47,28 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         public RequestPacer Pacer => pacer;
         public int CachedCount => cache.Count;
 
+        // ── Items Steam has no book for ──
+        // Live (2026-11-13): all 82 Steam failures in 13.7 h were one item ("Souvenir PP-Bizon | Wood Block Camo
+        // (Battle-Scarred)") that Steam answers success:false for, fetched again on every sweep because a failed fetch was
+        // never remembered. A definite "no book" answer now backs the item off (15 min, doubling to 12 h). Steam itself
+        // answered, so it is not a failure of the source and does not count towards ConsecutiveFailures. Pre-purchase
+        // re-checks (Critical) always go to Steam.
+        public static readonly TimeSpan FirstMissBackoff = TimeSpan.FromMinutes(15);
+        public static readonly TimeSpan MaxMissBackoff = TimeSpan.FromHours(12);
+        private readonly ConcurrentDictionary<string, (DateTime Until, int Count)> misses = new(StringComparer.Ordinal);
+        /// <summary>Definite "Steam has no book for this item" answers.</summary>
+        public long Misses;
+        /// <summary>Lookups answered from the back-off instead of asking Steam again.</summary>
+        public long MissSkips;
+        public int KnownMisses => misses.Count(kv => kv.Value.Until > DateTime.UtcNow);
+        /// <summary>The items currently backed off, longest first (for the status route).</summary>
+        public IReadOnlyList<(string Name, DateTime UntilUtc, int Count)> BackedOffItems(int max = 10) =>
+            misses.Where(kv => kv.Value.Until > DateTime.UtcNow).OrderByDescending(kv => kv.Value.Count)
+                .Take(max).Select(kv => (kv.Key, kv.Value.Until, kv.Value.Count)).ToList();
+
+        internal static TimeSpan MissBackoff(int misses) =>
+            TimeSpan.FromTicks(Math.Min(MaxMissBackoff.Ticks, FirstMissBackoff.Ticks * (1L << Math.Clamp(misses - 1, 0, 20))));
+
         public SteamMarketClient(Func<IReadOnlyDictionary<string, double>?> usdRates, Func<string, int?> nameIdLookup,
             TimeSpan requestSpacing, Action<string>? log = null, HttpMessageHandler? handler = null)
         {
@@ -96,6 +118,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             }
             // A pre-purchase re-check must not queue behind a coalesced background fetch of the same item.
             if (priority == RequestPriority.Critical) return await FetchAndCacheAsync(marketHashName, priority, ct);
+            if (misses.TryGetValue(marketHashName, out var miss) && miss.Until > DateTime.UtcNow)
+            {
+                Interlocked.Increment(ref MissSkips);
+                return cached;
+            }
             var lazy = inflight.GetOrAdd(marketHashName, name => new Lazy<Task<SteamOrderBook?>>(() => FetchAndCacheAsync(name, priority, ct)));
             try
             {
@@ -110,9 +137,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
         private async Task<SteamOrderBook?> FetchAndCacheAsync(string marketHashName, RequestPriority priority, CancellationToken ct)
         {
             SteamOrderBook? book = null;
+            bool definiteMiss = false;
             try
             {
-                book = await FetchOrderbookAsync(marketHashName, priority, ct);
+                (book, definiteMiss) = await FetchOrderbookAsync(marketHashName, priority, ct);
             }
             catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
             catch (Exception ex)
@@ -138,6 +166,17 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 }
             }
 
+            if (book == null && definiteMiss)
+            {
+                Interlocked.Increment(ref Misses);
+                var entry = misses.AddOrUpdate(marketHashName,
+                    _ => (DateTime.UtcNow + MissBackoff(1), 1),
+                    (_, old) => (DateTime.UtcNow + MissBackoff(old.Count + 1), old.Count + 1));
+                // Said once per item (and again only after a day of back-offs), not on every fetch.
+                if (entry.Count == 1 || entry.Count % 8 == 0)
+                    NoteFailure($"orderbook {marketHashName}: Steam has no book for it (unsuccessful or unconvertible); not asked again for {MissBackoff(entry.Count).TotalMinutes:0} min");
+                return cache.TryGetValue(marketHashName, out var lastKnown) ? lastKnown : null;
+            }
             if (book == null)
             {
                 Interlocked.Increment(ref Failures);
@@ -145,6 +184,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
                 return cache.TryGetValue(marketHashName, out var stale) ? stale : null;
             }
 
+            misses.TryRemove(marketHashName, out _);
             Trim(book);
             cache[marketHashName] = book;
             Interlocked.Increment(ref Successes);
@@ -153,14 +193,14 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Steam
             return book;
         }
 
-        private async Task<SteamOrderBook?> FetchOrderbookAsync(string marketHashName, RequestPriority priority, CancellationToken ct)
+        /// <summary>The SPA order book; <c>DefiniteMiss</c> when Steam answered but has no usable book for the item.</summary>
+        private async Task<(SteamOrderBook? Book, bool DefiniteMiss)> FetchOrderbookAsync(string marketHashName, RequestPriority priority, CancellationToken ct)
         {
             string url = Host + "/market/orderbook?q=Load&qp=" + Uri.EscapeDataString(JsonConvert.SerializeObject(new object[] { 730, marketHashName }));
             string? body = await GetAsync(url, priority, queryAction: true, ct);
-            if (body == null) return null;
+            if (body == null) return (null, false);
             var book = SteamOrderBook.ParseOrderbookResponse(body, marketHashName, ToGbpPence, DateTime.UtcNow);
-            if (book == null) NoteFailure($"orderbook {marketHashName}: unsuccessful or unconvertible response");
-            return book;
+            return (book, book == null);
         }
 
         private async Task<SteamOrderBook?> FetchHistogramAsync(string marketHashName, int nameId, RequestPriority priority, CancellationToken ct)
