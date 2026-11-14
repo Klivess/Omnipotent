@@ -148,18 +148,29 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         public void Event(EventLevel level, string kind, string message, string? gameId = null) =>
             Store.Mutate(s => s.AddEvent(level, kind, message, gameId, Clock()));
 
-        private (long Version, Build.WorldGen.AssetCatalog Catalog)? catalog;
+        private (long Version, DateTime BuiltUtc, Build.WorldGen.AssetCatalog Catalog)? catalog;
         private readonly object catalogLock = new();
 
-        /// <summary>The library sorted by role, style and biome for the world generator and the map report (rebuilt when the library changes).</summary>
+        /// <summary>
+        /// How long a catalog is kept once labels have changed under it. While the harvester labels a few models every
+        /// half minute, each world tool, render and map report would otherwise rebuild it; a model labelled a few minutes
+        /// ago missing from the generator's choices costs nothing. Zero rebuilds on every change (tests).
+        /// </summary>
+        public TimeSpan CatalogRefreshAfter { get; set; } = TimeSpan.FromMinutes(10);
+
+        /// <summary>The library sorted by role, style and biome for the world generator and the map report (rebuilt when its labels change).</summary>
         public Build.WorldGen.AssetCatalog Catalog()
         {
-            long version = Library.Version;
+            long version = Library.CatalogVersion;
             lock (catalogLock)
             {
-                if (catalog is { } c && c.Version == version) return c.Catalog;
-                var built = Build.WorldGen.AssetCatalog.FromRecords(Library.Labeled());
-                catalog = (version, built);
+                if (catalog is { } c && (c.Version == version || Clock() - c.BuiltUtc < CatalogRefreshAfter)) return c.Catalog;
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                var records = Library.Labeled();
+                var built = Build.WorldGen.AssetCatalog.FromRecords(records);
+                // Slow rebuilds hold up whatever asked (a render, a map report, a builder's tool), so say so.
+                if (timer.ElapsedMilliseconds > 2000) Log($"[OmniBlox] world catalog rebuilt from {records.Count} labelled models in {timer.Elapsed.TotalSeconds:0.0} s");
+                catalog = (version, Clock(), built);
                 return built;
             }
         }

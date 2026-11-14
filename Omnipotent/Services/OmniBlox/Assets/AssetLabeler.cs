@@ -122,6 +122,12 @@ Reply with ONE JSON object and nothing else:
 
         private readonly IOmniBloxLlm llm;
 
+        /// <summary>
+        /// The answer's budget, thinking included. It was 900: the labeller's 27,238 calls averaged 445 completion
+        /// tokens, so the long tail ran out mid-thought or mid-JSON, and 1,017 models were failed for it (Nov 2026).
+        /// </summary>
+        internal const int LabelMaxTokens = 2400;
+
         public AssetLabeler(IOmniBloxLlm llm) => this.llm = llm;
 
         public async Task<LabelResult> LabelAsync(AssetRecord record, byte[]? thumbnail, IReadOnlyList<(string View, byte[] Png)> renders,
@@ -140,9 +146,14 @@ Reply with ONE JSON object and nothing else:
                 var (request, pictures) = Request(record, thumbnail, renders);
                 llm.AppendStableUser(session, request, pictures);
                 var turn = await llm.QueryAsync(session, Array.Empty<ToolDefinition>(),
-                    new LlmCallOptions { MaxTokens = 900, Thinking = "low", WorkClass = AIRouterWorkClass.OneShot }, ct);
+                    new LlmCallOptions { MaxTokens = LabelMaxTokens, Thinking = "low", WorkClass = AIRouterWorkClass.OneShot }, ct);
                 if (!turn.Success) throw new InvalidOperationException("Labelling call failed: " + turn.Error);
-                var label = Parse(turn.Text);
+                AssetLabel label;
+                try { label = Parse(turn.Text); }
+                catch (Exception ex) when (turn.Truncated && ex is FormatException or JsonException)
+                {
+                    throw new FormatException($"{CutOffMessage} ({turn.CompletionTokens} tokens, limit {LabelMaxTokens})", ex);
+                }
                 label.Model = turn.Model ?? "";
                 return new LabelResult { Label = label, PromptTokens = turn.PromptTokens, CachedTokens = turn.CachedTokens, CompletionTokens = turn.CompletionTokens };
             }
@@ -336,12 +347,15 @@ Reply with ONE JSON object and nothing else:
             return picked;
         }
 
+        /// <summary>How a label failure caused by the token limit reads (not the model's fault: a later try can pass).</summary>
+        internal const string CutOffMessage = "The answer was cut off at the token limit";
+
         internal static AssetLabel Parse(string text)
         {
-            int start = text.IndexOf('{');
-            int end = text.LastIndexOf('}');
-            if (start < 0 || end <= start) throw new FormatException("The model did not return a JSON label.");
-            var j = JObject.Parse(text[start..(end + 1)]);
+            string json = FirstObject(text) ?? throw new FormatException(text.Contains('{')
+                ? "The model's JSON label was not complete."
+                : "The model did not return a JSON label.");
+            var j = JObject.Parse(json);
             List<string> List(string key) => (j[key] as JArray)?.Select(x => x.ToString().Trim()).Where(x => x.Length > 0).Take(12).ToList() ?? new();
             string category = ((string?)j["category"] ?? "other").Trim().ToLowerInvariant();
             if (!Categories.Contains(category)) category = "other";
@@ -361,6 +375,40 @@ Reply with ONE JSON object and nothing else:
                 Quality = Math.Clamp((double?)j["quality"] ?? 5, 0, 10),
                 Issues = List("issues"),
             };
+        }
+
+        /// <summary>
+        /// The first complete JSON object in a model's answer, braces inside strings ignored. Taking everything from
+        /// the first '{' to the last '}' broke on prose or a second object after the label ("Additional text
+        /// encountered after finished reading JSON content") and on answers cut off mid-object.
+        /// </summary>
+        internal static string? FirstObject(string text)
+        {
+            for (int start = text.IndexOf('{'); start >= 0; start = text.IndexOf('{', start + 1))
+            {
+                int depth = 0;
+                bool inString = false, escaped = false;
+                for (int i = start; i < text.Length; i++)
+                {
+                    char c = text[i];
+                    if (inString)
+                    {
+                        if (escaped) escaped = false;
+                        else if (c == '\\') escaped = true;
+                        else if (c == '"') inString = false;
+                        continue;
+                    }
+                    if (c == '"') inString = true;
+                    else if (c == '{') depth++;
+                    else if (c == '}' && --depth == 0)
+                    {
+                        string candidate = text[start..(i + 1)];
+                        try { JObject.Parse(candidate); return candidate; }
+                        catch (JsonException) { break; }
+                    }
+                }
+            }
+            return null;
         }
 
         private static string Clip(string s, int max) => s.Length <= max ? s : s[..max];

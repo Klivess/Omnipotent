@@ -624,6 +624,8 @@ namespace Omnipotent.Tests.OmniBlox
                 Alert = message => { lock (Alerts) Alerts.Add(message); return Task.CompletedTask; },
                 Settings = settings,
                 LocalEngine = localEngine,
+                // Scripted runs label and place in the same minute of fake time: always the newest catalog.
+                CatalogRefreshAfter = TimeSpan.Zero,
             };
             Orchestrator = new Orchestrator(Ctx);
             Connection = new RobloxConnection(Ctx, new RobloxQuickLogin(http, clock), cookie => { settings.SessionCookie = cookie; return Task.CompletedTask; });

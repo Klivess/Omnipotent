@@ -27,6 +27,8 @@ namespace Omnipotent.Services.OmniBlox
 
         /// <summary>Below this many labelled models the overview suggests switching the harvester on.</summary>
         private const long SmallLibrary = 200;
+        /// <summary>A switched-on harvester that has added nothing for this long is stuck, not resting.</summary>
+        internal static readonly TimeSpan HarvesterIdleAlert = TimeSpan.FromHours(24);
 
         public static object GameSummary(StudioContext ctx, GameDossier g)
         {
@@ -122,7 +124,7 @@ namespace Omnipotent.Services.OmniBlox
                 ctx.Settings.RequireLaunchApproval,
                 ctx.Settings.RequireBuildSignoff,
                 ctx.Settings.MaxGamesInProduction,
-                Attention = Attention(ctx, status, tasks, library, slotsFree, games),
+                Attention = Attention(ctx, status, tasks, library, slotsFree, games, studio.Harvester),
                 StageCounts = Enum.GetValues<GameStage>().ToDictionary(st => st.ToString(), st => games.Count(g => g.Stage == st)),
                 Games = games.OrderByDescending(g => g.CreatedUtc).Select(g => GameSummary(ctx, g)).ToList(),
                 OwnerTasks = tasks.OrderByDescending(t => t.CreatedUtc).ToList(),
@@ -135,6 +137,10 @@ namespace Omnipotent.Services.OmniBlox
                     studio.Harvester.Relabeled,
                     studio.Harvester.LastRunUtc,
                     studio.Harvester.LastError,
+                    // State from before progress was kept: the library's newest model says when it last grew.
+                    LastProgressUtc = studio.Harvester.LastProgressUtc ?? library.NewestUtc,
+                    studio.Harvester.Idle,
+                    Downloadable = library.Downloadable,
                     studio.Harvester.PriorityQueries,
                     Last = status.LastHarvest,
                     status.LastHarvestUtc,
@@ -178,7 +184,7 @@ namespace Omnipotent.Services.OmniBlox
         }
 
         /// <summary>Why the studio cannot do its work right now, most serious first. Needs the owner files as tasks are not repeated here.</summary>
-        private static List<object> Attention(StudioContext ctx, StudioStatus status, List<OwnerTask> openTasks, LibraryStats library, int slotsFree, List<GameDossier> games)
+        private static List<object> Attention(StudioContext ctx, StudioStatus status, List<OwnerTask> openTasks, LibraryStats library, int slotsFree, List<GameDossier> games, HarvesterState harvester)
         {
             var items = new List<(int Rank, object Item)>();
             void Add(string level, string title, string detail, string? action) =>
@@ -210,6 +216,11 @@ namespace Omnipotent.Services.OmniBlox
             long labeled = library.ByStatus.GetValueOrDefault(AssetStatus.Labeled);
             if (!ctx.Settings.HarvesterEnabled && labeled < SmallLibrary)
                 Add("info", "The asset harvester is off", $"The Asset Library has {labeled} labelled model(s). Builders place far better worlds with a few hundred to choose from.", "harvester");
+            // On, running every minute, and adding nothing: it sat like that for 9 days before anyone looked (Nov 2026).
+            var progress = harvester.LastProgressUtc ?? library.NewestUtc;
+            if (ctx.Settings.HarvesterEnabled && !library.Counting && progress is { } last && ctx.Clock() - last > HarvesterIdleAlert)
+                Add("warning", "The asset harvester is on but has added nothing",
+                    $"Nothing found, downloaded or labelled since {last:yyyy-MM-dd HH:mm} UTC ({(ctx.Clock() - last).TotalDays:0} days). Last step: {harvester.Idle ?? harvester.LastError ?? "no reason recorded"}.", null);
             return items.OrderBy(i => i.Rank).Select(i => i.Item).ToList();
         }
 

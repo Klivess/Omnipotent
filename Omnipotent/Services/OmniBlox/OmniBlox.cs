@@ -56,6 +56,14 @@ namespace Omnipotent.Services.OmniBlox
                 store.StartFlusher();
                 var library = new AssetLibrary(Path.Combine(root, "assets"));
                 library.Open();
+                if (library.OpenNote != null) await ServiceLog("[OmniBlox] " + library.OpenNote, false);
+                // The overview's first poll used to work the counts out itself, under the lock, behind whatever held it.
+                _ = Task.Run(() =>
+                {
+                    var timer = System.Diagnostics.Stopwatch.StartNew();
+                    try { library.WarmStats(); _ = ServiceLog($"[OmniBlox] asset library counted in {timer.ElapsedMilliseconds} ms", false); }
+                    catch (Exception ex) { _ = ServiceLogError(ex, "[OmniBlox] counting the asset library failed", false); }
+                });
                 var telemetry = new TelemetryStore(Path.Combine(root, "telemetry.db"));
                 telemetry.Open();
 
