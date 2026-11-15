@@ -75,6 +75,14 @@ coordinating session works here. Everything below is committed; `219` v3 tests p
     "dee_marsh" were never compared).
 12. Incident reconstruction (X13) read everything either person said in any channel both use.
 13. Explaining a chart point (X11) read the wrong field name from Explore's records.
+14. (Found by reading, while the look-back page was built, 2026-11-14.) MinorGuard was checked when a fact was written but
+    only partly when one was read. `knowledge/facts` and `knowledge/facts/get` served an inference made before someone
+    was known to be under 18: it stays live until the next detective run withdraws it, and stays in the history after
+    that, which the "on record on a date" mode reads. And a restricted fact stored under an adult that names someone who
+    later turned out to be under 18 ("her brother is ...") was still shown on the adult's page. `Attributes.IsShownFor`
+    is now the one read-side rule (restricted for the subject, restricted for the person named, or an inference about
+    someone the guard covers), used by both routes in every mode, by the profile as it is built, and by the profile
+    route as it is served (`KnowledgeRoutes.Withhold`).
 
 ### Known limits
 - Same-person candidates are found by name, avatar and unfurled links. A link that appears only in message text pairs two
