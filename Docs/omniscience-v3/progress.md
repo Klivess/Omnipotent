@@ -8,7 +8,7 @@ Fix-by-fix status is in [traceability.md](traceability.md).
 - **Additive until cutover:**
   - v3 lives in `Omnipotent/Services/OmniscienceV3/` with service name `OmniscienceV3`, routes under `/omniscience/v3/*` and data in `SavedData/Omniscience/v3/`.
   - The legacy `Services/Omniscience/` keeps running untouched until cutover (plan R8).
-- **Shadow mode:** v3 is registered only when `OmniscienceV3_ShadowEnabled=true`. It tails the legacy DB and opens no Discord gateways.
+- **Shadow mode:** v3 works only when `OmniscienceV3_ShadowEnabled=true`; it then tails the legacy DB and opens no Discord gateways. While the setting is off the service starts, registers its routes (they answer 503 "disabled") and does nothing else.
 - **Architecture rules (R4):**
   - no `DateTime.Now/UtcNow/Today` in v3 code outside `Temporal/SystemClock`;
   - no empty `catch {}`;
@@ -23,6 +23,8 @@ Fix-by-fix status is in [traceability.md](traceability.md).
 ## Where to work
 Work in the git worktree `C:\Projects\Software\Omnipotent\.claude\worktrees\omniscience-v3` (branch `omniscience-v3`).
 Another live session commits and pushes on master from the main folder, so never check the branch out there.
+Since 2026-11-18 `master` contains the branch, with v3 switched off. Later v3 work still happens here and lands on
+`master` by fast-forward.
 
 ## Phases
 | Phase | Scope | Status |
@@ -30,7 +32,7 @@ Another live session commits and pushes on master from the main folder, so never
 | 0 | Branch, docs, contracts | done |
 | 1 | Foundations: temporal ✓, storage ✓, kernel ✓, LLM gateway ✓, ML runtime ✓, policy ✓, API skeleton ✓, legacy importer ✓, synthetic corpus + perf harness ✓ | done (contracts to freeze) |
 | 2 | Workstreams WS-A ingest/media/faces, WS-B knowledge/deduction/inquiry, WS-C classification/analytics/read models/signals, WS-D replica, WS-E UI | built on every branch (2026-11-12) and merged into `omniscience-v3` (2026-11-13). Captions and visual search (WS-A) and the website pages for the WS-A/B/D routes followed on 2026-11-13/14. Not built: faces (WS-A: the face stack and its model files are still to be chosen) |
-| 3 | Integration, shadow run, parity gates, cutover | integration done on `omniscience-v3` ("Next" items 2 and 3): merged A → C → B → D, the open wiring done, X17, X48 and X50 built, KliveRAG fed by v3 behind a switch. Shadow run, parity gates and cutover not started |
+| 3 | Integration, shadow run, parity gates, cutover | integration done on `omniscience-v3` ("Next" items 2 and 3): merged A → C → B → D, the open wiring done, X17, X48 and X50 built, KliveRAG fed by v3 behind a switch. On `master`, switched off, since 2026-11-18 ("Next" item 4). Shadow run, parity gates and cutover not started |
 
 ## Log
 - 2026-11-06:
@@ -209,9 +211,11 @@ Another live session commits and pushes on master from the main folder, so never
    Website: `vue-tsc` shows only master's two errors; all 37 v3 e2e tests pass (10 new); `npm run build` succeeds.
    With the redesign of 2026-11-15 (`fc6839a`): the same two errors; 40 v3 e2e tests pass (3 new), on each of the last three runs, the last one on the final stylesheet;
    `npm run build` succeeds. Nothing was run against a live engine, then or since.
-4. **`master` taken in, 2026-11-18.** Klives asked whether the plan was done ("If so, commit, then merge into main, then
-   push"). It is not (item 5), so nothing was merged into `master` and nothing was pushed. Both v3 branches contain
-   `master` now, so landing them is a fast-forward for as long as `master` does not move.
+4. **`master` taken in, and v3 landed switched off, 2026-11-18.** Klives asked whether the plan was done ("If so, commit,
+   then merge into main, then push"). It is not (item 5), so at first nothing was merged into `master`: both v3 branches
+   took `master` in instead, so that landing them would be a fast-forward. Told what was left and what landing does while
+   v3 is off, he said "Yes, land it". `master` was fast-forwarded to both branches and pushed the same day, in both
+   repositories. `OmniscienceV3_ShadowEnabled` is still off, and switching it on is his.
 
    | Commit | What |
    |---|---|
@@ -226,9 +230,11 @@ Another live session commits and pushes on master from the main folder, so never
    throwaway worktree), and `Demiurge.StimulusQueueTests.UnavailableDestinationCannotDeadlock…` fails under the full run's
    load and passes on its own.
    Website: `vue-tsc` shows errors in four of `master`'s files only (each identical to `master`), none in a v3 file; 63 e2e tests pass in one run (the 40 of v3, the 12 of the old console's spec and the 11 of the access-control spec); `npm run build` succeeds.
-   Nothing was run against a live engine.
+   A fresh checkout of the branch publishes the way the server's sync script does it (`dotnet publish
+   Omnipotent/Omnipotent.csproj`). Nothing was run against a live engine, and the server had not pulled this yet when
+   it was written.
 
-   What landing does by itself, with `OmniscienceV3_ShadowEnabled` still off: the v3 service starts, registers its routes
+   What the landing changes by itself, with `OmniscienceV3_ShadowEnabled` still off: the v3 service starts, registers its routes
    (they answer 503 "disabled") and does nothing else; KliveRAG's reads pass through the guard, which only looks at hits
    from the "omniscience" source, and the v3 connector runs every 15 minutes and removes nothing; the scheduler knows a
    `Background` class that nobody uses yet; the project gains DuckDB, SkiaSharp, Recognizers and Tensors, and
@@ -236,12 +242,12 @@ Another live session commits and pushes on master from the main folder, so never
    compiles unchanged); the website's menu gains "Omniscience v3", whose pages say the engine is off. No request another
    service sends changes.
 5. Still to do: faces (N1) and the image pivot X24; the shadow run on live data (`OmniscienceV3_ShadowEnabled=true` on the
-   server), which needs v3 on `master` first because the server builds what it pulls from `origin/master`; parity gates,
+   server, once it has pulled and rebuilt); parity gates,
    Quality Lab gates, and cutover, which switches `OmniscienceV3_FeedsKliveRag` and
    `ingest.discord_bot.enabled` on; then the website branch. Smaller open items: the general search does not union
    `translate/search`; WS-A's source health does not hand findings to the notices; no page opens a cited message
    (ws-e.md gap 10); twelve routes outside the knowledge, replica, source and media groups have no page yet
    (ws-e.md, "Not built"); the tactics that act outwards (X77 to X81) have no confirmation route; `Docs/omniscience.md`
-   still describes the old engine and is rewritten at cutover. Decisions still open for Klives: landing the two branches on
-   `master` with v3 off (the step before the shadow run); the cutover itself; the face stack and its model files; the Discord
+   still describes the old engine and is rewritten at cutover. Decisions still open for Klives: switching the shadow run on;
+   the cutover itself; the face stack and its model files; the Discord
    user-token gateway (not built).
