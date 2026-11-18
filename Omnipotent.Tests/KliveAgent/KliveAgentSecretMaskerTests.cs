@@ -398,10 +398,17 @@ public class KliveAgentSecretMaskerTests
             .Select(folder => Path.Combine(root, folder))
             .Where(Directory.Exists)
             .SelectMany(folder => Directory.EnumerateFiles(folder, "*.cs", SearchOption.AllDirectories))
-            .Where(path => !path.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar)
-                && !path.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar)
-                && !path.Contains(Path.DirectorySeparatorChar + ".claude" + Path.DirectorySeparatorChar)
-                && !FixturesWithExampleCredentials.Contains(Path.GetFileName(path)))
+            .Where(path =>
+            {
+                // Judged by where the file is inside the repository. A checkout that itself sits under a ".claude"
+                // folder (a worktree) is still this project's source: judged by the whole path, every file of it
+                // was skipped and the sweep had nothing to read.
+                string inside = Path.DirectorySeparatorChar + Path.GetRelativePath(root, path);
+                return !inside.Contains(Path.DirectorySeparatorChar + "bin" + Path.DirectorySeparatorChar)
+                    && !inside.Contains(Path.DirectorySeparatorChar + "obj" + Path.DirectorySeparatorChar)
+                    && !inside.Contains(Path.DirectorySeparatorChar + ".claude" + Path.DirectorySeparatorChar)
+                    && !FixturesWithExampleCredentials.Contains(Path.GetFileName(path));
+            })
             .ToList();
         Assert.True(files.Count > 200, $"only {files.Count} source files found under {root}");
 
