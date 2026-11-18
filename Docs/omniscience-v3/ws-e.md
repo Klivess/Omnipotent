@@ -18,7 +18,7 @@ Repository: `klives-management-website`, branch `omniscience-v3`, worktree
 4. **2026-11-14, the pages for those routes** (`74aec4a`, `29d1eb4`): what is known about a person, the review queue,
    asking, the agenda, the Quality Lab, replicas, sources and imports, and image search. Two small backend additions went
    with them (`7be4506`): `GET people/names` and contract types for the Quality Lab's read model.
-5. **2026-11-15, its own design** (uncommitted in the worktree at the time of writing). Klives asked for the Omniscience
+5. **2026-11-15, its own design** (website `84cf6a5`). Klives asked for the Omniscience
    pages to stop using a shared template ("Do NOT use a template for the UI like the other pages", then "make sure youre
    editing omniscience v3"). The pages no longer borrow OmniTrader's design system: one stylesheet and six components of
    v3's own replace it, the frame and the first page are new, and the people directory gained a quick look and a
@@ -192,7 +192,9 @@ whole console, `pages/omniscience-{person,review,search,explore}.vue` redirect i
 `composables/useOmniscienceApi.ts` and `components/ReplicaChatPanel.vue`. `assets/scss/omniscience.scss` (F064) is
 already gone there. All of that talks to the old `/omniscience/*` routes and goes at cutover.
 
-This branch is 14 commits behind `master` (2026-11-18) and does not have that console, the Admin or OmniDefence
-consoles, or the Projects to Demiurge rename. Merge `master` in before cutover: expect to settle `nuxt.config.ts`,
-`scripts/pageAccess.ts` and `layouts/navbar.vue` by hand. The two designs are separate on purpose (`.omx` for the old
-engine's console, `omni-*` here), so neither stylesheet touches the other's pages.
+This branch has all of that since 2026-11-18: `master` (`3032626`) was merged in as `631ac86`, with that console, the
+Admin and OmniDefence consoles and the Projects to Demiurge rename. Only `nuxt.config.ts` had to be settled by hand (both
+sets of route rules are kept); `scripts/pageAccess.ts` and `layouts/navbar.vue` merged on their own, and each lists
+Omniscience and Omniscience v3 as separate entries until cutover. The two designs are separate on purpose (`.omx` for the
+old engine's console, `omni-*` here), so neither stylesheet touches the other's pages; the old console's own spec passes
+beside the v3 specs on the merged branch.

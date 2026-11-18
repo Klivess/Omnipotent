@@ -203,17 +203,45 @@ Another live session commits and pushes on master from the main folder, so never
    | website `74aec4a`, `29d1eb4` | WS-E slice 3: a person's knowledge, timeline and audit tabs, Review, Ask, Agenda, Quality Lab, Replicas, Sources and Images ([ws-e.md](ws-e.md)). Every first page load of the three v3 e2e specs goes through `loadPage`, which loads the page again when the dev machine runs out of socket buffers. |
    | `71f8607` | MinorGuard when a fact is read, not only when it is written. `knowledge/facts` and `knowledge/facts/get` served an inference made before someone was known to be under 18 (live until the next detective run, and in the history after it), and a restricted fact stored under an adult that names someone who later turned out to be under 18. `Attributes.IsShownFor` is the one read-side rule now, used by both routes in every mode, by the profile as it is built and by the profile route as it is served ([ws-b.md](ws-b.md), defect 14). |
    | website `c1aab00`, `5224b4e` | The two routes of the knowledge and replica groups that no page called: a "Look back" panel on a person's knowledge tab (`knowledge/facts`: true on a date as known today, the same going only by what had been said by then, on record that day, and the facts the list leaves out), and a blind test that is named in the link, carried on after a reload or from the results, and looked at again pair by pair (`replica/blind/session`). The image search waits until its filters stop changing. `loadPage` no longer waits for the load event, which a request that is never answered held back until the test timed out. |
-   | website, uncommitted in the worktree (2026-11-15) | The pages on a design of their own, at Klives's request ("Do NOT use a template for the UI like the other pages", then "make sure youre editing omniscience v3"). They no longer use OmniTrader's design system: `assets/scss/omniscience-v3.scss` and v3's own `Card`, `Kpi`, `Drawer`, `StateBlock`, `DataTable` and `BarList` replace it. A new frame (navigation in two levels; a palette that finds people by name), a Brief as the first page (what needs you, worst first; the engine overview moved to `/omniscience-v3/engine`), and in the people directory a quick look beside the list and a comparison of two people (`insights/pair`, which no page called before). No backend change. [ws-e.md](ws-e.md), slice 5. |
+   | website `84cf6a5` (written 2026-11-15, committed 2026-11-18) | The pages on a design of their own, at Klives's request ("Do NOT use a template for the UI like the other pages", then "make sure youre editing omniscience v3"). They no longer use OmniTrader's design system: `assets/scss/omniscience-v3.scss` and v3's own `Card`, `Kpi`, `Drawer`, `StateBlock`, `DataTable` and `BarList` replace it. A new frame (navigation in two levels; a palette that finds people by name), a Brief as the first page (what needs you, worst first; the engine overview moved to `/omniscience-v3/engine`), and in the people directory a quick look beside the list and a comparison of two people (`insights/pair`, which no page called before). No backend change. [ws-e.md](ws-e.md), slice 5. |
 
    Tests: 519 of 525 v3, KliveRAG and gateway tests pass (6 opt-in skipped). The whole suite: 4,047 of 4,084 pass, 34 skipped, 3 fail, the same three as on 2026-11-13 and all outside v3: `KliveLLM.BriefContinuityTests.MultiWakeReplay…` (fails the same way at the branch point, so it is master's), and `KliveAPI.Telemetry.TelemetryEngineTests.InstantResponses_AtScale` and `Projects.StimulusQueueTests.UnavailableDestinationCannotDeadlock…`, which fail under the full run's load and pass on their own.
    Website: `vue-tsc` shows only master's two errors; all 37 v3 e2e tests pass (10 new); `npm run build` succeeds.
-   With the uncommitted redesign of 2026-11-15: the same two errors; 40 v3 e2e tests pass (3 new), on each of the last three runs, the last one on the final stylesheet;
+   With the redesign of 2026-11-15 (`84cf6a5`): the same two errors; 40 v3 e2e tests pass (3 new), on each of the last three runs, the last one on the final stylesheet;
    `npm run build` succeeds. Nothing was run against a live engine, then or since.
-4. Still to do: faces (N1) and the image pivot X24; the shadow run on live data (`OmniscienceV3_ShadowEnabled=true` on the
-   server); parity gates, Quality Lab gates, and cutover, which switches `OmniscienceV3_FeedsKliveRag` and
+4. **`master` taken in, 2026-11-18.** Klives asked whether the plan was done ("If so, commit, then merge into main, then
+   push"). It is not (item 5), so nothing was merged into `master` and nothing was pushed. Both v3 branches contain
+   `master` now, so landing them is a fast-forward for as long as `master` does not move.
+
+   | Commit | What |
+   |---|---|
+   | website `84cf6a5` | The pages' own design (the last row of item 3), committed. |
+   | `7d36f0b` | `master` (`b2e5e07`) merged into the backend branch: the Projects to Demiurge rename, KliveLLM's per-service routing and call ledger, and the rest. Three files conflicted and keep both sides: the scheduler's session prefixes, `KliveLLM.cs` (tool choice and response format carried through the planned, lane-gated, logged call) and `KliveRAG.cs` (the v3 connector beside the renamed Demiurge connectors). |
+   | `9271036` | v3 as a KliveLLM caller of its own, which the textual merge did not give it. KliveLLM routes, budgets and logs by caller now, and v3 calls through the gateway, whose own file is inside `Services/KliveLLM`: each of its calls would have been filed under KliveLLM › internal and followed that lane's spending rule. Two catalogued lanes, `OmniscienceV3/background` and `OmniscienceV3/interactive`, named from a request's work class in `Llm/LlmClient.cs`; neither spends per token unless that is changed on the KliveLLM page. The gateway passes the caller on, with the request's purpose as the operation. `GetActiveModelContextAsync(caller:)`: a prompt is packed for the model the lane is routed to, not for the default route's. And the sender sends a tool list as it was given again: v3 had made it leave out an empty one, which would have changed the request of Demiurge's front desk and summaries and of Stratum's summary on the day v3 landed; the gateway passes no list instead, so only its own requests leave the key out ([klivellm.md](../klivellm.md)). |
+   | `c2108dd` | `KliveAgentSecretMaskerTests.ShapeRules_ChangeNothingInThisRepositorysOwnSource` left out every file of a checkout under `.claude/worktrees` and failed having read nothing. It goes by the path inside the repository now, and v3's source passes it. |
+   | website `631ac86` | `master` (`3032626`) merged into the website branch: the old engine's rebuilt console, the Admin and OmniDefence consoles, the Demiurge rename. `nuxt.config.ts` conflicted and keeps both sets of route rules; the navigation and the page-access rules merged on their own ([ws-e.md](ws-e.md), "At cutover"). |
+
+   Tests: the whole suite on the merged branch: 4,792 of 4,831 pass, 37 skipped, 2 fail, both outside v3.
+   `KliveLLM.BriefContinuityTests.MultiWakeReplay…` fails the same way on a clean build of `master` `b2e5e07` (checked in a
+   throwaway worktree), and `Demiurge.StimulusQueueTests.UnavailableDestinationCannotDeadlock…` fails under the full run's
+   load and passes on its own.
+   Website: `vue-tsc` shows errors in four of `master`'s files only (each identical to `master`), none in a v3 file; 63 e2e tests pass in one run (the 40 of v3, the 12 of the old console's spec and the 11 of the access-control spec); `npm run build` succeeds.
+   Nothing was run against a live engine.
+
+   What landing does by itself, with `OmniscienceV3_ShadowEnabled` still off: the v3 service starts, registers its routes
+   (they answer 503 "disabled") and does nothing else; KliveRAG's reads pass through the guard, which only looks at hits
+   from the "omniscience" source, and the v3 connector runs every 15 minutes and removes nothing; the scheduler knows a
+   `Background` class that nobody uses yet; the project gains DuckDB, SkiaSharp, Recognizers and Tensors, and
+   `Microsoft.ML.Tokenizers` goes from 1.0.2 to 2.0.1 (the old engine's `ReplicaEmbedder` is its only other user and
+   compiles unchanged); the website's menu gains "Omniscience v3", whose pages say the engine is off. No request another
+   service sends changes.
+5. Still to do: faces (N1) and the image pivot X24; the shadow run on live data (`OmniscienceV3_ShadowEnabled=true` on the
+   server), which needs v3 on `master` first because the server builds what it pulls from `origin/master`; parity gates,
+   Quality Lab gates, and cutover, which switches `OmniscienceV3_FeedsKliveRag` and
    `ingest.discord_bot.enabled` on; then the website branch. Smaller open items: the general search does not union
    `translate/search`; WS-A's source health does not hand findings to the notices; no page opens a cited message
    (ws-e.md gap 10); twelve routes outside the knowledge, replica, source and media groups have no page yet
-   (ws-e.md, "Not built"); the website branch is 14 commits behind `master` (2026-11-18) and has to take `master` in
-   before cutover, where the old engine's pages were rebuilt as their own console in the meantime (ws-e.md, "At cutover"). Decisions still open for Klives: the cutover itself; the face stack and its model files; the Discord
+   (ws-e.md, "Not built"); the tactics that act outwards (X77 to X81) have no confirmation route; `Docs/omniscience.md`
+   still describes the old engine and is rewritten at cutover. Decisions still open for Klives: landing the two branches on
+   `master` with v3 off (the step before the shadow run); the cutover itself; the face stack and its model files; the Discord
    user-token gateway (not built).
