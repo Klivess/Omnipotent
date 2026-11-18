@@ -13,12 +13,12 @@ Repository: `klives-management-website`, branch `omniscience-v3`, worktree
    (relationships, community pages, similar people, the people map, check-ins), links, translation, monitors and data controls.
    `scripts/omniscience/contracts.ts` is now a copy of that file. Pages that need WS-A, WS-B or WS-D DTOs still wait (below).
 3. **2026-11-13, the merged contract.** After the backend merge, `contracts.ts` is a copy of `api-contracts.ts` on
-   `omniscience-v3` with every workstream in it (`5cde727`), so WS-A's, WS-B's and WS-D's DTOs are typed now. The notice
-   list has sentences for plan reminders and standing-question flips (`0d518cd`). Their pages are the next slice.
-4. **2026-11-14, the pages for those routes** (`74aec4a`, `29d1eb4`): what is known about a person, the review queue,
+   `omniscience-v3` with every workstream in it (`ea66482`), so WS-A's, WS-B's and WS-D's DTOs are typed now. The notice
+   list has sentences for plan reminders and standing-question flips (`453b808`). Their pages are the next slice.
+4. **2026-11-14, the pages for those routes** (`779649f`, `5f217ad`): what is known about a person, the review queue,
    asking, the agenda, the Quality Lab, replicas, sources and imports, and image search. Two small backend additions went
-   with them (`7be4506`): `GET people/names` and contract types for the Quality Lab's read model.
-5. **2026-11-15, its own design** (website `84cf6a5`). Klives asked for the Omniscience
+   with them (`cf61bd9`): `GET people/names` and contract types for the Quality Lab's read model.
+5. **2026-11-15, its own design** (website `fc6839a`). Klives asked for the Omniscience
    pages to stop using a shared template ("Do NOT use a template for the UI like the other pages", then "make sure youre
    editing omniscience v3"). The pages no longer borrow OmniTrader's design system: one stylesheet and six components of
    v3's own replace it, the frame and the first page are new, and the people directory gained a quick look and a
@@ -158,7 +158,7 @@ the first navigation is a full load (`go()` in the specs): repeated full loads o
 ## Contract gaps for the other workstreams and Phase 3
 1. **Read-model bodies need contract types.** Mark each read model's body record `[ApiContract]` so it lands in
    `api-contracts.ts`; WS-E builds the domain pages on those types. Typed so far: `person.dossier` (`DossierDto`),
-   `knowledge.profile`, `knowledge.timeline`, `knowledge.agenda` and, since `7be4506`, `knowledge.quality` (`QualityLabDto`).
+   `knowledge.profile`, `knowledge.timeline`, `knowledge.agenda` and, since `cf61bd9`, `knowledge.quality` (`QualityLabDto`).
    The pages cast `ReadModelDto.body` to them, because the envelope itself still answers `body: unknown`.
 2. **Outbound confirmation has no route.** `POST tactics/run` answers `confirmation_required` when `confirmationToken` is
    missing, but nothing issues a token. Needed: a preview route that returns what would be sent plus a token (`OutboundPolicy`).
@@ -192,7 +192,7 @@ whole console, `pages/omniscience-{person,review,search,explore}.vue` redirect i
 `composables/useOmniscienceApi.ts` and `components/ReplicaChatPanel.vue`. `assets/scss/omniscience.scss` (F064) is
 already gone there. All of that talks to the old `/omniscience/*` routes and goes at cutover.
 
-This branch has all of that since 2026-11-18: `master` (`3032626`) was merged in as `631ac86`, with that console, the
+This branch has all of that since 2026-11-18: `master` (`3032626`) was merged in as `57213ae`, with that console, the
 Admin and OmniDefence consoles and the Projects to Demiurge rename. Only `nuxt.config.ts` had to be settled by hand (both
 sets of route rules are kept); `scripts/pageAccess.ts` and `layouts/navbar.vue` merged on their own, and each lists
 Omniscience and Omniscience v3 as separate entries until cutover. The two designs are separate on purpose (`.omx` for the

@@ -1,6 +1,6 @@
 # WS-B — Knowledge, deduction & inquiry (progress)
 
-Branch `claude/omniscience-v3-ws-b-49da68` (worktree `.claude/worktrees/omniscience-v3-ws-b-49da68`), cut from Phase 1 (3dc87df).
+Branch `claude/omniscience-v3-ws-b-49da68` (worktree `.claude/worktrees/omniscience-v3-ws-b-49da68`), cut from Phase 1 (ac223e6).
 Charter: [workstreams.md](workstreams.md). Status of every traceability row of these areas: [traceability.md](traceability.md).
 
 ## Layout (`Omnipotent/Services/OmniscienceV3/Knowledge/`)
@@ -21,7 +21,7 @@ Charter: [workstreams.md](workstreams.md). Status of every traceability row of t
 `knowledge.deduction`, `knowledge.identity`, `knowledge.timeline`, `knowledge.plans`, `knowledge.quality`, `knowledge.inquiry`.
 
 ## Decisions recorded for the integrator
-- **NuGet:** `Microsoft.Recognizers.Text.DateTime` 1.8.13 (MIT, exact pin), own commit 9d3ce76. Used only by `Evidence/TemporalResolver.cs`.
+- **NuGet:** `Microsoft.Recognizers.Text.DateTime` 1.8.13 (MIT, exact pin), own commit a4cc4f0. Used only by `Evidence/TemporalResolver.cs`.
 - **Shared-file edits:** `Kernel/Modules/Datasets.cs` gains three D2 dimensions (`prov.source_kind`, `knowledge.attribute`,
   `knowledge.category`) — additive lines at the end of the catalogue.
 - **Dataset → table map** for the Explore mirror: `KnowledgeSchema.DatasetTables`.

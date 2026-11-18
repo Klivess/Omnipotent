@@ -1,6 +1,6 @@
 # WS-D — Replica (Omniscience v3 Phase 2)
 
-Branch `claude/omniscience-v3-ws-d-21c7c3`, cut from the Phase 1 commit `3dc87df`. Code lives in
+Branch `claude/omniscience-v3-ws-d-21c7c3`, cut from the Phase 1 commit `ac223e6`. Code lives in
 `Omnipotent/Services/OmniscienceV3/Replica/` (module id `replica`, its own intel migration line `ReplicaSchema`).
 This file is the workstream's progress record: what is done, what is not, and why. It is kept current as work lands.
 

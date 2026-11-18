@@ -1,25 +1,25 @@
 # WS-C — Classification, analytics, read models & signals
 
-Branch `claude/omniscience-v3-ws-c-99fa83`, cut from the Phase 1 commit 3dc87df. This file is the workstream's
+Branch `claude/omniscience-v3-ws-c-99fa83`, cut from the Phase 1 commit ac223e6. This file is the workstream's
 progress record: what is done, what is not and why, and what the integrator must know. It is kept current as work
 lands, so a restart can resume from it.
 
 ## Commits that matter to the integrator
 | What | Commit | Notes |
 |---|---|---|
-| NuGet packages | 3f3f2f9 | `DuckDB.NET.Data.Full` 1.5.6.1 (MIT; pulls `DuckDB.NET.Bindings.Full` 1.5.6.1, MIT, and `Apache.Arrow` 23.0.0, Apache-2.0) and an explicit `System.Numerics.Tensors` 10.0.4 (MIT; already resolved transitively at that version, now pinned). Two lines in `Omnipotent/Omnipotent.csproj`. |
-| C-base 1/3: encoder + vectors | 3613aee | `Ml/Encoders`, `Ml/Vectors`, kernel wiring of `ModuleContext.Encoder/Vectors`. |
-| C-base 2/3: A2 ensembles + X19 | 7621a5b | `Ml/Classification`, `Modules/Classification`. |
-| **C-base 3/3: rollups + read models (C-base complete)** | 2b948cc | `Modules/Rollups`, `Modules/Projections`, `Api/WsCRoutes.cs`, serving filter. **Merge this commit as "C-base".** |
-| Explore engine | the commit after 2b948cc | `Modules/Explore`, `Kernel/Explore/ExploreContracts.cs` (additive), `Temporal/Zones.OffsetSegments` (additive), routes `explore/facets` and `explore/export`. Done by the coordinating session from 2026-11-12 (the workstream's own session stopped mid-way through it). |
+| NuGet packages | 7b46a3f | `DuckDB.NET.Data.Full` 1.5.6.1 (MIT; pulls `DuckDB.NET.Bindings.Full` 1.5.6.1, MIT, and `Apache.Arrow` 23.0.0, Apache-2.0) and an explicit `System.Numerics.Tensors` 10.0.4 (MIT; already resolved transitively at that version, now pinned). Two lines in `Omnipotent/Omnipotent.csproj`. |
+| C-base 1/3: encoder + vectors | 762bc5b | `Ml/Encoders`, `Ml/Vectors`, kernel wiring of `ModuleContext.Encoder/Vectors`. |
+| C-base 2/3: A2 ensembles + X19 | dd883cd | `Ml/Classification`, `Modules/Classification`. |
+| **C-base 3/3: rollups + read models (C-base complete)** | cec2d29 | `Modules/Rollups`, `Modules/Projections`, `Api/WsCRoutes.cs`, serving filter. **Merge this commit as "C-base".** |
+| Explore engine | the commit after cec2d29 | `Modules/Explore`, `Kernel/Explore/ExploreContracts.cs` (additive), `Temporal/Zones.OffsetSegments` (additive), routes `explore/facets` and `explore/export`. Done by the coordinating session from 2026-11-12 (the workstream's own session stopped mid-way through it). |
 | Signals (radar, watch rules, reply inbox, X41, X49) | the commit after the Explore engine | `Modules/Signalling`, `Api/SignalsRoutes.cs`. Needs nothing from another workstream; reads the classifier's labels and the rollups when they are installed. |
 | Digests and briefs (N10, N4, X18, X30, X31, X52) | the commit after Signals | `Modules/Briefs`, `Modules/PersonZones.cs`, `Api/BriefsRoutes.cs`. Reads the rollups, the reply inbox and the frozen `assertions` table when they are there. |
 | Transforms without a model (X20–X22, X28, X29, X34, X37–X40) | the commit after digests and briefs | `Modules/Transforms`, `Api/TransformsRoutes.cs`. `TransformsModule` is given the module list (to check saved charts against declared datasets), like Explore. |
 | Notices, relationship dynamics and communities (N12, X36, X45) | the commit after the transforms | `Kernel/Modules/Notices.cs` (additive contract), `Modules/Insights`, `Api/InsightsRoutes.cs`, signals migration 2. `InsightsModule` is given the signals module (its notice sink). |
-| Wellbeing check-ins (N14, X44) | 9cb702a | `InsightsModule.Wellbeing.cs`, insights migration 2. |
-| Data controls (N20, X76) | 5bf8ec4 | `Modules/DataControls`, `Storage/Forgotten.cs`, `Storage/AnalysisOff.cs`, `Api/DataControlsRoutes.cs`; analysis off touches the classifier, rollups, signals, briefs, insights, transforms, explore, projections and the tactic runner (a few lines each); the old-database importer honours both. See "For the merge" in its section. |
-| Community pages (N13), similar people and map (N16) | 59c185d | `InsightsModule.Spaces.cs`, `InsightsModule.People.cs`, `Layout2D.cs`; insights migrations 3 and 4; rollups migration 2 (`rollup_scope_day.klives`). |
-| Link intelligence (N15, X23) and translation (N19, X33) | 9beaba8 | `Modules/Links`, `Modules/Translate`, `Api/LinksRoutes.cs`, `Api/TranslateRoutes.cs`, `Kernel/Modules/Translations.cs` (additive). `BriefsModule` now takes the translation layer; in `BuildModules()` it is added after the list for that reason. Looking links up at providers (`links.unfurl.enabled`) was off by default; it is **on by default since `077e481`** (Klives's decision, 2026-11-13). |
+| Wellbeing check-ins (N14, X44) | baa44f5 | `InsightsModule.Wellbeing.cs`, insights migration 2. |
+| Data controls (N20, X76) | 1f95935 | `Modules/DataControls`, `Storage/Forgotten.cs`, `Storage/AnalysisOff.cs`, `Api/DataControlsRoutes.cs`; analysis off touches the classifier, rollups, signals, briefs, insights, transforms, explore, projections and the tactic runner (a few lines each); the old-database importer honours both. See "For the merge" in its section. |
+| Community pages (N13), similar people and map (N16) | ae2581a | `InsightsModule.Spaces.cs`, `InsightsModule.People.cs`, `Layout2D.cs`; insights migrations 3 and 4; rollups migration 2 (`rollup_scope_day.klives`). |
+| Link intelligence (N15, X23) and translation (N19, X33) | d30c10f | `Modules/Links`, `Modules/Translate`, `Api/LinksRoutes.cs`, `Api/TranslateRoutes.cs`, `Kernel/Modules/Translations.cs` (additive). `BriefsModule` now takes the translation layer; in `BuildModules()` it is added after the list for that reason. Looking links up at providers (`links.unfurl.enabled`) was off by default; it is **on by default since `9d96753`** (Klives's decision, 2026-11-13). |
 | Monitors (X42, X43, X46, X47, X51) and the discourse tactics (X32, X35) | the commit after links and translation | `Modules/Monitors`, `Api/MonitorsRoutes.cs`, `Modules/Briefs/DiscourseTactics.cs`. `MonitorsModule` is handed the signals module (notices). |
 
 ## What the other workstreams integrate against (C-base)
@@ -226,7 +226,7 @@ rankings, comparisons and member lists (counted, never named). `Stats.cs` holds 
 continuity correction, chi-square with its exact tail, Benjamini–Hochberg), checked against textbook values.
 
 **Not built here:** X17 (extract from a selection) calls WS-B's extractor, so it was built at the merge, in WS-B's
-deduction module (`Knowledge/Tactics/ExtractFromSelectionTactic.cs`, `9afcf26`); X23 (link tracker) comes with link
+deduction module (`Knowledge/Tactics/ExtractFromSelectionTactic.cs`, `6d35cc4`); X23 (link tracker) comes with link
 intelligence (N15); X32, X33, X35 and X36 are pending.
 
 ## Relationship dynamics and communities (N12, X36, X45) and notices
@@ -263,7 +263,7 @@ module implements the sink, table `sig_notices`, routes `GET signals/notices`, `
 is listed only, `attention` follows quiet hours and the hourly cap, `urgent` is pushed at once. A finding older than 48
 hours when handed in is listed, never pushed. A person-targeted notice about a possible minor is not recorded.
 **For the integrator:** WS-B's standing-question flips (X50) and WS-A's source health can hand their findings to the same
-sink: pass the `SignalsModule` instance to them in `BuildModules()`. Done at the merge for WS-B (`0ac131f`): the
+sink: pass the `SignalsModule` instance to them in `BuildModules()`. Done at the merge for WS-B (`d1a35f4`): the
 integration module puts the sink on the knowledge kit (`KnowledgeKit.Notices`); plan reminders are kind `plan_reminder`,
 flips `standing_question`, and a flip is no longer also pushed as its own alert. WS-A's source health is not wired.
 
@@ -377,7 +377,7 @@ under 18 (not recorded, not told) or whose analysis is switched off; the event l
   the ones that still exist.
 - Not exercised: real traffic (thresholds are defaults to tune with live data), and WS-A's real source statuses (the
   module treats anything but active, ok, connected, idle, running, live and syncing as down, and disabled or paused as deliberate).
-- X48 plan/date reminders and X50 standing-question flips were built at the merge (`0ac131f`, tests in
+- X48 plan/date reminders and X50 standing-question flips were built at the merge (`d1a35f4`, tests in
   `MergeWiringTests` and `ReasoningTacticsTests`): they hand their findings to the same notices. A reminder whose plan has
   gone or is held back by the minor guard is cancelled, not fired.
 
@@ -411,7 +411,7 @@ Module `links` (`Modules/Links`), routes under `links/` (`Api/LinksRoutes.cs`), 
   query**, marked, and never looked up anywhere.
 - **Where the description comes from.** First the preview stored with the message (`message_embeds`): no request at all,
   stamped with when the message arrived. Only when a link has none, **and only while `links.unfurl.enabled` is on
-  (the default since `077e481`; Klives's decision on 2026-11-13)**, the provider's own metadata endpoint is asked: eight fixed hosts (`LinkParser.EndpointHosts`),
+  (the default since `9d96753`; Klives's decision on 2026-11-13)**, the provider's own metadata endpoint is asked: eight fixed hosts (`LinkParser.EndpointHosts`),
   about a public link, never the shared address itself. The fetcher (`HttpLinkFetcher`) allows only https, those hosts,
   default port and no credentials; resolves the host itself and refuses private, loopback and link-local addresses, then
   connects to exactly the address it checked; follows at most two redirects, each through the same checks; sends no
@@ -455,7 +455,7 @@ Module `translate` (`Modules/Translate`), routes under `translate/` (`Api/Transl
 - Forgetting a person removes their translations with their messages, out of the search index too (the index follows the
   table by triggers).
 - For the merge: WS-B's extraction and search should read `ITranslations.Cached` the way digests do (the general search
-  can union `translate/search`). Done at the merge for what WS-B reads (`621d1e4`): the evidence assembler shows a stored
+  can union `translate/search`). Done at the merge for what WS-B reads (`488facb`): the evidence assembler shows a stored
   translation of the same message version beside the original, as a reading aid to quote the original by. The general
   search does not union `translate/search` yet. "Multilingual embeddings" is the encoder's property (C-base), not this module's.
 - Not exercised: a real model's translations, and real language readings (the tests write the readings and script the model).
@@ -546,15 +546,15 @@ permission; everything else needs engine management.
   before it stores anything, and skip a forgotten account's events. Its face labels, crops, thumbnails, OCR and caption
   rows are swept when their tables key by `message_id`, `person_id` or `identity_id`; files it stores outside the CAS need
   its own handler on `person.erase`. Faces and captions of an analysis-off person are not computed.
-  **Done** for the writer (`621d1e4`: every write site passes the tombstones; an import does not store a forgotten
+  **Done** for the writer (`488facb`: every write site passes the tombstones; an import does not store a forgotten
   message's files). Faces and captions are not built.
 - WS-B's extraction, inquiry and standing questions, and WS-D's replica training, must skip the people in
   `AnalysisOff.Load(...)` in their background jobs (tactics are refused centrally). An assertion about somebody else that
-  loses its last evidence message to an erase should be retracted by WS-B. **Done** (`621d1e4`, `9afcf26`): the knowledge
+  loses its last evidence message to an erase should be retracted by WS-B. **Done** (`488facb`, `6d35cc4`): the knowledge
   reader leaves out what they wrote and reloads the set at once after a switch; claims and rows citing a forgotten message
   go, and the people they were about are consolidated again (change kind `evidence.removed`).
-- KliveRAG's Omniscience connector must drop what it indexed about a person on `person.erase`. **Done** (`892d22b`,
-  `2437c28`): KliveRAG has a v3 connector behind the switch `OmniscienceV3_FeedsKliveRag` (off until cutover). It holds
+- KliveRAG's Omniscience connector must drop what it indexed about a person on `person.erase`. **Done** (`6a81157`,
+  `f46a365`): KliveRAG has a v3 connector behind the switch `OmniscienceV3_FeedsKliveRag` (off until cutover). It holds
   nothing about someone forgotten, with analysis off or possibly under 18; every read drops such documents from the
   moment the forget is confirmed, and the events `data.forgetting` and `data.forgotten` make it purge at once.
 - A route that sets a person's tier must not be read as switching analysis back on: the mark is what counts, not the tier.
@@ -670,7 +670,7 @@ holds the corpus writer for its duration, seconds on a few million messages).
 | Transforms X20, X21, X22, X28, X29, X34, X37, X38, X39, X40 | done, tested (8 tests; statistics checked against textbook values) |
 | Monitors X42, X43, X46, X47, X51 | done, tested (5 tests; thresholds are defaults to tune on live data) |
 | Tactics X32 (slang decoder) and X35 (sides in a dispute) | done, tested (2 tests with a scripted model, including answers it must reject) |
-| X17 (merge step with WS-B's extractor), X48 and X50 (need WS-B) | done at the merge (`0ac131f`, `9afcf26`), tested (X17: 3 tests with a scripted model; X48, X50: one each) |
+| X17 (merge step with WS-B's extractor), X48 and X50 (need WS-B) | done at the merge (`d1a35f4`, `6d35cc4`), tested (X17: 3 tests with a scripted model; X48, X50: one each) |
 | Traceability rows | Explore rows ticked (F485, F486, F553, F555, F557; F061 and F148 wait for the website). Signals rows ticked (F047–F050, F387, F502, F528–F531 fixed; F086, F125, F158, F160, F161, F254, F366, F527 in progress, waiting for the website or for WS-B). **The C-base rows (encoder, classification, rollups, read models) are not ticked yet**: do that from the tests of each area before the merge. |
 
 ## Known limits (Explore)
