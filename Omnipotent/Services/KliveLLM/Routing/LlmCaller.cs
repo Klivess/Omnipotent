@@ -8,8 +8,8 @@ namespace Omnipotent.Services.KliveLLM
     /// route on and nothing to attribute usage to.
     ///
     /// <see cref="Service"/> is the Omnipotent service, <see cref="Lane"/> one part of it with its own
-    /// traffic shape (a Project's Commander and its one-shot utility calls want different routers),
-    /// <see cref="Subject"/> a low-cardinality grouping the caller supplies (a project id, a game id),
+    /// traffic shape (a Steward's Commander and its one-shot utility calls want different routers),
+    /// <see cref="Subject"/> a low-cardinality grouping the caller supplies (a Steward id, a game id),
     /// and <see cref="Operation"/> a free label for the call log.
     /// </summary>
     public sealed record LlmCaller(string Service, string Lane = "default", string? Subject = null, string? Operation = null)
@@ -71,11 +71,11 @@ namespace Omnipotent.Services.KliveLLM
             public static readonly LlmCaller KliveAgentChat = new("KliveAgent", "chat");
             public static readonly LlmCaller KliveAgentTalk = new("KliveAgent", "talk");
             public static readonly LlmCaller KliveAgentSpeech = new("KliveAgent", "speech");
-            public static readonly LlmCaller ProjectsCommander = new("Projects", "commander");
-            public static readonly LlmCaller ProjectsSubAgent = new("Projects", "subagent");
-            public static readonly LlmCaller ProjectsFrontDesk = new("Projects", "frontdesk");
-            public static readonly LlmCaller ProjectsCouncil = new("Projects", "council");
-            public static readonly LlmCaller ProjectsUtility = new("Projects", "utility");
+            public static readonly LlmCaller DemiurgeCommander = new("Demiurge", "commander");
+            public static readonly LlmCaller DemiurgeSubAgent = new("Demiurge", "subagent");
+            public static readonly LlmCaller DemiurgeFrontDesk = new("Demiurge", "frontdesk");
+            public static readonly LlmCaller DemiurgeCouncil = new("Demiurge", "council");
+            public static readonly LlmCaller DemiurgeUtility = new("Demiurge", "utility");
             public static readonly LlmCaller OmniBloxAgents = new("OmniBlox", "agents");
             public static readonly LlmCaller OmniBloxLabeller = new("OmniBlox", "labeller");
             public static readonly LlmCaller StratumEngineer = new("Stratum", "engineer");
@@ -86,7 +86,28 @@ namespace Omnipotent.Services.KliveLLM
             public static readonly LlmCaller Internal = new("KliveLLM", "internal");
         }
 
-        private const string ProjectModels = "Each project's own model routes (Project, Settings)";
+        /// <summary>
+        /// Services that were renamed, old → new. The ledger moves their history across once
+        /// (LlmTelemetryDb version 2) and the routing document re-keys their policies, budgets and
+        /// capture windows as it loads, so a rename never resets a budget part-way through a month.
+        /// </summary>
+        public static readonly IReadOnlyList<(string Old, string New)> RenamedServices = new[]
+        {
+            ("Projects", "Demiurge"), // November 2026
+        };
+
+        /// <summary>A routing key ("Service" or "Service/lane") under its service's current name.</summary>
+        public static string CurrentKey(string key)
+        {
+            foreach (var (oldName, newName) in RenamedServices)
+            {
+                if (key.Equals(oldName, StringComparison.OrdinalIgnoreCase)) return newName;
+                if (key.StartsWith(oldName + "/", StringComparison.OrdinalIgnoreCase)) return newName + key[oldName.Length..];
+            }
+            return key;
+        }
+
+        private const string StewardModels = "Each Steward's own model routes (Steward, Settings)";
 
         /// <summary>Catalogued lanes, in the order the page lists them.</summary>
         public static readonly IReadOnlyList<LlmLaneDescriptor> Lanes = new List<LlmLaneDescriptor>
@@ -98,16 +119,16 @@ namespace Omnipotent.Services.KliveLLM
             new("KliveAgent", "speech", "Speech", "Speech to text and text to speech for talk mode.",
                 AIRouterWorkClass.Audio, FixedRouter: "airouter"),
 
-            new("Projects", "commander", "Commander", "Each project's Commander wake loop.",
-                AIRouterWorkClass.Agent, NeedsToolCalling: true, ModelSource: ProjectModels, ModelSourceLink: "/projects"),
-            new("Projects", "subagent", "Sub-agents", "Worker agents inside a project.",
-                AIRouterWorkClass.Agent, NeedsToolCalling: true, ModelSource: ProjectModels, ModelSourceLink: "/projects"),
-            new("Projects", "council", "Councils", "Adversarial council turns.",
-                AIRouterWorkClass.Burst, ModelSource: ProjectModels, ModelSourceLink: "/projects"),
-            new("Projects", "frontdesk", "Front desk", "Instant replies while a wake is busy.",
-                AIRouterWorkClass.Interactive, ModelSource: ProjectModels, ModelSourceLink: "/projects"),
-            new("Projects", "utility", "Utility", "One-shot digests, triage and summaries.",
-                AIRouterWorkClass.OneShot, ModelSource: ProjectModels, ModelSourceLink: "/projects"),
+            new("Demiurge", "commander", "Commander", "Each Steward's Commander wake loop.",
+                AIRouterWorkClass.Agent, NeedsToolCalling: true, ModelSource: StewardModels, ModelSourceLink: "/demiurge"),
+            new("Demiurge", "subagent", "Sub-agents", "Worker agents inside a Steward.",
+                AIRouterWorkClass.Agent, NeedsToolCalling: true, ModelSource: StewardModels, ModelSourceLink: "/demiurge"),
+            new("Demiurge", "council", "Councils", "Adversarial council turns.",
+                AIRouterWorkClass.Burst, ModelSource: StewardModels, ModelSourceLink: "/demiurge"),
+            new("Demiurge", "frontdesk", "Front desk", "Instant replies while a wake is busy.",
+                AIRouterWorkClass.Interactive, ModelSource: StewardModels, ModelSourceLink: "/demiurge"),
+            new("Demiurge", "utility", "Utility", "One-shot digests, triage and summaries.",
+                AIRouterWorkClass.OneShot, ModelSource: StewardModels, ModelSourceLink: "/demiurge"),
 
             new("OmniBlox", "agents", "Studio agents", "The Roblox studio's design, build and test agents.",
                 AIRouterWorkClass.Agent, NeedsToolCalling: true, DefaultSpending: LlmSpending.Never),
@@ -150,10 +171,10 @@ namespace Omnipotent.Services.KliveLLM
         {
             ("/services/kliveagent/talk/", Callers.KliveAgentTalk),
             ("/services/kliveagent/", Callers.KliveAgentChat),
-            ("/services/projects/projectcommander", Callers.ProjectsCommander),
-            ("/services/projects/projectsubagent", Callers.ProjectsSubAgent),
-            ("/services/projects/projectfrontdesk", Callers.ProjectsFrontDesk),
-            ("/services/projects/", Callers.ProjectsUtility),
+            ("/services/demiurge/stewardcommander", Callers.DemiurgeCommander),
+            ("/services/demiurge/stewardsubagent", Callers.DemiurgeSubAgent),
+            ("/services/demiurge/stewardfrontdesk", Callers.DemiurgeFrontDesk),
+            ("/services/demiurge/", Callers.DemiurgeUtility),
             ("/services/omniblox/assets/", Callers.OmniBloxLabeller),
             ("/services/omniblox/", Callers.OmniBloxAgents),
             ("/services/omniscience/profiling/", new LlmCaller("Omniscience", "profiling")),

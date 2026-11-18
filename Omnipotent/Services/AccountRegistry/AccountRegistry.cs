@@ -5,10 +5,10 @@ using Omnipotent.Services.KliveMail.Persistence;
 namespace Omnipotent.Services.AccountRegistry
 {
     /// <summary>
-    /// A single GLOBAL account registry shared by KliveAgent and every Project. When an agent
+    /// A single GLOBAL account registry shared by KliveAgent and every Steward. When an agent
     /// creates an account on an external service (GitHub, a mail relay, an API provider…) it records
     /// it here — service, username, email, description, owners, timestamps, and the encrypted
-    /// secrets — so agents on other projects reuse it instead of creating redundant duplicates.
+    /// secrets — so agents on other Stewards reuse it instead of creating redundant duplicates.
     ///
     /// Cross-system access mirrors KliveRAG: consumers resolve this service at call time via
     /// GetActiveServices().OfType&lt;AccountRegistry&gt;() and fail soft if it isn't running.

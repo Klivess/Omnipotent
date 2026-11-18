@@ -3,7 +3,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using Omnipotent.Services.KliveMail.Models;
 using Omnipotent.Services.KliveMail.Persistence;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 
 namespace Omnipotent.Services.KliveAgent;
 
@@ -14,7 +14,7 @@ namespace Omnipotent.Services.KliveAgent;
 ///
 /// Without these the only path was reflecting into the KliveMail service from execute_csharp — the
 /// Service Surface exposes it read-only, so creating a mailbox meant guessing at repository internals
-/// mid-signup. Projects hit exactly that (a 730k-token reflection loop) before it got first-class
+/// mid-signup. Demiurge hit exactly that (a 730k-token reflection loop) before it got first-class
 /// tools; this is the same fix for the interactive agent, driven in-process with no HTTP or auth.
 /// </summary>
 internal static class KliveAgentMailTools
@@ -123,7 +123,7 @@ internal static class KliveAgentMailTools
                 var nearby = await repo.ListMessagesAsync(null, false, false, false, 1, 100, ct);
                 hit = nearby.Where(m => Matches(m)
                         && !string.Equals(m.ToAddress, box, StringComparison.OrdinalIgnoreCase)
-                        && ProjectCommanderTools.LikelyMailboxVariant(box, m.ToAddress))
+                        && StewardCommanderTools.LikelyMailboxVariant(box, m.ToAddress))
                     .OrderBy(m => m.ReceivedUtc)
                     .FirstOrDefault();
                 if (hit != null)
@@ -153,7 +153,7 @@ internal static class KliveAgentMailTools
     internal static string DescribeMessage(StoredMessage m, int maxBodyChars)
     {
         string text = !string.IsNullOrWhiteSpace(m.BodyText) ? m.BodyText! : HtmlToText(m.BodyHtml);
-        string? code = ProjectCommanderTools.ExtractVerificationCode((m.Subject ?? "") + "\n" + text);
+        string? code = StewardCommanderTools.ExtractVerificationCode((m.Subject ?? "") + "\n" + text);
         var links = ExtractLinks(m.BodyHtml, m.BodyText);
 
         var sb = new StringBuilder();

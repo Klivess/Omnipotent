@@ -2,7 +2,7 @@
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveLLM;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 using Xunit.Abstractions;
 using Llm = Omnipotent.Services.KliveLLM.KliveLLM;
 
@@ -10,7 +10,7 @@ namespace Omnipotent.Tests.KliveLLM;
 
 public class BriefContinuityTests(ITestOutputHelper output)
 {
-    private const string Id = "projects-commander-continuity-test";
+    private const string Id = "demiurge-commander-continuity-test";
     private static readonly DateTime Now = new(2026, 9, 5, 12, 0, 0, DateTimeKind.Utc);
     private static Llm.KliveLLMSession Session(Llm llm) =>
         ((Dictionary<string, Llm.KliveLLMSession>)typeof(Llm).GetField("sessions", BindingFlags.Instance | BindingFlags.NonPublic)!
@@ -85,9 +85,9 @@ public class BriefContinuityTests(ITestOutputHelper output)
         Begin(llm);
         Assert.False(Begin(llm, system: "NEW ASSIGNMENT").Continued);
         var tools = new List<HFWrapper.HFTool>();
-        string first = ProjectPromptContinuity.CompatibilityKey("provider", new[] { "route" }, tools, null);
+        string first = StewardPromptContinuity.CompatibilityKey("provider", new[] { "route" }, tools, null);
         tools.Add(new() { function = new() { name = "new-tool", description = "changed" } });
-        Assert.NotEqual(first, ProjectPromptContinuity.CompatibilityKey("provider", new[] { "route" }, tools, null));
+        Assert.NotEqual(first, StewardPromptContinuity.CompatibilityKey("provider", new[] { "route" }, tools, null));
     }
 
     [Fact]
@@ -124,12 +124,12 @@ public class BriefContinuityTests(ITestOutputHelper output)
     public void StructuredCommanderBrief_IsIdenticalToExistingSeedAndKeepsJournalIdentities()
     {
         var sections = new List<ToolSessionBriefSection>();
-        var events = Enumerable.Range(1, 60).Select(i => new ProjectEvent
+        var events = Enumerable.Range(1, 60).Select(i => new StewardEvent
         {
-            Sequence = i, Timestamp = Now, Type = ProjectEventTypes.CommanderMessage, Author = "commander", Text = $"Entry {i}",
+            Sequence = i, Timestamp = Now, Type = StewardEventTypes.CommanderMessage, Author = "commander", Text = $"Entry {i}",
         }).ToList();
-        string seed = ProjectCommanderPrompts.BuildWakeSeed(new Project { ProjectID = "p", Goal = "Build" },
-            new ProjectDigest(), events, new(), "go", directivesBlock: "── SOME BODY HEADING ──\nObey this", briefSections: sections);
+        string seed = StewardCommanderPrompts.BuildWakeSeed(new Steward { StewardID = "p", Goal = "Build" },
+            new StewardDigest(), events, new(), "go", directivesBlock: "── SOME BODY HEADING ──\nObey this", briefSections: sections);
         Assert.Equal(seed, ToolSessionBriefState.FullText(sections));
         Assert.Single(sections.Where(section => section.Key == "directives"));
         var journal = Assert.Single(sections.Where(section => section.Key == "recent-events"));
@@ -178,7 +178,7 @@ public class BriefContinuityTests(ITestOutputHelper output)
             new string((char)('a' + i % 20), 3000), MustKeep: i == 1)).ToArray();
         var raw = Brief().Append(new ToolSessionBriefSection("files", new string('f', 16000)))
             .Append(new ToolSessionBriefSection("recent-events", "── EVENTS ──\n" + string.Join("\n", journal.Select(entry => entry.Text)), journal)).ToArray();
-        var fitted = ProjectPromptContinuity.FitReferences(raw);
+        var fitted = StewardPromptContinuity.FitReferences(raw);
         Assert.Equal(raw.Single(s => s.Key == "directives"), fitted.Single(s => s.Key == "directives"));
         Assert.Equal(raw.Single(s => s.Key == "approvals"), fitted.Single(s => s.Key == "approvals"));
         Assert.True(ToolSessionBriefState.FullText(fitted).Length < ToolSessionBriefState.FullText(raw).Length / 3);
@@ -221,15 +221,15 @@ public class BriefContinuityTests(ITestOutputHelper output)
         string previous = "";
         double total = 0, reused = 0;
         int rotations = 0;
-        var project = new Project { ProjectID = "replay", Name = "Replay", Goal = "Execute the plan" };
-        string doctrine = ProjectCommanderAgent.BuildSystemPrompt(project, visionEnabled: false);
-        var tools = ProjectToolFacade.Fold(ProjectAgentToolCatalog.BuildCommanderCanonical(visionEnabled: false));
+        var steward = new Steward { StewardID = "replay", Name = "Replay", Goal = "Execute the plan" };
+        string doctrine = StewardCommanderAgent.BuildSystemPrompt(steward, visionEnabled: false);
+        var tools = StewardToolFacade.Fold(StewardAgentToolCatalog.BuildCommanderCanonical(visionEnabled: false));
         string toolPrefix = JsonConvert.SerializeObject(tools) + "\n";
         for (int wake = 0; wake < 24; wake++)
         {
             var brief = new[]
             {
-                new ToolSessionBriefSection("directives", "Project rules\n" + new string('d', 5000)),
+                new ToolSessionBriefSection("directives", "Steward rules\n" + new string('d', 5000)),
                 new ToolSessionBriefSection("state", $"State revision: {wake}\n" + new string('s', 800)),
                 new ToolSessionBriefSection("files", "── FILES ──\n" + new string('f', 16000)),
                 new ToolSessionBriefSection("knowledge", "── KNOWLEDGE ──\n" + new string('k', 16000)),
@@ -238,7 +238,7 @@ public class BriefContinuityTests(ITestOutputHelper output)
             };
             if (continuity)
             {
-                var start = Begin(llm, ProjectPromptContinuity.FitReferences(brief).ToArray(), budget: 96_000, system: doctrine);
+                var start = Begin(llm, StewardPromptContinuity.FitReferences(brief).ToArray(), budget: 96_000, system: doctrine);
                 if (!start.Continued && wake > 0) rotations++;
             }
             else

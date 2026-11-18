@@ -5,7 +5,7 @@ Three modules make up the AI layer, and they are deliberately different shapes:
 | Module | Shape | Runs for |
 |---|---|---|
 | **KliveAgent** | Single conversational agent, arbitrary C# as its action surface | Seconds to minutes |
-| **Projects** | Multi-agent task force with its own containers and budgets | Days to weeks |
+| **Demiurge** | Multi-agent task force with its own containers and budgets | Days to weeks |
 | **KliveRAG** | Retrieval service, no agency of its own | Continuous indexing |
 
 For KliveAgent's loop in full detail — prompt assembly, parsing, guardrails, the shipped-versus-open
@@ -73,16 +73,16 @@ remote model with native tool calling. The original files remain downloadable th
 
 Each successful KliveAgent model call also writes provider-reported prompt-cache and latency
 telemetry, without storing prompt content. `GET /kliveagent/stats/prompt-cache?range=30d`
-uses the same cache analytics calculations as Projects; the KliveAgent analytics view shows
+uses the same cache analytics calculations as Demiurge; the KliveAgent analytics view shows
 hit rates, reusable-prefix efficiency, provider breakdown, time series, and recent calls.
 
-## Projects — the long-running task force
+## Demiurge — the long-running task force
 
-Source: [`Omnipotent/Services/Projects/`](../Omnipotent/Services/Projects)
+Source: [`Omnipotent/Services/Demiurge/`](../Omnipotent/Services/Demiurge)
 
-Where KliveAgent handles a request, Projects owns an objective for weeks. A
-[`ProjectCommanderRunner`](../Omnipotent/Services/Projects/ProjectCommanderRunner.cs) plans and
-delegates; [`ProjectSubAgentManager`](../Omnipotent/Services/Projects/ProjectSubAgentManager.cs)
+Where KliveAgent handles a request, Demiurge owns an objective for weeks. A
+[`StewardCommanderRunner`](../Omnipotent/Services/Demiurge/StewardCommanderRunner.cs) plans and
+delegates; [`StewardSubAgentManager`](../Omnipotent/Services/Demiurge/StewardSubAgentManager.cs)
 staffs workers against milestones, mixing bounded "task" missions with ongoing "standing" ones.
 
 The hard problems here are not prompting problems. They are the ones any autonomous system hits once
@@ -90,30 +90,30 @@ it runs unattended for longer than a context window:
 
 **Continuity.** Agents wake, work a slice, and sleep. Everything that matters is in durable stores —
 event logs, digests, a plan of record, budget ledgers, observables — so the next wake reconstructs
-state rather than inheriting it. `ProjectWakeCycle`, `ProjectDigestStore` and `ProjectLoopRecovery`
+state rather than inheriting it. `StewardWakeCycle`, `StewardDigestStore` and `StewardLoopRecovery`
 carry that.
 
 **Not repeating itself.** A journal of tool calls plus convergence detection
-(`ProjectToolCallJournal`, `ProjectToolCallConvergence`) catches an agent re-running the same failing
+(`StewardToolCallJournal`, `StewardToolCallConvergence`) catches an agent re-running the same failing
 action across wakes, which is invisible within any single wake.
 
-**Bounded cost.** `ProjectBudgetLedger` and `ProjectTokenUsageStore` track spend per project;
-`ProjectTierRouter` routes work to a model tier proportional to its difficulty rather than sending
+**Bounded cost.** `StewardBudgetLedger` and `StewardTokenUsageStore` track spend per Steward;
+`StewardTierRouter` routes work to a model tier proportional to its difficulty rather than sending
 everything to the largest model.
 
 **A coherent tool surface.** Related tools fold into one definition with an `op` parameter
-([`ProjectToolFacade`](../Omnipotent/Services/Projects/ProjectToolFacade.cs)), so a capability group
+([`StewardToolFacade`](../Omnipotent/Services/Demiurge/StewardToolFacade.cs)), so a capability group
 reads as one vocabulary rather than a dozen sibling names. Folding is presentation only: every call
 is unfolded back to its canonical `(name, arguments)` pair before contract validation, tier gating,
 auditing and dispatch. There is no cap on the number of offered definitions — a new capability is
 added as whichever shape fits it, a new tool or an op on an existing group.
 
-**Real environments.** [`Containers/`](../Omnipotent/Services/Projects/Containers) gives each project
+**Real environments.** [`Containers/`](../Omnipotent/Services/Demiurge/Containers) gives each Steward
 an isolated Docker desktop, reachable over VNC. Agents get a browser and a shell; the owner can take
 over the same desktop live from the dashboard to clear a CAPTCHA or an OAuth prompt.
 
-**Human checkpoints.** `ProjectGateManager` and `ProjectGrandPlanStore` stop the task force at
-plan approval, spending and escalation — not at every step. `ProjectCouncilRunner` runs adversarial
+**Human checkpoints.** `StewardGateManager` and `StewardGrandPlanStore` stop the task force at
+plan approval, spending and escalation — not at every step. `StewardCouncilRunner` runs adversarial
 review of a plan before it is committed.
 
 ## KliveRAG — shared retrieval
@@ -129,14 +129,14 @@ Fusion, then get a recency boost and a per-document diversity cap. Lexical searc
 paraphrase; vector search alone misses exact identifiers and error strings. Fusion is cheaper and
 more robust than tuning either one.
 
-**Connectors** index incrementally by watermark and hash: Projects event logs and digests (live, and
-across projects), KliveAgent conversations and memories as turn-pair chunks, Omniscience's distilled
+**Connectors** index incrementally by watermark and hash: Demiurge event logs and digests (live, and
+across Stewards), KliveAgent conversations and memories as turn-pair chunks, Omniscience's distilled
 knowledge, repository markdown, and TTL'd cached web pages. Omniscience's raw message corpus is
 **federated at query time** rather than re-embedded — it already has its own index, and duplicating it
 would double storage for no recall gain.
 
 **Delivery is both push and pull.** A budgeted `[Relevant Knowledge]` block is auto-injected into
-KliveAgent's system prompt and into Projects wake seeds, *and* both agents get explicit
+KliveAgent's system prompt and into Demiurge wake seeds, *and* both agents get explicit
 `search_knowledge`, `read_knowledge_doc`, `web_search` and `web_fetch` tools. Auto-injection races a
 ~300–400 ms timeout and **fails soft**, returning empty: retrieval degrading must never be able to
 stall a turn.
@@ -149,7 +149,7 @@ expired web documents.
 ```
 KliveAgent ──┐                    ┌── live service graph (Roslyn, in-process)
              ├── KliveRAG ────────┤
-Projects  ───┘   hybrid recall    └── Omniscience (federated at query time)
+Demiurge  ───┘   hybrid recall    └── Omniscience (federated at query time)
 ```
 
 Nothing here is a wrapper around a single model call. The model is one component inside a runtime

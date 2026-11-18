@@ -179,22 +179,30 @@ namespace Omnipotent.Data_Handling
             public static string StratumRunsDirectory = $"{StratumDirectory}/Runs";
             public static string StratumConversationsDirectory = $"{StratumDirectory}/Conversations";
 
-            //Projects (autonomous 24/7 agent task force)
-            public static string ProjectsDirectory = $"{SavedDataDirectory}/Projects";
-            public static string ProjectsIndexFile = $"{ProjectsDirectory}/projects.json";
-            public static string ProjectsEventLogDirectory = $"{ProjectsDirectory}/EventLog";
-            public static string ProjectsDigestsDirectory = $"{ProjectsDirectory}/Digests";
-            public static string ProjectsVaultsDirectory = $"{ProjectsDirectory}/Vaults";
-            public static string ProjectsStimulusDirectory = $"{ProjectsDirectory}/Stimulus";
-            public static string ProjectsContainersFile = $"{ProjectsDirectory}/containers.json";
-            public static string ProjectsVolumesDirectory = $"{ProjectsDirectory}/Volumes";
-            public static string ProjectsFileMetadataDirectory = $"{ProjectsDirectory}/FileMetadata";
-            public static string ProjectsFileMetadataDatabase = $"{ProjectsFileMetadataDirectory}/project-files.db";
-            public static string ProjectsFileStagingDirectory = $"{ProjectsDirectory}/FileStaging";
-            public static string ProjectsObservablesDirectory = $"{ProjectsDirectory}/Observables";
-            public static string ProjectsCouncilsDirectory = $"{ProjectsDirectory}/Councils";
-            public static string ProjectsGrandPlansDirectory = $"{ProjectsDirectory}/GrandPlans";
-            public static string ProjectsMemoryDirectory = $"{ProjectsDirectory}/Memory";
+            //Demiurge (autonomous 24/7 agent task force; each Steward is one goal + budget)
+            // Properties, not fields: OmniStartupManager creates every *field* path at boot, and an
+            // empty SavedData/Demiurge made before DemiurgeStorageMigration runs would hide the data
+            // still sitting in the pre-rename SavedData/Projects folder. Demiurge lays out its own
+            // folders once its data is in place.
+            /// <summary>The data root. <see cref="Services.Demiurge.DemiurgeStorageMigration"/> points it at
+            /// the pre-rename folder for a run in which that folder could not be moved yet.</summary>
+            public static string DemiurgeDirectory { get; set; } = $"{SavedDataDirectory}/Demiurge";
+            /// <summary>The data root's name before Projects became Demiurge (November 2026).</summary>
+            public static string DemiurgeLegacyDirectory => $"{SavedDataDirectory}/Projects";
+            public static string DemiurgeIndexFile => $"{DemiurgeDirectory}/stewards.json";
+            public static string DemiurgeEventLogDirectory => $"{DemiurgeDirectory}/EventLog";
+            public static string DemiurgeDigestsDirectory => $"{DemiurgeDirectory}/Digests";
+            public static string DemiurgeVaultsDirectory => $"{DemiurgeDirectory}/Vaults";
+            public static string DemiurgeStimulusDirectory => $"{DemiurgeDirectory}/Stimulus";
+            public static string DemiurgeContainersFile => $"{DemiurgeDirectory}/containers.json";
+            public static string DemiurgeVolumesDirectory => $"{DemiurgeDirectory}/Volumes";
+            public static string DemiurgeFileMetadataDirectory => $"{DemiurgeDirectory}/FileMetadata";
+            public static string DemiurgeFileMetadataDatabase => $"{DemiurgeFileMetadataDirectory}/steward-files.db";
+            public static string DemiurgeFileStagingDirectory => $"{DemiurgeDirectory}/FileStaging";
+            public static string DemiurgeObservablesDirectory => $"{DemiurgeDirectory}/Observables";
+            public static string DemiurgeCouncilsDirectory => $"{DemiurgeDirectory}/Councils";
+            public static string DemiurgeGrandPlansDirectory => $"{DemiurgeDirectory}/GrandPlans";
+            public static string DemiurgeMemoryDirectory => $"{DemiurgeDirectory}/Memory";
 
             //KAPI Reachability Monitor
             public static string KAPIReachabilityMonitorDirectory = $"{SavedDataDirectory}/KAPIReachabilityMonitor";

@@ -23,8 +23,8 @@ public sealed class TelemetryPayloadDump
 
         var profiles = new[]
         {
-            new RouteProfile("GET", "/projects/list", 4, 0.6, 30, 18_000, 0.85, 0, true),
-            new RouteProfile("GET", "/projects/get", 1.2, 0.5, 40, 42_000, 0.9, 0, true),
+            new RouteProfile("GET", "/demiurge/list", 4, 0.6, 30, 18_000, 0.85, 0, true),
+            new RouteProfile("GET", "/demiurge/get", 1.2, 0.5, 40, 42_000, 0.9, 0, true),
             new RouteProfile("GET", "/KliveAPI/Statistics", 0.8, 0.4, 12, 6_000, 0, 0, true),
             new RouteProfile("GET", "/GeneralBotStatistics/GetFrontpageStats", 2, 0.5, 12, 3_500, 0.6, 0, true),
             new RouteProfile("GET", "/api/logs", 6, 0.7, 10, 38_000, 0.2, 0, true),
@@ -43,9 +43,9 @@ public sealed class TelemetryPayloadDump
             new RouteProfile("PUT", "/KliveCloud/Upload", 1500, 0.9, 1, 300, 0, 0.01, false),
             new RouteProfile("GET", "/KMProfiles/LoginStatus", 0.4, 0.3, 14, 40, 0, 0, false),
             new RouteProfile("GET", "/ping", 0.15, 0.3, 4, 4, 0, 0, false),
-            new RouteProfile("GET", "/projects/cache-health", 18, 0.6, 2, 8_000, 0.5, 0, true),
+            new RouteProfile("GET", "/demiurge/cache-health", 18, 0.6, 2, 8_000, 0.5, 0, true),
             new RouteProfile("GET", "/stratum/projects", 7, 0.5, 2, 16_000, 0.6, 0, false),
-            new RouteProfile("POST", "/projects/steer", 55, 0.6, 1, 900, 0, 0.005, false),
+            new RouteProfile("POST", "/demiurge/steer", 55, 0.6, 1, 900, 0, 0.005, false),
             new RouteProfile("GET", "/klivemail/inbox", 30, 0.8, 3, 70_000, 0.4, 0, false),
         };
         int totalWeight = profiles.Sum(p => p.Weight);
@@ -116,7 +116,7 @@ public sealed class TelemetryPayloadDump
             }
             if (rng.NextDouble() < 0.05) tel.Fold(TraceHelpers.Make("/wp-login.php", matched: false, status: 404, handlerMs: 0.05, origin: "DirectApi"));
             if (rng.NextDouble() < 0.02) tel.Fold(TraceHelpers.Make("/.env", denied: true, status: 403, handlerMs: 0.02, origin: "DirectApi"));
-            tel.Fold(TraceHelpers.Make("/projects/list", method: "OPTIONS", seriesOverride: ApiTelemetry.PreflightSeries, handlerMs: 0.05, bytes: 0));
+            tel.Fold(TraceHelpers.Make("/demiurge/list", method: "OPTIONS", seriesOverride: ApiTelemetry.PreflightSeries, handlerMs: 0.05, bytes: 0));
 
             // Browser timings for a subset.
             for (int k = 0; k < (int)(3 * density) + 1; k++)

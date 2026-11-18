@@ -102,13 +102,13 @@
 	<ItemGroup>
 		<!-- Desktop-container build context, shipped with the app so the container
 		     bootstrapper can auto-build the image when it's missing on the host. -->
-		<None Update="Services\Projects\Containers\desktop.Dockerfile" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\desktop-entrypoint.sh" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\browser-inspect.py" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\browser-service.py" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\klive-fp-manifest.json" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\klive-fp-patch.js" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\klive-cdp" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\desktop.Dockerfile" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\desktop-entrypoint.sh" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\browser-inspect.py" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\browser-service.py" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\klive-fp-manifest.json" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\klive-fp-patch.js" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\klive-cdp" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 	<ItemGroup>

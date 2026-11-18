@@ -85,7 +85,7 @@ namespace Omnipotent.Tests.KliveAgent
             var registered = new[]
             {
                 "/api/omnitrader/status", "/api/omnitrader/firm/overview", "/api/omnitrader/firm/positions",
-                "/api/omnitrader/firm/reconciliation", "/kliveagent/status", "/projects/overview", "/omniscience/stats/overview",
+                "/api/omnitrader/firm/reconciliation", "/kliveagent/status", "/demiurge/overview", "/omniscience/stats/overview",
             };
             Assert.Equal("/api/omnitrader/status", OmniApiClient.ClosestRoutes("/omnitrader/status", registered)[0]);
             Assert.Contains("/api/omnitrader/firm/positions", OmniApiClient.ClosestRoutes("/omnitrader/positions", registered));

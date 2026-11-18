@@ -16,8 +16,8 @@ optional (a null throws at registration), so a route cannot be added without a d
 decision:
 
 ```csharp
-await CreateAPIRoute("/projects/list", HandleList,
-                     HttpMethod.Get, ProjectsPerms.OverviewView);
+await CreateAPIRoute("/demiurge/list", HandleList,
+                     HttpMethod.Get, DemiurgePerms.OverviewView);
 
 await CreateStreamingAPIRoute("/KliveCloud/UploadFile", HandleUpload,
                               HttpMethod.Post, KliveCloudPerms.FilesUpload,
@@ -71,7 +71,7 @@ Every permission sits in a **tier** — how much information or power it gives:
 | 1 · Glance | Status, counts, summaries | `omnitrader.status.view`, `klivecloud.drive.view` |
 | 2 · Read | Full records, history, content | `omniscience.persons.read`, `klivemail.messages.read` |
 | 3 · Act | Routine, mostly reversible operations | `omnitrader.backtests.run`, `klivecloud.files.upload` |
-| 4 · Manage | Creating, deleting, configuring | `klivemail.mailboxes.manage`, `projects.lifecycle.manage` |
+| 4 · Manage | Creating, deleting, configuring | `klivemail.mailboxes.manage`, `demiurge.lifecycle.manage` |
 | 5 · Critical | Live money, host control, secrets, other profiles | `omnitrader.orders.place`, `system.terminal.use` |
 
 Routes reading the same data at the same depth share a key; every mutation has its own key separate

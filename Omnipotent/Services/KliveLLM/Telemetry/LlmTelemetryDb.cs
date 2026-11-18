@@ -112,7 +112,40 @@ namespace Omnipotent.Services.KliveLLM.Telemetry
             using (var wal = conn.CreateCommand()) { wal.CommandText = "PRAGMA journal_mode=WAL;"; wal.ExecuteNonQuery(); }
             int version;
             using (var cmd = conn.CreateCommand()) { cmd.CommandText = "PRAGMA user_version;"; version = Convert.ToInt32(cmd.ExecuteScalar()); }
-            if (version >= 1) return;
+            if (version < 1) CreateSchema(conn);
+            if (version < 2) RenameServices(conn);
+        }
+
+        /// <summary>
+        /// Version 2: calls recorded under a service's old name move to its new one
+        /// (<see cref="LlmConsumerCatalog.RenamedServices"/>: Projects became Demiurge), so
+        /// history, the page and every budget read one continuous service. An aggregate bucket that
+        /// somehow already exists under the new name keeps its row; the old one is left beside it.
+        /// </summary>
+        private static void RenameServices(SqliteConnection conn)
+        {
+            var sql = new StringBuilder();
+            foreach (var (oldName, newName) in LlmConsumerCatalog.RenamedServices)
+            {
+                string from = oldName.Replace("'", "''"), to = newName.Replace("'", "''");
+                sql.AppendLine($"UPDATE calls SET service = '{to}' WHERE service = '{from}';");
+                sql.AppendLine($"UPDATE OR IGNORE subject_1d SET service = '{to}' WHERE service = '{from}';");
+                foreach (var tier in LlmTiers.All)
+                    sql.AppendLine($"UPDATE OR IGNORE {LlmTiers.Table(tier)} SET service = '{to}' WHERE service = '{from}';");
+            }
+            sql.Append("PRAGMA user_version = 2;");
+            using var tx = conn.BeginTransaction();
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.Transaction = tx;
+                cmd.CommandText = sql.ToString();
+                cmd.ExecuteNonQuery();
+            }
+            tx.Commit();
+        }
+
+        private static void CreateSchema(SqliteConnection conn)
+        {
 
             var sql = new StringBuilder(@"
 CREATE TABLE IF NOT EXISTS calls (

@@ -1,0 +1,539 @@
+using Omnipotent.Services.Demiurge;
+using Omnipotent.Services.Demiurge.Stimulus;
+using Omnipotent.Data_Handling;
+using Omnipotent.Services.Demiurge.Containers;
+using Omnipotent.Services.KliveLLM;
+using System.Net;
+
+namespace Omnipotent.Tests.Demiurge;
+
+public class StewardDesktopInteractionPolicyTests
+{
+    private static StewardSettings Enabled() => new() { DesktopFirstWebsiteInteraction = true };
+
+    [Theory]
+    [InlineData("run_bash", "{\"script\":\"python -c \\\"from playwright.sync_api import sync_playwright\\\"\"}")]
+    [InlineData("computer_terminal", "{\"command\":\"xdotool click 10 10\"}")]
+    [InlineData("computer_terminal", "{\"command\":\"chromium https://social.example/signup\"}")]
+    [InlineData("run_powershell", "{\"script\":\"curl --request POST https://social.example/api/post\"}")]
+    [InlineData("run_bash", "{\"script\":\"fetch('https://social.example/post', {method: 'POST'})\"}")]
+    public void HiddenWebsiteAutomation_IsBlocked(string tool, string arguments)
+    {
+        string? violation = StewardDesktopInteractionPolicy.FindViolation(Enabled(), tool, arguments);
+
+        Assert.StartsWith("DESKTOP_INTERACTION_REQUIRED", violation);
+    }
+
+    [Fact]
+    public void MutatingPublicHttp_IsBlocked_ButReadOnlyAndLocalRequestsRemainAvailable()
+    {
+        Assert.NotNull(StewardDesktopInteractionPolicy.FindViolation(Enabled(), "http_request",
+            "{\"url\":\"https://social.example/account\",\"method\":\"POST\"}"));
+        Assert.Null(StewardDesktopInteractionPolicy.FindViolation(Enabled(), "http_request",
+            "{\"url\":\"https://social.example/account\",\"method\":\"GET\"}"));
+        Assert.Null(StewardDesktopInteractionPolicy.FindViolation(Enabled(), "http_request",
+            "{\"url\":\"http://127.0.0.1:5000/test\",\"method\":\"POST\"}"));
+    }
+
+    [Fact]
+    public void DisposableMailFallbackIsBlockedAcrossBrowserAndScriptSurfaces()
+    {
+        Assert.Contains("DISPOSABLE_MAIL_PROHIBITED", StewardDesktopInteractionPolicy.FindViolation(Enabled(),
+            "computer_navigate", "{\"url\":\"https://mail.tm/en/\"}"));
+        Assert.Contains("DISPOSABLE_MAIL_PROHIBITED", StewardDesktopInteractionPolicy.FindViolation(Enabled(),
+            "run_bash", "{\"script\":\"curl https://api.mail.tm/domains\"}"));
+    }
+
+    [Fact]
+    public void InvokedStewardScript_IsInspected_NotJustTheShellCommand()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "policy-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(root);
+        try
+        {
+            File.WriteAllText(Path.Combine(root, "signup.py"),
+                "from selenium import webdriver\ndriver = webdriver.Chrome()");
+
+            string? violation = StewardDesktopInteractionPolicy.FindViolation(Enabled(), "run_bash",
+                "{\"script\":\"python signup.py\"}", root);
+
+            Assert.NotNull(violation);
+        }
+        finally { Directory.Delete(root, recursive: true); }
+    }
+
+    [Fact]
+    public void ScriptStimulusCannotBecomeAHiddenBrowserWorker()
+    {
+        string? violation = StewardDesktopInteractionPolicy.FindViolation(Enabled(), "create_stimulus_hook",
+            "{\"sourceKind\":\"script\",\"sourceSpec\":{\"script\":\"requests.post('https://social.example/post')\"}} ");
+
+        Assert.NotNull(violation);
+    }
+
+    [Fact]
+    public void OrdinaryDiagnosticsAndSourceWork_AreNotBlocked()
+    {
+        Assert.Null(StewardDesktopInteractionPolicy.FindViolation(Enabled(), "run_bash",
+            "{\"script\":\"docker ps && rg TODO /project\"}"));
+        Assert.Null(StewardDesktopInteractionPolicy.FindViolation(Enabled(), "execute_csharp",
+            "{\"code\":\"var fileLocator = new FileLocator();\"}"));
+    }
+}
+
+public class StewardToolCallJournalTests
+{
+    [Fact]
+    public void RestartRecovery_PairsOnlyCallsWhoseResultWasNeverCommitted()
+    {
+        var log = new StewardEventLogStore(_ => { });
+        string stewardID = "journal_" + Guid.NewGuid().ToString("N");
+        const string wakeID = "wake-1";
+        log.Append(new StewardEvent
+        {
+            StewardID = stewardID, WakeID = wakeID, AgentID = "commander",
+            Type = StewardEventTypes.ToolCall, ToolCallId = "complete", ToolName = "read_file",
+        });
+        log.Append(new StewardEvent
+        {
+            StewardID = stewardID, WakeID = wakeID, AgentID = "commander",
+            Type = StewardEventTypes.ToolResult, ToolCallId = "complete", ToolName = "read_file",
+        });
+        log.Append(new StewardEvent
+        {
+            StewardID = stewardID, WakeID = wakeID, AgentID = "commander",
+            Type = StewardEventTypes.ToolCall, ToolCallId = "lost", ToolName = "computer_click_text",
+        });
+
+        Assert.Equal(1, StewardToolCallJournal.ReconcileInterruptedWake(log, stewardID, wakeID, "commander"));
+        Assert.Equal(0, StewardToolCallJournal.ReconcileInterruptedWake(log, stewardID, wakeID, "commander"));
+        var repaired = Assert.Single(log.ReadSince(stewardID, 0, 20),
+            e => e.Type == StewardEventTypes.ToolResult && e.ToolCallId == "lost");
+        Assert.StartsWith(StewardToolCallJournal.InterruptedResultPrefix, repaired.Text);
+        Assert.Contains("outcome is unknown", repaired.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Equal("{\"succeeded\":false}", repaired.PayloadJson);
+    }
+}
+
+public class StewardRecurringTimerTests
+{
+    [Fact]
+    public void RecurrenceRemainsWallClockAnchoredAcrossRestart()
+    {
+        DateTime anchor = new(2026, 7, 14, 9, 0, 0, DateTimeKind.Utc);
+        TimeSpan daily = TimeSpan.FromDays(1);
+
+        Assert.Equal(anchor, StimulusAdapterManager.NextTimerOccurrence(
+            anchor, daily, anchor.AddHours(-1)));
+        Assert.Equal(new DateTime(2026, 7, 16, 9, 0, 0, DateTimeKind.Utc),
+            StimulusAdapterManager.NextTimerOccurrence(anchor, daily,
+                new DateTime(2026, 7, 15, 14, 0, 0, DateTimeKind.Utc)));
+    }
+}
+
+public class StewardWakeStatusTests
+{
+    [Fact]
+    public void MissingClosingText_IsSynthesizedOnlyFromDurableState()
+    {
+        var digest = new StewardDigest { CurrentFocus = "verify profile", NextSteps = ["publish first draft"] };
+        var runtime = new StewardRuntimeState
+        {
+            Checkpoint = new StewardRuntimeCheckpoint
+            {
+                LastSuccessfulAction = new StewardActionCheckpoint { Summary = "signup form submitted" },
+                ResumeAction = new StewardResumeAction { Summary = "inspect the verification screen" },
+            },
+        };
+
+        string status = StewardWakeStatus.ForCommander(digest, runtime);
+
+        Assert.Contains("synthesized from durable state", status);
+        Assert.Contains("signup form submitted", status);
+        Assert.Contains("inspect the verification screen", status);
+        Assert.DoesNotContain("(no closing status)", status);
+    }
+
+    [Fact]
+    public void ConsumedWorkSliceResume_IsClearedRegardlessOfWakeOutcome()
+    {
+        var resume = new StewardResumeAction { Kind = "work-slice", Summary = "continue" };
+
+        Assert.True(StewardWorkSliceBoundary.ShouldClearConsumedResume(false, resume));
+        Assert.False(StewardWorkSliceBoundary.ShouldClearConsumedResume(true, resume));
+        Assert.False(StewardWorkSliceBoundary.ShouldClearConsumedResume(false,
+            new StewardResumeAction { Kind = "loop-recovery", Summary = "change strategy" }));
+    }
+
+    [Theory]
+    [InlineData("HTTP 402 from the API", "retry 402 API")]
+    [InlineData("Received a DM through Discord", "DM status")]
+    public void EventScoring_RetainsMeaningfulShortTokens(string eventText, string query)
+    {
+        double matching = DemiurgeContextBudget.ScoreEvent(eventText, query, 20);
+        double unrelated = DemiurgeContextBudget.ScoreEvent("unrelated historical event", query, 20);
+
+        Assert.True(matching > unrelated);
+    }
+
+    [Fact]
+    public void EventScoring_HasARecencyFloor()
+    {
+        Assert.True(DemiurgeContextBudget.ScoreEvent("unrelated", "query", 100_000) >= 0.06);
+    }
+}
+
+public class KliveMailboxIntegrityTests
+{
+    [Theory]
+    [InlineData("growth.bot@klive.dev", "growthbot@klive.dev", true)]
+    [InlineData("growthbot@klive.dev", "growthbo@klive.dev", true)]
+    [InlineData("growthbot@klive.dev", "growthbox@klive.dev", true)]
+    [InlineData("growthbot@klive.dev", "growbot@klive.dev", false)]
+    [InlineData("growthbot@klive.dev", "growthbot@example.com", false)]
+    [InlineData("growthbot@klive.dev", "growthbot@klive.dev", false)]
+    public void NearbyMailboxDetection_IsNarrowAndDomainBound(string expected, string actual, bool nearby)
+    {
+        Assert.Equal(nearby, StewardCommanderTools.LikelyMailboxVariant(expected, actual));
+    }
+}
+
+public class StewardWorkProgressTests
+{
+    [Fact]
+    public void ExplicitToolFailure_NeverEarnsAContinuationCheckpoint()
+    {
+        var runtime = new StewardRuntimeStateStore(_ => { });
+        string stewardID = "progress_" + Guid.NewGuid().ToString("N");
+        var failed = new CommanderToolResult("Output happened to look useful") { Succeeded = false };
+
+        Assert.False(StewardWorkProgress.RecordIfNovel(runtime, stewardID, "commander",
+            "run_bash", "{\"script\":\"false\"}", failed));
+        Assert.Null(runtime.Get(stewardID).Checkpoint.LastSuccessfulAction);
+    }
+
+    [Fact]
+    public void SuccessfulOutcomeHistory_SurvivesInterveningActionsAndRestart()
+    {
+        var runtime = new StewardRuntimeStateStore(_ => { });
+        string stewardID = "progress_" + Guid.NewGuid().ToString("N");
+        var success = new CommanderToolResult("same durable observation");
+
+        Assert.True(StewardWorkProgress.RecordIfNovel(runtime, stewardID, "commander",
+            "read_file", "{\"path\":\"a.txt\"}", success));
+        Assert.True(StewardWorkProgress.RecordIfNovel(runtime, stewardID, "commander",
+            "read_file", "{\"path\":\"b.txt\"}", new CommanderToolResult("different observation")));
+
+        var reloaded = new StewardRuntimeStateStore(_ => { });
+        Assert.False(StewardWorkProgress.RecordIfNovel(reloaded, stewardID, "commander",
+            "read_file", "{\"path\":\"a.txt\"}", success));
+    }
+}
+
+public class StewardContextSliceTests
+{
+    [Fact]
+    public void StewardTurnsHaveExplicitAffordableOutputAndAggregateTokenBoundaries()
+    {
+        var settings = new StewardSettings();
+
+        Assert.InRange(settings.CommanderMaxOutputTokens, 512, 32_768);
+        Assert.InRange(settings.SubAgentMaxOutputTokens, 512, 32_768);
+        Assert.InRange(settings.WorkSliceTokenBudget, 128_000, 2_000_000);
+        Assert.Equal(0, settings.WorkSliceToolCalls);
+        Assert.Equal(0, settings.WorkSliceModelTurns);
+        Assert.Equal(48_000, DemiurgeContextBudget.RecentEventsBudget);
+    }
+
+    [Theory]
+    [InlineData(40, 40, 8, 24, 20_000, 64_000, "tool-call boundary reached (40/40)")]
+    [InlineData(8, 40, 24, 24, 20_000, 64_000, "model-turn boundary reached (24/24)")]
+    [InlineData(8, 40, 8, 24, 64_001, 64_000, "token boundary reached (64001/64000)")]
+    public void RolloverRecordsTheExactBoundary(int calls, int callLimit, int turns, int turnLimit,
+        long tokens, long tokenLimit, string expected)
+    {
+        string? reason = StewardWorkSliceBoundary.Describe(
+            calls, callLimit, turns, turnLimit, tokens, tokenLimit);
+
+        Assert.Equal(expected, reason);
+    }
+
+    [Fact]
+    public void ZeroCallAndTurnLimitsLeaveTheLiveContextAsThePrimaryBoundary()
+    {
+        string? below = StewardWorkSliceBoundary.Describe(500, 0, 500, 0, 179_999, 180_000);
+        string? atLimit = StewardWorkSliceBoundary.Describe(500, 0, 500, 0, 180_000, 180_000);
+
+        Assert.Null(below);
+        Assert.Equal("token boundary reached (180000/180000)", atLimit);
+    }
+
+    [Fact]
+    public void DisabledCallAndTurnBoundaries_DoNotTellAgentsToStopWorking()
+    {
+        Assert.False(StewardWorkSliceBoundary.IsToolCallLimitReached(0, 0));
+        Assert.False(StewardWorkSliceBoundary.IsToolCallLimitReached(500, 0));
+        Assert.False(StewardWorkSliceBoundary.IsFinalModelTurn(0, 0));
+        Assert.False(StewardWorkSliceBoundary.IsFinalModelTurn(500, 0));
+
+        Assert.True(StewardWorkSliceBoundary.IsToolCallLimitReached(3, 3));
+        Assert.True(StewardWorkSliceBoundary.IsFinalModelTurn(2, 3));
+    }
+
+    [Fact]
+    public void WakeDiagnostic_ExplainsWhenTheModelReturnedNoToolCalls()
+    {
+        var diagnostic = StewardWakeDiagnostics.Create("p", "w", "commander",
+            StewardEventTypes.WakeCompleted, DateTime.UtcNow.AddSeconds(-2), modelTurns: 1,
+            modelToolCalls: 0, dispatchedToolCalls: 0, productiveActions: 0, emptyResponses: 0,
+            loopTrips: 0, endedAtWorkSlice: false, initialModel: "model/a", finalModel: "model/a",
+            toolCallLimit: 0, modelTurnLimit: 0, liveContextTokens: 1234, tokenLimit: 180000,
+            lastToolName: null);
+
+        Assert.Equal(StewardEventTypes.WakeDiagnostic, diagnostic.Type);
+        Assert.Contains("model returned prose/no native tool calls", diagnostic.Text);
+        Assert.Contains("tool-call cap=off (offered tools remained available)", diagnostic.Text);
+        Assert.DoesNotContain("tools=disabled", diagnostic.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("slice limits", diagnostic.Text, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("\"modelToolCalls\":0", diagnostic.PayloadJson);
+    }
+
+    [Fact]
+    public void LiveContextUsesOnlyTheCurrentProviderTurn_NotCumulativeBillingUsage()
+    {
+        long firstTurn = StewardWorkSliceBoundary.MeasureLiveContext(20_000, 2_000);
+        long secondTurn = StewardWorkSliceBoundary.MeasureLiveContext(30_000, 2_000);
+
+        Assert.Equal(22_000, firstTurn);
+        Assert.Equal(32_000, secondTurn);
+        Assert.NotEqual(firstTurn + secondTurn, secondTurn);
+    }
+
+    [Fact]
+    public void CompletedToolBatchIsReportedAsExecuted_NotAsFailedOrDeferred()
+    {
+        string message = StewardWorkSliceBoundary.CompletedBatchMessage(
+            "token boundary reached (64001/64000)", 4);
+        string resume = StewardWorkSliceBoundary.ResumeSummary(
+            "token boundary reached (64001/64000)",
+            ["web_fetch", "web_fetch", "computer_navigate"]);
+
+        Assert.Contains("complete returned tool batch (4 calls) was executed", message);
+        Assert.Contains("every result was committed", message);
+        Assert.DoesNotContain("not executed", message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("web_fetch, computer_navigate", resume);
+        Assert.Contains("current external state", resume);
+    }
+
+    [Fact]
+    public void RolloverHandoffPreservesSpecificStatusAndLatestResult()
+    {
+        string resume = StewardWorkSliceBoundary.ResumeSummary(
+            "token boundary reached (180100/180000)", ["read_file"], "read_file",
+            "Configuration says region=eu-west and retries=7.",
+            "Next, update the deployment manifest; do not re-read the configuration.");
+
+        Assert.Contains("region=eu-west", resume);
+        Assert.Contains("update the deployment manifest", resume);
+        Assert.Contains("do not re-read", resume);
+    }
+
+    [Fact]
+    public void RunnersContainNoBoundaryPathThatFabricatesFailedToolResults()
+    {
+        string root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,
+            "..", "..", "..", "..", "Omnipotent", "Services", "Demiurge"));
+        string commander = File.ReadAllText(Path.Combine(root, "StewardCommanderRunner.cs"));
+        string worker = File.ReadAllText(Path.Combine(root, "StewardSubAgentRunner.cs"));
+
+        const string removedFailure = "recorded but not executed because the context slice ended";
+        Assert.DoesNotContain(removedFailure, commander, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(removedFailure, worker, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("CompletedBatchMessage", commander);
+        Assert.Contains("CompletedBatchMessage", worker);
+    }
+}
+
+public class StewardHostShellTests
+{
+    [Fact]
+    public async Task CallerCancellation_PropagatesToToolJournalBoundary()
+    {
+        using var cancellation = new CancellationTokenSource();
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            HostShell.RunPowerShellAsync("Write-Output 'must not run'", ct: cancellation.Token));
+    }
+}
+
+public class StewardToolAuditTests
+{
+    [Theory]
+    [InlineData("vault_save", "{\"name\":\"password\",\"value\":\"plaintext-secret\"}")]
+    [InlineData("account_register", "{\"service\":\"example\",\"username\":\"bot\",\"secrets\":{\"password\":\"plaintext-secret\"}}")]
+    [InlineData("account_update", "{\"accountID\":\"id\",\"addSecretName\":\"password\",\"addSecretValue\":\"plaintext-secret\"}")]
+    [InlineData("http_request", "{\"url\":\"https://example.test/hook?token=plaintext-secret\",\"method\":\"POST\",\"body\":\"plaintext-secret\"}")]
+    public void DurableToolPayloads_RedactSecretValues(string toolName, string arguments)
+    {
+        string audit = StewardCommanderTools.AuditPayload(toolName, arguments)!;
+
+        Assert.DoesNotContain("plaintext-secret", audit);
+        Assert.Contains(toolName == "http_request" ? "omitted" : "redacted", audit,
+            StringComparison.OrdinalIgnoreCase);
+    }
+}
+
+public class StewardCurrentHealthTests
+{
+    [Fact]
+    public void SuccessfulWake_DoesNotEraseAnUnhealthyIndependentDependency()
+    {
+        var store = new StewardRuntimeStateStore(_ => { });
+        string stewardID = "health_" + Guid.NewGuid().ToString("N");
+        store.RecordDependencyHealth(stewardID, "desktop/commander", false,
+            "FrameBlack", "VNC returned a black frame.");
+        store.RecordExecutionFailure(stewardID, new StewardExecutionFailure
+        {
+            Code = "ProviderUnavailable", Summary = "temporary", Retryable = true,
+        });
+
+        var result = store.RecordExecutionSuccess(stewardID, 42);
+
+        Assert.Equal(StewardExecutionHealthStatus.Degraded, result.State.Health.Status);
+        Assert.Null(result.State.Health.LastFailure);
+        Assert.Contains("desktop/commander", result.State.Health.Dependencies.Keys);
+        Assert.Contains("dependency degraded", store.DescribeForWake(stewardID));
+    }
+
+    [Fact]
+    public void WatchdogRecoveryAccounting_IsDurableAndMonotonic()
+    {
+        var store = new StewardRuntimeStateStore(_ => { });
+        string stewardID = "watchdog_" + Guid.NewGuid().ToString("N");
+        DateTime first = new(2026, 7, 13, 10, 0, 0, DateTimeKind.Utc);
+        store.RecordWatchdogRecovery(stewardID, TimeSpan.FromHours(3), nowUtc: first);
+        var second = store.RecordWatchdogRecovery(stewardID, TimeSpan.FromHours(3), nowUtc: first.AddHours(4));
+
+        Assert.Equal(2, second.State.Health.Watchdog.RecoveryCount);
+        Assert.Single(second.State.Health.Watchdog.RecoveriesUtc);
+
+        var reloaded = new StewardRuntimeStateStore(_ => { }).Get(stewardID);
+        Assert.Equal(2, reloaded.Health.Watchdog.RecoveryCount);
+    }
+}
+
+public class StewardProviderFailureTelemetryTests
+{
+    [Fact]
+    public void ProviderFailure_RetainsActionableFields_AndRedactsBearerTokens()
+    {
+        var error = new RemoteLLMException(RemoteLLMFailureKind.InvalidRequest,
+            "Body: bad max_tokens; Authorization=secret-value; Bearer raw-token",
+            "OpenRouter", "provider/model", HttpStatusCode.BadRequest,
+            requestedMaxTokens: 8192, affordableMaxTokens: 4096);
+
+        var failure = StewardProviderFailure.ToExecutionFailure(error, "wake-1");
+        string payload = StewardProviderFailure.ToPayloadJson(error);
+
+        Assert.Equal("OpenRouter", failure.Provider);
+        Assert.Equal("provider/model", failure.Model);
+        Assert.Equal(400, failure.HttpStatus);
+        Assert.Equal(8192, failure.RequestedMaxTokens);
+        Assert.Equal(4096, failure.AffordableMaxTokens);
+        Assert.DoesNotContain("secret-value", failure.Summary);
+        Assert.DoesNotContain("raw-token", payload);
+    }
+
+    [Fact]
+    public void NonRetryableProviderFailure_StillGetsFiniteAutomaticRetry()
+    {
+        var error = new RemoteLLMException(RemoteLLMFailureKind.Authentication,
+            "credential rejected", "OpenRouter", "provider/model", HttpStatusCode.Unauthorized);
+        DateTime now = new(2026, 7, 14, 12, 0, 0, DateTimeKind.Utc);
+
+        DateTime retryAt = StewardProviderFailure.AutomaticRetryAt(error, now);
+
+        Assert.Equal(now.AddMinutes(15), retryAt);
+    }
+
+    [Theory]
+    [InlineData("OpenRouter 400 InvalidRequest: malformed tools", RemoteLLMFailureKind.InvalidRequest, 400)]
+    [InlineData("OpenRouter 429 rate limited", RemoteLLMFailureKind.RateLimited, 429)]
+    [InlineData("provider returned no diagnostic", RemoteLLMFailureKind.ProviderUnavailable, null)]
+    public void LegacyUnsuccessfulResponses_AreConvertedToStructuredFailures(
+        string detail, RemoteLLMFailureKind expectedKind, int? expectedStatus)
+    {
+        var error = StewardProviderFailure.FromUnsuccessfulResponse(detail, "provider/model", 8192);
+
+        Assert.Equal(expectedKind, error.Kind);
+        Assert.Equal(expectedStatus, error.StatusCode.HasValue ? (int?)error.StatusCode.Value : null);
+        Assert.Equal("provider/model", error.Model);
+        Assert.Equal(8192, error.RequestedMaxTokens);
+    }
+}
+
+public class StewardDesktopReadinessInvariantTests
+{
+    [Fact]
+    public void CompleteFramebuffer_IsUsableRegardlessOfBrightness_IncompleteIsRejected()
+    {
+        // Readiness is confirmed by a structurally complete framebuffer, NOT by brightness. A dark
+        // desktop (dark theme / dark solid root / fullscreen dark app) is a perfectly valid desktop,
+        // so an all-dark but full-size frame must be accepted — rejecting it was the old luminance
+        // heuristic's false-negative that reported working desktops as broken.
+        byte[] dark = new byte[640 * 480 * 4];
+        byte[] painted = new byte[640 * 480 * 4];
+        for (int i = 0; i < painted.Length; i += 4)
+        {
+            painted[i] = 80;
+            painted[i + 1] = 120;
+            painted[i + 2] = 160;
+            painted[i + 3] = 255;
+        }
+
+        Assert.True(ContainerDesktopManager.IsCompleteFrame(dark, 640, 480));
+        Assert.True(ContainerDesktopManager.IsCompleteFrame(painted, 640, 480));
+
+        // Rigid rejections: a truncated buffer, undersized dimensions, and a null frame.
+        Assert.False(ContainerDesktopManager.IsCompleteFrame(new byte[640 * 480 * 4 - 1], 640, 480));
+        Assert.False(ContainerDesktopManager.IsCompleteFrame(new byte[64 * 64 * 4], 64, 64));
+        Assert.False(ContainerDesktopManager.IsCompleteFrame(null!, 640, 480));
+    }
+
+    [Fact]
+    public void ApplicationArguments_AreTokenizedWithoutShellInterpretation()
+    {
+        string[] args = ContainerDesktopCommandBridge.SplitArguments("--title 'Growth dashboard' --count=2");
+
+        Assert.Equal(new[] { "--title", "Growth dashboard", "--count=2" }, args);
+        Assert.Throws<InvalidOperationException>(() => ContainerDesktopCommandBridge.SplitArguments("'unterminated"));
+    }
+
+    [Fact]
+    public void MissingUiTarget_DoesNotInvalidateHealthyDesktopInfrastructure()
+    {
+        var semantic = ContainerToolAdapter.ContainerToolResult.Fail("button not found",
+            ContainerToolAdapter.ContainerToolFailureKind.Semantic);
+        var infrastructure = ContainerToolAdapter.ContainerToolResult.Fail("VNC disconnected",
+            ContainerToolAdapter.ContainerToolFailureKind.Infrastructure);
+        var browserInspection = ContainerToolAdapter.ContainerToolResult.Fail("CDP unavailable",
+            ContainerToolAdapter.ContainerToolFailureKind.BrowserInspection);
+
+        Assert.False(global::Omnipotent.Services.Demiurge.Demiurge.InvalidatesDesktopReadiness(semantic));
+        Assert.False(global::Omnipotent.Services.Demiurge.Demiurge.InvalidatesDesktopReadiness(browserInspection));
+        Assert.True(global::Omnipotent.Services.Demiurge.Demiurge.InvalidatesDesktopReadiness(infrastructure));
+    }
+}
+
+public class StewardPowerShellExitCodeTests
+{
+    [Fact]
+    public async Task FailedNativeCommand_CannotMasqueradeAsPowerShellSuccess()
+    {
+        var result = await HostShell.RunPowerShellAsync("cmd.exe /c exit 7", TimeSpan.FromSeconds(20));
+
+        Assert.False(result.Success);
+        Assert.Equal(7, result.ExitCode);
+    }
+}

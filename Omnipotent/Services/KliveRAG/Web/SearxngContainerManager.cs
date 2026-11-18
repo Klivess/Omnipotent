@@ -1,7 +1,7 @@
 using Docker.DotNet;
 using Docker.DotNet.Models;
 using Omnipotent.Data_Handling;
-using Omnipotent.Services.Projects.Containers;
+using Omnipotent.Services.Demiurge.Containers;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -16,13 +16,13 @@ namespace Omnipotent.Services.KliveRAG.Web
     /// <summary>
     /// Runs a single self-hosted SearXNG metasearch container that KliveRAG queries via its JSON API —
     /// no API keys, no per-query cost, no rate limits, good for always-on autonomous agents. Reuses
-    /// the same Docker daemon endpoint as the Projects desktop fleet but is fully self-contained (its
-    /// own DockerClient + owner label), so it never touches the Projects container plumbing.
+    /// the same Docker daemon endpoint as the Demiurge desktop fleet but is fully self-contained (its
+    /// own DockerClient + owner label), so it never touches the Demiurge container plumbing.
     ///
     /// Lifecycle is lazy + single-flight: the first web search brings it up (pull image → write
     /// settings.yml → create bound to loopback → wait for health); a boot kick reconciles a survivor.
     /// When Docker is unavailable the web tools fail with an actionable message; the internal index is
-    /// unaffected. KliveRAG does NOT auto-install Docker (Projects owns that, and racing it risks a
+    /// unaffected. KliveRAG does NOT auto-install Docker (Demiurge owns that, and racing it risks a
     /// double winget install).
     /// </summary>
     public sealed class SearxngContainerManager
@@ -46,7 +46,7 @@ namespace Omnipotent.Services.KliveRAG.Web
         {
             this.http = http;
             this.log = log ?? (_ => { });
-            dockerUri = ProjectContainerConfig.ResolveDockerUri();
+            dockerUri = StewardContainerConfig.ResolveDockerUri();
             hostPort = int.TryParse(Environment.GetEnvironmentVariable("KLIVERAG_SEARXNG_PORT"), out var p) ? p : DefaultHostPort;
         }
 

@@ -2,7 +2,7 @@ using Newtonsoft.Json;
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAPI.Telemetry;
 using Omnipotent.Services.KliveLLM;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 using System.Text;
 
 namespace Omnipotent.Services.KliveAgent;
@@ -20,7 +20,7 @@ public sealed class KliveAgentPromptCache
     private const string Version = "kliveagent-prefix-v1";
     private readonly string path;
     private readonly object gate = new();
-    private readonly List<ProjectTokenUsageRecord> journal = new();
+    private readonly List<StewardTokenUsageRecord> journal = new();
     /// <summary>Bytes of the file already parsed into <see cref="journal"/>.</summary>
     private long consumedBytes;
     private long sequence;
@@ -37,10 +37,10 @@ public sealed class KliveAgentPromptCache
     public void Record(string conversationId, int turnIndex, KliveLLM.KliveLLM.KliveLLMResponse response)
     {
         if (response.PromptTokens <= 0) return;
-        var record = new ProjectTokenUsageRecord
+        var record = new StewardTokenUsageRecord
         {
             UsageID = Guid.NewGuid().ToString("N"),
-            ProjectID = "kliveagent",
+            StewardID = "kliveagent",
             OccurredAt = DateTime.UtcNow,
             RecordedAt = DateTime.UtcNow,
             WakeID = conversationId,
@@ -78,21 +78,21 @@ public sealed class KliveAgentPromptCache
 
     public AnalyticsPromptCacheSnapshot GetSnapshot(string? rangeKey, string? bucket = null)
     {
-        List<ProjectTokenUsageRecord> records;
+        List<StewardTokenUsageRecord> records;
         using (RequestTrace.AmbientSpan("prompt-cache-read"))
         {
             lock (gate)
             {
                 CatchUpLocked();
-                records = new List<ProjectTokenUsageRecord>(journal);
+                records = new List<StewardTokenUsageRecord>(journal);
             }
         }
         using (RequestTrace.AmbientSpan("prompt-cache-build"))
         {
             var now = DateTime.UtcNow;
             var earliest = records.Count > 0 ? records.Min(x => x.OccurredAt) : now;
-            var range = ProjectAnalyticsRange.Resolve(rangeKey, earliest, now, null, null, bucket);
-            return ProjectPromptCacheAnalytics.Build(
+            var range = StewardAnalyticsRange.Resolve(rangeKey, earliest, now, null, null, bucket);
+            return StewardPromptCacheAnalytics.Build(
                 records.Where(x => x.OccurredAt >= range.FromUtc && x.OccurredAt <= range.ToUtc), range, Version);
         }
     }
@@ -146,7 +146,7 @@ public sealed class KliveAgentPromptCache
             ParsedLines++;
             try
             {
-                var record = JsonConvert.DeserializeObject<ProjectTokenUsageRecord>(trimmed);
+                var record = JsonConvert.DeserializeObject<StewardTokenUsageRecord>(trimmed);
                 if (record == null) continue;
                 journal.Add(record);
                 if (record.Sequence > sequence) sequence = record.Sequence;

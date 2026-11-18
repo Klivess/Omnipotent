@@ -74,13 +74,13 @@
             const StringComparison ord = StringComparison.Ordinal;
 
             if (sessionId.StartsWith("kliveagent-", ord)) return AIRouterWorkClass.Interactive;
-            if (sessionId.StartsWith("projects-council-", ord)) return AIRouterWorkClass.Burst;
+            if (sessionId.StartsWith("demiurge-council-", ord)) return AIRouterWorkClass.Burst;
             // Ahead of the general stratum- arm: a summary is one query, then the session is dropped.
             if (sessionId.StartsWith("stratum-engineer-summary-", ord)) return AIRouterWorkClass.OneShot;
             if (sessionId.StartsWith("stratum-", ord)) return AIRouterWorkClass.Agent;
-            if (sessionId.StartsWith("projects-commander-", ord)) return AIRouterWorkClass.Agent;
-            if (sessionId.StartsWith("projects-agent-", ord)) return AIRouterWorkClass.Agent;
-            // projects-{operation}-{Guid:N}: the utility routes, which are all one-shot.
+            if (sessionId.StartsWith("demiurge-commander-", ord)) return AIRouterWorkClass.Agent;
+            if (sessionId.StartsWith("demiurge-agent-", ord)) return AIRouterWorkClass.Agent;
+            // demiurge-{operation}-{Guid:N}: the utility routes, which are all one-shot.
             if (EndsWithGuidN(sessionId)) return AIRouterWorkClass.OneShot;
             return AIRouterWorkClass.Agent;
         }

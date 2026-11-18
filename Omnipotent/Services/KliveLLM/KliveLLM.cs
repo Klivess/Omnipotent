@@ -109,7 +109,7 @@ namespace Omnipotent.Services.KliveLLM
     /// <summary>
     /// Per-call sampling overrides. Every member is optional: a null is simply not sent, so the
     /// provider's own default applies and a caller that pins nothing produces the identical request it
-    /// did before this type existed. Callers (Projects' per-route parameter configuration) are
+    /// did before this type existed. Callers (Demiurge's per-route parameter configuration) are
     /// responsible for range validation — see <c>ModelParameterCatalog</c>.
     ///
     /// <see cref="TopK"/>, <see cref="RepetitionPenalty"/>, <see cref="MinP"/>, <see cref="TopA"/>,
@@ -155,8 +155,8 @@ namespace Omnipotent.Services.KliveLLM
         // AIRouter (api.airouter.ch) — a Swiss OpenAI-compatible router sold as a FLAT FEE: unlimited
         // access, no per-token price. It gets its own provider rather than riding the generic custom
         // endpoint because two of its behaviours are not generic:
-        //   • no pricing — every cost meter (the Projects budget ledger above all) must book ZERO for
-        //     it, or a project would budget-pause against money that is never actually charged;
+        //   • no pricing — every cost meter (the Demiurge budget ledger above all) must book ZERO for
+        //     it, or a Steward would budget-pause against money that is never actually charged;
         //   • a hard fair-use envelope (3 parallel / 240 req-min / 10M token-min) that we stay under
         //     by client-side admission control (AIRouterFairUseLimiter) instead of by handling 429s.
         // The wire format itself is vanilla OpenAI chat-completions, so every OpenRouter-proprietary
@@ -208,14 +208,14 @@ namespace Omnipotent.Services.KliveLLM
 
         /// <summary>
         /// True for providers billed as a flat subscription rather than per token. Callers that meter
-        /// spend (the Projects budget ledger, KliveAgent's stats estimate) must book zero for these:
+        /// spend (the Demiurge budget ledger, KliveAgent's stats estimate) must book zero for these:
         /// their token counts are still real telemetry, but no money moves with them, so a budget
         /// must never pause work on account of them.
         /// </summary>
         internal static bool IsFlatFee(LLMProvider provider) => provider == LLMProvider.AIRouter;
 
         // One process-wide limiter: the fair-use envelope is per KEY, and every subsystem
-        // (KliveAgent, Projects Commander + sub-agents + councils + utility routes, Omniscience,
+        // (KliveAgent, Demiurge Commander + sub-agents + councils + utility routes, Omniscience,
         // Stratum) shares the one configured AIRouter key, so they must share one queue.
         private static readonly AIRouterFairUseLimiter sharedAIRouterFairUse = new();
 
@@ -241,7 +241,7 @@ namespace Omnipotent.Services.KliveLLM
             => sharedAIRouterFairUse.ConversationBudget();
 
         /// <summary>Hold one shared AIRouter slot back from background work while Klives is mid-conversation
-        /// with something that is not a KliveAgent chat (a Project's Commander). Renewed by calling again.</summary>
+        /// with something that is not a KliveAgent chat (a Steward's Commander). Renewed by calling again.</summary>
         internal static void AIRouterEngageInteractiveReserve(string ownerId, TimeSpan ttl)
             => sharedAIRouterFairUse.EngageInteractiveReserve(ownerId, ttl);
 
@@ -396,7 +396,7 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>Maps the RemoteLLMProvider dropdown value onto the provider it selects. This is the
         /// single place the setting is interpreted — every remote call site resolves its endpoint, key and
         /// model through <see cref="GetRemoteProviderConfigurationAsync"/>, so the dropdown governs ALL
-        /// traffic (KliveAgent, Omniscience, and the Projects Commander/sub-agent/utility/council routes)
+        /// traffic (KliveAgent, Omniscience, and the Demiurge Commander/sub-agent/utility/council routes)
         /// rather than any one subsystem. An unrecognised value falls back to HuggingFace.</summary>
         internal static LLMProvider ParseProvider(string? configuredProvider)
         {
@@ -467,7 +467,7 @@ namespace Omnipotent.Services.KliveLLM
         /// <summary>
         /// Whether the active router charges a flat fee rather than per token — the question every
         /// cost meter in Omnipotent has to answer before it books spend. Synchronous by design: it
-        /// serves the per-turn budget check in Projects, which cannot await a settings read.
+        /// serves the per-turn budget check in Demiurge, which cannot await a settings read.
         /// </summary>
         public bool IsFlatFeeProviderNow(LlmCaller? caller = null)
         {
@@ -834,7 +834,7 @@ namespace Omnipotent.Services.KliveLLM
         /// DeepSeek). Any other chat id is redirected to the configured model before it is sent (see
         /// ResolveAIRouterModelAsync), so it lands on one of those two. The family table knows neither
         /// name and called them text-only, which refused every KliveAgent image attachment and silently
-        /// switched off Projects screenshots and OmniTumblr vision captions.</summary>
+        /// switched off Demiurge screenshots and OmniTumblr vision captions.</summary>
         internal static ModelCapabilities AIRouterModelCapabilities(string? modelId)
         {
             string id = (modelId ?? string.Empty).ToLowerInvariant();
@@ -934,7 +934,7 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
-        /// <summary>Projects uses this to run OpenRouter-specific credit preflight only when its
+        /// <summary>Demiurge uses this to run OpenRouter-specific credit preflight only when its
         /// ordinary wake requests will actually use OpenRouter.</summary>
         public async Task<bool> IsOpenRouterActiveAsync(LlmCaller? caller = null, [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
         {
@@ -1018,7 +1018,7 @@ namespace Omnipotent.Services.KliveLLM
         }
 
         /// <summary>
-        /// Append a Projects wake seed without prepending another receipt-time stamp. Wake seeds are
+        /// Append a Demiurge wake seed without prepending another receipt-time stamp. Wake seeds are
         /// already temporally grounded by their trailing <c>Now:</c> line; putting a fresh timestamp
         /// in byte zero made every otherwise-stable wake prefix unique and defeated provider caching.
         /// OmniBlox's cycle briefings follow the same contract (stable sections first, a closing
@@ -1280,7 +1280,7 @@ namespace Omnipotent.Services.KliveLLM
                         // this is how the model knows how much wall-clock the step consumed.
                         content = StampIncoming(content)
                     });
-                    // Projects already runs the deterministic context-window compactor immediately
+                    // Demiurge already runs the deterministic context-window compactor immediately
                     // before every request. Let it opt out of this older-history rewrite so normal
                     // turns only append bytes and remain fully eligible for prefix reuse.
                     if (!preservePromptPrefix) PruneOldToolResults(s, keepRecentFull);
@@ -1365,7 +1365,7 @@ namespace Omnipotent.Services.KliveLLM
                 foreach (var tc in m.tool_calls)
                     chars += (tc.function?.name?.Length ?? 0) + (tc.function?.arguments?.Length ?? 0) + 8;
             // Three chars/token is intentionally more conservative than the common English prose
-            // heuristic. Projects prompts contain source code, JSON and non-English text, all of
+            // heuristic. Demiurge prompts contain source code, JSON and non-English text, all of
             // which tokenize more densely; OpenRouter's exact-token compression is the final guard.
             int tokens = (int)Math.Ceiling(chars / 3.0) + 8; // role/content envelope
             if (MessageHasImage(m)) tokens += 1100; // a downscaled screenshot the text estimate misses
@@ -1427,7 +1427,7 @@ namespace Omnipotent.Services.KliveLLM
         /// How many messages immediately AFTER the leading system block are protected from summarisation.
         ///
         /// A caller whose first user turn is a large rehydrated brief must pass a non-zero value. The
-        /// Projects wake seed is one such message, carrying the agent's directives, grand plan, typed
+        /// Demiurge wake seed is one such message, carrying the agent's directives, grand plan, typed
         /// execution state, verified facts, dead ends, retrieval hits and recent-event window. Without
         /// this it is summarised like any other user turn — clipped to 240 characters by BuildCompacted —
         /// and the agent silently loses its entire rehydrated context mid-wake, which reliably produces
@@ -1653,7 +1653,7 @@ namespace Omnipotent.Services.KliveLLM
                         Math.Max(0, maxTokensOverride ?? 0),
                         tools);
                     // A real provider window is a hard policy and therefore overrides an old
-                    // compactAbove=0 "disable generic compaction" choice made by Projects.
+                    // compactAbove=0 "disable generic compaction" choice made by Demiurge.
                     compactAbove = compactAbove > 0
                         ? Math.Min(compactAbove, preflightMessageBudget.Value)
                         : preflightMessageBudget.Value;
@@ -1791,7 +1791,7 @@ namespace Omnipotent.Services.KliveLLM
             {
                 // Do not append the raw envelope to the session: a later retry must start from the
                 // last clean user/tool turn, and no caller should mistake provider protocol markup
-                // for prose. Projects resets sessions that do not end at a clean assistant turn.
+                // for prose. Demiurge resets sessions that do not end at a clean assistant turn.
                 var protocolRecord = call.Succeed(response, Telemetry.LlmOutcome.Error, normalized.Error);
                 var protocolFailure = new KliveLLMResponse
                 {
@@ -2027,7 +2027,7 @@ namespace Omnipotent.Services.KliveLLM
         private const double AffordableTokenSafetyFraction = 0.90;
 
         // Short AIRouter rate limits can recover inside a wake. Longer provider Retry-After values
-        // are respected in full and surfaced to the project scheduler rather than retried early.
+        // are respected in full and surfaced to the Steward scheduler rather than retried early.
         private const int AIRouterRateLimitMaxAttempts = 6;
         private static readonly TimeSpan AIRouterMaxCoolOff = TimeSpan.FromSeconds(75);
         private static readonly TimeSpan AIRouterDefaultCoolOff = TimeSpan.FromSeconds(10);
@@ -2123,9 +2123,9 @@ namespace Omnipotent.Services.KliveLLM
 
         // ── AIRouter model resolution ──
         // AIRouter serves a small catalogue under its OWN names ("Qwen3.8", "DeepSeek-V4-Flash"),
-        // not the "vendor/model" slugs OpenRouter uses. Every Projects role and KliveAgent route is
+        // not the "vendor/model" slugs OpenRouter uses. Every Demiurge role and KliveAgent route is
         // configured in slug form, so pointing the provider dropdown at AIRouter would send it a
-        // model it has never heard of — a 404, classified ModelUnavailable, which opens the project
+        // model it has never heard of — a 404, classified ModelUnavailable, which opens the Steward
         // circuit and DEFERS the wake. That is the exact failure this integration exists to remove,
         // and it would hit on the very first turn after switching provider. So a request whose model
         // AIRouter does not serve is redirected to the configured AIRouterModelID instead.
@@ -2541,7 +2541,7 @@ namespace Omnipotent.Services.KliveLLM
         ///
         /// On every other provider — HuggingFace and a custom OpenAI-compatible endpoint — a caller's route
         /// list still selects the model (route 0 becomes the request's `model`), but the backup entries are
-        /// simply not sent: a strict endpoint would reject the unknown parameter. So a Projects role
+        /// simply not sent: a strict endpoint would reject the unknown parameter. So a Demiurge role
         /// configured with several routes runs on its PRIMARY route there, with no provider-side failover.
         /// </summary>
         internal static void ApplyModelFallback(ref HFWrapper.HFLLMInferenceRequest payload,
@@ -2643,7 +2643,7 @@ namespace Omnipotent.Services.KliveLLM
         }
 
         // Ask OpenRouter to report the REAL per-request cost back in the response usage object
-        // (usage.cost, in credits == USD). This is the authoritative figure the Projects budget ledger
+        // (usage.cost, in credits == USD). This is the authoritative figure the Demiurge budget ledger
         // meters against — accurate for whatever model is actually in use, instead of a flat per-million
         // estimate that is wildly wrong for cheap/free models. It arrives in the same response (and the
         // final streamed usage chunk), so there's no separate round-trip. No-op for other providers.
@@ -2654,7 +2654,7 @@ namespace Omnipotent.Services.KliveLLM
         }
 
         /// <summary>
-        /// Enables OpenRouter's exact-token context compression as a final safety net. Projects first
+        /// Enables OpenRouter's exact-token context compression as a final safety net. Demiurge first
         /// performs deterministic local compaction so its durable digest/recent-tail semantics are
         /// preserved; this plugin handles tokenizer variance or an irreducible request envelope that
         /// local character estimates cannot measure exactly. It is never sent to other providers.
@@ -3347,7 +3347,7 @@ namespace Omnipotent.Services.KliveLLM
 
                         // A long Retry-After is the provider telling us this wake cannot recover yet.
                         // Do not send another full native-fallback chain before that window expires; the
-                        // project circuit will defer the next wake using the unbounded provider hint.
+                        // Steward circuit will defer the next wake using the unbounded provider hint.
                         bool retryFitsThisWake = !rateLimited || !retryAfter.HasValue
                             || retryAfter.Value <= TimeSpan.FromMilliseconds(RateLimitMaxDelayMs);
                         if (transient && retryFitsThisWake && attempt < maxAttempts)
@@ -3507,7 +3507,7 @@ namespace Omnipotent.Services.KliveLLM
             int code = (int)status;
             if (status == HttpStatusCode.PaymentRequired) return RemoteLLMFailureKind.InsufficientProviderCredit;
             // A model-specific access gate says nothing about the account credential or other
-            // routes. Misclassifying it as authentication opens a project-wide provider circuit.
+            // routes. Misclassifying it as authentication opens a Steward-wide provider circuit.
             if (status == HttpStatusCode.Forbidden && IsModelAccessRestriction(responseContent))
                 return RemoteLLMFailureKind.ModelUnavailable;
             if (status is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden) return RemoteLLMFailureKind.Authentication;
@@ -3815,7 +3815,7 @@ namespace Omnipotent.Services.KliveLLM
             public long RequestBytes { get; set; }
 
             /// <summary>The live model-window limit applied to this request, when the caller supplied
-            /// one (Projects/OpenRouter).</summary>
+            /// one (Demiurge/OpenRouter).</summary>
             public int? ContextWindowTokens { get; set; }
 
             /// <summary>Whether KliveLLM compacted the structured session before dispatch.</summary>

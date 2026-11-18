@@ -21,7 +21,7 @@ namespace Omnipotent.Services.AccountRegistry
     }
 
     /// <summary>
-    /// A single account an agent created on an external service, shared across ALL projects and
+    /// A single account an agent created on an external service, shared across ALL Stewards and
     /// KliveAgent so nobody creates a redundant duplicate. Non-secret metadata (service, username,
     /// email, description, owners, timestamps) is plaintext for enumeration and dedup; the actual
     /// credentials live encrypted in <see cref="Secrets"/> and are referenced by agents only as
@@ -41,9 +41,9 @@ namespace Omnipotent.Services.AccountRegistry
         /// <summary>Free-form operator notes (≤ MaxNotesLength).</summary>
         public string? Notes { get; set; }
         public AccountStatus Status { get; set; } = AccountStatus.Active;
-        /// <summary>"KliveAgent" | "project:&lt;id&gt;" | "klives".</summary>
+        /// <summary>"KliveAgent" | "steward:&lt;id&gt;" | "klives".</summary>
         public string CreatedBy { get; set; } = "";
-        /// <summary>Every owner/user of the account: project IDs (as "project:&lt;id&gt;") and/or "KliveAgent".</summary>
+        /// <summary>Every owner/user of the account: Steward IDs (as "steward:&lt;id&gt;") and/or "KliveAgent".</summary>
         public List<string> Owners { get; set; } = new();
         public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
         public DateTime UpdatedAt { get; set; } = DateTime.UtcNow;

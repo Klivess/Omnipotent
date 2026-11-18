@@ -10,7 +10,7 @@ using Tesseract;
 namespace Omnipotent.Services.ComputerControl
 {
     /// <summary>
-    /// Target-neutral contract for visual computer control.  The host desktop and project VNC
+    /// Target-neutral contract for visual computer control.  The host desktop and Steward VNC
     /// desktops deliberately expose the same vocabulary while advertising the few operations
     /// that are unavailable on a particular target.
     /// </summary>
@@ -28,7 +28,7 @@ namespace Omnipotent.Services.ComputerControl
         public bool SupportsClipboard { get; init; }
         public bool SupportsAppLaunch { get; init; }
         /// <summary>Target can run a bounded command in its own isolated terminal environment.
-        /// False for the real host desktop; true only for Project desktop containers.</summary>
+        /// False for the real host desktop; true only for Steward desktop containers.</summary>
         public bool SupportsTerminalExecution { get; init; }
         public bool SupportsRelativeMouse { get; init; }
         public bool SupportsHumanization { get; init; }
@@ -238,7 +238,7 @@ namespace Omnipotent.Services.ComputerControl
 
         /// <summary>
         /// Reads every OCR text row from a screen frame and returns its text plus framebuffer
-        /// coordinates. This is the model-independent screen reader used by text-only Project
+        /// coordinates. This is the model-independent screen reader used by text-only Steward
         /// agents: it exposes what is written on an ordinary GUI without attaching raw pixels to
         /// the model. Rows are ordered top-to-bottom and then left-to-right.
         /// </summary>

@@ -2,7 +2,7 @@ using System.Collections.Specialized;
 using Microsoft.Data.Sqlite;
 using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.KliveLLM.Telemetry;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 
 namespace Omnipotent.Tests.KliveLLM
 {
@@ -29,7 +29,7 @@ namespace Omnipotent.Tests.KliveLLM
             try { Directory.Delete(dir, true); } catch { }
         }
 
-        private static LlmCallRecord Call(long endedMs, string service = "Projects", string lane = "commander", string router = LlmRouterIds.AIRouter,
+        private static LlmCallRecord Call(long endedMs, string service = "Demiurge", string lane = "commander", string router = LlmRouterIds.AIRouter,
             string model = "Qwen3.8", string outcome = LlmOutcome.Ok, long prompt = 10_000, long cached = 8_000, long completion = 500,
             long providerMs = 2_000, long? ttftMs = 900, string billing = "flat", double? cost = null, string? subject = "p1") => new()
         {
@@ -117,13 +117,13 @@ namespace Omnipotent.Tests.KliveLLM
             double listPerCall = (2_000 * 1 + 8_000 * 0.1 + 500 * 4) / 1_000_000.0;
             Assert.Equal(0.25 + 20 * listPerCall, json["total"]!["listCostUsd"]!.ToObject<double>(), 6);
             var groups = json["groups"]!.Select(g => g["key"]!.ToString()).ToList();
-            Assert.Equal(new[] { "Projects", "Stratum" }, groups);
+            Assert.Equal(new[] { "Demiurge", "Stratum" }, groups);
 
             Assert.True(LlmQuerySpec.TryParse(new NameValueCollection { ["range"] = "24h", ["groupBy"] = "subject" }, now, 0, ledger.Options, out var subjects, out _));
             var subjectJson = Newtonsoft.Json.Linq.JObject.FromObject(engine.Breakdown(subjects));
             Assert.Equal("p1", subjectJson["groups"]![0]!["subject"]!.ToString());
 
-            Assert.True(ledger.Usage("Projects").DayTokens > 0);
+            Assert.True(ledger.Usage("Demiurge").DayTokens > 0);
             Assert.Equal(0.25, ledger.Usage("Stratum/engineer").DayCostUsd, 6);
         }
 
@@ -215,23 +215,23 @@ namespace Omnipotent.Tests.KliveLLM
         }
 
         [Fact]
-        public void ProjectsJournalTurns_ImportAsCommanderAndWorkerCalls()
+        public void DemiurgeJournalTurns_ImportAsCommanderAndWorkerCalls()
         {
-            var turn = new ProjectTokenUsageRecord
+            var turn = new StewardTokenUsageRecord
             {
-                ProjectID = "p9", Source = "subagent", Provider = "AIRouter", Model = "Qwen3.8", PromptTokens = 50_000, CachedPromptTokens = 45_000,
+                StewardID = "p9", Source = "subagent", Provider = "AIRouter", Model = "Qwen3.8", PromptTokens = 50_000, CachedPromptTokens = 45_000,
                 CompletionTokens = 900, CacheMetricsAvailable = true, CostUsd = 0, CostBasis = "actual", RequestDurationMs = 4_000,
                 QueueDurationMs = 500, ProviderDurationMs = 3_400, CacheEpochTurnIndex = 3,
             };
-            var call = LlmProjectsImport.ToCall(turn, 1_700_000_000_000);
-            Assert.Equal("Projects/subagent", call.Service + "/" + call.Lane);
+            var call = LlmDemiurgeImport.ToCall(turn, 1_700_000_000_000);
+            Assert.Equal("Demiurge/subagent", call.Service + "/" + call.Lane);
             Assert.Equal("p9", call.Subject);
             Assert.Equal(LlmRouterIds.AIRouter, call.Router);
             Assert.Equal("flat", call.Billing);
             Assert.Null(call.CostUsd);
             Assert.True(call.Has(LlmCallFlags.Imported));
 
-            var provisional = LlmProjectsImport.ToCall(new ProjectTokenUsageRecord { Source = "commander", Provider = "OpenRouter", CostUsd = 0.4, CostBasis = "provisional" }, 1);
+            var provisional = LlmDemiurgeImport.ToCall(new StewardTokenUsageRecord { Source = "commander", Provider = "OpenRouter", CostUsd = 0.4, CostBasis = "provisional" }, 1);
             Assert.Equal("commander", provisional.Lane);
             Assert.Null(provisional.CostUsd);
         }

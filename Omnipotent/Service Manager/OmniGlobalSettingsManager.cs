@@ -230,11 +230,14 @@ namespace Omnipotent.Service_Manager
                     else if (!legacy && sensitiveNames.Contains(s.Name))
                         throw new InvalidDataException("Sensitive setting is missing encryption.");
                 }
+                var takenKeys = list.Select(s => ComposeKey(s.ParentServiceId, s.Name)).ToHashSet(StringComparer.OrdinalIgnoreCase);
                 foreach (var s in list)
                 {
                     var plain = !legacy && OmniSettingsProtector.IsProtected(s.Value) ? DecodeSetting(s) : Copy(s);
                     plain.Sensitive |= sensitiveNames.Contains(plain.Name);
                     plain.ParentServiceName = string.IsNullOrWhiteSpace(plain.ParentServiceName) ? "UnknownService" : plain.ParentServiceName;
+                    // Decoded above and encoded again below, so a renamed identity re-seals cleanly.
+                    ApplyServiceRenames(plain, takenKeys);
                     plain.DropdownOptions = NormalizeDropdownOptions(plain.DropdownOptions, enforceInputLimits: false);
                     string key = ComposeKey(plain.ParentServiceId, plain.Name);
                     if (!legacy && loaded.ContainsKey(key)) throw new InvalidDataException("Duplicate setting identity.");
@@ -948,6 +951,39 @@ namespace Omnipotent.Service_Manager
         {
             string parent = NormalizeParentServiceId(parentServiceId);
             return $"{parent.Length}:{parent}{NormalizeSettingName(name)}";
+        }
+
+        /// <summary>Services that were renamed, with the setting-name prefix that moved with them.</summary>
+        internal static readonly (string OldService, string NewService, string OldPrefix, string NewPrefix)[] RenamedServices =
+        {
+            ("Projects", "Demiurge", "Projects_", "Demiurge_"), // Projects became Demiurge, November 2026
+        };
+
+        /// <summary>
+        /// Moves a setting saved under a renamed service to its new owner and name as settings load, so
+        /// the renamed service reads back every value Klives set instead of writing fresh defaults. When a
+        /// setting already holds the new identity the old one is left exactly as it was.
+        /// </summary>
+        internal static void ApplyServiceRenames(OmniSetting plain, ISet<string> takenKeys)
+        {
+            foreach (var (oldService, newService, oldPrefix, newPrefix) in RenamedServices)
+            {
+                bool owned = string.Equals(plain.ParentServiceName?.Trim(), oldService, StringComparison.OrdinalIgnoreCase);
+                bool prefixed = plain.Name.StartsWith(oldPrefix, StringComparison.OrdinalIgnoreCase);
+                if (!owned && !prefixed) continue;
+                string name = prefixed ? newPrefix + plain.Name[oldPrefix.Length..] : plain.Name;
+                string oldKey = ComposeKey(plain.ParentServiceId, plain.Name);
+                string newKey = ComposeKey(plain.ParentServiceId, name);
+                if (!newKey.Equals(oldKey, StringComparison.OrdinalIgnoreCase))
+                {
+                    if (takenKeys.Contains(newKey)) return;
+                    takenKeys.Remove(oldKey);
+                    takenKeys.Add(newKey);
+                }
+                plain.Name = name;
+                if (owned) plain.ParentServiceName = newService;
+                return;
+            }
         }
         private static void ValidateStoredIdentity(string name, string parentId)
         {

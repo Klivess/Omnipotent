@@ -26,7 +26,7 @@ time over 28,961 observations. A few analytical reads dominate the total:
 | `POST /batch` | 53 | 64.7 s | 34.5 min | 110 min | 8.3 h |
 | `GET /omnidefence/requests` | 796 | 0.106 s | 2.9 s | 107 min | 6.4 h |
 | `GET /omnidefence/ip` | 251 | 0.038 s | 8.6 min | 105 min | 5.5 h |
-| `GET /projects/overview` | 1,916 | 0.126 s | 3.4 s | 38.7 s | 0.48 h |
+| `GET /demiurge/overview` | 1,916 | 0.126 s | 3.4 s | 38.7 s | 0.48 h |
 | `GET /api/omnitrader/firm/overview` | 31 | 22.9 s | 108.8 s | 126.6 s | 0.29 h |
 | `GET /klivemail/stats` | 25 | 11.4 s | 45.7 s | 58.4 s | 0.12 h |
 
@@ -38,7 +38,7 @@ The worst tails also coincide with database contention or queueing; a snapshot
 read alone cannot guarantee sub-second network time under an overloaded host.
 
 Other analytical routes with observed seven-day p95 above one second include
-OmniTrader risk/backtests/deployments, Projects cost simulator and list, CS2
+OmniTrader risk/backtests/deployments, Demiurge cost simulator and list, CS2
 analytics and balance history, Tripwire summary/events/list, KliveMail
 mailboxes, and Omniscience stats/briefing. Their per-route samples and maxima
 are in the inventory.
@@ -72,7 +72,7 @@ Background materializers now cover the expensive observed analytics:
   filters and IPs stay in a bounded in-memory cache.
 - OmniTrader firm overview, risk, backtests, and deployments have bounded-age
   snapshots. Backtest summaries avoid loading full candle and trade arrays.
-- Projects overview, cost simulator, and list; KliveMail stats/mailboxes; CS2
+- Demiurge overview, cost simulator, and list; KliveMail stats/mailboxes; CS2
   scanned-comparison analytics, balance history, and liquidity plan; and
   Tripwire summary use independent background snapshots. Mutation paths wake
   relevant workers where available.

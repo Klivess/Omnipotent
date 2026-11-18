@@ -153,7 +153,7 @@ messaging Klives. What makes that work:
   20-min ceiling). The stall watchdog only kills runs that are genuinely silent, and skips turns
   parked in the AIRouter queue. A stream that goes quiet for `KliveAgent_ModelStreamIdleSeconds`
   (240) raises `KliveLLMStreamStalledException` instead of hanging. The original bug: a healthy
-  first call queued behind the Projects fleet was killed and the run labelled "Done".
+  first call queued behind the Demiurge fleet was killed and the run labelled "Done".
 - **Truthful endings.** `AgentChatRunControl` records why a run stopped (user | stall | shutdown)
   *before* cancelling it. The service token reads as "shutdown". `DescribeStop` writes the closing
   line, and the website badge shows Done / Stopped / Failed / Interrupted from status + `stopReason`.
@@ -165,7 +165,7 @@ messaging Klives. What makes that work:
   checkpoint nudge fires every 40 steps. If the model rejects screenshots, images are stripped and
   the run continues on DOM/OCR perception.
 - **The computer.** `KliveAgent_ComputerTarget` = auto | container | host. The container is a
-  Projects desktop owned by `kliveagent` (`ExternalDesktopOwners`), driven through the same
+  Demiurge desktop owned by `kliveagent` (`ExternalDesktopOwners`), driven through the same
   `ContainerToolAdapter`: structured browser inspect/act, verified fills, overlay dismissal, free
   `solve_challenge`, uploads, a terminal. Host = `HostControlManager`. For a human-only blocker,
   `request_human` posts a takeover card carrying the `containerId`. The website then embeds
@@ -195,7 +195,7 @@ later one; three Alpha Lab runs were cut by a restart and never answered; a run 
 
 - **One reference set.** `OmniScriptReferences` builds the references once from the runtime's own
   assembly list plus Omnipotent's dependencies, metadata only, and every script host uses it
-  (KliveAgent, Projects work scripts, Projects stimulus hooks). Before, each host referenced
+  (KliveAgent, Demiurge work scripts, Demiurge stimulus hooks). Before, each host referenced
   "whatever was loaded when it started", which is why three stimulus hooks failed at start-up with
   `CS0234 'Linq' does not exist in the namespace 'System'`.
 - **A held root.** `KliveAgentScriptEngine` (in `KliveAgentScriptSession.cs`) compiles one empty root
@@ -289,7 +289,7 @@ later one; three Alpha Lab runs were cut by a restart and never answered; a run 
 - **Resuming from a saved transcript** instead of a summary. The ledger and the fuller continuation
   message carry what a restart used to lose, without serialising model sessions to disk.
 - **A richer compaction digest inside KliveLLM.** The headline-first result gets the same effect from
-  KliveAgent's side and leaves the digest Projects depends on byte-identical.
+  KliveAgent's side and leaves the digest Demiurge depends on byte-identical.
 
 ## Computer-use reliability (October 2026)
 
@@ -324,7 +324,7 @@ and reCAPTCHA unbeatable by synthetic input. What was actually wrong, and what f
 - **`computer_cdp`** — evaluate (top-level await, any frame), raw commands, trusted click/type/key,
   JavaScript dialogs, `set_files`, targets, a page-only screenshot. Sign-in wipes are refused, cookie
   values redacted, and every value substituted from the vault/registry on this desktop is masked in
-  all tool output (`SecretEchoScrubber`). `klive-cdp` is the same engine for the terminal. Project
+  all tool output (`SecretEchoScrubber`). `klive-cdp` is the same engine for the terminal. Steward
   agents keep their browser-first contract: their `evaluate`/`send` are limited to non-hidden work.
 - **Uploads by interception.** `computer_upload_file` takes `trigger` (the site's upload button) and
   presses it with `Page.setInterceptFileChooserDialog` on, so no GTK dialog opens and inputs the page
@@ -339,7 +339,7 @@ and reCAPTCHA unbeatable by synthetic input. What was actually wrong, and what f
   once — a solved token lives about two minutes.
 - **Known dead ends are named in results.** Inspection adds `JS_DIALOG_OPEN` and `PAYMENT_FRAME`
   advisories beside the existing CHALLENGE/NATIVE_DIALOG banners; navigation answers "Leave site?".
-- Kill switch: `PROJECTS_INPUT_VERIFICATION=0` turns preflight/receipt off (input then goes out exactly
+- Kill switch: `DEMIURGE_INPUT_VERIFICATION=0` turns preflight/receipt off (input then goes out exactly
   as before). Desktop image v13.
 - **Task tools.** `klivemail_create_mailbox/list/get/wait_for_email` (returns codes plus links
   ranked verification-first; catches near-miss addresses). `account_register` takes `{generate}`
@@ -362,16 +362,16 @@ and reCAPTCHA unbeatable by synthetic input. What was actually wrong, and what f
   new setting name. The settings above supersede `KliveAgent_MaxRunTokens`,
   `KliveAgent_MaxRunMinutes` and `KliveAgent_MaxLlmRetries`, which are no longer read.
 
-## KliveRAG — cross-system knowledge (shared with Projects)
+## KliveRAG — cross-system knowledge (shared with Demiurge)
 
-`Services/KliveRAG` is a separate `OmniService` that gives both KliveAgent and the Projects task
+`Services/KliveRAG` is a separate `OmniService` that gives both KliveAgent and the Demiurge task
 force semantic + lexical recall across **all** of Klives' systems, plus live web. It is local and
 free: MiniLM ONNX embeddings (the same `ReplicaEmbedder` Omniscience uses), a SQLite store with an
 FTS5 lexical leg and BLOB vectors, brute-force cosine, and a self-hosted SearXNG container for web
 search (no API keys).
 
-- **Sources (connectors, incremental via watermarks/hashes):** Projects event logs + digests
-  (live via `EventAppended`, cross-project), KliveAgent conversations + memories (turn-pair chunks),
+- **Sources (connectors, incremental via watermarks/hashes):** Demiurge event logs + digests
+  (live via `EventAppended`, cross-Steward), KliveAgent conversations + memories (turn-pair chunks),
   Omniscience distilled knowledge (person facts / Q&A / hypotheses / profiles), repo `*.md` docs, and
   cached web pages (TTL'd). Omniscience's raw-message corpus is **federated at query time** (not
   re-embedded) through its existing `MessageEmbeddingIndex`.
@@ -382,14 +382,14 @@ search (no API keys).
   path searches everything with a 15 s deadline. A search that runs out of time returns what its legs
   had, often nothing; it never waits.
 - **Why the bound matters:** until Oct 2026 the lexical leg ran synchronously on the caller's thread
-  with no deadline. With the Projects event log indexed, a message full of common words ("use your
+  with no deadline. With the Demiurge event log indexed, a message full of common words ("use your
   computer to make a tumblr account…") made bm25 score millions of rows. That held KliveAgent at
-  "preparing context" for 5–12 minutes, and every Projects wake ran the same query. A "??" nudge has
+  "preparing context" for 5–12 minutes, and every Demiurge wake ran the same query. A "??" nudge has
   no searchable words, which is why the nudges always got through. Measured on a synthetic
   1M-chunk index: 3.3 s warm and growing linearly with size before the fix; 0.2–0.5 s after.
 - **Delivery:** a budgeted `[Relevant Knowledge]` block auto-injected into KliveAgent's system prompt
-  (below the cache breakpoint, `KnowledgeBudget`) and into Projects wake seeds (a `RELEVANT KNOWLEDGE`
-  section, own-project events excluded), **plus** the native tools `search_knowledge`,
+  (below the cache breakpoint, `KnowledgeBudget`) and into Demiurge wake seeds (a `RELEVANT KNOWLEDGE`
+  section, own-Steward events excluded), **plus** the native tools `search_knowledge`,
   `read_knowledge_doc`, `web_search`, `web_fetch` on both agents.
 - **Jobs:** background embed queue, live/periodic connector scans, and a nightly 04:15 sweep
   (`KliveRAGScheduler` — after Omniscience's 03:30) that reconciles connectors and evicts expired web

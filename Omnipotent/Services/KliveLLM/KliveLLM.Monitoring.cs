@@ -72,15 +72,15 @@ public partial class KliveLLM
         if (Ledger != null)
             _ = Task.Run(async () =>
             {
-                // After start-up has settled: the import reads every Projects journal once.
+                // After start-up has settled: the import reads every Demiurge journal once.
                 try { await Task.Delay(TimeSpan.FromMinutes(2), monitorStop.Token); } catch { return; }
                 try
                 {
-                    string journals = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.ProjectsDirectory), "AnalyticsUsage");
-                    int imported = await LlmProjectsImport.RunAsync(Ledger, journals, message => { try { _ = ServiceLog(message); } catch { } }, monitorStop.Token);
-                    if (imported > 0) await ServiceLog($"KliveLLM ledger: imported {imported:N0} Projects turns from before it started.");
+                    string journals = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.DemiurgeDirectory), "AnalyticsUsage");
+                    int imported = await LlmDemiurgeImport.RunAsync(Ledger, journals, message => { try { _ = ServiceLog(message); } catch { } }, monitorStop.Token);
+                    if (imported > 0) await ServiceLog($"KliveLLM ledger: imported {imported:N0} Demiurge turns from before it started.");
                 }
-                catch (Exception ex) { try { await ServiceLogError(ex, "KliveLLM: Projects history import failed (it will be retried at the next start)."); } catch { } }
+                catch (Exception ex) { try { await ServiceLogError(ex, "KliveLLM: Demiurge history import failed (it will be retried at the next start)."); } catch { } }
             });
     }
 

@@ -4,7 +4,7 @@ using Newtonsoft.Json.Linq;
 namespace Omnipotent.Services.ServiceTools;
 
 /// <summary>A machine-readable explanation of why a model-authored tool call was rejected. Mirrors the
-/// envelope Projects already returns (TOOL_ARGUMENT_ERROR + a JSON body), so the agent sees one error
+/// envelope Demiurge already returns (TOOL_ARGUMENT_ERROR + a JSON body), so the agent sees one error
 /// format across both tool systems and can learn a single recovery habit.</summary>
 public sealed record ToolArgumentError(string Code, string Path, string Message, string? Suggestion = null)
 {
@@ -46,9 +46,9 @@ public sealed class ToolArgumentResult
 /// Validates model-authored arguments against the JSON-Schema subset that <see cref="OmniToolSchema"/>
 /// generates: an object of typed properties, with enums, arrays and one level of nested objects.
 ///
-/// Deliberately separate from Projects' ProjectToolContract. That validator carries repair rules for
-/// Projects' hand-written tool surface (run_bash aliases, wait-condition and plan-step shapes) which do
-/// not apply here, and this module must not depend on Projects - ServiceTools is the shared layer both
+/// Deliberately separate from Demiurge's StewardToolContract. That validator carries repair rules for
+/// Demiurge's hand-written tool surface (run_bash aliases, wait-condition and plan-step shapes) which do
+/// not apply here, and this module must not depend on Demiurge - ServiceTools is the shared layer both
 /// agents sit on. What the two share is the error envelope, so the model sees one format.
 ///
 /// Validation runs before dispatch: a caller invokes only when <see cref="ToolArgumentResult.IsValid"/>.

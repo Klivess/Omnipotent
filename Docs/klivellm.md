@@ -7,8 +7,8 @@ all of it on `/klivellm` (Ops ▸ KliveLLM).
 
 Words: a **router** is the endpoint KliveLLM posts to (OpenRouter, AIRouter, HuggingFace, the custom
 endpoint, the local model, or one added from the page). A **provider** is whoever ran the model upstream
-(only OpenRouter reports it). A **lane** is one part of a service with its own traffic (Projects ›
-commander, KliveAgent › chat…). A **subject** is the caller's own grouping key (a project id, a game id).
+(only OpenRouter reports it). A **lane** is one part of a service with its own traffic (Demiurge ›
+commander, KliveAgent › chat…). A **subject** is the caller's own grouping key (a Steward id, a game id).
 
 ## Who is calling
 
@@ -31,13 +31,13 @@ its own model setting lives, and a fixed router if it has one (KliveAgent › sp
 5. The default route's router, then the `RemoteLLMProvider` setting (an empty document routes everything
    exactly as before; `KliveLLMRoutedCallTests` checks the request bytes are unchanged).
 
-Model: a **pinned** model wins; otherwise the caller's own model if the router serves it (Projects'
-per-project routes, `KliveAgent_FastModel`, `StratumEngineerModelID`…); then the route's model; then the
+Model: a **pinned** model wins; otherwise the caller's own model if the router serves it (Demiurge's
+per-Steward routes, `KliveAgent_FastModel`, `StratumEngineerModelID`…); then the route's model; then the
 router's default. A level whose router differs from the one chosen does not lend its model.
 
 Guards, in order: paused → budget → spending → router enabled and keyed → tool calling available. A refused
 call fails before anything is sent, with `RemoteLLMFailureKind` `Paused`, `BudgetExceeded` or
-`SpendingNotAllowed` (not retryable; Projects defers the wake with a plain blocker).
+`SpendingNotAllowed` (not retryable; Demiurge defers the wake with a plain blocker).
 
 **Spending** (per service or lane):
 
@@ -71,15 +71,15 @@ a single writer thread does the rest (drops are counted, never block). SQLite in
   attempts, tokens incl. cached / cache-write / reasoning, cost reported, timings, flags, routing revision).
 - `agg_1m`, `agg_1h`, `agg_1d`: rollups keyed by time × service × lane × router × provider × model × kind,
   with log histograms for latency and sizes; `subject_1d`; `router_1m` / `router_1h` (health and gauges);
-  `marks` (routing changes, restarts, the Projects import).
+  `marks` (routing changes, restarts, the Demiurge import).
 - Retention: calls 90 days (`KliveLLM_LedgerCallRetentionDays`, 7–730), minute rollups 14 days, hourly
   400 days, daily forever. Queries are time-bounded, index-driven and keyset-paged.
 - Kept text (opt-in, per service or lane, for 1 h / 24 h / 3 days, self-expiring):
   `klivellm-content.db`, gzipped, images and audio replaced by size markers, 2 MB a call, 2 GB in all,
   `KliveLLM_KeptTextRetentionDays` (default 3, max 14). Readable only with `klivellm.content.read`;
   every read is logged.
-- On first start the Projects usage journals are imported (records before the ledger's first live call),
-  so Projects has history from day one.
+- On first start the Demiurge usage journals are imported (records before the ledger's first live call),
+  so Demiurge has history from day one.
 
 Costs are computed when read, from the price book (`SavedData/KliveLLM/prices.json`, filled from
 OpenRouter's catalogue and editable): reported cost where the router gives one, else tokens × price; flat-fee

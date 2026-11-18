@@ -1204,8 +1204,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("clientJobId")]
         public string? ClientJobId { get; set; }
 
+        [JsonProperty("stewardId")]
+        public string StewardId { get; set; } = string.Empty;
+
+        /// <summary>Reads links saved before Projects became Demiurge (written as "projectId").</summary>
         [JsonProperty("projectId")]
-        public string ProjectId { get; set; } = string.Empty;
+        private string? LegacyProjectId { set { if (!string.IsNullOrEmpty(value) && string.IsNullOrEmpty(StewardId)) StewardId = value; } }
 
         [JsonProperty("directiveId")]
         public string DirectiveId { get; set; } = string.Empty;
@@ -1237,8 +1241,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("clientJobId")]
         public string? ClientJobId { get; set; }
 
+        [JsonProperty("stewardId")]
+        public string StewardId { get; set; } = string.Empty;
+
+        /// <summary>Reads links saved before Projects became Demiurge (written as "projectId").</summary>
         [JsonProperty("projectId")]
-        public string ProjectId { get; set; } = string.Empty;
+        private string? LegacyProjectId { set { if (!string.IsNullOrEmpty(value) && string.IsNullOrEmpty(StewardId)) StewardId = value; } }
 
         [JsonProperty("directiveId")]
         public string DirectiveId { get; set; } = string.Empty;
@@ -1306,8 +1314,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("jobId")]
         public string? JobId { get; set; }
 
+        [JsonProperty("stewardId")]
+        public string? StewardId { get; set; }
+
+        /// <summary>Reads links saved before Projects became Demiurge (written as "projectId").</summary>
         [JsonProperty("projectId")]
-        public string? ProjectId { get; set; }
+        private string? LegacyProjectId { set { if (!string.IsNullOrEmpty(value) && string.IsNullOrEmpty(StewardId)) StewardId = value; } }
 
         [JsonProperty("artifactPaths")]
         public List<string> ArtifactPaths { get; set; } = new();

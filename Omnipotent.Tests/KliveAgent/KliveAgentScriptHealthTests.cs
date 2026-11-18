@@ -2,7 +2,7 @@ using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveAgent;
 using Omnipotent.Services.KliveAgent.Models;
 using Omnipotent.Services.KliveLLM;
-using Omnipotent.Services.Projects.Stimulus;
+using Omnipotent.Services.Demiurge.Stimulus;
 
 namespace Omnipotent.Tests.KliveAgent
 {

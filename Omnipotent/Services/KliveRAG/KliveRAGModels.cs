@@ -10,8 +10,11 @@ namespace Omnipotent.Services.KliveRAG
     /// </summary>
     public static class RagSource
     {
-        public const string ProjectsEvents = "projects-events";
-        public const string ProjectsDigests = "projects-digests";
+        // Demiurge's two sources keep the keys they were stored under while Demiurge was still called
+        // Projects: they are written into every document, chunk, counter and cursor of an index that is
+        // gigabytes on the server, so renaming them would rewrite all of it. Show them by label instead.
+        public const string DemiurgeEvents = "projects-events";
+        public const string DemiurgeDigests = "projects-digests";
         public const string AgentConversations = "agent-conversations";
         public const string AgentMemories = "agent-memories";
         public const string Omniscience = "omniscience";
@@ -21,7 +24,7 @@ namespace Omnipotent.Services.KliveRAG
 
         public static readonly string[] All =
         {
-            ProjectsEvents, ProjectsDigests, AgentConversations, AgentMemories, Omniscience, RepoDocs, Web, OmniLogs
+            DemiurgeEvents, DemiurgeDigests, AgentConversations, AgentMemories, Omniscience, RepoDocs, Web, OmniLogs
         };
 
         public static bool IsKnown(string source) => Array.IndexOf(All, source) >= 0;
@@ -96,8 +99,8 @@ namespace Omnipotent.Services.KliveRAG
         /// <summary>Drop hits from these sources (applied after <see cref="Sources"/>). Used to keep noisy
         /// sources like omni-logs out of the auto-injection path while leaving them searchable via tools.</summary>
         public IReadOnlyCollection<string>? ExcludeSources;
-        /// <summary>Drop hits from projects-events / projects-digests of this project (avoids duplicating a project's own log leg).</summary>
-        public string? ExcludeProjectId;
+        /// <summary>Drop hits from Demiurge's event and digest sources for this Steward (avoids duplicating a Steward's own log leg).</summary>
+        public string? ExcludeStewardId;
         /// <summary>Also federate into Omniscience's raw-message semantic index (tool path only).</summary>
         public bool IncludeMessages;
         /// <summary>Wall-clock budget for the retrieval legs. When it passes, the running SQLite statements
@@ -110,8 +113,8 @@ namespace Omnipotent.Services.KliveRAG
     }
 
     /// <summary>
-    /// A retrieval hit as consumed by prompt-injection callers (KliveAgent, Projects). Deliberately
-    /// small and stable so Projects can depend on it without pulling the whole retriever surface.
+    /// A retrieval hit as consumed by prompt-injection callers (KliveAgent, Demiurge). Deliberately
+    /// small and stable so Demiurge can depend on it without pulling the whole retriever surface.
     /// </summary>
     public sealed record KnowledgeHit(string Source, string Title, string Text, string DocId, long CreatedAtUnixMs, double Score);
 

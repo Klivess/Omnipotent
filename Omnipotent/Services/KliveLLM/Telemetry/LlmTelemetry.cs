@@ -147,7 +147,7 @@ namespace Omnipotent.Services.KliveLLM.Telemetry
             }
         }
 
-        /// <summary>What a service ("Projects") or lane ("Projects/commander") has spent today and this month.</summary>
+        /// <summary>What a service ("Demiurge") or lane ("Demiurge/commander") has spent today and this month.</summary>
         public LlmUsageSnapshot Usage(string key)
             => usage.TryGetValue(key, out var counter) ? counter.Snapshot(DateTime.UtcNow) : LlmUsageSnapshot.Zero;
 

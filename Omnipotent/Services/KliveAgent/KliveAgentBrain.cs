@@ -101,18 +101,18 @@ namespace Omnipotent.Services.KliveAgent
 
         private static readonly PromptToolDescriptor[] KnowledgeTools =
         [
-            new("SearchKnowledge", "Search Klives' whole cross-system knowledge base (past Projects, your conversations & memories, Omniscience facts, repo docs, cached web) by free-text query. Returns cited snippets with doc ids. Use for \"have we done/decided this before\" and \"what do we know about X\" questions."),
+            new("SearchKnowledge", "Search Klives' whole cross-system knowledge base (past Stewards, your conversations & memories, Omniscience facts, repo docs, cached web) by free-text query. Returns cited snippets with doc ids. Use for \"have we done/decided this before\" and \"what do we know about X\" questions."),
             new("ReadKnowledgeDoc", "Open the full text of a knowledge document by the doc id shown in a SearchKnowledge result."),
             new("WebSearch", "Search the LIVE web (self-hosted SearXNG). Use for current/external info the knowledge base won't have; fetchTop>0 also indexes the top pages for full-text follow-up."),
             new("WebFetch", "Download one web page by URL, extract its text, index it, and return the text.")
         ];
 
-        private static readonly PromptToolDescriptor[] ProjectsTools =
+        private static readonly PromptToolDescriptor[] DemiurgeTools =
         [
-            new("CreateProject", "Delegate long-running autonomous work to the Projects task force: CreateProject(name, goal, tokenBudgetUsd, moneyBudgetUsd?, moneyAutonomousThresholdUsd?, subAgentCap?). Returns the new project ID. Use for goals that outlast one chat — the Commander pursues them 24/7 and shares this memory."),
-            new("ListProjects", "List all Projects with a one-line status (id, name, status, budget, active agents, last event)."),
-            new("GetProjectStatus", "Get one Project's status/budget/agent summary by ID."),
-            new("SteerProject", "Send a message to a Project's Commander (steers a live wake or wakes it): SteerProject(projectID, message).")
+            new("CreateSteward", "Delegate long-running autonomous work to the Demiurge task force: CreateSteward(name, goal, tokenBudgetUsd, moneyBudgetUsd?, moneyAutonomousThresholdUsd?, subAgentCap?). Returns the new Steward ID. Use for goals that outlast one chat — the Commander pursues them 24/7 and shares this memory."),
+            new("ListStewards", "List all Stewards with a one-line status (id, name, status, budget, active agents, last event)."),
+            new("GetStewardStatus", "Get one Steward's status/budget/agent summary by ID."),
+            new("SteerSteward", "Send a message to a Steward's Commander (steers a live wake or wakes it): SteerSteward(stewardID, message).")
         ];
 
         public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
@@ -618,8 +618,8 @@ namespace Omnipotent.Services.KliveAgent
                     new { type = "object", properties = new { id = new { type = "string", description = "The memory id or short-id prefix." } }, required = new[] { "id" } }),
 
                 Tool("search_knowledge",
-                    "Semantic + keyword search across Klives' WHOLE knowledge base — past Projects (their decisions/outcomes), your own conversations & memories, Omniscience person facts, repo docs, and cached web pages. " +
-                    "Use this for cross-system questions that memory alone won't answer (\"what did project X conclude\", \"have we solved this before\", \"what do we know about <person/topic>\"). " +
+                    "Semantic + keyword search across Klives' WHOLE knowledge base — past Stewards (their decisions/outcomes), your own conversations & memories, Omniscience person facts, repo docs, and cached web pages. " +
+                    "Use this for cross-system questions that memory alone won't answer (\"what did Steward X conclude\", \"have we solved this before\", \"what do we know about <person/topic>\"). " +
                     "Returns cited snippets with a doc:<id> for each; call read_knowledge_doc to open one in full.",
                     new { type = "object", properties = new {
                         query = new { type = "string", description = "Free-text search query." },
@@ -628,7 +628,7 @@ namespace Omnipotent.Services.KliveAgent
                     }, required = new[] { "query" } }),
 
                 Tool("read_knowledge_doc",
-                    "Open the FULL text of a knowledge document by the doc:<id> shown in a search_knowledge result (e.g. a whole conversation, a repo doc, a project digest). This also opens web pages indexed by web_search/web_fetch.",
+                    "Open the FULL text of a knowledge document by the doc:<id> shown in a search_knowledge result (e.g. a whole conversation, a repo doc, a Steward digest). This also opens web pages indexed by web_search/web_fetch.",
                     new { type = "object", properties = new {
                         docId = new { type = "string", description = "The document id (the doc:... value from a search result)." },
                         maxTokens = new { type = "integer", description = "Max tokens of document text to return (default 1500, max 3000)." }
@@ -650,13 +650,13 @@ namespace Omnipotent.Services.KliveAgent
                     }, required = new[] { "url" } }),
 
                 Tool("account_list",
-                    "List accounts in the GLOBAL shared registry (every Project and you share it). ALWAYS call this before signing up on ANY external service — an account may already exist (created by another project). Shows service, username, email, status, owners, and the {account:...} refs to type its secrets. Secret values are never shown.",
+                    "List accounts in the GLOBAL shared registry (every Steward and you share it). ALWAYS call this before signing up on ANY external service — an account may already exist (created by another Steward). Shows service, username, email, status, owners, and the {account:...} refs to type its secrets. Secret values are never shown.",
                     new { type = "object", properties = new {
                         service = new { type = "string", description = "Optional service filter, e.g. \"github.com\"." }
                     }, required = Array.Empty<string>() }),
 
                 Tool("account_register",
-                    "Record an account in the GLOBAL shared registry so no project re-creates it — call it BEFORE filling a signup form, then type its secrets into the form as {account:<service>/<field>}. Pass secrets {\"password\":\"{generate}\"} to have a strong password minted for you without ever seeing it. Prefer a dedicated <something>@klive.dev email (create it with klivemail_create_mailbox; verification/reset mail arrives there). Secrets are stored encrypted and NEVER shown back. If the service already has an account this returns it and registers nothing unless allowDuplicate=true with a reason.",
+                    "Record an account in the GLOBAL shared registry so no Steward re-creates it — call it BEFORE filling a signup form, then type its secrets into the form as {account:<service>/<field>}. Pass secrets {\"password\":\"{generate}\"} to have a strong password minted for you without ever seeing it. Prefer a dedicated <something>@klive.dev email (create it with klivemail_create_mailbox; verification/reset mail arrives there). Secrets are stored encrypted and NEVER shown back. If the service already has an account this returns it and registers nothing unless allowDuplicate=true with a reason.",
                     new { type = "object", properties = new {
                         service = new { type = "string", description = "Service name or URL, e.g. \"github.com\"." },
                         username = new { type = "string", description = "The account's username/login." },
@@ -768,7 +768,7 @@ namespace Omnipotent.Services.KliveAgent
             var strType = new { type = "string" };
             var intType = new { type = "integer" };
 
-            // The shared visual surface is also used by isolated Project desktops.  Host-only
+            // The shared visual surface is also used by isolated Steward desktops.  Host-only
             // approval, handoff, and encrypted-memory operations are appended below.
             tools.AddRange(VisualComputerToolCatalog.Build(new ComputerCapabilities
             {
@@ -1506,7 +1506,7 @@ namespace Omnipotent.Services.KliveAgent
             bool background = false)
         {
             // While someone is waiting on this run, one of AIRouter's slots is kept clear of background
-            // work (the Projects fleet, an Alpha Lab run). Renewed every step; released when the run ends.
+            // work (the Demiurge fleet, an Alpha Lab run). Renewed every step; released when the run ends.
             string reserveOwner = "kliveagent-run-" + conversation.ConversationId;
             void HoldInteractiveReserve()
             {
@@ -3319,7 +3319,7 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("Codebase: " + string.Join(", ", DiscoveryTools.Select(t => t.MethodName)));
             if (ShouldIncludeAdvancedRuntimeTools(userMessage))
                 sb.AppendLine("Runtime: " + string.Join(", ", AdvancedRuntimeTools.Select(t => t.MethodName)));
-            sb.AppendLine("Projects: " + string.Join(", ", ProjectsTools.Select(t => t.MethodName)));
+            sb.AppendLine("Demiurge: " + string.Join(", ", DemiurgeTools.Select(t => t.MethodName)));
             sb.AppendLine("GetTypeSchema(\"ScriptGlobals\") lists exact signatures; GetMethodDocumentation(\"ScriptGlobals\", name) describes one helper.");
             sb.AppendLine("Example: var svc = GetService(\"Name\"); Log(await CallObjectMethod(svc, \"Method\", args));");
             return sb.ToString();
@@ -3356,16 +3356,16 @@ namespace Omnipotent.Services.KliveAgent
             else
                 AppendToolNames(sb, "Time", TemporalTools);
 
-            // Cross-system knowledge retrieval (always surfaced): reaches other Projects, Omniscience,
+            // Cross-system knowledge retrieval (always surfaced): reaches other Stewards, Omniscience,
             // repo docs and cached web that plain memory/codebase search can't.
             if (toolCallingMode)
-                sb.AppendLine("Knowledge (NATIVE TOOLS): search_knowledge(query, maxResults?, includeMessages?) — semantic search across Projects history, your memories/conversations, Omniscience facts, repo docs & cached web; read_knowledge_doc(docId, maxTokens?) — open a full result document; web_search(query, maxResults?, fetchTop?, timeRange?) — LIVE web search; web_fetch(url) — read one web page.");
+                sb.AppendLine("Knowledge (NATIVE TOOLS): search_knowledge(query, maxResults?, includeMessages?) — semantic search across Demiurge history, your memories/conversations, Omniscience facts, repo docs & cached web; read_knowledge_doc(docId, maxTokens?) — open a full result document; web_search(query, maxResults?, fetchTop?, timeRange?) — LIVE web search; web_fetch(url) — read one web page.");
             else
                 AppendToolNames(sb, "Knowledge", KnowledgeTools);
 
-            // Projects delegation is always surfaced (small set) — the interactive assistant can hand
+            // Demiurge delegation is always surfaced (small set) — the interactive assistant can hand
             // long-running goals to the autonomous task force it shares memory with.
-            AppendToolNames(sb, "Projects", ProjectsTools);
+            AppendToolNames(sb, "Demiurge", DemiurgeTools);
 
             sb.AppendLine("If a tool you need isn't listed, run: GetTypeSchema(\"ScriptGlobals\") to see every tool, or GetMethodDocumentation(\"ScriptGlobals\", \"ToolName\") for one signature.");
 

@@ -82,7 +82,7 @@ namespace Omnipotent.Tests.KliveRAG
         [Fact]
         public void Chunker_SingleChunk_YieldsOneChunk()
         {
-            var doc = Doc("projevt:p:1", string.Concat(Enumerable.Repeat("word ", 500)), RagSource.ProjectsEvents, single: true);
+            var doc = Doc("projevt:p:1", string.Concat(Enumerable.Repeat("word ", 500)), RagSource.DemiurgeEvents, single: true);
             Assert.Single(RagChunker.Chunk(doc));
         }
 
@@ -147,13 +147,13 @@ namespace Omnipotent.Tests.KliveRAG
         }
 
         [Fact]
-        public async Task Retriever_ExcludeProjectId_DropsOwnProjectEvents()
+        public async Task Retriever_ExcludeStewardId_DropsOwnStewardEvents()
         {
-            await writer.UpsertAsync(Doc("projevt:P1:5", "decision to use SearXNG for web search", RagSource.ProjectsEvents, single: true));
-            await writer.UpsertAsync(Doc("projevt:P2:9", "another project also discussed SearXNG web search", RagSource.ProjectsEvents, single: true));
+            await writer.UpsertAsync(Doc("projevt:P1:5", "decision to use SearXNG for web search", RagSource.DemiurgeEvents, single: true));
+            await writer.UpsertAsync(Doc("projevt:P2:9", "another Steward also discussed SearXNG web search", RagSource.DemiurgeEvents, single: true));
 
             var retriever = new HybridRetriever(db, new RagEmbedQueue(db, new HttpClient(), _ => { }));
-            var hits = await retriever.SearchAsync("SearXNG web search", new RagSearchOptions { MaxResults = 5, ExcludeProjectId = "P1" });
+            var hits = await retriever.SearchAsync("SearXNG web search", new RagSearchOptions { MaxResults = 5, ExcludeStewardId = "P1" });
 
             Assert.NotEmpty(hits);
             Assert.DoesNotContain(hits, h => h.DocId.StartsWith("projevt:P1:"));

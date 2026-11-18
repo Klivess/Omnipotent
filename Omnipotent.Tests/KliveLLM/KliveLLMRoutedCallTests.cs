@@ -171,8 +171,8 @@ namespace Omnipotent.Tests.KliveLLM
             {
                 requests.Clear();
                 var service = Service(doc);
-                Seed(service, "projects-commander-p", LlmConsumerCatalog.Callers.ProjectsCommander.For("p"));
-                var response = await service.QueryToolSessionAsync("projects-commander-p", new List<HFWrapper.HFTool>(), maxTokensOverride: 64,
+                Seed(service, "demiurge-commander-p", LlmConsumerCatalog.Callers.DemiurgeCommander.For("p"));
+                var response = await service.QueryToolSessionAsync("demiurge-commander-p", new List<HFWrapper.HFTool>(), maxTokensOverride: 64,
                     modelOverride: modelOverride, modelRoutes: new[] { "anthropic/claude-sonnet-4.5", "openai/gpt-5" });
                 Assert.True(response.Success);
                 return Assert.Single(requests).Body;
@@ -180,13 +180,13 @@ namespace Omnipotent.Tests.KliveLLM
 
             string unrouted = await Run(new LlmRoutingDocument(), null);
             var explicitDoc = new LlmRoutingDocument();
-            explicitDoc.Lanes["Projects/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter };
+            explicitDoc.Lanes["Demiurge/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter };
             Assert.Equal(unrouted, await Run(explicitDoc, null));
             Assert.Contains("\"model\":\"anthropic/claude-sonnet-4.5\"", unrouted);
             Assert.Contains("\"models\":[\"openai/gpt-5\"]", unrouted);
 
             var pinned = new LlmRoutingDocument();
-            pinned.Lanes["Projects/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter, Model = "openai/gpt-5-mini", Pin = true };
+            pinned.Lanes["Demiurge/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter, Model = "openai/gpt-5-mini", Pin = true };
             string pinnedBody = await Run(pinned, null);
             Assert.Contains("\"model\":\"openai/gpt-5-mini\"", pinnedBody);
             Assert.DoesNotContain("\"models\"", pinnedBody);

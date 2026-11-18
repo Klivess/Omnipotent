@@ -3,7 +3,7 @@ using Microsoft.CodeAnalysis.Scripting;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAgent.Models;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
@@ -51,7 +51,7 @@ namespace Omnipotent.Services.KliveAgent
         /// A compact, always-accurate reference for the script API a run_script/execute_csharp turn
         /// sees: a curated preamble of the mistakes that fail most when the signatures are guessed
         /// (the CS1503/CS0103/CS1061 loops that burned whole wakes), followed by the real signatures
-        /// reflected off <paramref name="globalsType"/> (defaults to this type, but the Projects host
+        /// reflected off <paramref name="globalsType"/> (defaults to this type, but the Demiurge host
         /// passes its WorkScriptGlobals so its file/Output helpers show too). Reflection means the
         /// signatures can never drift from the code; a test asserts every public method is covered.
         /// </summary>
@@ -62,7 +62,7 @@ namespace Omnipotent.Services.KliveAgent
             var sb = new StringBuilder();
             sb.AppendLine("SCRIPT API (run_script / execute_csharp) — exact signatures. These are the calls that fail most when guessed:");
             sb.AppendLine("• GetService(\"KliveMail\") returns the service OBJECT. GetServiceMember takes a STRING type name + member name — GetServiceMember(\"KliveMail\",\"Repo\"), NOT GetServiceMember(svcObject,\"Repo\") (that is CS1503 object→string).");
-            sb.AppendLine("• await RunBash(cmd) / RunPowerShell(cmd) — they return Task<string>. In Projects, Output(RunBash(cmd)) is also supported and awaits/unpacks it.");
+            sb.AppendLine("• await RunBash(cmd) / RunPowerShell(cmd) — they return Task<string>. In Demiurge, Output(RunBash(cmd)) is also supported and awaits/unpacks it.");
             sb.AppendLine("• GetObjectMembers(obj) returns AgentObjectMember with .Name, .Kind/.MemberType and .Type/.TypeName. Invoke with CallObjectMethod(obj,\"Method\",args); read a field/prop with GetObjectMember(obj,\"Name\"). Never dot-access on a boxed object.");
             sb.AppendLine("• Locals do NOT persist across separate run_script blocks unless the prior block COMPILED — chain discovery + action + Output(...) in ONE block.");
             sb.AppendLine("• Prefer first-class tools over reflecting into services: klivemail_* for email, account_* for logins, ensure_desktop_ready before browser work, http_request, read_file/write_file.");
@@ -71,6 +71,7 @@ namespace Omnipotent.Services.KliveAgent
             var methods = globalsType
                 .GetMethods(BindingFlags.Public | BindingFlags.Instance)
                 .Where(m => m.DeclaringType != typeof(object) && !m.IsSpecialName && !m.Name.StartsWith('<'))
+                .Where(m => m.GetCustomAttribute<ObsoleteAttribute>() == null) // retired names stay callable, unadvertised
                 .GroupBy(m => m.Name)
                 .OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase);
 
@@ -123,27 +124,27 @@ namespace Omnipotent.Services.KliveAgent
                 .ToList();
         }
 
-        // ── Projects bridge (delegate long-running work to the autonomous task force) ──
-        // Projects is part of KliveAgent (same shared memory). These let the interactive assistant
-        // spin up, inspect and steer autonomous projects without hand-reflecting the Projects internals.
+        // ── Demiurge bridge (delegate long-running work to the autonomous task force) ──
+        // Demiurge is part of KliveAgent (same shared memory). These let the interactive assistant
+        // spin up, inspect and steer autonomous Stewards without hand-reflecting the Demiurge internals.
 
-        private Omnipotent.Services.Projects.Projects? GetProjectsService()
+        private Omnipotent.Services.Demiurge.Demiurge? GetDemiurgeService()
             => agentService?.GetActiveServices()
-                .OfType<Omnipotent.Services.Projects.Projects>()
+                .OfType<Omnipotent.Services.Demiurge.Demiurge>()
                 .FirstOrDefault(s => s.IsServiceActive());
 
-        /// <summary>Create and start an autonomous Project (a goal + a budget). Returns the new project's ID, or an error string.</summary>
-        public async Task<string> CreateProject(string name, string goal, double tokenBudgetUsd,
+        /// <summary>Create and start an autonomous Steward (a goal + a budget). Returns the new Steward's ID, or an error string.</summary>
+        public async Task<string> CreateSteward(string name, string goal, double tokenBudgetUsd,
             double moneyBudgetUsd = 0, double moneyAutonomousThresholdUsd = 0, int subAgentCap = 5)
         {
-            var projects = GetProjectsService();
-            if (projects == null) return "Projects service is not available.";
+            var demiurge = GetDemiurgeService();
+            if (demiurge == null) return "Demiurge service is not available.";
             try
             {
-                var p = await projects.CreateProjectAsync(name, goal, tokenBudgetUsd, moneyBudgetUsd, moneyAutonomousThresholdUsd, subAgentCap);
-                return p.ProjectID;
+                var p = await demiurge.CreateStewardAsync(name, goal, tokenBudgetUsd, moneyBudgetUsd, moneyAutonomousThresholdUsd, subAgentCap);
+                return p.StewardID;
             }
-            catch (Exception ex) { return $"Failed to create project: {ex.Message}"; }
+            catch (Exception ex) { return $"Failed to create Steward: {ex.Message}"; }
         }
 
         /// <summary>Create a durable, independently-running job linked to this conversation. The
@@ -167,7 +168,7 @@ namespace Omnipotent.Services.KliveAgent
                     MoneyAutonomousThresholdUsd = moneyAutonomousThresholdUsd,
                     SubAgentCap = subAgentCap
                 });
-                return $"Long-term job {job.JobId} accepted (Project {job.ProjectId}, status {job.Status}).";
+                return $"Long-term job {job.JobId} accepted (Steward {job.StewardId}, status {job.Status}).";
             }
             catch (Exception ex)
             {
@@ -175,40 +176,53 @@ namespace Omnipotent.Services.KliveAgent
             }
         }
 
-        /// <summary>List every Project with a one-line status (id, name, status, budget, active agents, last event).</summary>
-        public string ListProjects()
+        /// <summary>List every Steward with a one-line status (id, name, status, budget, active agents, last event).</summary>
+        public string ListStewards()
         {
-            var projects = GetProjectsService();
-            if (projects == null) return "Projects service is not available.";
-            var all = projects.Store.ListProjects();
-            if (all.Count == 0) return "No projects.";
-            return string.Join("\n", all.Select(p => projects.DescribeProjectStatus(p.ProjectID)));
+            var demiurge = GetDemiurgeService();
+            if (demiurge == null) return "Demiurge service is not available.";
+            var all = demiurge.Store.ListStewards();
+            if (all.Count == 0) return "No Stewards.";
+            return string.Join("\n", all.Select(p => demiurge.DescribeStewardStatus(p.StewardID)));
         }
 
-        /// <summary>Send a message to a Project's Commander — steers a live wake or wakes it. Returns confirmation.</summary>
-        public string SteerProject(string projectID, string message)
+        /// <summary>Send a message to a Steward's Commander — steers a live wake or wakes it. Returns confirmation.</summary>
+        public string SteerSteward(string stewardID, string message)
         {
-            var projects = GetProjectsService();
-            if (projects == null) return "Projects service is not available.";
-            var receipt = projects.MessageProjectWithReceipt(
-                projectID, message, ProjectDirectiveKind.Steering);
+            var demiurge = GetDemiurgeService();
+            if (demiurge == null) return "Demiurge service is not available.";
+            var receipt = demiurge.MessageStewardWithReceipt(
+                stewardID, message, StewardDirectiveKind.Steering);
             if (!receipt.Accepted)
-                return receipt.Reason ?? $"No project with ID {projectID}.";
+                return receipt.Reason ?? $"No Steward with ID {stewardID}.";
             return receipt.Status == "delivered"
-                ? $"Project command {receipt.DirectiveID} was persisted and delivered to wake {receipt.WakeID}."
-                : $"Project command {receipt.DirectiveID} was persisted and is {receipt.Status}: {receipt.Reason ?? "awaiting a runnable wake"}.";
+                ? $"Steward command {receipt.DirectiveID} was persisted and delivered to wake {receipt.WakeID}."
+                : $"Steward command {receipt.DirectiveID} was persisted and is {receipt.Status}: {receipt.Reason ?? "awaiting a runnable wake"}.";
         }
 
-        /// <summary>Get a single Project's current status/budget/agent summary.</summary>
-        public string GetProjectStatus(string projectID)
+        /// <summary>Get a single Steward's current status/budget/agent summary.</summary>
+        public string GetStewardStatus(string stewardID)
         {
-            var projects = GetProjectsService();
-            if (projects == null) return "Projects service is not available.";
-            return projects.DescribeProjectStatus(projectID) ?? $"No project with ID {projectID}.";
+            var demiurge = GetDemiurgeService();
+            if (demiurge == null) return "Demiurge service is not available.";
+            return demiurge.DescribeStewardStatus(stewardID) ?? $"No Steward with ID {stewardID}.";
         }
+
+        // Names from before Projects became Demiurge, so remembered scripts and shortcuts keep
+        // running. [Obsolete] keeps them out of the API reference the agent reads.
+        [Obsolete("Use CreateSteward.")]
+        public Task<string> CreateProject(string name, string goal, double tokenBudgetUsd,
+            double moneyBudgetUsd = 0, double moneyAutonomousThresholdUsd = 0, int subAgentCap = 5)
+            => CreateSteward(name, goal, tokenBudgetUsd, moneyBudgetUsd, moneyAutonomousThresholdUsd, subAgentCap);
+        [Obsolete("Use ListStewards.")]
+        public string ListProjects() => ListStewards();
+        [Obsolete("Use SteerSteward.")]
+        public string SteerProject(string projectID, string message) => SteerSteward(projectID, message);
+        [Obsolete("Use GetStewardStatus.")]
+        public string GetProjectStatus(string projectID) => GetStewardStatus(projectID);
 
         // ── KliveRAG bridge (cross-system knowledge retrieval + live web) ──
-        // KliveRAG indexes Projects history, KliveAgent conversations/memories, Omniscience facts, repo
+        // KliveRAG indexes Demiurge history, KliveAgent conversations/memories, Omniscience facts, repo
         // docs and cached web pages. These give the agent semantic recall across all of them, plus live web.
 
         private Omnipotent.Services.KliveRAG.KliveRAG? GetRagService()
@@ -221,7 +235,7 @@ namespace Omnipotent.Services.KliveAgent
                 .OfType<Omnipotent.Services.AccountRegistry.AccountRegistry>()
                 .FirstOrDefault(s => s.IsServiceActive());
 
-        /// <summary>List accounts in the GLOBAL shared registry (all projects + KliveAgent). ALWAYS call
+        /// <summary>List accounts in the GLOBAL shared registry (all Stewards + KliveAgent). ALWAYS call
         /// before signing up on any service — an account may already exist. Metadata + {account:...} refs
         /// only; secret values are never shown.</summary>
         public async Task<string> ListAccounts(string? service = null)
@@ -233,7 +247,7 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>Record an account you created on an external service into the GLOBAL shared registry so
-        /// no project re-creates it. Secrets are encrypted and never shown back; reference them as
+        /// no Steward re-creates it. Secrets are encrypted and never shown back; reference them as
         /// {account:&lt;service&gt;/&lt;field&gt;}. Duplicate on a service is refused unless allowDuplicate=true + reason.</summary>
         public async Task<string> RegisterAccount(string service, string username, string? email,
             Dictionary<string, string>? secrets, string? description = null, bool allowDuplicate = false, string? reason = null)
@@ -295,7 +309,7 @@ namespace Omnipotent.Services.KliveAgent
         /// messaged, or for something he must know before this run ends. Never put secrets in it.</summary>
         public Task<string> NotifyKlives(string message) => agentService.NotifyKlivesAsync(message, ConversationId);
 
-        /// <summary>Semantic + lexical search across Klives' whole knowledge base (Projects, KliveAgent memory,
+        /// <summary>Semantic + lexical search across Klives' whole knowledge base (Demiurge, KliveAgent memory,
         /// Omniscience, repo docs, cached web). Returns cited results; follow up with ReadKnowledgeDoc(docId).
         /// Set includeMessages to also search Omniscience's raw message corpus.</summary>
         public async Task<string> SearchKnowledge(string query, int maxResults = 8, bool includeMessages = true)
@@ -1426,16 +1440,42 @@ namespace Omnipotent.Services.KliveAgent
         {
             if (string.IsNullOrWhiteSpace(key)) return "Error: key is required.";
 
-            var gpType = typeof(Omnipotent.Data_Handling.OmniPaths.GlobalPaths);
-            var fields = gpType.GetFields(BindingFlags.Public | BindingFlags.Static);
-            var field = Array.Find(fields, f => f.Name.Equals(key, StringComparison.Ordinal))
-                ?? Array.Find(fields, f => f.Name.Equals(key, StringComparison.OrdinalIgnoreCase));
-            if (field == null)
-                return $"Unknown global path key '{key}'.{SuggestClosest(key, fields.Select(f => f.Name))}";
-
-            var token = field.GetValue(null) as string ?? string.Empty;
+            var keys = GlobalPathKeys();
+            string? token = FindGlobalPath(keys, key);
+            if (token == null)
+                return $"Unknown global path key '{key}'.{SuggestClosest(key, keys.Keys)}";
             return Omnipotent.Data_Handling.OmniPaths.GetPath(token);
         }
+
+        /// <summary>Every GlobalPaths key and its current value: static string fields plus static string
+        /// properties (Demiurge's paths are properties so they can follow its data root).</summary>
+        private static Dictionary<string, Func<string?>> GlobalPathKeys()
+        {
+            var gpType = typeof(Omnipotent.Data_Handling.OmniPaths.GlobalPaths);
+            var keys = new Dictionary<string, Func<string?>>(StringComparer.Ordinal);
+            foreach (var f in gpType.GetFields(BindingFlags.Public | BindingFlags.Static).Where(f => f.FieldType == typeof(string)))
+                keys[f.Name] = () => f.GetValue(null) as string;
+            foreach (var p in gpType.GetProperties(BindingFlags.Public | BindingFlags.Static).Where(p => p.PropertyType == typeof(string)))
+                keys[p.Name] = () => p.GetValue(null) as string;
+            return keys;
+        }
+
+        /// <summary>Exact, then case-insensitive. Keys from before Projects became Demiurge
+        /// ("ProjectsVolumesDirectory") still resolve, so remembered scripts keep working.</summary>
+        private static string? FindGlobalPath(Dictionary<string, Func<string?>> keys, string key)
+        {
+            string trimmed = key.Trim();
+            foreach (string candidate in new[] { trimmed, DemiurgeKeyFor(trimmed) })
+            {
+                if (keys.TryGetValue(candidate, out var exact)) return exact() ?? string.Empty;
+                var loose = keys.Keys.FirstOrDefault(k => k.Equals(candidate, StringComparison.OrdinalIgnoreCase));
+                if (loose != null) return keys[loose]() ?? string.Empty;
+            }
+            return null;
+        }
+
+        private static string DemiurgeKeyFor(string key) =>
+            key.StartsWith("Projects", StringComparison.OrdinalIgnoreCase) ? "Demiurge" + key["Projects".Length..] : key;
 
         /// <summary>List files and folders in a codebase directory. Path is relative to the project root (e.g. "Omnipotent/Services").</summary>
         public string ListDirectory(string relativePath = "")
@@ -1469,12 +1509,9 @@ namespace Omnipotent.Services.KliveAgent
         {
             if (string.IsNullOrWhiteSpace(pathOrKey)) return AppDomain.CurrentDomain.BaseDirectory;
 
-            var gpType = typeof(Omnipotent.Data_Handling.OmniPaths.GlobalPaths);
-            var fields = gpType.GetFields(BindingFlags.Public | BindingFlags.Static);
-            var field = Array.Find(fields, f => f.Name.Equals(pathOrKey, StringComparison.Ordinal))
-                ?? Array.Find(fields, f => f.Name.Equals(pathOrKey, StringComparison.OrdinalIgnoreCase));
-            if (field != null)
-                return Omnipotent.Data_Handling.OmniPaths.GetPath(field.GetValue(null) as string ?? string.Empty);
+            string? token = FindGlobalPath(GlobalPathKeys(), pathOrKey);
+            if (token != null)
+                return Omnipotent.Data_Handling.OmniPaths.GetPath(token);
 
             return Path.IsPathRooted(pathOrKey)
                 ? pathOrKey
@@ -1650,8 +1687,13 @@ namespace Omnipotent.Services.KliveAgent
             if (string.IsNullOrWhiteSpace(typeName)) return null;
 
             var classes = GetProjectClassIndex();
+            // A short name several types share (KliveAgent's ScriptGlobals and the one nested in
+            // Demiurge's StimulusScriptAdapter) means the top-level type, whichever folder sorts first.
+            var byName = classes.Where(c => c.Name.Equals(typeName, StringComparison.OrdinalIgnoreCase)).ToList();
+            var named = byName.FirstOrDefault(c => typeof(ScriptGlobals).Assembly.GetType(c.FullName) != null)
+                ?? byName.FirstOrDefault();
             return classes.FirstOrDefault(c => c.FullName.Equals(typeName, StringComparison.OrdinalIgnoreCase))
-                ?? classes.FirstOrDefault(c => c.Name.Equals(typeName, StringComparison.OrdinalIgnoreCase))
+                ?? named
                 ?? classes.FirstOrDefault(c => c.FullName.Contains(typeName, StringComparison.OrdinalIgnoreCase));
         }
 

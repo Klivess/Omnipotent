@@ -30,7 +30,7 @@ public sealed class PermissionCatalogTests
     public void Catalog_SplitsServicesAcrossTiers()
     {
         // "Granular": the big services expose several tiers rather than one key.
-        foreach (string service in new[] { "omnitrader", "projects", "omniscience", "klivecloud", "kliveagent" })
+        foreach (string service in new[] { "omnitrader", "demiurge", "omniscience", "klivecloud", "kliveagent" })
         {
             var tiers = PermissionCatalog.All.Where(d => d.ServiceKey == service).Select(d => d.Tier).Distinct().Count();
             Assert.True(tiers >= 3, $"{service} only spans {tiers} tiers");

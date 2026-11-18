@@ -1,6 +1,6 @@
 using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveLLM;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 
 namespace Omnipotent.Tests.KliveLLM;
 
@@ -11,7 +11,7 @@ public class GemmaToolCallCompatibilityTests
     {
         var result = Normalize(
             """<|tool_call>call:reply_to_klives{message:<|"|>On it.<|"|>}<tool_call|><|tool_response>""",
-            ProjectTools());
+            StewardTools());
 
         Assert.True(result.Detected);
         Assert.True(result.Success, result.Error);
@@ -29,10 +29,10 @@ public class GemmaToolCallCompatibilityTests
         string text = """
             I have started.
             <|tool_call>call:kliveagent:reply_to_klives{message:"Directives acknowledged."}<tool_call|>
-            <|tool_call>call:project_directive:op:acknowledge{directive_id:"directive-123"}<tool_call|>
+            <|tool_call>call:steward_directive:op:acknowledge{directive_id:"directive-123"}<tool_call|>
             """;
 
-        var result = Normalize(text, ProjectTools());
+        var result = Normalize(text, StewardTools());
 
         Assert.True(result.Success, result.Error);
         Assert.Equal("I have started.", result.Content);
@@ -45,7 +45,7 @@ public class GemmaToolCallCompatibilityTests
             },
             call =>
             {
-                Assert.Equal("project_directive", call.function.name);
+                Assert.Equal("steward_directive", call.function.name);
                 var args = JObject.Parse(call.function.arguments);
                 Assert.Equal("acknowledge", (string?)args["op"]);
                 Assert.Equal("directive-123", (string?)args["directive_id"]);
@@ -67,7 +67,7 @@ public class GemmaToolCallCompatibilityTests
             """;
         string text = "<|tool_call>call:execute_csharp{code:\n" + code + "\n}<tool_call|>";
 
-        var result = Normalize(text, ProjectTools());
+        var result = Normalize(text, StewardTools());
 
         Assert.True(result.Success, result.Error);
         var call = Assert.Single(result.ToolCalls!);
@@ -145,7 +145,7 @@ public class GemmaToolCallCompatibilityTests
     {
         const string content = "All requested work is complete.";
 
-        var result = Normalize(content, ProjectTools());
+        var result = Normalize(content, StewardTools());
 
         Assert.False(result.Detected);
         Assert.True(result.Success);
@@ -162,7 +162,7 @@ public class GemmaToolCallCompatibilityTests
             <|tool_call>call:delete_everything{path:"/"}<tool_call|>
             """;
 
-        var result = Normalize(text, ProjectTools());
+        var result = Normalize(text, StewardTools());
 
         Assert.True(result.Detected);
         Assert.False(result.Success);
@@ -193,7 +193,7 @@ public class GemmaToolCallCompatibilityTests
         // cannot stand in for the sentinel and half a script must not run.
         var result = Normalize(
             "<|tool_call>call:execute_csharp{code:\nvar keep = File.ReadAllText(\"a.txt\");\nFile.Delete(",
-            ProjectTools());
+            StewardTools());
 
         Assert.True(result.Detected);
         Assert.False(result.Success);
@@ -233,7 +233,7 @@ public class GemmaToolCallCompatibilityTests
             <|tool_call>call:reply_to_klives{message:"All done, account is live."}<tool_call|>
             """;
 
-        var result = Normalize(text, ProjectTools());
+        var result = Normalize(text, StewardTools());
 
         Assert.True(result.Success, result.Error);
         Assert.Equal("Setting the status now.", result.Content);
@@ -278,19 +278,19 @@ public class GemmaToolCallCompatibilityTests
     public void EncodedOperationMustExistInTheOfferedSchema()
     {
         var result = Normalize(
-            """<|tool_call>call:project_directive:op:destroy{directive_id:"x"}<tool_call|>""",
-            ProjectTools());
+            """<|tool_call>call:steward_directive:op:destroy{directive_id:"x"}<tool_call|>""",
+            StewardTools());
 
         Assert.False(result.Success);
-        Assert.Contains("is not allowed by the offered 'project_directive' schema", result.Error);
+        Assert.Contains("is not allowed by the offered 'steward_directive' schema", result.Error);
     }
 
     [Fact]
     public void EncodedAndArgumentOperationsCannotConflict()
     {
         var result = Normalize(
-            """<|tool_call>call:project_directive:op:acknowledge{op:"complete",directive_id:"x"}<tool_call|>""",
-            ProjectTools());
+            """<|tool_call>call:steward_directive:op:acknowledge{op:"complete",directive_id:"x"}<tool_call|>""",
+            StewardTools());
 
         Assert.False(result.Success);
         Assert.Contains("conflicts with the 'op' value", result.Error);
@@ -340,8 +340,8 @@ public class GemmaToolCallCompatibilityTests
     public void FoldedOperation_UsesAuthoredGemmaNameForItsResponse()
     {
         var normalized = Normalize(
-            """<|tool_call>call:project_directive:op:acknowledge{directive_id:"directive-123"}<tool_call|>""",
-            ProjectTools());
+            """<|tool_call>call:steward_directive:op:acknowledge{directive_id:"directive-123"}<tool_call|>""",
+            StewardTools());
         var call = Assert.Single(normalized.ToolCalls!);
         var messages = new List<HFWrapper.HFMessage>
         {
@@ -356,7 +356,7 @@ public class GemmaToolCallCompatibilityTests
             {
                 role = "tool",
                 tool_call_id = call.id,
-                name = "project_directive",
+                name = "steward_directive",
                 content = "Acknowledged.",
             },
         };
@@ -365,10 +365,10 @@ public class GemmaToolCallCompatibilityTests
         string continuation = Assert.IsType<string>(Assert.Single(prepared).content);
 
         Assert.Contains(
-            """<|tool_call>call:project_directive:op:acknowledge{directive_id:<|"|>directive-123<|"|>,op:<|"|>acknowledge<|"|>}<tool_call|>""",
+            """<|tool_call>call:steward_directive:op:acknowledge{directive_id:<|"|>directive-123<|"|>,op:<|"|>acknowledge<|"|>}<tool_call|>""",
             continuation);
         Assert.EndsWith(
-            """<|tool_response>response:project_directive:op:acknowledge{result:<|"|>Acknowledged.<|"|>}<tool_response|>""",
+            """<|tool_response>response:steward_directive:op:acknowledge{result:<|"|>Acknowledged.<|"|>}<tool_response|>""",
             continuation);
     }
 
@@ -484,8 +484,8 @@ public class GemmaToolCallCompatibilityTests
         string content, IReadOnlyList<HFWrapper.HFTool> tools) =>
         GemmaToolCallCompatibility.Normalize(content, null, tools);
 
-    private static List<HFWrapper.HFTool> ProjectTools() =>
-        ProjectToolFacade.Fold(ProjectCommanderAgent.BuildCoreToolDefinitions());
+    private static List<HFWrapper.HFTool> StewardTools() =>
+        StewardToolFacade.Fold(StewardCommanderAgent.BuildCoreToolDefinitions());
 
     private static HFWrapper.HFTool Tool(string name, params (string Name, string Type)[] properties)
     {

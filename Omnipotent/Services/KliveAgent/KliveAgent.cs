@@ -2049,9 +2049,9 @@ namespace Omnipotent.Services.KliveAgent
                 conversation, run.RequestId, run.FinalResponse, deliveryStatus);
         }
 
-        private Omnipotent.Services.Projects.Projects GetProjectsService() =>
+        private Omnipotent.Services.Demiurge.Demiurge GetDemiurgeService() =>
             GetActiveServices()
-                .OfType<Omnipotent.Services.Projects.Projects>()
+                .OfType<Omnipotent.Services.Demiurge.Demiurge>()
                 .FirstOrDefault(x => x.IsServiceActive() && x.Store != null);
 
         public async Task<AgentLongTermJobView> CreateLongTermJobAsync(
@@ -2087,52 +2087,52 @@ namespace Omnipotent.Services.KliveAgent
                     && longTermJobs.TryGetValue(existingJobId, out var existingLink))
                 {
                     var existing = BuildLongTermJobView(existingLink);
-                    var existingProject = GetProjectsService()?.Store.GetProject(existingLink.ProjectId);
+                    var existingSteward = GetDemiurgeService()?.Store.GetSteward(existingLink.StewardId);
                     if (!string.Equals(existing.Goal, cleanGoal, StringComparison.Ordinal)
                         || !string.Equals(existing.Name, name, StringComparison.Ordinal)
-                        || existingProject == null
-                        || existingProject.TokenBudgetUsd != request.TokenBudgetUsd
-                        || existingProject.MoneyBudgetUsd != request.MoneyBudgetUsd
-                        || existingProject.MoneyAutonomousThresholdUsd
+                        || existingSteward == null
+                        || existingSteward.TokenBudgetUsd != request.TokenBudgetUsd
+                        || existingSteward.MoneyBudgetUsd != request.MoneyBudgetUsd
+                        || existingSteward.MoneyAutonomousThresholdUsd
                             != request.MoneyAutonomousThresholdUsd
-                        || existingProject.SubAgentCap != agentCap)
+                        || existingSteward.SubAgentCap != agentCap)
                         throw new ArgumentException(
                             "clientJobId is already associated with different job parameters.");
                     return existing;
                 }
 
-                var projects = GetProjectsService()
-                    ?? throw new InvalidOperationException("The Projects service is not ready.");
-                Omnipotent.Services.Projects.Project project = null;
+                var demiurge = GetDemiurgeService()
+                    ?? throw new InvalidOperationException("The Demiurge service is not ready.");
+                Omnipotent.Services.Demiurge.Steward steward = null;
                 try
                 {
-                    project = await projects.CreateProjectAsync(
+                    steward = await demiurge.CreateStewardAsync(
                         name,
                         cleanGoal,
                         request.TokenBudgetUsd,
                         request.MoneyBudgetUsd,
                         request.MoneyAutonomousThresholdUsd,
                         agentCap);
-                    var receipt = projects.MessageProjectWithReceipt(
-                        project.ProjectID,
+                    var receipt = demiurge.MessageStewardWithReceipt(
+                        steward.StewardID,
                         cleanGoal,
-                        Omnipotent.Services.Projects.ProjectDirectiveKind.Task,
+                        Omnipotent.Services.Demiurge.StewardDirectiveKind.Task,
                         expectedArtifactPaths: request.ExpectedArtifactPaths ?? new List<string>());
                     if (!receipt.Accepted)
                         throw new InvalidOperationException(
-                            receipt.Reason ?? "The Project rejected its root job directive.");
+                            receipt.Reason ?? "The Steward rejected its root job directive.");
 
                     var link = new AgentLongTermJobLink
                     {
                         ClientJobId = request.ClientJobId,
-                        ProjectId = project.ProjectID,
+                        StewardId = steward.StewardID,
                         DirectiveId = receipt.DirectiveID,
                         ConversationId = request.ConversationId,
                         OriginatingMessageId = request.OriginatingMessageId,
-                        LastObservedStatus = project.Status.ToString()
+                        LastObservedStatus = steward.Status.ToString()
                     };
                     // Persist before publishing the link or returning. A lost HTTP response can be
-                    // retried with clientJobId and resolves to this same funded Project.
+                    // retried with clientJobId and resolves to this same funded Steward.
                     await PersistLongTermJobAsync(link);
                     longTermJobs[link.JobId] = link;
                     if (!string.IsNullOrWhiteSpace(link.ClientJobId))
@@ -2141,11 +2141,11 @@ namespace Omnipotent.Services.KliveAgent
                 }
                 catch
                 {
-                    // Project creation wakes a Commander immediately. If linking fails, halt it so
+                    // Steward creation wakes a Commander immediately. If linking fails, halt it so
                     // an invisible orphan cannot continue spending in the background.
-                    if (project != null)
+                    if (steward != null)
                     {
-                        try { projects.HaltProject(project.ProjectID); } catch { }
+                        try { demiurge.HaltSteward(steward.StewardID); } catch { }
                     }
                     throw;
                 }
@@ -2182,119 +2182,119 @@ namespace Omnipotent.Services.KliveAgent
                 ? BuildLongTermJobView(link)
                 : null;
 
-        public Omnipotent.Services.Projects.ProjectCommandReceipt SteerLongTermJob(
+        public Omnipotent.Services.Demiurge.StewardCommandReceipt SteerLongTermJob(
             string jobId, string message)
         {
             if (!longTermJobs.TryGetValue(jobId ?? string.Empty, out var link))
-                return new Omnipotent.Services.Projects.ProjectCommandReceipt
+                return new Omnipotent.Services.Demiurge.StewardCommandReceipt
                     { Status = "rejected", Reason = "Unknown jobId." };
-            var projects = GetProjectsService();
-            if (projects == null)
-                return new Omnipotent.Services.Projects.ProjectCommandReceipt
-                    { Status = "rejected", Reason = "The Projects service is unavailable." };
-            return projects.MessageProjectWithReceipt(
-                link.ProjectId,
+            var demiurge = GetDemiurgeService();
+            if (demiurge == null)
+                return new Omnipotent.Services.Demiurge.StewardCommandReceipt
+                    { Status = "rejected", Reason = "The Demiurge service is unavailable." };
+            return demiurge.MessageStewardWithReceipt(
+                link.StewardId,
                 message,
-                Omnipotent.Services.Projects.ProjectDirectiveKind.Steering);
+                Omnipotent.Services.Demiurge.StewardDirectiveKind.Steering);
         }
 
         public bool StopLongTermJob(string jobId)
         {
             if (!longTermJobs.TryGetValue(jobId ?? string.Empty, out var link)) return false;
-            var projects = GetProjectsService();
-            var project = projects?.Store.GetProject(link.ProjectId);
-            if (project == null
-                || project.Status is Omnipotent.Services.Projects.ProjectStatus.Completed
-                    or Omnipotent.Services.Projects.ProjectStatus.Archived)
+            var demiurge = GetDemiurgeService();
+            var steward = demiurge?.Store.GetSteward(link.StewardId);
+            if (steward == null
+                || steward.Status is Omnipotent.Services.Demiurge.StewardStatus.Completed
+                    or Omnipotent.Services.Demiurge.StewardStatus.Archived)
                 return false;
-            if (project.HaltedFromStatus.HasValue) return true;
-            return projects.HaltProject(link.ProjectId);
+            if (steward.HaltedFromStatus.HasValue) return true;
+            return demiurge.HaltSteward(link.StewardId);
         }
 
         public async Task<bool> ResumeLongTermJobAsync(string jobId)
         {
             if (!longTermJobs.TryGetValue(jobId ?? string.Empty, out var link)) return false;
-            var projects = GetProjectsService();
-            var project = projects?.Store.GetProject(link.ProjectId);
-            if (project == null
-                || project.Status is Omnipotent.Services.Projects.ProjectStatus.Completed
-                    or Omnipotent.Services.Projects.ProjectStatus.Archived)
+            var demiurge = GetDemiurgeService();
+            var steward = demiurge?.Store.GetSteward(link.StewardId);
+            if (steward == null
+                || steward.Status is Omnipotent.Services.Demiurge.StewardStatus.Completed
+                    or Omnipotent.Services.Demiurge.StewardStatus.Archived)
                 return false;
-            if (project.HaltedFromStatus.HasValue)
-                return projects.UnhaltProject(link.ProjectId);
-            if (project.Status is Omnipotent.Services.Projects.ProjectStatus.Active
-                or Omnipotent.Services.Projects.ProjectStatus.Planning)
+            if (steward.HaltedFromStatus.HasValue)
+                return demiurge.UnhaltSteward(link.StewardId);
+            if (steward.Status is Omnipotent.Services.Demiurge.StewardStatus.Active
+                or Omnipotent.Services.Demiurge.StewardStatus.Planning)
                 return true;
-            if (project.Status == Omnipotent.Services.Projects.ProjectStatus.BudgetPaused
-                && !projects.Budget.IsWithinTokenBudget(project.ProjectID))
+            if (steward.Status == Omnipotent.Services.Demiurge.StewardStatus.BudgetPaused
+                && !demiurge.Budget.IsWithinTokenBudget(steward.StewardID))
                 return false;
 
-            bool needsPlan = !projects.GrandPlans.HasApprovedPlan(project.ProjectID);
-            bool wasBlocked = project.BlockedAt.HasValue
-                || !string.IsNullOrWhiteSpace(project.BlockedReason);
-            var fromStatus = project.Status;
-            project.Status = needsPlan
-                ? Omnipotent.Services.Projects.ProjectStatus.Planning
-                : Omnipotent.Services.Projects.ProjectStatus.Active;
-            project.BlockedAt = null;
-            project.BlockedReason = null;
-            project.HaltedFromStatus = null;
-            projects.Store.SaveProject(project);
-            projects.RuntimeState.SetDisposition(
-                project.ProjectID,
-                Omnipotent.Services.Projects.ProjectExecutionDisposition.Running);
-            projects.RuntimeState.ClearBlocker(project.ProjectID);
-            projects.RuntimeState.CloseCircuit(project.ProjectID);
-            // Same three release steps /projects/resume performs — this dashboard path is a second
+            bool needsPlan = !demiurge.GrandPlans.HasApprovedPlan(steward.StewardID);
+            bool wasBlocked = steward.BlockedAt.HasValue
+                || !string.IsNullOrWhiteSpace(steward.BlockedReason);
+            var fromStatus = steward.Status;
+            steward.Status = needsPlan
+                ? Omnipotent.Services.Demiurge.StewardStatus.Planning
+                : Omnipotent.Services.Demiurge.StewardStatus.Active;
+            steward.BlockedAt = null;
+            steward.BlockedReason = null;
+            steward.HaltedFromStatus = null;
+            demiurge.Store.SaveSteward(steward);
+            demiurge.RuntimeState.SetDisposition(
+                steward.StewardID,
+                Omnipotent.Services.Demiurge.StewardExecutionDisposition.Running);
+            demiurge.RuntimeState.ClearBlocker(steward.StewardID);
+            demiurge.RuntimeState.CloseCircuit(steward.StewardID);
+            // Same three release steps /demiurge/resume performs — this dashboard path is a second
             // front door to the same state machine, and every one of them was missing here.
             // Closing the circuit alone still leaves the per-actor provider-admission deadline
             // standing, which refuses the wake below outright; a pause caught in a wake's startup
             // window leaves a cancel-on-birth flag that kills it; and the desktop reconcile is an
             // unbounded Docker round trip that has no business delaying the wake.
-            projects.RuntimeState.ClearProviderAdmission(project.ProjectID);
-            projects.CommanderRunner.ClearPendingCancellation(project.ProjectID);
-            _ = projects.RefreshDesktopRegistryAsync();
-            projects.EventLog.Append(new Omnipotent.Services.Projects.ProjectEvent
+            demiurge.RuntimeState.ClearProviderAdmission(steward.StewardID);
+            demiurge.CommanderRunner.ClearPendingCancellation(steward.StewardID);
+            _ = demiurge.RefreshDesktopRegistryAsync();
+            demiurge.EventLog.Append(new Omnipotent.Services.Demiurge.StewardEvent
             {
-                ProjectID = project.ProjectID,
+                StewardID = steward.StewardID,
                 Type = wasBlocked
-                    ? Omnipotent.Services.Projects.ProjectEventTypes.ProjectUnblocked
-                    : Omnipotent.Services.Projects.ProjectEventTypes.Status,
+                    ? Omnipotent.Services.Demiurge.StewardEventTypes.StewardUnblocked
+                    : Omnipotent.Services.Demiurge.StewardEventTypes.Status,
                 Author = "klives",
-                Text = "Project resumed from the KliveAgent job dashboard.",
-                PayloadJson = Omnipotent.Services.Projects.ProjectLifecycleEvents.Payload(
-                    fromStatus, project.Status, wasBlocked ? "job-dashboard-unblock" : "job-dashboard-resume"),
+                Text = "Steward resumed from the KliveAgent job dashboard.",
+                PayloadJson = Omnipotent.Services.Demiurge.StewardLifecycleEvents.Payload(
+                    fromStatus, steward.Status, wasBlocked ? "job-dashboard-unblock" : "job-dashboard-resume"),
             });
-            projects.CommanderRunner.Wake(
-                project,
+            demiurge.CommanderRunner.Wake(
+                steward,
                 needsPlan
-                    ? "Project resumed by Klives — continue planning and submit the Grand Plan for approval."
-                    : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.");
+                    ? "Steward resumed by Klives — continue planning and submit the Grand Plan for approval."
+                    : "Steward resumed by Klives. Rehydrate current state and continue with the next concrete step.");
             // Pausing cancelled every worker mid-flight; without this the roster stays asleep until
             // each agent's quiet period elapses (20 min, doubling toward 4 h) and only the Commander
-            // comes back — which reads as a resumed project doing nothing.
-            projects.ResumeWorkers(project);
-            projects.DeliverPendingDirectives(project.ProjectID);
+            // comes back — which reads as a resumed Steward doing nothing.
+            demiurge.ResumeWorkers(steward);
+            demiurge.DeliverPendingDirectives(steward.StewardID);
             return true;
         }
 
         private AgentLongTermJobView BuildLongTermJobView(AgentLongTermJobLink link)
         {
-            var projects = GetProjectsService();
-            var project = projects?.Store.GetProject(link.ProjectId);
-            var directive = projects?.Directives.Get(link.ProjectId, link.DirectiveId);
-            var lastEvent = projects?.EventLog.ReadTail(link.ProjectId, 1).LastOrDefault();
-            var pendingPlan = projects?.GrandPlans.Get(link.ProjectId).Versions
+            var demiurge = GetDemiurgeService();
+            var steward = demiurge?.Store.GetSteward(link.StewardId);
+            var directive = demiurge?.Directives.Get(link.StewardId, link.DirectiveId);
+            var lastEvent = demiurge?.EventLog.ReadTail(link.StewardId, 1).LastOrDefault();
+            var pendingPlan = demiurge?.GrandPlans.Get(link.StewardId).Versions
                 .Where(x => x.Status
-                    == Omnipotent.Services.Projects.GrandPlanVersionStatus.PendingApproval)
+                    == Omnipotent.Services.Demiurge.GrandPlanVersionStatus.PendingApproval)
                 .OrderByDescending(x => x.Version)
                 .FirstOrDefault();
-            var blocker = projects?.RuntimeState.Get(link.ProjectId).Blocker;
-            string status = directive?.Status is Omnipotent.Services.Projects.ProjectDirectiveStatus.Completed
-                    or Omnipotent.Services.Projects.ProjectDirectiveStatus.Failed
-                    or Omnipotent.Services.Projects.ProjectDirectiveStatus.Revoked
+            var blocker = demiurge?.RuntimeState.Get(link.StewardId).Blocker;
+            string status = directive?.Status is Omnipotent.Services.Demiurge.StewardDirectiveStatus.Completed
+                    or Omnipotent.Services.Demiurge.StewardDirectiveStatus.Failed
+                    or Omnipotent.Services.Demiurge.StewardDirectiveStatus.Revoked
                 ? directive.Status.ToString()
-                : project?.Status.ToString() ?? "Unavailable";
+                : steward?.Status.ToString() ?? "Unavailable";
             string attentionKey = null;
             string attentionMessage = null;
             if (pendingPlan != null)
@@ -2304,13 +2304,13 @@ namespace Omnipotent.Services.KliveAgent
                     ? $"Grand Plan v{pendingPlan.Version} is ready for approval."
                     : $"Grand Plan v{pendingPlan.Version} is ready for approval: {pendingPlan.Summary}";
             }
-            else if (project?.Status is Omnipotent.Services.Projects.ProjectStatus.Blocked
-                or Omnipotent.Services.Projects.ProjectStatus.BudgetPaused)
+            else if (steward?.Status is Omnipotent.Services.Demiurge.StewardStatus.Blocked
+                or Omnipotent.Services.Demiurge.StewardStatus.BudgetPaused)
             {
-                attentionKey = $"{project.Status}-{blocker?.BlockerID ?? "project"}";
+                attentionKey = $"{steward.Status}-{blocker?.BlockerID ?? "steward"}";
                 attentionMessage = blocker?.Summary
-                    ?? project.BlockedReason
-                    ?? $"The job needs attention because it is {project.Status}.";
+                    ?? steward.BlockedReason
+                    ?? $"The job needs attention because it is {steward.Status}.";
             }
             DateTime lastUpdated = new[]
             {
@@ -2323,11 +2323,11 @@ namespace Omnipotent.Services.KliveAgent
             {
                 JobId = link.JobId,
                 ClientJobId = link.ClientJobId,
-                ProjectId = link.ProjectId,
+                StewardId = link.StewardId,
                 DirectiveId = link.DirectiveId,
                 ConversationId = link.ConversationId,
-                Name = project?.Name ?? "Unavailable job",
-                Goal = project?.Goal ?? string.Empty,
+                Name = steward?.Name ?? "Unavailable job",
+                Goal = steward?.Goal ?? string.Empty,
                 Status = status,
                 RequiresPlanApproval = pendingPlan != null,
                 AttentionRequired = attentionMessage != null,
@@ -2340,7 +2340,7 @@ namespace Omnipotent.Services.KliveAgent
                     ? new List<string>()
                     : new List<string>(directive.CompletionArtifactPaths),
                 CreatedAt = link.CreatedAt,
-                CompletedAt = directive?.CompletedAt ?? project?.CompletedAt,
+                CompletedAt = directive?.CompletedAt ?? steward?.CompletedAt,
                 LastUpdated = lastUpdated
             };
         }
@@ -2377,7 +2377,7 @@ namespace Omnipotent.Services.KliveAgent
                                     Body = view.AttentionMessage ?? "This job needs your attention.",
                                     ConversationId = link.ConversationId,
                                     JobId = link.JobId,
-                                    ProjectId = link.ProjectId
+                                    StewardId = link.StewardId
                                 });
                                 link.LastAttentionKey = view.AttentionKey;
                                 linkChanged = true;
@@ -2396,7 +2396,7 @@ namespace Omnipotent.Services.KliveAgent
                                     Body = view.Result ?? $"Job ended with status {view.Status}.",
                                     ConversationId = link.ConversationId,
                                     JobId = link.JobId,
-                                    ProjectId = link.ProjectId,
+                                    StewardId = link.StewardId,
                                     ArtifactPaths = view.ArtifactPaths
                                 });
                                 link.CompletionNotifiedAt = DateTime.UtcNow;
@@ -2446,7 +2446,7 @@ namespace Omnipotent.Services.KliveAgent
                     var link = await GetDataHandler()
                         .ReadAndDeserialiseDataFromFile<AgentLongTermJobLink>(file);
                     if (link != null && IsSafeIdentifier(link.JobId)
-                        && IsSafeIdentifier(link.ProjectId))
+                        && IsSafeIdentifier(link.StewardId))
                     {
                         longTermJobs[link.JobId] = link;
                         if (IsSafeIdentifier(link.ClientJobId))

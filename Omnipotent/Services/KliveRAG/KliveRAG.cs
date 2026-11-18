@@ -13,8 +13,8 @@ namespace Omnipotent.Services.KliveRAG
 {
     /// <summary>
     /// KliveRAG: a cross-system retrieval-augmented knowledge index shared by KliveAgent and the
-    /// Projects task force. It embeds (local MiniLM) + lexically indexes (SQLite FTS5) documents
-    /// drawn from Projects event logs, KliveAgent conversations/memories, Omniscience distilled
+    /// Demiurge task force. It embeds (local MiniLM) + lexically indexes (SQLite FTS5) documents
+    /// drawn from Demiurge event logs, KliveAgent conversations/memories, Omniscience distilled
     /// knowledge, repo docs and cached web pages, and serves them back both by automatic prompt
     /// injection (budgeted, fail-soft) and by explicit agent tools.
     ///
@@ -32,7 +32,7 @@ namespace Omnipotent.Services.KliveRAG
         public HttpClient Http { get; private set; } = null!;
 
         private RepoDocsConnector repoDocs = null!;
-        private ProjectsEventConnector projectsEvents = null!;
+        private DemiurgeEventConnector demiurgeEvents = null!;
         private KliveAgentConnector agentFiles = null!;
         private OmniscienceConnector omniscience = null!;
         private OmniLogConnector omniLogs = null!;
@@ -72,16 +72,16 @@ namespace Omnipotent.Services.KliveRAG
             Embed = new RagEmbedQueue(Db, Http, msg => _ = ServiceLog(msg));
             Retriever = new HybridRetriever(Db, Embed);
 
-            // Connectors. Projects/Omniscience are resolved lazily (they may start after us).
-            Func<Task<Projects.Projects?>> resolveProjects = async () =>
-                (await GetServicesByType<Projects.Projects>()).FirstOrDefault() as Projects.Projects;
+            // Connectors. Demiurge/Omniscience are resolved lazily (they may start after us).
+            Func<Task<Demiurge.Demiurge?>> resolveDemiurge = async () =>
+                (await GetServicesByType<Demiurge.Demiurge>()).FirstOrDefault() as Demiurge.Demiurge;
             Func<Task<Omniscience.Omniscience?>> resolveOmni = async () =>
                 (await GetServicesByType<Omniscience.Omniscience>()).FirstOrDefault() as Omniscience.Omniscience;
             Func<Task<Omnipotent.Logging.OmniLogging?>> resolveLogs = async () =>
                 (await GetServicesByType<Omnipotent.Logging.OmniLogging>()).FirstOrDefault() as Omnipotent.Logging.OmniLogging;
 
             repoDocs = new RepoDocsConnector(Writer, msg => _ = ServiceLog(msg));
-            projectsEvents = new ProjectsEventConnector(Writer, msg => _ = ServiceLog(msg), resolveProjects);
+            demiurgeEvents = new DemiurgeEventConnector(Writer, msg => _ = ServiceLog(msg), resolveDemiurge);
             agentFiles = new KliveAgentConnector(Writer, msg => _ = ServiceLog(msg));
             omniscience = new OmniscienceConnector(Writer, msg => _ = ServiceLog(msg), resolveOmni);
             omniLogs = new OmniLogConnector(Writer, msg => _ = ServiceLog(msg), resolveLogs);
@@ -111,13 +111,13 @@ namespace Omnipotent.Services.KliveRAG
             // Never on the start path, and the stats route does not wait for it.
             _ = Task.Run(CountExistingRowsAsync);
 
-            // Initial backfill: cheap/local sources first, project events last (largest volume).
+            // Initial backfill: cheap/local sources first, Steward events last (largest volume).
             _ = Task.Run(async () =>
             {
                 await RunConnectorSafe(repoDocs, cts.Token);
                 await RunConnectorSafe(agentFiles, cts.Token);
                 await RunConnectorSafe(omniscience, cts.Token);
-                await RunConnectorSafe(projectsEvents, cts.Token); // also wires the live EventAppended push
+                await RunConnectorSafe(demiurgeEvents, cts.Token); // also wires the live EventAppended push
                 await RunConnectorSafe(omniLogs, cts.Token);
             });
 
@@ -125,7 +125,7 @@ namespace Omnipotent.Services.KliveRAG
             _ = PeriodicLoop(repoDocs, TimeSpan.FromHours(6));
             _ = PeriodicLoop(agentFiles, TimeSpan.FromMinutes(15));
             _ = PeriodicLoop(omniscience, TimeSpan.FromMinutes(30));
-            _ = PeriodicLoop(projectsEvents, TimeSpan.FromMinutes(10));
+            _ = PeriodicLoop(demiurgeEvents, TimeSpan.FromMinutes(10));
             _ = PeriodicLoop(omniLogs, TimeSpan.FromMinutes(5)); // errors are ephemeral in-memory — capture often
 
             // Non-blocking: reattach to a surviving SearXNG container if Docker is already up.
@@ -173,7 +173,7 @@ namespace Omnipotent.Services.KliveRAG
         }
 
         /// <summary>Prompt injection only looks at the newest this-many chunks: a constant cost however
-        /// large the Projects event log grows, and fresh material is what injection is for anyway.</summary>
+        /// large the Demiurge event log grows, and fresh material is what injection is for anyway.</summary>
         internal const int InjectionRecentWindow = 150_000;
 
         /// <summary>The tool/route path reads the whole corpus, but a search still has to end.</summary>
@@ -187,27 +187,27 @@ namespace Omnipotent.Services.KliveRAG
         /// Budget-fitted knowledge block for automatic prompt injection. Returns "" when the deadline
         /// passes or on not-ready / any error, so a slow or cold index never holds up a prompt build.
         /// </summary>
-        public async Task<string> SearchForPromptAsync(string query, int maxTokens, TimeSpan timeout, string? excludeProjectId = null)
+        public async Task<string> SearchForPromptAsync(string query, int maxTokens, TimeSpan timeout, string? excludeStewardId = null)
         {
             if (!ready || string.IsNullOrWhiteSpace(query)) return "";
-            var hits = await SearchForInjectionAsync(query, 6, timeout, excludeProjectId);
+            var hits = await SearchForInjectionAsync(query, 6, timeout, excludeStewardId);
             return HybridRetriever.FormatForPrompt(hits, maxTokens,
                 "[Relevant Knowledge] (Klives' cross-system knowledge base — search_knowledge / read_knowledge_doc for more)");
         }
 
-        /// <summary>Injection hits for Projects wake seeds (rendered + budgeted by the caller).</summary>
-        public async Task<List<KnowledgeHit>> SearchKnowledgeHitsAsync(string query, int maxResults, TimeSpan timeout, string? excludeProjectId = null)
+        /// <summary>Injection hits for Demiurge wake seeds (rendered + budgeted by the caller).</summary>
+        public async Task<List<KnowledgeHit>> SearchKnowledgeHitsAsync(string query, int maxResults, TimeSpan timeout, string? excludeStewardId = null)
         {
             if (!ready || string.IsNullOrWhiteSpace(query)) return new List<KnowledgeHit>();
-            return HybridRetriever.ToKnowledgeHits(await SearchForInjectionAsync(query, maxResults, timeout, excludeProjectId));
+            return HybridRetriever.ToKnowledgeHits(await SearchForInjectionAsync(query, maxResults, timeout, excludeStewardId));
         }
 
-        private async Task<List<RagHit>> SearchForInjectionAsync(string query, int maxResults, TimeSpan timeout, string? excludeProjectId)
+        private async Task<List<RagHit>> SearchForInjectionAsync(string query, int maxResults, TimeSpan timeout, string? excludeStewardId)
         {
             var opts = new RagSearchOptions
             {
                 MaxResults = maxResults,
-                ExcludeProjectId = excludeProjectId,
+                ExcludeStewardId = excludeStewardId,
                 ExcludeSources = InjectionExcludedSources,
                 Deadline = timeout,
                 RecentWindow = InjectionRecentWindow,
@@ -312,8 +312,8 @@ namespace Omnipotent.Services.KliveRAG
                 if (source == null || source == RagSource.AgentConversations || source == RagSource.AgentMemories)
                     await RunConnectorSafe(agentFiles, cts.Token);
                 if (source == null || source == RagSource.Omniscience) await RunConnectorSafe(omniscience, cts.Token);
-                if (source == null || source == RagSource.ProjectsEvents || source == RagSource.ProjectsDigests)
-                    await RunConnectorSafe(projectsEvents, cts.Token);
+                if (source == null || source == RagSource.DemiurgeEvents || source == RagSource.DemiurgeDigests)
+                    await RunConnectorSafe(demiurgeEvents, cts.Token);
                 if (source == null || source == RagSource.OmniLogs) await RunConnectorSafe(omniLogs, cts.Token);
                 return true;
             }

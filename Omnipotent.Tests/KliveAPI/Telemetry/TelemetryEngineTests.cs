@@ -193,10 +193,10 @@ public sealed class TelemetryEngineTests : IDisposable
     [Fact]
     public void Rum_BeaconIsClampedAndUnknownRoutesCollapse()
     {
-        using var doc = JsonDocument.Parse("""{"r":"https://klive.dev/projects/list?x=1","t":"00000000000000ff","dns":-5,"tls":999999999,"net":12.5,"srv":3,"dl":1,"tot":20,"reuse":1,"xfer":900}""");
-        var sample = TelemetryRoutes.ParseRum(doc.RootElement, 1_000, r => r == "/projects/list" ? "GET" : null);
+        using var doc = JsonDocument.Parse("""{"r":"https://klive.dev/demiurge/list?x=1","t":"00000000000000ff","dns":-5,"tls":999999999,"net":12.5,"srv":3,"dl":1,"tot":20,"reuse":1,"xfer":900}""");
+        var sample = TelemetryRoutes.ParseRum(doc.RootElement, 1_000, r => r == "/demiurge/list" ? "GET" : null);
         Assert.NotNull(sample);
-        Assert.Equal("/projects/list", sample!.Route);
+        Assert.Equal("/demiurge/list", sample!.Route);
         Assert.Equal("GET", sample.Method);
         Assert.Equal(255, sample.TraceId);
         Assert.Equal(0, sample.PhaseMicros[(int)RumPhase.Dns]);

@@ -300,7 +300,7 @@ public sealed class KliveAgentTaskCompletionTests
                      "computer_confirm_and_click", "request_human", "save_encrypted_memory" })
             Assert.Contains(required, names);
         Assert.Equal(names.Count, names.Distinct().Count());
-        Assert.DoesNotContain(tools, t => t.function.description.Contains("Project approval gate"));
+        Assert.DoesNotContain(tools, t => t.function.description.Contains("Steward approval gate"));
         Assert.All(tools, t => Assert.Equal("function", t.type));
     }
 

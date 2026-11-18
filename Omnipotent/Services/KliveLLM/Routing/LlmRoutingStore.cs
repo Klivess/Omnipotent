@@ -118,10 +118,17 @@ namespace Omnipotent.Services.KliveLLM
             Lanes = Rebuild(Lanes);
             Routers = (Routers ?? new()).Where(r => r != null && !string.IsNullOrWhiteSpace(r.Id))
                 .GroupBy(r => r.Id, StringComparer.OrdinalIgnoreCase).Select(g => g.Last()).ToList();
-            Capture = new Dictionary<string, LlmCaptureWindow>(
-                (Capture ?? new()).Where(kv => kv.Value != null && !string.IsNullOrWhiteSpace(kv.Key)),
-                StringComparer.OrdinalIgnoreCase);
+            var capture = new Dictionary<string, LlmCaptureWindow>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (key, window) in Capture ?? new())
+            {
+                if (window == null || string.IsNullOrWhiteSpace(key)) continue;
+                string current = LlmConsumerCatalog.CurrentKey(key.Trim());
+                if (current == key.Trim() || !capture.ContainsKey(current)) capture[current] = window;
+            }
+            Capture = capture;
             if (Override != null && string.IsNullOrWhiteSpace(Override.Router)) Override = null;
+            if (Override?.Services is { Count: > 0 } services)
+                Override.Services = services.Select(LlmConsumerCatalog.CurrentKey).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
 
         private static Dictionary<string, LlmRoutePolicy> Rebuild(Dictionary<string, LlmRoutePolicy>? source)
@@ -131,7 +138,10 @@ namespace Omnipotent.Services.KliveLLM
             {
                 if (string.IsNullOrWhiteSpace(key) || policy == null) continue;
                 Clean(policy);
-                if (!policy.IsEmpty) result[key.Trim()] = policy;
+                if (policy.IsEmpty) continue;
+                // A policy saved under a renamed service moves to its new name (unless one is already there).
+                string current = LlmConsumerCatalog.CurrentKey(key.Trim());
+                if (current == key.Trim() || !result.ContainsKey(current)) result[current] = policy;
             }
             return result;
         }

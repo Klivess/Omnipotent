@@ -1,7 +1,7 @@
 using Omnipotent.Data_Handling;
 using Omnipotent.Services.KliveAgent;
 using Omnipotent.Services.KliveAgent.Models;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 
 namespace Omnipotent.Tests.KliveAgent
 {
@@ -137,7 +137,7 @@ namespace Omnipotent.Tests.KliveAgent
         [Fact]
         public void ObservableTrend_ReportsDeltaOverTheWindow()
         {
-            var o = new ProjectObservable
+            var o = new StewardObservable
             {
                 Type = ObservableType.Numeric,
                 NumericValue = 150,
@@ -148,7 +148,7 @@ namespace Omnipotent.Tests.KliveAgent
                     new() { Timestamp = Now, NumericValue = 150 },
                 },
             };
-            string trend = ProjectObservableStore.DescribeTrend(o, Now);
+            string trend = StewardObservableStore.DescribeTrend(o, Now);
             Assert.Contains("+50", trend);   // vs the 24h+ baseline (100), not the 10h sample
             Assert.Contains("↑", trend);
             Assert.Contains("30h", trend);
@@ -157,7 +157,7 @@ namespace Omnipotent.Tests.KliveAgent
         [Fact]
         public void ObservableTrend_SilentWhenFlatOrHistoryless()
         {
-            var flat = new ProjectObservable
+            var flat = new StewardObservable
             {
                 Type = ObservableType.Numeric,
                 NumericValue = 100,
@@ -167,9 +167,9 @@ namespace Omnipotent.Tests.KliveAgent
                     new() { Timestamp = Now, NumericValue = 100 },
                 },
             };
-            Assert.Equal("", ProjectObservableStore.DescribeTrend(flat, Now));
-            Assert.Equal("", ProjectObservableStore.DescribeTrend(
-                new ProjectObservable { Type = ObservableType.Text, TextValue = "ok" }, Now));
+            Assert.Equal("", StewardObservableStore.DescribeTrend(flat, Now));
+            Assert.Equal("", StewardObservableStore.DescribeTrend(
+                new StewardObservable { Type = ObservableType.Text, TextValue = "ok" }, Now));
         }
     }
 }

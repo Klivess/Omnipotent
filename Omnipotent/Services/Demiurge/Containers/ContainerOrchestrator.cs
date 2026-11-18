@@ -1,0 +1,1578 @@
+using Docker.DotNet;
+using Docker.DotNet.Models;
+using Omnipotent.Data_Handling;
+using Omnipotent.Services.Demiurge;
+using System.Collections.Concurrent;
+
+namespace Omnipotent.Services.Demiurge.Containers
+{
+    /// <summary>
+    /// Docker lifecycle for the desktop-container fleet (§4). Talks to the local Docker daemon
+    /// via Docker.DotNet (named pipe on Windows, unix socket if the host ever moves to Linux).
+    /// Containers are created with restart=unless-stopped and are deliberately NOT stopped when
+    /// Omnipotent restarts — <see cref="ReconcileAsync"/> reattaches to them on boot instead,
+    /// which is what keeps logins and open tabs alive across redeploys.
+    ///
+    /// VNC ports are bound to 127.0.0.1 only: the RFB connection carries no auth (security type
+    /// None), so network isolation IS the auth boundary — nothing off-box can reach a desktop.
+    /// </summary>
+    public class ContainerOrchestrator
+    {
+        private readonly ContainerRegistry registry;
+        private readonly Action<string> log;
+        private readonly Func<string, string> imageForSteward;  // stewardID → image (per-Steward setting)
+        private readonly string dockerUri;
+        // Where published container ports are reached from this process (the Docker host's loopback).
+        private readonly string daemonHost;
+        private DockerClient? client;
+        private readonly SemaphoreSlim clientGate = new(1, 1);
+        private readonly ConcurrentDictionary<string, ImageBuildFlight> imageBuildFlights = new(StringComparer.OrdinalIgnoreCase);
+        // Browser startup is single-flight per container. Readiness checks, explicit opens and
+        // structured inspection can arrive concurrently; without this gate each spawned a new
+        // Chromium against the same profile and manufactured SingletonLock conflicts.
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> browserLaunchGates = new(StringComparer.Ordinal);
+
+        private sealed class ImageBuildFlight
+        {
+            public ImageBuildFlight(bool force, Func<Task<string?>> factory)
+            {
+                Force = force;
+                Work = new Lazy<Task<string?>>(factory, LazyThreadSafetyMode.ExecutionAndPublication);
+            }
+            public bool Force { get; }
+            public Lazy<Task<string?>> Work { get; }
+        }
+
+        private const int VncContainerPort = 5901;
+        /// <summary>Container port for the browser-helper front door (see browser-service.py).</summary>
+        private const int BrowserServiceContainerPort = 5902;
+        /// <summary>Image label carrying the SHA-256 of the build context, so a changed
+        /// Dockerfile/entrypoint triggers a rebuild instead of being silently ignored. The same key
+        /// is stamped on containers (see <see cref="ContainerLabels.ContextHash"/>) so a container
+        /// can be compared against its image for staleness.</summary>
+        private const string ContextHashLabel = ContainerLabels.ContextHash;
+        private static readonly TimeSpan ImageBuildTimeout = TimeSpan.FromMinutes(30);
+        internal static readonly string[] DesktopBuildContextFiles =
+        {
+            "desktop.Dockerfile", "desktop-entrypoint.sh", "browser-inspect.py", "browser-service.py",
+            "klive-fp-manifest.json", "klive-fp-patch.js", "klive-cdp",
+        };
+
+        public ContainerOrchestrator(
+            ContainerRegistry registry,
+            Action<string> log,
+            Func<string, string> imageForSteward,
+            string dockerUri,
+            string daemonHost = "127.0.0.1")
+        {
+            this.registry = registry;
+            this.log = log ?? (_ => { });
+            this.imageForSteward = imageForSteward;
+            this.dockerUri = dockerUri;
+            this.daemonHost = string.IsNullOrWhiteSpace(daemonHost) ? "127.0.0.1" : daemonHost;
+        }
+
+        /// <summary>
+        /// The in-container control daemon for a desktop, or an unconfigured client when the registry
+        /// has no published port for it (a container from before the service existed).
+        /// </summary>
+        public ComputerDaemonClient DaemonFor(string containerID)
+        {
+            var record = registry.All().LastOrDefault(r => string.Equals(r.ContainerID, containerID, StringComparison.Ordinal));
+            return new ComputerDaemonClient(daemonHost, record is { Lost: false, Suspended: false } ? record.BrowserServiceHostPort : 0, containerID);
+        }
+
+        /// <summary>Test seam: lets a test stand in a fake daemon without a registry record.</summary>
+        internal Func<string, ComputerDaemonClient>? DaemonOverride { get; set; }
+
+        private ComputerDaemonClient Daemon(string containerID) => DaemonOverride?.Invoke(containerID) ?? DaemonFor(containerID);
+
+        /// <summary>
+        /// The daemon carries an exec only when it provably can: the request either reaches it (and its
+        /// answer — even a timeout — is final) or provably did not, in which case docker exec runs the
+        /// command instead. Telemetry for which route served it is kept so the health page can show it.
+        /// </summary>
+        private async Task<ContainerShellResult?> TryDaemonExecAsync(string containerID, string? command,
+            IReadOnlyList<string>? argv, string? workingDirectory, int timeoutSeconds, bool idempotent, CancellationToken ct)
+        {
+            var daemon = Daemon(containerID);
+            if (!daemon.Configured) return null;
+            var outcome = await daemon.ExecAsync(command, argv, workingDirectory, timeoutSeconds, ct, idempotent);
+            if (outcome.Reached)
+            {
+                Interlocked.Increment(ref daemonExecs);
+                return outcome.Result;
+            }
+            Interlocked.Increment(ref dockerExecFallbacks);
+            return null;
+        }
+
+        private long daemonExecs;
+        private long dockerExecFallbacks;
+
+        /// <summary>How many in-container commands went through the daemon vs. fell back to docker exec.</summary>
+        public (long Daemon, long DockerExec) ExecRouteCounts => (Interlocked.Read(ref daemonExecs), Interlocked.Read(ref dockerExecFallbacks));
+
+        internal ContainerOrchestrator(ContainerRegistry registry, DockerClient client)
+            : this(registry, _ => { }, _ => "test-desktop", "http://localhost") => this.client = client;
+
+        /// <summary>
+        /// Budget for one desktop-control exec (launch/focus a window). Generous against commands
+        /// that finish in milliseconds, because Chromium's first launch on a cold profile is the
+        /// slow one — but finite, which is the entire point.
+        /// </summary>
+        private static readonly TimeSpan DesktopControlTimeout = TimeSpan.FromSeconds(60);
+
+        private async Task<DockerClient> GetClientAsync(CancellationToken ct = default)
+        {
+            if (client != null) return client;
+            await clientGate.WaitAsync(ct);
+            try
+            {
+                if (client != null) return client;
+                // Left on the library default on purpose. A blanket short timeout here looks like the
+                // obvious fix and is not: StopContainerAsync legitimately waits WaitBeforeKillSeconds
+                // (15s) before the daemon SIGKILLs, and capping every call near that turns an ordinary
+                // teardown into a failure on a busy host. The calls that actually hung are bounded
+                // individually by WithDeadlineAsync instead, where the right budget is known.
+                client = new DockerClientConfiguration(new Uri(dockerUri)).CreateClient();
+                return client;
+            }
+            finally { clientGate.Release(); }
+        }
+
+        /// <summary>
+        /// Runs <paramref name="operation"/> against a wall-clock budget we enforce ourselves, and
+        /// abandons it if the budget expires.
+        ///
+        /// This exists because passing a CancellationToken into Docker.DotNet is not sufficient to
+        /// bound a call. Exec attach is a HIJACKED stream: the library drops its own timeout to
+        /// infinite for the duration, and once the named pipe stops producing bytes neither our
+        /// linked token nor its timeout ends the read. On 2026-09-16 that let one
+        /// computer_browser_action sit for 26 minutes against a ~35-second bound, simultaneously
+        /// across three Stewards on the one daemon — each agent's prompt prefix expired while it
+        /// waited, which is what the fleet eventually halted over.
+        ///
+        /// The abandoned task keeps running and is left to finish on its own: it owns a live stream
+        /// we must not dispose from under it, and the command inside the container is already bounded
+        /// by GNU timeout. Its exceptions are observed so an abandoned failure cannot resurface as an
+        /// unobserved-task crash long after the caller has moved on.
+        /// </summary>
+        internal static async Task<T> WithDeadlineAsync<T>(
+            Func<CancellationToken, Task<T>> operation, TimeSpan budget, string what, CancellationToken ct)
+        {
+            // Not scoped with `using`: on the abandon path the call we walk away from is still holding
+            // this token, and disposing a CancellationTokenSource out from under a live registration
+            // throws ObjectDisposedException inside it. It is disposed only once the work is finished
+            // with it, and otherwise left for the collector.
+            var attempt = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var work = operation(attempt.Token);
+            using var timer = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            var finished = await Task.WhenAny(work, Task.Delay(budget, timer.Token));
+            if (finished == work)
+            {
+                timer.Cancel();   // stop the pending delay rather than leaving a timer per call
+                try { return await work; } finally { attempt.Dispose(); }
+            }
+            // Ask politely first; the read may still be sitting on the pipe regardless.
+            try { attempt.Cancel(); } catch { }
+            work.ContinueWith(t =>
+            {
+                _ = t.Exception;   // observed, so an abandoned failure is never an unobserved-task crash
+                try { attempt.Dispose(); } catch { }
+            }, TaskScheduler.Default);
+            ct.ThrowIfCancellationRequested();
+            throw new ContainerDaemonTimeoutException(
+                $"the Docker daemon did not complete {what} within {budget.TotalSeconds:0.#}s");
+        }
+
+        /// <summary>
+        /// Probes the Docker daemon with a short timeout. Returns null when it answers, or a
+        /// human-readable reason when it doesn't (daemon not running, wrong endpoint, etc.). This
+        /// turns the opaque "The operation has timed out." (a named-pipe connect timeout when no
+        /// daemon is listening) into an actionable diagnosis for the agent and the logs.
+        /// </summary>
+        public async Task<string?> ProbeDaemonAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                await WithDeadlineAsync(async token =>
+                {
+                    var docker = await GetClientAsync(token);
+                    await docker.System.PingAsync(token);
+                    return true;
+                }, TimeSpan.FromSeconds(4), "daemon health probe", ct);
+                return null;
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                return $"the Docker daemon at {dockerUri} did not respond within 4s — it is not running (or is unreachable at that endpoint).";
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                return $"the Docker daemon at {dockerUri} is unreachable: {ex.Message}";
+            }
+        }
+
+        /// <summary>The Docker endpoint this orchestrator targets (for diagnostics).</summary>
+        public string DockerUri => dockerUri;
+
+        /// <summary>Total memory of the VM the daemon runs in (Docker's own MemTotal), or 0 when
+        /// the daemon cannot say. This is the ceiling desktop admission is budgeted against.</summary>
+        public async Task<long> GetDaemonMemoryTotalAsync(CancellationToken ct = default)
+        {
+            try
+            {
+                return await WithDeadlineAsync(async token =>
+                {
+                    var docker = await GetClientAsync(token);
+                    return (await docker.System.GetSystemInfoAsync(token)).MemTotal;
+                }, TimeSpan.FromSeconds(10), "daemon memory query", ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return 0; }
+        }
+
+        /// <summary>
+        /// CPU use of one container as a share of one core, from a single non-streaming stats call
+        /// (the daemon samples twice about a second apart). Null when it could not be measured, which
+        /// callers must treat as "busy" — an unmeasured desktop is never stopped as idle.
+        /// </summary>
+        public async Task<double?> SampleCpuPercentAsync(string containerID, CancellationToken ct = default)
+        {
+            try
+            {
+                return await WithDeadlineAsync(async token =>
+                {
+                    var docker = await GetClientAsync(token);
+                    ContainerStatsResponse? sample = null;
+                    await docker.Containers.GetContainerStatsAsync(containerID,
+                        new ContainerStatsParameters { Stream = false },
+                        new Progress<ContainerStatsResponse>(s => sample = s), token);
+                    // Progress<T> posts asynchronously; give the callback a moment to land.
+                    for (int i = 0; sample == null && i < 20; i++) await Task.Delay(25, token);
+                    if (sample?.CPUStats?.CPUUsage == null || sample.PreCPUStats?.CPUUsage == null) return (double?)null;
+                    return DesktopCapacityPolicy.CpuPercentOfOneCore(
+                        sample.CPUStats.CPUUsage.TotalUsage, sample.PreCPUStats.CPUUsage.TotalUsage,
+                        sample.CPUStats.SystemUsage, sample.PreCPUStats.SystemUsage,
+                        sample.CPUStats.OnlineCPUs);
+                }, TimeSpan.FromSeconds(10), "container CPU sample", ct);
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Executes one fixed desktop-control operation inside an owned desktop container. This is
+        /// intentionally not a shell API: operation and arguments are validated before an exec is
+        /// created, and browser URLs are passed as a positional parameter rather than interpolated
+        /// into a command string.
+        /// </summary>
+        public async Task ExecuteDesktopControlAsync(string containerID, ContainerDesktopControlCommand command, string? argument,
+            CancellationToken ct = default)
+        {
+            SemaphoreSlim? browserGate = command == ContainerDesktopControlCommand.LaunchBrowser
+                ? browserLaunchGates.GetOrAdd(containerID, _ => new SemaphoreSlim(1, 1))
+                : null;
+            if (browserGate != null) await browserGate.WaitAsync(ct);
+            try
+            {
+            IList<string> cmd = command switch
+            {
+                ContainerDesktopControlCommand.LaunchBrowser when string.IsNullOrWhiteSpace(argument)
+                    => new[] { "bash", "-lc", BrowserLaunchScriptForExec, "bash", "" },
+                ContainerDesktopControlCommand.LaunchBrowser when Uri.TryCreate(argument, UriKind.Absolute, out var uri) &&
+                    (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+                    => new[] { "bash", "-lc", BrowserLaunchScriptForExec, "bash", uri.AbsoluteUri },
+                ContainerDesktopControlCommand.LaunchTerminal when string.IsNullOrWhiteSpace(argument)
+                    => new[] { "bash", "-lc", ApplicationLaunchScriptForExec, "desktop-launch", "xfce4-terminal" },
+                ContainerDesktopControlCommand.LaunchApplication when ParseApplication(argument) is { } app
+                    => new[] { "bash", "-lc", ApplicationLaunchScriptForExec, "desktop-launch", app.Executable }
+                        .Concat(app.Arguments).ToArray(),
+                ContainerDesktopControlCommand.FocusBrowser when string.IsNullOrWhiteSpace(argument)
+                    => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Chromium" },
+                ContainerDesktopControlCommand.FocusTerminal when string.IsNullOrWhiteSpace(argument)
+                    => new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a Terminal" },
+                ContainerDesktopControlCommand.FocusWindow when ParseWindowFocus(argument) is { } focus
+                    => focus.ProcessName is { Length: > 0 }
+                        ? new[] { "sh", "-lc", "pid=$(pgrep -o -f -- \"$1\") || exit 2; wid=$(DISPLAY=:1 wmctrl -lp | awk -v p=\"$pid\" '$3==p {print $1; exit}'); [ -n \"$wid\" ] || exit 3; DISPLAY=:1 wmctrl -ia \"$wid\"", "desktop-control", focus.ProcessName }
+                        : new[] { "sh", "-lc", "DISPLAY=:1 wmctrl -a \"$1\"", "desktop-control", focus.TitleContains! },
+                _ => throw new InvalidOperationException("Invalid isolated desktop-control command."),
+            };
+
+            // The in-container daemon first: no Docker daemon on the path of a browser launch, which
+            // every navigation, physical click and challenge solve performs. The browser supervisor and
+            // the focus commands are idempotent, so any daemon failure may fall through to docker exec;
+            // an application launch is re-run only when the daemon provably never received it, or a
+            // slow answer would open the application twice.
+            bool idempotentControl = command is ContainerDesktopControlCommand.LaunchBrowser
+                or ContainerDesktopControlCommand.FocusBrowser or ContainerDesktopControlCommand.FocusTerminal
+                or ContainerDesktopControlCommand.FocusWindow;
+            var served = await TryDaemonExecAsync(containerID, null, cmd.ToArray(), "/home/agent",
+                (int)DesktopControlTimeout.TotalSeconds, idempotentControl, ct);
+            if (served != null)
+            {
+                if (served.ExitCode != 0)
+                    throw new InvalidOperationException($"Desktop control command failed (exit {served.ExitCode}): {(served.Stderr + served.Stdout).Trim()}");
+                return;
+            }
+
+            // Bounded like every other daemon call. This one had no ceiling at all, and it is the
+            // first thing every structured browser action does (LaunchAsync("browser")) — while
+            // holding the per-container launch gate, so one wedged launch stalled the whole desktop
+            // rather than just its own call. These commands all return in well under a second.
+            await WithDeadlineAsync(async execCt =>
+            {
+                var docker = await GetClientAsync(execCt);
+                var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
+                {
+                    AttachStdout = true,
+                    AttachStderr = true,
+                    Tty = false,
+                    User = "agent",
+                    WorkingDir = "/home/agent",
+                    Cmd = cmd,
+                }, execCt);
+                using var output = await docker.Exec.StartAndAttachContainerExecAsync(created.ID, false, execCt);
+                var (stdout, stderr) = await output.ReadOutputToEndAsync(execCt);
+                var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, execCt);
+                if (inspected.ExitCode != 0)
+                    throw new InvalidOperationException($"Desktop control command failed (exit {inspected.ExitCode}): {(stderr + stdout).Trim()}");
+                return true;
+            }, DesktopControlTimeout, $"desktop control '{command}'", ct);
+            }
+            finally
+            {
+                browserGate?.Release();
+            }
+        }
+
+        /// <summary>
+        /// Serialises a profile-level operation with every browser launch on the supplied desktops.
+        /// A session handoff holds these locks while Chromium is stopped and its on-disk profile is
+        /// replaced; a competing launch must not recreate SQLite or Singleton state mid-copy.
+        /// Callers also hold the corresponding desktop action gates.
+        /// </summary>
+        internal async Task WithBrowserLaunchLocksAsync(IEnumerable<string> containerIDs, Func<Task> operation,
+            CancellationToken ct = default)
+        {
+            var ids = containerIDs.Where(id => !string.IsNullOrWhiteSpace(id))
+                .Distinct(StringComparer.Ordinal).OrderBy(id => id, StringComparer.Ordinal).ToList();
+            var held = new List<SemaphoreSlim>(ids.Count);
+            try
+            {
+                foreach (string containerID in ids)
+                {
+                    var gate = browserLaunchGates.GetOrAdd(containerID, _ => new SemaphoreSlim(1, 1));
+                    await gate.WaitAsync(ct);
+                    held.Add(gate);
+                }
+                await operation();
+            }
+            finally
+            {
+                for (int i = held.Count - 1; i >= 0; i--) held[i].Release();
+            }
+        }
+
+        // One idempotent browser supervisor. It waits for an in-progress start instead of spawning
+        // a competitor, kills a genuinely wedged local Chromium before clearing stale singleton
+        // markers, and does not return success until CDP is listening. When a browser is already
+        // healthy, URL navigation uses CDP to create a visible tab without starting another process.
+        internal const string BrowserLaunchScript = """
+            set -u
+            export DISPLAY=:1 XDG_RUNTIME_DIR=/tmp/runtime-agent
+            mkdir -p "$XDG_RUNTIME_DIR" "$OMNIPOTENT_BROWSER_PROFILE"
+            if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi
+            url="${1:-}"
+            cdp_up() { python3 -c 'import urllib.request; urllib.request.build_opener(urllib.request.ProxyHandler({})).open("http://127.0.0.1:9222/json/version", timeout=1).read()' >/dev/null 2>&1; }
+            wait_cdp() { for i in $(seq 1 60); do cdp_up && return 0; sleep 0.25; done; return 1; }
+            # Reuse the tab that is already in front instead of stacking a new one per navigation.
+            # Chromium's only HTTP navigation endpoint (/json/new) always creates a tab, which is how
+            # a desktop ended up with 15+ of them and agents started acting on stale pages. The
+            # helper drives the foreground tab over CDP and prunes blank/duplicate/cold tabs; the
+            # PUT remains as the fallback when the helper is unavailable.
+            open_url() {
+              [ -z "$url" ] && return 0
+              payload=$(python3 -c 'import base64,json,sys; print(base64.urlsafe_b64encode(json.dumps({"url":sys.argv[1],"maxTabs":6}).encode()).decode().rstrip("="))' "$url" 2>/dev/null)
+              if [ -n "$payload" ] && python3 /usr/local/bin/browser-inspect.py navigate "$payload" >/dev/null 2>&1; then
+                return 0
+              fi
+              python3 -c 'import sys,urllib.parse,urllib.request; u="http://127.0.0.1:9222/json/new?"+urllib.parse.quote(sys.argv[1],safe=""); urllib.request.build_opener(urllib.request.ProxyHandler({})).open(urllib.request.Request(u,method="PUT"),timeout=3).read()' "$url"
+            }
+            focus_browser() { wmctrl -a Chromium >/dev/null 2>&1 || true; wmctrl -r Chromium -b add,maximized_vert,maximized_horz >/dev/null 2>&1 || true; }
+            browser_visible() { wmctrl -lx 2>/dev/null | grep -qi 'chromium'; }
+            if cdp_up; then open_url; focus_browser; exit 0; fi
+            if pgrep -x chromium >/dev/null 2>&1; then
+              if wait_cdp; then open_url; focus_browser; exit 0; fi
+            fi
+            # A browser left by an older launcher may not have CDP enabled but can still own this
+            # profile. There is exactly one browser per desktop container, so stop every local
+            # Chromium before repairing singleton markers and performing the supervised start.
+            pkill -x chromium >/dev/null 2>&1 || true
+            for i in $(seq 1 20); do pgrep -x chromium >/dev/null 2>&1 || break; sleep 0.25; done
+            if pgrep -x chromium >/dev/null 2>&1; then
+              pkill -KILL -x chromium >/dev/null 2>&1 || true
+              for i in $(seq 1 20); do pgrep -x chromium >/dev/null 2>&1 || break; sleep 0.25; done
+            fi
+            if pgrep -x chromium >/dev/null 2>&1; then
+              echo 'Chromium still owns the profile after TERM/KILL; singleton markers were not removed.' >&2
+              exit 1
+            fi
+            # Chromium inherits fd 9, keeping this lock for the browser's lifetime. A replacement
+            # container sharing the persistent profile therefore cannot delete the live owner's
+            # singleton markers even though its PID namespace cannot see that owner's process.
+            exec 9>"$OMNIPOTENT_BROWSER_PROFILE/.omnipotent-launch.lock"
+            flock -w 20 9 || { echo 'Timed out waiting for the browser profile owner to exit; singleton markers were not removed.' >&2; exit 1; }
+            rm -f "$OMNIPOTENT_BROWSER_PROFILE/SingletonLock" "$OMNIPOTENT_BROWSER_PROFILE/SingletonSocket" "$OMNIPOTENT_BROWSER_PROFILE/SingletonCookie"
+            : > /tmp/chromium.log
+            # Chromium's own UI is a source of blocked clicks: the "Save password?" bubble lands on
+            # top of the submit button of the very form that triggered it, and notification/translate
+            # prompts steal focus mid-flow. Seed the profile so none of them ever appear. Merged into
+            # the existing preferences (never overwriting them) so a persistent profile keeps its state.
+            python3 - "$OMNIPOTENT_BROWSER_PROFILE/Default/Preferences" <<'PREFS' || true
+            import json, os, sys
+            path = sys.argv[1]
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                with open(path, 'r', encoding='utf-8') as handle: prefs = json.load(handle)
+            except Exception:
+                prefs = {}
+            if not isinstance(prefs, dict): prefs = {}
+            def branch(root, *names):
+                node = root
+                for name in names:
+                    child = node.get(name)
+                    if not isinstance(child, dict): child = {}; node[name] = child
+                    node = child
+                return node
+            prefs['credentials_enable_service'] = False
+            prefs['credentials_enable_autosignin'] = False
+            branch(prefs, 'profile')['password_manager_enabled'] = False
+            # Every restart of this browser follows a kill (idle-stopped container, the pkill above), so
+            # Chromium would open with a "Restore pages?" bubble that takes the keyboard and swallows the
+            # agent's typing and clicks. Record the last exit as clean so it never appears.
+            branch(prefs, 'profile')['exit_type'] = 'Normal'
+            branch(prefs, 'profile')['exited_cleanly'] = True
+            branch(prefs, 'profile', 'default_content_setting_values')['notifications'] = 2
+            branch(prefs, 'profile', 'default_content_setting_values')['geolocation'] = 2
+            branch(prefs, 'translate')['enabled'] = False
+            branch(prefs, 'bookmark_bar')['show_on_all_tabs'] = False
+            with open(path, 'w', encoding='utf-8') as handle: json.dump(prefs, handle)
+            PREFS
+            # Assemble the per-desktop fingerprint extension into a writable dir: the baked template
+            # (manifest + patch.js) plus a one-line persona.js carrying this desktop's values. This is
+            # a main-world, document_start content script that normalises the page-visible environment
+            # (chiefly the WebGL renderer, which --disable-gpu otherwise exposes as SwiftShader). If the
+            # persona var or template is absent the block is skipped and the browser is unchanged.
+            fp_args=()
+            extension_dirs=()
+            if [ -n "${OMNIPOTENT_FP_JSON:-}" ] && [ -f /usr/local/share/klive-fp/patch.js ]; then
+              FPDIR="$HOME/.klive-fp"
+              mkdir -p "$FPDIR"
+              cp -f /usr/local/share/klive-fp/manifest.json /usr/local/share/klive-fp/patch.js "$FPDIR"/ 2>/dev/null || true
+              printf 'self.__KFP__=%s;\n' "$OMNIPOTENT_FP_JSON" > "$FPDIR/persona.js"
+              extension_dirs+=("$FPDIR")
+            fi
+            # Load the free solver alongside the persona extension, also when humanisation is off.
+            # No account key is supplied: this cannot consume paid recognition credits.
+            if [ -f /usr/local/share/klive-nopecha/manifest.json ]; then
+              extension_dirs+=("/usr/local/share/klive-nopecha")
+            fi
+            if [ "${#extension_dirs[@]}" -gt 0 ]; then
+              extension_paths=$(IFS=,; echo "${extension_dirs[*]}")
+              fp_args=(--disable-extensions-except="$extension_paths" --load-extension="$extension_paths" \
+                --disable-features=DisableLoadExtensionCommandLineSwitch)
+            fi
+            # --disable-blink-features=AutomationControlled keeps navigator.webdriver false and drops
+            # the AutomationControlled hint; --lang gives the persona a real Accept-Language instead of
+            # the container default. CDP stays on loopback (page JS cannot read the debug port) so
+            # structured inspection keeps working. A bash array preserves the literal "*" and any
+            # spaces in the profile path across the two launch forms.
+            # --renderer-process-limit keeps a desktop inside its memory ceiling: tabs share renderer
+            # processes instead of each growing its own, which is what the kernel used to OOM-kill.
+            common_args=(--no-sandbox --disable-dev-shm-usage --disable-gpu --no-first-run --no-default-browser-check \
+              --renderer-process-limit=4 \
+              --hide-crash-restore-bubble --password-store=basic --disable-blink-features=AutomationControlled \
+              "--lang=${OMNIPOTENT_BROWSER_LANG:-en-US}" --start-maximized \
+              --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 "--remote-allow-origins=*" \
+              --user-data-dir="$OMNIPOTENT_BROWSER_PROFILE")
+            if [ -n "$url" ]; then
+              nohup chromium "${common_args[@]}" "${fp_args[@]}" "$url" >/tmp/chromium.log 2>&1 </dev/null &
+            else
+              nohup chromium "${common_args[@]}" "${fp_args[@]}" >/tmp/chromium.log 2>&1 </dev/null &
+            fi
+            if wait_cdp; then focus_browser; exit 0; fi
+            if browser_visible; then
+              echo 'Chromium is visible but its optional CDP endpoint is unavailable; visual control remains usable.' >>/tmp/chromium.log
+              focus_browser
+              exit 0
+            fi
+            echo 'Chromium failed to expose CDP after a single supervised launch.' >&2
+            tail -n 20 /tmp/chromium.log >&2 || true
+            exit 1
+            """;
+
+        // C# raw strings retain their source file's physical line endings. This repository is
+        // commonly checked out as CRLF on Windows, while the script executes inside Linux. Strip
+        // carriage returns at the Docker argv boundary so Bash never sees `set -u\r` or `$'\r'`.
+        // The fourth `bash -lc` argv is deliberately just "bash" ($0), not a pretend executable
+        // name that agents could mistake for a missing launcher binary.
+        internal static string BrowserLaunchScriptForExec => NormalizeLinuxShellScript(BrowserLaunchScript);
+
+        internal static string ApplicationLaunchScriptForExec => NormalizeLinuxShellScript(ApplicationLaunchScript);
+        private const string ApplicationLaunchScript = """
+            set -e
+            if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi
+            export DISPLAY=:1
+            command -v -- "$1" >/dev/null || { printf 'Application is not installed: %s\n' "$1" >&2; exit 127; }
+            log=$(mktemp /tmp/desktop-app.XXXXXX.log)
+            nohup "$@" </dev/null >"$log" 2>&1 &
+            app_pid=$!
+            sleep 0.5
+            if ! kill -0 "$app_pid" 2>/dev/null; then
+                wait "$app_pid" || { code=$?; cat "$log" >&2; exit "$code"; }
+            fi
+            printf 'Application launch accepted; log: %s\n' "$log"
+            """;
+        internal static string NormalizeLinuxShellScript(string script) =>
+            (script ?? "").Replace("\r", "", StringComparison.Ordinal);
+
+        private sealed record DesktopApplicationRequest(string Executable, string[] Arguments);
+        private sealed record DesktopWindowFocusRequest(string? TitleContains, string? ProcessName);
+
+        private static DesktopApplicationRequest? ParseApplication(string? json)
+        {
+            try
+            {
+                var value = System.Text.Json.JsonSerializer.Deserialize<DesktopApplicationRequest>(json ?? "",
+                    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                if (value == null || value.Executable.Length is < 1 or > 512
+                    || value.Executable.Any(char.IsControl)
+                    || !value.Executable.All(c => char.IsLetterOrDigit(c) || c is '_' or '-' or '+' or '.' or '/')
+                    || value.Executable.Contains('/') && !value.Executable.StartsWith('/')
+                    || value.Executable is "/" || value.Executable.EndsWith('/') || value.Executable.Contains("//")
+                    || value.Executable.Split('/', StringSplitOptions.RemoveEmptyEntries).Any(segment => segment is "." or "..")
+                    || value.Arguments.Length > 128 || value.Arguments.Any(x => x.Length > 4096 || x.Any(char.IsControl)))
+                    return null;
+                return value;
+            }
+            catch { return null; }
+        }
+
+        private static DesktopWindowFocusRequest? ParseWindowFocus(string? json)
+        {
+            try
+            {
+                var value = System.Text.Json.JsonSerializer.Deserialize<DesktopWindowFocusRequest>(json ?? "",
+                    new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true });
+                string target = value?.ProcessName ?? value?.TitleContains ?? "";
+                return target.Length is > 0 and <= 256 && !target.Any(char.IsControl) ? value : null;
+            }
+            catch { return null; }
+        }
+
+        /// <summary>
+        /// Executes a shell command inside an already-owned desktop container. This is the
+        /// reliable counterpart to opening XFCE Terminal and typing the same command through
+        /// VNC: it runs as the container's unprivileged <c>agent</c> user, never on the host,
+        /// and receives no Docker socket or extra capability. The image intentionally grants
+        /// that user passwordless sudo, matching the authority it already has in the GUI.
+        /// </summary>
+        public Task<ContainerShellResult> ExecuteDesktopShellAsync(
+            string containerID, string command, string? workingDirectory, int timeoutSeconds,
+            CancellationToken ct = default) =>
+            ExecuteDesktopShellAsync(containerID, command, workingDirectory, timeoutSeconds, idempotent: false, ct);
+
+        /// <summary>
+        /// Runs a shell command inside a desktop. <paramref name="idempotent"/> marks harness probes that
+        /// may be re-run through docker exec after any daemon failure; an agent's own command is re-run
+        /// only when the daemon provably never received it, so nothing is ever executed twice.
+        /// </summary>
+        public async Task<ContainerShellResult> ExecuteDesktopShellAsync(
+            string containerID, string command, string? workingDirectory, int timeoutSeconds,
+            bool idempotent, CancellationToken ct = default)
+        {
+            if (string.IsNullOrWhiteSpace(command))
+                throw new ArgumentException("Provide a non-empty command.", nameof(command));
+            if (command.Length > 65536)
+                throw new ArgumentException("Command is too large (maximum 65,536 characters).", nameof(command));
+
+            string workDir = ContainerShellResult.NormalizeWorkingDirectory(workingDirectory);
+            int seconds = Math.Clamp(timeoutSeconds, 1, 900);
+
+            var served = await TryDaemonExecAsync(containerID, command, null, workDir, seconds, idempotent, ct);
+            if (served != null) return served;
+
+            // The budget is ours to enforce, not the daemon's to respect: the inner command is
+            // already bounded by GNU timeout, so anything past this is the host-side call hanging.
+            try
+            {
+                return await WithDeadlineAsync(async execCt =>
+                {
+                var docker = await GetClientAsync(execCt);
+                var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
+                {
+                    AttachStdout = true,
+                    AttachStderr = true,
+                    Tty = false,
+                    User = "agent",
+                    WorkingDir = workDir,
+                    Env = new List<string> { "DISPLAY=:1" },
+                    // Keep the command as one argv value rather than interpolating it into a host-side
+                    // shell. GNU timeout owns a process group, so descendants do not outlive the bound.
+                    Cmd = new[]
+                    {
+                        "timeout", "--signal=TERM", "--kill-after=5s", $"{seconds}s",
+                        "bash", "-lc",
+                        "if [ -r /tmp/desktop-session.env ]; then . /tmp/desktop-session.env; fi; exec bash -lc \"$1\"",
+                        "desktop-terminal", command,
+                    },
+                }, execCt);
+
+                using var output = await docker.Exec.StartAndAttachContainerExecAsync(created.ID, false, execCt);
+                using var stdout = new BoundedCaptureStream(64 * 1024);
+                using var stderr = new BoundedCaptureStream(64 * 1024);
+                await output.CopyOutputToAsync(Stream.Null, stdout, stderr, execCt);
+                var inspected = await docker.Exec.InspectContainerExecAsync(created.ID, execCt);
+                long exitCode = inspected.ExitCode;
+                return new ContainerShellResult(
+                    exitCode,
+                    stdout.GetText(),
+                    stderr.GetText(),
+                    TimedOut: exitCode == 124 || exitCode == 137,
+                    OutputTruncated: stdout.Truncated || stderr.Truncated);
+                }, TimeSpan.FromSeconds(seconds + 15), $"a command in container {containerID[..Math.Min(12, containerID.Length)]}", ct);
+            }
+            catch (ContainerDaemonTimeoutException ex)
+            {
+                // Say which side stalled. The agent cannot act on the host being busy, and the
+                // previous bare cancellation read to it as its own command failing.
+                log($"Container exec abandoned after {seconds + 15}s: {ex.Message}");
+                return new ContainerShellResult(124, "", $"Docker exec exceeded its bounded command window — {ex.Message}. "
+                    + "The command may or may not have run; the host, not this desktop, was unresponsive.",
+                    TimedOut: true, OutputTruncated: false);
+            }
+            catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+            {
+                return new ContainerShellResult(124, "", "Docker exec exceeded its bounded command window.",
+                    TimedOut: true, OutputTruncated: false);
+            }
+        }
+
+        /// <summary>True when <paramref name="imageTag"/> exists locally.</summary>
+        public async Task<bool> ImageExistsAsync(string imageTag, CancellationToken ct = default)
+            => await FindImageAsync(imageTag, ct) != null;
+
+        private async Task<ImagesListResponse?> FindImageAsync(string imageTag, CancellationToken ct)
+        {
+            var docker = await GetClientAsync();
+            var images = await docker.Images.ListImagesAsync(new ImagesListParameters { All = true }, ct);
+            var found = images.FirstOrDefault(i => i.RepoTags?.Contains(imageTag) == true);
+            if (found != null) return found;
+
+            // The image built before Projects became Demiurge: give it the current tag rather than
+            // rebuilding an identical image, which takes minutes with every desktop waiting on it.
+            string? legacyTag = StewardSettings.Defaults.LegacyDesktopImageFor(imageTag);
+            var legacy = legacyTag == null ? null : images.FirstOrDefault(i => i.RepoTags?.Contains(legacyTag) == true);
+            if (legacy == null) return null;
+            int colon = imageTag.LastIndexOf(':');
+            try
+            {
+                await docker.Images.TagImageAsync(legacy.ID, new ImageTagParameters
+                {
+                    RepositoryName = colon > 0 ? imageTag[..colon] : imageTag,
+                    Tag = colon > 0 ? imageTag[(colon + 1)..] : "latest",
+                }, ct);
+                log($"Desktop image '{legacyTag}' is now also tagged '{imageTag}'.");
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                log($"Could not tag desktop image '{legacyTag}' as '{imageTag}': {ex.Message}");
+                return null;
+            }
+            images = await docker.Images.ListImagesAsync(new ImagesListParameters { All = true }, ct);
+            return images.FirstOrDefault(i => i.RepoTags?.Contains(imageTag) == true);
+        }
+
+        /// <summary>The build-context hash the given image was built with, or null when the image
+        /// is missing or unlabelled (a hand-built or pre-labelling image). Used both to stamp new
+        /// containers and to judge existing ones stale.</summary>
+        public async Task<string?> GetImageContextHashAsync(string imageTag, CancellationToken ct = default)
+        {
+            var image = await FindImageAsync(imageTag, ct);
+            return ContainerLabels.TryGet(image?.Labels, ContextHashLabel, out var hash) ? hash : null;
+        }
+
+        /// <summary>
+        /// True when a container is running an out-of-date desktop image — i.e. the Steward's
+        /// current image was rebuilt from a changed build context (new baked tools) after this
+        /// container was created. Recreating a stale container is how those newer tools reach a
+        /// long-lived Steward whose desktop predates them. Conservative: when the current image
+        /// carries no context hash (missing/unlabelled), nothing is judged stale, so a host that
+        /// can't rebuild never churns its containers.
+        /// </summary>
+        public async Task<bool> IsRecordStaleAsync(DesktopContainerRecord record, CancellationToken ct = default)
+        {
+            string? currentHash = await GetImageContextHashAsync(imageForSteward(record.StewardID), ct);
+            return IsStaleAgainst(record.ImageContextHash, currentHash);
+        }
+
+        /// <summary>Pure staleness comparison (Docker-free, unit-tested): a container is stale when the
+        /// current image has a known context hash that differs from the one stamped on the container.
+        /// An unknown current hash (missing/unlabelled image) is never stale — recreating couldn't help
+        /// and would only churn. An empty stamped hash (a legacy container from before stamping) differs
+        /// from any real current hash, so it is recreated once.</summary>
+        internal static bool IsStaleAgainst(string? recordHash, string? currentImageHash)
+        {
+            if (string.IsNullOrWhiteSpace(currentImageHash)) return false;
+            return !string.Equals(recordHash ?? "", currentImageHash, StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// Builds the desktop image from a shipped build context when it's missing on this host —
+        /// the second half of dependency self-healing (daemon install being the first). The image
+        /// carries a label with the build context's hash, so a shipped change to the
+        /// Dockerfile/entrypoint rebuilds the (same-tagged) image on the next bootstrap instead of
+        /// being silently ignored; running containers keep the old image until they're recreated.
+        /// The context is tarred in-process (no docker CLI needed); .sh files are normalised to LF
+        /// so a CRLF git checkout can't produce a container whose entrypoint dies on '\r'. Returns
+        /// null on success (or already current), else a human-readable reason.
+        /// </summary>
+        public Task<string?> EnsureImageBuiltAsync(string imageTag, string contextDir, string dockerfileName, CancellationToken ct = default) =>
+            EnsureImageBuiltAsync(imageTag, contextDir, dockerfileName, forceRebuild: false, ct: ct);
+
+        public async Task<string?> EnsureImageBuiltAsync(string imageTag, string contextDir, string dockerfileName,
+            bool forceRebuild, CancellationToken ct = default)
+        {
+            string key = imageTag.Trim();
+            while (true)
+            {
+                var candidate = new ImageBuildFlight(forceRebuild,
+                    () => RunImageBuildFlightAsync(imageTag, contextDir, dockerfileName, forceRebuild));
+                var flight = imageBuildFlights.GetOrAdd(key, candidate);
+                Task<string?> work = flight.Work.Value;
+                if (ReferenceEquals(flight, candidate))
+                    _ = work.ContinueWith(_ => RemoveImageBuildFlight(key, flight), CancellationToken.None,
+                        TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
+
+                string? result = await work.WaitAsync(ct);
+                RemoveImageBuildFlight(key, flight);
+                // A live-capability repair explicitly requested a rebuild. If it happened to join
+                // an ordinary currency check that did not force one, run one forced flight after
+                // that check completes rather than silently treating the join as a repair.
+                if (forceRebuild && !flight.Force) continue;
+                return result;
+            }
+        }
+
+        private void RemoveImageBuildFlight(string key, ImageBuildFlight flight)
+        {
+            if (imageBuildFlights.TryGetValue(key, out var current) && ReferenceEquals(current, flight))
+                imageBuildFlights.TryRemove(key, out _);
+        }
+
+        private async Task<string?> RunImageBuildFlightAsync(string imageTag, string contextDir,
+            string dockerfileName, bool forceRebuild)
+        {
+            using var timeout = new CancellationTokenSource(ImageBuildTimeout);
+            try
+            {
+                return await EnsureImageBuiltCoreAsync(imageTag, contextDir, dockerfileName,
+                    forceRebuild, timeout.Token);
+            }
+            catch (OperationCanceledException) when (timeout.IsCancellationRequested)
+            {
+                return $"desktop image build exceeded its {ImageBuildTimeout.TotalMinutes:0}-minute recovery window; " +
+                       "the single-flight build was stopped and a later readiness attempt may retry.";
+            }
+        }
+
+        private async Task<string?> EnsureImageBuiltCoreAsync(string imageTag, string contextDir, string dockerfileName,
+            bool forceRebuild, CancellationToken ct)
+        {
+            try
+            {
+                var missingContextFiles = DesktopBuildContextFiles
+                    .Where(name => !File.Exists(Path.Combine(contextDir, name))).ToList();
+                bool contextAvailable = Directory.Exists(contextDir) && missingContextFiles.Count == 0;
+                var existing = await FindImageAsync(imageTag, ct);
+                if (!contextAvailable)
+                {
+                    return $"desktop build context is incomplete at {contextDir}; missing: {string.Join(", ", missingContextFiles)}. " +
+                           "The application output must contain every desktop asset before browser work can be trusted.";
+                }
+
+                string contextHash = ComputeContextHash(contextDir);
+                if (!forceRebuild && ContainerLabels.TryGet(existing?.Labels, ContextHashLabel, out var builtHash) && builtHash == contextHash)
+                    return null; // image is current
+
+                log(existing == null
+                    ? $"Desktop image '{imageTag}' not found — building it now (first build takes several minutes)…"
+                    : forceRebuild
+                        ? $"Desktop image '{imageTag}' failed its live capability probe — rebuilding from the verified shipped context…"
+                        : $"Desktop image '{imageTag}' is stale (build context changed) — rebuilding…");
+                var docker = await GetClientAsync();
+                using var context = CreateTarContext(contextDir);
+                string? buildError = null;
+                await docker.Images.BuildImageFromDockerfileAsync(
+                    new ImageBuildParameters
+                    {
+                        Dockerfile = dockerfileName,
+                        Tags = new List<string> { imageTag },
+                        Labels = new Dictionary<string, string> { [ContextHashLabel] = contextHash },
+                    },
+                    context,
+                    null, null,
+                    new Progress<JSONMessage>(m =>
+                    {
+                        if (!string.IsNullOrWhiteSpace(m.Stream)) log($"docker build: {m.Stream.TrimEnd()}");
+                        if (m.Error != null) buildError = m.Error.Message;
+                    }),
+                    ct);
+
+                if (buildError != null) return $"docker build failed: {buildError}";
+                if (!await ImageExistsAsync(imageTag, ct)) return "docker build finished but the image is still missing.";
+                log($"Desktop image '{imageTag}' built successfully.");
+                return null;
+            }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { throw; }
+            catch (Exception ex)
+            {
+                return $"desktop image build failed: {ex.Message}";
+            }
+        }
+
+        /// <summary>Container environment, including the per-desktop browser fingerprint persona. The
+        /// persona is seeded from the persistent profile identity (Steward + profile segment) so it is
+        /// stable across container recreation and matches the aged browser profile it drives. When the
+        /// fingerprint kill switch is off, the var is simply omitted and the launcher skips the
+        /// extension — the browser is then byte-for-byte the previous behaviour.</summary>
+        internal static List<string> BuildContainerEnv(int width, int height, string profileSegment, string stewardID)
+        {
+            var env = new List<string>
+            {
+                $"DISPLAY_WIDTH={width}",
+                $"DISPLAY_HEIGHT={height}",
+                $"OMNIPOTENT_BROWSER_PROFILE=/project/.klive/browser-profiles/{profileSegment}",
+                "KLIVE_AGENT_RUNTIME=/agent-runtime",
+            };
+            if (BrowserPersona.GloballyEnabled)
+                env.Add($"OMNIPOTENT_FP_JSON={BrowserPersona.ForSeed($"{stewardID}/{profileSegment}").ToEnvJson()}");
+            return env;
+        }
+
+        /// <summary>In-process tar of the exact, flat desktop build context.</summary>
+        private static MemoryStream CreateTarContext(string contextDir)
+        {
+            var ms = new MemoryStream();
+            using (var writer = new System.Formats.Tar.TarWriter(ms, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: true))
+            {
+                foreach (var file in DesktopBuildContextFiles.Select(name => Path.Combine(contextDir, name)))
+                {
+                    var entry = new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile, Path.GetFileName(file))
+                    {
+                        DataStream = new MemoryStream(ReadContextFile(file)),
+                    };
+                    writer.WriteEntry(entry);
+                }
+            }
+            ms.Position = 0;
+            return ms;
+        }
+
+        /// <summary>A context file's bytes as they enter the build: scripts and the Dockerfile
+        /// normalised to LF, so a CRLF checkout cannot leak '\r' into a shebang or a RUN line.</summary>
+        private static byte[] ReadContextFile(string file) =>
+            file.EndsWith(".sh", StringComparison.OrdinalIgnoreCase) || file.EndsWith(".py", StringComparison.OrdinalIgnoreCase)
+            || file.EndsWith(".Dockerfile", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(Path.GetFileName(file), "klive-cdp", StringComparison.Ordinal)
+                ? System.Text.Encoding.UTF8.GetBytes(File.ReadAllText(file).Replace("\r\n", "\n").Replace('\r', '\n'))
+                : File.ReadAllBytes(file);
+
+        /// <summary>
+        /// The harness's in-container helpers. They are refreshed in place on a running desktop when
+        /// they differ from the shipped ones, because image changes otherwise reach only newly created
+        /// computers — and an existing computer is never recreated, since that would discard the
+        /// software its agent installed. Without this, a fix to the helper (the browser-service
+        /// framing bug above all) would never reach the desktops that were actually failing.
+        /// </summary>
+        internal static readonly string[] LiveHelperFiles = { "browser-inspect.py", "browser-service.py", "klive-cdp" };
+
+        /// <summary>SHA-256 of each shipped helper exactly as it would be installed.</summary>
+        internal static Dictionary<string, string> ShippedHelperHashes(string contextDir) =>
+            LiveHelperFiles.ToDictionary(name => name,
+                name => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(ReadContextFile(Path.Combine(contextDir, name))))
+                    .ToLowerInvariant(),
+                StringComparer.Ordinal);
+
+        /// <summary>Which helpers a desktop needs refreshed, from `sha256sum` output of its copies.</summary>
+        internal static List<string> StaleHelpers(string sha256sumOutput, IReadOnlyDictionary<string, string> shipped)
+        {
+            var installed = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (string line in (sha256sumOutput ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                int space = line.IndexOf(' ');
+                if (space <= 0) continue;
+                string hash = line[..space].Trim().ToLowerInvariant();
+                string name = Path.GetFileName(line[(space + 1)..].Trim().TrimStart('*'));
+                if (hash.Length == 64) installed[name] = hash;
+            }
+            return shipped.Where(pair => !installed.TryGetValue(pair.Key, out var hash) || hash != pair.Value)
+                .Select(pair => pair.Key).ToList();
+        }
+
+        /// <summary>
+        /// Brings a running desktop's helpers up to the shipped versions. One read-only exec decides;
+        /// stale files are written into /usr/local/bin through the Docker archive API, and the helper
+        /// service is restarted (the entrypoint's supervisor brings it back within seconds; callers
+        /// fall back to exec meanwhile). Returns what was refreshed, or null when already current.
+        /// </summary>
+        public async Task<string?> SyncDesktopHelpersAsync(string containerID, string contextDir, CancellationToken ct = default)
+        {
+            var shipped = ShippedHelperHashes(contextDir);
+            var probe = await ExecuteDesktopShellAsync(containerID,
+                "sha256sum " + string.Join(" ", LiveHelperFiles.Select(name => "/usr/local/bin/" + name))
+                    + " " + ComputerDaemonToken.ContainerTokenPath + " 2>/dev/null; true",
+                "/home/agent", 15, idempotent: true, ct);
+            if (probe.TimedOut)
+                throw new ContainerDaemonTimeoutException("The helper version probe timed out.");
+
+            // The daemon's credential travels with the helpers: a desktop that predates it, was adopted,
+            // or was rebuilt gets its token here, and the daemon reads it on the next request.
+            bool tokenDelivered = false;
+            if (!HasToken(probe.Stdout, ComputerDaemonToken.For(containerID)))
+            {
+                await DeliverComputerTokenAsync(containerID, ct);
+                tokenDelivered = true;
+            }
+
+            var stale = StaleHelpers(probe.Stdout, shipped);
+            if (stale.Count == 0) return tokenDelivered ? "delivered the computer-daemon token" : null;
+
+            using var archive = new MemoryStream();
+            using (var writer = new System.Formats.Tar.TarWriter(archive, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: true))
+            {
+                foreach (string name in stale)
+                {
+                    writer.WriteEntry(new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile, name)
+                    {
+                        DataStream = new MemoryStream(ReadContextFile(Path.Combine(contextDir, name))),
+                        Mode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute
+                             | UnixFileMode.GroupRead | UnixFileMode.GroupExecute
+                             | UnixFileMode.OtherRead | UnixFileMode.OtherExecute,
+                        Uid = 0,
+                        Gid = 0,
+                    });
+                }
+            }
+            archive.Position = 0;
+            await WithDeadlineAsync(async token =>
+            {
+                var docker = await GetClientAsync(token);
+                await docker.Containers.ExtractArchiveToContainerAsync(containerID,
+                    new ContainerPathStatParameters { Path = "/usr/local/bin", AllowOverwriteDirWithFile = false }, archive, token);
+                return true;
+            }, TimeSpan.FromSeconds(30), $"helper refresh in container {containerID[..Math.Min(12, containerID.Length)]}", ct);
+
+            if (stale.Contains("browser-service.py"))
+            {
+                // Through docker exec on purpose: asking the daemon to kill itself mid-request would
+                // report a dropped connection. The entrypoint's supervisor restarts it within seconds.
+                await ExecuteViaDockerAsync(containerID, "pkill -f /usr/local/bin/browser-service.py >/dev/null 2>&1; true",
+                    "/home/agent", 10, ct);
+                Daemon(containerID).Forget();
+            }
+            return "refreshed " + string.Join(", ", stale) + (tokenDelivered ? " and delivered the computer-daemon token" : "");
+        }
+
+        /// <summary>Whether `sha256sum` output shows the container already holds this token.</summary>
+        internal static bool HasToken(string sha256sumOutput, string token)
+        {
+            string expected = ComputerDaemonToken.FileHash(token);
+            foreach (string line in (sha256sumOutput ?? "").Split('\n', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+            {
+                int space = line.IndexOf(' ');
+                if (space <= 0) continue;
+                if (line[(space + 1)..].Trim().TrimStart('*').EndsWith(ComputerDaemonToken.ContainerTokenFileName, StringComparison.Ordinal)
+                    && string.Equals(line[..space].Trim(), expected, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
+        /// <summary>Writes the desktop's daemon token into it through the Docker archive API (no exec).</summary>
+        public async Task DeliverComputerTokenAsync(string containerID, CancellationToken ct = default)
+        {
+            using var archive = new MemoryStream();
+            using (var writer = new System.Formats.Tar.TarWriter(archive, System.Formats.Tar.TarEntryFormat.Pax, leaveOpen: true))
+            {
+                writer.WriteEntry(new System.Formats.Tar.PaxTarEntry(System.Formats.Tar.TarEntryType.RegularFile,
+                    ComputerDaemonToken.ContainerTokenFileName)
+                {
+                    DataStream = new MemoryStream(System.Text.Encoding.UTF8.GetBytes(ComputerDaemonToken.For(containerID) + "\n")),
+                    Mode = UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.GroupRead | UnixFileMode.OtherRead,
+                    Uid = 0,
+                    Gid = 0,
+                });
+            }
+            archive.Position = 0;
+            await WithDeadlineAsync(async token =>
+            {
+                var docker = await GetClientAsync(token);
+                await docker.Containers.ExtractArchiveToContainerAsync(containerID,
+                    new ContainerPathStatParameters { Path = ComputerDaemonToken.ContainerTokenDirectory, AllowOverwriteDirWithFile = false },
+                    archive, token);
+                return true;
+            }, TimeSpan.FromSeconds(30), $"computer-daemon token delivery to {containerID[..Math.Min(12, containerID.Length)]}", ct);
+            Daemon(containerID).Forget();
+        }
+
+        /// <summary>A command through docker exec only — for the few calls that must not go through the
+        /// daemon (stopping the daemon itself).</summary>
+        private async Task ExecuteViaDockerAsync(string containerID, string command, string workingDirectory, int seconds, CancellationToken ct)
+        {
+            try
+            {
+                await WithDeadlineAsync(async execCt =>
+                {
+                    var docker = await GetClientAsync(execCt);
+                    var created = await docker.Exec.ExecCreateContainerAsync(containerID, new ContainerExecCreateParameters
+                    {
+                        AttachStdout = true,
+                        AttachStderr = true,
+                        Tty = false,
+                        User = "agent",
+                        WorkingDir = workingDirectory,
+                        Cmd = new[] { "timeout", "--signal=TERM", "--kill-after=5s", $"{seconds}s", "bash", "-lc", command },
+                    }, execCt);
+                    using var output = await docker.Exec.StartAndAttachContainerExecAsync(created.ID, false, execCt);
+                    await output.ReadOutputToEndAsync(execCt);
+                    return true;
+                }, TimeSpan.FromSeconds(seconds + 15), $"a command in container {containerID[..Math.Min(12, containerID.Length)]}", ct);
+            }
+            catch (ContainerDaemonTimeoutException ex) { log($"Docker exec abandoned: {ex.Message}"); }
+        }
+
+        /// <summary>SHA-256 over the context's file names + normalised contents (order-stable), so
+        /// the staleness check sees exactly what the build would see.</summary>
+        private static string ComputeContextHash(string contextDir)
+        {
+            using var sha = System.Security.Cryptography.SHA256.Create();
+            using var ms = new MemoryStream();
+            foreach (var file in DesktopBuildContextFiles.Select(name => Path.Combine(contextDir, name))
+                         .OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase))
+            {
+                byte[] name = System.Text.Encoding.UTF8.GetBytes(Path.GetFileName(file) + "\0");
+                ms.Write(name, 0, name.Length);
+                byte[] bytes = ReadContextFile(file);
+                ms.Write(bytes, 0, bytes.Length);
+            }
+            return Convert.ToHexString(sha.ComputeHash(ms.ToArray())).ToLowerInvariant();
+        }
+
+        /// <summary>
+        /// Creates and starts a desktop container. <paramref name="agentID"/> null = the
+        /// Steward's shared desktop; non-null = a per-agent container. The Steward volume is
+        /// mounted at /project in every container of the Steward (shared directories, §4).
+        /// </summary>
+        public async Task<DesktopContainerRecord> CreateDesktopContainerAsync(string stewardID, string? agentID,
+            int? width = null, int? height = null, CancellationToken ct = default)
+        {
+            int resolvedWidth = width ?? StewardContainerConfig.ResolveDesktopWidth();
+            int resolvedHeight = height ?? StewardContainerConfig.ResolveDesktopHeight();
+            var docker = await GetClientAsync();
+            string image = imageForSteward(stewardID);
+            // Stamp the container with the image's build-context hash so a later image rebuild
+            // (new baked tools) makes this container detectably stale and recreatable.
+            string imageContextHash = await GetImageContextHashAsync(image, ct) ?? "";
+
+            string volumeHostDir = StewardWorkspaceLocator.HostRoot(stewardID);
+            Directory.CreateDirectory(volumeHostDir);
+            string profileSegment = BrowserProfileHandoff.ProfileSegment(agentID);
+            string profileHostDir = BrowserProfileHandoff.ProfilePath(stewardID, agentID);
+            Directory.CreateDirectory(profileHostDir);
+            // Package environments contain platform-specific launchers and native binaries. Keep
+            // them in an owner-specific Linux runtime mount rather than the cross-OS /project tree;
+            // this persists across image/container replacement without allowing one agent's venv
+            // or node_modules to corrupt another's.
+            string runtimeHostDir = Path.Combine(volumeHostDir, ".klive", "agent-runtime", profileSegment);
+            Directory.CreateDirectory(runtimeHostDir);
+
+            var create = await docker.Containers.CreateContainerAsync(new CreateContainerParameters
+            {
+                Image = image,
+                Name = $"demiurge-{stewardID[..Math.Min(8, stewardID.Length)]}-{(agentID == null ? "shared" : agentID[..Math.Min(8, agentID.Length)])}-{Guid.NewGuid().ToString("N")[..6]}",
+                Labels = new Dictionary<string, string>
+                {
+                    [ContainerLabels.Owner] = ContainerLabels.OwnerValue,
+                    [ContainerLabels.StewardID] = stewardID,
+                    [ContainerLabels.AgentID] = agentID ?? "",
+                    [ContainerLabels.Width] = resolvedWidth.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    [ContainerLabels.Height] = resolvedHeight.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    [ContainerLabels.ContextHash] = imageContextHash,
+                },
+                Env = BuildContainerEnv(resolvedWidth, resolvedHeight, profileSegment, stewardID),
+                ExposedPorts = new Dictionary<string, EmptyStruct>
+                {
+                    [$"{VncContainerPort}/tcp"] = default,
+                    [$"{BrowserServiceContainerPort}/tcp"] = default,
+                },
+                HostConfig = new HostConfig
+                {
+                    // Ceilings, not reservations: an idle desktop costs only what it touches, and
+                    // the sum of these ceilings is what DesktopCapacityPolicy admits against.
+                    Memory = DesktopCapacityPolicy.DesktopMemoryLimitBytes,
+                    MemoryReservation = DesktopCapacityPolicy.DesktopMemoryReservationBytes,
+                    MemorySwap = DesktopCapacityPolicy.DesktopMemoryLimitBytes + DesktopCapacityPolicy.DesktopSwapAllowanceBytes,
+                    // Under memory pressure the kernel must pick a desktop process, never dockerd.
+                    OomScoreAdj = DesktopCapacityPolicy.DesktopOomScoreAdj,
+                    PidsLimit = DesktopCapacityPolicy.DesktopPidsLimit,
+                    // Ephemeral host port, loopback only — see class remarks on the auth boundary.
+                    PortBindings = new Dictionary<string, IList<PortBinding>>
+                    {
+                        [$"{VncContainerPort}/tcp"] = new List<PortBinding> { new() { HostIP = "127.0.0.1", HostPort = "" } },
+                        // Loopback-only on the host, same as VNC: inside the container the service
+                        // binds every interface (a published port arrives over the bridge), so the
+                        // host binding is the confinement.
+                        [$"{BrowserServiceContainerPort}/tcp"] = new List<PortBinding> { new() { HostIP = "127.0.0.1", HostPort = "" } },
+                    },
+                    Binds = new List<string> { $"{volumeHostDir}:/project", $"{runtimeHostDir}:/agent-runtime" },
+                    RestartPolicy = new RestartPolicy { Name = RestartPolicyKind.UnlessStopped },
+                    ShmSize = 256 * 1024 * 1024, // browsers crash with the 64MB default /dev/shm
+                },
+            }, ct);
+
+            DesktopContainerRecord record;
+            try
+            {
+                await docker.Containers.StartContainerAsync(create.ID, new ContainerStartParameters(), ct);
+
+                // Docker Desktop's WSL2 backend often returns from StartContainerAsync before the
+                // ephemeral host port is wired into the port proxy, so a single inspect races and
+                // sees no binding. Poll until Docker reports it (usually well under a second).
+                int hostPort = await WaitForHostPortAsync(docker, create.ID, ct)
+                    ?? throw new InvalidOperationException(
+                        $"Container {create.ID[..12]} started but no host port was bound for VNC after waiting " +
+                        $"(container state: {await DescribeStateAsync(docker, create.ID, ct)}).");
+
+                // By the time VNC's binding exists the rest are wired too. Not fatal if absent: a
+                // missing browser-service port only costs the docker-exec fallback, whereas no VNC
+                // port means no desktop at all, which is why only that one throws.
+                int browserServicePort = 0;
+                try
+                {
+                    browserServicePort = ResolvePublishedPort(
+                        await docker.Containers.InspectContainerAsync(create.ID, ct),
+                        BrowserServiceContainerPort) ?? 0;
+                }
+                catch (Exception ex) { log($"Could not resolve the browser-service port for {create.ID[..12]}: {ex.Message}"); }
+
+                record = new DesktopContainerRecord
+                {
+                    ContainerID = create.ID,
+                    StewardID = stewardID,
+                    AgentID = agentID,
+                    VncHostPort = hostPort,
+                    BrowserServiceHostPort = browserServicePort,
+                    Width = resolvedWidth,
+                    Height = resolvedHeight,
+                    ImageContextHash = imageContextHash,
+                };
+                registry.Add(record);
+            }
+            catch
+            {
+                // The container was created (and possibly started) but never made it into the
+                // registry — with restart=unless-stopped it would otherwise run and hold ~2 GB
+                // forever, invisible to the registry-driven reap. Tear it down before rethrowing.
+                // Uses CancellationToken.None so a cancelled create still cleans up after itself.
+                try { await docker.Containers.RemoveContainerAsync(create.ID, new ContainerRemoveParameters { Force = true }, CancellationToken.None); }
+                catch (Exception cleanupEx) { log($"Failed to remove container {create.ID[..12]} after a failed create: {cleanupEx.Message}"); }
+                throw;
+            }
+            log($"Created desktop container {create.ID[..12]} for Steward {stewardID}{(agentID == null ? " (shared)" : $" agent {agentID}")} on 127.0.0.1:{record.VncHostPort}.");
+            try { await DeliverComputerTokenAsync(create.ID, ct); }
+            catch (Exception ex) when (!ct.IsCancellationRequested)
+            {
+                // Not fatal: the first helper sync delivers it, and docker exec serves until then.
+                log($"Could not deliver the computer-daemon token to {create.ID[..12]} yet: {ex.Message}");
+            }
+            return record;
+        }
+
+        /// <summary>Idle computers retain installed packages, home files and settings.</summary>
+        public async Task SuspendContainerAsync(DesktopContainerRecord record, CancellationToken ct = default)
+        {
+            if (record.Suspended) return;
+            // Persist intent first so reconciliation cannot restart an intentionally idle machine.
+            record.Suspended = true;
+            registry.Update(record);
+            try
+            {
+                await WithDeadlineAsync(async token =>
+                {
+                    var docker = await GetClientAsync(token);
+                    await docker.Containers.StopContainerAsync(record.ContainerID,
+                        new ContainerStopParameters { WaitBeforeKillSeconds = 15 }, token);
+                    return true;
+                }, TimeSpan.FromSeconds(30), "desktop suspension", ct);
+            }
+            catch
+            {
+                record.Suspended = false;
+                registry.Update(record);
+                throw;
+            }
+        }
+
+        public async Task ResumeContainerAsync(DesktopContainerRecord record, CancellationToken ct = default)
+        {
+            await WithDeadlineAsync(async token =>
+            {
+                var docker = await GetClientAsync(token);
+                var inspect = await docker.Containers.InspectContainerAsync(record.ContainerID, token);
+                if (!inspect.State.Running)
+                    await docker.Containers.StartContainerAsync(record.ContainerID, new ContainerStartParameters(), token);
+                record.VncHostPort = await WaitForHostPortAsync(docker, record.ContainerID, token)
+                    ?? throw new InvalidOperationException("Resumed desktop has no VNC port.");
+                inspect = await docker.Containers.InspectContainerAsync(record.ContainerID, token);
+                record.BrowserServiceHostPort = ResolvePublishedPort(inspect, BrowserServiceContainerPort) ?? 0;
+                record.Suspended = false;
+                record.Lost = false;
+                record.LastUsedAt = DateTime.UtcNow;
+                registry.Update(record);
+                return true;
+            }, TimeSpan.FromSeconds(45), "desktop resume", ct);
+        }
+
+        /// <summary>Stops and removes a container and forgets it in the registry.</summary>
+        public async Task StopContainerAsync(string containerID, CancellationToken ct = default)
+        {
+            var docker = await GetClientAsync();
+            try { await docker.Containers.StopContainerAsync(containerID, new ContainerStopParameters { WaitBeforeKillSeconds = 15 }, ct); }
+            catch (DockerContainerNotFoundException) { }
+            try { await docker.Containers.RemoveContainerAsync(containerID, new ContainerRemoveParameters { Force = true }, ct); }
+            catch (DockerContainerNotFoundException) { }
+            registry.Remove(containerID);
+            log($"Stopped and removed desktop container {containerID[..Math.Min(12, containerID.Length)]}.");
+        }
+
+        /// <summary>
+        /// Safety-net reap of desktop containers Docker still runs but the registry has no record
+        /// for — orphans left by a create that failed after start, a registry reset/corruption, or
+        /// any other drift. Because our containers carry restart=unless-stopped, an untracked one
+        /// would otherwise run (holding ~2 GB) forever, invisible to the registry-driven reap.
+        /// Only containers older than <paramref name="minAge"/> are removed, so a container that is
+        /// mid-provision (started, not yet in the registry) is never killed out from under itself.
+        /// Returns the number reaped.
+        /// </summary>
+        public async Task<int> ReapOrphansAsync(TimeSpan minAge, CancellationToken ct = default)
+        {
+            IList<ContainerListResponse> live;
+            try { live = await ListRunningAsync(ct); }
+            catch (Exception ex)
+            {
+                log($"ContainerOrchestrator: Docker unreachable during orphan reap ({ex.Message}).");
+                return 0;
+            }
+
+            var tracked = new HashSet<string>(registry.All().Select(r => r.ContainerID), StringComparer.Ordinal);
+            var cutoff = DateTime.UtcNow - minAge;
+            int reaped = 0;
+            foreach (var c in live)
+            {
+                if (tracked.Contains(c.ID)) continue;
+                if (c.Created > cutoff) continue; // too young — may be an in-flight provision
+                try
+                {
+                    await StopContainerAsync(c.ID, ct);
+                    reaped++;
+                    log($"Reaped orphaned desktop container {c.ID[..Math.Min(12, c.ID.Length)]} (no registry record; created {c.Created:u}).");
+                }
+                catch (Exception ex) { log($"Failed to reap orphaned container {c.ID[..Math.Min(12, c.ID.Length)]}: {ex.Message}"); }
+            }
+            return reaped;
+        }
+
+        /// <summary>All live Docker containers carrying our owner label (current or pre-rename value).</summary>
+        public async Task<IList<ContainerListResponse>> ListRunningAsync(CancellationToken ct = default)
+        {
+            var docker = await GetClientAsync();
+            return await ListOwnedAsync(docker, ct);
+        }
+
+        /// <summary>Docker filters on one label value at a time, so filter on the key and keep both
+        /// owner values; desktops created before the rename are still Demiurge's to manage.</summary>
+        internal static async Task<IList<ContainerListResponse>> ListOwnedAsync(DockerClient docker, CancellationToken ct)
+        {
+            var all = await docker.Containers.ListContainersAsync(new ContainersListParameters
+            {
+                All = true,
+                Filters = new Dictionary<string, IDictionary<string, bool>>
+                {
+                    ["label"] = new Dictionary<string, bool> { [ContainerLabels.Owner] = true },
+                },
+            }, ct);
+            return all.Where(c => ContainerLabels.IsOwnedByDemiurge(c.Labels)).ToList();
+        }
+
+        /// <summary>
+        /// Reconciliation between the persisted registry and Docker reality. Docker containers
+        /// carrying our ownership labels are adopted when their registry entry is missing;
+        /// registry records whose container is gone are marked Lost (never silently dropped — the
+        /// Commander should learn its desktop died). Running containers are re-inspected so a
+        /// changed ephemeral port is picked up; stopped-but-present containers are restarted.
+        /// </summary>
+        public async Task ReconcileAsync(CancellationToken ct = default)
+        {
+            IList<ContainerListResponse> live;
+            try { live = await ListRunningAsync(ct); }
+            catch (Exception ex)
+            {
+                log($"ContainerOrchestrator: Docker unreachable during reconcile ({ex.Message}) — desktops unavailable until it returns.");
+                throw; // A failed inventory must never authorize subsequent cleanup.
+            }
+            var docker = await GetClientAsync();
+
+            // A desktop created before the data folder moved from SavedData/Projects still mounts a
+            // path that no longer holds its volume. Replace it rather than adopt it: the next use
+            // creates a fresh desktop on the moved volume (files, profiles and runtimes live there).
+            if (!DemiurgeStorageMigration.UsingLegacyFolder)
+            {
+                var stale = live.Where(c => DemiurgeStorageMigration.MountsLegacyFolder(c.Mounts?.Select(m => m.Source))).ToList();
+                foreach (var container in stale)
+                {
+                    try
+                    {
+                        await StopContainerAsync(container.ID, ct);
+                        registry.Remove(container.ID);
+                        log($"Reconcile: removed desktop {container.ID[..Math.Min(12, container.ID.Length)]}, which mounts the pre-rename SavedData/Projects folder; it is recreated on the moved volume on next use.");
+                    }
+                    catch (Exception ex) { log($"Reconcile: failed to remove pre-rename desktop {container.ID[..Math.Min(12, container.ID.Length)]}: {ex.Message}"); }
+                }
+                if (stale.Count > 0)
+                {
+                    var removed = stale.Select(c => c.ID).ToHashSet(StringComparer.Ordinal);
+                    live = live.Where(c => !removed.Contains(c.ID)).ToList();
+                }
+            }
+            var liveByID = live.ToDictionary(c => c.ID, c => c);
+
+            // The registry is a cache of discoverability, not the authority for whether a desktop
+            // exists. A surviving labelled Docker container may still be in active use by an agent
+            // even if a prior registry write/load was interrupted. Adopt it before the UI snapshots
+            // the registry (and before the orphan reaper can mistake it for garbage).
+            var trackedIDs = new HashSet<string>(registry.All().Select(r => r.ContainerID), StringComparer.Ordinal);
+            foreach (var summary in live.Where(c => !trackedIDs.Contains(c.ID)))
+            {
+                if (summary.Labels == null
+                    || !ContainerLabels.TryGet(summary.Labels, ContainerLabels.StewardID, out string? stewardID)
+                    || string.IsNullOrWhiteSpace(stewardID))
+                {
+                    log($"Reconcile: labelled desktop {summary.ID[..Math.Min(12, summary.ID.Length)]} has no Steward ID; leaving it untracked for orphan cleanup.");
+                    continue;
+                }
+
+                if (!string.Equals(summary.State, "running", StringComparison.OrdinalIgnoreCase))
+                {
+                    try { await docker.Containers.StartContainerAsync(summary.ID, new ContainerStartParameters(), ct); }
+                    catch (Exception ex)
+                    {
+                        log($"Reconcile: failed to restart untracked desktop {summary.ID[..Math.Min(12, summary.ID.Length)]}: {ex.Message}");
+                        continue;
+                    }
+                }
+
+                try
+                {
+                    var inspect = await docker.Containers.InspectContainerAsync(summary.ID, ct);
+                    int? port = ResolveHostPort(inspect);
+                    if (!port.HasValue)
+                    {
+                        log($"Reconcile: surviving desktop {summary.ID[..Math.Min(12, summary.ID.Length)]} has no VNC host port yet; adoption deferred.");
+                        continue;
+                    }
+
+                    summary.Labels.TryGetValue(ContainerLabels.AgentID, out string? agentID);
+                    ContainerLabels.TryGet(summary.Labels, ContainerLabels.ContextHash, out string? contextHash);
+                    int width = ReadDesktopDimension(summary.Labels, inspect.Config?.Env, ContainerLabels.Width, "DISPLAY_WIDTH", 1920);
+                    int height = ReadDesktopDimension(summary.Labels, inspect.Config?.Env, ContainerLabels.Height, "DISPLAY_HEIGHT", 1080);
+                    var adopted = new DesktopContainerRecord
+                    {
+                        ContainerID = summary.ID,
+                        StewardID = stewardID,
+                        AgentID = string.IsNullOrWhiteSpace(agentID) ? null : agentID,
+                        VncHostPort = port.Value,
+                        BrowserServiceHostPort = ResolvePublishedPort(inspect, BrowserServiceContainerPort) ?? 0,
+                        Width = width,
+                        Height = height,
+                        CreatedAt = summary.Created,
+                        LastUsedAt = DateTime.UtcNow,
+                        ImageContextHash = contextHash ?? "",
+                    };
+                    registry.Add(adopted);
+                    trackedIDs.Add(summary.ID);
+                    log($"Reconcile: adopted surviving desktop {summary.ID[..Math.Min(12, summary.ID.Length)]} for Steward {stewardID}{(adopted.AgentID == null ? " (shared)" : $" agent {adopted.AgentID}")}.");
+                }
+                catch (Exception ex) { log($"Reconcile: failed to adopt surviving desktop {summary.ID[..Math.Min(12, summary.ID.Length)]}: {ex.Message}"); }
+            }
+
+            foreach (var record in registry.All())
+            {
+                if (!liveByID.TryGetValue(record.ContainerID, out var summary))
+                {
+                    if (!record.Lost)
+                    {
+                        record.Lost = true;
+                        registry.Update(record);
+                        log($"Reconcile: container {record.ContainerID[..12]} (Steward {record.StewardID}) is gone — marked lost.");
+                    }
+                    continue;
+                }
+
+                if (record.Suspended) continue;
+                if (!string.Equals(summary.State, "running", StringComparison.OrdinalIgnoreCase))
+                {
+                    try { await docker.Containers.StartContainerAsync(record.ContainerID, new ContainerStartParameters(), ct); }
+                    catch (Exception ex) { log($"Reconcile: failed to restart {record.ContainerID[..12]}: {ex.Message}"); continue; }
+                }
+
+                try
+                {
+                    var inspect = await docker.Containers.InspectContainerAsync(record.ContainerID, ct);
+                    await AlignMemoryLimitsAsync(docker, record.ContainerID, inspect, ct);
+                    int? port = ResolveHostPort(inspect);
+                    // Docker reassigns ephemeral published ports on restart, so both must be
+                    // re-read together — a stale browser-service port silently sends every action
+                    // back down the docker-exec path this service exists to avoid.
+                    int browserPort = ResolvePublishedPort(inspect, BrowserServiceContainerPort) ?? 0;
+                    if (port.HasValue && (port.Value != record.VncHostPort || record.Lost
+                        || browserPort != record.BrowserServiceHostPort))
+                    {
+                        record.VncHostPort = port.Value;
+                        record.BrowserServiceHostPort = browserPort;
+                        record.Lost = false;
+                        registry.Update(record);
+                    }
+                }
+                catch (Exception ex) { log($"Reconcile: inspect failed for {record.ContainerID[..12]}: {ex.Message}"); }
+            }
+
+            // Enforce the one-container-per-owner invariant after reality has been reattached.
+            // This also cleans up duplicate records left by a crash between replacement creation
+            // and old-container removal.
+            foreach (var group in registry.All().Where(r => !r.Lost)
+                .GroupBy(r => r.StewardID + "\0" + (r.AgentID ?? "<shared>"), StringComparer.Ordinal))
+            {
+                var ordered = group.OrderByDescending(r => r.LastUsedAt).ThenByDescending(r => r.CreatedAt).ToList();
+                foreach (var duplicate in ordered.Skip(1))
+                {
+                    try
+                    {
+                        await StopContainerAsync(duplicate.ContainerID, ct);
+                        log($"Reconcile: removed duplicate desktop {duplicate.ContainerID[..12]} for Steward owner {group.Key.Replace("\0", "/")}.");
+                    }
+                    catch (Exception ex) { log($"Reconcile: failed to remove duplicate {duplicate.ContainerID[..12]}: {ex.Message}"); }
+                }
+            }
+            log($"Container reconcile complete: {registry.All().Count(r => !r.Lost)} live desktop(s).");
+        }
+
+        /// <summary>
+        /// Brings a desktop created under an older policy (2 GB, no reservation) onto the current
+        /// ceilings, so admission's arithmetic holds for the whole fleet and not just new machines.
+        /// Best-effort: the kernel may refuse to lower a ceiling below current use, in which case
+        /// the desktop keeps its old limit until it is next stopped.
+        /// </summary>
+        private async Task AlignMemoryLimitsAsync(DockerClient docker, string containerID,
+            ContainerInspectResponse inspect, CancellationToken ct)
+        {
+            var host = inspect.HostConfig;
+            if (host == null) return;
+            long swap = DesktopCapacityPolicy.DesktopMemoryLimitBytes + DesktopCapacityPolicy.DesktopSwapAllowanceBytes;
+            if (host.Memory == DesktopCapacityPolicy.DesktopMemoryLimitBytes
+                && host.MemoryReservation == DesktopCapacityPolicy.DesktopMemoryReservationBytes
+                && host.MemorySwap == swap)
+                return;
+            try
+            {
+                await docker.Containers.UpdateContainerAsync(containerID, new ContainerUpdateParameters
+                {
+                    Memory = DesktopCapacityPolicy.DesktopMemoryLimitBytes,
+                    MemoryReservation = DesktopCapacityPolicy.DesktopMemoryReservationBytes,
+                    MemorySwap = swap,
+                    PidsLimit = DesktopCapacityPolicy.DesktopPidsLimit,
+                }, ct);
+                log($"Desktop {containerID[..Math.Min(12, containerID.Length)]} moved onto the current memory ceilings.");
+            }
+            catch (Exception ex)
+            {
+                log($"Desktop {containerID[..Math.Min(12, containerID.Length)]} kept its previous memory ceiling ({ex.Message}).");
+            }
+        }
+
+        /// <summary>
+        /// Polls the container's inspect until Docker reports the ephemeral VNC host-port binding,
+        /// working around the WSL2 backend race where StartContainerAsync returns early. Returns
+        /// null if the binding never appears within the window, or if the container exits first.
+        /// </summary>
+        private static async Task<int?> WaitForHostPortAsync(DockerClient docker, string containerID, CancellationToken ct)
+        {
+            const int maxAttempts = 20;   // 20 * 250ms = up to ~5s
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                var inspect = await docker.Containers.InspectContainerAsync(containerID, ct);
+                int? port = ResolveHostPort(inspect);
+                if (port.HasValue) return port;
+
+                // The entrypoint crashed and Docker isn't retrying it — no port is ever coming.
+                if (inspect.State is { Running: false, Restarting: false })
+                    return null;
+
+                await Task.Delay(250, ct);
+            }
+            return null;
+        }
+
+        /// <summary>Best-effort container status string for diagnostics; never throws.</summary>
+        private static async Task<string> DescribeStateAsync(DockerClient docker, string containerID, CancellationToken ct)
+        {
+            try
+            {
+                var s = (await docker.Containers.InspectContainerAsync(containerID, ct)).State;
+                if (s == null) return "unknown";
+                string status = s.Status ?? "unknown";
+                return s.ExitCode != 0 ? $"{status}, exit {s.ExitCode}{(string.IsNullOrEmpty(s.Error) ? "" : $": {s.Error}")}" : status;
+            }
+            catch { return "uninspectable"; }
+        }
+
+        private static int? ResolveHostPort(ContainerInspectResponse inspect)
+            => ResolvePublishedPort(inspect, VncContainerPort);
+
+        private static int? ResolvePublishedPort(ContainerInspectResponse inspect, int containerPort)
+        {
+            if (inspect.NetworkSettings?.Ports != null &&
+                inspect.NetworkSettings.Ports.TryGetValue($"{containerPort}/tcp", out var bindings) &&
+                bindings is { Count: > 0 } &&
+                int.TryParse(bindings[0].HostPort, out int port))
+                return port;
+            return null;
+        }
+
+        private static int ReadDesktopDimension(IDictionary<string, string> labels, IList<string>? env,
+            string labelName, string envName, int fallback)
+        {
+            if (labels.TryGetValue(labelName, out string? labelled)
+                && int.TryParse(labelled, out int labelValue) && labelValue > 0)
+                return labelValue;
+            string prefix = envName + "=";
+            string? envValue = env?.FirstOrDefault(value => value.StartsWith(prefix, StringComparison.Ordinal));
+            return envValue != null && int.TryParse(envValue[prefix.Length..], out int parsed) && parsed > 0
+                ? parsed
+                : fallback;
+        }
+    }
+}

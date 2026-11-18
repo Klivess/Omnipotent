@@ -74,21 +74,21 @@ namespace Omnipotent.Tests.KliveLLM
         {
             var doc = new LlmRoutingDocument();
             doc.Default.Router = LlmRouterIds.HuggingFace;
-            doc.Services["Projects"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter };
-            doc.Lanes["Projects/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.AIRouter };
+            doc.Services["Demiurge"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter };
+            doc.Lanes["Demiurge/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.AIRouter };
 
-            Assert.Equal(LlmRouterIds.AIRouter, Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCommander).Primary!.Id);
-            Assert.Equal(LlmRouterIds.OpenRouter, Resolve(doc, LlmConsumerCatalog.Callers.ProjectsUtility).Primary!.Id);
+            Assert.Equal(LlmRouterIds.AIRouter, Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCommander).Primary!.Id);
+            Assert.Equal(LlmRouterIds.OpenRouter, Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeUtility).Primary!.Id);
             Assert.Equal(LlmRouterIds.HuggingFace, Resolve(doc, LlmConsumerCatalog.Callers.StratumEngineer).Primary!.Id);
 
             doc.Override = new LlmEmergencyOverride { Router = LlmRouterIds.Custom, UntilUtc = Now.AddHours(1) };
-            var overridden = Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCommander);
+            var overridden = Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCommander);
             Assert.Equal(LlmRouterIds.Custom, overridden.Primary!.Id);
             Assert.Equal("override", overridden.Source);
-            Assert.Equal(LlmRouterIds.AIRouter, Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCommander, now: Now.AddHours(2)).Primary!.Id);
+            Assert.Equal(LlmRouterIds.AIRouter, Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCommander, now: Now.AddHours(2)).Primary!.Id);
 
             doc.Override.Services = new List<string> { "Stratum" };
-            Assert.Equal(LlmRouterIds.AIRouter, Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCommander).Primary!.Id);
+            Assert.Equal(LlmRouterIds.AIRouter, Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCommander).Primary!.Id);
             Assert.Equal(LlmRouterIds.Custom, Resolve(doc, LlmConsumerCatalog.Callers.StratumEngineer).Primary!.Id);
         }
 
@@ -96,16 +96,16 @@ namespace Omnipotent.Tests.KliveLLM
         public void AModelChosenForOneRouter_NeverCarriesOverToAnother()
         {
             var doc = new LlmRoutingDocument();
-            doc.Services["Projects"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter, Model = "anthropic/claude-sonnet-4.5" };
-            doc.Lanes["Projects/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.AIRouter };
-            var commander = Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCommander);
+            doc.Services["Demiurge"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter, Model = "anthropic/claude-sonnet-4.5" };
+            doc.Lanes["Demiurge/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.AIRouter };
+            var commander = Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCommander);
             Assert.Equal(LlmRouterIds.AIRouter, commander.Primary!.Id);
             Assert.Null(commander.Model);
 
             // A lane that keeps the service's router inherits its model; one that only names a model keeps the router.
-            Assert.Equal("anthropic/claude-sonnet-4.5", Resolve(doc, LlmConsumerCatalog.Callers.ProjectsUtility).Model);
-            doc.Lanes["Projects/council"] = new LlmRoutePolicy { Model = "openai/gpt-5", Pin = true };
-            var council = Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCouncil);
+            Assert.Equal("anthropic/claude-sonnet-4.5", Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeUtility).Model);
+            doc.Lanes["Demiurge/council"] = new LlmRoutePolicy { Model = "openai/gpt-5", Pin = true };
+            var council = Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCouncil);
             Assert.Equal(LlmRouterIds.OpenRouter, council.Primary!.Id);
             Assert.Equal("openai/gpt-5", council.Model);
             Assert.True(council.Pin);
@@ -155,11 +155,11 @@ namespace Omnipotent.Tests.KliveLLM
         public void APausedServiceOrLane_IsRefused()
         {
             var doc = new LlmRoutingDocument();
-            doc.Lanes["Projects/council"] = new LlmRoutePolicy { Paused = true, PausedReason = "testing" };
-            Assert.Equal(RemoteLLMFailureKind.Paused, Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCouncil).Block);
-            Assert.False(Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCommander).IsBlocked);
-            doc.Services["Projects"] = new LlmRoutePolicy { Paused = true };
-            Assert.Equal(RemoteLLMFailureKind.Paused, Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCommander).Block);
+            doc.Lanes["Demiurge/council"] = new LlmRoutePolicy { Paused = true, PausedReason = "testing" };
+            Assert.Equal(RemoteLLMFailureKind.Paused, Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCouncil).Block);
+            Assert.False(Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCommander).IsBlocked);
+            doc.Services["Demiurge"] = new LlmRoutePolicy { Paused = true };
+            Assert.Equal(RemoteLLMFailureKind.Paused, Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCommander).Block);
         }
 
         [Fact]
@@ -196,9 +196,9 @@ namespace Omnipotent.Tests.KliveLLM
         public void ToolCallingLanes_CannotRunOnTheLocalModel()
         {
             var doc = new LlmRoutingDocument();
-            doc.Lanes["Projects/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.Local };
+            doc.Lanes["Demiurge/commander"] = new LlmRoutePolicy { Router = LlmRouterIds.Local };
             Assert.NotNull(LlmRouteResolver.Validate(doc, LlmRouterRegistry.Merge(doc.Routers)));
-            Assert.Equal(RemoteLLMFailureKind.RouterUnavailable, Resolve(doc, LlmConsumerCatalog.Callers.ProjectsCommander).Block);
+            Assert.Equal(RemoteLLMFailureKind.RouterUnavailable, Resolve(doc, LlmConsumerCatalog.Callers.DemiurgeCommander).Block);
             doc.Lanes.Clear();
             doc.Lanes["KliveBot/discord-chat"] = new LlmRoutePolicy { Router = LlmRouterIds.Local };
             Assert.Null(LlmRouteResolver.Validate(doc, LlmRouterRegistry.Merge(doc.Routers)));
@@ -230,28 +230,28 @@ namespace Omnipotent.Tests.KliveLLM
                 var store = LlmRoutingStore.Load(dir, null);
                 Assert.Equal(0, store.Revision);
                 var next = store.Current.Clone();
-                next.Services["Projects"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter };
-                var first = store.Apply(next, 0, "Klives", "move projects");
+                next.Services["Demiurge"] = new LlmRoutePolicy { Router = LlmRouterIds.OpenRouter };
+                var first = store.Apply(next, 0, "Klives", "move Stewards");
                 Assert.True(first.Ok);
                 Assert.Equal(1, store.Revision);
-                Assert.Contains(first.Entry!.Changes, c => c.Contains("Projects") && c.Contains("openrouter"));
+                Assert.Contains(first.Entry!.Changes, c => c.Contains("Demiurge") && c.Contains("openrouter"));
 
                 var stale = store.Apply(next, 0, "Klives", "again");
                 Assert.False(stale.Ok);
                 Assert.True(stale.Conflict);
 
-                var second = store.Mutate(doc => { doc.Services["Projects"].Router = LlmRouterIds.AIRouter; return null; }, "Klives", "back");
+                var second = store.Mutate(doc => { doc.Services["Demiurge"].Router = LlmRouterIds.AIRouter; return null; }, "Klives", "back");
                 Assert.True(second.Ok);
                 Assert.Equal(2, store.Revision);
 
                 // A fresh store reads what was saved, and history can restore revision 1.
                 var reopened = LlmRoutingStore.Load(dir, null);
-                Assert.Equal(LlmRouterIds.AIRouter, reopened.Current.Services["projects"].Router);
+                Assert.Equal(LlmRouterIds.AIRouter, reopened.Current.Services["demiurge"].Router);
                 var history = reopened.History(10);
                 Assert.Equal(new long[] { 2, 1 }, history.Select(h => h.Revision));
                 var restored = reopened.Apply(reopened.HistoryEntry(1)!.After!, reopened.Revision, "Klives", "restore");
                 Assert.True(restored.Ok);
-                Assert.Equal(LlmRouterIds.OpenRouter, reopened.Current.Services["Projects"].Router);
+                Assert.Equal(LlmRouterIds.OpenRouter, reopened.Current.Services["Demiurge"].Router);
             }
             finally { try { Directory.Delete(dir, true); } catch { } }
         }
@@ -264,7 +264,7 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.False(circuit.IsOpen("Stratum/engineer", "alpha"));
             circuit.RecordFailure("Stratum/engineer", "alpha", "503");
             Assert.True(circuit.IsOpen("Stratum/engineer", "alpha"));
-            Assert.False(circuit.IsOpen("Projects/commander", "alpha"));
+            Assert.False(circuit.IsOpen("Demiurge/commander", "alpha"));
 
             clock = clock.AddMinutes(3);
             Assert.False(circuit.IsOpen("Stratum/engineer", "alpha")); // this call is the test
@@ -281,7 +281,7 @@ namespace Omnipotent.Tests.KliveLLM
         [Fact]
         public void CallSites_AreNamedByTheirFolder()
         {
-            Assert.Equal("Projects/commander", LlmConsumerCatalog.FromCallSite(@"C:\src\Omnipotent\Services\Projects\ProjectCommanderRunner.cs").Key);
+            Assert.Equal("Demiurge/commander", LlmConsumerCatalog.FromCallSite(@"C:\src\Omnipotent\Services\Demiurge\StewardCommanderRunner.cs").Key);
             Assert.Equal("Omniscience/detective", LlmConsumerCatalog.FromCallSite("/_/Omnipotent/Services/Omniscience/Deduction/DetectivePass.cs").Key);
             Assert.Equal("Omniscience/extraction", LlmConsumerCatalog.FromCallSite(@"C:\src\Omnipotent\Services\Omniscience\Deduction\ExtractionJob.cs").Key);
             Assert.Equal("KliveBot/discord-chat", LlmConsumerCatalog.FromCallSite(@"C:\src\Omnipotent\Services\KliveBot Discord\KliveBotDiscord.cs").Key);

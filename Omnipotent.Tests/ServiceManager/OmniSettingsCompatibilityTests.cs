@@ -521,6 +521,28 @@ public sealed class OmniSettingsCompatibilityTests
         Assert.DoesNotContain("saved-secret-before-failed-migration", File.ReadAllText(fixture.SettingsPath));
     }
 
+    [Fact]
+    public async Task SettingsOfARenamedService_KeepTheirValues_UnderTheNewNames()
+    {
+        if (!OperatingSystem.IsWindows()) return;
+        using var fixture = new Fixture();
+        fixture.WriteLegacy(
+            new OmniSetting { Name = "Projects_CacheHaltEnabled", Value = "False", Type = OmniSettingType.Bool, ParentServiceId = "run-1", ParentServiceName = "Projects" },
+            new OmniSetting { Name = "Projects_MaxLiveConversations", Value = "4", Type = OmniSettingType.Int, ParentServiceId = "run-1", ParentServiceName = "Projects" },
+            // Already holds the new identity: the old copy must not overwrite it.
+            new OmniSetting { Name = "Projects_FileMaxSizeGb", Value = "3", Type = OmniSettingType.Int, ParentServiceId = "run-1", ParentServiceName = "Projects" },
+            new OmniSetting { Name = "Demiurge_FileMaxSizeGb", Value = "7", Type = OmniSettingType.Int, ParentServiceId = "run-1", ParentServiceName = "Demiurge" });
+
+        await fixture.Manager.InitializeAsync();
+
+        Assert.False(await fixture.Manager.GetBoolOmniSetting("Demiurge_CacheHaltEnabled", true, parentServiceId: "run-2", parentServiceName: "Demiurge"));
+        Assert.Equal(4, await fixture.Manager.GetIntOmniSetting("Demiurge_MaxLiveConversations", 0, parentServiceId: "run-2", parentServiceName: "Demiurge"));
+        Assert.Equal(7, await fixture.Manager.GetIntOmniSetting("Demiurge_FileMaxSizeGb", 10, parentServiceId: "run-2", parentServiceName: "Demiurge"));
+        var rows = ReadRows(fixture.SettingsPath);
+        Assert.DoesNotContain(rows, r => r.Name == "Projects_CacheHaltEnabled" || r.Name == "Projects_MaxLiveConversations");
+        Assert.All(rows.Where(r => r.Name.StartsWith("Demiurge_")), r => Assert.Equal("Demiurge", r.ParentServiceName));
+    }
+
     private static OmniSetting Setting(string name, string? value, OmniSettingType type = OmniSettingType.String) => new()
     {
         Name = name, Value = value!, Type = type, Sensitive = true, ParentServiceId = ServiceId, ParentServiceName = ServiceName

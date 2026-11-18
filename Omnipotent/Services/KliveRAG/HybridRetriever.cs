@@ -18,7 +18,7 @@ namespace Omnipotent.Services.KliveRAG
     /// Both legs run on the thread pool and every SQLite statement is bound to the search deadline
     /// (<see cref="RagSearchOptions.Deadline"/>), because the work underneath is synchronous: an FTS
     /// bm25 sort over every chunk containing a common word, or a cosine scan of every embedding. With
-    /// the Projects event log in the index that is millions of rows, and an unbounded lexical leg on
+    /// the Demiurge event log in the index that is millions of rows, and an unbounded lexical leg on
     /// the caller's thread is what held KliveAgent at "preparing context" for 5-12 minutes.
     /// </summary>
     public sealed class HybridRetriever
@@ -99,11 +99,11 @@ namespace Omnipotent.Services.KliveRAG
 
             if (fused.Count == 0) return new List<RagHit>();
 
-            // Exclude a project's own events/digests (the caller already has that log leg).
-            if (!string.IsNullOrEmpty(opts.ExcludeProjectId))
+            // Exclude a Steward's own events/digests (the caller already has that log leg).
+            if (!string.IsNullOrEmpty(opts.ExcludeStewardId))
             {
-                string p1 = $"projevt:{opts.ExcludeProjectId}:";
-                string p2 = $"projdigest:{opts.ExcludeProjectId}";
+                string p1 = $"projevt:{opts.ExcludeStewardId}:";
+                string p2 = $"projdigest:{opts.ExcludeStewardId}";
                 foreach (var key in fused.Keys.ToList())
                     if (fused[key].DocId.StartsWith(p1, StringComparison.Ordinal) ||
                         fused[key].DocId.StartsWith(p2, StringComparison.Ordinal))
@@ -113,7 +113,7 @@ namespace Omnipotent.Services.KliveRAG
             long now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             foreach (var hit in fused.Values)
             {
-                if (hit.Source == RagSource.ProjectsEvents || hit.Source == RagSource.AgentConversations)
+                if (hit.Source == RagSource.DemiurgeEvents || hit.Source == RagSource.AgentConversations)
                 {
                     double ageDays = Math.Max(0, (now - hit.CreatedAtUnixMs) / 86_400_000.0);
                     hit.Score += 0.08 * Math.Exp(-ageDays / 21.0);

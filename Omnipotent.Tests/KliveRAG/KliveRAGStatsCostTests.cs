@@ -104,7 +104,7 @@ namespace Omnipotent.Tests.KliveRAG
         }
 
         /// <summary>
-        /// Appends documents the size of a Projects event (one chunk each, about 900 characters), the
+        /// Appends documents the size of a Demiurge event (one chunk each, about 900 characters), the
         /// way the event connector grows the index. One in twenty-five is a web page; all but the
         /// newest ten have been embedded.
         /// </summary>
@@ -131,7 +131,7 @@ VALUES($id || '#0',$id,0,$src,$at,$text,$id,225,$embedded)";
 
             for (int i = 0; i < count; i++, filled++)
             {
-                string source = filled % 25 == 0 ? RagSource.Web : RagSource.ProjectsEvents;
+                string source = filled % 25 == 0 ? RagSource.Web : RagSource.DemiurgeEvents;
                 string text = string.Join(' ', Enumerable.Range(0, 150).Select(k => "w" + (filled * 31 + k * 7) % 5000));
                 textBytes += text.Length;
                 foreach (var cmd in new[] { doc, chunk })
@@ -276,8 +276,8 @@ VALUES($id || '#0',$id,0,$src,$at,$text,$id,225,$embedded)";
 
             string longText = string.Concat(Enumerable.Repeat("Sentence about foxes and hounds in the field. ", 150));
             await writer.UpsertAsync(Doc("repodoc:long", longText, RagSource.RepoDocs, single: false));
-            await writer.UpsertAsync(Doc("projevt:p:1", "the commander decided to ship the build today", RagSource.ProjectsEvents));
-            await writer.UpsertAsync(Doc("projevt:p:2", "the agent reported the upload had finished", RagSource.ProjectsEvents));
+            await writer.UpsertAsync(Doc("projevt:p:1", "the commander decided to ship the build today", RagSource.DemiurgeEvents));
+            await writer.UpsertAsync(Doc("projevt:p:2", "the agent reported the upload had finished", RagSource.DemiurgeEvents));
             await writer.UpsertAsync(Doc("web:a", "a fetched page about sqlite counters", RagSource.Web, expiresAt: 1));
             await writer.UpsertAsync(Doc("web:b", "a fetched page that is still fresh", RagSource.Web, expiresAt: long.MaxValue));
             Assert.True(Scalar("SELECT COUNT(*) FROM rag_chunks WHERE doc_id = 'repodoc:long'") > 1);
@@ -297,7 +297,7 @@ VALUES($id || '#0',$id,0,$src,$at,$text,$id,225,$embedded)";
             // Changed content: the writer deletes and re-inserts the chunks that differ, embedded or not.
             Execute("UPDATE rag_chunks SET embedded_at = 7");
             await writer.UpsertAsync(Doc("repodoc:long", longText.Replace("foxes", "badgers"), RagSource.RepoDocs, single: false));
-            await writer.UpsertAsync(Doc("projevt:p:1", "the commander decided to hold the build back", RagSource.ProjectsEvents));
+            await writer.UpsertAsync(Doc("projevt:p:1", "the commander decided to hold the build back", RagSource.DemiurgeEvents));
             AssertCountersMatchTheTables("after documents changed");
 
             // The same document filed under another source.
@@ -347,16 +347,16 @@ VALUES($id || '#0',$id,0,$src,$at,$text,$id,225,$embedded)";
             Assert.NotNull(before.CountsNote);
 
             // Writes between the upgrade and the count, including a delete from a source nothing has been added to since.
-            await writer.UpsertAsync(Doc("projevt:new:1", "an event that arrived after the upgrade", RagSource.ProjectsEvents));
+            await writer.UpsertAsync(Doc("projevt:new:1", "an event that arrived after the upgrade", RagSource.DemiurgeEvents));
             await writer.DeleteAsync("repodoc:only");
-            await writer.DeleteAsync(RagSource.ProjectsEvents + ":7");
+            await writer.DeleteAsync(RagSource.DemiurgeEvents + ":7");
             Execute("UPDATE rag_chunks SET embedded_at = 9 WHERE chunk_id = 'projevt:new:1#0'");
 
             RagCounters.ExistingRows existing;
             using (var conn = db.Open()) existing = RagCounters.ReadExistingRows(conn);
 
             // Writes that land while the count is being taken: after its snapshot, before it is applied.
-            await writer.UpsertAsync(Doc("projevt:new:2", "an event that arrived during the count", RagSource.ProjectsEvents));
+            await writer.UpsertAsync(Doc("projevt:new:2", "an event that arrived during the count", RagSource.DemiurgeEvents));
             await writer.UpsertAsync(Doc("omnilog:new:1", "an error that was logged during the count", RagSource.OmniLogs));
             await writer.DeleteAsync("agentmem:only");
             await writer.DeleteAsync(RagSource.Web + ":25");
@@ -377,7 +377,7 @@ VALUES($id || '#0',$id,0,$src,$at,$text,$id,225,$embedded)";
 
             // Ingestion goes on being counted.
             Fill(40);
-            await writer.DeleteAsync(RagSource.ProjectsEvents + ":8");
+            await writer.DeleteAsync(RagSource.DemiurgeEvents + ":8");
             AssertCountersMatchTheTables("after more ingestion");
         }
 
@@ -610,7 +610,7 @@ VALUES('projevt:open:1','projects-events','t',NULL,'uncommitted','h',1,1,NULL,NU
             Assert.Equal(30, json.Value<long>("chunks"));
             Assert.Equal(20, json.Value<long>("embeddedChunks"));
             Assert.Equal(10, json.Value<long>("pendingEmbeds"));
-            Assert.Equal(28, json["perSource"]!.Value<long>(RagSource.ProjectsEvents));
+            Assert.Equal(28, json["perSource"]!.Value<long>(RagSource.DemiurgeEvents));
             Assert.Equal(2, json["perSource"]!.Value<long>(RagSource.Web));
             Assert.Equal("exact", json.Value<string>("countsState"));
             Assert.False(json.Value<bool>("countsStale"));

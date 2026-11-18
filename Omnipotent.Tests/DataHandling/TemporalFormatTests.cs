@@ -1,5 +1,5 @@
 using Omnipotent.Data_Handling;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 using LlmService = Omnipotent.Services.KliveLLM.KliveLLM;
 
 namespace Omnipotent.Tests.DataHandling
@@ -64,11 +64,11 @@ namespace Omnipotent.Tests.DataHandling
         [Fact]
         public void CommanderEventLines_CarryFullDateStamps()
         {
-            var line = ProjectCommanderPrompts.DescribeEvent(new ProjectEvent
+            var line = StewardCommanderPrompts.DescribeEvent(new StewardEvent
             {
                 Sequence = 7,
                 Timestamp = KnownUtc,
-                Type = ProjectEventTypes.Status,
+                Type = StewardEventTypes.Status,
                 Author = "commander",
                 Text = "checkpoint reached",
             });
@@ -76,20 +76,20 @@ namespace Omnipotent.Tests.DataHandling
         }
 
         [Fact]
-        public void CommanderWakeSeed_AnchorsOnCurrentClockAndProjectCreation()
+        public void CommanderWakeSeed_AnchorsOnCurrentClockAndStewardCreation()
         {
-            var project = new Project
+            var steward = new Steward
             {
-                ProjectID = "p1",
+                StewardID = "p1",
                 Name = "Test",
                 Goal = "Do the thing",
                 CreatedAt = KnownUtc,
             };
-            string seed = ProjectCommanderPrompts.BuildWakeSeed(
-                project,
-                new ProjectDigest { ProjectID = "p1" },
-                new List<ProjectEvent>(),
-                new List<ProjectRetrievalIndex.RetrievalHit>(),
+            string seed = StewardCommanderPrompts.BuildWakeSeed(
+                steward,
+                new StewardDigest { StewardID = "p1" },
+                new List<StewardEvent>(),
+                new List<StewardRetrievalIndex.RetrievalHit>(),
                 "keepalive");
 
             Assert.Contains("Now: ", seed);
@@ -97,7 +97,7 @@ namespace Omnipotent.Tests.DataHandling
             // The creation stamp is ABSOLUTE, not "(3d 4h ago)". A recomputed age in the seed header
             // changes bytes on every wake and costs the provider's prefix cache the entire seed behind
             // it — see PromptPrefixStabilityTests. Elapsed time is read off the 'Now:' line instead.
-            Assert.Contains("project created 2026-07-12 18:04 UTC", seed);
+            Assert.Contains("Steward created 2026-07-12 18:04 UTC", seed);
         }
     }
 }
