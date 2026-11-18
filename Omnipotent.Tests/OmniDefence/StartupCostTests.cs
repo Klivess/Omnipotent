@@ -1,0 +1,288 @@
+using Microsoft.Data.Sqlite;
+using Newtonsoft.Json.Linq;
+using Omnipotent.Services.OmniDefence;
+
+namespace Omnipotent.Tests.OmniDefence
+{
+    /// <summary>
+    /// What OmniDefence does before its routes exist. On 10 Nov 2026 they were still missing 82 and
+    /// 92 minutes after two starts: start-up awaited one query that linked IPs to profiles by
+    /// grouping the whole request log, which SQLite ran as a walk of an IP index with a table lookup
+    /// for every row. The links are now read from a watermark, after start-up, and start-up times
+    /// each of its steps.
+    /// </summary>
+    public class StartupCostTests : IDisposable
+    {
+        private readonly string dbPath = Path.Combine(Path.GetTempPath(), "omnidefence-start-" + Guid.NewGuid().ToString("N") + ".db");
+
+        public void Dispose()
+        {
+            SqliteConnection.ClearAllPools();
+            foreach (var suffix in new[] { "", "-wal", "-shm" })
+            {
+                try { if (File.Exists(dbPath + suffix)) File.Delete(dbPath + suffix); } catch { }
+            }
+        }
+
+        private async Task<OmniDefenceStore> NewStoreAsync()
+        {
+            var store = new OmniDefenceStore(dbPath);
+            await store.InitializeAsync();
+            return store;
+        }
+
+        private static RequestRow Audit(string ip, long ts, string? profile = null, int? rank = null) => new()
+        {
+            UtcTimestamp = ts, Ip = ip, Method = "GET", Route = "/ping", StatusCode = 200, MatchedRoute = true,
+            ProfileId = profile, ProfileName = profile == null ? null : "name-" + profile, ProfileRank = rank
+        };
+
+        private static async Task<IpThreatTracker> StartedTrackerAsync(OmniDefenceStore store)
+        {
+            var tracker = new IpThreatTracker(store);
+            await tracker.LoadAsync();
+            return tracker;
+        }
+
+        [Fact]
+        public async Task ProfileLinks_AreReadFromTheWatermark_NotTheWholeLogAgain()
+        {
+            var store = await NewStoreAsync();
+            await store.InsertRequestsAsync(new[]
+            {
+                Audit("198.51.100.1", 1000, "p1", 5),
+                Audit("198.51.100.2", 1100, "p2", 1),
+                Audit("198.51.100.3", 1200),
+            });
+
+            var first = await (await StartedTrackerAsync(store)).CatchUpProfileLinksAsync();
+            Assert.Equal(new IpThreatTracker.ProfileLinkPass(0, 3, 2), first);
+            Assert.Equal("3", await store.GetSettingAsync(OmniDefenceStore.ProfileLinkWatermarkKey));
+
+            // Rewrite a row the first pass has already read. A pass over the whole log, which is
+            // what every start used to run, would now move 198.51.100.1 to "rewritten".
+            await store.WithLockAsync(async conn =>
+            {
+                using var cmd = conn.CreateCommand();
+                cmd.CommandText = "UPDATE requests SET profile_id = 'rewritten', utc_ts = 9000 WHERE id = 1";
+                await cmd.ExecuteNonQueryAsync();
+            });
+            await store.InsertRequestsAsync(new[] { Audit("198.51.100.3", 1300, "p3", 2) });
+
+            var restarted = await StartedTrackerAsync(store);
+            var second = await restarted.CatchUpProfileLinksAsync();
+
+            Assert.Equal(new IpThreatTracker.ProfileLinkPass(3, 4, 1), second);
+            Assert.Equal("p1", restarted.Get("198.51.100.1")!.AssociatedProfileId);
+            Assert.Equal(5, restarted.Get("198.51.100.1")!.AssociatedProfileRank);
+            Assert.Equal("p2", restarted.Get("198.51.100.2")!.AssociatedProfileId);
+            Assert.Equal("p3", restarted.Get("198.51.100.3")!.AssociatedProfileId);
+
+            // Nothing new: the next start reads no rows at all.
+            var third = await (await StartedTrackerAsync(store)).CatchUpProfileLinksAsync();
+            Assert.Equal(new IpThreatTracker.ProfileLinkPass(4, 4, 0), third);
+        }
+
+        [Fact]
+        public async Task ProfileLinks_TheLatestRequestWins_AcrossSpansAndSurvivesAReload()
+        {
+            var store = await NewStoreAsync();
+            await store.InsertRequestsAsync(new[]
+            {
+                Audit("203.0.113.7", 100, "early", 1),
+                Audit("203.0.113.7", 300, "latest", 5),
+                Audit("203.0.113.7", 400),                 // no profile: links nothing
+                Audit("203.0.113.7", 200, "out-of-order", 2),
+                Audit("203.0.113.8", 250, "other", 3),
+            });
+
+            // Two ids per read, so the rows for one IP arrive in three separate reads.
+            var pass = await (await StartedTrackerAsync(store)).CatchUpProfileLinksAsync(span: 2);
+            Assert.Equal(new IpThreatTracker.ProfileLinkPass(0, 5, 4), pass);
+
+            var reloaded = await StartedTrackerAsync(store);
+            Assert.Equal("latest", reloaded.Get("203.0.113.7")!.AssociatedProfileId);
+            Assert.Equal("name-latest", reloaded.Get("203.0.113.7")!.AssociatedProfileName);
+            Assert.Equal(300, reloaded.Get("203.0.113.7")!.AssociatedProfileLastSeenUtc);
+            Assert.True(reloaded.IsLinkedToKlives("203.0.113.7"));
+            Assert.Equal("other", reloaded.Get("203.0.113.8")!.AssociatedProfileId);
+        }
+
+        [Fact]
+        public async Task ProfileLinks_StartOver_WhenTheWatermarkIsPastTheEndOfTheLog()
+        {
+            var store = await NewStoreAsync();
+            await store.InsertRequestsAsync(new[] { Audit("198.51.100.9", 500, "p9", 1) });
+            await store.SetSettingAsync(OmniDefenceStore.ProfileLinkWatermarkKey, "999");
+
+            var tracker = await StartedTrackerAsync(store);
+            var pass = await tracker.CatchUpProfileLinksAsync();
+
+            Assert.Equal(new IpThreatTracker.ProfileLinkPass(0, 1, 1), pass);
+            Assert.Equal("p9", tracker.Get("198.51.100.9")!.AssociatedProfileId);
+        }
+
+        [Fact]
+        public async Task ProfileLinkRead_WalksTheTableInStoredOrder_ThroughNoIndex()
+        {
+            await NewStoreAsync();
+            using var conn = new SqliteConnection(new SqliteConnectionStringBuilder
+            {
+                DataSource = dbPath, Mode = SqliteOpenMode.ReadWrite, Pooling = false
+            }.ToString());
+            await conn.OpenAsync();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "EXPLAIN QUERY PLAN " + OmniDefenceStore.ProfileLinkRowsSql;
+            cmd.Parameters.AddWithValue("$after", 0);
+            cmd.Parameters.AddWithValue("$through", 20_000);
+            var plan = new List<string>();
+            using (var reader = await cmd.ExecuteReaderAsync())
+            {
+                while (await reader.ReadAsync()) plan.Add(reader.GetString(3));
+            }
+
+            string step = Assert.Single(plan);
+            Assert.Contains("USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)", step);
+        }
+
+        [Fact]
+        public async Task StartupTrace_NamesTheStepUnderWay_ThenKeepsEachStepsTime()
+        {
+            DateTimeOffset now = new(2026, 11, 10, 21, 10, 58, TimeSpan.Zero);
+            var trace = new OmniDefenceStartupTrace(() => now);
+            Assert.False(trace.Running);
+
+            trace.Begin();
+            var gate = new TaskCompletionSource();
+            await trace.Step("opening the store", () => Task.CompletedTask);
+            Task loading = trace.Step("IP records", () => gate.Task);
+
+            // Mid-start: the step it is in, and how long the start has run so far.
+            now = now.AddMinutes(25);
+            Assert.True(trace.Running);
+            Assert.Equal("IP records", trace.CurrentStep);
+            var during = JObject.FromObject(trace.Status());
+            Assert.False(during.Value<bool>("ready"));
+            Assert.Equal("IP records", during.Value<string>("step"));
+            Assert.Equal(1500, during.Value<double>("seconds"));
+            Assert.Equal(new[] { "opening the store" }, ((JObject)during["steps"]!).Properties().Select(p => p.Name));
+
+            gate.SetResult();
+            await loading;
+            now = now.AddSeconds(2);
+            trace.Ready();
+
+            Assert.False(trace.Running);
+            var after = JObject.FromObject(trace.Status());
+            Assert.True(after.Value<bool>("ready"));
+            Assert.Null(after.Value<string>("step"));
+            Assert.Equal(1502, after.Value<double>("seconds"));
+            // Steps in the order they ran, each with its milliseconds.
+            Assert.Equal(new[] { "opening the store", "IP records" }, ((JObject)after["steps"]!).Properties().Select(p => p.Name));
+            Assert.StartsWith("1502.0 s (", trace.Summary());
+        }
+
+        [Fact]
+        public async Task StartupTrace_AStepAfterTheRoutes_IsTimedAndShown_ButNothingWaitsForIt()
+        {
+            // Loading the fingerprint engine took 193.8 s of a 318.5 s start on 11 Nov 2026, all of
+            // it before the routes existed. It now runs after them: the start is ready without it.
+            DateTimeOffset now = new(2026, 11, 11, 0, 28, 39, TimeSpan.Zero);
+            var trace = new OmniDefenceStartupTrace(() => now);
+            trace.Begin();
+            await trace.Step("IP records", () => Task.CompletedTask);
+            now = now.AddSeconds(124);
+            await trace.Step("routes", () => Task.CompletedTask);
+            trace.Ready();
+
+            var loading = new TaskCompletionSource();
+            Task late = trace.Step("fingerprinting", () => loading.Task);
+            now = now.AddSeconds(190);
+
+            var during = JObject.FromObject(trace.Status());
+            Assert.True(during.Value<bool>("ready"));
+            Assert.False(trace.Running);                                 // so no slow-start alert for it
+            Assert.Equal(124, during.Value<double>("seconds"));          // the wait for the routes, not for this
+            Assert.Equal("fingerprinting", during.Value<string>("step"));
+
+            loading.SetResult();
+            await late;
+            var after = JObject.FromObject(trace.Status());
+            Assert.Null(after.Value<string>("step"));
+            Assert.Equal(124, after.Value<double>("seconds"));
+            Assert.Equal(new[] { "IP records", "routes", "fingerprinting" }, ((JObject)after["steps"]!).Properties().Select(p => p.Name));
+        }
+
+        /// <summary>
+        /// "IP records" took 53 s on 11 Nov 2026 and 182 s on 13 Nov for about 6,000 small rows. The
+        /// load now says how long it waited for a read slot, how long the open took, and how many
+        /// pages it read, and start-up serves that beside the step's time.
+        /// </summary>
+        [Fact]
+        public async Task IpRecordLoad_SaysWhereItsTimeWent_AndStartupServesIt()
+        {
+            var store = await NewStoreAsync();
+            var records = Enumerable.Range(1, 300).Select(i => new IpRecord
+            {
+                Ip = $"198.51.{i / 250}.{i % 250}", FirstSeen = 1000 + i, LastSeen = 2000 + i, TotalRequests = i, Status = "Normal",
+                Country = "GB", City = new string('c', 40), Notes = new string('n', 120),
+            }).ToList();
+            await store.UpsertIpRecordsAsync(records);
+            SqliteConnection.ClearAllPools(); // a cold connection, as at start-up
+
+            var tracker = new IpThreatTracker(store);
+            var cost = await tracker.LoadAsync();
+            Assert.Equal(300, cost.Rows);
+            Assert.Equal(300, tracker.All().Count());
+            Assert.True(cost.PagesRead > 0, cost.ToString());
+            Assert.True(cost.SlotWaitMs >= 0 && cost.OpenMs >= 0 && cost.ReadMs >= 0, cost.ToString());
+
+            var trace = new OmniDefenceStartupTrace();
+            trace.Begin();
+            await trace.Step("IP records", () => Task.CompletedTask);
+            trace.Detail("IP records", cost.ToString());
+            var status = JObject.FromObject(trace.Status());
+            Assert.Contains("300 rows", status["details"]!.Value<string>("IP records"));
+            Assert.Contains("pages read", status["details"]!.Value<string>("IP records"));
+
+            trace.Begin(); // a restart starts a clean trace
+            Assert.Empty((JObject)JObject.FromObject(trace.Status())["details"]!);
+            await store.ShutdownAsync();
+        }
+
+        [Fact]
+        public async Task OpeningTheStore_ReportsItsThreeSteps_SoTheSlowOneCanBeNamed()
+        {
+            var steps = new List<string>();
+            var store = new OmniDefenceStore(dbPath);
+            await store.InitializeAsync(async (name, run) =>
+            {
+                steps.Add(name);
+                await run();
+            });
+
+            Assert.Equal(new[] { "opening the database", "checking the schema", "scrubbing settings audits" }, steps);
+            // And it is a working store: the schema is there and the audit flusher is running.
+            await store.InsertRequestsAsync(new[] { Audit("198.51.100.20", 1000, "p1", 1) });
+            Assert.Equal(1, await store.MaxRequestIdAsync());
+            await store.ShutdownAsync();
+        }
+
+        [Fact]
+        public async Task StartupTrace_AFailedStepIsStillTimed_AndTheStartReportsItsError()
+        {
+            var trace = new OmniDefenceStartupTrace();
+            trace.Begin();
+            var failure = new InvalidOperationException("database is locked");
+            await Assert.ThrowsAsync<InvalidOperationException>(() => trace.Step("opening the store", () => throw failure));
+            trace.Failed(failure);
+
+            var status = JObject.FromObject(trace.Status());
+            Assert.False(status.Value<bool>("ready"));
+            Assert.Equal("database is locked", status.Value<string>("error"));
+            Assert.Equal("opening the store", status.Value<string>("step"));
+            Assert.NotNull(status["steps"]!["opening the store"]);
+            Assert.False(trace.Running);
+        }
+    }
+}

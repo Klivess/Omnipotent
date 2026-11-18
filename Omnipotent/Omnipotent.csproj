@@ -30,9 +30,14 @@
 
 	<ItemGroup>
 		<EmbeddedResource Include="Resources\KliveLink\WindowsCacheHostManaged.gz" LogicalName="KliveLink.ManagedAgent.Gzip" />
+		<EmbeddedResource Include="Resources\KliveLink\WindowsCacheHostArm64.gz" LogicalName="KliveLink.ManagedAgentArm64.Gzip" />
 		<EmbeddedResource Include="Resources\KliveLink\WindowsCacheHostNative.b64" LogicalName="KliveLink.NativeAgent.Base64" />
 		<EmbeddedResource Include="Resources\KliveLink\BundledSetup.exe" LogicalName="KliveLink.BundledSetup" />
 		<EmbeddedResource Include="Resources\KliveLink\InfectStub.exe" LogicalName="KliveLink.InfectStub" />
+		<EmbeddedResource Include="Resources\KliveLink\PortableAssets.json" LogicalName="KliveLink.PortableAssets" />
+		<EmbeddedResource Include="Resources\KliveLink\install.sh" LogicalName="KliveLink.InstallSh" />
+		<EmbeddedResource Include="Resources\KliveLink\install.ps1" LogicalName="KliveLink.InstallPs1" />
+		<EmbeddedResource Include="Resources\KliveLink\landing.html" LogicalName="KliveLink.LandingHtml" />
 	</ItemGroup>
 
 	<ItemGroup>
@@ -101,13 +106,13 @@
 	<ItemGroup>
 		<!-- Desktop-container build context, shipped with the app so the container
 		     bootstrapper can auto-build the image when it's missing on the host. -->
-		<None Update="Services\Projects\Containers\desktop.Dockerfile" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\desktop-entrypoint.sh" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\browser-inspect.py" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\browser-service.py" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\klive-fp-manifest.json" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\klive-fp-patch.js" CopyToOutputDirectory="PreserveNewest" />
-		<None Update="Services\Projects\Containers\klive-cdp" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\desktop.Dockerfile" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\desktop-entrypoint.sh" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\browser-inspect.py" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\browser-service.py" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\klive-fp-manifest.json" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\klive-fp-patch.js" CopyToOutputDirectory="PreserveNewest" />
+		<None Update="Services\Demiurge\Containers\klive-cdp" CopyToOutputDirectory="PreserveNewest" />
 	</ItemGroup>
 
 	<ItemGroup>

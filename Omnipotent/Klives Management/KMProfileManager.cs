@@ -404,6 +404,7 @@ namespace Omnipotent.Profiles
                 mutationLock.Release();
             }
             CacheDeps.Bump("kmprofiles");
+            InvalidateInsights();
             if (accessChanged)
             {
                 CacheDeps.Bump(AccessDependencyKey(userId));
@@ -530,7 +531,7 @@ namespace Omnipotent.Profiles
 
             if (notes.Count > 0)
             {
-                string summary = "Profiles converted from ranks to permissions:\n" + string.Join("\n", notes.Select(n => "• " + n));
+                string summary = "Profile permissions migrated:\n" + string.Join("\n", notes.Select(n => "• " + n));
                 ServiceLog(summary);
                 _ = SafeDiscord(summary);
             }
@@ -575,6 +576,31 @@ namespace Omnipotent.Profiles
                 p.SchemaVersion = CurrentSchemaVersion;
                 p.AccessVersion++;
                 note = p.IsOwner ? $"{p.Name}: owner" : $"{p.Name}: {p.Grants.Count} permissions (was {legacy})";
+                changed = true;
+            }
+
+            // Grants under a renamed service key (projects.* became demiurge.*) move to the new key.
+            // A renamed grant that duplicates one already held under the new key is dropped.
+            if (p.Grants != null && p.Grants.Any(g => g != null && PermissionCatalog.CurrentKey(g.Key) != g.Key))
+            {
+                var held = new HashSet<string>(p.Grants.Where(g => g != null && PermissionCatalog.CurrentKey(g.Key) == g.Key)
+                    .Select(g => g.Key), StringComparer.Ordinal);
+                var renamed = new List<string>();
+                var grants = new List<PermissionGrant>();
+                foreach (var g in p.Grants)
+                {
+                    if (g == null) continue;
+                    string current = PermissionCatalog.CurrentKey(g.Key);
+                    if (current == g.Key) { grants.Add(g); continue; }
+                    renamed.Add(g.Key);
+                    if (!held.Add(current)) continue;
+                    var moved = g.Clone();
+                    moved.Key = current;
+                    grants.Add(moved);
+                }
+                p.Grants = grants;
+                p.AccessVersion++;
+                note ??= $"{p.Name}: {renamed.Count} permission(s) moved to renamed keys ({string.Join(", ", renamed)})";
                 changed = true;
             }
 

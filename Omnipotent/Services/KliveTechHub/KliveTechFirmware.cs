@@ -358,6 +358,7 @@ namespace Omnipotent.Services.KliveTechHub
                     await TryAbortFirmwareUpdateAsync(gadget);
                 }
                 job.completedUtc = DateTime.UtcNow;
+                RecordFirmwareJobFinished(job);
                 if (gadget != null)
                 {
                     activeFirmwareJobsByGadget.TryGetValue(gadget.gadgetID, out string? activeJobId);

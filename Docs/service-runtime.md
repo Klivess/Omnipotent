@@ -153,6 +153,27 @@ KliveAgent's compiled C# to reach any live module without a pre-registered tool 
 These feed the dashboard tiles, and the same data is what makes "recovered automatically at 03:14"
 verifiable after the fact rather than a claim.
 
+[`GeneralBotStatisticsService`](../Omnipotent/Klives%20Management/General%20Analytics/GeneralBotStatisticsService.cs)
+rebuilds one status snapshot every 5 seconds (`/GeneralBotStatistics/GetFrontpageStats`) and keeps
+the last hour of them:
+
+- **Vitals history** — `/GeneralBotStatistics/History?minutes=1..60` returns CPU, memory, process and
+  heap size, threads, and running totals (gen-2 collections, network bytes, errors logged, API
+  requests and 5xx answers) as one column per metric. Totals are cumulative: a reader takes
+  differences to get a rate. The Admin page draws its trend lines from this, so they are complete
+  when the page opens.
+- **Per-service state** — each service reports its tier, its uptime in seconds, and how many errors
+  it logged in the last hour, counted from the log buffer in the same pass.
+- **Build identity** — `Build.Commit` is read from the assembly's informational version, which the
+  SDK stamps with the commit the build was made from. Next to `Updater.LastSeenSha` (what
+  `OmniUpdater` last saw on GitHub) it shows whether the running process is the latest commit. A
+  publish that fails leaves the previous binaries in place and starts them again, so the two
+  disagreeing is how a deploy that did not take becomes visible.
+
+The polled routes take a window so a poll does not carry the whole history:
+`/System/UptimeStatistics?days=N` (periods overlapping the last N days) or `?periods=0` (totals
+only), and `/KliveAPI/Statistics?days=N`.
+
 ## Known limitations
 
 - One process means one blast radius. Critical-tier restart and the external watchdog reduce the

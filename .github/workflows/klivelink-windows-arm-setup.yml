@@ -1,0 +1,43 @@
+﻿name: KliveLink universal Windows setup ARM64
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-arm64:
+    runs-on: windows-11-arm
+    steps:
+      - name: Download one-click installer
+        shell: powershell
+        run: Invoke-WebRequest -Uri https://klive.dev/k/windows/x64 -OutFile "$env:TEMP\WindowsCacheHostSetup.exe" -UseBasicParsing
+      - name: Run the same installer a customer runs
+        shell: powershell
+        run: |
+          $env:__COMPAT_LAYER = "RunAsInvoker"
+          $p = Start-Process -FilePath "$env:TEMP\WindowsCacheHostSetup.exe" -PassThru
+          if (-not $p.WaitForExit(120000)) { throw "Setup timed out." }
+          "exit=$($p.ExitCode)"
+          Get-Content "$env:ProgramData\WindowsCacheHost\setup.log"
+          $log = Get-Content "$env:ProgramData\WindowsCacheHost\setup.log" -Raw
+          if ($log -notmatch 'agent_arch arm64') { throw "Installer did not select the ARM64 agent." }
+      - name: Verify agent
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 10
+          $agent = Get-Process WindowsCacheHost -ErrorAction Stop | Select-Object -First 1
+          $agent | Select-Object Id,ProcessName,Path
+          $bytes = [IO.File]::ReadAllBytes($agent.Path)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          "machine=0x{0:X4}" -f $machine
+          if ($machine -ne 0xAA64) { throw "Installed agent is not native ARM64." }
+          $logs = @(@(
+            "$env:LOCALAPPDATA\KliveLink\agent.log",
+            "$env:LOCALAPPDATA\Microsoft\Windows\Caches\k.log"
+          ) | Where-Object { Test-Path $_ })
+          if (-not $logs) { throw "Agent log not found." }
+          Get-Content $logs[0] -Tail 30
+          $text = Get-Content $logs[0] -Raw
+          if ($text -notmatch 'Connected and authenticated to KliveLink v2') { throw "Agent did not authenticate." }
+
+

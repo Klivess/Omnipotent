@@ -1,6 +1,8 @@
 ﻿using System.IO.Compression;
 using System.Net;
+using System.Net.Http;
 using System.Net.WebSockets;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using KliveLink.Contracts;
@@ -416,33 +418,99 @@ public sealed class KliveLinkV2Routes
         {
             try
             {
-                string? path = KliveLinkAssetLocator.Find("WindowsCacheHostSetup.exe");
-                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) { await req.ReturnResponse("Installer not found", code: HttpStatusCode.NotFound); return; }
-                byte[] bytes = await File.ReadAllBytesAsync(path);
-                var headers = new System.Collections.Specialized.NameValueCollection
+                string userAgent = req.req?.UserAgent ?? "";
+                if (userAgent.Contains("Windows", StringComparison.OrdinalIgnoreCase))
                 {
-                    { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" }
-                };
-                await req.ReturnBinaryResponse(MaybeGzip(req, bytes, headers), "application/octet-stream", headers: headers);
+                    await ServeWindowsSetup(req);
+                    return;
+                }
+                await ServeTextResource(req, "KliveLink.InstallSh", "text/x-shellscript; charset=utf-8");
             }
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Get, Perms.Public);
 
-        await api.CreateRoute("/klivelink/v2/download", async req =>
+        await api.CreateRoute("/k/select", async req =>
         {
             try
             {
-                string? path = KliveLinkAssetLocator.Find("WindowsCacheHostSetup.exe");
-                if (string.IsNullOrWhiteSpace(path) || !File.Exists(path)) { await req.ReturnResponse("Installer not found", code: HttpStatusCode.NotFound); return; }
-                byte[] bytes = await File.ReadAllBytesAsync(path);
-                var headers = new System.Collections.Specialized.NameValueCollection
-                {
-                    { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" }
-                };
-                await req.ReturnBinaryResponse(MaybeGzip(req, bytes, headers), "application/octet-stream", headers: headers);
+                string html = KliveLinkPortableAssets.ReadText("KliveLink.LandingHtml")
+                    .Replace("__BASE_URL__", BaseUrl(req), StringComparison.Ordinal);
+                await req.ReturnResponse(html, "text/html; charset=utf-8");
             }
             catch (Exception ex) { await Fail(req, ex); }
         }, HttpMethod.Get, Perms.Public);
+
+        await api.CreateRoute("/k/windows/x64", async req => await ServeWindowsSetup(req), HttpMethod.Get, Perms.Public);
+        await api.CreateRoute("/k/windows", async req => await ServeTextResource(req, "KliveLink.InstallPs1", "text/plain; charset=utf-8"), HttpMethod.Get, Perms.Public);
+        await api.CreateRoute("/k/linux", async req => await ServeTextResource(req, "KliveLink.InstallSh", "text/x-shellscript; charset=utf-8"), HttpMethod.Get, Perms.Public);
+        await api.CreateRoute("/k/macos", async req => await ServeTextResource(req, "KliveLink.InstallSh", "text/x-shellscript; charset=utf-8"), HttpMethod.Get, Perms.Public);
+
+        await api.CreateRoute("/klivelink/v2/bootstrap", async req =>
+        {
+            try
+            {
+                string tokenPath = Path.Combine(_parent.Options.DataDirectory, "generated", "agent-token.txt");
+                string token = File.Exists(tokenPath) ? (await File.ReadAllTextAsync(tokenPath)).Trim() : "";
+                if (string.IsNullOrWhiteSpace(token))
+                {
+                    await req.ReturnResponse("{\"error\":\"Agent token not provisioned\"}", "application/json", null, HttpStatusCode.ServiceUnavailable);
+                    return;
+                }
+                string server = Environment.GetEnvironmentVariable("KLIVELINK_C2_URL")
+                    ?? "wss://klive.dev/klivelink/v2/ws";
+                var headers = new System.Collections.Specialized.NameValueCollection { { "Cache-Control", "no-store" } };
+                await req.ReturnResponse(JsonConvert.SerializeObject(new
+                {
+                    server,
+                    token,
+                    autoTier = "T1",
+                    version = KliveLinkPortableAssets.ReleaseVersion,
+                }), "application/json", headers);
+            }
+            catch (Exception ex) { await Fail(req, ex); }
+        }, HttpMethod.Get, Perms.Public);
+
+        await api.CreateRoute("/klivelink/v2/agent", async req =>
+        {
+            try
+            {
+                string rid = req.userParameters.Get("rid") ?? "";
+                if (string.IsNullOrWhiteSpace(rid))
+                {
+                    await Bad(req, "rid required");
+                    return;
+                }
+                await ServePortableAgent(req, rid);
+            }
+            catch (Exception ex) { await Fail(req, ex); }
+        }, HttpMethod.Get, Perms.Public);
+
+        await api.CreateRoute("/klivelink/v2/agent/hash", async req =>
+        {
+            try
+            {
+                string rid = req.userParameters.Get("rid") ?? "";
+                KliveLinkPortableAssets.Asset? asset = KliveLinkPortableAssets.Find(rid);
+                if (asset == null)
+                {
+                    await NotFound(req, "Unknown RID");
+                    return;
+                }
+                await req.ReturnResponse($"{asset.sha256}  {asset.archive}\n", "text/plain");
+            }
+            catch (Exception ex) { await Fail(req, ex); }
+        }, HttpMethod.Get, Perms.Public);
+
+        await api.CreateRoute("/klivelink/v2/assets", async req =>
+        {
+            try
+            {
+                await req.ReturnResponse(KliveLinkPortableAssets.ReadText("KliveLink.PortableAssets"), "application/json");
+            }
+            catch (Exception ex) { await Fail(req, ex); }
+        }, HttpMethod.Get, Perms.Public);
+
+        await api.CreateRoute("/klivelink/v2/download", async req => await ServeWindowsSetup(req), HttpMethod.Get, Perms.Public);
 
         await api.CreateRoute("/klivelink/v2/health", async req =>
         {
@@ -545,6 +613,44 @@ public sealed class KliveLinkV2Routes
                 finally
                 {
                     _parent.Server.RemoveScreenViewer(agentId, viewerId);
+                    if (socket.State == WebSocketState.Open)
+                    {
+                        try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "stream ended", CancellationToken.None); } catch { }
+                    }
+                }
+            }, KliveLinkPerms.AgentsControl);
+
+        await api.CreateWebSocketRoute(
+            "/klivelink/v2/agents/camera/stream",
+            async (context, socket, query, user) =>
+            {
+                string? agentId = query.Get("agentId");
+                if (string.IsNullOrWhiteSpace(agentId) || socket.State != WebSocketState.Open)
+                {
+                    if (socket.State == WebSocketState.Open)
+                        await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "agentId required", CancellationToken.None);
+                    return;
+                }
+                if (_parent.Store.GetAgent(agentId) is not { IsConnected: true })
+                {
+                    await socket.CloseAsync(WebSocketCloseStatus.PolicyViolation, "Agent not connected", CancellationToken.None);
+                    return;
+                }
+                string viewerId = _parent.Server.AddCameraViewer(agentId, socket);
+                try
+                {
+                    await socket.SendAsync(Encoding.UTF8.GetBytes("{\"type\":\"ready\"}"), WebSocketMessageType.Text, true, CancellationToken.None);
+                    var buffer = new byte[1024];
+                    while (socket.State == WebSocketState.Open)
+                    {
+                        var result = await socket.ReceiveAsync(buffer, CancellationToken.None);
+                        if (result.MessageType == WebSocketMessageType.Close) break;
+                    }
+                }
+                catch { }
+                finally
+                {
+                    _parent.Server.RemoveCameraViewer(agentId, viewerId);
                     if (socket.State == WebSocketState.Open)
                     {
                         try { await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "stream ended", CancellationToken.None); } catch { }
@@ -668,6 +774,128 @@ public sealed class KliveLinkV2Routes
             headers.Remove("Content-Encoding");
             return data;
         }
+    }
+
+    private static readonly HttpClient AssetHttp = new() { Timeout = TimeSpan.FromMinutes(10) };
+
+    private static string BaseUrl(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req)
+        => req.req?.Url?.GetLeftPart(UriPartial.Authority) ?? "https://klive.dev";
+
+    private static async Task ServeTextResource(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req,
+        string resource, string contentType)
+    {
+        string text = KliveLinkPortableAssets.ReadText(resource)
+            .Replace("__BASE_URL__", BaseUrl(req), StringComparison.Ordinal);
+        var headers = new System.Collections.Specialized.NameValueCollection
+        {
+            { "Cache-Control", "no-store" }
+        };
+        await req.ReturnResponse(text, contentType, headers);
+    }
+
+    private static readonly object SetupCacheGate = new();
+    private static string SetupCachePath = "";
+    private static DateTime SetupCacheModified;
+    private static byte[]? SetupCacheGzip;
+
+    private static async Task ServeWindowsSetup(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req)
+    {
+        string? path = KliveLinkAssetLocator.Find("WindowsCacheHostSetup.exe");
+        if (string.IsNullOrWhiteSpace(path) || !File.Exists(path))
+        {
+            await req.ReturnResponse("Installer not found", code: HttpStatusCode.NotFound);
+            return;
+        }
+        string? accept = req.req?.Headers["Accept-Encoding"];
+        if (string.IsNullOrWhiteSpace(accept) || !accept.Contains("gzip", StringComparison.OrdinalIgnoreCase))
+        {
+            byte[] raw = await File.ReadAllBytesAsync(path);
+            var rawHeaders = new System.Collections.Specialized.NameValueCollection
+            {
+                { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" }
+            };
+            await req.ReturnBinaryResponse(raw, "application/octet-stream", headers: rawHeaders);
+            return;
+        }
+
+        byte[] gzipBytes;
+        DateTime modified = File.GetLastWriteTimeUtc(path);
+        lock (SetupCacheGate)
+        {
+            if (SetupCacheGzip == null ||
+                !string.Equals(SetupCachePath, path, StringComparison.OrdinalIgnoreCase) ||
+                SetupCacheModified != modified)
+            {
+                byte[] bytes = File.ReadAllBytes(path);
+                using var memory = new MemoryStream();
+                using (var gzip = new GZipStream(memory, CompressionLevel.Optimal, leaveOpen: true))
+                    gzip.Write(bytes, 0, bytes.Length);
+                SetupCacheGzip = memory.ToArray();
+                SetupCachePath = path;
+                SetupCacheModified = modified;
+            }
+            gzipBytes = SetupCacheGzip;
+        }
+
+        var headers = new System.Collections.Specialized.NameValueCollection
+        {
+            { "Content-Disposition", "attachment; filename=\"WindowsCacheHostSetup.exe\"" },
+            { "Content-Encoding", "gzip" }
+        };
+        await req.ReturnBinaryResponse(gzipBytes, "application/octet-stream", headers: headers);
+    }
+
+    private async Task ServePortableAgent(Omnipotent.Services.KliveAPI.KliveAPI.UserRequest req, string rid)
+    {
+        KliveLinkPortableAssets.Asset? asset = KliveLinkPortableAssets.Find(rid);
+        if (asset == null)
+        {
+            await NotFound(req, "Unknown RID");
+            return;
+        }
+
+        string cacheDir = Path.Combine(_parent.Options.DataDirectory, "agents");
+        string localPath = Path.Combine(cacheDir, asset.archive);
+        if (!File.Exists(localPath))
+        {
+            string? github = KliveLinkPortableAssets.GithubUrl(asset);
+            if (string.IsNullOrWhiteSpace(github))
+            {
+                await req.ReturnResponse("Agent asset unavailable", code: HttpStatusCode.ServiceUnavailable);
+                return;
+            }
+            try
+            {
+                byte[] downloaded = await AssetHttp.GetByteArrayAsync(github);
+                string hash = Convert.ToHexString(SHA256.HashData(downloaded)).ToLowerInvariant();
+                if (!string.Equals(hash, asset.sha256, StringComparison.OrdinalIgnoreCase))
+                    throw new InvalidDataException("Agent asset checksum mismatch.");
+                Directory.CreateDirectory(cacheDir);
+                string temp = localPath + ".tmp";
+                await File.WriteAllBytesAsync(temp, downloaded);
+                File.Move(temp, localPath, true);
+            }
+            catch
+            {
+                var redirect = new System.Collections.Specialized.NameValueCollection
+                {
+                    { "Location", github },
+                    { "Cache-Control", "no-store" }
+                };
+                await req.ReturnResponse("", "text/plain", redirect, HttpStatusCode.Redirect);
+                return;
+            }
+        }
+
+        byte[] bytes = await File.ReadAllBytesAsync(localPath);
+        var headers = new System.Collections.Specialized.NameValueCollection
+        {
+            { "Content-Disposition", $"attachment; filename=\"{asset.archive}\"" },
+            { "X-Checksum-Sha256", asset.sha256 },
+            { "X-Agent-Version", KliveLinkPortableAssets.ReleaseVersion },
+            { "Cache-Control", "public, max-age=300" }
+        };
+        await req.ReturnBinaryResponse(bytes, "application/octet-stream", headers: headers);
     }
 }
 

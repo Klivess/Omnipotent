@@ -139,6 +139,11 @@ namespace Omnipotent.Services.KliveGames.Games.Minecraft
 
         public string GetGracefulStopCommand() => "stop";
 
+        private static readonly BackupSaveHooks SaveHooks = new("save-off", "save-all flush",
+            new Regex(@"Saved the (game|world)", RegexOptions.IgnoreCase | RegexOptions.Compiled), "save-on");
+
+        public BackupSaveHooks? GetBackupSaveHooks() => SaveHooks;
+
         public bool TryParseStarted(string line) => StartedRx.IsMatch(line);
 
         public bool TryParsePlayerJoin(string line, out string player)

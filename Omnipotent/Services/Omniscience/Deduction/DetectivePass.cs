@@ -64,8 +64,7 @@ in reasoning). Do not restate single facts as 'derived'. Max 12 derived facts, 8
             KliveLLM.KliveLLM.KliveLLMResponse resp;
             try
             {
-                resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 2200,
-                    systemPrompt: SystemPrompt, useFreeModel: true);
+                resp = await OmniscienceLlm.AskAsync(llm, prompt, SystemPrompt, useFreeModel: true);
             }
             catch (Exception ex)
             {

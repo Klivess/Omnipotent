@@ -31,6 +31,7 @@ namespace Omnipotent.Services.Omniscience
     public class ReplicaRoutes
     {
         private readonly Omniscience service;
+        private ReplicaReadinessCounts readinessCounts => service.ReplicaReadiness;
         public ReplicaRoutes(Omniscience service) { this.service = service; }
 
         public async Task RegisterRoutes()
@@ -41,7 +42,7 @@ namespace Omnipotent.Services.Omniscience
                 {
                     string? personId = req.userParameters?["personId"];
                     if (string.IsNullOrWhiteSpace(personId)) { await Err(req, "personId required"); return; }
-                    var payload = BuildStatusPayload(personId);
+                    var payload = await BuildStatusPayloadAsync(personId);
                     await req.ReturnResponse(payload.ToString(Formatting.None));
                 }
                 catch (Exception ex) { await Err(req, ex); }
@@ -320,8 +321,10 @@ namespace Omnipotent.Services.Omniscience
 
         // ── payload builders ──
 
-        private JObject BuildStatusPayload(string personId)
+        private async Task<JObject> BuildStatusPayloadAsync(string personId)
         {
+            // The embedding counts first: a person's first count may be waited on (briefly), with no connection held.
+            var counts = await readinessCounts.ReadAsync(personId, TimeSpan.FromSeconds(2));
             using var conn = service.Db.Open();
             using var cmd = conn.CreateCommand();
             cmd.CommandText = @"SELECT status, version, built_at, model_used, messages_embedded,
@@ -352,11 +355,11 @@ namespace Omnipotent.Services.Omniscience
                 };
             }
             r.Close();
-            AddReadiness(conn, payload, personId);
+            AddReadiness(conn, payload, personId, counts);
             return payload;
         }
 
-        private static void AddReadiness(SqliteConnection conn, JObject payload, string personId)
+        private static void AddReadiness(SqliteConnection conn, JObject payload, string personId, ReplicaReadinessCounts.Read counts)
         {
             long Scalar(string sql)
             {
@@ -373,39 +376,33 @@ namespace Omnipotent.Services.Omniscience
             long eras = Scalar("SELECT COUNT(*) FROM replica_era_profiles WHERE person_id=$p");
             long facts = Scalar("SELECT COUNT(*) FROM person_facts WHERE person_id=$p AND status='active'");
             long latest = Scalar("SELECT COALESCE((SELECT last_message_at FROM person_message_counts WHERE person_id=$p),0)");
-            long embedded = 0, pairs = 0, embeddedStimuli = 0;
+            long pairs = 0;
             try
             {
+                // Cheap (idx_srp_replier covers it), so always current; the embedding counts come from readinessCounts.
                 var idents = Analytics.AnalyticHelpers.GetPersonIdentityIds(conn, personId);
                 if (idents.Count > 0)
                 {
-                    using (var cmd = conn.CreateCommand())
-                    {
-                        string inC = Analytics.AnalyticHelpers.BindInClause(cmd, "i", idents);
-                        cmd.CommandText = $@"SELECT
-                            (SELECT COUNT(*) FROM message_embeddings e JOIN messages m ON m.message_id=e.message_id WHERE m.author_identity_id IN ({inC})),
-                            (SELECT COUNT(*) FROM stimulus_reply_pairs s WHERE s.replier_identity_id IN ({inC})),
-                            (SELECT COUNT(*) FROM stimulus_reply_pairs s JOIN message_embeddings e ON e.message_id=s.stimulus_message_id WHERE s.replier_identity_id IN ({inC}))";
-                        using var reader = cmd.ExecuteReader();
-                        if (reader.Read())
-                        {
-                            embedded = reader.GetInt64(0);
-                            pairs = reader.GetInt64(1);
-                            embeddedStimuli = reader.GetInt64(2);
-                        }
-                    }
+                    using var cmd = conn.CreateCommand();
+                    string inC = Analytics.AnalyticHelpers.BindInClause(cmd, "i", idents);
+                    cmd.CommandText = $"SELECT COUNT(*) FROM stimulus_reply_pairs s WHERE s.replier_identity_id IN ({inC})";
+                    pairs = Convert.ToInt64(cmd.ExecuteScalar() ?? 0L);
                 }
             }
             catch { }
+            var known = counts.Value;
             var warnings = new JArray();
             if (messages < 50) warnings.Add("Sparse message history");
             if (pairs < 5) warnings.Add("Few harvested stimulus/reply pairs");
-            if (embeddedStimuli < pairs) warnings.Add("Stimulus embeddings are still backfilling");
+            if (known != null && known.EmbeddedStimuli < pairs) warnings.Add("Stimulus embeddings are still backfilling");
             if (eras == 0) warnings.Add("Temporal eras have not been built");
             payload["target_messages"] = messages;
-            payload["embedded_messages"] = embedded;
+            // null until the person's first background count lands (the panel shows "—" and its 30 s poll picks it up).
+            payload["embedded_messages"] = known?.Embedded;
             payload["stimulus_reply_pairs"] = pairs;
-            payload["embedded_stimuli"] = embeddedStimuli;
+            payload["embedded_stimuli"] = known?.EmbeddedStimuli;
+            payload["embedding_counts_as_of"] = known?.AsOfUtc.ToUnixTimeMilliseconds();
+            payload["embedding_counts_counting"] = counts.Counting;
             payload["active_facts"] = facts;
             payload["era_count"] = eras;
             payload["latest_message_at"] = latest == 0 ? null : latest;

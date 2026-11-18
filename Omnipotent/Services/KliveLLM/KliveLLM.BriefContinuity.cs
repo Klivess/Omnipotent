@@ -51,20 +51,34 @@ public partial class KliveLLM
     internal static bool PrefixIsDead(KliveLLMSession session, DateTime now)
         => session.briefState != null && now - session.lastUpdated > EffectiveBriefIdleLimit();
 
-    internal async Task<string> GetBriefProviderKeyAsync()
+    /// <summary>
+    /// What a briefed session's prefix depends on, hashed: the router and model its lane is routed to,
+    /// their service tier and the reasoning ceiling. A change re-seeds the session instead of continuing
+    /// one whose cached prefix belongs to another router. With no routing set, this is the same value it
+    /// always was, so a deploy does not cold-start every briefed session.
+    /// </summary>
+    internal async Task<string> GetBriefProviderKeyAsync(LlmCaller? caller = null,
+        [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
     {
-        var provider = await GetRemoteProviderConfigurationAsync();
+        var decision = await ResolveRouteAsync(LlmConsumerCatalog.Resolve(caller, callerFile));
+        var provider = decision.Primary is { IsLocal: false } router && !decision.IsBlocked
+            ? await BuildRouterConfigurationAsync(router, decision) ?? await GetRemoteProviderConfigurationAsync()
+            : await GetRemoteProviderConfigurationAsync();
+        string model = decision.Pin && decision.Model != null ? decision.Model : provider.Model;
+        string thinking = decision.Thinking ?? thinkingType;
         string value = Newtonsoft.Json.JsonConvert.SerializeObject(new
         {
-            provider.Provider, provider.ChatCompletionsEndpoint, provider.Model, provider.ServiceTier, thinkingType,
+            provider.Provider, provider.ChatCompletionsEndpoint, Model = model, provider.ServiceTier, thinkingType = thinking,
         });
         return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value)));
     }
 
     public BriefSessionStart StartOrContinueBriefedToolSession(string sessionId, string systemPrompt,
         IReadOnlyList<ToolSessionBriefSection> sections, string compatibilityKey, int messageBudget,
-        DateTime? nowUtc = null)
+        DateTime? nowUtc = null, LlmCaller? caller = null,
+        [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
     {
+        var who = LlmConsumerCatalog.Resolve(caller, callerFile);
         if (string.IsNullOrWhiteSpace(sessionId)) throw new ArgumentException("sessionId required", nameof(sessionId));
         if (sections.Select(section => section.Key).Distinct(StringComparer.Ordinal).Count() != sections.Count)
             throw new ArgumentException("Brief section keys must be unique.", nameof(sections));
@@ -103,6 +117,7 @@ public partial class KliveLLM
                     var message = new HFWrapper.HFMessage { role = "user", content = delta };
                     session.structuredMessages.Add(message);
                     state.Remember(sections, message);
+                    session.caller = who;
                     return new(true, "continued", (delta.Length + 3) / 4, fullTokens);
                 }
             }
@@ -115,7 +130,7 @@ public partial class KliveLLM
                 .Select(pair => pair.Key).ToArray())
                 sessions.Remove(stale);
 
-            StartToolSession(sessionId, systemPrompt);
+            StartToolSession(sessionId, systemPrompt, who);
             session = sessions[sessionId];
             session.lastUpdated = now;
             var seed = new HFWrapper.HFMessage { role = "user", content = full };

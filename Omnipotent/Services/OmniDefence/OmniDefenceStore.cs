@@ -60,15 +60,24 @@ namespace Omnipotent.Services.OmniDefence
             }.ToString();
         }
 
-        public async Task InitializeAsync()
+        /// <summary>
+        /// Opens the database, brings the schema up to date and scrubs legacy settings audits.
+        /// <paramref name="step"/> runs each of the three under its name so the caller can time them:
+        /// together they took 68 s of one start-up (11 Nov 2026) and it is not known which it was.
+        /// </summary>
+        public async Task InitializeAsync(Func<string, Func<Task>, Task>? step = null)
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
-            sharedConnection = new SqliteConnection(connectionString);
-            await sharedConnection.OpenAsync();
+            step ??= (_, run) => run();
+            await step("opening the database", async () =>
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(dbPath)!);
+                sharedConnection = new SqliteConnection(connectionString);
+                await sharedConnection.OpenAsync();
 
-            using var pragma = sharedConnection.CreateCommand();
-            pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;";
-            await pragma.ExecuteNonQueryAsync();
+                using var pragma = sharedConnection.CreateCommand();
+                pragma.CommandText = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON;";
+                await pragma.ExecuteNonQueryAsync();
+            });
 
             string[] schema = new[]
             {
@@ -230,9 +239,19 @@ namespace Omnipotent.Services.OmniDefence
                 );"
             };
 
+            await step("checking the schema", () => ApplySchemaAsync(schema));
+            await step("scrubbing settings audits", async () =>
+            {
+                SensitiveAuditMigrationChangedRows = await ScrubLegacySensitiveSettingsAuditsAsync();
+            });
+            StartAuditFlusher();
+        }
+
+        private async Task ApplySchemaAsync(string[] schema)
+        {
             foreach (var stmt in schema)
             {
-                using var cmd = sharedConnection.CreateCommand();
+                using var cmd = Connection.CreateCommand();
                 cmd.CommandText = stmt;
                 await cmd.ExecuteNonQueryAsync();
             }
@@ -265,9 +284,6 @@ namespace Omnipotent.Services.OmniDefence
             await EnsureColumnAsync("ip_records", "reverse_dns", "TEXT");
             await EnsureColumnAsync("ip_records", "timezone", "TEXT");
             await EnsureColumnAsync("ip_records", "as_name", "TEXT");
-
-            SensitiveAuditMigrationChangedRows = await ScrubLegacySensitiveSettingsAuditsAsync();
-            StartAuditFlusher();
         }
 
         /// <summary>
@@ -1001,6 +1017,52 @@ namespace Omnipotent.Services.OmniDefence
             return list;
         });
 
+        // ---------- Profile links ----------
+        // Which profile last used each IP lives on the IP record, written as requests arrive. After
+        // a start the tracker reads the audit rows it has not yet linked: the tail a crash left
+        // unflushed. That used to be one query over the whole log, grouped by IP, awaited during
+        // start-up: SQLite walked an IP index and fetched every row of the table through it, in IP
+        // order, to test profile_id. On 10 Nov 2026 the service's routes were still missing 82 and
+        // 92 minutes after two starts. The rows are now read in the order they are stored, from a
+        // watermark, so each start reads only the rows added since the one before.
+
+        /// <summary>od_settings key: the highest audit-row id whose profile has been linked to its IP.</summary>
+        internal const string ProfileLinkWatermarkKey = "profile_links_through_id";
+
+        /// <summary>
+        /// NOT INDEXED pins this to a walk of the table by id, the order the rows are stored in,
+        /// whatever indexes exist: a page is read once, and neighbouring rows share it.
+        /// </summary>
+        internal const string ProfileLinkRowsSql = @"SELECT id, ip, profile_id, profile_name, profile_rank, utc_ts
+                FROM requests NOT INDEXED
+                WHERE id > $after AND id <= $through
+                    AND profile_id IS NOT NULL AND profile_id <> '' AND ip IS NOT NULL AND ip <> ''
+                ORDER BY id";
+
+        public sealed record ProfileLinkRow(long Id, string Ip, string ProfileId, string? ProfileName, int? ProfileRank, long UtcTs);
+
+        /// <summary>Audit rows that carry a profile, ids in (afterId, throughId], in id order. One bounded read.</summary>
+        public Task<List<ProfileLinkRow>> ReadProfileLinkRowsAsync(long afterId, long throughId) => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = ProfileLinkRowsSql;
+            cmd.Parameters.AddWithValue("$after", afterId);
+            cmd.Parameters.AddWithValue("$through", throughId);
+            var list = new List<ProfileLinkRow>();
+            using var rdr = await cmd.ExecuteReaderAsync();
+            while (await rdr.ReadAsync())
+            {
+                list.Add(new ProfileLinkRow(
+                    rdr.GetInt64(0),
+                    rdr.GetString(1),
+                    rdr.GetString(2),
+                    rdr.IsDBNull(3) ? null : rdr.GetString(3),
+                    rdr.IsDBNull(4) ? null : rdr.GetInt32(4),
+                    rdr.IsDBNull(5) ? 0 : rdr.GetInt64(5)));
+            }
+            return list;
+        });
+
         // ---------- Intel cache ----------
 
         public Task UpsertIntelAsync(string ip, string provider, long fetchedUtc, string? json) => WithLockAsync(async conn =>
@@ -1071,6 +1133,15 @@ namespace Omnipotent.Services.OmniDefence
             return map;
         });
 
+        /// <summary>One od_settings value, or null when the key has never been written.</summary>
+        public Task<string?> GetSettingAsync(string key) => WithReadAsync(async conn =>
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT value FROM od_settings WHERE key = $k";
+            cmd.Parameters.AddWithValue("$k", key);
+            return await cmd.ExecuteScalarAsync() as string;
+        });
+
         public Task SetSettingAsync(string key, string? value) => WithLockAsync(async conn =>
         {
             using var cmd = conn.CreateCommand();
@@ -1115,6 +1186,46 @@ namespace Omnipotent.Services.OmniDefence
             while (await rdr.ReadAsync()) list.Add(ReadIpRecord(rdr));
             return list;
         });
+
+        /// <summary>What one read cost: waiting for a read slot, opening a connection, reading; the rows and the database pages read.</summary>
+        public sealed record ReadCost(long SlotWaitMs, long OpenMs, long ReadMs, long Rows, int PagesRead)
+        {
+            public override string ToString() =>
+                $"{Rows:N0} rows, {PagesRead:N0} pages read in {ReadMs:N0} ms; {SlotWaitMs:N0} ms waiting for a read slot, {OpenMs:N0} ms opening";
+        }
+
+        /// <summary>
+        /// Every IP record, with what the read cost. Start-up's "IP records" step took 53 s on
+        /// 11 Nov 2026 and 182 s on 13 Nov for about 6,000 small rows, which no amount of row work
+        /// explains; the split (slot, open, pages read) is what pins it on the next start.
+        /// </summary>
+        public async Task<(List<IpRecord> Records, ReadCost Cost)> LoadAllIpRecordsMeasuredAsync()
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            await readGate.WaitAsync();
+            long waited = clock.ElapsedMilliseconds;
+            try
+            {
+                using var conn = new SqliteConnection(readConnectionString);
+                await conn.OpenAsync();
+                long opened = clock.ElapsedMilliseconds;
+                // Page-cache misses on this connection = pages that had to come from the file.
+                SQLitePCL.raw.sqlite3_db_status(conn.Handle, SQLitePCL.raw.SQLITE_DBSTATUS_CACHE_MISS, out _, out _, 1);
+                var list = new List<IpRecord>();
+                using (var cmd = conn.CreateCommand())
+                {
+                    cmd.CommandText = "SELECT * FROM ip_records";
+                    using var rdr = await cmd.ExecuteReaderAsync();
+                    while (await rdr.ReadAsync()) list.Add(ReadIpRecord(rdr));
+                }
+                SQLitePCL.raw.sqlite3_db_status(conn.Handle, SQLitePCL.raw.SQLITE_DBSTATUS_CACHE_MISS, out int pages, out _, 0);
+                return (list, new ReadCost(waited, opened - waited, clock.ElapsedMilliseconds - opened, list.Count, pages));
+            }
+            finally
+            {
+                readGate.Release();
+            }
+        }
 
         public Task<List<IpRecord>> LoadAllIpRecordsAsync() => WithReadAsync(async conn =>
         {

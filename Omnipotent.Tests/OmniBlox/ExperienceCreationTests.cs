@@ -82,8 +82,10 @@ namespace Omnipotent.Tests.OmniBlox
             Assert.Equal(FakeRoblox.FirstCreatedUniverse, (await Slots.EnsureAsync(h.Ctx, SeedGame(h, "g2", "Timber Tycoon"), None))!.UniverseId);
             Assert.Equal(1, h.Roblox.CreateCalls);
 
-            // g2 is abandoned: the next game takes its experience instead of making another.
+            // g2 is abandoned: the next game takes its experience instead of making another, and it asks for no sign-off any more.
+            h.Ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.BuildSignoff, Approvals.SignoffKey("g2"), "Play and sign off \"Timber Tycoon\" (r1)", "…", "g2", h.Now));
             Orchestrator.Abandon(h.Ctx, "g2", "not fun");
+            Assert.DoesNotContain(Open(h), t => t.DedupeKey == Approvals.SignoffKey("g2"));
             Assert.Equal(FakeRoblox.FirstCreatedUniverse, (await Slots.EnsureAsync(h.Ctx, SeedGame(h, "g3", "Pet Sim"), None))!.UniverseId);
             Assert.Equal(1, h.Roblox.CreateCalls);
             Assert.Equal((2, 0), Slots.Count(h.Ctx));

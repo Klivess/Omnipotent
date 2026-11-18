@@ -66,6 +66,11 @@ namespace Omnipotent.Services.KliveGames.Games
         /// spawned, and disposed when it exits — commands and the graceful stop go here when present.</summary>
         IRemoteConsole? CreateRemoteConsole(GameServerInstance inst) => null;
 
+        /// <summary>How to make a running server's files safe to copy for a backup: optionally pause its own
+        /// autosave (<c>Hold</c>), make it write everything now (<c>Flush</c>, finished when a console line
+        /// matches <c>FlushDone</c>), and resume afterwards (<c>Release</c>). Null = copy the files as they are.</summary>
+        BackupSaveHooks? GetBackupSaveHooks() => null;
+
         // ---- Console parsing ----
         bool TryParseStarted(string line);
         bool TryParsePlayerJoin(string line, out string player);

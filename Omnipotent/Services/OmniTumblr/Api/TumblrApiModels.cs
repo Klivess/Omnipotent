@@ -34,6 +34,9 @@ namespace Omnipotent.Services.OmniTumblr.Api
         public long? Posts { get; set; }
         public long? Likes { get; set; }
         public DateTime? UpdatedUtc { get; set; }
+        /// <summary>Largest avatar Tumblr listed, when it lists any.</summary>
+        public string? AvatarUrl { get; set; }
+        public string? HeaderImageUrl { get; set; }
     }
 
     public sealed class TumblrPostSummary
@@ -49,6 +52,25 @@ namespace Omnipotent.Services.OmniTumblr.Api
         public string? State { get; set; }
         /// <summary>First text of the post, trimmed, for display.</summary>
         public string? Summary { get; set; }
+
+        // ── What a reblog of this post needs, and what decides whether to make one ──
+        public string? BlogUuid { get; set; }
+        public string? ReblogKey { get; set; }
+        /// <summary>The post is itself a reblog of someone else's.</summary>
+        public bool IsReblog { get; set; }
+        /// <summary>False when its author switched reblogs off.</summary>
+        public bool ReblogsOpen { get; set; } = true;
+        /// <summary>Tumblr or its author marked it (or its blog) as mature.</summary>
+        public bool Mature { get; set; }
+        /// <summary>Its picture (a video's poster) in the sizes Tumblr offers, when the listing gave any.</summary>
+        public List<TumblrImage> Images { get; set; } = new();
+    }
+
+    public sealed class TumblrImage
+    {
+        public string Url { get; set; } = "";
+        public string? Type { get; set; }
+        public int Width { get; set; }
     }
 
     public sealed class TumblrPostsPage
@@ -125,6 +147,11 @@ namespace Omnipotent.Services.OmniTumblr.Api
         Task<TumblrPostsPage> GetPostsAsync(TumblrCredentials creds, string blog, int offset, int limit, CancellationToken ct);
         Task<TumblrNotesSummary> GetNotesSummaryAsync(TumblrCredentials creds, string blog, string postId, CancellationToken ct);
         Task<TumblrNotificationsPage> GetNotificationsAsync(TumblrCredentials creds, string blog, long? before, CancellationToken ct);
+        /// <summary>
+        /// The newest public posts under a tag, from any blog (GET /v2/tagged, an API-key endpoint), up to 20.
+        /// <paramref name="before"/> pages back: only posts older than that Unix time.
+        /// </summary>
+        Task<List<TumblrPostSummary>> GetTaggedAsync(TumblrCredentials creds, string tag, long? before, CancellationToken ct);
         Task<TumblrCreatedPost> CreatePostAsync(TumblrCredentials creds, string blog, NpfPostRequest request, CancellationToken ct);
         Task DeletePostAsync(TumblrCredentials creds, string blog, string postId, CancellationToken ct);
 

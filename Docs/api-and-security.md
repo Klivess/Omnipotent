@@ -16,8 +16,8 @@ optional (a null throws at registration), so a route cannot be added without a d
 decision:
 
 ```csharp
-await CreateAPIRoute("/projects/list", HandleList,
-                     HttpMethod.Get, ProjectsPerms.OverviewView);
+await CreateAPIRoute("/demiurge/list", HandleList,
+                     HttpMethod.Get, DemiurgePerms.OverviewView);
 
 await CreateStreamingAPIRoute("/KliveCloud/UploadFile", HandleUpload,
                               HttpMethod.Post, KliveCloudPerms.FilesUpload,
@@ -71,7 +71,7 @@ Every permission sits in a **tier** — how much information or power it gives:
 | 1 · Glance | Status, counts, summaries | `omnitrader.status.view`, `klivecloud.drive.view` |
 | 2 · Read | Full records, history, content | `omniscience.persons.read`, `klivemail.messages.read` |
 | 3 · Act | Routine, mostly reversible operations | `omnitrader.backtests.run`, `klivecloud.files.upload` |
-| 4 · Manage | Creating, deleting, configuring | `klivemail.mailboxes.manage`, `projects.lifecycle.manage` |
+| 4 · Manage | Creating, deleting, configuring | `klivemail.mailboxes.manage`, `demiurge.lifecycle.manage` |
 | 5 · Critical | Live money, host control, secrets, other profiles | `omnitrader.orders.place`, `system.terminal.use` |
 
 Routes reading the same data at the same depth share a key; every mutation has its own key separate
@@ -359,6 +359,29 @@ session (`WebsiteNoProfile`) are +3. An IP the fingerprint classifier calls `Own
 (beacon-proven input) is never auto-escalated until a hard rule reclassifies it. Discord "new attacker"
 alerts skip the website's logged-out traffic and IPs classed as people. The OmniDefence page's
 "Needs review" rail lists where the classifier and the gate still disagree.
+
+The overview (`/omnidefence/overview`) is never computed on a request. A background worker rebuilds it
+and the route serves the last copy, marked `stale` with `ageSeconds` once it is over two minutes old.
+Each build step is named and timed (`health.buildSteps`), and a build that runs past two minutes logs
+the step it is in. `/omnidefence/overview/status` answers whether or not an overview exists: the step a
+running build is in, how long the last start took step by step (`startup`), and the pass that links IPs
+to profiles after it (`profileLinks`).
+
+Two rules keep the build and the start fast as the request log grows; `OverviewQueryCostTests` and
+`StartupCostTests` hold them, counting database pages rather than milliseconds.
+
+- **Every read of the request log names how it reaches the rows**: `INDEXED BY ix_requests_ts` for a
+  time window, `NOT INDEXED` for a walk by id. SQLite has no statistics for this database, and left to
+  choose it walked a whole index to save a sort, fetching every row ever logged: with 1.69 million rows
+  that kept one overview build in a single step for over an hour, and kept the service's routes
+  missing for 103 minutes after a start.
+- **Nothing on the start-up path reads the whole log, and nothing waits that does not have to.** Until
+  the routes register every `/omnidefence` route answers 404, so each step before them is timed
+  (`startup.steps`) and a start over two minutes logs the step it is in. What can load once the service
+  is answering does: the fingerprint engine and its intel (the engine queues signals and commands until
+  it has loaded, and the beacon nonce reports `enabled: false` until then), then the profile links,
+  which read from a watermark in `od_settings`. `startup.seconds` is the wait for the routes; a step
+  listed after `routes` ran afterwards.
 
 ## Security posture — read this before deploying anything
 

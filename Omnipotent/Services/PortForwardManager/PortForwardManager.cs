@@ -219,16 +219,24 @@ namespace Omnipotent.Services.PortForwardManager
             return "127.0.0.1";
         }
 
+        /// <summary>The router's mapping table as the list route serves it (JSON: success, localIp, externalIp,
+        /// mappings[], asOfUtc), from the same snapshot: walked at most every 30 s, refreshed in the background
+        /// while younger than 5 min. For services that need to know whether their own forwards exist.</summary>
+        public async Task<string> GetMappingSnapshotJson()
+        {
+            var snapshot = listSnapshot;
+            if (snapshot == null || DateTime.UtcNow - snapshot.AsOfUtc > ListMaxStale)
+                snapshot = await RefreshListAsync();
+            else if (DateTime.UtcNow - snapshot.AsOfUtc > ListFreshFor)
+                _ = RefreshInBackgroundAsync();
+            return snapshot.Json;
+        }
+
         private async Task HandleListRequest(UserRequest req)
         {
             try
             {
-                var snapshot = listSnapshot;
-                if (snapshot == null || DateTime.UtcNow - snapshot.AsOfUtc > ListMaxStale)
-                    snapshot = await RefreshListAsync();
-                else if (DateTime.UtcNow - snapshot.AsOfUtc > ListFreshFor)
-                    _ = RefreshInBackgroundAsync();
-                await req.ReturnResponse(snapshot.Json, "application/json");
+                await req.ReturnResponse(await GetMappingSnapshotJson(), "application/json");
             }
             catch (Exception ex)
             {

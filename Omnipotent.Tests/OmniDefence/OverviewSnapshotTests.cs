@@ -36,8 +36,98 @@ public sealed class OverviewSnapshotTests : IDisposable
         Assert.Equal(body, restarted.CurrentJson);
         Assert.Equal(1, builds);
 
+        // Past the freshness window the overview is still served, saying how old it is. Withholding it
+        // left the live page with nothing at all for as long as builds ran slow.
         now = now.AddMinutes(3);
-        Assert.Null(first.CurrentJson);
+        var stale = Newtonsoft.Json.Linq.JObject.Parse(first.CurrentJson!);
+        Assert.True(stale.Value<bool>("stale"));
+        Assert.Equal(180, stale.Value<long>("ageSeconds"));
+        Assert.Equal(12, stale.Value<int>("requests24h"));
+        Assert.Equal("/test", stale["topRoutes"]![0]!.Value<string>("route"));
+    }
+
+    [Fact]
+    public async Task ASnapshotFromBeforeARestartIsServedHoweverOldUntilTheFirstBuildLands()
+    {
+        string path = Path.Combine(directory, "overview.snapshot.json");
+        DateTimeOffset now = new(2026, 11, 10, 12, 0, 0, TimeSpan.Zero);
+        var before = new OmniDefenceOverviewSnapshot(path, () => Task.FromResult("{\"requests24h\":7}"), utcNow: () => now);
+        await before.RefreshOnceAsync();
+
+        var gate = new TaskCompletionSource<string>();
+        var after = new OmniDefenceOverviewSnapshot(path, () => gate.Task, utcNow: () => now.AddHours(5));
+        after.LoadFromDisk();
+
+        var served = Newtonsoft.Json.Linq.JObject.Parse(after.CurrentJson!);
+        Assert.True(served.Value<bool>("stale"));
+        Assert.Equal(5 * 3600, served.Value<long>("ageSeconds"));
+        Assert.Equal(7, served.Value<int>("requests24h"));
+
+        // While a build runs, the status says so and names the step it has reached.
+        Task building = after.RefreshOnceAsync();
+        after.ReportStep("requests in the last 7 days");
+        var status = Newtonsoft.Json.Linq.JObject.FromObject(after.Status());
+        Assert.True(status.Value<bool>("building"));
+        Assert.Equal("requests in the last 7 days", status.Value<string>("step"));
+        Assert.True(status.Value<bool>("stale"));
+        now = now.AddSeconds(90);
+        Assert.Equal(90, Newtonsoft.Json.Linq.JObject.FromObject(after.Status()).Value<long>("buildRunningSeconds"));
+
+        gate.SetResult("{\"requests24h\":9}");
+        await building;
+        Assert.Equal("{\"requests24h\":9}", after.CurrentJson);
+        Assert.False(Newtonsoft.Json.Linq.JObject.FromObject(after.Status()).Value<bool>("building"));
+    }
+
+    [Fact]
+    public void ASlowBuildIsReportedAtOnceThenOnlyEveryHalfHourWhileBuildsStaySlow()
+    {
+        DateTimeOffset first = new(2026, 11, 10, 12, 0, 0, TimeSpan.Zero);
+        Assert.True(OmniDefenceOverviewSnapshot.ShouldReportSlowBuild(null, first));
+        // Builds that keep overrunning arrive every two or three minutes: one line each would be
+        // about twenty errors an hour for a condition the status route already shows.
+        Assert.False(OmniDefenceOverviewSnapshot.ShouldReportSlowBuild(first, first.AddMinutes(3)));
+        Assert.False(OmniDefenceOverviewSnapshot.ShouldReportSlowBuild(first, first.AddMinutes(29)));
+        Assert.True(OmniDefenceOverviewSnapshot.ShouldReportSlowBuild(first, first.AddMinutes(30)));
+    }
+
+    [Fact]
+    public async Task ABuildThatNeverYieldsItsThreadIsReportedSlowWhileItRuns()
+    {
+        string path = Path.Combine(directory, "overview.snapshot.json");
+        using var release = new ManualResetEventSlim(false);
+        var reported = new TaskCompletionSource<Exception>(TaskCreationOptions.RunContinuationsAsynchronously);
+        OmniDefenceOverviewSnapshot? snapshot = null;
+        snapshot = new OmniDefenceOverviewSnapshot(path, () =>
+        {
+            // What the real build does: SQLite's async calls complete synchronously, so the build
+            // holds its thread from start to finish and hands back a task that is already done.
+            snapshot!.ReportStep("busiest routes today");
+            release.Wait();
+            return Task.FromResult("{\"requests24h\":1}");
+        }, ex => reported.TrySetResult(ex), slowBuildAfter: TimeSpan.FromMilliseconds(100));
+
+        using var stop = new CancellationTokenSource();
+        Task loop = Task.Run(() => snapshot.RunAsync(stop.Token));
+        try
+        {
+            // Called straight from the loop, such a build blocked it: the slow-build watch started
+            // only after the build was over, so it never fired. In production a build sat in this
+            // step for over an hour and the log stayed empty.
+            Exception error = await reported.Task.WaitAsync(TimeSpan.FromSeconds(15));
+            Assert.IsType<TimeoutException>(error);
+            Assert.Contains("still in step 'busiest routes today'", error.Message);
+            // Said while the build was running, not once it had finished.
+            Assert.Null(snapshot.CurrentJson);
+            Assert.True(Newtonsoft.Json.Linq.JObject.FromObject(snapshot.Status()).Value<bool>("building"));
+        }
+        finally
+        {
+            release.Set();
+            stop.Cancel();
+            await loop.WaitAsync(TimeSpan.FromSeconds(15));
+        }
+        Assert.Equal("{\"requests24h\":1}", snapshot.CurrentJson);
     }
 
     [Fact]

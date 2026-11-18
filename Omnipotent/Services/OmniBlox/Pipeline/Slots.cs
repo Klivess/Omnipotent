@@ -150,6 +150,12 @@ namespace Omnipotent.Services.OmniBlox.Pipeline
         {
             if (!ctx.Cloud.HasKey) return "the Roblox API key is not set";
             if (ctx.Session is not { HasSession: true }) return "no Roblox account is connected (dashboard → Roblox account → Connect), and Roblox creates experiences only for a signed-in account";
+            // It would land on the session's account, not the games' (a session pasted into OmniSettings is not checked when set).
+            if (CredentialCheck.SessionIsOthers(ctx) is long user)
+                return $"the connected session is Roblox user {user}, not the studio's account (user {ctx.Settings.CreatorUserId}), so a new experience would land on the wrong account";
+            // The key could not reach it (e.g. just after switching accounts, before the new account's key is set).
+            if (CredentialCheck.KeyIsOthers(ctx) is long owner)
+                return $"the API key is Roblox user {owner}'s, not the studio's account's (user {ctx.Settings.CreatorUserId}), so it could not reach a new experience";
             return ctx.Store.Read(s =>
             {
                 var now = ctx.Clock();

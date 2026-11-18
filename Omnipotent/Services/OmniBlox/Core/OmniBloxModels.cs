@@ -969,5 +969,9 @@ namespace Omnipotent.Services.OmniBlox.Core
         public long Relabeled { get; set; }
         public DateTime? LastRunUtc { get; set; }
         public string? LastError { get; set; }
+        /// <summary>The last step that added, downloaded or labelled anything (null on state from before it was kept).</summary>
+        public DateTime? LastProgressUtc { get; set; }
+        /// <summary>Why the last step did nothing (null when it made progress).</summary>
+        public string? Idle { get; set; }
     }
 }

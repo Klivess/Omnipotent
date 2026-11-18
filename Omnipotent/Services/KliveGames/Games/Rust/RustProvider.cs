@@ -144,6 +144,12 @@ namespace Omnipotent.Services.KliveGames.Games.Rust
 
         public string GetGracefulStopCommand() => "quit";
 
+        // "server.save" answers "Saved 41,233 ents, cache(0.12), write(0.03), disk(0.01)."
+        private static readonly BackupSaveHooks SaveHooks = new(null, "server.save",
+            new Regex(@"Saved", RegexOptions.IgnoreCase | RegexOptions.Compiled), null);
+
+        public BackupSaveHooks? GetBackupSaveHooks() => SaveHooks;
+
         public bool TryParseStarted(string line)
             => line.Contains("Server startup complete", StringComparison.OrdinalIgnoreCase);
 

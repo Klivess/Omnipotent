@@ -130,16 +130,25 @@ namespace Omnipotent.Services.MemeScraper
             downloader = new ReelDownloader();
             _ = CreateRoutes();
 
+            MemeScraperMedia? media = null;
             try
             {
                 schedulerState = "loading data";
                 var sources = new MemeScraperSources(this);
-                var media = new MemeScraperMedia(this);
-                await Task.WhenAll(sources.LoadAllInstagramSources(), sources.LoadNiches(), media.LoadAllScrapedInstagramReels(), LoadScrapeLogAsync());
+                media = new MemeScraperMedia(this);
+                loadingMedia = media;
+                // Each step is timed: the 13 Nov start spent 1,171 s here and nothing said which part.
+                await Task.WhenAll(
+                    TimeStep("sources", sources.LoadAllInstagramSources),
+                    TimeStep("niches", sources.LoadNiches),
+                    TimeStep("reels", media.LoadAllScrapedInstagramReels),
+                    TimeStep("scrape history", LoadScrapeLogAsync));
                 // Published only once loaded: OmniGram/OmniTumblr/OmniTube treat a non-null mediaManager as ready.
                 SourceManager = sources;
                 mediaManager = media;
                 memeScraperLabs = new(this);
+                startup.DataLoadMs = startupClock.ElapsedMilliseconds;
+                startup.DataReadyUtc = DateTime.UtcNow;
                 dataReady.TrySetResult();
             }
             catch (Exception ex)
@@ -154,7 +163,76 @@ namespace Omnipotent.Services.MemeScraper
             try { await RefreshSettingsAsync(); }
             catch (Exception ex) { _ = ServiceLogError(ex, "MemeScraper couldn't read its settings; using the defaults until the next scheduler tick."); }
             _ = Task.Run(SchedulerLoopAsync);
-            await ServiceLog($"MemeScraper data loaded in {startupClock.ElapsedMilliseconds} ms: {SourceManager.InstagramSources.Count} Instagram sources, {SourceManager.AllNiches.Count} niches, {mediaManager.Count} reels.");
+            _ = Task.Run(ThumbnailBackfillLoopAsync);
+            var load = mediaManager.LastLoad;
+            string how = load == null ? ""
+                : load.Via == "index"
+                    ? $" Reels came from the reel index ({FormatBytes(load.IndexBytes)}, {load.IndexMs} ms); checking it against the reel files in the background."
+                    : $" Reels were read from {load.FilesRead:n0} file(s) ({load.IndexProblem ?? "no index"}); writing the reel index for the next start.";
+            await ServiceLog($"MemeScraper data loaded in {startup.DataLoadMs} ms: {SourceManager.InstagramSources.Count} Instagram sources, {SourceManager.AllNiches.Count} niches, {mediaManager.Count} reels. Steps: {string.Join(", ", startup.Steps.Select(s => $"{s.Key} {s.Value} ms"))}.{how}");
+            _ = ReportReconcileAsync(mediaManager);
+        }
+
+        /// <summary>What start-up took, step by step, for the health route (and the page's start-up line).</summary>
+        public sealed class StartupReport
+        {
+            public DateTime StartedUtc = DateTime.UtcNow;
+            public DateTime? DataReadyUtc;
+            public long? DataLoadMs;
+            public Dictionary<string, long> Steps = new();
+        }
+
+        private readonly StartupReport startup = new();
+        // The media manager while it loads (mediaManager stays null until it is ready), for load progress.
+        private MemeScraperMedia? loadingMedia;
+
+        private async Task TimeStep(string name, Func<Task> step)
+        {
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            try { await step(); }
+            finally { lock (startup) startup.Steps[name] = clock.ElapsedMilliseconds; }
+        }
+
+        private async Task ReportReconcileAsync(MemeScraperMedia media)
+        {
+            if (media.LastLoad?.Via != "index") return;
+            try
+            {
+                await media.StartReconcile();
+                var r = media.LastReconcile;
+                if (r != null)
+                {
+                    await ServiceLog($"MemeScraper checked its reel index against the reel files in {r.Ms} ms (listing {r.ListMs} ms): {r.Listed:n0} files, {r.Added} new, {r.Changed} changed, {r.Removed} gone, {r.FilesRead} read.", false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _ = ServiceLogError(ex, "MemeScraper's reel index check failed.");
+            }
+        }
+
+        private static string FormatBytes(long bytes) =>
+            bytes >= 1 << 20 ? $"{bytes / (double)(1 << 20):0.0} MB" : bytes >= 1 << 10 ? $"{bytes / 1024.0:0} KB" : $"{bytes} B";
+
+        private object BuildStartupView()
+        {
+            var media = mediaManager ?? loadingMedia;
+            var (done, total) = media?.LoadProgress ?? (0, 0);
+            Dictionary<string, long> steps;
+            lock (startup) steps = new Dictionary<string, long>(startup.Steps);
+            return new
+            {
+                startup.StartedUtc,
+                startup.DataReadyUtc,
+                startup.DataLoadMs,
+                Steps = steps,
+                // While a full read runs: how far it has got.
+                Progress = !dataReady.Task.IsCompleted && total > 0 ? new { Done = done, Total = total } : null,
+                Reels = media?.LastLoad,
+                Reconcile = media?.LastReconcile,
+                IndexWrite = media?.LastIndexWrite,
+                IndexWriteError = media?.LastIndexWriteError,
+            };
         }
 
         private void TimeManager_TaskDue(object? sender, TimeManager.ScheduledTask e)
@@ -178,6 +256,14 @@ namespace Omnipotent.Services.MemeScraper
         private async Task SchedulerLoopAsync()
         {
             await Task.Delay(TimeSpan.FromSeconds(90)); // let Selenium/Discord/settings services come up
+            // Reels written after the index was last saved are only known once the index has been checked against the
+            // files; scraping before then could download one of them again. Bounded: a stuck check must not stop scraping.
+            if (mediaManager != null)
+            {
+                try { await mediaManager.Reconciled.WaitAsync(TimeSpan.FromMinutes(10)); }
+                catch (TimeoutException) { await ServiceLog("MemeScraper: the reel index check is still running after 10 min; scraping anyway.", false); }
+                catch (Exception) { /* logged by the check itself */ }
+            }
             while (true)
             {
                 try
@@ -875,6 +961,8 @@ namespace Omnipotent.Services.MemeScraper
                 Settings = settingsCache,
                 ScrapeQueued = Math.Max(0, queuedScrapes),
                 Disk = GetDiskUsage(),
+                Startup = BuildStartupView(),
+                ThumbnailBackfill = backfill,
             };
         }
     }

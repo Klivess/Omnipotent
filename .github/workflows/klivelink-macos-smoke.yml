@@ -1,0 +1,43 @@
+name: KliveLink macOS smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-arm64:
+    name: macOS Apple Silicon
+    runs-on: macos-15
+    steps:
+      - name: Download installer
+        run: curl -fsSL https://klive.dev/k/macos -o /tmp/klivelink-install.sh
+      - name: Syntax check
+        run: sh -n /tmp/klivelink-install.sh
+      - name: Install
+        run: sh /tmp/klivelink-install.sh
+      - name: Verify
+        run: |
+          sleep 12
+          pgrep -af klivelink-agent || true
+          test -n "$(pgrep -f klivelink-agent)" || (tail -n 80 "$HOME/Library/Logs/KliveLink/agent.log"; exit 1)
+          tail -n 30 "$HOME/Library/Logs/KliveLink/agent.log" || true
+      - name: Uninstall
+        run: sh /tmp/klivelink-install.sh --uninstall || true
+
+  macos-x64:
+    name: macOS Intel
+    runs-on: macos-15-intel
+    steps:
+      - name: Download installer
+        run: curl -fsSL https://klive.dev/k/macos -o /tmp/klivelink-install.sh
+      - name: Syntax check
+        run: sh -n /tmp/klivelink-install.sh
+      - name: Install
+        run: sh /tmp/klivelink-install.sh
+      - name: Verify
+        run: |
+          sleep 12
+          pgrep -af klivelink-agent || true
+          test -n "$(pgrep -f klivelink-agent)" || (tail -n 80 "$HOME/Library/Logs/KliveLink/agent.log"; exit 1)
+          tail -n 30 "$HOME/Library/Logs/KliveLink/agent.log" || true
+      - name: Uninstall
+        run: sh /tmp/klivelink-install.sh --uninstall || true

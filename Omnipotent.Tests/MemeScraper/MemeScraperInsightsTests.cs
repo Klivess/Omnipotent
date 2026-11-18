@@ -400,6 +400,24 @@ namespace Omnipotent.Tests.MemeScraper
             Assert.Equal("2026-09-28", summary.MemesDownloadedPerDay.Keys.First());
         }
 
+        [Fact]
+        public void SummaryCarriesTheEarliestScrapeDueSoAQuietDayIsNotMistakenForAStall()
+        {
+            // Live 13 Nov: 0 reels today and the last one 17 h old, yet the next scrape was due at 19:03 on a
+            // 24 h interval. Without the schedule the home page could only guess.
+            var (sources, reels) = Fixture();
+            sources[0].NextScrapeDueUtc = Now.AddHours(7);
+            sources[1].NextScrapeDueUtc = Now.AddHours(3);
+            sources[2].NextScrapeDueUtc = Now.AddHours(-30);
+            sources[2].DownloadReels = false; // a source that doesn't scrape reels has no say in when the next one is
+            sources.Add(new Source { Username = "new", AccountID = "4", DownloadReels = true, NextScrapeDueUtc = null });
+
+            var summary = MemeScraperInsights.BuildSummary(sources, reels, null, Now);
+
+            Assert.Equal(Now.AddHours(3), summary.NextScrapeDueUtc);
+            Assert.Null(summary.SchedulerState); // filled in by the route, not the pure builder
+        }
+
         // ─────────────────────────────── Scrape log ───────────────────────────────
 
         [Fact]

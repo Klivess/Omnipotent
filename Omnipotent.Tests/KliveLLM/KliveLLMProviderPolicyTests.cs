@@ -86,15 +86,15 @@ namespace Omnipotent.Tests.KliveLLM
                 new HFWrapper.HFMessage
                 {
                     role = "system",
-                    content = "stable doctrine" + LlmService.CacheBreakpointMarker + "project identity",
+                    content = "stable doctrine" + LlmService.CacheBreakpointMarker + "Steward identity",
                 },
                 new HFWrapper.HFMessage { role = "user", content = "stable wake seed" },
             };
 
-            LlmService.ApplyOpenRouterSession(ref payload, OpenRouter(), "projects-commander-p1");
+            LlmService.ApplyOpenRouterSession(ref payload, OpenRouter(), "demiurge-commander-p1");
             LlmService.ApplyPromptCaching(ref payload, OpenRouter());
 
-            Assert.Equal("projects-commander-p1", payload.session_id);
+            Assert.Equal("demiurge-commander-p1", payload.session_id);
             Assert.NotNull(payload.cache_control);
             Assert.IsType<List<object>>(payload.messages[0].content);
             Assert.IsType<List<object>>(payload.messages[1].content);
@@ -176,7 +176,7 @@ namespace Omnipotent.Tests.KliveLLM
                 OpenRouter(), Payload(8192), CancellationToken.None, stream ? _ => { } : null));
             Assert.Equal(RemoteLLMFailureKind.ModelUnavailable, error.Kind);
             Assert.Equal(HttpStatusCode.Forbidden, error.StatusCode);
-            Assert.False(Omnipotent.Services.Projects.ProjectWakeRecovery.IsSharedFailure(error));
+            Assert.False(Omnipotent.Services.Demiurge.StewardWakeRecovery.IsSharedFailure(error));
             Assert.Single(handler.RequestBodies);
         }
 
@@ -269,7 +269,7 @@ namespace Omnipotent.Tests.KliveLLM
             LlmService.ApplyModelFallback(ref hf, HuggingFace(), new[] { "a/b", "c/d" });
             Assert.Null(hf.models);
 
-            // A custom OpenAI-compatible endpoint: the Projects route list still selects the primary
+            // A custom OpenAI-compatible endpoint: the Demiurge route list still selects the primary
             // model, but the backup entries must not be sent as an unknown parameter.
             var custom = Payload(null);
             LlmService.ApplyModelFallback(ref custom, CustomOpenAI(), new[] { "a/b", "c/d" });
@@ -350,7 +350,7 @@ namespace Omnipotent.Tests.KliveLLM
         [Fact]
         public void FlatFee_IsTrueOnlyForTheFlatFeeRouter()
         {
-            // This flag is what stops the Projects budget ledger metering spend that never happens.
+            // This flag is what stops the Demiurge budget ledger metering spend that never happens.
             Assert.True(LlmService.IsFlatFee(LlmService.LLMProvider.AIRouter));
             Assert.False(LlmService.IsFlatFee(LlmService.LLMProvider.OpenRouter));
             Assert.False(LlmService.IsFlatFee(LlmService.LLMProvider.CustomOpenAI));
@@ -425,7 +425,7 @@ namespace Omnipotent.Tests.KliveLLM
         public async Task AIRouterRateLimit_IsWaitedOutInWakeRatherThanSurfacedAsAFailure()
         {
             // The fair-use windows are per minute, so a 429 is a pause, not a wall. The whole point
-            // is that Projects never sees a RateLimited exception it would defer a wake on.
+            // is that Demiurge never sees a RateLimited exception it would defer a wake on.
             var handler = new RecordingHandler(
                 _ => RateLimitResponse(),
                 _ => RateLimitResponse(),
@@ -474,7 +474,7 @@ namespace Omnipotent.Tests.KliveLLM
         public void AIRouterChatModels_AcceptImageInput(string model, bool imageInput)
         {
             // The family table knows neither AIRouter name; relying on it refused every KliveAgent
-            // image attachment and turned off Projects screenshots under AIRouter.
+            // image attachment and turned off Demiurge screenshots under AIRouter.
             Assert.Equal(imageInput, LlmService.AIRouterModelCapabilities(model).ImageInput);
             Assert.False(LlmService.AIRouterModelCapabilities(model).AudioInput);
         }
@@ -565,7 +565,7 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal(RemoteLLMFailureKind.RateLimited, error.Kind);
             Assert.Equal(TimeSpan.FromHours(1), error.RetryAfter);
             Assert.Equal(TimeSpan.FromHours(1), service.FairUse.Describe().PenaltyRemaining);
-            Assert.Equal(now.AddHours(1), Omnipotent.Services.Projects.ProjectProviderFailure.AutomaticRetryAt(error, now, flatFeeProvider: true));
+            Assert.Equal(now.AddHours(1), Omnipotent.Services.Demiurge.StewardProviderFailure.AutomaticRetryAt(error, now, flatFeeProvider: true));
         }
 
         [Theory]

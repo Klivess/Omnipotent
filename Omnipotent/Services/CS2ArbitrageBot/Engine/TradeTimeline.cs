@@ -193,5 +193,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         public double? SteamMaxListingPence { get; init; }
         /// <summary>The CSFloat account is set to away: its listings cannot sell.</summary>
         public bool CSFloatSellingPaused { get; init; }
+        /// <summary>Why the Steam Market can't be sold on right now (the bot's Steam login needs Klives's approval); null when it can.</summary>
+        public string? SteamUnavailableReason { get; init; }
     }
 }

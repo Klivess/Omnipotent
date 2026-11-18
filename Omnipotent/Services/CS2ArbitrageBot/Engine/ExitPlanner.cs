@@ -191,6 +191,7 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         private static int SteamBidNow(ExitContext ctx, ExitModelSettings s, bool atPurchase, out string? problem)
         {
             problem = null;
+            if (ctx.Environment.SteamUnavailableReason is string down) { problem = "Steam selling unavailable: " + down; return 0; }
             var book = ctx.Book;
             if (book == null) { problem = "no Steam order book"; return 0; }
             if (!book.HasBuyOrders) { problem = "no Steam buy orders"; return 0; }

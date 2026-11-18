@@ -21,10 +21,10 @@ namespace Omnipotent.Tests.AccountRegistry
             var r = store.Register(svc, "bot", null, new() { ["password"] = "pw-123" }, null, "KliveAgent", null, false, null);
             string id = r.Account!.AccountID;
 
-            string outText = store.ResolveAccountPlaceholders($"login {{account:{svc}/password}} done", "project:xyz");
+            string outText = store.ResolveAccountPlaceholders($"login {{account:{svc}/password}} done", "steward:xyz");
             Assert.Equal("login pw-123 done", outText);
             Assert.NotNull(store.Get(id)!.LastUsedAt);
-            Assert.Contains("project:xyz", store.Get(id)!.Owners); // auto-claimed
+            Assert.Contains("steward:xyz", store.Get(id)!.Owners); // auto-claimed
         }
 
         [Fact]

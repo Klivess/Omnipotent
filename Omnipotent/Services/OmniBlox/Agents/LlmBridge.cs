@@ -101,11 +101,15 @@ namespace Omnipotent.Services.OmniBlox.Agents
         {
             var llm = resolve();
             if (llm == null || !llm.IsServiceActive()) return (false, "KliveLLM is not running.");
-            bool flatFee;
-            try { flatFee = await llm.IsFlatFeeProviderAsync(); }
-            catch (Exception ex) { return (false, "Could not read the active model provider: " + ex.Message); }
-            if (!flatFee)
-                return (false, "OmniBlox only runs on AIRouter (flat fee), and RemoteLLMProvider is set to something else. It never spends money on a per-token provider.");
+            // OmniBlox's lane decides now: by default it may never spend per token, so a per-token
+            // route (or a paused or over-budget lane) stops work before it starts, with the reason.
+            try
+            {
+                var (ok, reason) = await llm.CheckRouteAsync(LlmConsumerCatalog.Callers.OmniBloxAgents);
+                if (!ok)
+                    return (false, reason ?? "OmniBlox only runs on a free or flat-fee router (AIRouter), and its route bills per token.");
+            }
+            catch (Exception ex) { return (false, "Could not read OmniBlox's model route: " + ex.Message); }
             return (true, null);
         }
 
@@ -121,7 +125,13 @@ namespace Omnipotent.Services.OmniBlox.Agents
 
         private KliveLlmService Llm => resolve() ?? throw new InvalidOperationException("KliveLLM is not running.");
 
-        public void StartSession(string sessionId, string systemPrompt) => Llm.StartToolSession(sessionId, systemPrompt);
+        public void StartSession(string sessionId, string systemPrompt) => Llm.StartToolSession(sessionId, systemPrompt, CallerFor(sessionId));
+
+        /// <summary>The asset labeller's sessions are its own lane on the KliveLLM page; everything else is the studio's agents.</summary>
+        private static LlmCaller CallerFor(string sessionId)
+            => sessionId.StartsWith("omniblox-label-", StringComparison.Ordinal) || sessionId.StartsWith("omniblox-calibrate-", StringComparison.Ordinal)
+                ? LlmConsumerCatalog.Callers.OmniBloxLabeller
+                : LlmConsumerCatalog.Callers.OmniBloxAgents;
 
         public void AppendUser(string sessionId, string text, IReadOnlyList<byte[]>? images = null)
         {

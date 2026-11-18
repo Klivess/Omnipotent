@@ -221,7 +221,7 @@ public class OmniToolRegistryTests
     // -- helpers --
 
     /// <summary>Builds a payload filling every declared property with a value of its declared type,
-    /// the same trick ProjectToolFacadeTests uses to prove a schema is satisfiable.</summary>
+    /// the same trick StewardToolFacadeTests uses to prove a schema is satisfiable.</summary>
     private static JObject SaturatePayload(JObject schema)
     {
         var payload = new JObject();

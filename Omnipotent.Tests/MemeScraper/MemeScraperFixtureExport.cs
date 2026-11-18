@@ -18,7 +18,7 @@ namespace Omnipotent.Tests.MemeScraper
         private const string Zone = "Europe/London";
 
         private sealed record Spec(string User, string Name, string[] Niches, int Followers, double PerDay, double MedianViews,
-            int StartDaysAgo, int QuietDaysAgo = 0, int Failures = 0, bool Paused = false);
+            int StartDaysAgo, int QuietDaysAgo = 0, int Failures = 0, bool Paused = false, bool Empty = false);
 
         private static readonly Spec[] Specs =
         {
@@ -34,6 +34,9 @@ namespace Omnipotent.Tests.MemeScraper
             new("sigmagrindset", "Sigma Grindset", new[] { "motivation" }, 150_000, 1.2, 40_000, 90, Failures: 1),
             new("memezar", "Memezar", new[] { "relatable", "cats" }, 520_000, 2.6, 95_000, 60),
             new("startup.lol", "Startup LOL", Array.Empty<string>(), 45_000, 0.6, 7_000, 45),
+            // Scraped every day, never a reel (9 of 30 live sources on 13 Nov 2026).
+            new("memevault.archive", "Saving The Username", new[] { "relatable" }, 14, 0, 0, 31, Empty: true),
+            new("lol.reposts", "LOL Reposts", Array.Empty<string>(), 92, 0, 0, 31, Empty: true),
         };
 
         // Every provider was blocked for these days: nothing downloaded, every scrape failed.
@@ -164,6 +167,19 @@ namespace Omnipotent.Tests.MemeScraper
                 Settings = new { Paused = false, IntervalHours = 24, MaxPagesPerScrape = 40, ReadUtc = Now },
                 ScrapeQueued = 0,
                 Disk = new { Bytes = reels.Count * 4_200_000L - 3 * 4_200_000L, Files = reels.Count - 3 + 2, MissingVideos = 3, OrphanFiles = 2, ThumbnailBytes = 18_400_000L, MeasuredUtc = Now.AddMinutes(-4), DurationMs = 212 },
+                Startup = new
+                {
+                    StartedUtc = Now.AddHours(-13.7),
+                    DataReadyUtc = Now.AddHours(-13.7).AddSeconds(2.4),
+                    DataLoadMs = 2_410L,
+                    Steps = new Dictionary<string, long> { ["sources"] = 84, ["niches"] = 11, ["reels"] = 2_390, ["scrape history"] = 46 },
+                    Progress = (object?)null,
+                    Reels = new MemeScraperReelIndex.LoadReport { Via = "index", Ms = 2_390, IndexMs = 2_210, IndexBytes = 9_841_220, IndexWrittenUtc = Now.AddHours(-14), Reels = reels.Count },
+                    Reconcile = new MemeScraperReelIndex.ReconcileReport { Ms = 38_412, ListMs = 37_960, Listed = reels.Count, Added = 2, Changed = 0, Removed = 0, FilesRead = 2, FinishedUtc = Now.AddHours(-13.68) },
+                    IndexWrite = new MemeScraperReelIndex.WriteReport { WrittenUtc = Now.AddHours(-2), Reels = reels.Count, Bytes = 9_844_018, Ms = 1_220 },
+                    IndexWriteError = (string?)null,
+                },
+                ThumbnailBackfill = new { State = "running", Made = 412, Failed = 3, Remaining = 5_180, LastMadeUtc = Now.AddSeconds(-20), CountedUtc = Now.AddMinutes(-6) },
             });
         }
 
@@ -238,6 +254,13 @@ namespace Omnipotent.Tests.MemeScraper
 
                     // The first scrape back-fills older reels; later ones catch what was posted since.
                     bool backfill = day == start;
+                    if (spec.Empty)
+                    {
+                        report.ProviderSummary = "inflact: ok, 0 reels, 1 page(s) — cross-checking with instagram | instagram: ok, 0 reels, 1 page(s)";
+                        report.SucceededVia = "instagram";
+                        history.Add(report);
+                        continue;
+                    }
                     int count = backfill ? rng.Next(25, 55) : day >= quietSince ? 0 : Poisson(rng, spec.PerDay * (day.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday ? 1.25 : 1.0));
                     int partialFailures = !backfill && count > 0 && rng.NextDouble() < 0.06 ? 1 : 0;
                     int saved = 0;

@@ -16,9 +16,9 @@ namespace Omnipotent.Tests.KliveLLM
             limiter.EngageInteractiveReserve("talk:test", TimeSpan.FromMinutes(5));
             Assert.Equal(1, limiter.Describe().ReservedSlots);
 
-            var a = await limiter.AcquireAsync(10, Ticket("projects-agent-a", AIRouterWorkClass.Agent));
-            var b = await limiter.AcquireAsync(10, Ticket("projects-agent-b", AIRouterWorkClass.Agent));
-            var c = limiter.AcquireAsync(10, Ticket("projects-agent-c", AIRouterWorkClass.Agent));
+            var a = await limiter.AcquireAsync(10, Ticket("demiurge-agent-a", AIRouterWorkClass.Agent));
+            var b = await limiter.AcquireAsync(10, Ticket("demiurge-agent-b", AIRouterWorkClass.Agent));
+            var c = limiter.AcquireAsync(10, Ticket("demiurge-agent-c", AIRouterWorkClass.Agent));
             await Task.Delay(150);
             Assert.False(c.IsCompleted); // the fleet waits; it does not take the reserved slot
 
@@ -45,8 +45,8 @@ namespace Omnipotent.Tests.KliveLLM
             limiter.EngageInteractiveReserve("talk:test", TimeSpan.FromMinutes(5));
 
             var live = await limiter.AcquireAsync(10, Ticket("kliveagent-conv", AIRouterWorkClass.Interactive));
-            var a = await limiter.AcquireAsync(10, Ticket("projects-agent-a", AIRouterWorkClass.Agent)).WaitAsync(TimeSpan.FromSeconds(2));
-            var b = await limiter.AcquireAsync(10, Ticket("projects-agent-b", AIRouterWorkClass.Agent)).WaitAsync(TimeSpan.FromSeconds(2));
+            var a = await limiter.AcquireAsync(10, Ticket("demiurge-agent-a", AIRouterWorkClass.Agent)).WaitAsync(TimeSpan.FromSeconds(2));
+            var b = await limiter.AcquireAsync(10, Ticket("demiurge-agent-b", AIRouterWorkClass.Agent)).WaitAsync(TimeSpan.FromSeconds(2));
             Assert.Equal(3, limiter.Describe().InFlight);
 
             live.Dispose();
@@ -59,8 +59,8 @@ namespace Omnipotent.Tests.KliveLLM
         {
             var limiter = new AIRouterFairUseLimiter(maxParallelRequests: 3);
             limiter.EngageInteractiveReserve("talk:test", TimeSpan.FromMinutes(5));
-            var a = await limiter.AcquireAsync(10, Ticket("projects-agent-a", AIRouterWorkClass.Agent));
-            var b = await limiter.AcquireAsync(10, Ticket("projects-agent-b", AIRouterWorkClass.Agent));
+            var a = await limiter.AcquireAsync(10, Ticket("demiurge-agent-a", AIRouterWorkClass.Agent));
+            var b = await limiter.AcquireAsync(10, Ticket("demiurge-agent-b", AIRouterWorkClass.Agent));
 
             var speech = await limiter.AcquireAsync(1, Ticket("audio:tts", AIRouterWorkClass.Audio)).WaitAsync(TimeSpan.FromSeconds(2));
             Assert.Equal(3, limiter.Describe().InFlight);
@@ -77,13 +77,13 @@ namespace Omnipotent.Tests.KliveLLM
             var limiter = new AIRouterFairUseLimiter(maxParallelRequests: 3);
             var held = new List<AIRouterFairUseLease>();
             for (int i = 0; i < 3; i++)
-                held.Add(await limiter.AcquireAsync(10, Ticket($"projects-agent-{i}", AIRouterWorkClass.Agent)));
+                held.Add(await limiter.AcquireAsync(10, Ticket($"demiurge-agent-{i}", AIRouterWorkClass.Agent)));
 
             limiter.EngageInteractiveReserve("talk:test", TimeSpan.FromMinutes(5));
             Assert.Equal(3, limiter.Describe().InFlight); // nobody was evicted
 
             var live = limiter.AcquireAsync(10, Ticket("kliveagent-conv", AIRouterWorkClass.Interactive));
-            var background = limiter.AcquireAsync(10, Ticket("projects-agent-x", AIRouterWorkClass.Agent));
+            var background = limiter.AcquireAsync(10, Ticket("demiurge-agent-x", AIRouterWorkClass.Agent));
             held[0].Dispose();
             var admitted = await live.WaitAsync(TimeSpan.FromSeconds(5));
             await Task.Delay(150);
@@ -104,9 +104,9 @@ namespace Omnipotent.Tests.KliveLLM
             limiter.EngageInteractiveReserve("talk:test", TimeSpan.FromMinutes(1));
             DateTime start = clock.UtcNow;
 
-            var a = await limiter.AcquireAsync(10, Ticket("projects-agent-a", AIRouterWorkClass.Agent));
-            var b = await limiter.AcquireAsync(10, Ticket("projects-agent-b", AIRouterWorkClass.Agent));
-            var c = await limiter.AcquireAsync(10, Ticket("projects-agent-c", AIRouterWorkClass.Agent)).WaitAsync(TimeSpan.FromSeconds(5));
+            var a = await limiter.AcquireAsync(10, Ticket("demiurge-agent-a", AIRouterWorkClass.Agent));
+            var b = await limiter.AcquireAsync(10, Ticket("demiurge-agent-b", AIRouterWorkClass.Agent));
+            var c = await limiter.AcquireAsync(10, Ticket("demiurge-agent-c", AIRouterWorkClass.Agent)).WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.True(clock.UtcNow - start >= TimeSpan.FromMinutes(1));
             Assert.Equal(0, limiter.Describe().ReservedSlots);

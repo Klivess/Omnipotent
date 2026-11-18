@@ -141,6 +141,9 @@ namespace Omnipotent.Services.MemeScraper
             };
             int benchedCount = providers.Count(p => IsBenched(p.Provider.Name));
             bool inflactWasEmpty = false;
+            // inflact's error for an account with no reels at all ("HTTP 200: Something went wrong" for 8 of the 9 empty
+            // sources live, 13 Nov 2026) is not inflact being down. Whether it counts waits for Instagram's answer.
+            string? primaryFailure = null;
 
             foreach (var (provider, timeout) in providers)
             {
@@ -186,8 +189,23 @@ namespace Omnipotent.Services.MemeScraper
                 catch (Exception ex)
                 {
                     string reason = ex is OperationCanceledException ? $"timed out after {timeout.TotalMinutes:0} min" : ex.Message;
-                    RecordFailure(provider.Name, reason);
+                    if (provider == primary) primaryFailure = reason;
+                    else RecordFailure(provider.Name, reason);
                     outcome.Attempts.Add($"{provider.Name}: FAILED — {reason}");
+                }
+            }
+
+            if (primaryFailure != null)
+            {
+                // Instagram answered and saw no reels either: the account has none to give, so inflact's error says
+                // nothing about inflact. Counted, three such accounts in a row would bench a working provider for 6 h.
+                if (outcome.SucceededVia == fallback.Name && merged.Count == 0)
+                {
+                    outcome.Attempts.Add($"{primary.Name}'s failure not counted: {fallback.Name} found no reels for {username} either");
+                }
+                else
+                {
+                    RecordFailure(primary.Name, primaryFailure);
                 }
             }
 

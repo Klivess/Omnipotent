@@ -102,11 +102,34 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
             }
             foreach (var p in await papers.QueryAsync(new DocumentQuery { K2 = nameof(PaperStatus.Analysing), Limit = 200 }, ct))
             {
-                p.Status = p.Attempts >= 2 ? PaperStatus.Analysed : PaperStatus.Queued;
+                RequeueAfterRestart(p);
                 await papers.UpsertAsync(p, ct);
             }
             foreach (var c in await candidates.QueryAsync(new DocumentQuery { K2In = new[] { "Proposed", "Evaluating" }, Limit = 200 }, ct))
                 evaluations.Writer.TryWrite(c.Id);
+        }
+
+        /// <summary>How many times a restart may hand a paper its attempt back.</summary>
+        internal const int MaxRestartRefunds = 3;
+
+        /// <summary>
+        /// Puts a paper that was being read when the process stopped back in the queue.
+        ///
+        /// A paper gets two attempts, and the attempt is counted when the batch is sent. A restart in
+        /// the middle of a batch therefore used one up without the agent reading anything, and two such
+        /// restarts closed the paper as "analysed" with no verdict: on 5 Nov 2026 the server started 15
+        /// times in a day. The restart ended the read, not the paper, so the attempt is given back, a
+        /// bounded number of times in case a paper is itself what brings the process down.
+        /// </summary>
+        internal static void RequeueAfterRestart(ResearchPaper paper)
+        {
+            if (paper.Attempts > 0 && paper.RestartRefunds < MaxRestartRefunds)
+            {
+                paper.Attempts--;
+                paper.RestartRefunds++;
+            }
+            paper.Status = paper.Attempts >= 2 ? PaperStatus.Analysed : PaperStatus.Queued;
+            if (paper.Status == PaperStatus.Analysed) paper.Verdict ??= "no verdict recorded";
         }
 
         public async Task SaveSettingsAsync(AlphaSettings updated, CancellationToken ct = default)
@@ -479,6 +502,9 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
 
         // ── papers ───────────────────────────────────────────────────────────────
 
+        /// <summary>Changes whenever any paper is written (ingest, analysis, verdicts, stars).</summary>
+        public long PapersVersion => papers.Version;
+
         public Task<ResearchPaper?> GetPaperAsync(string id, CancellationToken ct = default) => papers.GetAsync(id, ct);
 
         public Task<List<ResearchPaper>> ListPapersAsync(string? status = null, string? text = null, double? minRelevance = null,
@@ -668,6 +694,9 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
             if (settings.AutoEvaluate) evaluations.Writer.TryWrite(c.Id);
             return c;
         }
+
+        /// <summary>Changes whenever any candidate is written: readers can keep what they read until it moves.</summary>
+        public long CandidatesVersion => candidates.Version;
 
         public Task<AlphaCandidate?> GetCandidateAsync(string id, CancellationToken ct = default) => candidates.GetAsync(id, ct);
 

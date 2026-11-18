@@ -24,11 +24,12 @@ namespace Omnipotent.Services.OmniTrader.Api
             {
                 var def = Body<ScreenDefinition>(req);
                 if (def == null) { await Bad(req, "Body must be a screen definition"); return; }
+                ScreenerEngine.Normalise(def);
                 // A saved or preset id with no filters of its own runs that screen.
                 if (def.Filters.Count == 0 && def.Columns.Count == 0 && !string.IsNullOrWhiteSpace(def.Id))
                 {
                     var stored = await screens.GetAsync(def.Id) ?? ScreenerEngine.Presets().FirstOrDefault(p => p.Id == def.Id);
-                    if (stored != null) def = stored;
+                    if (stored != null) def = ScreenerEngine.Normalise(stored);
                 }
                 var errors = ScreenerEngine.Validate(def);
                 if (errors.Count > 0) { await Json(req, new { Ok = false, Errors = errors }); return; }
@@ -42,6 +43,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             {
                 var def = Body<ScreenDefinition>(req);
                 if (def == null) { await Bad(req, "Body must be a screen definition"); return; }
+                ScreenerEngine.Normalise(def);
                 var errors = ScreenerEngine.Validate(def);
                 await Json(req, new { Ok = errors.Count == 0, Errors = errors });
             });
@@ -50,6 +52,7 @@ namespace Omnipotent.Services.OmniTrader.Api
             {
                 var def = Body<ScreenDefinition>(req);
                 if (def == null) { await Bad(req, "Body must be a screen definition"); return; }
+                ScreenerEngine.Normalise(def);
                 var errors = ScreenerEngine.Validate(def);
                 if (errors.Count > 0) { await Json(req, new { Ok = false, Errors = errors }); return; }
                 if (def.Preset || ScreenerEngine.Presets().Any(p => p.Id == def.Id)) def.Id = Guid.NewGuid().ToString("N");

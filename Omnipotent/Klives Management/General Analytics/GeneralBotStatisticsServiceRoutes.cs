@@ -135,6 +135,23 @@ namespace Omnipotent.Klives_Management.General_Analytics
                 }
             }, HttpMethod.Get, SystemPerms.StatusView);
 
+            // The last hour of the same vitals, for trend lines: ?minutes=1..60 (default 60).
+            await g.CreateAPIRoute("/GeneralBotStatistics/History", async (req) =>
+            {
+                try
+                {
+                    // Wall-clock data with no store behind it: never a candidate for the response cache.
+                    Omnipotent.Services.KliveAPI.Caching.CacheDeps.MarkUncacheable("vitals history");
+                    int minutes = int.TryParse(req.userParameters["minutes"], out int parsed) ? Math.Clamp(parsed, 1, 60) : 60;
+                    var series = g.History.Read(TimeSpan.FromMinutes(minutes), DateTime.UtcNow);
+                    await req.ReturnResponse(JsonConvert.SerializeObject(series));
+                }
+                catch (Exception ex)
+                {
+                    await req.ReturnResponse(new ErrorInformation(ex).FullFormattedMessage, code: System.Net.HttpStatusCode.InternalServerError);
+                }
+            }, HttpMethod.Get, SystemPerms.StatusView);
+
             // Lightweight hardware-only summary (CPU, RAM, disks, network)
             await g.CreateAPIRoute("/GeneralBotStatistics/GetHardwareStats", async (req) =>
             {

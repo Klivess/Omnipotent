@@ -406,16 +406,23 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
 
         /// <summary>
         /// Builds (unless the caller just built clean: <paramref name="built"/>), then runs the engine tests on that
-        /// build and records the run: in Roblox's engine, or, while there is no API key or experience slot, in the
-        /// studio's local engine (<see cref="LocalEngine"/>). Null run (with the reason) when they cannot run: no key
-        /// or slot and no local engine, a failed build, or Roblox (or the local engine) unable to run it.
+        /// build and records the run: in Roblox's engine, or, while there is no API key or experience slot or Roblox
+        /// refuses the key, in the studio's local engine (<see cref="LocalEngine"/>). Null run (with the reason) when
+        /// they cannot run: no key or slot and no local engine, a failed build, or Roblox (or the local engine) unable to
+        /// run it. <paramref name="requireRoblox"/> (a launch or an update, which only Roblox's engine can clear) asks
+        /// Roblox even while it has been refusing.
         /// </summary>
-        public static async Task<(EngineRun? Run, string Message)> RunEngineTestsAsync(StudioContext ctx, string gameId, CancellationToken ct, BuildRun? built = null)
+        public static async Task<(EngineRun? Run, string Message)> RunEngineTestsAsync(StudioContext ctx, string gameId, CancellationToken ct, BuildRun? built = null, bool requireRoblox = false)
         {
-            var slot = ctx.Cloud.HasKey ? await Slots.EnsureAsync(ctx, gameId, ct) : null;
+            // Roblox refusing the key is not asked again on every run_tests (one game asked 54 times): the local engine
+            // stands in until the key changes or the owner marks the refusal fixed.
+            string? refused = ctx.Cloud.HasKey && !requireRoblox ? CredentialCheck.Refusal(ctx) : null;
+            var slot = ctx.Cloud.HasKey && refused == null ? await Slots.EnsureAsync(ctx, gameId, ct) : null;
             if (slot == null)
             {
-                string waiting = ctx.Cloud.HasKey
+                string waiting = refused != null
+                    ? $"Roblox's engine is not used now: {refused} (the owner has been asked); it runs again before launch."
+                    : ctx.Cloud.HasKey
                     ? $"Engine tests wait for an experience to run in ({Slots.Unavailable(ctx, ask: false)})."
                     : "Engine tests need the Roblox API key, which is not set yet; they run before launch.";
                 if (ctx.LocalEngine is not { Available: true })
@@ -435,9 +442,19 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                 try { run = await EngineTests.RunAsync(ctx, gameId, slot, ct); }
                 catch (RobloxApiException ex) when (ex.IsAuth)
                 {
-                    ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.ApiKey, "apikey-engine", "Let the Roblox API key run engine tests",
-                        $"Running the game in Roblox's engine was refused ({ex.Message}). The key needs universe-places:write (to save a test version) and luau-execution-session:write (to run it) on experience {slot.UniverseId}.", gameId, ctx.Clock()));
-                    return (null, "The engine tests were refused by Roblox (the API key lacks a permission; the owner has been asked). Nothing is wrong with the game for that.");
+                    // Whose the key is decides what to tell the owner: another account's key has every permission and
+                    // is still refused, so "add a permission" would send them looking in the wrong place.
+                    try { await ctx.Credentials.CheckAsync(ctx, ct); }
+                    catch (Exception check) when (check is not OperationCanceledException) { ctx.Log("[OmniBlox] credential check after an engine refusal: " + check.Message); }
+                    if (CredentialCheck.KeyIsOthers(ctx) == null)
+                    {
+                        string title = ctx.Game(gameId)?.DisplayTitle ?? gameId;
+                        ctx.Store.Mutate(s => s.FileOwnerTask(OwnerTaskKind.ApiKey, CredentialCheck.EngineRefusedKey, "Roblox refuses the API key's engine tests",
+                            CredentialCheck.EngineRefusalDetail(ctx, title, slot, ex), null, ctx.Clock()));
+                    }
+                    string fallback = ctx.LocalEngine is { Available: true } ? "run_tests runs the game in the local engine until it is fixed" : "build covers the static checks until it is fixed";
+                    string reason = CredentialCheck.KeyIsOthers(ctx) != null ? CredentialCheck.Refusal(ctx)! : ex.Message;
+                    return (null, $"Roblox refused the engine tests: {reason} (the owner has been asked). Nothing is wrong with the game for that; {fallback}.");
                 }
                 catch (Exception ex) when (ex is RobloxApiException or TimeoutException or HttpRequestException or RobloxKeyMissingException
                     || ex is OperationCanceledException && !ct.IsCancellationRequested)
@@ -453,6 +470,8 @@ namespace Omnipotent.Services.OmniBlox.Pipeline.Tools
                     g.Build.LastEngineRun = run;
                     if (run.Ok) g.Publish.EngineTestedRevision = run.Revision;
                 });
+                // Roblox took the test version: whatever it refused before is fixed.
+                if (run.Ran) ctx.Store.Mutate(s => s.ResolveOwnerTasks(CredentialCheck.EngineRefusedKey, ctx.Clock()));
                 if (run.KitFailed) ReportKitFailure(ctx, gameId, run);
                 return (run, run.Summary);
             }

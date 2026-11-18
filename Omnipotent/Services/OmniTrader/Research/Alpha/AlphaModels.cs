@@ -34,6 +34,8 @@ namespace Omnipotent.Services.OmniTrader.Research.Alpha
 
         public PaperStatus Status { get; set; } = PaperStatus.New;
         public int Attempts { get; set; }
+        /// <summary>Attempts handed back because a restart, not the paper, ended the read (AlphaLab.RequeueAfterRestart).</summary>
+        public int RestartRefunds { get; set; }
         public string? Verdict { get; set; }
         public string? Notes { get; set; }
         public string? AnalysedBy { get; set; }

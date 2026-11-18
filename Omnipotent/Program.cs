@@ -101,9 +101,9 @@ namespace Omnipotent
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new KliveMultiTool());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Tripwires.TripwireService());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Stratum.Stratum());
-                // Projects receives the API instance directly so route registration never depends on
+                // Demiurge receives the API instance directly so route registration never depends on
                 // the service manager's unbounded asynchronous type lookup during cold startup.
-                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Projects.Projects(kliveApi));
+                omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.Demiurge.Demiurge(kliveApi));
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.KliveRAG.KliveRAG());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new Omnipotent.Services.AccountRegistry.AccountRegistry());
                 omniServiceManager.CreateAndStartNewMonitoredOmniService(new PortForwardManager());

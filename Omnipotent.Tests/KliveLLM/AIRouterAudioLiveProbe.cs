@@ -28,7 +28,7 @@ namespace Omnipotent.Tests.KliveLLM
     ///
     /// Not covered here, deliberately: whether audio requests count toward the 3-parallel limit. Testing
     /// that means holding three chat requests open on the shared key, which would collide with the
-    /// Projects fleet. Pause the fleet first, or ask support@airouter.ch, then set
+    /// Demiurge fleet. Pause the fleet first, or ask support@airouter.ch, then set
     /// AIRouterAudioCountsTowardParallel accordingly.
     /// </summary>
     public class AIRouterAudioLiveProbe(ITestOutputHelper output)

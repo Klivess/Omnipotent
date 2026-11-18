@@ -106,7 +106,7 @@ Key files: [`KliveAPI.cs`](Omnipotent/Services/KliveAPI/KliveAPI.cs) ·
 [`KliveApiStatisticsStore.cs`](Omnipotent/Services/KliveAPI/KliveApiStatisticsStore.cs) ·
 [`KMProfileManager.cs`](Omnipotent/Klives%20Management/KMProfileManager.cs)
 
-### 3. KliveAgent, Projects and cross-system retrieval
+### 3. KliveAgent, Demiurge and cross-system retrieval
 
 [`Services/KliveAgent/`](Omnipotent/Services/KliveAgent) · **[Full write-up →](Docs/agent-and-rag.md)** · [Architecture notes](Omnipotent/Services/KliveAgent/AGENT_ARCHITECTURE.md)
 
@@ -117,7 +117,7 @@ tool schema, no registration and no glue. Around that loop sit a per-category co
 persistent memory, compaction of the oldest turns, token streaming, self-scheduled future work, and a
 per-run token and wall-clock budget that force-finalises rather than capping iterations.
 
-**Projects** extends this to autonomous work lasting weeks: a commander delegating to staffed workers,
+**Demiurge** extends this to autonomous work lasting weeks: a commander delegating to staffed workers,
 durable event logs and digests so each wake reconstructs state, cross-wake repeat detection, budget
 ledgers, model-tier routing, a hard 64-tool cap enforced by folding related tools behind an `op`
 parameter, and isolated Docker desktops over VNC that the owner can take over live to clear a CAPTCHA.
@@ -129,8 +129,8 @@ must never stall a turn.
 
 Key files: [`KliveAgentBrain.cs`](Omnipotent/Services/KliveAgent/KliveAgentBrain.cs) ·
 [`KliveAgentScriptEngine.cs`](Omnipotent/Services/KliveAgent/KliveAgentScriptEngine.cs) ·
-[`ProjectCommanderRunner.cs`](Omnipotent/Services/Projects/ProjectCommanderRunner.cs) ·
-[`ContainerOrchestrator.cs`](Omnipotent/Services/Projects/Containers/ContainerOrchestrator.cs) ·
+[`StewardCommanderRunner.cs`](Omnipotent/Services/Demiurge/StewardCommanderRunner.cs) ·
+[`ContainerOrchestrator.cs`](Omnipotent/Services/Demiurge/Containers/ContainerOrchestrator.cs) ·
 [`HybridRetriever.cs`](Omnipotent/Services/KliveRAG/HybridRetriever.cs)
 
 ## What the platform is used for
@@ -141,7 +141,7 @@ supported for other users, or security-hardened.
 
 | Area | Includes | Status |
 |---|---|---|
-| **AI and agents** | KliveAgent, Projects, KliveLLM, KliveRAG, local and hosted models | Active; some features need credentials |
+| **AI and agents** | KliveAgent, Demiurge, KliveLLM, KliveRAG, local and hosted models | Active; some features need credentials |
 | **Data and search** | Import, SQLite/FTS5 search, retrieval, behavioural statistics, deductions | Active; needs linked data |
 | **Hardware and design** | Device control, telemetry, relays, firmware builds, CAD, electronics, FEA | Active with supported hardware and local tools |
 | **Trading and simulation** | Backtests, paper trading, market analysis, portfolio and risk | Paper and backtest active; adapters need credentials; execution and settlement partly experimental |

@@ -29,6 +29,9 @@ namespace Omnipotent.Services.OmniDefence
         private volatile IpThreatTracker tracker = null!;
         private OmniDefenceOverviewSnapshot? overviewSnapshot;
         private OmniDefenceReadSnapshotCache? readSnapshots;
+        // Start-up step by step, and the profile-link pass that follows it (both in OverviewStatus).
+        private readonly OmniDefenceStartupTrace startup = new();
+        private volatile object? profileLinkStatus;
         private OmniDefenceScanner scanner = new();
         private static readonly HttpClient GeoIpClient = new() { Timeout = TimeSpan.FromSeconds(3) };
 
@@ -67,6 +70,20 @@ namespace Omnipotent.Services.OmniDefence
         public IpThreatTracker Tracker => tracker;
         internal string? OverviewJson => overviewSnapshot?.CurrentJson;
         internal long OverviewBuildMs => overviewSnapshot?.LastBuildMs ?? 0;
+        /// <summary>The overview builder names each step as it starts it, so a stalled build can say where it is.</summary>
+        internal void OverviewStep(string step) => overviewSnapshot?.ReportStep(step);
+        /// <summary>How the overview build is going. Answers whether or not an overview exists.</summary>
+        internal object OverviewStatus() => new
+        {
+            overview = overviewSnapshot?.Status(),
+            auditQueue = store?.PendingAuditRows ?? 0,
+            auditRowsDropped = store?.DroppedAuditRows ?? 0,
+            readPoolTimeouts = store?.ReadPoolTimeouts ?? 0,
+            // How long the last start took, step by step: this route only exists once it is over.
+            startup = startup.Status(),
+            // The pass that follows start-up: which audit rows it read to link IPs to profiles.
+            profileLinks = profileLinkStatus,
+        };
         internal OmniDefenceReadSnapshotCache ReadSnapshots => readSnapshots
             ?? throw new InvalidOperationException("OmniDefence read snapshots are not running.");
         public OmniDefenceScanner Scanner => scanner;
@@ -77,70 +94,120 @@ namespace Omnipotent.Services.OmniDefence
 
         protected override async void ServiceMain()
         {
+            // Every step is named and timed (see OmniDefenceStartupTrace): whatever runs before
+            // the routes register is how long the whole service is missing.
+            startup.Begin();
+            _ = ReportSlowStartupAsync();
             try
             {
                 Directory.CreateDirectory(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory));
                 store = new OmniDefenceStore(OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDatabaseFile));
-                await store.InitializeAsync();
+                // Three steps of its own: opening the database, checking the schema, scrubbing
+                // settings audits.
+                await store.InitializeAsync(startup.Step);
 
                 // Audit rows are batched, so a shutdown between flushes would drop the
                 // tail of the log. Commit what is queued on the way out.
                 ServiceQuitRequest += () => { try { store.ShutdownAsync().GetAwaiter().GetResult(); } catch { } };
 
                 tracker = new IpThreatTracker(store) { AutoEscalated = OnAutoEscalated };
-                await LoadSettingsAsync();
-                await tracker.LoadAsync();
-                await BackfillProfileAssociationsAsync();
+                await startup.Step("settings", LoadSettingsAsync);
+                OmniDefenceStore.ReadCost? ipCost = null;
+                await startup.Step("IP records", async () => ipCost = await tracker.LoadAsync());
+                if (ipCost != null) startup.Detail("IP records", ipCost.ToString());
 
-                foreach (var hp in await store.ListHoneypotRoutesAsync())
+                await startup.Step("honeypot routes", async () =>
                 {
-                    honeypotRoutes[hp.Route] = hp.ResponseKind;
-                }
-                await EnsureRobotsTrapAsync();
+                    foreach (var hp in await store.ListHoneypotRoutesAsync())
+                    {
+                        honeypotRoutes[hp.Route] = hp.ResponseKind;
+                    }
+                    await EnsureRobotsTrapAsync();
+                });
 
-                foreach (var region in await store.ListBlockedRegionsAsync())
+                await startup.Step("blocked regions", async () =>
                 {
-                    blockedRegions[region.Id] = region;
-                }
-                RefreshBlockedRegionSnapshot();
+                    foreach (var region in await store.ListBlockedRegionsAsync())
+                    {
+                        blockedRegions[region.Id] = region;
+                    }
+                    RefreshBlockedRegionSnapshot();
+                });
 
-                await ServiceLog($"OmniDefence active. Loaded {tracker.All().Count()} IP records, {honeypotRoutes.Count} honeypot routes, {blockedRegions.Count} blocked regions.");
+                await ServiceLog($"OmniDefence active. Loaded {tracker.All().Count()} IP records ({ipCost}), {honeypotRoutes.Count} honeypot routes, {blockedRegions.Count} blocked regions.");
 
-                // The overview is expensive to aggregate. Load a recent durable body
-                // immediately, then keep rebuilding it on a single background worker.
-                string overviewPath = Path.Combine(
-                    OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory),
-                    "overview.snapshot.json");
-                var snapshot = new OmniDefenceOverviewSnapshot(overviewPath,
-                    () => OmniDefenceRoutes.BuildOverviewJsonAsync(this),
-                    ex => _ = ServiceLogError(ex, "OmniDefence overview refresh failed."));
-                overviewSnapshot = snapshot;
-                snapshot.LoadFromDisk();
-                var refreshCts = new CancellationTokenSource();
-                ServiceQuitRequest += () => refreshCts.Cancel();
-                _ = Task.Run(() => snapshot.RunAsync(refreshCts.Token));
+                await startup.Step("snapshots", () =>
+                {
+                    // The overview is expensive to aggregate. Load a recent durable body
+                    // immediately, then keep rebuilding it on a single background worker.
+                    string overviewPath = Path.Combine(
+                        OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory),
+                        "overview.snapshot.json");
+                    var snapshot = new OmniDefenceOverviewSnapshot(overviewPath,
+                        () => OmniDefenceRoutes.BuildOverviewJsonAsync(this),
+                        ex => _ = ServiceLogError(ex, "OmniDefence overview refresh failed."));
+                    overviewSnapshot = snapshot;
+                    snapshot.LoadFromDisk();
+                    var refreshCts = new CancellationTokenSource();
+                    ServiceQuitRequest += () => refreshCts.Cancel();
+                    _ = Task.Run(() => snapshot.RunAsync(refreshCts.Token));
 
-                var reads = new OmniDefenceReadSnapshotCache(Path.Combine(
-                    OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory), "read-snapshots"),
-                    ex => _ = ServiceLogError(ex, "OmniDefence read snapshot refresh failed."));
-                reads.RemoveLegacyAuditSnapshots();
-                readSnapshots = reads;
-                var readCts = new CancellationTokenSource();
-                ServiceQuitRequest += () => readCts.Cancel();
-                reads.Start(readCts.Token);
-                OmniDefenceRoutes.WarmDefaultRequests(this);
+                    var reads = new OmniDefenceReadSnapshotCache(Path.Combine(
+                        OmniPaths.GetPath(OmniPaths.GlobalPaths.OmniDefenceDirectory), "read-snapshots"),
+                        ex => _ = ServiceLogError(ex, "OmniDefence read snapshot refresh failed."));
+                    reads.RemoveLegacyAuditSnapshots();
+                    readSnapshots = reads;
+                    var readCts = new CancellationTokenSource();
+                    ServiceQuitRequest += () => readCts.Cancel();
+                    reads.Start(readCts.Token);
+                    OmniDefenceRoutes.WarmDefaultRequests(this);
+                    return Task.CompletedTask;
+                });
 
                 // Periodic flush so threat scores survive restarts.
                 _ = PeriodicFlushLoop();
 
-                await StartFingerprintingAsync();
+                await startup.Step("routes", () => OmniDefenceRoutes.RegisterAsync(this));
 
-                await OmniDefenceRoutes.RegisterAsync(this);
+                startup.Ready();
+                await ServiceLog($"OmniDefence start-up took {startup.Summary()}.");
+
+                // After the routes, never before them: nothing on the start path waits for these.
+                _ = Task.Run(FinishStartupAsync);
             }
             catch (Exception ex)
             {
+                startup.Failed(ex);
                 await ServiceLogError(ex, "OmniDefence failed to start.");
             }
+        }
+
+        /// <summary>
+        /// What start-up leaves until the routes exist. Loading the fingerprint engine and its intel
+        /// took 193.8 s of a 318.5 s start on 11 Nov 2026, and every /omnidefence route waited for
+        /// it. The engine queues signals and commands until it has loaded, and each route answers
+        /// without it, so it now loads once the service is up. The profile links follow: they read
+        /// only the audit rows added since the last start. One after the other, because each holds
+        /// one of the two read slots while it reads.
+        /// </summary>
+        private async Task FinishStartupAsync()
+        {
+            await startup.Step("fingerprinting", StartFingerprintingAsync);
+            await CatchUpProfileLinksAsync();
+        }
+
+        /// <summary>
+        /// A start that overruns says so, once, naming its step. A slow one used to leave only
+        /// "Started service." in the log while every /omnidefence route answered 404.
+        /// </summary>
+        private async Task ReportSlowStartupAsync()
+        {
+            try { await Task.Delay(OmniDefenceStartupTrace.SlowAfter, cancellationToken?.Token ?? CancellationToken.None); }
+            catch (OperationCanceledException) { return; }
+            if (!startup.Running) return;
+            await ServiceLogError(new TimeoutException(
+                $"OmniDefence start-up has run for over {OmniDefenceStartupTrace.SlowAfter.TotalMinutes:0} minutes and is still in step '{startup.CurrentStep}'. " +
+                "The steps after it, and every /omnidefence route, wait for it."));
         }
 
         /// <summary>Score-based Watch/Block transitions get an IP event like every manual one.</summary>
@@ -287,39 +354,42 @@ namespace Omnipotent.Services.OmniDefence
             catch (Exception ex) { await ServiceLogError(ex, "OmniDefence RecordIpEventAsync failed."); }
         }
 
-        private async Task BackfillProfileAssociationsAsync()
+        /// <summary>
+        /// Links IPs to the profile that last used them, from audit rows added since the last pass
+        /// (<see cref="IpThreatTracker.CatchUpProfileLinksAsync"/>). Runs once start-up is over, in
+        /// the background. It used to run inside start-up as one query over the whole request log,
+        /// and everything after it waited: on 10 Nov 2026 the routes were still missing 82 and 92
+        /// minutes after two starts.
+        /// </summary>
+        private async Task CatchUpProfileLinksAsync()
         {
+            static object Status(bool running, IpThreatTracker.ProfileLinkPass? pass, long? ms, string? error) => new
+            {
+                running,
+                fromId = pass?.FromId,
+                throughId = pass?.ThroughId,
+                rowsRead = pass?.RowsRead,
+                ms,
+                error,
+            };
+
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            long Elapsed() => (long)System.Diagnostics.Stopwatch.GetElapsedTime(started).TotalMilliseconds;
+            profileLinkStatus = Status(true, null, null, null);
             try
             {
-                var rows = await store.QueryAsync(@"
-                    SELECT r.ip, r.profile_id, r.profile_name, r.profile_rank, r.utc_ts
-                    FROM requests r
-                    INNER JOIN (
-                        SELECT ip, MAX(utc_ts) AS last_profile_seen
-                        FROM requests
-                        WHERE ip IS NOT NULL AND ip <> '' AND profile_id IS NOT NULL AND profile_id <> ''
-                        GROUP BY ip
-                    ) latest ON latest.ip = r.ip AND latest.last_profile_seen = r.utc_ts
-                    WHERE r.profile_id IS NOT NULL AND r.profile_id <> ''",
-                    new());
-
-                foreach (var row in rows)
-                {
-                    string? ip = row.TryGetValue("ip", out var rawIp) ? rawIp as string : null;
-                    string? profileId = row.TryGetValue("profile_id", out var rawProfileId) ? rawProfileId as string : null;
-                    if (string.IsNullOrWhiteSpace(ip) || string.IsNullOrWhiteSpace(profileId)) continue;
-
-                    string? profileName = row.TryGetValue("profile_name", out var rawProfileName) ? rawProfileName as string : null;
-                    int? profileRank = row.TryGetValue("profile_rank", out var rawProfileRank) && rawProfileRank != null ? Convert.ToInt32(rawProfileRank) : null;
-                    long seenUtc = row.TryGetValue("utc_ts", out var rawSeen) && rawSeen != null ? Convert.ToInt64(rawSeen) : DateTimeOffset.UtcNow.ToUnixTimeSeconds();
-                    tracker.LinkProfile(tracker.GetOrCreate(ip), profileId, profileName, profileRank, seenUtc);
-                }
-
-                await tracker.PersistAllDirtyAsync();
+                var pass = await tracker.CatchUpProfileLinksAsync(
+                    cancellationToken: cancellationToken?.Token ?? CancellationToken.None);
+                profileLinkStatus = Status(false, pass, Elapsed(), null);
+            }
+            catch (OperationCanceledException)
+            {
+                profileLinkStatus = Status(false, null, Elapsed(), "cancelled");
             }
             catch (Exception ex)
             {
-                await ServiceLogError(ex, "OmniDefence profile association backfill failed.");
+                profileLinkStatus = Status(false, null, Elapsed(), ex.Message);
+                await ServiceLogError(ex, "OmniDefence profile link catch-up failed.");
             }
         }
 

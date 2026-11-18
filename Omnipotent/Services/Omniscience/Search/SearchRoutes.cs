@@ -146,8 +146,8 @@ namespace Omnipotent.Services.Omniscience.Search
             if (llms == null || llms.Length == 0)
                 return new JObject(new JProperty("answer", "KliveLLM unavailable."), new JProperty("citations", evidence));
             var llm = (KliveLLM.KliveLLM)llms[0];
-            var resp = await llm.QueryLLM(sb.ToString(), sessionId: null, maxTokensOverride: 700,
-                systemPrompt: "You are a precise analyst answering questions from archived chat evidence. Never invent facts.",
+            var resp = await OmniscienceLlm.AskAsync(llm, sb.ToString(),
+                "You are a precise analyst answering questions from archived chat evidence. Never invent facts.",
                 useFreeModel: true);
 
             return new JObject(

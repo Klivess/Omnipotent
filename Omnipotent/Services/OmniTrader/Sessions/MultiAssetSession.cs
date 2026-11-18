@@ -8,13 +8,14 @@ namespace Omnipotent.Services.OmniTrader.Sessions
 {
     /// <summary>
     /// Live counterpart of <see cref="Backtesting.BacktestSession"/>'s portfolio core: drives a
-    /// cross-sectional (multi-asset) strategy over a dynamically-resolved universe, in PAPER (against the
-    /// portfolio-mode <see cref="SimulatedOrderRouter"/>) or real-money LIVE (per-symbol Kraken orders).
+    /// cross-sectional (multi-asset) strategy over a dynamically-resolved universe, or over the fixed
+    /// basket the strategy declares, in PAPER (against the portfolio-mode <see cref="SimulatedOrderRouter"/>)
+    /// or real-money LIVE (per-symbol Kraken orders).
     /// <para>Bar stepping is REST-poll driven (robust — it advances even when websockets are blocked),
-    /// mirroring the backtest's deterministic stepping. A fast tick poll keeps live marks fresh. The
-    /// universe is re-resolved periodically. Live starts disarmed and routes through a per-order risk
-    /// check; positions are tracked optimistically from placed market orders. Brackets (TP/SL) are
-    /// engine-managed in paper and venue-managed (Kraken close orders) in live.</para>
+    /// mirroring the backtest's deterministic stepping. A fast tick poll keeps live marks fresh. A dynamic
+    /// universe is re-resolved periodically; a basket never changes. Live starts disarmed and routes through
+    /// a per-order risk check; positions are tracked optimistically from placed market orders. Brackets
+    /// (TP/SL) are engine-managed in paper and venue-managed (Kraken close orders) in live.</para>
     /// </summary>
     public sealed class MultiAssetSession : IAsyncDisposable
     {
@@ -31,11 +32,14 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         private readonly FillRepository fillRepo;
         private readonly EquityRepository equityRepo;
         private readonly DeploymentRepository deploymentRepo;
+        private readonly PaperBookStore? books;
         private readonly RiskGate risk;
         private readonly Action<string> log;
         private readonly Action<string, Exception?> err;
 
         private readonly UniverseSpec spec;
+        /// <summary>The fixed symbols of a basket strategy; null for a dynamic top-N universe.</summary>
+        private readonly IReadOnlyList<string>? basket;
         private readonly StrategyContext context;
 
         // Paper book.
@@ -55,13 +59,26 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         private Task? loopTask;
         private bool isRunning;
 
-        private const int PreloadBars = 400;
+        // Pulse for the health check.
+        private readonly DateTime startedUtc = DateTime.UtcNow;
+        private DateTime? lastBarSeenUtc;
+        private int barsThisRun;
+        private readonly int barsBefore;
+        private readonly SessionErrors errors = new();
+
+        // Market orders can fill inside PlaceOrderAsync (SignalClose), before the order row exists; their
+        // fills wait here until it does (see PaperSession).
+        private int placing;
+        private readonly Queue<FillEvent> deferredFills = new();
+
+        public const int PreloadBars = 400;
 
         public MultiAssetSession(
             string deploymentId, DeploymentConfig config, TradingStrategy strategy, SessionMode mode,
             MarketDataRouter marketData, BinanceUniverseProvider universeProvider, IOrderRouter? exchange,
             OrderRepository orderRepo, FillRepository fillRepo, EquityRepository equityRepo, DeploymentRepository deploymentRepo,
-            Action<string> log, Action<string, Exception?> err, decimal? startingQuote = null)
+            Action<string> log, Action<string, Exception?> err, decimal? startingQuote = null,
+            IReadOnlyList<string>? basket = null, PaperBookStore? books = null, PaperBook? restore = null)
         {
             DeploymentId = deploymentId;
             Config = config;
@@ -74,10 +91,17 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             this.fillRepo = fillRepo;
             this.equityRepo = equityRepo;
             this.deploymentRepo = deploymentRepo;
+            this.books = books;
             this.log = log;
-            this.err = err;
+            this.err = (m, e) => { errors.Note(e == null ? m : $"{m}: {e.Message}"); err(m, e); };
             this.risk = new RiskGate(config.Caps ?? new RiskCaps());
-            spec = strategy.DeclareSymbols().Universe ?? new UniverseSpec();
+            this.basket = basket is { Count: > 0 }
+                ? basket.Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).ToList()
+                : null;
+            // A basket clocks off its first symbol, as the backtest does (PreparedData.RegimeSymbol = Primary).
+            spec = this.basket != null
+                ? new UniverseSpec { TopN = this.basket.Count, RegimeSymbol = this.basket[0] }
+                : strategy.DeclareSymbols().Universe ?? new UniverseSpec();
             liveQuote = startingQuote ?? config.InitialQuoteBalance;
 
             if (mode == SessionMode.Paper)
@@ -93,7 +117,13 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                     BorrowAnnualRate = config.Margin.BorrowAnnualRate,
                     OpeningFeeFraction = config.Margin.OpeningFeeFraction,
                     SecondsPerBar = (int)config.Interval * 60,
+                    Execution = config.Execution ?? ExecutionTiming.SignalClose,
                 };
+                if (restore != null)
+                {
+                    restore.ApplyTo(simState);
+                    barsBefore = restore.Bars;
+                }
                 router = new SimulatedOrderRouter(simState, OnPaperFillAsync, m => log($"[{deploymentId}] {m}"));
             }
 
@@ -101,7 +131,7 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 deploymentId, mode, spec.RegimeSymbol, config.Interval,
                 SubmitOrderAsync, CancelByIntentAsync,
                 () => null, () => Mode == SessionMode.Paper ? simState!.QuoteBalance : liveQuote, () => 0m,
-                m => log($"[{deploymentId}] {m}"), (m, e) => err($"[{deploymentId}] {m}", e),
+                m => log($"[{deploymentId}] {m}"), (m, e) => this.err($"[{deploymentId}] {m}", e),
                 config.Margin.ClampedLeverage,
                 portfolioPositionsFunc: PortfolioPositions,
                 equityFunc: Equity);
@@ -109,8 +139,29 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             strategy.Attach(context);
         }
 
+        public bool IsBasket => basket != null;
+        public IReadOnlyList<string> Universe => universe;
+
         public void Arm() { IsArmed = true; risk.Reset(); }
         public void Disarm() => IsArmed = false;
+
+        public SessionPulse Pulse()
+        {
+            var (count, last, lastUtc) = errors.Read();
+            return new SessionPulse
+            {
+                Kind = basket != null ? "basket" : "universe",
+                StartedUtc = startedUtc,
+                LastBarUtc = lastBarTs == default ? null : lastBarTs,
+                LastBarSeenUtc = lastBarSeenUtc,
+                BarsThisRun = barsThisRun,
+                BarsTotal = barsBefore + barsThisRun,
+                SymbolsTracked = histories.Count(h => h.Value.Count > 0),
+                Errors = count,
+                LastError = last,
+                LastErrorUtc = lastUtc,
+            };
+        }
 
         public decimal Equity()
         {
@@ -152,10 +203,19 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             if (loopTask != null) { try { await loopTask; } catch { } }
             try { await Strategy.OnStop(CancellationToken.None); } catch { }
             try { await deploymentRepo.UpdateEquityAsync(DeploymentId, Equity()); } catch { }
+            await SaveBookAsync(CancellationToken.None);
         }
 
-        private async Task ResolveUniverseAsync(CancellationToken ct)
+        internal async Task ResolveUniverseAsync(CancellationToken ct)
         {
+            if (basket != null)
+            {
+                // A basket trades exactly what the strategy names. This used to resolve Binance's top-N
+                // coins for every multi-asset session, so an ETF basket would have been handed crypto.
+                universe = basket.ToList();
+                lastUniverseResolve = DateTime.UtcNow;
+                return;
+            }
             var resolved = await universeProvider.ResolveUniverseAsync(spec.TopN, ct);
             if (!resolved.Contains(spec.RegimeSymbol, StringComparer.OrdinalIgnoreCase)) resolved.Add(spec.RegimeSymbol);
             universe = resolved;
@@ -165,17 +225,27 @@ namespace Omnipotent.Services.OmniTrader.Sessions
 
         private async Task PreloadAsync(CancellationToken ct)
         {
+            var loaded = new Dictionary<string, IReadOnlyList<OHLCCandle>>(StringComparer.OrdinalIgnoreCase);
+            int bars = Math.Clamp(Config.HistoryBars ?? PreloadBars, 50, 3000);
             foreach (var sym in universe)
             {
                 ct.ThrowIfCancellationRequested();
-                try
-                {
-                    var bars = await marketData.GetHistoricalCandlesAsync(sym, Config.Interval, PreloadBars, ct);
-                    histories[sym] = bars.Select(ToUsdVolume).ToList();
-                    if (histories[sym].Count > 0) marks[sym] = histories[sym][^1].Close;
-                }
+                try { loaded[sym] = await marketData.GetHistoricalCandlesAsync(sym, Config.Interval, bars, ct); }
                 catch (Exception ex) { err($"[{DeploymentId}] preload {sym} failed", ex); }
             }
+            Seed(loaded);
+            log($"[{DeploymentId}] preloaded {Config.Interval} history for {loaded.Count(l => l.Value.Count > 0)} of {universe.Count} symbol(s).");
+        }
+
+        /// <summary>Load closed history without dispatching it (preload; tests).</summary>
+        internal void Seed(IReadOnlyDictionary<string, IReadOnlyList<OHLCCandle>> loaded)
+        {
+            foreach (var (sym, bars) in loaded)
+            {
+                histories[sym] = bars.Select(ToUsdVolume).ToList();
+                if (histories[sym].Count > 0) marks[sym] = histories[sym][^1].Close;
+            }
+            if (universe.Count == 0) universe = loaded.Keys.ToList();
             // Clock off the regime symbol's latest bar.
             if (histories.TryGetValue(spec.RegimeSymbol, out var rh) && rh.Count > 0)
                 lastBarTs = rh[^1].Timestamp;
@@ -190,7 +260,6 @@ namespace Omnipotent.Services.OmniTrader.Sessions
         {
             int barSeconds = (int)Config.Interval * 60;
             var step = TimeSpan.FromSeconds(Math.Clamp(barSeconds / 6.0, 20, 600));
-            var tick = TimeSpan.FromSeconds(5);
             var tickTask = Task.Run(() => TickLoopAsync(ct), ct);
             try
             {
@@ -228,27 +297,36 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 try { await ResolveUniverseAsync(ct); } catch { }
             }
 
-            // Pull the latest candles for every universe symbol and append newly-closed bars.
-            DateTime newest = lastBarTs;
+            // Pull the latest candles for every universe symbol.
+            var latest = new Dictionary<string, IReadOnlyList<OHLCCandle>>(StringComparer.OrdinalIgnoreCase);
             foreach (var sym in universe.ToList())
             {
-                try
-                {
-                    var bars = await marketData.GetHistoricalCandlesAsync(sym, Config.Interval, 3, ct);
-                    if (!histories.TryGetValue(sym, out var h)) { h = new List<OHLCCandle>(); histories[sym] = h; }
-                    DateTime last = h.Count > 0 ? h[^1].Timestamp : DateTime.MinValue;
-                    foreach (var b in bars)
-                    {
-                        if (b.Timestamp > last) { h.Add(ToUsdVolume(b)); if (h.Count > 5000) h.RemoveAt(0); }
-                    }
-                    if (h.Count > 0) marks[sym] = h[^1].Close;
-                    if (h.Count > 0 && h[^1].Timestamp > newest) newest = h[^1].Timestamp;
-                }
+                try { latest[sym] = await marketData.GetHistoricalCandlesAsync(sym, Config.Interval, 3, ct); }
                 catch { /* skip this symbol this step */ }
             }
+            await IngestAsync(latest, ct);
+        }
 
-            if (newest <= lastBarTs) return; // no new bar yet
+        /// <summary>Append newly-closed bars and, when the clock moved, run one portfolio bar. True when a bar was dispatched.</summary>
+        internal async Task<bool> IngestAsync(IReadOnlyDictionary<string, IReadOnlyList<OHLCCandle>> latest, CancellationToken ct)
+        {
+            DateTime newest = lastBarTs;
+            foreach (var (sym, bars) in latest)
+            {
+                if (!histories.TryGetValue(sym, out var h)) { h = new List<OHLCCandle>(); histories[sym] = h; }
+                DateTime last = h.Count > 0 ? h[^1].Timestamp : DateTime.MinValue;
+                foreach (var b in bars)
+                {
+                    if (b.Timestamp > last) { h.Add(ToUsdVolume(b)); if (h.Count > 5000) h.RemoveAt(0); }
+                }
+                if (h.Count > 0) marks[sym] = h[^1].Close;
+                if (h.Count > 0 && h[^1].Timestamp > newest) newest = h[^1].Timestamp;
+            }
+
+            if (newest <= lastBarTs) return false; // no new bar yet
             lastBarTs = newest;
+            lastBarSeenUtc = DateTime.UtcNow;
+            barsThisRun++;
 
             // Paper: process marks, margin/borrow, and bracket fills via the router before dispatch.
             if (Mode == SessionMode.Paper && router != null)
@@ -280,6 +358,15 @@ namespace Omnipotent.Services.OmniTrader.Sessions
                 await deploymentRepo.UpdateEquityAsync(DeploymentId, equity, ct);
             }
             catch { }
+            await SaveBookAsync(ct);
+            return true;
+        }
+
+        private async Task SaveBookAsync(CancellationToken ct)
+        {
+            if (books == null || simState == null) return;
+            try { await books.SaveAsync(PaperBook.Capture(DeploymentId, simState, lastBarTs == default ? null : lastBarTs, barsBefore + barsThisRun), ct); }
+            catch (Exception ex) { err($"[{DeploymentId}] paper book save failed", ex); }
         }
 
         // ── Order routing ────────────────────────────────────────────────────────
@@ -290,8 +377,13 @@ namespace Omnipotent.Services.OmniTrader.Sessions
             {
                 if (await orderRepo.ExistsByIntentAsync(DeploymentId, req.IntentId, ct))
                     return Reject(req, "duplicate intent_id");
-                var intent = await router!.PlaceOrderAsync(DeploymentId, req, ct);
-                try { await orderRepo.InsertAsync(intent, ct); } catch { }
+                OrderIntent intent;
+                placing++;
+                try { intent = await router!.PlaceOrderAsync(DeploymentId, req, ct); }
+                finally { placing--; }
+                try { await orderRepo.InsertAsync(intent, ct); }
+                catch (Exception ex) { err($"[{DeploymentId}] order {intent.Id} could not be recorded", ex); }
+                if (placing == 0) await FlushDeferredFillsAsync();
                 return intent;
             }
 
@@ -330,7 +422,19 @@ namespace Omnipotent.Services.OmniTrader.Sessions
 
         private async Task OnPaperFillAsync(FillEvent fill)
         {
-            try { await fillRepo.InsertAsync(fill); } catch { }
+            if (placing > 0) { deferredFills.Enqueue(fill); return; }
+            await RecordFillAsync(fill);
+        }
+
+        private async Task FlushDeferredFillsAsync()
+        {
+            while (deferredFills.TryDequeue(out var fill)) await RecordFillAsync(fill);
+        }
+
+        private async Task RecordFillAsync(FillEvent fill)
+        {
+            try { await fillRepo.InsertAsync(fill); }
+            catch (Exception ex) { err($"[{DeploymentId}] fill for order {fill.OrderId} could not be recorded", ex); }
             try { await orderRepo.UpdateStatusAsync(fill.OrderId, OrderStatus.Filled); } catch { }
             try { await Strategy.OnOrderFilled(fill, CancellationToken.None); } catch (Exception ex) { err($"[{DeploymentId}] OnOrderFilled failed", ex); }
         }

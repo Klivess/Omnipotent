@@ -22,14 +22,14 @@ namespace Omnipotent.Tests.KliveLLM
         // GUID-suffix rule placed any earlier would silently demote real interactive chat.
         [InlineData("kliveagent-7f1c2a3b4d5e6f708192a3b4c5d6e7f8", AIRouterWorkClass.Interactive)]
         [InlineData("kliveagent-42", AIRouterWorkClass.Interactive)]
-        [InlineData("projects-commander-proj1", AIRouterWorkClass.Agent)]
-        [InlineData("projects-agent-proj1-worker7", AIRouterWorkClass.Agent)]
-        [InlineData("projects-council-c1-chair", AIRouterWorkClass.Burst)]
+        [InlineData("demiurge-commander-proj1", AIRouterWorkClass.Agent)]
+        [InlineData("demiurge-agent-proj1-worker7", AIRouterWorkClass.Agent)]
+        [InlineData("demiurge-council-c1-chair", AIRouterWorkClass.Burst)]
         // The trap that motivated making the string rule a FALLBACK: these two sit in the same
         // id-space, one is a real multi-turn session and the other is a single discarded query.
         [InlineData("stratum-engineer-proj1-run9", AIRouterWorkClass.Agent)]
         [InlineData("stratum-engineer-summary-run9", AIRouterWorkClass.OneShot)]
-        [InlineData("projects-digest-rebuild-7f1c2a3b4d5e6f708192a3b4c5d6e7f8", AIRouterWorkClass.OneShot)]
+        [InlineData("demiurge-digest-rebuild-7f1c2a3b4d5e6f708192a3b4c5d6e7f8", AIRouterWorkClass.OneShot)]
         [InlineData(null, AIRouterWorkClass.OneShot)]
         [InlineData("", AIRouterWorkClass.OneShot)]
         public void Classification_PinsTheKnownSessionIdShapes(string? sessionId, AIRouterWorkClass expected)
@@ -44,10 +44,10 @@ namespace Omnipotent.Tests.KliveLLM
             var scheduler = new AIRouterResidencyScheduler();
             scheduler.Maintain(T0, TimeSpan.FromMinutes(4), TimeSpan.FromSeconds(30), 0.2, 3);
 
-            scheduler.OnDispatch(Ticket("projects-commander-p1#epochA|qwen"), T0, false);
-            Assert.True(scheduler.IsResident("projects-commander-p1#epochA|qwen"));
-            Assert.False(scheduler.IsResident("projects-commander-p1#epochB|qwen"));
-            Assert.Null(scheduler.GapSinceLastDispatch("projects-commander-p1#epochB|qwen", T0));
+            scheduler.OnDispatch(Ticket("demiurge-commander-p1#epochA|qwen"), T0, false);
+            Assert.True(scheduler.IsResident("demiurge-commander-p1#epochA|qwen"));
+            Assert.False(scheduler.IsResident("demiurge-commander-p1#epochB|qwen"));
+            Assert.Null(scheduler.GapSinceLastDispatch("demiurge-commander-p1#epochB|qwen", T0));
         }
 
         [Fact]
@@ -74,7 +74,7 @@ namespace Omnipotent.Tests.KliveLLM
             scheduler.Maintain(T0, TimeSpan.FromSeconds(480), TimeSpan.FromSeconds(180), 0.2, 3);
             Assert.True(scheduler.K < roomy);
 
-            // The regime that actually matters: one fully-staffed project is 13 conversations, and the
+            // The regime that actually matters: one fully-staffed Steward is 13 conversations, and the
             // arithmetic says only a handful can be kept warm. Oversubscription is normal, not an edge.
             scheduler.Maintain(T0, TimeSpan.FromSeconds(120), TimeSpan.FromSeconds(180), 0.2, 3);
             Assert.True(scheduler.K <= 2, $"expected a tiny cohort under slow cold turns, got {scheduler.K}");
@@ -262,7 +262,7 @@ namespace Omnipotent.Tests.KliveLLM
 
             // A digest rebuild can never reuse a prefix, and its prefill evicts one that could. While a
             // warm conversation is due, it waits.
-            var digest = Ticket("projects-digest-rebuild-abc#e|m", AIRouterWorkClass.OneShot);
+            var digest = Ticket("demiurge-digest-rebuild-abc#e|m", AIRouterWorkClass.OneShot);
             Assert.False(scheduler.MayDispatch(digest, T0.AddSeconds(1), false, 0, 0,
                 TimeSpan.FromSeconds(60), out string reason));
             Assert.Equal("oneshot-yields-to-warm", reason);
@@ -282,7 +282,7 @@ namespace Omnipotent.Tests.KliveLLM
 
             for (int i = 0; i < 3; i++)
             {
-                var seat = Ticket($"projects-council-c1-seat{i}#e|m", AIRouterWorkClass.Burst);
+                var seat = Ticket($"demiurge-council-c1-seat{i}#e|m", AIRouterWorkClass.Burst);
                 bool may = scheduler.MayDispatch(seat, T0, false, 0, 0, TimeSpan.FromSeconds(30), out string reason);
                 if (i < 2) { Assert.True(may); scheduler.OnDispatch(seat, T0, false); }
                 else { Assert.False(may); Assert.Equal("burst-cap", reason); }
@@ -319,7 +319,7 @@ namespace Omnipotent.Tests.KliveLLM
         /// The blind spot that let the scheduler switch itself off on 2026-09-16.
         ///
         /// Every agent prompt opens with the same system block and tool schemas. That block is
-        /// referenced by every project on the box, so it is never what LRU evicts, and it is 27K of a
+        /// referenced by every Steward on the box, so it is never what LRU evicts, and it is 27K of a
         /// 50K commander prompt. A continuation whose own conversation had been dropped therefore came
         /// back 54% cached on the preamble alone — over a 50%-of-the-whole-prompt bar, so it scored as
         /// a hit. No band could ever fail, the lifetime climbed to its ceiling, the warm cohort was
@@ -330,7 +330,7 @@ namespace Omnipotent.Tests.KliveLLM
         public void SurvivingSharedPreamble_IsNotAHit()
         {
             var meter = new PrefixSurvivalMeter();
-            const string key = "projects-commander-p1#e1|qwen";
+            const string key = "demiurge-commander-p1#e1|qwen";
             TimeSpan lifetimeBefore = meter.EffectiveLifetime();
 
             // Enough evidence to schedule on, every sample a continuation that got the preamble back
@@ -353,7 +353,7 @@ namespace Omnipotent.Tests.KliveLLM
         public void ReusedConversationPrefix_IsAHit()
         {
             var meter = new PrefixSurvivalMeter();
-            const string key = "projects-commander-p2#e1|qwen";
+            const string key = "demiurge-commander-p2#e1|qwen";
 
             for (int i = 0; i < 200; i++)
                 meter.RecordOutcome(key, TimeSpan.FromSeconds(20), promptTokens: 50_000 + i,
@@ -393,14 +393,14 @@ namespace Omnipotent.Tests.KliveLLM
         {
             var warm = new PrefixSurvivalMeter();
             for (int i = 0; i < 200; i++)
-                warm.RecordOutcome($"projects-commander-warm{i % 4}#e1|qwen", TimeSpan.FromSeconds(20),
+                warm.RecordOutcome($"demiurge-commander-warm{i % 4}#e1|qwen", TimeSpan.FromSeconds(20),
                     promptTokens: 50_000 + i, cachedTokens: 49_900, wasResident: true, outsideCohort: false,
                     slotOccupancy: TimeSpan.FromSeconds(15), nowUtc: T0.AddSeconds(i * 20));
             int warmBudget = new AIRouterFairUseLimiter(3, 240, 10_000_000, null, null, warm).ConversationBudget();
 
             var cold = new PrefixSurvivalMeter();
             for (int i = 0; i < 200; i++)
-                cold.RecordOutcome($"projects-commander-cold{i % 4}#e1|qwen", TimeSpan.FromSeconds(400),
+                cold.RecordOutcome($"demiurge-commander-cold{i % 4}#e1|qwen", TimeSpan.FromSeconds(400),
                     promptTokens: 50_000 + i, cachedTokens: 27_200, wasResident: true, outsideCohort: false,
                     slotOccupancy: TimeSpan.FromSeconds(120), nowUtc: T0.AddSeconds(i * 400));
             int coldBudget = new AIRouterFairUseLimiter(3, 240, 10_000_000, null, null, cold).ConversationBudget();
@@ -421,13 +421,13 @@ namespace Omnipotent.Tests.KliveLLM
             // pays for this machinery, the whole thing is a regression however well it scales.
             var meter = new PrefixSurvivalMeter();
             for (int i = 0; i < 120; i++)
-                meter.RecordOutcome("projects-commander-solo#e1|qwen", TimeSpan.FromSeconds(20), 50_000, 49_000,
+                meter.RecordOutcome("demiurge-commander-solo#e1|qwen", TimeSpan.FromSeconds(20), 50_000, 49_000,
                     wasResident: true, outsideCohort: false, TimeSpan.FromSeconds(30), T0.AddSeconds(i * 30));
             Assert.True(meter.HasEnoughEvidence, "the scheduler must actually be in charge for this to mean anything");
 
             var limiter = new AIRouterFairUseLimiter(3, 240, 10_000_000, null, null, meter);
             limiter.SetMode(AIRouterSchedulerMode.Enforce);
-            var ticket = Ticket("projects-commander-solo#e1|qwen");
+            var ticket = Ticket("demiurge-commander-solo#e1|qwen");
 
             for (int turn = 0; turn < 40; turn++)
             {

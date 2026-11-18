@@ -111,6 +111,12 @@ namespace Omnipotent.Services.OmniBlox.Assets
         public long Total { get; set; }
         public long Placeable { get; set; }
         public List<CategoryCount> TopCategories { get; set; } = new();
+        /// <summary>Found or previewed models the download step will actually take (<see cref="AssetLibrary.DownloadableWhere"/>).</summary>
+        public long Downloadable { get; set; }
+        /// <summary>When the newest model was found, analysed or labelled: the library's last progress.</summary>
+        public DateTime? NewestUtc { get; set; }
+        /// <summary>No counts yet: the library was busy when they were first asked for, and they are being worked out.</summary>
+        public bool Counting { get; set; }
     }
 
     /// <summary>
@@ -131,11 +137,39 @@ namespace Omnipotent.Services.OmniBlox.Assets
         private volatile StatsSnapshot? statsCache;
         private long statsVersion;
 
+        // How long a reader of the counts waits for the lock. Before there were cached counts the first reader
+        // after a start waited without limit: the studio overview's first poll queued behind a cold scan or an
+        // Assets page load for 4 to 19 minutes (11 Nov 2026), and every later poll piled up behind it.
+        internal static readonly TimeSpan StatsWaitCached = TimeSpan.FromMilliseconds(100);
+        internal static readonly TimeSpan StatsWaitCold = TimeSpan.FromSeconds(2);
+
+        /// <summary>
+        /// The rows the download step takes. The harvester's backlog is counted with the same test: counting rows
+        /// it never takes (too many triangles or scripts, three failed tries) stopped discovery for good once 4,740
+        /// of them had piled up (4 Nov 2026), with nothing else left to do.
+        /// </summary>
+        internal const string DownloadableWhere = "status IN ('discovered','previewed') AND attempts < 3 AND triangles <= 120000 AND script_count <= 12";
+
+        /// <summary>The order "newest first" lists use; the recency indexes are built on exactly this expression.</summary>
+        internal const string RecencyExpr = "COALESCE(labeled_utc, analyzed_utc, discovered_utc)";
+
+        /// <summary>Set by <see cref="Open"/> when it built the library's indexes (the first start after they were added).</summary>
+        public string? OpenNote { get; private set; }
+
         /// <summary>Called under the lock by every write that can change a count in <see cref="Stats"/>.</summary>
         private void CountsChanged() => Interlocked.Increment(ref statsVersion);
 
         /// <summary>Changes whenever a model is added, analysed, labelled or rejected (what caches of the library key on).</summary>
         public long Version => Interlocked.Read(ref statsVersion);
+
+        // The world catalog holds labelled models only. Keyed on Version it was thrown away by every thumbnail,
+        // discovery and failed download too: the harvester writes several a step, and a rebuild reads every
+        // labelled row's JSON under the library lock (23,596 rows: 1.6 s on an idle workstation).
+        private long catalogVersion;
+        private void CatalogChanged() => Interlocked.Increment(ref catalogVersion);
+
+        /// <summary>Changes only when a labelled model is added, re-rated or changes status: what the world catalog keys on.</summary>
+        public long CatalogVersion => Interlocked.Read(ref catalogVersion);
 
         /// <summary>Every labelled, placeable model (the world generator's catalog is built from these).</summary>
         public List<AssetRecord> Labeled()
@@ -208,7 +242,62 @@ CREATE VIRTUAL TABLE IF NOT EXISTS assets_fts USING fts5(asset_id UNINDEXED, nam
             // Libraries created before labels were versioned: their labels are on the old, uncalibrated scale (0).
             if (!HasColumn(conn, "assets", "label_version"))
                 Exec(conn, "ALTER TABLE assets ADD COLUMN label_version INTEGER NOT NULL DEFAULT 0");
+            EnsureReadIndexes(conn);
+            RequeueCutOffLabels(conn);
             lock (sync) db = conn;
+        }
+
+        /// <summary>
+        /// Once per library (PRAGMA user_version 0 → 1): models failed by their label go back to the labeller. The
+        /// label answer had a 900-token budget, thinking included, and the long tail was cut off mid-thought or
+        /// mid-JSON; 1,017 placeable models on the server were failed for it (Nov 2026). Another try costs a call each.
+        /// </summary>
+        private void RequeueCutOffLabels(SqliteConnection conn)
+        {
+            using (var get = conn.CreateCommand())
+            {
+                get.CommandText = "PRAGMA user_version";
+                if (Convert.ToInt64(get.ExecuteScalar() ?? 0L, CultureInfo.InvariantCulture) >= 1) return;
+            }
+            int requeued;
+            using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = "UPDATE assets SET status = 'analyzed', attempts = 0, status_reason = NULL WHERE status = 'failed' AND placeable = 1 AND status_reason LIKE 'label:%'";
+                requeued = cmd.ExecuteNonQuery();
+            }
+            Exec(conn, "PRAGMA user_version = 1");
+            if (requeued > 0) AddOpenNote($"{requeued} model(s) failed by a cut-off label answer are queued to be labelled again");
+        }
+
+        private void AddOpenNote(string note) => OpenNote = OpenNote == null ? note : OpenNote + "; " + note;
+
+        /// <summary>
+        /// Indexes for the reads the dashboard makes on every visit. Without them the Assets page's "newest first"
+        /// list sorted every row (SELECT * over 43,677 rows, the JSON columns included) and the overview's counts
+        /// walked the whole table, both under the library lock: the default view took over 60 s on the server.
+        /// Built once, the first time a library opens without them.
+        /// </summary>
+        private void EnsureReadIndexes(SqliteConnection conn)
+        {
+            var wanted = new (string Name, string Sql)[]
+            {
+                ("ix_assets_recency", $"CREATE INDEX ix_assets_recency ON assets({RecencyExpr})"),
+                ("ix_assets_status_recency", $"CREATE INDEX ix_assets_status_recency ON assets(status, {RecencyExpr})"),
+                ("ix_assets_counts", "CREATE INDEX ix_assets_counts ON assets(status, placeable, category)"),
+            };
+            var missing = wanted.Where(w => !HasIndex(conn, w.Name)).ToList();
+            if (missing.Count == 0) return;
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            foreach (var (_, sql) in missing) Exec(conn, sql);
+            AddOpenNote($"built {missing.Count} asset library index(es) ({string.Join(", ", missing.Select(m => m.Name))}) in {timer.Elapsed.TotalSeconds:0.0} s");
+        }
+
+        private static bool HasIndex(SqliteConnection conn, string name)
+        {
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = $n";
+            cmd.Parameters.AddWithValue("$n", name);
+            return cmd.ExecuteScalar() != null;
         }
 
         private static bool HasColumn(SqliteConnection conn, string table, string column)
@@ -333,9 +422,9 @@ ON CONFLICT(asset_id) DO UPDATE SET up_votes = excluded.up_votes, down_votes = e
             lock (sync)
             {
                 using var cmd = Db.CreateCommand();
-                cmd.CommandText = @"
+                cmd.CommandText = $@"
 SELECT * FROM assets
-WHERE status IN ('discovered','previewed') AND attempts < 3 AND triangles <= 120000 AND script_count <= 12
+WHERE {DownloadableWhere}
 ORDER BY priority DESC,
   (CASE WHEN has_scripts = 0 THEN 2 ELSE 0 END) + creator_verified + (CASE WHEN up_percent >= 80 AND up_votes >= 5 THEN 1 ELSE 0 END) DESC,
   up_votes DESC
@@ -470,6 +559,7 @@ WHERE asset_id = $id";
                 }
                 tx.Commit();
                 CountsChanged();
+                CatalogChanged();
             }
         }
 
@@ -499,6 +589,7 @@ WHERE asset_id = $id";
                 cmd.Parameters.AddWithValue("$id", assetId);
                 cmd.ExecuteNonQuery();
                 CountsChanged();
+                CatalogChanged(); // a labelled model can be rejected
             }
         }
 
@@ -608,7 +699,8 @@ WHERE asset_id = $id";
             lock (sync)
             {
                 using var cmd = Db.CreateCommand();
-                cmd.CommandText = "SELECT * FROM assets" + (status == null ? "" : " WHERE status = $s") + " ORDER BY COALESCE(labeled_utc, analyzed_utc, discovered_utc) DESC LIMIT $n OFFSET $o";
+                // Walks ix_assets_recency / ix_assets_status_recency, so only the rows shown are read.
+                cmd.CommandText = "SELECT * FROM assets" + (status == null ? "" : " WHERE status = $s") + $" ORDER BY {RecencyExpr} DESC LIMIT $n OFFSET $o";
                 if (status != null) cmd.Parameters.AddWithValue("$s", status);
                 cmd.Parameters.AddWithValue("$n", Math.Clamp(limit, 1, 200));
                 cmd.Parameters.AddWithValue("$o", Math.Max(0, offset));
@@ -643,9 +735,9 @@ FROM assets_fts JOIN assets a ON a.asset_id = assets_fts.asset_id WHERE assets_f
             bool taken = false;
             try
             {
-                if (cached != null) Monitor.TryEnter(sync, 100, ref taken);
-                else Monitor.Enter(sync, ref taken);
-                if (!taken) return cached!.Stats; // a harvest or labelling pass holds the library: show the last counts
+                Monitor.TryEnter(sync, cached != null ? StatsWaitCached : StatsWaitCold, ref taken);
+                // Another reader or a harvest holds the library: show the last counts, or say they are coming.
+                if (!taken) return cached?.Stats ?? new LibraryStats { Counting = true };
                 // Writers bump the version under this lock, so it matches exactly what is read here.
                 var fresh = new StatsSnapshot(Interlocked.Read(ref statsVersion), ComputeStatsLocked());
                 statsCache = fresh;
@@ -682,7 +774,75 @@ FROM assets_fts JOIN assets a ON a.asset_id = assets_fts.asset_id WHERE assets_f
                 using var r = cmd.ExecuteReader();
                 while (r.Read()) stats.TopCategories.Add(new CategoryCount(r.GetString(0), r.GetInt64(1)));
             }
+            using (var cmd = Db.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT COUNT(*) FROM assets WHERE {DownloadableWhere}";
+                stats.Downloadable = Convert.ToInt64(cmd.ExecuteScalar() ?? 0L, CultureInfo.InvariantCulture);
+            }
+            using (var cmd = Db.CreateCommand())
+            {
+                cmd.CommandText = $"SELECT MAX({RecencyExpr}) FROM assets";
+                stats.NewestUtc = ParseIso(cmd.ExecuteScalar() as string);
+            }
             return stats;
+        }
+
+        /// <summary>Works the counts out ahead of the first reader (run in the background right after <see cref="Open"/>).</summary>
+        public void WarmStats()
+        {
+            if (statsCache != null) return;
+            lock (sync)
+            {
+                if (statsCache != null) return;
+                statsCache = new StatsSnapshot(Interlocked.Read(ref statsVersion), ComputeStatsLocked());
+            }
+        }
+
+        /// <summary>The query plan SQLite picks for a read (tests check the dashboard's reads use an index).</summary>
+        internal string ExplainRecent(string? status)
+        {
+            lock (sync)
+            {
+                using var cmd = Db.CreateCommand();
+                cmd.CommandText = "EXPLAIN QUERY PLAN SELECT * FROM assets" + (status == null ? "" : " WHERE status = $s") + $" ORDER BY {RecencyExpr} DESC LIMIT 60 OFFSET 0";
+                if (status != null) cmd.Parameters.AddWithValue("$s", status);
+                return ReadPlan(cmd);
+            }
+        }
+
+        internal string ExplainStats()
+        {
+            lock (sync)
+            {
+                var plans = new List<string>();
+                foreach (string sql in new[]
+                {
+                    "SELECT status, COUNT(*) FROM assets GROUP BY status",
+                    "SELECT COUNT(*), SUM(placeable) FROM assets",
+                    "SELECT category, COUNT(*) FROM assets WHERE status = 'labeled' AND category <> '' GROUP BY category ORDER BY COUNT(*) DESC LIMIT 12",
+                    $"SELECT MAX({RecencyExpr}) FROM assets",
+                })
+                {
+                    using var cmd = Db.CreateCommand();
+                    cmd.CommandText = "EXPLAIN QUERY PLAN " + sql;
+                    plans.Add(ReadPlan(cmd));
+                }
+                return string.Join("\n", plans);
+            }
+        }
+
+        private static string ReadPlan(SqliteCommand cmd)
+        {
+            var lines = new List<string>();
+            using var r = cmd.ExecuteReader();
+            while (r.Read()) lines.Add(r.GetString(r.FieldCount - 1));
+            return string.Join("\n", lines);
+        }
+
+        /// <summary>Runs <paramref name="work"/> while holding the library lock (tests stand in for a long harvest or scan).</summary>
+        internal void HoldLockFor(Action work)
+        {
+            lock (sync) work();
         }
 
         // ─────────────── helpers ───────────────

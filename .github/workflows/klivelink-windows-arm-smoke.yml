@@ -1,0 +1,29 @@
+name: KliveLink Windows ARM64 smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  windows-arm64:
+    runs-on: windows-11-arm
+    steps:
+      - name: Download installer
+        shell: powershell
+        run: Invoke-WebRequest -Uri https://klive.dev/k/windows -OutFile "$env:TEMP\klivelink-install.ps1" -UseBasicParsing
+      - name: Syntax check
+        shell: powershell
+        run: |
+          $null = [scriptblock]::Create((Get-Content "$env:TEMP\klivelink-install.ps1" -Raw))
+      - name: Install
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\klivelink-install.ps1" -Rid win-arm64
+      - name: Verify
+        shell: powershell
+        run: |
+          Start-Sleep -Seconds 12
+          $p = Get-Process klivelink-agent -ErrorAction SilentlyContinue
+          if (-not $p) { Get-Content "$env:LOCALAPPDATA\KliveLink\agent.log" -Tail 80; exit 1 }
+          Get-Content "$env:LOCALAPPDATA\KliveLink\agent.log" -Tail 40
+      - name: Uninstall
+        shell: powershell
+        run: powershell -NoProfile -ExecutionPolicy Bypass -File "$env:TEMP\klivelink-install.ps1" -Rid win-arm64 -Uninstall

@@ -83,7 +83,9 @@ namespace Omnipotent.Services.KliveMail.Smtp
                     };
 
                     stored.Attachments = await SaveAttachmentsAsync(message, stored.Id, cancellationToken);
-                    stored.HasAttachments = stored.Attachments.Count > 0;
+                    // Images the HTML shows inline are kept so the page can draw them, but a logo is
+                    // not an attachment: the paperclip means a file somebody sent.
+                    stored.HasAttachments = stored.Attachments.Any(a => !a.IsInline);
 
                     await repo.InsertMessageAsync(stored, cancellationToken);
 
@@ -116,16 +118,46 @@ namespace Omnipotent.Services.KliveMail.Smtp
             return string.IsNullOrEmpty(subj) ? Guid.NewGuid().ToString("N") : "subj:" + subj.ToLowerInvariant();
         }
 
+        /// <summary>At most this many inline images are kept per message, each at most this size.</summary>
+        internal const int MaxInlineImages = 30;
+        internal const long MaxInlineImageBytes = 5 * 1024 * 1024;
+
+        /// <summary>
+        /// The parts worth keeping: every attachment, plus the images the HTML body draws by Content-ID
+        /// ("cid:"). MimeKit's <c>Attachments</c> lists only parts marked as attachments, so inline
+        /// images were dropped on arrival and those mails rendered with broken pictures (one sampled
+        /// live newsletter referenced 4 of them, 139 KB, none stored).
+        /// </summary>
+        internal static List<(MimeEntity Entity, bool Inline)> PartsToKeep(MimeMessage message)
+        {
+            var parts = message.Attachments
+                .Select(e => (Entity: e, Inline: e.ContentDisposition?.Disposition == ContentDisposition.Inline))
+                .ToList();
+            string html = message.HtmlBody ?? "";
+            if (html.IndexOf("cid:", StringComparison.OrdinalIgnoreCase) < 0) return parts;
+            int inline = 0;
+            foreach (var part in message.BodyParts.OfType<MimePart>())
+            {
+                if (inline >= MaxInlineImages) break;
+                if (part.IsAttachment || string.IsNullOrEmpty(part.ContentId)) continue;
+                if (!part.ContentType.MediaType.Equals("image", StringComparison.OrdinalIgnoreCase)) continue;
+                if (parts.Any(p => ReferenceEquals(p.Entity, part))) continue;
+                if (html.IndexOf("cid:" + part.ContentId, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                parts.Add((part, true));
+                inline++;
+            }
+            return parts;
+        }
+
         private async Task<List<StoredAttachment>> SaveAttachmentsAsync(MimeMessage message, string messageId, CancellationToken ct)
         {
             var result = new List<StoredAttachment>();
             var attachmentsDir = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveMailAttachmentsDirectory), messageId);
 
-            foreach (var entity in message.Attachments)
+            foreach (var (entity, isInline) in PartsToKeep(message))
             {
                 try
                 {
-                    bool isInline = entity.ContentDisposition?.Disposition == ContentDisposition.Inline;
                     string? contentId = (entity as MimePart)?.ContentId ?? (entity as MessagePart)?.ContentId;
                     string? fileName;
                     string? contentType;
@@ -155,6 +187,11 @@ namespace Omnipotent.Services.KliveMail.Smtp
                             await mimePart.Content.DecodeToAsync(fs, ct);
                         else if (entity is MessagePart msgPart)
                             await msgPart.Message.WriteToAsync(fs, ct);
+                    }
+                    if (isInline && new FileInfo(storagePath).Length > MaxInlineImageBytes)
+                    {
+                        File.Delete(storagePath);
+                        continue;
                     }
 
                     result.Add(new StoredAttachment

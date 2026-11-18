@@ -278,19 +278,16 @@ namespace Omnipotent.Services.Omniscience
         // ever blocks the very first requester.
         private void StartCacheWarmer()
         {
-            // Keys must mirror the keys constructed in the matching routes. The
-            // persons key uses limit=60 because that is what the Omniscience page
-            // actually requests (a l=200 entry was previously warmed here, which
-            // the site never asked for — its real query always missed the warm
-            // cache and paid the full messages scan).
+            // Keys must mirror the keys constructed in the matching routes. /omniscience/persons
+            // and /omniscience/conversations are no longer warmed: the page moved to
+            // /omniscience/workspace/directory (persons is only its fallback on a 404), neither
+            // route had a single call in the week to 13 Nov 2026, and the persons build read
+            // every person with two identity subqueries each, every 45 s, for nobody. Both
+            // routes still answer on demand through GetOrComputeAsync.
             RegisterWarmTarget("sources", TimeSpan.FromSeconds(15), BuildSourcesPayload);
             service.RouteSnapshots.Register("stats/overview", "stats-overview.json",
                 TimeSpan.FromSeconds(30), TimeSpan.FromMinutes(3), BuildOverviewPayload);
             RegisterWarmTarget("profile-targets", TimeSpan.FromSeconds(30), BuildProfileTargetsPayload);
-            RegisterWarmTarget("persons|s=|p=|r=|l=60|o=0", TimeSpan.FromSeconds(45),
-                () => BuildPersonsPayload(null, null, null, 60, 0));
-            RegisterWarmTarget("conversations|p=|k=|l=200", TimeSpan.FromSeconds(45),
-                () => BuildConversationsPayload(null, null, 200));
 
             _ = Task.Run(async () =>
             {
@@ -733,6 +730,19 @@ namespace Omnipotent.Services.Omniscience
         private string BuildOverviewPayload()
         {
             using var conn = service.Db.Open();
+            return BuildOverviewPayload(conn, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
+        }
+
+        /// <summary>
+        /// The overview's counters. The snapshot rebuilds this every 30 s around the clock (the site read it
+        /// 69 times in the week to 13 Nov 2026), and through 6285052 every rebuild walked a whole index of the
+        /// 5.7M-row messages table for its total and read every row of persons twice. Messages are never
+        /// deleted or moved between conversations, and every insert bumps conversation_message_counts in the
+        /// same transaction, so once the one-off backfill has run their sum is the exact total; the person
+        /// counts read idx_persons_live_tier, which only a query saying "tier >= ''" can use.
+        /// </summary>
+        internal static string BuildOverviewPayload(SqliteConnection conn, long nowMs)
+        {
             long Scalar(string sql)
             {
                 using var c = conn.CreateCommand();
@@ -743,18 +753,21 @@ namespace Omnipotent.Services.Omniscience
             // Deduction-era counters are wrapped in try/scalar-0 because a pre-v8 db won't
             // have the tables (the helper returns 0 on any error via the catch below).
             long SafeScalar(string sql) { try { return Scalar(sql); } catch { return 0L; } }
+            bool summariesReady = SafeScalar($"SELECT COUNT(*) FROM omniscience_meta WHERE key='{Analytics.ActivitySummaryStore.BackfillMetaKey}'") > 0;
             var obj = new JObject(
-                new JProperty("persons", Scalar("SELECT COUNT(*) FROM persons WHERE merged_into_person_id IS NULL")),
+                new JProperty("persons", Scalar("SELECT COUNT(*) FROM persons p INDEXED BY idx_persons_live_tier WHERE p.tier >= '' AND p.merged_into_person_id IS NULL")),
                 new JProperty("identities", Scalar("SELECT COUNT(*) FROM platform_identities")),
                 new JProperty("conversations", Scalar("SELECT COUNT(*) FROM conversations")),
-                new JProperty("messages", Scalar("SELECT COUNT(*) FROM messages")),
+                new JProperty("messages", Scalar(summariesReady
+                    ? "SELECT COALESCE(SUM(message_count),0) FROM conversation_message_counts"
+                    : "SELECT COUNT(*) FROM messages")),
                 new JProperty("attachments", Scalar("SELECT COUNT(*) FROM attachments")),
                 new JProperty("sources", Scalar("SELECT COUNT(*) FROM harvest_sources")),
                 new JProperty("personality_profiles", Scalar("SELECT COUNT(DISTINCT person_id) FROM personality_profiles")),
-                new JProperty("tracked", SafeScalar("SELECT COUNT(*) FROM persons WHERE tier='tracked' AND merged_into_person_id IS NULL")),
+                new JProperty("tracked", SafeScalar("SELECT COUNT(*) FROM persons p INDEXED BY idx_persons_live_tier WHERE p.tier >= '' AND p.tier='tracked' AND p.merged_into_person_id IS NULL")),
                 new JProperty("facts_active", SafeScalar("SELECT COUNT(*) FROM person_facts WHERE status='active'")),
                 new JProperty("relationships", SafeScalar("SELECT COUNT(*) FROM entity_relationships WHERE status='active'")),
-                new JProperty("radar_alerts_24h", SafeScalar($"SELECT COUNT(*) FROM radar_alerts WHERE occurred_at >= {DateTimeOffset.UtcNow.AddHours(-24).ToUnixTimeMilliseconds()}"))
+                new JProperty("radar_alerts_24h", SafeScalar($"SELECT COUNT(*) FROM radar_alerts WHERE occurred_at >= {nowMs - 86_400_000L}"))
             );
             return obj.ToString(Formatting.None);
         }

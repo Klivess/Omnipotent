@@ -462,10 +462,16 @@ namespace Omnipotent.Services.CS2ArbitrageBot.CSFloat
             return result;
         }
 
-        /// <summary>Recent trades (buys and sells) for the account, newest first.</summary>
-        public async Task<JArray> GetTradesAsync(int limit = 100, CancellationToken ct = default)
+        /// <summary>
+        /// Recent trades for the account, newest first: buys and sells, or one side with <paramref name="role"/>
+        /// ("seller" / "buyer"). On the live account the newest 100 trades were all purchases, so a relist's sale could
+        /// sit outside them; the trade monitor also reads the seller side while a relist is open.
+        /// </summary>
+        public async Task<JArray> GetTradesAsync(int limit = 100, CancellationToken ct = default, string? role = null)
         {
-            string body = await SendAsync(TradesBucket, HttpMethod.Get, BaseUrl + "/me/trades?page=0&limit=" + Math.Clamp(limit, 1, 1000).ToString(CultureInfo.InvariantCulture), null, ct);
+            string url = BaseUrl + "/me/trades?page=0&limit=" + Math.Clamp(limit, 1, 1000).ToString(CultureInfo.InvariantCulture);
+            if (!string.IsNullOrEmpty(role)) url += "&role=" + Uri.EscapeDataString(role);
+            string body = await SendAsync(TradesBucket, HttpMethod.Get, url, null, ct);
             JToken root = JToken.Parse(body);
             return root as JArray ?? root["trades"] as JArray ?? new JArray();
         }

@@ -1,5 +1,6 @@
 using Newtonsoft.Json;
 using Omnipotent.Services.OmniTumblr.Models;
+using System.Diagnostics;
 
 namespace Omnipotent.Services.OmniTumblr.Engine
 {
@@ -23,6 +24,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public List<OmniTumblrEvent> Events { get; } = new();
         /// <summary>Content key → fingerprint of its media (see <see cref="OmniTumblrFingerprints"/>).</summary>
         public Dictionary<string, MediaFingerprint> Fingerprints { get; } = new(StringComparer.Ordinal);
+        /// <summary>Tag (lower case) → what Tumblr's listing of it showed (see <see cref="OmniTumblrTagResearch"/>).</summary>
+        public Dictionary<string, TagResearch> Tags { get; } = new(StringComparer.Ordinal);
 
         public OmniTumblrVault Vault => store.Vault;
 
@@ -65,6 +68,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public void MarkFlows() => store.MarkDirty("flows");
         public void MarkEngine() => store.MarkDirty("engine");
         public void MarkFingerprints() => store.MarkDirty("fingerprints");
+        public void MarkTags() => store.MarkDirty("tags");
         public void MarkBlog(string blogId) => store.MarkDirty("blog:" + blogId);
         public void MarkPosts(string blogId) => store.MarkDirty("posts:" + blogId);
         public void MarkInsights(string blogId) => store.MarkDirty("insights:" + blogId);
@@ -134,6 +138,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private string FlowsPath => Path.Combine(Root, "auth-flows.json");
         private string EnginePath => Path.Combine(Root, "engine.json");
         private string FingerprintsPath => Path.Combine(Root, "fingerprints.json");
+        private string TagsPath => Path.Combine(Root, "tags.json");
         private string EventsPath => Path.Combine(Root, "events.jsonl");
         private string BlogDir(string blogId) => Path.Combine(BlogsDirectory, blogId);
 
@@ -141,22 +146,53 @@ namespace Omnipotent.Services.OmniTumblr.Engine
 
         public T Read<T>(Func<OmniTumblrState, T> reader)
         {
-            lock (gate) return reader(State);
+            long asked = Stopwatch.GetTimestamp();
+            lock (gate)
+            {
+                NoteGateWait(asked);
+                return reader(State);
+            }
         }
 
         public T Mutate<T>(Func<OmniTumblrState, T> mutator)
         {
             T result;
-            lock (gate) result = mutator(State);
+            long asked = Stopwatch.GetTimestamp();
+            lock (gate)
+            {
+                NoteGateWait(asked);
+                result = mutator(State);
+            }
             SignalFlush();
             return result;
         }
 
         public void Mutate(Action<OmniTumblrState> mutator)
         {
-            lock (gate) mutator(State);
+            long asked = Stopwatch.GetTimestamp();
+            lock (gate)
+            {
+                NoteGateWait(asked);
+                mutator(State);
+            }
             SignalFlush();
         }
+
+        /// <summary>
+        /// Every route reads through the one lock, so a long hold anywhere shows up as a wait everywhere (the
+        /// overview's 19 s and dashboard-stats' 10 s maxima in Nov 2026 had no work of their own to explain
+        /// them). Waits past 2 ms go on the request's trace as "tumblr-lock" and into <see cref="Stats"/>.
+        /// </summary>
+        private void NoteGateWait(long askedTimestamp)
+        {
+            long waited = Stopwatch.GetTimestamp() - askedTimestamp;
+            if (waited < Stopwatch.Frequency / 500) return;
+            Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.Current?.AddSpan("tumblr-lock", askedTimestamp, waited);
+            stats.NoteWait(waited * 1000.0 / Stopwatch.Frequency);
+        }
+
+        /// <summary>Lock waits and background saves: what the Settings view shows as the store's health.</summary>
+        public OmniTumblrStoreStats Stats => stats.Snapshot();
 
         /// <summary>A detached deep copy, safe to use outside the lock.</summary>
         public static T Clone<T>(T value) =>
@@ -196,14 +232,19 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     if (!string.IsNullOrEmpty(f.FlowId)) State.Flows[f.FlowId] = f;
                 foreach (var (key, fingerprint) in ReadJson<Dictionary<string, MediaFingerprint>>(FingerprintsPath) ?? new())
                     if (fingerprint?.Version == MediaFingerprint.CurrentVersion) State.Fingerprints[key] = fingerprint;
+                foreach (var (key, research) in ReadJson<Dictionary<string, TagResearch>>(TagsPath) ?? new())
+                    if (research != null) State.Tags[key] = research;
 
                 foreach (string dir in Directory.EnumerateDirectories(BlogsDirectory))
                 {
                     var blog = ReadJson<OmniTumblrBlog>(Path.Combine(dir, "blog.json"));
                     if (blog == null || string.IsNullOrEmpty(blog.BlogId)) continue;
                     blog.Strategy ??= OmniTumblrStrategy.CreateDefault();
+                    blog.Strategy.Reblogs ??= new ReblogSettings();
+                    blog.ReblogHistory ??= new Dictionary<string, ReblogDecision>(StringComparer.Ordinal);
                     blog.Stats ??= new BlogStats();
                     blog.Health ??= new BlogHealth();
+                    blog.Health.Search ??= new SearchVisibility();
                     blog.UsedContentKeys ??= new HashSet<string>(StringComparer.Ordinal);
                     blog.RejectedContentKeys ??= new HashSet<string>(StringComparer.Ordinal);
                     State.Blogs[blog.BlogId] = blog;
@@ -275,7 +316,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                         await flushSignal.WaitAsync(token);
                         await Task.Delay(250, token); // coalesce bursts of mutations into one write
                         while (flushSignal.CurrentCount > 0) flushSignal.Wait(0);
-                        await FlushAsync();
+                        await FlushAsync(background: true);
                     }
                     catch (OperationCanceledException) { break; }
                     catch (Exception ex)
@@ -294,29 +335,71 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             await FlushAsync();
         }
 
-        /// <summary>Writes every dirty document now.</summary>
-        public async Task FlushAsync()
+        /// <summary>
+        /// How often a background save may rewrite fingerprints.json. Every newly fingerprinted clip used to
+        /// rewrite the whole file (up to <see cref="OmniTumblrFingerprints.MaxStored"/> × ~10 KB of base64) a
+        /// quarter of a second later; it is a cache, so a crash costs at most this long of recomputation.
+        /// </summary>
+        internal TimeSpan FingerprintSaveInterval { get; set; } = TimeSpan.FromSeconds(60);
+
+        private readonly OmniTumblrStoreStatsRecorder stats = new();
+        private DateTime lastFingerprintSaveUtc = DateTime.MinValue;
+        private int deferredFlushScheduled;
+
+        /// <summary>Writes every dirty document now (fingerprints included).</summary>
+        public Task FlushAsync() => FlushAsync(background: false);
+
+        private async Task FlushAsync(bool background)
         {
             await writeLock.WaitAsync();
             try
             {
+                var total = Stopwatch.StartNew();
                 List<(string Path, string Json)> writes = new();
                 List<OmniTumblrEvent> events;
+                Dictionary<string, MediaFingerprint>? fingerprints = null;
+                bool deferFingerprints = false;
+                double gateMs;
                 lock (gate)
                 {
+                    var held = Stopwatch.StartNew();
                     foreach (string key in dirty)
                     {
+                        if (key == "fingerprints") continue;
                         var write = Serialize(key);
                         if (write != null) writes.Add(write.Value);
                     }
+                    if (dirty.Contains("fingerprints"))
+                    {
+                        deferFingerprints = background && DateTime.UtcNow - lastFingerprintSaveUtc < FingerprintSaveInterval;
+                        // A copy of the references only: a stored fingerprint is never changed after it is added,
+                        // so the large serialisation below can run without the lock every route reads through.
+                        if (!deferFingerprints) fingerprints = new Dictionary<string, MediaFingerprint>(State.Fingerprints, StringComparer.Ordinal);
+                    }
                     dirty.Clear();
+                    if (deferFingerprints) dirty.Add("fingerprints");
                     events = pendingEventAppends.ToList();
                     pendingEventAppends.Clear();
+                    gateMs = held.Elapsed.TotalMilliseconds;
                 }
 
+                double fingerprintMs = 0;
+                if (fingerprints != null)
+                {
+                    var serialising = Stopwatch.StartNew();
+                    writes.Add((FingerprintsPath, JsonConvert.SerializeObject(fingerprints, Formatting.None, JsonSettings)));
+                    fingerprintMs = serialising.Elapsed.TotalMilliseconds;
+                    lastFingerprintSaveUtc = DateTime.UtcNow;
+                }
+
+                long bytes = 0;
                 foreach (var (path, json) in writes)
                 {
-                    try { WriteAtomic(path, json); }
+                    try
+                    {
+                        WriteAtomic(path, json);
+                        bytes += json.Length;
+                    }
                     catch (Exception ex)
                     {
                         log($"OmniTumblr: failed to save {path}: {ex.Message}");
@@ -325,11 +408,31 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 }
 
                 if (events.Count > 0) AppendEvents(events);
+                if (deferFingerprints) ScheduleDeferredFlush();
+                if (writes.Count > 0 || events.Count > 0)
+                    stats.NoteFlush(total.Elapsed.TotalMilliseconds, gateMs, bytes, writes.Count,
+                        fingerprints?.Count, fingerprints != null ? writes[^1].Json.Length : null, fingerprintMs);
             }
             finally
             {
                 writeLock.Release();
             }
+        }
+
+        /// <summary>Makes sure fingerprints held back by <see cref="FingerprintSaveInterval"/> are written once it passes.</summary>
+        private void ScheduleDeferredFlush()
+        {
+            if (Interlocked.Exchange(ref deferredFlushScheduled, 1) == 1) return;
+            TimeSpan wait = lastFingerprintSaveUtc + FingerprintSaveInterval - DateTime.UtcNow;
+            _ = Task.Run(async () =>
+            {
+                try { await Task.Delay(wait > TimeSpan.Zero ? wait : TimeSpan.Zero); }
+                finally
+                {
+                    Interlocked.Exchange(ref deferredFlushScheduled, 0);
+                    SignalFlush();
+                }
+            });
         }
 
         private (string Path, string Json)? Serialize(string key)
@@ -339,6 +442,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (key == "flows") return (FlowsPath, JsonConvert.SerializeObject(State.Flows.Values.ToList(), Formatting.Indented, JsonSettings));
             if (key == "engine") return (EnginePath, JsonConvert.SerializeObject(State.Engine, Formatting.Indented, JsonSettings));
             if (key == "fingerprints") return (FingerprintsPath, JsonConvert.SerializeObject(State.Fingerprints, Formatting.None, JsonSettings));
+            if (key == "tags") return (TagsPath, JsonConvert.SerializeObject(State.Tags, Formatting.None, JsonSettings));
             int colon = key.IndexOf(':');
             if (colon < 0) return null;
             string kind = key[..colon], blogId = key[(colon + 1)..];
@@ -361,6 +465,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (path == FlowsPath) return "flows";
             if (path == EnginePath) return "engine";
             if (path == FingerprintsPath) return "fingerprints";
+            if (path == TagsPath) return "tags";
             string blogId = Path.GetFileName(Path.GetDirectoryName(path)) ?? "";
             return Path.GetFileName(path) switch
             {

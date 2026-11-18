@@ -43,17 +43,9 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             try
             {
-                string gadgets = "";
                 var kt = (KliveTechHub.KliveTechHub)(await parent.GetServicesByType<KliveTechHub.KliveTechHub>())[0];
-                foreach (var item in kt.connectedGadgets)
-                {
-                    gadgets += $"**Gadget: {item.name}**";
-                    foreach (var action in item.actions)
-                    {
-                        gadgets += $"\nAction: {action.name} Description: {action.paramDescription}, Accepted Parameter Type: {action.parameters.ToString()}";
-                    }
-                    gadgets += "\n\n";
-                }
+                // Never empty (Discord refuses an empty message) and within Discord's 2,000 characters.
+                string gadgets = kt.DescribeFleetText();
                 await ctx.CreateResponseAsync(DSharpPlus.InteractionResponseType.ChannelMessageWithSource, new DSharpPlus.Entities.DiscordInteractionResponseBuilder().WithContent(gadgets));
             }
             catch (Exception ex)

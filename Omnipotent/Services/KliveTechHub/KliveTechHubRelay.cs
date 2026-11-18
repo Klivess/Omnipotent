@@ -26,8 +26,10 @@ namespace Omnipotent.Services.KliveTechHub
                 HubName = hubName;
                 Socket = socket;
                 LastMessageReceived = DateTime.UtcNow;
+                ConnectedUtc = DateTime.UtcNow;
             }
 
+            internal DateTime ConnectedUtc { get; }
             internal string HubId { get; }
             internal string HubName { get; }
             internal WebSocket Socket { get; }
@@ -120,6 +122,11 @@ namespace Omnipotent.Services.KliveTechHub
         private async Task HandleRelayHubConnectionAsync(WebSocket socket)
         {
             RelayHubConnection? connection = null;
+            // Every attempt is recorded, including the ones turned away before the hub said who it
+            // was: those used to close silently, so a hub that could not get in left no trace here.
+            RelayAttempt attempt = BeginRelayAttempt();
+            string endOutcome = "closed";
+            string endDetail = "The hub closed the connection.";
             try
             {
                 using CancellationTokenSource handshakeDeadline =
@@ -134,12 +141,19 @@ namespace Omnipotent.Services.KliveTechHub
                         out helloError) ||
                     hello == null)
                 {
+                    FinishRelayAttempt(attempt, "bad-hello", helloError);
                     await CloseRelaySocketAsync(socket, WebSocketCloseStatus.PolicyViolation, helloError);
                     return;
                 }
 
                 if (!KliveTechRelayProtocol.TokensEqual(relayAccessToken, hello.Token))
                 {
+                    FinishRelayAttempt(
+                        attempt,
+                        "refused",
+                        "Its access token does not match KliveTechHubAccessToken.",
+                        hello.HubId,
+                        hello.HubName);
                     await CloseRelaySocketAsync(socket, WebSocketCloseStatus.PolicyViolation, "Unauthorized");
                     await ServiceLogError("Rejected an unauthorized KliveTech relay hub connection.");
                     return;
@@ -163,6 +177,7 @@ namespace Omnipotent.Services.KliveTechHub
                     hello.HubId,
                     hello.Hub?.Name ?? hello.HubName,
                     isHub: true);
+                FinishRelayAttempt(attempt, "connected", string.Empty, hello.HubId, hello.HubName);
                 await ServiceLog($"KliveTech relay hub connected: {hello.HubName} ({hello.HubId}).");
 
                 while (socket.State == WebSocketState.Open && !cancellationToken.IsCancellationRequested)
@@ -170,6 +185,13 @@ namespace Omnipotent.Services.KliveTechHub
                     string? message = await ReceiveWebSocketTextAsync(socket, cancellationToken.Token);
                     if (message == null)
                     {
+                        if (socket.CloseStatus.HasValue)
+                        {
+                            string reason = string.IsNullOrWhiteSpace(socket.CloseStatusDescription)
+                                ? string.Empty
+                                : $": {socket.CloseStatusDescription}";
+                            endDetail = $"The hub closed the connection ({socket.CloseStatus}{reason}).";
+                        }
                         break;
                     }
                     connection.LastMessageReceived = DateTime.UtcNow;
@@ -179,22 +201,42 @@ namespace Omnipotent.Services.KliveTechHub
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
                 // Normal service shutdown.
+                endDetail = "The KliveTech service stopped.";
             }
             catch (OperationCanceledException)
             {
+                if (attempt.outcome == "pending")
+                {
+                    FinishRelayAttempt(attempt, "handshake-timeout", "It opened the socket but sent no hello within 10 s.");
+                }
                 await CloseRelaySocketAsync(socket, WebSocketCloseStatus.PolicyViolation, "Handshake timeout");
             }
             catch (WebSocketException)
             {
                 // The hub disconnected without a close frame.
+                endOutcome = "failed";
+                endDetail = "The connection dropped without a close frame (Wi-Fi or power loss on the hub).";
             }
             catch (Exception ex)
             {
+                endOutcome = "failed";
+                endDetail = ex.Message;
                 await ServiceLogError(ex, "KliveTech relay hub connection failed.");
                 await CloseRelaySocketAsync(socket, WebSocketCloseStatus.InternalServerError, "Relay failure");
             }
             finally
             {
+                bool replaced = connection != null &&
+                    (!relayHubConnections.TryGetValue(connection.HubId, out RelayHubConnection? current) ||
+                     !ReferenceEquals(current, connection));
+                if (attempt.outcome is "pending" or "connected")
+                {
+                    FinishRelayAttempt(
+                        attempt,
+                        attempt.outcome == "pending" ? "failed" : endOutcome,
+                        replaced ? "Replaced by a newer connection from the same hub." : endDetail);
+                }
+
                 if (connection != null &&
                     relayHubConnections.TryGetValue(connection.HubId, out RelayHubConnection? active) &&
                     ReferenceEquals(active, connection))
@@ -444,6 +486,7 @@ namespace Omnipotent.Services.KliveTechHub
                 }
             }, connectionToken);
 
+            RecordConnectionAttempt(deviceId, gadget.name, error: null, attempt: 0, maximumAttempts: 1, gadget);
             await ServiceLog(
                 isHub
                     ? $"Registered KliveTech hub gadget: {gadget.name}."

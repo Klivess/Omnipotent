@@ -265,5 +265,24 @@ namespace Omnipotent.Tests.OmniTumblr
             Assert.Equal(Now.AddHours(3), k.NextPostUtc);
             Assert.Equal("a", k.NextPostBlog);
         }
+
+        [Fact]
+        public void FleetKpis_NextPostSkipsPostsWaitingForApproval()
+        {
+            // Live 13 Nov: "next post" was a reblog waiting for approval since the day before, 27 h in the past.
+            using var h = new Harness(Now);
+            string conn = h.Connect();
+            string a = h.AddBlog(conn, b => b.Stats.Followers = 1, "dank");
+            string b = h.AddBlog(conn, x => x.Stats.Followers = 1, "house");
+            h.AddReadyPost(a, p => { p.Status = PostStatus.AwaitingApproval; p.ScheduledUtc = Now.AddHours(-27); });
+            h.AddReadyPost(b, p => p.ScheduledUtc = Now.AddMinutes(40));
+
+            var k = h.Store.Read(s => OmniTumblrViews.FleetKpis(s, Now));
+
+            Assert.Equal(Now.AddMinutes(40), k.NextPostUtc);
+            Assert.Equal("house", k.NextPostBlog);
+            Assert.Equal(2, k.Pending);          // still pending: it is in the queue
+            Assert.Equal(1, k.AwaitingApproval); // and counted where it belongs
+        }
     }
 }

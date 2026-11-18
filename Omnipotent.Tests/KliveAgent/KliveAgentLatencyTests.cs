@@ -100,7 +100,8 @@ public sealed class KliveAgentLatencyTests(ITestOutputHelper output)
             await File.WriteAllTextAsync(Path.Combine(root, "Source.cs"), "namespace A; public class Target {} public class Caller { private Target value; }");
             Directory.CreateDirectory(Path.Combine(root, "Other"));
             await File.WriteAllTextAsync(Path.Combine(root, "Other", "Use.cs"), "namespace B; public class User { private A.Target value; }");
-            foreach (var excluded in new[] { "bin", "OBJ", "node_modules", ".git", ".vs", ".nuxt", ".output" })
+            // .claude: a coding session's worktrees, each a whole copy of the repository.
+            foreach (var excluded in new[] { "bin", "OBJ", "node_modules", ".git", ".vs", ".nuxt", ".output", ".claude" })
             {
                 var path = Path.Combine(root, excluded, "nested");
                 Directory.CreateDirectory(path);

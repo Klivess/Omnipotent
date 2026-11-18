@@ -60,6 +60,7 @@ The engine answers *"what should we trade?"*. The firm layer answers *"is the fi
 36. [Lab](#36-lab)
 37. [Alpha Lab](#37-alpha-lab)
 38. [Agent tools, terminal UI and tests](#38-agent-tools-terminal-ui-and-tests)
+39. [Deploying: plans, health and the paper book](#39-deploying-plans-health-and-the-paper-book)
 
 ---
 
@@ -283,16 +284,18 @@ A strategy can also expose **views** over a nested config object (the momentum s
 
 ## 7. Execution modes & sessions
 
-`SessionMode` = `Backtest | Paper | Live`. The [`SessionManager`](Sessions/SessionManager.cs) creates the right session from a `DeploymentConfig`, choosing **portfolio vs single** generically off `strategy.DeclareSymbols().IsUniverse`:
+`SessionMode` = `Backtest | Paper | Live`. The [`SessionManager`](Sessions/SessionManager.cs) creates the right session from a `DeploymentConfig`, choosing it with `SessionManager.KindOf(strategy.DeclareSymbols())`: one fixed symbol, a fixed basket (more than one), or a dynamic universe. A basket is NOT a universe (`IsUniverse` is false for it); until 13 Nov 2026 deployments only checked `IsUniverse`, so baskets ran on a single-symbol session that never called them.
 
 | Strategy shape | Backtest | Paper | Live |
 |---|---|---|---|
 | Single-symbol | `BacktestSession.RunAsync` | `PaperSession` | `LiveSession` |
+| Fixed basket | `BacktestSession.RunPortfolioAsync` | `MultiAssetSession` (basket) | `MultiAssetSession` (basket, armed) |
 | Universe | `BacktestSession.RunPortfolioAsync` | `MultiAssetSession` | `MultiAssetSession` (armed) |
 
 - **PaperSession** ([`PaperSession.cs`](Sessions/PaperSession.cs)) — streams live candles (websocket + REST fallback for robustness), fills against the `SimulatedOrderRouter`, all P&L synthetic. Preloads ~500 candles so indicator strategies act on the next bar.
 - **LiveSession** ([`LiveSession.cs`](Sessions/LiveSession.cs)) — places real Kraken orders behind a `RiskGate`; starts **disarmed** (must be armed). Reconciles fills into a `LiveLedger` (see §11).
-- **MultiAssetSession** ([`MultiAssetSession.cs`](Sessions/MultiAssetSession.cs)) — the paper/live counterpart for universe strategies; resolves the universe, REST-steps synchronized bars, dispatches `OnUniverseBar`, paper uses portfolio-mode `SimulatedOrderRouter`, live places per-symbol Kraken orders.
+- **MultiAssetSession** ([`MultiAssetSession.cs`](Sessions/MultiAssetSession.cs)) — the paper/live counterpart for basket and universe strategies; trades a basket's own symbols or resolves the universe, REST-steps synchronized bars, dispatches `OnUniverseBar`, paper uses portfolio-mode `SimulatedOrderRouter`, live places per-symbol Kraken orders.
+- Paper sessions save a **paper book** after every bar and restore it on restart and resume (§39). A market order can fill inside `PlaceOrderAsync`, before its order row exists, so both paper sessions hold such fills until the row is written (the `fills.order_id` foreign key refused them before).
 
 `DeploymentConfig` (the per-deployment settings):
 
@@ -303,6 +306,9 @@ FeeFraction (0.001), SlippageFraction (0.0005)
 MarginSettings Margin
 RiskCaps? Caps              // live only
 Dictionary<string,object?>? Parameters   // [Param] values
+ExecutionTiming? Execution  // NextOpen = fill market orders at the next bar's open (paper); null = signal close
+int? HistoryBars            // bars preloaded at start (default 500 single / 400 multi-asset)
+DeploymentOrigin? Origin    // the candidate/version it came from and the evidence it was deployed on (§39)
 ```
 
 `TimeInterval`: `OneMinute, FiveMinute, FifteenMinute, ThirtyMinute, OneHour, FourHour, OneDay, OneWeek`.
@@ -444,9 +450,11 @@ All under `/api/omnitrader/` (see [`OmniTraderRoutes.cs`](Api/OmniTraderRoutes.c
 |---|---|---|
 | GET | `status` | service health, deployment count, Kraken-configured flag |
 | GET | `strategies` | discovered strategies + parameter schema + `RequiresUniverse` |
-| GET | `deployments` | all deployments (equity, PnL%, mode, status, armed) |
-| GET | `deployment?id=` | one deployment + recent orders + fills |
-| GET | `deployment/equity?id=` | equity time series |
+| GET | `deployments` | all deployments (equity, PnL%, mode, status, armed, StrategyName, Origin, Health) |
+| GET | `deployment?id=` | one deployment + Health, Pulse, paper Book, Trades (orders with fill price and fees), raw orders + fills |
+| GET | `deployment/equity?id=&points=` | equity time series, thinned to `points` (default 1,500; 0 = every row) |
+| GET | `deploy/catalog` | every deployable strategy, ranked by its evidence (§39) |
+| GET | `deploy/plan?candidate=\|strategy=&symbol=&interval=&mode=&capital=` | a filled-in, checked deployment to show and post (§39) |
 | GET | `deployment/chart?id=&limit=` | recent candles + buy/sell/exit markers |
 | GET | `deployment/ticks?id=` | live price + forming candle (generic; any session type) |
 | GET | `portfolio/equity?mode=` | summed equity over time across deployments of a mode (the "total account value") |
@@ -1343,3 +1351,40 @@ Website e2e: `tests/e2e/omnitrader.spec.ts` with the mocked API in `tests/e2e/fi
 Every test fails on any page error or console error. Run it against a production build
 (`nuxi build`, then `node .output/server/index.mjs` and `PLAYWRIGHT_BASE_URL=…`); the dev server's
 on-demand compilation stalls under Playwright.
+
+---
+
+## 39. Deploying: plans, health and the paper book
+
+**Plans.** `GET deploy/plan?candidate=ac_…` (or `strategy=`) returns a [`DeployPlan`](Sessions/DeployPlanner.cs):
+every setting filled from the evidence the strategy carries, plus checks, then `Request`, the exact body
+for `POST deployment/create`. From an Alpha Lab candidate it takes the interval and primary test symbol
+the lab used, offers the other tested symbols with their Sharpe, pins `studio:id@vN` (the version that
+was evaluated), charges the fees of the venue it would really trade on (Kraken for crypto, a zero-commission
+broker for shares, IG CFD spread for FX/futures/indices), fills paper at the next bar's open (as the lab
+tests), preloads enough history for its longest lookback-like input (`HistoryBars`), and keeps the
+strategy's default inputs (what the lab scored). Overrides (`symbol`, `interval`, `mode`, `capital`)
+re-plan on the server. Checks are `pass | info | warn | block`; Live is blocked for non-Kraken symbols and
+for dynamic universes (the symbol allow-list would refuse every coin but the regime one). The request
+carries a `DeploymentOrigin` (candidate, score, version, evidence, bars per trade, warm-up).
+
+**Catalog.** `GET deploy/catalog` ([`DeployCatalog`](Sessions/DeployCatalog.cs)): the best candidate per
+strategy version, Studio strategies no candidate covers, then built-ins; ranked Promoted, Promising,
+untested Studio, Weak, unevaluated, Rejected. Built in memory and served for two minutes, rebuilt in the
+background (candidate and Studio documents are slow cold reads on the server).
+
+**Health.** [`DeploymentHealth.Assess`](Sessions/DeploymentHealth.cs) turns a row, its session's
+`SessionPulse` and its order counts into one state: `ok`, `starting`, `warming`, `quiet` (no orders in
+3× the backtest's bars-per-trade, or 120 bars without that), `erroring`, `stalled` (no new bar for three
+bars plus a margin; equity feeds get the weekend), `detached` (marked running, no session), `disarmed`,
+`paused`, `stopped`, `errored`. It is on every `deployments` row and the Deploy page leads with the worst.
+
+**Paper book.** [`PaperBook`](Sessions/PaperBook.cs) (document collection `paper-books`) holds cash,
+base units or per-symbol balances, average entries, fees, bars processed and orders waiting for the next
+open. Saved after every bar; restored on restart and resume. Deployments made before it existed restart
+from their equity as cash, as they always did.
+
+**UI.** `/omnitrader/strategies` in the website (`components/Deploy/*`, `composables/useDeployConsole.ts`,
+`scripts/deployConsole.ts`); the Alpha Lab candidate panel's "Deploy…" opens `?candidate=`. E2e:
+`tests/e2e/omnitrader-deploy.spec.ts` against fixtures written by
+`DeployFixtureExport` (`OMNITRADER_FIXTURES=… --filter "FullyQualifiedName~DeployFixtureExport"`).

@@ -277,6 +277,8 @@ namespace Omnipotent.Tests.OmniBlox
         /// <summary>What API-key introspection says: the key "unknown-key" is not known; every other belongs to KeyOwner.</summary>
         public long KeyOwner { get; set; } = 42;
         public bool KeyEnabled { get; set; } = true;
+        /// <summary>Refuse every place upload as Roblox refuses another account's key (what a key pasted from a new account met on Nov 2 2026).</summary>
+        public bool RefusePlaceUploads { get; set; }
 
         private HttpResponseMessage? QuickLogin(HttpRequestMessage request, string path)
         {
@@ -502,7 +504,9 @@ namespace Omnipotent.Tests.OmniBlox
             if (uri.Host == "games.roblox.com" && path == "/v1/games/votes")
                 return Json(new { data = new[] { new { id = 111L, upVotes = 9000, downVotes = 1000 } } });
             if (path.StartsWith("/universes/v1/") && path.EndsWith("/versions"))
-                return Json(new { versionNumber = nextVersion++ });
+                return RefusePlaceUploads
+                    ? new HttpResponseMessage(HttpStatusCode.Unauthorized) { Content = new StringContent("{\"code\":\"Unauthorized\",\"message\":\"User unauthorized to update place. reason: [Unauthorized].\"}", Encoding.UTF8, "application/json") }
+                    : Json(new { versionNumber = nextVersion++ });
             if (path.Contains("/luau-execution-session-tasks"))
                 return Json(JObject.Parse($"{{\"path\":\"universes/1/places/2/versions/1/luau-execution-sessions/s1/tasks/t1\",\"state\":\"COMPLETE\",\"output\":{EngineOutput}}}"));
             if (path.EndsWith("/logs"))
@@ -620,6 +624,8 @@ namespace Omnipotent.Tests.OmniBlox
                 Alert = message => { lock (Alerts) Alerts.Add(message); return Task.CompletedTask; },
                 Settings = settings,
                 LocalEngine = localEngine,
+                // Scripted runs label and place in the same minute of fake time: always the newest catalog.
+                CatalogRefreshAfter = TimeSpan.Zero,
             };
             Orchestrator = new Orchestrator(Ctx);
             Connection = new RobloxConnection(Ctx, new RobloxQuickLogin(http, clock), cookie => { settings.SessionCookie = cookie; return Task.CompletedTask; });

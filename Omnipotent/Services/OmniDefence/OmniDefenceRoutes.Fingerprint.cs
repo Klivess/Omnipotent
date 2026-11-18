@@ -35,7 +35,9 @@ namespace Omnipotent.Services.OmniDefence
                 // Per-IP value: must never be served from the shared response cache.
                 CacheDeps.MarkUncacheable("per-IP beacon nonce");
                 string ip = OmniDefence.ExtractClientIp(req.req);
-                bool enabled = parent.Settings.BeaconEnabled && parent.Settings.FingerprintEnabled;
+                // Off until the engine exists: it loads after the routes, and a beacon posted
+                // before then would be refused.
+                bool enabled = parent.Settings.BeaconEnabled && parent.Settings.FingerprintEnabled && parent.Fingerprints != null;
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { enabled, nonce = enabled ? parent.IssueBeaconNonce(ip) : null }), "application/json");
             }, HttpMethod.Get, Perms.Public);
 
@@ -161,8 +163,8 @@ namespace Omnipotent.Services.OmniDefence
                     classifications = engine?.Classifications ?? 0,
                     backfillRunning = engine?.BackfillRunning ?? false,
                     backfillRowsFolded = engine?.BackfillRowsFolded ?? 0,
-                    classBreakdown = ClassBreakdown(parent),
-                    tagBreakdown = TagBreakdown(parent),
+                    classBreakdown = ClassBreakdown(parent.Tracker.All()),
+                    tagBreakdown = TagBreakdown(parent.Tracker.All()),
                     intel = intelSvc == null ? null : new
                     {
                         datacenterRanges = intelSvc.DatacenterRanges,
@@ -178,10 +180,10 @@ namespace Omnipotent.Services.OmniDefence
 
         // ── helpers ──
 
-        private static Dictionary<string, int> ClassBreakdown(OmniDefence parent)
+        private static Dictionary<string, int> ClassBreakdown(IEnumerable<IpRecord> records)
         {
             var counts = IpClassInfo.All.ToDictionary(i => i.Class.ToString(), _ => 0);
-            foreach (var rec in parent.Tracker.All())
+            foreach (var rec in records)
             {
                 string cls = rec.Classification ?? nameof(IpClass.Unknown);
                 counts[cls] = counts.TryGetValue(cls, out int n) ? n + 1 : 1;
@@ -189,10 +191,10 @@ namespace Omnipotent.Services.OmniDefence
             return counts;
         }
 
-        private static Dictionary<string, int> TagBreakdown(OmniDefence parent)
+        private static Dictionary<string, int> TagBreakdown(IEnumerable<IpRecord> records)
         {
             var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-            foreach (var rec in parent.Tracker.All())
+            foreach (var rec in records)
             {
                 string? tags = rec.ClassTags;
                 if (string.IsNullOrEmpty(tags)) continue;

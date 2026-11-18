@@ -131,7 +131,10 @@ namespace Omnipotent.Services.KliveAgent
                 KliveAPI.Caching.CacheDeps.MarkUncacheable("live agent start-up state");
                 var (ready, state, progress, message) = service.GetInitializationStatus();
                 await req.ReturnResponse(JsonConvert.SerializeObject(new { ready, state, progress, message,
-                    codebase = service.GetCodebaseInitializationStatus() }));
+                    codebase = service.GetCodebaseInitializationStatus(),
+                    // The two rolling checks (scripts failing more than usual, provider slow right now), on
+                    // the route the page already polls. Null until the statistics have loaded.
+                    health = service.Stats?.BuildWatch() }));
             }, HttpMethod.Get, KliveAgentPerms.StatusView);
         }
 
@@ -167,6 +170,8 @@ namespace Omnipotent.Services.KliveAgent
                         conversationId,
                         req.user?.Name ?? "API",
                         body.ClientMessageId, attachments);
+                    // A retried message replays the stored turn, which may predate the secret guard.
+                    service.SecretGuard.MaskResponse(response);
 
                     await req.ReturnResponse(
                         JsonConvert.SerializeObject(response),
@@ -216,11 +221,30 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
-                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealRunForKlives(pendingResponse)), headers: new WebHeaderCollection
+                    bool reveal = req.Can(AccountsPerms.SecretsReveal);
+                    var view = service.RevealRunForKlives(pendingResponse, reveal)!;
+                    // A requestId poll is the page's long-poll, merged into its last copy: leave out what it holds.
+                    // activity=append: the page appends activity at activityFrom instead of replacing it.
+                    bool appendActivity = string.Equals(req.userParameters["activity"], "append", StringComparison.OrdinalIgnoreCase);
+                    var trimmed = string.IsNullOrWhiteSpace(requestId)
+                        ? new KliveAgentRunTrimmer.Trimmed(Array.Empty<string>(), null)
+                        : service.RunTrimmer.Trim(view, requestId + (reveal ? "|reveal" : "|masked"), afterSequence, appendActivity);
+                    var headers = new WebHeaderCollection
                     {
                         ["Cache-Control"] = "no-store",
                         ["X-Klive-Pending-Wait"] = "supported"
-                    });
+                    };
+                    if (trimmed.Omitted.Count > 0) headers["X-Klive-Pending-Unchanged"] = string.Join(",", trimmed.Omitted);
+                    string body;
+                    if (trimmed.ActivityFrom is int activityFrom)
+                    {
+                        // In the body, not a header: a credentialed cross-origin page cannot read a header exposed by "*".
+                        var json = Newtonsoft.Json.Linq.JObject.FromObject(view);
+                        json["activityFrom"] = activityFrom;
+                        body = json.ToString(Formatting.None);
+                    }
+                    else body = JsonConvert.SerializeObject(view);
+                    await req.ReturnResponse(body, headers: headers);
                 }
                 catch (Exception ex)
                 {
@@ -247,8 +271,9 @@ namespace Omnipotent.Services.KliveAgent
                     }
                     bool includeCompleted = !string.Equals(
                         req.userParameters["includeCompleted"], "false", StringComparison.OrdinalIgnoreCase);
+                    bool reveal = req.Can(AccountsPerms.SecretsReveal);
                     var runs = service.GetPendingApiResponses(conversationId, includeCompleted)
-                        .Select(run => service.RevealRunForKlives(run))
+                        .Select(run => service.RevealRunForKlives(run, reveal))
                         .ToList();
                     await req.ReturnResponse(JsonConvert.SerializeObject(runs), headers: NoStore());
                 }
@@ -555,6 +580,8 @@ namespace Omnipotent.Services.KliveAgent
                         return;
                     }
 
+                    // One that was slow to read at start-up is read now rather than reported missing.
+                    try { await service.EnsureConversationLoadedAsync(id); } catch (IOException) { }
                     var conversation = service.GetConversation(id);
                     if (conversation == null)
                     {
@@ -565,8 +592,9 @@ namespace Omnipotent.Services.KliveAgent
                     }
 
                     // Requested credentials appear as {account:...} references in the stored reply and
-                    // are resolved only here, for Klives' own authenticated view.
-                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealConversationForKlives(conversation)),
+                    // are resolved only here, and only for a caller who may reveal account secrets:
+                    // this route needs just kliveagent.history.read.
+                    await req.ReturnResponse(JsonConvert.SerializeObject(service.RevealConversationForKlives(conversation, req.Can(AccountsPerms.SecretsReveal))),
                         headers: NoStore());
                 }
                 catch (Exception ex)
@@ -635,6 +663,27 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(JsonConvert.SerializeObject(
                     service.GetLongTermJobs(activeOnly, limit)));
             }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
+
+            // What the agent will do on its own later: the tasks it scheduled for itself (schedule_task).
+            await CreateDurableRoute("/kliveagent/schedule", async req =>
+            {
+                KliveAPI.Caching.CacheDeps.MarkUncacheable("live scheduled tasks");
+                var scheduler = service.Scheduler;
+                await req.ReturnResponse(JsonConvert.SerializeObject(scheduler == null
+                    ? new { active = Array.Empty<object>(), recent = Array.Empty<object>(), maxActive = 0 }
+                    : scheduler.Snapshot()), headers: NoStore());
+            }, HttpMethod.Get, KliveAgentPerms.HistoryRead);
+
+            await CreateDurableRoute("/kliveagent/schedule/cancel", async req =>
+            {
+                var body = JsonConvert.DeserializeObject<dynamic>(req.userMessageContent);
+                string id = body?.id;
+                var scheduler = service.Scheduler;
+                bool cancelled = scheduler != null && await scheduler.CancelByIdAsync(id ?? "", req.user?.Name ?? "the website");
+                await req.ReturnResponse(
+                    JsonConvert.SerializeObject(new { success = cancelled }),
+                    code: cancelled ? HttpStatusCode.OK : HttpStatusCode.Conflict);
+            }, HttpMethod.Post, KliveAgentPerms.JobsManage);
 
             await CreateDurableRoute("/kliveagent/jobs/get", async req =>
             {
@@ -934,6 +983,15 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     await req.ReturnResponse(JsonConvert.SerializeObject(new { error = ex.Message }), code: HttpStatusCode.BadRequest);
                 }
+            }, HttpMethod.Get, KliveAgentPerms.StatusView);
+
+            // Script health: failure classes, what the engine repaired, compile times. A durable route so
+            // the page can show it while the model side is still warming up.
+            await CreateDurableRoute("/kliveagent/stats/scripts", async req =>
+            {
+                KliveAPI.Caching.CacheDeps.MarkUncacheable("live script statistics");
+                int days = int.TryParse(req.userParameters["days"], NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed) ? parsed : 30;
+                await req.ReturnResponse(JsonConvert.SerializeObject(service.Stats.BuildScriptHealth(days)));
             }, HttpMethod.Get, KliveAgentPerms.StatusView);
 
             await CreateRoute("/kliveagent/stats/summary", async (req) =>

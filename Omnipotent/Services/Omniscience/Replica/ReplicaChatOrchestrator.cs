@@ -14,8 +14,6 @@ namespace Omnipotent.Services.Omniscience.Replica
     {
         private const int RetrievedExemplarCount = 7;
         private const int StimulusMatchedCount = 6;
-        private const int DraftMaxTokens = 520;
-        private const int PolishMaxTokens = 520;
         private const string PipelineVersion = "temporal-v2";
         public const string SimulationLabel = "AI simulation based on archived messages; not the real person";
 
@@ -157,8 +155,7 @@ namespace Omnipotent.Services.Omniscience.Replica
             };
 
             var draftSw = System.Diagnostics.Stopwatch.StartNew();
-            var draftResp = await llm.QueryLLM(composed, sessionId: null, maxTokensOverride: DraftMaxTokens,
-                systemPrompt: systemPrompt, useFreeModel: false, cancellationToken: ct);
+            var draftResp = await OmniscienceLlm.AskAsync(llm, composed, systemPrompt, useFreeModel: false, ct);
             draftSw.Stop();
             if (!draftResp.Success || string.IsNullOrWhiteSpace(draftResp.Response))
                 throw new InvalidOperationException("KliveLLM draft call failed: " + draftResp.ErrorMessage);
@@ -174,9 +171,8 @@ namespace Omnipotent.Services.Omniscience.Replica
             {
                 string critiquePrompt = BuildCritiquePrompt(userMessage, result.Draft);
                 var polishSw = System.Diagnostics.Stopwatch.StartNew();
-                var polishResp = await llm.QueryLLM(critiquePrompt, sessionId: null, maxTokensOverride: PolishMaxTokens,
-                    systemPrompt: ReplicaPromptBuilder.CritiqueSystemPrompt + "\n\n" + systemPrompt,
-                    useFreeModel: false, cancellationToken: ct);
+                var polishResp = await OmniscienceLlm.AskAsync(llm, critiquePrompt,
+                    ReplicaPromptBuilder.CritiqueSystemPrompt + "\n\n" + systemPrompt, useFreeModel: false, ct);
                 polishSw.Stop();
                 if (polishResp.Success && !string.IsNullOrWhiteSpace(polishResp.Response))
                 {

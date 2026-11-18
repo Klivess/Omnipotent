@@ -1,0 +1,308 @@
+﻿using System.Collections.Concurrent;
+using Newtonsoft.Json;
+using Omnipotent.Data_Handling;
+using Omnipotent.Services.KliveAPI.Caching;
+
+namespace Omnipotent.Services.Demiurge;
+
+/// <summary>
+/// Attribution supplied by a caller when an LLM turn is booked to the Steward ledger.
+/// The ledger remains the authority for cumulative totals; this context makes the same
+/// spend useful for time-series, model, wake and agent analytics.
+/// </summary>
+public sealed class StewardTokenUsageContext
+{
+    public DateTime? OccurredAt { get; set; }
+    public string? WakeID { get; set; }
+    public string? AgentID { get; set; }
+    public string Source { get; set; } = "unknown";
+    public string? Operation { get; set; }
+    public string? Model { get; set; }
+    public string? SourceReference { get; set; }
+    public string? Label { get; set; }
+    public string? Provider { get; set; }
+    public string? RoutedProvider { get; set; }
+    public bool CacheMetricsAvailable { get; set; }
+    public long CacheWritePromptTokens { get; set; }
+    public double? UpstreamInferenceCostUsd { get; set; }
+    public int TurnIndex { get; set; }
+    public long RequestDurationMs { get; set; }
+    public long QueueDurationMs { get; set; }
+    public long ProviderDurationMs { get; set; }
+    public bool LatencyBreakdownAvailable { get; set; }
+    public string? RouterStrategy { get; set; }
+    public int? RouterAttempt { get; set; }
+    public bool ContextWasCompacted { get; set; }
+    public string? CacheEpochID { get; set; }
+    public int CacheEpochTurnIndex { get; set; }
+    public string? PromptAssemblyStatus { get; set; }
+    public int AppendedBriefTokens { get; set; }
+    public int FullBriefTokens { get; set; }
+    public string? CacheSessionID { get; set; }
+    public string? ResponseCacheStatus { get; set; }
+    public string? PromptCacheTelemetryVersion { get; set; }
+    /// <summary>The router that served this turn charges nothing per token (KliveLLM's answer for this
+    /// exact call). Null when not known; the budget ledger then asks the turn's lane.</summary>
+    public bool? FlatFee { get; set; }
+}
+
+/// <summary>Version gate separating measurements produced after the repaired Demiurge prefix
+/// assembly from older journal rows whose missing cache fields cannot be distinguished from zero.</summary>
+public static class StewardPromptCacheTelemetry
+{
+    public const string CurrentVersion = "projects-prefix-v3";
+}
+
+/// <summary>One immutable token-spend or cost-reconciliation journal entry.</summary>
+public sealed class StewardTokenUsageRecord
+{
+    public int SchemaVersion { get; set; } = 2;
+    public string RecordKind { get; set; } = "usage";
+    public long Sequence { get; set; }
+    public string UsageID { get; set; } = "";
+    public string StewardID { get; set; } = "";
+    public DateTime OccurredAt { get; set; }
+    public DateTime RecordedAt { get; set; }
+    public string? WakeID { get; set; }
+    public string AgentID { get; set; } = "system";
+    public string Source { get; set; } = "unknown";
+    public string? Operation { get; set; }
+    public string Model { get; set; } = "unknown";
+    public string? SourceReference { get; set; }
+    public string? Label { get; set; }
+    public long PromptTokens { get; set; }
+    public long CompletionTokens { get; set; }
+    /// <summary>How many of <see cref="PromptTokens"/> the provider served from its prompt cache.
+    /// Zero on routes that don't support caching — which is exactly what makes it worth journaling.</summary>
+    public long CachedPromptTokens { get; set; }
+    public bool CacheMetricsAvailable { get; set; }
+    public long CacheWritePromptTokens { get; set; }
+    public string? Provider { get; set; }
+    public string? RoutedProvider { get; set; }
+    public double? UpstreamInferenceCostUsd { get; set; }
+    public int TurnIndex { get; set; }
+    public long RequestDurationMs { get; set; }
+    public long QueueDurationMs { get; set; }
+    public long ProviderDurationMs { get; set; }
+    public bool LatencyBreakdownAvailable { get; set; }
+    public string? RouterStrategy { get; set; }
+    public int? RouterAttempt { get; set; }
+    public bool ContextWasCompacted { get; set; }
+    public string? CacheEpochID { get; set; }
+    public int CacheEpochTurnIndex { get; set; }
+    public string? PromptAssemblyStatus { get; set; }
+    public int AppendedBriefTokens { get; set; }
+    public int FullBriefTokens { get; set; }
+    public string? CacheSessionID { get; set; }
+    public string? ResponseCacheStatus { get; set; }
+    public string? PromptCacheTelemetryVersion { get; set; }
+    /// <summary>
+    /// Effective USD booked by this entry. Reconciliation entries may be negative so
+    /// the sum of the provisional record and its adjustment equals the provider truth.
+    /// </summary>
+    public double CostUsd { get; set; }
+    public string CostBasis { get; set; } = "unknown";
+    public string? GenerationID { get; set; }
+    public string? ReconcilesUsageID { get; set; }
+}
+
+/// <summary>
+/// Append-only per-Steward JSONL journal for structured LLM usage attribution.
+/// Layout: Demiurge/AnalyticsUsage/&lt;stewardID&gt;.usage.jsonl.
+/// </summary>
+public sealed class StewardTokenUsageStore
+{
+    private readonly string root;
+    private readonly Action<string> log;
+    private readonly ConcurrentDictionary<string, object> locks = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, long> sequenceCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, DateTime> cutoverCache = new(StringComparer.Ordinal);
+
+    private static string CacheKey(string stewardID) => "demiurge:token-usage:" + stewardID;
+    private const string CacheKeyAll = "demiurge:token-usage";
+
+    public StewardTokenUsageStore(Action<string> log)
+    {
+        this.log = log ?? (_ => { });
+        root = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.DemiurgeDirectory), "AnalyticsUsage");
+        Directory.CreateDirectory(root);
+    }
+
+    private object LockFor(string stewardID) => locks.GetOrAdd(stewardID, _ => new object());
+    private string PathFor(string stewardID) => Path.Combine(root, stewardID + ".usage.jsonl");
+
+    public StewardTokenUsageRecord? TryAppend(StewardTokenUsageRecord record)
+    {
+        try
+        {
+            if (record == null || string.IsNullOrWhiteSpace(record.StewardID))
+                throw new ArgumentException("token usage requires StewardID");
+
+            lock (LockFor(record.StewardID))
+            {
+                record.Sequence = GetLastSequenceLocked(record.StewardID) + 1;
+                if (string.IsNullOrWhiteSpace(record.UsageID))
+                    record.UsageID = Guid.NewGuid().ToString("N");
+                record.OccurredAt = NormalizeUtc(record.OccurredAt == default ? DateTime.UtcNow : record.OccurredAt);
+                record.RecordedAt = NormalizeUtc(record.RecordedAt == default ? DateTime.UtcNow : record.RecordedAt);
+                record.AgentID = Clean(record.AgentID, 160, "system");
+                record.Source = Clean(record.Source, 80, "unknown");
+                record.RecordKind = Clean(record.RecordKind, 40, "usage");
+                record.Operation = CleanNullable(record.Operation, 120);
+                record.Model = Clean(record.Model, 240, "unknown");
+                record.SourceReference = CleanNullable(record.SourceReference, 240);
+                record.Label = CleanNullable(record.Label, 240);
+                record.GenerationID = CleanNullable(record.GenerationID, 240);
+                record.ReconcilesUsageID = CleanNullable(record.ReconcilesUsageID, 64);
+                record.Provider = CleanNullable(record.Provider, 80);
+                record.RoutedProvider = CleanNullable(record.RoutedProvider, 120);
+                record.RouterStrategy = CleanNullable(record.RouterStrategy, 120);
+                record.CacheSessionID = CleanNullable(record.CacheSessionID, 256);
+                record.ResponseCacheStatus = CleanNullable(record.ResponseCacheStatus, 40);
+                record.PromptCacheTelemetryVersion = CleanNullable(record.PromptCacheTelemetryVersion, 80);
+                record.PromptTokens = Math.Max(0, record.PromptTokens);
+                record.CompletionTokens = Math.Max(0, record.CompletionTokens);
+                record.CachedPromptTokens = Math.Clamp(record.CachedPromptTokens, 0, record.PromptTokens);
+                record.CacheWritePromptTokens = Math.Max(0, record.CacheWritePromptTokens);
+                record.TurnIndex = Math.Max(0, record.TurnIndex);
+                record.RequestDurationMs = Math.Max(0, record.RequestDurationMs);
+                record.QueueDurationMs = Math.Max(0, record.QueueDurationMs);
+                record.ProviderDurationMs = Math.Max(0, record.ProviderDurationMs);
+                if (record.RouterAttempt is < 0) record.RouterAttempt = null;
+                if (record.UpstreamInferenceCostUsd is { } upstream
+                    && (!double.IsFinite(upstream) || upstream < 0))
+                    record.UpstreamInferenceCostUsd = null;
+                if (!double.IsFinite(record.CostUsd)) record.CostUsd = 0;
+
+                string json = JsonConvert.SerializeObject(record, Formatting.None);
+                string path = PathFor(record.StewardID);
+                using var fs = new FileStream(path, FileMode.Append, FileAccess.Write, FileShare.Read);
+                using var sw = new StreamWriter(fs);
+                sw.WriteLine(json);
+                sw.Flush();
+                fs.Flush(flushToDisk: true);
+                sequenceCache[record.StewardID] = record.Sequence;
+                if (IsUsageCharge(record))
+                {
+                    cutoverCache.TryAdd(record.StewardID, record.OccurredAt);
+                }
+                CacheDeps.Bump(CacheKey(record.StewardID));
+                CacheDeps.Bump(CacheKeyAll);
+                return record;
+            }
+        }
+        catch (Exception ex)
+        {
+            log($"Steward token-usage journal append failed for {record?.StewardID ?? "unknown"}: {ex.Message}");
+            return null;
+        }
+    }
+
+    public long GetLastSequence(string stewardID)
+    {
+        CacheDeps.NoteRead(CacheKey(stewardID));
+        lock (LockFor(stewardID)) return GetLastSequenceLocked(stewardID);
+    }
+
+    public IEnumerable<StewardTokenUsageRecord> EnumerateRange(
+        string stewardID,
+        DateTime? fromUtc,
+        DateTime? toUtc)
+    {
+        CacheDeps.NoteRead(CacheKey(stewardID));
+        string path = PathFor(stewardID);
+        if (!File.Exists(path)) yield break;
+        DateTime? from = fromUtc?.ToUniversalTime();
+        DateTime? to = toUtc?.ToUniversalTime();
+
+        using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        using var sr = new StreamReader(fs);
+        string? line;
+        while ((line = sr.ReadLine()) != null)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            StewardTokenUsageRecord? record;
+            try { record = JsonConvert.DeserializeObject<StewardTokenUsageRecord>(line); }
+            catch { continue; }
+            if (record == null) continue;
+            DateTime occurredAt = NormalizeUtc(record.OccurredAt);
+            if (from.HasValue && occurredAt < from.Value) continue;
+            if (to.HasValue && occurredAt > to.Value) continue;
+            record.OccurredAt = occurredAt;
+            yield return record;
+        }
+    }
+
+    public StewardTokenUsageRecord? FindProvisionalByGeneration(
+        string stewardID,
+        string generationID)
+    {
+        if (string.IsNullOrWhiteSpace(generationID)) return null;
+        return EnumerateRange(stewardID, null, null)
+            .Where(record =>
+                string.Equals(record.GenerationID, generationID, StringComparison.Ordinal)
+                && string.Equals(record.CostBasis, "provisional", StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(record => record.Sequence)
+            .FirstOrDefault();
+    }
+
+    /// <summary>
+    /// First structured charge for a Steward. Analytics use this durable cutover to avoid
+    /// combining post-journal records with historical prose/diagnostic usage fallback.
+    /// </summary>
+    public DateTime? GetCutoverUtc(string stewardID)
+    {
+        CacheDeps.NoteRead(CacheKey(stewardID));
+        if (cutoverCache.TryGetValue(stewardID, out DateTime cached)) return cached;
+
+        DateTime? earliest = EnumerateRange(stewardID, null, null)
+            .Where(IsUsageCharge)
+            .OrderBy(record => record.Sequence)
+            .Select(record => (DateTime?)record.OccurredAt.ToUniversalTime())
+            .FirstOrDefault();
+        if (earliest.HasValue) cutoverCache[stewardID] = earliest.Value;
+        return earliest;
+    }
+
+    private long GetLastSequenceLocked(string stewardID)
+    {
+        if (sequenceCache.TryGetValue(stewardID, out long cached)) return cached;
+        long last = 0;
+        string path = PathFor(stewardID);
+        if (File.Exists(path))
+        {
+            foreach (string line in File.ReadLines(path))
+            {
+                if (string.IsNullOrWhiteSpace(line)) continue;
+                try
+                {
+                    var record = JsonConvert.DeserializeObject<StewardTokenUsageRecord>(line);
+                    if (record != null && record.Sequence > last) last = record.Sequence;
+                }
+                catch { }
+            }
+        }
+        sequenceCache[stewardID] = last;
+        return last;
+    }
+
+    private static DateTime NormalizeUtc(DateTime value)
+        => value.Kind == DateTimeKind.Utc ? value : value.ToUniversalTime();
+
+    private static bool IsUsageCharge(StewardTokenUsageRecord record)
+        => !string.Equals(record.RecordKind, "cost-adjustment", StringComparison.OrdinalIgnoreCase)
+            && (record.PromptTokens > 0 || record.CompletionTokens > 0);
+
+    private static string Clean(string? value, int maxLength, string fallback)
+    {
+        string clean = string.IsNullOrWhiteSpace(value) ? fallback : value.Trim();
+        return clean.Length <= maxLength ? clean : clean[..maxLength];
+    }
+
+    private static string? CleanNullable(string? value, int maxLength)
+    {
+        if (string.IsNullOrWhiteSpace(value)) return null;
+        string clean = value.Trim();
+        return clean.Length <= maxLength ? clean : clean[..maxLength];
+    }
+}

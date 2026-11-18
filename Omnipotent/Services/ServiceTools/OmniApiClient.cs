@@ -109,6 +109,10 @@ public sealed class OmniApiClient
 
             bool ok = response.IsSuccessStatusCode;
             var rendered = Render(response.StatusCode, text, response);
+            // A guessed path: name the routes that do exist near it, so the next call is not another guess
+            // (three 404s in a row for /omnitrader/… when the routes live under /api/omnitrader/…).
+            if (response.StatusCode == HttpStatusCode.NotFound && SuggestRoutes(path) is { } suggestion)
+                rendered += "\n" + suggestion;
 
             audit.Record(new OmniToolAuditEntry(DateTime.UtcNow, OmniToolCatalog.UniversalApiTool,
                 $"{method} {path}", "KliveAPI", mutating, ok, stopwatch.ElapsedMilliseconds, redacted,
@@ -194,6 +198,56 @@ public sealed class OmniApiClient
         return token == null
             ? (null, "No owner profile is loaded yet, so omni_api cannot authenticate.")
             : (token, null);
+    }
+
+    /// <summary>The registered routes closest to a path that returned 404, or null when none is close.</summary>
+    private string? SuggestRoutes(string path)
+    {
+        try
+        {
+            var api = resolveServices()?.OfType<Services.KliveAPI.KliveAPI>().FirstOrDefault();
+            if (api?.ControllerLookup == null) return null;
+            var routes = api.ControllerLookup.ToDictionary(kv => kv.Key, kv => kv.Value.normalizedMethod, StringComparer.OrdinalIgnoreCase);
+            var close = ClosestRoutes(path, routes.Keys);
+            return close.Count == 0 ? null
+                : "No route is registered at that path. Closest registered routes: "
+                  + string.Join(", ", close.Select(route => $"{routes[route]} {route}"));
+        }
+        catch { return null; }
+    }
+
+    /// <summary>Routes that contain the asked-for path (a missing prefix such as /api), then routes that
+    /// share its last segment, then the nearest by spelling.</summary>
+    internal static List<string> ClosestRoutes(string path, IEnumerable<string> registered, int max = 5)
+    {
+        string asked = path.Split('?')[0].TrimEnd('/');
+        if (asked.Length < 2) return new List<string>();
+        var all = registered.Where(r => !string.IsNullOrEmpty(r)).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        string last = asked[(asked.LastIndexOf('/') + 1)..];
+        var segments = asked.Split('/', StringSplitOptions.RemoveEmptyEntries);
+
+        var ranked = new List<(int Rank, double Score, string Route)>();
+        foreach (var route in all)
+        {
+            if (route.EndsWith(asked, StringComparison.OrdinalIgnoreCase)) ranked.Add((0, 1, route));
+            else if (route.Contains(asked, StringComparison.OrdinalIgnoreCase)) ranked.Add((1, 1, route));
+            else
+            {
+                var routeSegments = route.Split('/', StringSplitOptions.RemoveEmptyEntries);
+                int shared = segments.Count(s => routeSegments.Contains(s, StringComparer.OrdinalIgnoreCase));
+                bool sameLeaf = last.Length > 0 && routeSegments.Length > 0
+                    && string.Equals(routeSegments[^1], last, StringComparison.OrdinalIgnoreCase);
+                if (sameLeaf && shared >= 2) ranked.Add((2, shared, route));
+                else if (shared >= 2) ranked.Add((3, shared, route));
+                else
+                {
+                    double similarity = Services.KliveAgent.KliveAgentNames.Similarity(asked.ToLowerInvariant(), route.ToLowerInvariant());
+                    if (similarity >= 0.7) ranked.Add((4, similarity, route));
+                }
+            }
+        }
+        return ranked.OrderBy(r => r.Rank).ThenByDescending(r => r.Score).ThenBy(r => r.Route.Length)
+            .Take(max).Select(r => r.Route).ToList();
     }
 
     private string Render(HttpStatusCode status, string body, HttpResponseMessage response)

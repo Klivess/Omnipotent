@@ -173,8 +173,11 @@ namespace Omnipotent.Services.OmniTrader.Api
                     ids = chosen?.InstrumentIds ?? new List<string>();
                 }
 
-                var rows = await Firm.Watchlists.EvaluateAsync(ids, interval);
-                var breadth = await Firm.Watchlists.BreadthAsync(ids);
+                // Rows and breadth read different bars; fetch them side by side.
+                var rowsTask = Firm.Watchlists.EvaluateAsync(ids, interval);
+                var breadthTask = Firm.Watchlists.BreadthAsync(ids);
+                var rows = await rowsTask;
+                var breadth = await breadthTask;
                 await Json(req, new
                 {
                     Interval = interval.ToString(),
@@ -868,9 +871,16 @@ namespace Omnipotent.Services.OmniTrader.Api
                 var adapter = Firm.Venues.All.FirstOrDefault(a => a.Venue == venue);
                 var mapping = instrument.MappingFor(venue);
 
-                decimal mark = await Firm.Portfolio.GetMarkAsync(instrument.Id, venue);
+                // Three venue calls in turn (p95 15.7 s over 13 tickets in 30 days, 2.0 s the period before).
+                // Not run side by side: the account calls can log in to a broker, and parallel logins are what
+                // once produced 57 failed IG logins in 8 minutes. The spans say which call is slow.
+                decimal mark;
+                using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("ticket-mark")) mark = await Firm.Portfolio.GetMarkAsync(instrument.Id, venue);
                 var freshness = Firm.Instruments.GetFreshness(instrument.Id);
-                var riskState = await Firm.Portfolio.BuildRiskStateAsync();
+                Omnipotent.Services.OmniTrader.Risk.RiskPortfolioState riskState;
+                using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("ticket-risk")) riskState = await Firm.Portfolio.BuildRiskStateAsync();
+                List<object> accounts;
+                using (Omnipotent.Services.KliveAPI.Telemetry.RequestTrace.AmbientSpan("ticket-accounts")) accounts = await SpendingPowerAsync(venue);
 
                 await Json(req, new
                 {
@@ -892,7 +902,7 @@ namespace Omnipotent.Services.OmniTrader.Api
                     Limits = Firm.Limits,
                     FreeInventory = riskState.FreeInventory.TryGetValue(instrument.BaseAsset, out var free) ? free : 0m,
                     riskState.AvailableFunds,
-                    Accounts = await SpendingPowerAsync(venue)
+                    Accounts = accounts
                 });
             });
 

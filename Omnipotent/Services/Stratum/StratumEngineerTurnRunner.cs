@@ -207,7 +207,7 @@ namespace Omnipotent.Services.Stratum
                     var meta2 = timeline.GetMeta(projectID);
                     string prompt = StratumEngineerAgent.BuildSummaryPrompt(meta2.RollingSummary, turnEvents);
                     string summarySession = $"stratum-engineer-summary-{ctx.Run.RunID}";
-                    llm.StartToolSession(summarySession, null);
+                    llm.StartToolSession(summarySession, null, KliveLLM.LlmConsumerCatalog.Callers.StratumSummary);
                     llm.AppendUserMessageToToolSession(summarySession, prompt);
                     // One query, then the session is dropped. It shares an id-space with the real
                     // multi-turn engineer session, so no string rule could tell the two apart -- which

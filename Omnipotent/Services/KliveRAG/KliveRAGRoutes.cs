@@ -1,4 +1,5 @@
 using Newtonsoft.Json;
+using Omnipotent.Services.KliveAPI.Caching;
 using System;
 using System.Linq;
 using System.Net;
@@ -78,7 +79,17 @@ namespace Omnipotent.Services.KliveRAG
 
             await service.CreateAPIRoute("/kliverag/stats", async (req) =>
             {
-                try { await req.ReturnResponse(JsonConvert.SerializeObject(service.GetStats()), "application/json"); }
+                try
+                {
+                    // The counts and health flags move with no tracked write behind them, so a cached copy could only be old.
+                    CacheDeps.MarkUncacheable("kliverag stats");
+                    RagStats stats;
+                    using (req.Trace?.Span("counters"))
+                    {
+                        stats = await service.GetStatsAsync();
+                    }
+                    await req.ReturnResponse(JsonConvert.SerializeObject(stats), "application/json");
+                }
                 catch (Exception ex) { await req.ReturnResponse(JsonConvert.SerializeObject(new ErrorInformation(ex)), code: HttpStatusCode.InternalServerError); }
             }, HttpMethod.Get, KliveRagPerms.IndexView);
 

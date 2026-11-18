@@ -27,12 +27,18 @@ namespace Omnipotent.Services.OmniTrader.Api
                 string orderBy = req.userParameters.Get("orderBy") switch { "published" or "t1" => "t1", "updated" => "updated", _ => "n1" };
                 int limit = ParseInt(req.userParameters.Get("limit"), 100, 1, 500);
                 int offset = ParseInt(req.userParameters.Get("offset"), 0, 0, 1_000_000);
-                var rows = await lab.ListPapersAsync(status, text, minRel, orderBy, limit, offset);
-                await Json(req, new
+                // p95 32 s over 30 days; papers change on ingest (every 6 h) and analysis, so a page of them
+                // is kept until one is written.
+                string key = $"{status}|{text}|{minRel}|{orderBy}|{limit}|{offset}";
+                long version = lab.PapersVersion;
+                if (!(paperPages.TryGetValue(key, out var memo) && memo.Version == version))
                 {
-                    Total = await lab.CountPapersAsync(status, text, minRel),
-                    Rows = rows.Select(PaperRow)
-                });
+                    var rows = await lab.ListPapersAsync(status, text, minRel, orderBy, limit, offset);
+                    memo = (version, new { Total = await lab.CountPapersAsync(status, text, minRel), Rows = rows.Select(PaperRow).ToList() });
+                    if (paperPages.Count > 64) paperPages.Clear();
+                    paperPages[key] = memo;
+                }
+                await Json(req, memo.Page);
             });
 
             await Get("/alpha/paper", OmniTraderPerms.AlphaRead, async req =>
@@ -111,9 +117,21 @@ namespace Omnipotent.Services.OmniTrader.Api
 
             await Get("/alpha/candidates", OmniTraderPerms.AlphaRead, async req =>
             {
-                var list = await LabOrThrow.ListCandidatesAsync(req.userParameters.Get("status"), req.userParameters.Get("paperId"),
-                    ParseInt(req.userParameters.Get("limit"), 200, 1, 1000));
-                await Json(req, list.Select(CandidateRow));
+                var lab = LabOrThrow;
+                string? status = req.userParameters.Get("status"), paperId = req.userParameters.Get("paperId");
+                int limit = ParseInt(req.userParameters.Get("limit"), 200, 1, 1000);
+                // Candidates are full documents (per-symbol equity curves included): p95 19 s over 30 days on
+                // the server for a list the page projects to a few numbers. Kept until a candidate is written.
+                string key = $"{status}|{paperId}|{limit}";
+                long version = lab.CandidatesVersion;
+                if (!(candidateRows.TryGetValue(key, out var memo) && memo.Version == version))
+                {
+                    var list = await lab.ListCandidatesAsync(status, paperId, limit);
+                    memo = (version, list.Select(CandidateRow).ToList());
+                    if (candidateRows.Count > 64) candidateRows.Clear();
+                    candidateRows[key] = memo;
+                }
+                await Json(req, memo.Rows);
             });
 
             await Get("/alpha/candidate", OmniTraderPerms.AlphaRead, async req =>
@@ -166,9 +184,22 @@ namespace Omnipotent.Services.OmniTrader.Api
         }
 
         /// <summary>The Alpha Lab header: settings, schedule stamps, counts, recent runs and the leaderboard.</summary>
+        // The Alpha Lab page reads the overview every 30 s; it parsed 200 full candidate documents each time
+        // for a synthesis count and the top ten (p95 22.8 s, max 98 s over 243 reads in 30 days).
+        private static (AlphaLab Lab, long Version, List<AlphaCandidate> Top)? overviewTop;
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Version, List<object> Rows)> candidateRows = new();
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<string, (long Version, object Page)> paperPages = new();
+
         internal static async Task<object> AlphaOverviewAsync(AlphaLab lab)
         {
-            var top = await lab.ListCandidatesAsync(null, null, 200);
+            long version = lab.CandidatesVersion;
+            List<AlphaCandidate> top;
+            if (overviewTop is { } memo && ReferenceEquals(memo.Lab, lab) && memo.Version == version) top = memo.Top;
+            else
+            {
+                top = await lab.ListCandidatesAsync(null, null, 200);
+                overviewTop = (lab, version, top);
+            }
             static DateTime? Stamp(DateTime t) => t == default || t == DateTime.MinValue ? null : t;
             return new
             {

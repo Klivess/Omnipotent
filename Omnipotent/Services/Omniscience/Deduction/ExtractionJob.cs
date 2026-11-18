@@ -313,8 +313,7 @@ namespace Omnipotent.Services.Omniscience.Deduction
             KliveLLM.KliveLLM.KliveLLMResponse resp;
             try
             {
-                resp = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 1800,
-                    systemPrompt: ExtractionPromptBuilder.SystemPrompt, useFreeModel: true);
+                resp = await OmniscienceLlm.AskAsync(llm, prompt, ExtractionPromptBuilder.SystemPrompt, useFreeModel: true);
             }
             catch (Exception ex)
             {

@@ -211,7 +211,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     post.Status = PostStatus.Publishing;
                     post.BlockedReason = null;
                     post.Attempts++;
-                    post.Slug ??= TumblrNpf.MakeSlug(post.Caption, post.PostId);
+                    post.Slug ??= TumblrNpf.MakeSlug(post.IsReblog && string.IsNullOrWhiteSpace(post.Caption) ? "reblog" : post.Caption, post.PostId);
                     s.Touch(post, now);
                     return new Claimed
                     {
@@ -243,7 +243,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (!publishingEnabled) return ("Publishing is switched off (OmniSetting OmniTumblrV2_PublishingEnabled).", null, false);
             if (!s.App.IsConfigured) return ("The Tumblr app credentials are not set.", null, false);
             if (blog.Paused) return ("The blog is paused.", null, false);
-            if (!post.Approved && blog.RequireApproval && post.Origin == PostOrigin.Autopilot) return ("Waiting for approval.", null, false);
+            if (!post.Approved && blog.RequireApproval && post.Origin == PostOrigin.Autopilot && !post.IsReblog) return ("Waiting for approval.", null, false);
             var conn = s.Connection(blog.ConnectionId);
             if (conn == null) return ("The blog has no Tumblr connection; reconnect its account.", null, false);
             if (conn.Health == ConnectionHealth.NeedsReauth) return ($"Reconnect @{conn.UserName}: {conn.HealthDetail ?? "authorization expired or was revoked."}", null, false);
@@ -252,9 +252,10 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             {
                 var tz = OmniTumblrScheduleMath.ResolveTimeZone(blog.Strategy.TimeZone);
                 var dayStart = OmniTumblrScheduleMath.LocalDayStartUtc(now, tz);
-                int publishedToday = s.PostsOf(blog.BlogId).Count(p => p.Status == PostStatus.Published && p.PublishedUtc >= dayStart);
+                // Reblogs have their own count per day (the curator plans that many) and don't use up the blog's own posts'.
+                int publishedToday = s.PostsOf(blog.BlogId).Count(p => p.Status == PostStatus.Published && p.PublishedUtc >= dayStart && !p.IsReblog);
                 int cap = Math.Max(1, blog.Strategy.MaxPostsPerDay);
-                if (publishedToday >= cap)
+                if (publishedToday >= cap && !post.IsReblog)
                 {
                     var nextDay = OmniTumblrScheduleMath.LocalToUtc(OmniTumblrScheduleMath.UtcToLocal(now, tz).Date.AddDays(1), tz);
                     return ($"Daily cap of {cap} post(s) reached; continues tomorrow.", nextDay.AddMinutes(5), false);
@@ -393,6 +394,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                     Slug = c.Post.Slug,
                     State = c.Post.TumblrState,
                     AltText = c.Post.CaptionInfo.AltText,
+                    Reblog = c.Post.Reblog,
                 });
             }
             catch (Exception ex)
@@ -508,12 +510,16 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                         new TumblrPostSummary
                         {
                             Id = tumblrId, Slug = post.Slug, PublishedUtc = now, NoteCount = 0, Tags = post.Tags.ToList(),
-                            PostUrl = post.TumblrUrl, Type = post.Kind.ToString().ToLowerInvariant(), Summary = post.Caption,
+                            PostUrl = post.TumblrUrl, Type = post.IsReblog ? post.Reblog?.ParentType ?? "text" : post.Kind.ToString().ToLowerInvariant(),
+                            Summary = post.IsReblog ? post.Reblog?.Summary : post.Caption, IsReblog = post.IsReblog,
                         },
                     }, _ => post.PostId);
                     s.MarkInsights(blog.BlogId);
+                    if (post.IsReblog && post.Reblog != null)
+                        blog.ReblogHistory[post.Reblog.ParentPostId] = new ReblogDecision { Utc = now, Outcome = "taken", SourceBlog = post.Reblog.ParentBlogName };
+                    string what = post.IsReblog ? $"reblogged @{post.Reblog?.ParentBlogName}" : "published " + post.Kind.ToString().ToLowerInvariant();
                     s.AddEvent(EventLevel.Success, "publish.ok",
-                        $"@{blog.Name}: published {post.Kind.ToString().ToLowerInvariant()}{(reconciled ? " (confirmed after an uncertain response)" : "")}{(provisional ? " — Tumblr is processing the video" : " — " + post.TumblrUrl)}",
+                        $"@{blog.Name}: {what}{(reconciled ? " (confirmed after an uncertain response)" : "")}{(provisional ? " — Tumblr is processing the video" : " — " + post.TumblrUrl)}",
                         blog.BlogId, post.PostId, now);
                 }
             });
@@ -541,6 +547,17 @@ namespace Omnipotent.Services.OmniTumblr.Engine
 
                 switch (ex.Kind)
                 {
+                    // The original was deleted, or its author does not allow reblogs (or blocks this blog). That is
+                    // about the pick, not about this blog's posting: no alert, no mark against the blog, never picked again.
+                    case TumblrErrorKind.BadRequest or TumblrErrorKind.Forbidden or TumblrErrorKind.InvalidMedia when post.IsReblog:
+                        post.Status = PostStatus.Failed;
+                        post.NeedsReconcile = false;
+                        if (blog != null && post.Reblog != null)
+                            blog.ReblogHistory[post.Reblog.ParentPostId] = new ReblogDecision { Utc = now, Outcome = "failed", Reason = ex.Code, SourceBlog = post.Reblog.ParentBlogName };
+                        s.AddEvent(EventLevel.Warning, "reblog.refused", $"@{blogName}: Tumblr would not reblog @{post.Reblog?.ParentBlogName}'s post ({ex.Code}); it was deleted or its author does not allow it.", blog?.BlogId, post.PostId, now);
+                        countsAsFailure = false;
+                        break;
+
                     case TumblrErrorKind.Unauthorized:
                         post.Status = PostStatus.Ready;
                         post.Attempts = Math.Max(0, post.Attempts - 1);

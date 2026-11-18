@@ -114,9 +114,9 @@ namespace Omnipotent.Tests.AccountRegistry
             var r = store.Register(svc, "u", null, null, null, "KliveAgent", "KliveAgent", false, null);
             string id = r.Account!.AccountID;
 
-            Assert.True(store.AddOwner(id, "project:abc"));
-            Assert.False(store.AddOwner(id, "project:abc")); // idempotent
-            Assert.Contains("project:abc", store.Get(id)!.Owners);
+            Assert.True(store.AddOwner(id, "steward:abc"));
+            Assert.False(store.AddOwner(id, "steward:abc")); // idempotent
+            Assert.Contains("steward:abc", store.Get(id)!.Owners);
 
             Assert.Null(store.Get(id)!.LastUsedAt);
             Assert.True(store.TouchUsed(id));

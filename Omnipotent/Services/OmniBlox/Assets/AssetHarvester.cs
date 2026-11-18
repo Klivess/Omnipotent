@@ -17,6 +17,9 @@ namespace Omnipotent.Services.OmniBlox.Assets
         public int Relabeled { get; set; }
         public List<string> Notes { get; } = new();
 
+        /// <summary>The step added, previewed, downloaded or labelled something.</summary>
+        public bool MadeProgress => Discovered + Thumbnails + Analyzed + Rejected + Labeled + Relabeled > 0;
+
         public override string ToString() =>
             $"query={Query ?? "-"} new={Discovered} thumbs={Thumbnails} analyzed={Analyzed} rejected={Rejected} labeled={Labeled}" +
             (Relabeled > 0 ? $" re-rated={Relabeled}" : "") +
@@ -132,17 +135,32 @@ namespace Omnipotent.Services.OmniBlox.Assets
                 h.Relabeled += report.Relabeled;
                 h.LastRunUtc = now;
                 h.LastError = null;
+                if (report.MadeProgress) h.LastProgressUtc = now;
+                h.Idle = report.MadeProgress ? null : string.Join("; ", report.Notes.DefaultIfEmpty("nothing to do"));
                 s.MarkStudio();
             });
             return report;
         }
 
+        /// <summary>
+        /// The models the download step will take next. Rows it never takes (too many triangles or scripts, three
+        /// failed tries) are not work waiting: counting them stopped discovery for good once enough piled up.
+        /// </summary>
+        internal static long Backlog(LibraryStats stats) => stats.Downloadable;
+
         private async Task DiscoverAsync(HarvestStepReport report, DateTime now, CancellationToken ct)
         {
             var stats = library.Stats();
-            long backlog = stats.ByStatus.GetValueOrDefault(AssetStatus.Discovered) + stats.ByStatus.GetValueOrDefault(AssetStatus.Previewed);
+            if (stats.Counting) { report.Notes.Add("the library is busy; discovery waits for its counts"); return; }
+            long backlog = Backlog(stats);
             var (query, priority, cursor) = store.Read(s => PickQuery(s.Studio.Harvester, backlog, now));
-            if (query == null) return;
+            if (query == null)
+            {
+                report.Notes.Add(backlog >= MaxBacklog
+                    ? $"discovery waits: {backlog:N0} models are queued to download (it resumes below {MaxBacklog:N0})"
+                    : "discovery rests: every search term ran in the last 14 days");
+                return;
+            }
             report.Query = query;
 
             var page = await publicApi.SearchCreatorStoreAsync(new CreatorStoreQuery { Query = query, PageSize = 50, PageToken = cursor, FreeOnly = true }, ct);

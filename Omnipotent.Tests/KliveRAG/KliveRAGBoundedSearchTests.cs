@@ -5,7 +5,7 @@ using Omnipotent.Services.KliveRAG;
 namespace Omnipotent.Tests.KliveRAG
 {
     /// <summary>
-    /// The knowledge search sits on KliveAgent's and every Projects wake's critical path, so it has to
+    /// The knowledge search sits on KliveAgent's and every Demiurge wake's critical path, so it has to
     /// end on time however large the index grows. An unbounded FTS bm25 sort over every chunk that
     /// contains "the" or "account" held KliveAgent at "preparing context" for 5-12 minutes, while a
     /// "??" nudge (no searchable words) sailed straight through.

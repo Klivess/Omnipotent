@@ -56,6 +56,14 @@ namespace Omnipotent.Services.OmniBlox
                 store.StartFlusher();
                 var library = new AssetLibrary(Path.Combine(root, "assets"));
                 library.Open();
+                if (library.OpenNote != null) await ServiceLog("[OmniBlox] " + library.OpenNote, false);
+                // The overview's first poll used to work the counts out itself, under the lock, behind whatever held it.
+                _ = Task.Run(() =>
+                {
+                    var timer = System.Diagnostics.Stopwatch.StartNew();
+                    try { library.WarmStats(); _ = ServiceLog($"[OmniBlox] asset library counted in {timer.ElapsedMilliseconds} ms", false); }
+                    catch (Exception ex) { _ = ServiceLogError(ex, "[OmniBlox] counting the asset library failed", false); }
+                });
                 var telemetry = new TelemetryStore(Path.Combine(root, "telemetry.db"));
                 telemetry.Open();
 
@@ -108,6 +116,7 @@ namespace Omnipotent.Services.OmniBlox
                 StartupState = "running";
 
                 _ = Task.Run(() => Orchestrator.RunAsync(stop.Token));
+                _ = Task.Run(CheckCredentialsAsync);
                 _ = Task.Run(HarvesterLoopAsync);
                 _ = Task.Run(SettingsLoopAsync);
                 _ = Task.Run(() => WatchLoopAsync(new LiveWatch(ctx)));
@@ -212,7 +221,20 @@ namespace Omnipotent.Services.OmniBlox
                 try { await Task.Delay(TimeSpan.FromSeconds(60), stop.Token); }
                 catch (OperationCanceledException) { return; }
                 try { await RefreshSettingsAsync(); } catch { /* settings briefly unavailable */ }
+                await CheckCredentialsAsync();
             }
+        }
+
+        /// <summary>
+        /// Asks Roblox whose the API key and session are whenever either changed (a key or cookie pasted straight into
+        /// OmniSettings skips the dashboard's checks): see <see cref="CredentialCheck"/>.
+        /// </summary>
+        private async Task CheckCredentialsAsync()
+        {
+            if (Context is not { } ctx) return;
+            try { await ctx.Credentials.CheckAsync(ctx, stop.Token); }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested) { }
+            catch (Exception ex) { await ServiceLogError(ex, "[OmniBlox] checking the Roblox key and session failed", false); }
         }
 
         private async Task HarvesterLoopAsync()

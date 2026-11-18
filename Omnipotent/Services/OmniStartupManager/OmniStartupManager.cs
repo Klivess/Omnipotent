@@ -18,6 +18,9 @@ namespace Omnipotent.Services.OmniStartupManager
             threadAnteriority = ThreadAnteriority.Critical;
         }
 
+        // Prepares directories and files, then stops: there is nothing for it to keep doing.
+        public override bool RunsToCompletion => true;
+
         protected override void ServiceMain()
         {
             int directoriesCreated = 0;

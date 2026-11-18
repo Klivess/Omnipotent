@@ -35,6 +35,12 @@ namespace Omnipotent.Services.KliveAgent
         private KliveAgentComputer? computer;
         /// <summary>KliveAgent's computer: its own isolated desktop by default, or the host desktop.</summary>
         public KliveAgentComputer Computer => computer ??= new KliveAgentComputer(this);
+        private KliveAgentSecretGuard? secretGuard;
+        /// <summary>Keeps literal secrets out of what a run stores and serves. See KliveAgentSecretGuard.</summary>
+        public KliveAgentSecretGuard SecretGuard =>
+            LazyInitializer.EnsureInitialized(ref secretGuard, () => KliveAgentSecretGuard.ForService(this));
+        /// <summary>Leaves out of a pending-run poll what the caller already holds. See KliveAgentRunTrimmer.</summary>
+        internal KliveAgentRunTrimmer RunTrimmer { get; } = new();
 
         /// <summary>Talk mode: which conversations have a live spoken session attached, and the warm
         /// model session behind each.</summary>
@@ -274,6 +280,10 @@ namespace Omnipotent.Services.KliveAgent
                 // initialization fails. Load them before the execution-readiness gate.
                 await EnsureDirectories();
                 if (Superseded()) return;
+                // Off unless KliveAgent_MaskStoredConversationsOnce is switched on: rewrites the stored files
+                // (keeping the originals) before anything below reads them.
+                await SecretGuard.RunStoredPassIfEnabledAsync(this, serviceToken);
+                if (Superseded()) return;
                 await LoadConversationsAsync();
                 if (Superseded()) return;
                 await LoadChatRunsAsync();
@@ -315,7 +325,8 @@ namespace Omnipotent.Services.KliveAgent
                     OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentDirectory),
                     "KliveAgentStats.json"))
                 {
-                    ErrorLogger = (ex, msg) => _ = ServiceLogError(ex, msg, false)
+                    ErrorLogger = (ex, msg) => _ = ServiceLogError(ex, msg, false),
+                    Alert = alert => _ = RaiseHealthAlertAsync(alert)
                 };
                 await Stats.InitializeAsync();
                 if (Superseded()) return;
@@ -376,6 +387,8 @@ namespace Omnipotent.Services.KliveAgent
                 // Chat needs the durable state, memory and execution surface. Build optional code
                 // intelligence in the background so a cold repository cannot block conversation.
                 _ = Task.Run(() => WarmCodebaseAsync(serviceToken, generation), serviceToken);
+                // The page's cache statistics read from memory after this; only new lines are parsed later.
+                PromptCache.Warm();
 
                 // Background watchdog: cancels hung (zero-progress) runs and evicts stale pending entries.
                 _ = RunPendingRunWatchdogAsync(serviceToken);
@@ -526,7 +539,8 @@ namespace Omnipotent.Services.KliveAgent
             AgentChatRunControl runControl = null,
             Action<AgentSteeringMessage> onSteeringApplied = null,
             long? expectedServiceGeneration = null,
-            IReadOnlyList<AgentAttachment>? messageAttachments = null)
+            IReadOnlyList<AgentAttachment>? messageAttachments = null,
+            bool background = false)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
             {
@@ -557,6 +571,7 @@ namespace Omnipotent.Services.KliveAgent
             requestId ??= Guid.NewGuid().ToString("N");
             if (!IsSafeIdentifier(conversationId))
                 return InvalidIdentifierResponse("conversationId", conversationId);
+            await EnsureConversationLoadedAsync(conversationId);
 
             var executionGate = conversationExecutionGates.GetOrAdd(conversationId, _ => new SemaphoreSlim(1, 1));
             if (executionGate.CurrentCount == 0)
@@ -585,9 +600,11 @@ namespace Omnipotent.Services.KliveAgent
                 await RecordAcceptedUserMessageAsync(conversation, requestId, message, senderName,
                     attachments: messageAttachments);
 
-            // Process through the brain
-            var response = await brain.ProcessMessageAsync(message, conversation, senderName, onProgress,
-                cancellationToken, runControl, onSteeringApplied, messageAttachments);
+            // Process through the brain. Everything it reports for the record (script results, activity
+            // lines) passes the secret guard first, so neither the run nor the conversation holds a
+            // literal key; the brain keeps its own real results for the model.
+            var response = SecretGuard.MaskResponse(await brain.ProcessMessageAsync(message, conversation, senderName,
+                SecretGuard.Wrap(onProgress), cancellationToken, runControl, onSteeringApplied, messageAttachments, background))!;
 
             if (expectedServiceGeneration.HasValue
                 && expectedServiceGeneration.Value != Volatile.Read(ref serviceGeneration))
@@ -761,7 +778,9 @@ namespace Omnipotent.Services.KliveAgent
             string senderName = null,
             string clientMessageId = null,
             IReadOnlyList<AgentAttachment>? messageAttachments = null,
-            AgentPendingChatResponse? resumedFrom = null)
+            AgentPendingChatResponse? resumedFrom = null,
+            bool background = false,
+            bool allowAutoResume = true)
         {
             if (!TryGetApiAvailability(out _, out var availabilityMessage))
                 return new AgentChatResponse { Success = false, Response = availabilityMessage, ErrorMessage = availabilityMessage };
@@ -779,6 +798,11 @@ namespace Omnipotent.Services.KliveAgent
                 return InvalidIdentifierResponse("conversationId", conversationId);
             if (!string.IsNullOrWhiteSpace(clientMessageId) && !IsSafeIdentifier(clientMessageId))
                 return InvalidIdentifierResponse("clientMessageId", clientMessageId);
+            try { await EnsureConversationLoadedAsync(conversationId); }
+            catch (IOException ex)
+            {
+                return new AgentChatResponse { Success = false, Response = ex.Message, ErrorMessage = ex.Message };
+            }
 
             var admissionGate = conversationAdmissionGates.GetOrAdd(conversationId, _ => new SemaphoreSlim(1, 1));
             await admissionGate.WaitAsync();
@@ -881,8 +905,8 @@ namespace Omnipotent.Services.KliveAgent
                         return PendingReceipt(active, wasSteering: true, acceptedMessageId: steered.MessageId);
                 }
 
-                int resumeCount = resumedFrom == null ? 0 : resumedFrom.ResumeCount + 1;
-                bool resumesAfterShutdown = resumeCount < MaxAutoResumes
+                int resumeCount = NextResumeCount(resumedFrom);
+                bool resumesAfterShutdown = allowAutoResume && resumeCount < MaxAutoResumes
                     && await GetBoolOmniSetting("KliveAgent_AutoResumeInterruptedRuns", defaultValue: true);
                 var serviceToken = cancellationToken.Token;
                 var pending = new AgentPendingChatResponse
@@ -894,9 +918,16 @@ namespace Omnipotent.Services.KliveAgent
                     SenderName = senderName ?? "API",
                     Response = string.Empty,
                     CancellationSource = CancellationTokenSource.CreateLinkedTokenSource(serviceToken),
-                    Control = new AgentChatRunControl { ServiceToken = serviceToken, ResumesAfterShutdown = resumesAfterShutdown },
+                    Control = new AgentChatRunControl
+                    {
+                        ServiceToken = serviceToken, ResumesAfterShutdown = resumesAfterShutdown,
+                        // A continuation keeps the notes of the run it continues.
+                        Ledger = resumedFrom?.Ledger?.Copy() ?? new AgentRunLedger(),
+                    },
+                    Ledger = resumedFrom?.Ledger?.Copy(),
                     ResumedFromRequestId = resumedFrom?.RequestId,
                     ResumeCount = resumeCount,
+                    Background = background,
                 };
 
                 pendingApiResponses[pending.RequestId] = pending;
@@ -969,6 +1000,7 @@ namespace Omnipotent.Services.KliveAgent
                                         pending.PendingApproval = update.Approval.Status == "pending" ? update.Approval : null;
                                     if (!string.IsNullOrWhiteSpace(update.ComputerContainerId))
                                         pending.ComputerContainerId = update.ComputerContainerId;
+                                    if (update.Ledger != null) pending.Ledger = update.Ledger;
                                     TouchRunLocked(pending);
                                     if (update.Frame != null)
                                     {
@@ -984,6 +1016,7 @@ namespace Omnipotent.Services.KliveAgent
                             runControl: pending.Control,
                             expectedServiceGeneration: runGeneration,
                             messageAttachments: pending.Attachments,
+                            background: background,
                             onSteeringApplied: steering =>
                             {
                                 lock (pending)
@@ -1098,6 +1131,10 @@ namespace Omnipotent.Services.KliveAgent
                                 // the record is kept but does not count as unread.
                                 bool watched = DateTime.UtcNow - pending.LastObservedAt < WatchedRunWindow;
                                 bool interrupted = pending.Status == AgentTaskStatus.Interrupted;
+                                // A background run that finished cleanly reported to whoever started it
+                                // (Alpha Lab keeps its own record, the scheduler sends its own message):
+                                // it is recorded but is not unread news. One that did not finish is.
+                                bool quiet = pending.Background && pending.Status == AgentTaskStatus.Completed;
                                 await AddNotificationAsync(new AgentNotification
                                 {
                                     NotificationId = "run" + pending.RequestId,
@@ -1109,11 +1146,11 @@ namespace Omnipotent.Services.KliveAgent
                                     Body = notificationBody,
                                     ConversationId = pending.ConversationId,
                                     RequestId = pending.RequestId,
-                                    ReadAt = watched ? DateTime.UtcNow : null,
+                                    ReadAt = watched || quiet ? DateTime.UtcNow : null,
                                 });
                                 // A run that continues automatically after the restart reports when that
                                 // continuation finishes; the interruption itself is not news.
-                                if (!watched && !pending.AutoResumePending) await NotifyRunFinishedOffSiteAsync(pending);
+                                if (!watched && !quiet && !pending.AutoResumePending) await NotifyRunFinishedOffSiteAsync(pending);
                             }
                             catch (Exception ex)
                             {
@@ -1137,6 +1174,46 @@ namespace Omnipotent.Services.KliveAgent
             pendingApiResponses.TryGetValue(requestId, out var pendingResponse);
             return pendingResponse == null ? null : SnapshotRun(pendingResponse);
         }
+
+        /// <summary>
+        /// Runs a message for another service (OmniTrader's Alpha Lab, the scheduler) as a real run and
+        /// waits for its answer.
+        ///
+        /// Those callers used to call <see cref="HandleIncomingMessage"/> directly: no run record, so no
+        /// stall watchdog, no live view on the website, nothing said when the run died, and a conversation
+        /// left reading "running" for ever (three Alpha Lab runs between 24 Oct and 6 Nov 2026, each cut by
+        /// a restart, and two tool calls that hung for 2 h and 3 h 16 min with nothing watching).
+        ///
+        /// Automatic continuation after a restart is off here on purpose: both callers already retry what
+        /// a restart interrupted (Alpha Lab requeues its papers, a scheduled task fires late), so
+        /// continuing as well would do the work twice.
+        /// </summary>
+        public async Task<AgentChatResponse> RunDurableAsync(string message, string conversationId, string senderName,
+            bool background = true, CancellationToken cancellationToken = default)
+        {
+            var receipt = await QueueIncomingApiMessageAsync(message, conversationId, senderName,
+                background: background, allowAutoResume: false);
+            if (!receipt.IsPending || string.IsNullOrEmpty(receipt.PendingRequestId)) return receipt;
+
+            string requestId = receipt.PendingRequestId;
+            while (true)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (!pendingApiResponses.TryGetValue(requestId, out var pending))
+                    return new AgentChatResponse
+                    {
+                        Success = false, ConversationId = receipt.ConversationId, PendingRequestId = requestId,
+                        Response = "The run's record is gone, so its result is unknown.",
+                        ErrorMessage = "Run record not found.",
+                    };
+                AgentChatResponse? final;
+                lock (pending) final = pending.CompletedAt != null ? pending.FinalResponse : null;
+                if (final != null) return final;
+                await Task.Delay(DurableRunPollInterval, cancellationToken);
+            }
+        }
+
+        internal static TimeSpan DurableRunPollInterval { get; set; } = TimeSpan.FromSeconds(1);
 
         public async Task<AgentPendingChatResponse?> WaitForPendingApiResponseAsync(string requestId, long afterSequence, int waitMs)
         {
@@ -1690,6 +1767,8 @@ namespace Omnipotent.Services.KliveAgent
                     ResumedFromRequestId = source.ResumedFromRequestId,
                     ResumeCount = source.ResumeCount,
                     AutoResumePending = source.AutoResumePending,
+                    Background = source.Background,
+                    Ledger = source.Ledger,
                     LastObservedAt = source.LastObservedAt
                 };
             }
@@ -1911,6 +1990,9 @@ namespace Omnipotent.Services.KliveAgent
                 AgentTaskStatus.Failed => "failed",
                 _ => "running"
             };
+            // A run whose conversation is on disk but unreadable right now must not replace it.
+            try { await EnsureConversationLoadedAsync(run.ConversationId); }
+            catch (IOException) { return; }
             var conversation = conversations.GetOrAdd(run.ConversationId, _ => new AgentConversation
             {
                 ConversationId = run.ConversationId,
@@ -1967,9 +2049,9 @@ namespace Omnipotent.Services.KliveAgent
                 conversation, run.RequestId, run.FinalResponse, deliveryStatus);
         }
 
-        private Omnipotent.Services.Projects.Projects GetProjectsService() =>
+        private Omnipotent.Services.Demiurge.Demiurge GetDemiurgeService() =>
             GetActiveServices()
-                .OfType<Omnipotent.Services.Projects.Projects>()
+                .OfType<Omnipotent.Services.Demiurge.Demiurge>()
                 .FirstOrDefault(x => x.IsServiceActive() && x.Store != null);
 
         public async Task<AgentLongTermJobView> CreateLongTermJobAsync(
@@ -2005,52 +2087,52 @@ namespace Omnipotent.Services.KliveAgent
                     && longTermJobs.TryGetValue(existingJobId, out var existingLink))
                 {
                     var existing = BuildLongTermJobView(existingLink);
-                    var existingProject = GetProjectsService()?.Store.GetProject(existingLink.ProjectId);
+                    var existingSteward = GetDemiurgeService()?.Store.GetSteward(existingLink.StewardId);
                     if (!string.Equals(existing.Goal, cleanGoal, StringComparison.Ordinal)
                         || !string.Equals(existing.Name, name, StringComparison.Ordinal)
-                        || existingProject == null
-                        || existingProject.TokenBudgetUsd != request.TokenBudgetUsd
-                        || existingProject.MoneyBudgetUsd != request.MoneyBudgetUsd
-                        || existingProject.MoneyAutonomousThresholdUsd
+                        || existingSteward == null
+                        || existingSteward.TokenBudgetUsd != request.TokenBudgetUsd
+                        || existingSteward.MoneyBudgetUsd != request.MoneyBudgetUsd
+                        || existingSteward.MoneyAutonomousThresholdUsd
                             != request.MoneyAutonomousThresholdUsd
-                        || existingProject.SubAgentCap != agentCap)
+                        || existingSteward.SubAgentCap != agentCap)
                         throw new ArgumentException(
                             "clientJobId is already associated with different job parameters.");
                     return existing;
                 }
 
-                var projects = GetProjectsService()
-                    ?? throw new InvalidOperationException("The Projects service is not ready.");
-                Omnipotent.Services.Projects.Project project = null;
+                var demiurge = GetDemiurgeService()
+                    ?? throw new InvalidOperationException("The Demiurge service is not ready.");
+                Omnipotent.Services.Demiurge.Steward steward = null;
                 try
                 {
-                    project = await projects.CreateProjectAsync(
+                    steward = await demiurge.CreateStewardAsync(
                         name,
                         cleanGoal,
                         request.TokenBudgetUsd,
                         request.MoneyBudgetUsd,
                         request.MoneyAutonomousThresholdUsd,
                         agentCap);
-                    var receipt = projects.MessageProjectWithReceipt(
-                        project.ProjectID,
+                    var receipt = demiurge.MessageStewardWithReceipt(
+                        steward.StewardID,
                         cleanGoal,
-                        Omnipotent.Services.Projects.ProjectDirectiveKind.Task,
+                        Omnipotent.Services.Demiurge.StewardDirectiveKind.Task,
                         expectedArtifactPaths: request.ExpectedArtifactPaths ?? new List<string>());
                     if (!receipt.Accepted)
                         throw new InvalidOperationException(
-                            receipt.Reason ?? "The Project rejected its root job directive.");
+                            receipt.Reason ?? "The Steward rejected its root job directive.");
 
                     var link = new AgentLongTermJobLink
                     {
                         ClientJobId = request.ClientJobId,
-                        ProjectId = project.ProjectID,
+                        StewardId = steward.StewardID,
                         DirectiveId = receipt.DirectiveID,
                         ConversationId = request.ConversationId,
                         OriginatingMessageId = request.OriginatingMessageId,
-                        LastObservedStatus = project.Status.ToString()
+                        LastObservedStatus = steward.Status.ToString()
                     };
                     // Persist before publishing the link or returning. A lost HTTP response can be
-                    // retried with clientJobId and resolves to this same funded Project.
+                    // retried with clientJobId and resolves to this same funded Steward.
                     await PersistLongTermJobAsync(link);
                     longTermJobs[link.JobId] = link;
                     if (!string.IsNullOrWhiteSpace(link.ClientJobId))
@@ -2059,11 +2141,11 @@ namespace Omnipotent.Services.KliveAgent
                 }
                 catch
                 {
-                    // Project creation wakes a Commander immediately. If linking fails, halt it so
+                    // Steward creation wakes a Commander immediately. If linking fails, halt it so
                     // an invisible orphan cannot continue spending in the background.
-                    if (project != null)
+                    if (steward != null)
                     {
-                        try { projects.HaltProject(project.ProjectID); } catch { }
+                        try { demiurge.HaltSteward(steward.StewardID); } catch { }
                     }
                     throw;
                 }
@@ -2100,119 +2182,119 @@ namespace Omnipotent.Services.KliveAgent
                 ? BuildLongTermJobView(link)
                 : null;
 
-        public Omnipotent.Services.Projects.ProjectCommandReceipt SteerLongTermJob(
+        public Omnipotent.Services.Demiurge.StewardCommandReceipt SteerLongTermJob(
             string jobId, string message)
         {
             if (!longTermJobs.TryGetValue(jobId ?? string.Empty, out var link))
-                return new Omnipotent.Services.Projects.ProjectCommandReceipt
+                return new Omnipotent.Services.Demiurge.StewardCommandReceipt
                     { Status = "rejected", Reason = "Unknown jobId." };
-            var projects = GetProjectsService();
-            if (projects == null)
-                return new Omnipotent.Services.Projects.ProjectCommandReceipt
-                    { Status = "rejected", Reason = "The Projects service is unavailable." };
-            return projects.MessageProjectWithReceipt(
-                link.ProjectId,
+            var demiurge = GetDemiurgeService();
+            if (demiurge == null)
+                return new Omnipotent.Services.Demiurge.StewardCommandReceipt
+                    { Status = "rejected", Reason = "The Demiurge service is unavailable." };
+            return demiurge.MessageStewardWithReceipt(
+                link.StewardId,
                 message,
-                Omnipotent.Services.Projects.ProjectDirectiveKind.Steering);
+                Omnipotent.Services.Demiurge.StewardDirectiveKind.Steering);
         }
 
         public bool StopLongTermJob(string jobId)
         {
             if (!longTermJobs.TryGetValue(jobId ?? string.Empty, out var link)) return false;
-            var projects = GetProjectsService();
-            var project = projects?.Store.GetProject(link.ProjectId);
-            if (project == null
-                || project.Status is Omnipotent.Services.Projects.ProjectStatus.Completed
-                    or Omnipotent.Services.Projects.ProjectStatus.Archived)
+            var demiurge = GetDemiurgeService();
+            var steward = demiurge?.Store.GetSteward(link.StewardId);
+            if (steward == null
+                || steward.Status is Omnipotent.Services.Demiurge.StewardStatus.Completed
+                    or Omnipotent.Services.Demiurge.StewardStatus.Archived)
                 return false;
-            if (project.HaltedFromStatus.HasValue) return true;
-            return projects.HaltProject(link.ProjectId);
+            if (steward.HaltedFromStatus.HasValue) return true;
+            return demiurge.HaltSteward(link.StewardId);
         }
 
         public async Task<bool> ResumeLongTermJobAsync(string jobId)
         {
             if (!longTermJobs.TryGetValue(jobId ?? string.Empty, out var link)) return false;
-            var projects = GetProjectsService();
-            var project = projects?.Store.GetProject(link.ProjectId);
-            if (project == null
-                || project.Status is Omnipotent.Services.Projects.ProjectStatus.Completed
-                    or Omnipotent.Services.Projects.ProjectStatus.Archived)
+            var demiurge = GetDemiurgeService();
+            var steward = demiurge?.Store.GetSteward(link.StewardId);
+            if (steward == null
+                || steward.Status is Omnipotent.Services.Demiurge.StewardStatus.Completed
+                    or Omnipotent.Services.Demiurge.StewardStatus.Archived)
                 return false;
-            if (project.HaltedFromStatus.HasValue)
-                return projects.UnhaltProject(link.ProjectId);
-            if (project.Status is Omnipotent.Services.Projects.ProjectStatus.Active
-                or Omnipotent.Services.Projects.ProjectStatus.Planning)
+            if (steward.HaltedFromStatus.HasValue)
+                return demiurge.UnhaltSteward(link.StewardId);
+            if (steward.Status is Omnipotent.Services.Demiurge.StewardStatus.Active
+                or Omnipotent.Services.Demiurge.StewardStatus.Planning)
                 return true;
-            if (project.Status == Omnipotent.Services.Projects.ProjectStatus.BudgetPaused
-                && !projects.Budget.IsWithinTokenBudget(project.ProjectID))
+            if (steward.Status == Omnipotent.Services.Demiurge.StewardStatus.BudgetPaused
+                && !demiurge.Budget.IsWithinTokenBudget(steward.StewardID))
                 return false;
 
-            bool needsPlan = !projects.GrandPlans.HasApprovedPlan(project.ProjectID);
-            bool wasBlocked = project.BlockedAt.HasValue
-                || !string.IsNullOrWhiteSpace(project.BlockedReason);
-            var fromStatus = project.Status;
-            project.Status = needsPlan
-                ? Omnipotent.Services.Projects.ProjectStatus.Planning
-                : Omnipotent.Services.Projects.ProjectStatus.Active;
-            project.BlockedAt = null;
-            project.BlockedReason = null;
-            project.HaltedFromStatus = null;
-            projects.Store.SaveProject(project);
-            projects.RuntimeState.SetDisposition(
-                project.ProjectID,
-                Omnipotent.Services.Projects.ProjectExecutionDisposition.Running);
-            projects.RuntimeState.ClearBlocker(project.ProjectID);
-            projects.RuntimeState.CloseCircuit(project.ProjectID);
-            // Same three release steps /projects/resume performs — this dashboard path is a second
+            bool needsPlan = !demiurge.GrandPlans.HasApprovedPlan(steward.StewardID);
+            bool wasBlocked = steward.BlockedAt.HasValue
+                || !string.IsNullOrWhiteSpace(steward.BlockedReason);
+            var fromStatus = steward.Status;
+            steward.Status = needsPlan
+                ? Omnipotent.Services.Demiurge.StewardStatus.Planning
+                : Omnipotent.Services.Demiurge.StewardStatus.Active;
+            steward.BlockedAt = null;
+            steward.BlockedReason = null;
+            steward.HaltedFromStatus = null;
+            demiurge.Store.SaveSteward(steward);
+            demiurge.RuntimeState.SetDisposition(
+                steward.StewardID,
+                Omnipotent.Services.Demiurge.StewardExecutionDisposition.Running);
+            demiurge.RuntimeState.ClearBlocker(steward.StewardID);
+            demiurge.RuntimeState.CloseCircuit(steward.StewardID);
+            // Same three release steps /demiurge/resume performs — this dashboard path is a second
             // front door to the same state machine, and every one of them was missing here.
             // Closing the circuit alone still leaves the per-actor provider-admission deadline
             // standing, which refuses the wake below outright; a pause caught in a wake's startup
             // window leaves a cancel-on-birth flag that kills it; and the desktop reconcile is an
             // unbounded Docker round trip that has no business delaying the wake.
-            projects.RuntimeState.ClearProviderAdmission(project.ProjectID);
-            projects.CommanderRunner.ClearPendingCancellation(project.ProjectID);
-            _ = projects.RefreshDesktopRegistryAsync();
-            projects.EventLog.Append(new Omnipotent.Services.Projects.ProjectEvent
+            demiurge.RuntimeState.ClearProviderAdmission(steward.StewardID);
+            demiurge.CommanderRunner.ClearPendingCancellation(steward.StewardID);
+            _ = demiurge.RefreshDesktopRegistryAsync();
+            demiurge.EventLog.Append(new Omnipotent.Services.Demiurge.StewardEvent
             {
-                ProjectID = project.ProjectID,
+                StewardID = steward.StewardID,
                 Type = wasBlocked
-                    ? Omnipotent.Services.Projects.ProjectEventTypes.ProjectUnblocked
-                    : Omnipotent.Services.Projects.ProjectEventTypes.Status,
+                    ? Omnipotent.Services.Demiurge.StewardEventTypes.StewardUnblocked
+                    : Omnipotent.Services.Demiurge.StewardEventTypes.Status,
                 Author = "klives",
-                Text = "Project resumed from the KliveAgent job dashboard.",
-                PayloadJson = Omnipotent.Services.Projects.ProjectLifecycleEvents.Payload(
-                    fromStatus, project.Status, wasBlocked ? "job-dashboard-unblock" : "job-dashboard-resume"),
+                Text = "Steward resumed from the KliveAgent job dashboard.",
+                PayloadJson = Omnipotent.Services.Demiurge.StewardLifecycleEvents.Payload(
+                    fromStatus, steward.Status, wasBlocked ? "job-dashboard-unblock" : "job-dashboard-resume"),
             });
-            projects.CommanderRunner.Wake(
-                project,
+            demiurge.CommanderRunner.Wake(
+                steward,
                 needsPlan
-                    ? "Project resumed by Klives — continue planning and submit the Grand Plan for approval."
-                    : "Project resumed by Klives. Rehydrate current state and continue with the next concrete step.");
+                    ? "Steward resumed by Klives — continue planning and submit the Grand Plan for approval."
+                    : "Steward resumed by Klives. Rehydrate current state and continue with the next concrete step.");
             // Pausing cancelled every worker mid-flight; without this the roster stays asleep until
             // each agent's quiet period elapses (20 min, doubling toward 4 h) and only the Commander
-            // comes back — which reads as a resumed project doing nothing.
-            projects.ResumeWorkers(project);
-            projects.DeliverPendingDirectives(project.ProjectID);
+            // comes back — which reads as a resumed Steward doing nothing.
+            demiurge.ResumeWorkers(steward);
+            demiurge.DeliverPendingDirectives(steward.StewardID);
             return true;
         }
 
         private AgentLongTermJobView BuildLongTermJobView(AgentLongTermJobLink link)
         {
-            var projects = GetProjectsService();
-            var project = projects?.Store.GetProject(link.ProjectId);
-            var directive = projects?.Directives.Get(link.ProjectId, link.DirectiveId);
-            var lastEvent = projects?.EventLog.ReadTail(link.ProjectId, 1).LastOrDefault();
-            var pendingPlan = projects?.GrandPlans.Get(link.ProjectId).Versions
+            var demiurge = GetDemiurgeService();
+            var steward = demiurge?.Store.GetSteward(link.StewardId);
+            var directive = demiurge?.Directives.Get(link.StewardId, link.DirectiveId);
+            var lastEvent = demiurge?.EventLog.ReadTail(link.StewardId, 1).LastOrDefault();
+            var pendingPlan = demiurge?.GrandPlans.Get(link.StewardId).Versions
                 .Where(x => x.Status
-                    == Omnipotent.Services.Projects.GrandPlanVersionStatus.PendingApproval)
+                    == Omnipotent.Services.Demiurge.GrandPlanVersionStatus.PendingApproval)
                 .OrderByDescending(x => x.Version)
                 .FirstOrDefault();
-            var blocker = projects?.RuntimeState.Get(link.ProjectId).Blocker;
-            string status = directive?.Status is Omnipotent.Services.Projects.ProjectDirectiveStatus.Completed
-                    or Omnipotent.Services.Projects.ProjectDirectiveStatus.Failed
-                    or Omnipotent.Services.Projects.ProjectDirectiveStatus.Revoked
+            var blocker = demiurge?.RuntimeState.Get(link.StewardId).Blocker;
+            string status = directive?.Status is Omnipotent.Services.Demiurge.StewardDirectiveStatus.Completed
+                    or Omnipotent.Services.Demiurge.StewardDirectiveStatus.Failed
+                    or Omnipotent.Services.Demiurge.StewardDirectiveStatus.Revoked
                 ? directive.Status.ToString()
-                : project?.Status.ToString() ?? "Unavailable";
+                : steward?.Status.ToString() ?? "Unavailable";
             string attentionKey = null;
             string attentionMessage = null;
             if (pendingPlan != null)
@@ -2222,13 +2304,13 @@ namespace Omnipotent.Services.KliveAgent
                     ? $"Grand Plan v{pendingPlan.Version} is ready for approval."
                     : $"Grand Plan v{pendingPlan.Version} is ready for approval: {pendingPlan.Summary}";
             }
-            else if (project?.Status is Omnipotent.Services.Projects.ProjectStatus.Blocked
-                or Omnipotent.Services.Projects.ProjectStatus.BudgetPaused)
+            else if (steward?.Status is Omnipotent.Services.Demiurge.StewardStatus.Blocked
+                or Omnipotent.Services.Demiurge.StewardStatus.BudgetPaused)
             {
-                attentionKey = $"{project.Status}-{blocker?.BlockerID ?? "project"}";
+                attentionKey = $"{steward.Status}-{blocker?.BlockerID ?? "steward"}";
                 attentionMessage = blocker?.Summary
-                    ?? project.BlockedReason
-                    ?? $"The job needs attention because it is {project.Status}.";
+                    ?? steward.BlockedReason
+                    ?? $"The job needs attention because it is {steward.Status}.";
             }
             DateTime lastUpdated = new[]
             {
@@ -2241,11 +2323,11 @@ namespace Omnipotent.Services.KliveAgent
             {
                 JobId = link.JobId,
                 ClientJobId = link.ClientJobId,
-                ProjectId = link.ProjectId,
+                StewardId = link.StewardId,
                 DirectiveId = link.DirectiveId,
                 ConversationId = link.ConversationId,
-                Name = project?.Name ?? "Unavailable job",
-                Goal = project?.Goal ?? string.Empty,
+                Name = steward?.Name ?? "Unavailable job",
+                Goal = steward?.Goal ?? string.Empty,
                 Status = status,
                 RequiresPlanApproval = pendingPlan != null,
                 AttentionRequired = attentionMessage != null,
@@ -2258,7 +2340,7 @@ namespace Omnipotent.Services.KliveAgent
                     ? new List<string>()
                     : new List<string>(directive.CompletionArtifactPaths),
                 CreatedAt = link.CreatedAt,
-                CompletedAt = directive?.CompletedAt ?? project?.CompletedAt,
+                CompletedAt = directive?.CompletedAt ?? steward?.CompletedAt,
                 LastUpdated = lastUpdated
             };
         }
@@ -2295,7 +2377,7 @@ namespace Omnipotent.Services.KliveAgent
                                     Body = view.AttentionMessage ?? "This job needs your attention.",
                                     ConversationId = link.ConversationId,
                                     JobId = link.JobId,
-                                    ProjectId = link.ProjectId
+                                    StewardId = link.StewardId
                                 });
                                 link.LastAttentionKey = view.AttentionKey;
                                 linkChanged = true;
@@ -2314,7 +2396,7 @@ namespace Omnipotent.Services.KliveAgent
                                     Body = view.Result ?? $"Job ended with status {view.Status}.",
                                     ConversationId = link.ConversationId,
                                     JobId = link.JobId,
-                                    ProjectId = link.ProjectId,
+                                    StewardId = link.StewardId,
                                     ArtifactPaths = view.ArtifactPaths
                                 });
                                 link.CompletionNotifiedAt = DateTime.UtcNow;
@@ -2364,7 +2446,7 @@ namespace Omnipotent.Services.KliveAgent
                     var link = await GetDataHandler()
                         .ReadAndDeserialiseDataFromFile<AgentLongTermJobLink>(file);
                     if (link != null && IsSafeIdentifier(link.JobId)
-                        && IsSafeIdentifier(link.ProjectId))
+                        && IsSafeIdentifier(link.StewardId))
                     {
                         longTermJobs[link.JobId] = link;
                         if (IsSafeIdentifier(link.ClientJobId))
@@ -2384,9 +2466,23 @@ namespace Omnipotent.Services.KliveAgent
         /// <summary>Runs found mid-flight at load (the process restarted under them).</summary>
         private readonly List<AgentPendingChatResponse> interruptedAtBoot = new();
 
-        /// <summary>At most this many automatic continuations chain from one request, so a crash
-        /// loop cannot keep restarting the same work.</summary>
+        /// <summary>At most this many automatic continuations IN A ROW THAT GOT NOWHERE chain from one
+        /// request, so a crash loop cannot keep restarting the same work. A continuation that made
+        /// progress before the next restart does not count: on a day with twelve to fifteen deploys a
+        /// flat limit of two ended a long task at its third restart however well it was going.</summary>
         internal const int MaxAutoResumes = 2;
+
+        /// <summary>How much of the original request a continuation carries.</summary>
+        internal const int ContinuationTaskChars = 60_000;
+
+        /// <summary>Whether a run did anything before it was interrupted.</summary>
+        internal static bool MadeProgress(AgentPendingChatResponse run) =>
+            run != null && (run.Iteration >= 2 || (run.ScriptsExecuted?.Count ?? 0) > 0
+                || (run.Activity?.Any(a => a.Kind is "tool" or "script" or "action") ?? false));
+
+        /// <summary>The count a continuation of <paramref name="resumedFrom"/> starts with.</summary>
+        internal static int NextResumeCount(AgentPendingChatResponse? resumedFrom) =>
+            resumedFrom == null ? 0 : MadeProgress(resumedFrom) && resumedFrom.ResumeCount > 0 ? resumedFrom.ResumeCount : resumedFrom.ResumeCount + 1;
 
         /// <summary>How long a continuation waits for the interrupted run to finish unwinding.</summary>
         private static readonly TimeSpan InterruptedRunUnwindWait = TimeSpan.FromMinutes(3);
@@ -2410,17 +2506,26 @@ namespace Omnipotent.Services.KliveAgent
                 s = (s ?? "").Trim();
                 return s.Length <= max ? s : s[..max] + "…";
             }
+            static string OneLine(string? s) => (s ?? "").Replace("\r", "").Replace('\n', ' ');
             var sb = new System.Text.StringBuilder();
             sb.AppendLine("[Automatic continuation after an Omnipotent restart]");
             sb.AppendLine($"Omnipotent restarted while you were working on this request from Klives (started {TemporalFormat.StampMinute(run.CreatedAt)}):");
             sb.AppendLine();
-            sb.AppendLine("“" + Clip(run.UserMessage, 4000) + "”");
+            // The request in full. It used to be cut at 4,000 characters, and a brief from another service
+            // runs to 33 KB: the continuation was then working from the first eighth of its task.
+            sb.AppendLine("“" + Clip(run.UserMessage, ContinuationTaskChars) + "”");
             var steering = run.SteeringMessages?.Where(s => s.Status == "applied").ToList() ?? new();
             if (steering.Count > 0)
             {
                 sb.AppendLine();
                 sb.AppendLine("Guidance he added while you worked:");
                 foreach (var s in steering) sb.AppendLine("- " + Clip(s.Message, 600));
+            }
+            if (run.Ledger is { IsEmpty: false } ledger)
+            {
+                sb.AppendLine();
+                sb.AppendLine("Your own ledger from that run (it is restored: keep using task_ledger):");
+                sb.AppendLine(ledger.Render());
             }
             var activity = run.Activity ?? new();
             if (activity.Count > 0)
@@ -2429,6 +2534,18 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("What you had done before the restart (oldest first):");
                 foreach (var a in activity.TakeLast(60))
                     sb.AppendLine($"- [{TemporalFormat.StampMinute(a.Timestamp)}] step {a.Iteration} {a.Kind}: {Clip(a.Text, 200)}");
+            }
+            var scripts = run.ScriptsExecuted ?? new();
+            if (scripts.Count > 0)
+            {
+                sb.AppendLine();
+                sb.AppendLine($"Your last scripts (of {scripts.Count}; their variables are gone with the restart, so redo what you still need):");
+                foreach (var script in scripts.TakeLast(6))
+                {
+                    sb.AppendLine($"- {(script.Success ? "OK" : "FAILED")}: {Clip(OneLine(script.Code), 300)}");
+                    string outcome = script.Success ? script.Output : script.ErrorMessage;
+                    if (!string.IsNullOrWhiteSpace(outcome)) sb.AppendLine("    → " + Clip(OneLine(outcome), 300));
+                }
             }
             if (!string.IsNullOrWhiteSpace(run.Response))
             {
@@ -2535,10 +2652,15 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>A reveal-applied copy of a run snapshot. FinalResponse is cloned first: snapshots
-        /// share it with the live run, and the live run must keep the reference.</summary>
-        public AgentPendingChatResponse? RevealRunForKlives(AgentPendingChatResponse? run)
+        /// share it with the live run, and the live run must keep the reference.
+        /// <paramref name="reveal"/> is the caller's accounts.secrets.reveal grant: the chat routes only
+        /// need kliveagent.history.read, so without it the references are returned exactly as stored.</summary>
+        public AgentPendingChatResponse? RevealRunForKlives(AgentPendingChatResponse? run, bool reveal)
         {
-            if (run == null) return null;
+            // Whoever is asking: scripts, their output and activity lines never leave with a literal secret.
+            // A run recorded before the guard existed is masked here; its file is left as it is.
+            SecretGuard.MaskRunView(run);
+            if (run == null || !reveal) return run;
             run.Response = RevealForKlives(run.Response);
             if (run.FinalResponse != null)
             {
@@ -2563,12 +2685,14 @@ namespace Omnipotent.Services.KliveAgent
             return run;
         }
 
-        /// <summary>A reveal-applied conversation view (its messages are already clones).</summary>
-        public AgentConversationView? RevealConversationForKlives(AgentConversationView? view)
+        /// <summary>A reveal-applied conversation view (its messages are already clones). Without the
+        /// caller's accounts.secrets.reveal grant (<paramref name="reveal"/>) it is returned unchanged.</summary>
+        public AgentConversationView? RevealConversationForKlives(AgentConversationView? view, bool reveal)
         {
-            if (view == null) return null;
+            SecretGuard.MaskConversationView(view);
+            if (view == null || !reveal) return view;
             foreach (var message in view.Messages) message.Content = RevealForKlives(message.Content);
-            for (int i = 0; i < view.RecentRuns.Count; i++) view.RecentRuns[i] = RevealRunForKlives(view.RecentRuns[i])!;
+            for (int i = 0; i < view.RecentRuns.Count; i++) view.RecentRuns[i] = RevealRunForKlives(view.RecentRuns[i], reveal)!;
             return view;
         }
 
@@ -2669,6 +2793,30 @@ namespace Omnipotent.Services.KliveAgent
                 : $"Discord delivery failed ({discordError}); the message is listed in the website's Results panel only.";
         }
 
+        /// <summary>
+        /// A message from the stats watch (script failures up, provider slow): one Discord message and a
+        /// Results entry. KliveAgent_HealthAlerts switches the messages off; the watch keeps counting, and
+        /// its state stays on the script-health route either way.
+        /// </summary>
+        private async Task RaiseHealthAlertAsync(KliveAgentHealthAlert alert)
+        {
+            try
+            {
+                if (!await GetBoolOmniSetting("KliveAgent_HealthAlerts", true)) return;
+                await ServiceLog($"[KliveAgent] Health alert ({alert.Kind}): {alert.Message}");
+                try { await SendDiscordToKlivesAsync(alert.Message); }
+                catch (Exception ex) { _ = ServiceLogError(ex, "[KliveAgent] A health alert did not reach Discord.", false); }
+                await AddNotificationAsync(new AgentNotification
+                {
+                    NotificationId = "hlt" + Guid.NewGuid().ToString("N"),
+                    Kind = "health-" + alert.Kind,
+                    Title = alert.Title,
+                    Body = alert.Message,
+                });
+            }
+            catch (Exception ex) { _ = ServiceLogError(ex, "[KliveAgent] A health alert could not be recorded.", false); }
+        }
+
         public List<AgentNotification> GetNotifications(bool unreadOnly = false, int? limit = null) =>
             ApplyNotificationQuery(notifications.Values, unreadOnly, limit);
 
@@ -2695,19 +2843,45 @@ namespace Omnipotent.Services.KliveAgent
             return true;
         }
 
-        public async Task<int> MarkAllNotificationsReadAsync()
+        /// <summary>How long "mark all read" holds its request while the read-marks are written.</summary>
+        internal static readonly TimeSpan MarkAllReadWait = TimeSpan.FromSeconds(2);
+
+        public Task<int> MarkAllNotificationsReadAsync() =>
+            MarkAllReadAsync(notifications.Values, PersistNotificationAsync, MarkAllReadWait,
+                ex => _ = ServiceLogError(ex, "[KliveAgent] Could not persist a notification read-mark.", false));
+
+        /// <summary>
+        /// Marks every unread notification read in memory at once, then writes the marks a few at a time.
+        /// The request waits at most <paramref name="wait"/>; any writes still going finish in the background.
+        /// Until 2026-11-11 the marks were written one after another, each an atomic write through the
+        /// shared file queue, and "mark all read" held its request for 217–220 s (three calls, 14 Oct).
+        /// </summary>
+        internal static async Task<int> MarkAllReadAsync(
+            IEnumerable<AgentNotification> source,
+            Func<AgentNotification, Task> persist,
+            TimeSpan wait,
+            Action<Exception> onError,
+            int concurrency = 6)
         {
-            int marked = 0;
-            foreach (var notification in notifications.Values.Where(n => n.ReadAt == null).ToList())
+            var unread = source.Where(n => n.ReadAt == null).ToList();
+            if (unread.Count == 0) return 0;
+            var now = DateTime.UtcNow;
+            foreach (var notification in unread) notification.ReadAt = now;
+
+            // Not disposed here: writes still running after the wait keep using it, and it is released
+            // with the last of them.
+            var slots = new SemaphoreSlim(Math.Max(1, concurrency));
+            var writes = unread.Select(async notification =>
             {
-                notification.ReadAt = DateTime.UtcNow;
-                try { await PersistNotificationAsync(notification); marked++; }
-                catch (Exception ex)
-                {
-                    try { await ServiceLogError(ex, "[KliveAgent] Could not persist a notification read-mark.", false); } catch { }
-                }
-            }
-            return marked;
+                await slots.WaitAsync().ConfigureAwait(false);
+                try { await persist(notification).ConfigureAwait(false); }
+                catch (Exception ex) { try { onError(ex); } catch { } }
+                finally { slots.Release(); }
+            }).ToList();
+            var all = Task.WhenAll(writes);
+            _ = all.ContinueWith(_ => slots.Dispose(), TaskScheduler.Default);
+            await Task.WhenAny(all, Task.Delay(wait)).ConfigureAwait(false);
+            return unread.Count;
         }
 
         private async Task AddNotificationAsync(AgentNotification notification)
@@ -2874,36 +3048,128 @@ namespace Omnipotent.Services.KliveAgent
                 var dir = OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentConversationsDirectory);
                 if (!Directory.Exists(dir)) return;
 
-                foreach (var file in Directory.GetFiles(dir, "*.json"))
-                {
-                    try
+                // Read straight from disk, four at a time. They used to go one by one through the file queue
+                // every service shares, which is at its busiest during start-up: 334 files took 2 min 58 s
+                // (live, 2026-11-11), and KliveAgent answers nothing until they are in. Nothing writes these
+                // files before the service is ready, so reading them directly is safe.
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                var deferred = new System.Collections.Concurrent.ConcurrentBag<string>();
+                await Parallel.ForEachAsync(Directory.GetFiles(dir, "*.json"),
+                    new ParallelOptions { MaxDegreeOfParallelism = ConversationLoadParallelism },
+                    async (file, _) =>
                     {
-                        var conv = await GetDataHandler().ReadAndDeserialiseDataFromFile<AgentConversation>(file);
-                        if (conv != null && IsSafeIdentifier(conv.ConversationId))
+                        try
                         {
-                            conv.Messages ??= new List<AgentMessage>();
-                            foreach (var message in conv.Messages)
-                            {
-                                if (string.IsNullOrWhiteSpace(message.MessageId))
-                                    message.MessageId = Guid.NewGuid().ToString("N");
-                                message.DeliveryStatus ??= "completed";
-                            }
-                            if (!conversations.TryGetValue(conv.ConversationId, out var existing)
-                                || existing.LastUpdated < conv.LastUpdated)
-                                conversations[conv.ConversationId] = conv;
+                            AdoptLoadedConversation(await ReadConversationFileAsync(file, attempts: 1, timeout: TimeSpan.FromSeconds(30)));
                         }
-                    }
-                    catch (Exception ex) { await ServiceLogError(ex, $"[KliveAgent] Skipped unreadable conversation file {Path.GetFileName(file)}.", false); }
-                }
+                        catch (Exception ex) when (ex is TimeoutException or IOException or OperationCanceledException)
+                        {
+                            // Live 2026-11-11: a read during the start-up storm timed out and the conversation
+                            // was simply missing for the whole process. It is read again in the background,
+                            // so start-up does not wait on it.
+                            deferred.Add(file);
+                        }
+                        catch (Exception ex)
+                        {
+                            try { await ServiceLogError(ex, $"[KliveAgent] Skipped unreadable conversation file {Path.GetFileName(file)}.", false); } catch { }
+                        }
+                    });
 
                 if (conversations.Count > 0)
                 {
-                    await ServiceLog($"[KliveAgent] Loaded {conversations.Count} persisted conversations.");
+                    await ServiceLog($"[KliveAgent] Loaded {conversations.Count} persisted conversations in {timer.Elapsed.TotalSeconds:0.0} s"
+                        + (deferred.Count > 0 ? $"; {deferred.Count} slow to read, retrying in the background." : "."));
                 }
+                if (deferred.Count > 0) _ = Task.Run(() => RetryDeferredConversationsAsync(deferred.ToList()));
             }
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "[KliveAgent] Error loading conversations.");
+            }
+        }
+
+        /// <summary>How many conversation files are read at once at start-up.</summary>
+        internal const int ConversationLoadParallelism = 4;
+
+        /// <summary>Takes a conversation read from disk into memory, unless a newer copy is already there.</summary>
+        private bool AdoptLoadedConversation(AgentConversation conv)
+        {
+            if (conv == null || !IsSafeIdentifier(conv.ConversationId)) return false;
+            conv.Messages ??= new List<AgentMessage>();
+            foreach (var message in conv.Messages)
+            {
+                if (string.IsNullOrWhiteSpace(message.MessageId))
+                    message.MessageId = Guid.NewGuid().ToString("N");
+                message.DeliveryStatus ??= "completed";
+            }
+            if (conversations.TryGetValue(conv.ConversationId, out var existing) && existing.LastUpdated >= conv.LastUpdated)
+                return false;
+            conversations[conv.ConversationId] = conv;
+            return true;
+        }
+
+        /// <summary>Reads a conversation file straight from disk (not through the shared file queue and its
+        /// 60 s cap), retrying a few times while the file is being replaced.</summary>
+        internal static async Task<AgentConversation?> ReadConversationFileAsync(string path, int attempts = 3, TimeSpan? timeout = null)
+        {
+            for (int attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    using var cts = new CancellationTokenSource(timeout ?? TimeSpan.FromMinutes(2));
+                    string json = await File.ReadAllTextAsync(path, cts.Token).ConfigureAwait(false);
+                    return JsonConvert.DeserializeObject<AgentConversation>(json);
+                }
+                catch (Exception) when (attempt < attempts)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(2 * attempt)).ConfigureAwait(false);
+                }
+            }
+        }
+
+        private async Task RetryDeferredConversationsAsync(List<string> files)
+        {
+            int recovered = 0;
+            foreach (var file in files)
+            {
+                try
+                {
+                    if (AdoptLoadedConversation(await ReadConversationFileAsync(file))) recovered++;
+                }
+                catch (Exception ex)
+                {
+                    await ServiceLogError(ex, $"[KliveAgent] Skipped unreadable conversation file {Path.GetFileName(file)} after retrying.", false);
+                }
+            }
+            if (recovered > 0)
+                await ServiceLog($"[KliveAgent] Loaded {recovered} conversation(s) that were slow to read at start-up.");
+        }
+
+        /// <summary>
+        /// Makes sure a conversation that exists on disk is in memory before anything writes to it. Every
+        /// writer GetOrAdd's the conversation; for one that failed to load, that made an empty conversation
+        /// and the next persist overwrote the file on disk with it.
+        /// </summary>
+        internal async Task EnsureConversationLoadedAsync(string conversationId)
+        {
+            if (string.IsNullOrWhiteSpace(conversationId) || !IsSafeIdentifier(conversationId)
+                || conversations.ContainsKey(conversationId)) return;
+            string path;
+            try
+            {
+                path = Path.Combine(OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentConversationsDirectory), conversationId + ".json");
+            }
+            catch { return; }
+            if (!File.Exists(path)) return;
+            try
+            {
+                AdoptLoadedConversation(await ReadConversationFileAsync(path));
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, $"[KliveAgent] Could not read conversation {conversationId} from disk.", false);
+                // Writing an empty conversation over a file we could not read would lose it.
+                throw new IOException($"Conversation {conversationId} exists on disk but could not be read; not overwriting it.", ex);
             }
         }
 

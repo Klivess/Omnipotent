@@ -190,7 +190,7 @@ namespace Omnipotent.Services.KliveLLM
             public HFFunctionCall function { get; set; }
 
             // Gemma may encode an operation in the authored function name (for example
-            // project_directive:op:acknowledge) before the inbound adapter resolves it to the
+            // steward_directive:op:acknowledge) before the inbound adapter resolves it to the
             // canonical offered tool. Keep that original name solely for the native response
             // envelope used on the continuation request.
             [JsonIgnore]
@@ -216,7 +216,7 @@ namespace Omnipotent.Services.KliveLLM
             public HFFunctionDefinition function { get; set; }
         }
 
-        /// <summary>OpenRouter request plugin descriptor. Currently used by Projects for the
+        /// <summary>OpenRouter request plugin descriptor. Currently used by Demiurge for the
         /// server-side context-compression safety net.</summary>
         public class HFPlugin
         {
@@ -245,7 +245,7 @@ namespace Omnipotent.Services.KliveLLM
             public HFMessage[] messages;
             public string model;
 
-            // OpenRouter sticky-routing key. Projects supplies the same value for every turn of a
+            // OpenRouter sticky-routing key. Demiurge supplies the same value for every turn of a
             // Commander/worker session so the router keeps the conversation on the provider that
             // owns its prompt cache. Omitted for every other OpenAI-compatible provider.
             [JsonProperty("session_id", NullValueHandling = NullValueHandling.Ignore)]
@@ -335,7 +335,7 @@ namespace Omnipotent.Services.KliveLLM
 
             // OpenRouter usage accounting: { "include": true } asks the response's usage object to
             // carry the actual `cost` charged for this request (in credits == USD). This is the
-            // authoritative spend figure the Projects budget ledger meters against — far more accurate
+            // authoritative spend figure the Demiurge budget ledger meters against — far more accurate
             // than a flat per-model estimate. Ignored by providers that don't support it.
             [JsonProperty("usage", NullValueHandling = NullValueHandling.Ignore)]
             public object usage;
@@ -351,7 +351,7 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("reasoning_effort", NullValueHandling = NullValueHandling.Ignore)]
             public string reasoning_effort;
 
-            // OpenRouter request plugins. Projects opts into context-compression after doing its own
+            // OpenRouter request plugins. Demiurge opts into context-compression after doing its own
             // deterministic compaction so OpenRouter's exact tokenizer is the final overflow guard.
             [JsonProperty("plugins", NullValueHandling = NullValueHandling.Ignore)]
             public List<HFPlugin> plugins;
@@ -405,7 +405,7 @@ namespace Omnipotent.Services.KliveLLM
             }
         }
 
-        /// <summary>OpenRouter provider-routing preferences. Projects fills <c>only</c> from the
+        /// <summary>OpenRouter provider-routing preferences. Demiurge fills <c>only</c> from the
         /// selected endpoints advertised for the configured model route.</summary>
         public sealed class HFProviderRouting
         {

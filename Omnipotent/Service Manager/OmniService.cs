@@ -47,6 +47,11 @@ namespace Omnipotent.Service_Manager
             return serviceUptime.Elapsed;
         }
         public ThreadAnteriority GetThreadAnteriority() { return threadAnteriority; }
+        /// <summary>
+        /// True for a service that does a finite job and then stops itself. Monitoring reads it so that
+        /// "not running" is reported as finished rather than as a failure.
+        /// </summary>
+        public virtual bool RunsToCompletion => false;
         public bool IsServiceActive() { return ServiceActive; }
         public Thread GetThread()
         {

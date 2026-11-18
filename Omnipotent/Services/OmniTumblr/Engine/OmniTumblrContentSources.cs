@@ -45,6 +45,8 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         IReadOnlyList<ReelInfo> GetReels();
         /// <summary>Instagram username (lowercase) → the MemeScraper niches its source is tagged with.</summary>
         IReadOnlyDictionary<string, IReadOnlyList<string>> GetSourceNiches();
+        /// <summary>A preview frame the catalog already keeps for the reel (MemeScraper makes one per reel it shows), if it exists.</summary>
+        string? ExistingThumbnail(string postId) => null;
     }
 
     /// <summary>Reads MemeScraper's reels (resolving their base-directory-relative paths).</summary>
@@ -89,6 +91,21 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             return reels;
         }
 
+        /// <summary>MemeScraper's own preview of the reel (its library page makes them on first view and keeps them).</summary>
+        public string? ExistingThumbnail(string postId)
+        {
+            if (string.IsNullOrWhiteSpace(postId) || postId.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0) return null;
+            try
+            {
+                string path = Path.Combine(Omnipotent.Data_Handling.OmniPaths.GetPath(Omnipotent.Data_Handling.OmniPaths.GlobalPaths.MemeScraperThumbnailsDirectory), postId + ".jpg");
+                return File.Exists(path) ? path : null;
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
         public IReadOnlyDictionary<string, IReadOnlyList<string>> GetSourceNiches()
         {
             var result = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
@@ -127,6 +144,15 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         }
 
         public bool CatalogReady => catalog.IsReady;
+
+        /// <summary>How <see cref="Runway"/> looks for a file (tests count the calls: each one is a disk read on the server).</summary>
+        internal Func<string, bool> FileExists { get; set; } = File.Exists;
+
+        /// <summary>A preview that already exists for the candidate, so the website need not wait for ffmpeg.</summary>
+        public string? ExistingThumbnail(ContentCandidate candidate) =>
+            candidate.Source == ContentSourceKind.MemeScraper && candidate.Key.StartsWith("ig:", StringComparison.Ordinal)
+                ? catalog.ExistingThumbnail(candidate.Key[3..])
+                : null;
 
         public static string ReelKey(string postId) => "ig:" + postId;
         public static string FileKey(FileInfo file) => $"file:{file.Name.ToLowerInvariant()}:{file.Length}";
@@ -248,12 +274,29 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             return options;
         }
 
-        /// <summary>How much eligible content is left (cheap: no probing), plus the next few in line.</summary>
+        /// <summary>
+        /// How much eligible content is left, plus the next few in line. The count comes from metadata (the
+        /// reels MemeScraper lists as downloaded, the files a folder or library lists); only the preview is
+        /// looked for on disk, at most <paramref name="preview"/> × 3 files. It used to check every candidate,
+        /// some 20,000 reels on the server's media drive, on every blog page load and every 30 s poll of it:
+        /// GET /omnitumblr/blog p95 109 s, max 194 s in Nov 2026.
+        /// </summary>
         public (int Eligible, List<ContentCandidate> Next) Runway(OmniTumblrStrategy strategy, string blogId, IReadOnlySet<string> excluded, DateTime nowUtc, int preview = 12)
         {
-            var all = Enumerate(strategy, blogId, excluded, nowUtc).Where(c => File.Exists(c.FilePath)).ToList();
-            return (all.Count, all.Take(preview).ToList());
+            int eligible = 0, looked = 0;
+            var next = new List<ContentCandidate>(preview);
+            foreach (var candidate in Enumerate(strategy, blogId, excluded, nowUtc))
+            {
+                eligible++;
+                if (next.Count >= preview || looked >= RunwayDiskChecks(preview)) continue;
+                looked++;
+                if (FileExists(candidate.FilePath)) next.Add(candidate);
+            }
+            return (eligible, next);
         }
+
+        /// <summary>How many files <see cref="Runway"/> may look for on disk for a preview of <paramref name="preview"/>.</summary>
+        internal static int RunwayDiskChecks(int preview) => preview * 3;
 
         private IEnumerable<ContentCandidate> Enumerate(OmniTumblrStrategy strategy, string blogId, IReadOnlySet<string> excluded, DateTime nowUtc)
         {

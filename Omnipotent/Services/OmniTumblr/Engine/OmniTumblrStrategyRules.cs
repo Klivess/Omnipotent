@@ -67,6 +67,17 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             s.RotatingTags = TumblrNpf.NormalizeTags(s.RotatingTags, 200);
             s.RotatingTagsPerPost = Math.Clamp(s.RotatingTagsPerPost, 0, TumblrNpf.MaxTags);
             s.MaxTags = Math.Clamp(s.MaxTags, 1, TumblrNpf.MaxTags);
+
+            s.Reblogs ??= new ReblogSettings();
+            s.Reblogs.PerDay = Math.Clamp(s.Reblogs.PerDay, 1, 12);
+            s.Reblogs.Tags = TumblrNpf.NormalizeTags(s.Reblogs.Tags, 30);
+            s.Reblogs.MinNotes = Math.Clamp(s.Reblogs.MinNotes, 0, 1_000_000);
+            s.Reblogs.MaxAgeHours = Math.Clamp(s.Reblogs.MaxAgeHours, 6, 24 * 14);
+            s.Reblogs.StartHour = Math.Clamp(s.Reblogs.StartHour, 0, 23);
+            s.Reblogs.EndHour = Math.Clamp(s.Reblogs.EndHour, 1, 24);
+            if (s.Reblogs.EndHour <= s.Reblogs.StartHour) { s.Reblogs.StartHour = 9; s.Reblogs.EndHour = 23; }
+            s.Reblogs.Guidance = (s.Reblogs.Guidance ?? "").Trim();
+            if (s.Reblogs.Guidance.Length > 1000) s.Reblogs.Guidance = s.Reblogs.Guidance[..1000];
             return s;
         }
 
@@ -94,6 +105,11 @@ namespace Omnipotent.Services.OmniTumblr.Engine
             if (s.CaptionMode == CaptionMode.AI && s.Ai.Fallback == CaptionFallback.Fixed && s.FixedCaption.Length == 0)
                 errors.Add("The AI fallback is set to the fixed caption, but no fixed caption is set.");
             if (s.FixedCaption.Length > 4000) errors.Add("The fixed caption is too long (4,000 characters max).");
+            if (s.Reblogs is { Enabled: true } r)
+            {
+                if (!r.Images && !r.Videos && !r.Text) errors.Add("Curated reblogs need at least one kind of post to pick from (images, text or videos).");
+                if (r.Tags.Count == 0 && s.FixedTags.Count == 0 && s.RotatingTags.Count == 0) errors.Add("Curated reblogs need tags to look in: add some, or give the blog fixed tags.");
+            }
             return errors;
         }
 

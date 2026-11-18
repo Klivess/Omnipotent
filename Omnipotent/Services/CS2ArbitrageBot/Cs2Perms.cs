@@ -14,5 +14,9 @@ namespace Omnipotent.Profiles.Permissions
 
         public static readonly PermissionDef ScansRun = G.Define("scans.run", "Scans", PermissionTier.Act,
             "Trigger scans", "Ask the engine to scan the market now.", ProfileRank.Manager, implies: new[] { "scans.read" });
+
+        public static readonly PermissionDef Manage = G.Define("positions.manage", "Positions", PermissionTier.Manage,
+            "Manage positions and the Steam login", "Check a relist on CSFloat, close a position by hand, and ask for a Steam login approval (sent to Klives's Steam app).",
+            ProfileRank.Klives, implies: new[] { "scans.run" });
     }
 }

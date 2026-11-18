@@ -68,6 +68,24 @@ namespace Omnipotent.Profiles.Permissions
             return byKey.TryGetValue(key, out var def) ? def : null;
         }
 
+        /// <summary>
+        /// Service keys that were renamed, old → new. Grants stored under an old key are rewritten to
+        /// the new one when profiles load, so renaming a service never silently revokes anyone's access.
+        /// </summary>
+        public static readonly IReadOnlyDictionary<string, string> RenamedServiceKeys =
+            new Dictionary<string, string>(StringComparer.Ordinal)
+            {
+                ["projects"] = "demiurge", // Projects became Demiurge, November 2026
+            };
+
+        /// <summary>The key a grant should be stored under today (itself unless its service was renamed).</summary>
+        public static string CurrentKey(string key)
+        {
+            if (string.IsNullOrEmpty(key)) return key;
+            int dot = key.IndexOf('.');
+            return dot > 0 && RenamedServiceKeys.TryGetValue(key[..dot], out var renamed) ? renamed + key[dot..] : key;
+        }
+
         /// <summary>All grantable (standard) keys, ordered by service, area, tier and key.</summary>
         public static IReadOnlyList<PermissionDef> All
         {

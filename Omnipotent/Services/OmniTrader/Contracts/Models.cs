@@ -174,6 +174,16 @@ namespace Omnipotent.Services.OmniTrader.Contracts
         public RiskCaps? Caps { get; init; }
         /// <summary>User-chosen values for the strategy's [Param] properties (applied at session start).</summary>
         public Dictionary<string, object?>? Parameters { get; init; }
+        /// <summary>When market orders fill. Multi-asset paper sessions honour it (the Alpha Lab tests at
+        /// <see cref="ExecutionTiming.NextOpen"/>); single-symbol paper always fills at the signal close.
+        /// Null on deployments made before it existed, which keeps their original behaviour.</summary>
+        public ExecutionTiming? Execution { get; init; }
+        /// <summary>Closed bars to preload at start (null = the session's default: 500 single, 400 multi-asset).
+        /// A deploy plan raises it for strategies whose inputs look back further, so they can act on the
+        /// first live bar instead of waiting months of daily bars.</summary>
+        public int? HistoryBars { get; init; }
+        /// <summary>Where this deployment came from and what it was expected to do (null for older rows).</summary>
+        public DeploymentOrigin? Origin { get; init; }
     }
 
     public sealed class BacktestConfig

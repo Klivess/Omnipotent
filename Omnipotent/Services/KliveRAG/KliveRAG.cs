@@ -13,8 +13,8 @@ namespace Omnipotent.Services.KliveRAG
 {
     /// <summary>
     /// KliveRAG: a cross-system retrieval-augmented knowledge index shared by KliveAgent and the
-    /// Projects task force. It embeds (local MiniLM) + lexically indexes (SQLite FTS5) documents
-    /// drawn from Projects event logs, KliveAgent conversations/memories, Omniscience distilled
+    /// Demiurge task force. It embeds (local MiniLM) + lexically indexes (SQLite FTS5) documents
+    /// drawn from Demiurge event logs, KliveAgent conversations/memories, Omniscience distilled
     /// knowledge, repo docs and cached web pages, and serves them back both by automatic prompt
     /// injection (budgeted, fail-soft) and by explicit agent tools.
     ///
@@ -25,13 +25,14 @@ namespace Omnipotent.Services.KliveRAG
     public partial class KliveRAG : OmniService
     {
         public KliveRAGDb Db { get; private set; } = null!;
+        public RagCounters Counters { get; private set; } = null!;
         public RagIndexWriter Writer { get; private set; } = null!;
         public RagEmbedQueue Embed { get; private set; } = null!;
         public HybridRetriever Retriever { get; private set; } = null!;
         public HttpClient Http { get; private set; } = null!;
 
         private RepoDocsConnector repoDocs = null!;
-        private ProjectsEventConnector projectsEvents = null!;
+        private DemiurgeEventConnector demiurgeEvents = null!;
         private KliveAgentConnector agentFiles = null!;
         private OmniscienceConnector omniscience = null!;
         private OmniscienceV3Connector omniscienceV3 = null!;
@@ -70,13 +71,14 @@ namespace Omnipotent.Services.KliveRAG
             Http = new HttpClient { Timeout = TimeSpan.FromMinutes(2) };
             Db = new KliveRAGDb();
             Db.Migrate();
+            Counters = new RagCounters(Db);
             Writer = new RagIndexWriter(Db);
             Embed = new RagEmbedQueue(Db, Http, msg => _ = ServiceLog(msg));
             Retriever = new HybridRetriever(Db, Embed);
 
-            // Connectors. Projects/Omniscience are resolved lazily (they may start after us).
-            Func<Task<Projects.Projects?>> resolveProjects = async () =>
-                (await GetServicesByType<Projects.Projects>()).FirstOrDefault() as Projects.Projects;
+            // Connectors. Demiurge/Omniscience are resolved lazily (they may start after us).
+            Func<Task<Demiurge.Demiurge?>> resolveDemiurge = async () =>
+                (await GetServicesByType<Demiurge.Demiurge>()).FirstOrDefault() as Demiurge.Demiurge;
             // Omniscience v3 feeds the "omniscience" source instead of v2 once its switch is on (cutover): v2 is then not read.
             v3Feeds = () => GetBoolOmniSetting(Omnipotent.Services.OmniscienceV3.OmniscienceV3.FeedsKliveRagSetting, false);
             Func<Task<Omniscience.Omniscience?>> resolveOmni = async () => await v3Feeds() ? null :
@@ -87,7 +89,7 @@ namespace Omnipotent.Services.KliveRAG
                 (await GetServicesByType<Omnipotent.Logging.OmniLogging>()).FirstOrDefault() as Omnipotent.Logging.OmniLogging;
 
             repoDocs = new RepoDocsConnector(Writer, msg => _ = ServiceLog(msg));
-            projectsEvents = new ProjectsEventConnector(Writer, msg => _ = ServiceLog(msg), resolveProjects);
+            demiurgeEvents = new DemiurgeEventConnector(Writer, msg => _ = ServiceLog(msg), resolveDemiurge);
             agentFiles = new KliveAgentConnector(Writer, msg => _ = ServiceLog(msg));
             omniscience = new OmniscienceConnector(Writer, msg => _ = ServiceLog(msg), resolveOmni);
             omniscienceV3 = new OmniscienceV3Connector(Writer, msg => _ = ServiceLog(msg), resolveV3, v3Feeds);
@@ -115,14 +117,18 @@ namespace Omnipotent.Services.KliveRAG
             // Routes up early so the UI/tools can query as soon as the store exists.
             await new KliveRAGRoutes(this).RegisterRoutes();
 
-            // Initial backfill: cheap/local sources first, project events last (largest volume).
+            // Once per store, after the upgrade that added the counters: count what was already indexed.
+            // Never on the start path, and the stats route does not wait for it.
+            _ = Task.Run(CountExistingRowsAsync);
+
+            // Initial backfill: cheap/local sources first, Steward events last (largest volume).
             _ = Task.Run(async () =>
             {
                 await RunConnectorSafe(repoDocs, cts.Token);
                 await RunConnectorSafe(agentFiles, cts.Token);
                 await RunConnectorSafe(omniscience, cts.Token);
                 await RunConnectorSafe(omniscienceV3, cts.Token);
-                await RunConnectorSafe(projectsEvents, cts.Token); // also wires the live EventAppended push
+                await RunConnectorSafe(demiurgeEvents, cts.Token); // also wires the live EventAppended push
                 await RunConnectorSafe(omniLogs, cts.Token);
             });
 
@@ -131,7 +137,7 @@ namespace Omnipotent.Services.KliveRAG
             _ = PeriodicLoop(agentFiles, TimeSpan.FromMinutes(15));
             _ = PeriodicLoop(omniscience, TimeSpan.FromMinutes(30));
             _ = PeriodicLoop(omniscienceV3, TimeSpan.FromMinutes(15)); // also removes what v3 no longer allows
-            _ = PeriodicLoop(projectsEvents, TimeSpan.FromMinutes(10));
+            _ = PeriodicLoop(demiurgeEvents, TimeSpan.FromMinutes(10));
             _ = PeriodicLoop(omniLogs, TimeSpan.FromMinutes(5)); // errors are ephemeral in-memory — capture often
 
             // Non-blocking: reattach to a surviving SearXNG container if Docker is already up.
@@ -180,7 +186,7 @@ namespace Omnipotent.Services.KliveRAG
         }
 
         /// <summary>Prompt injection only looks at the newest this-many chunks: a constant cost however
-        /// large the Projects event log grows, and fresh material is what injection is for anyway.</summary>
+        /// large the Demiurge event log grows, and fresh material is what injection is for anyway.</summary>
         internal const int InjectionRecentWindow = 150_000;
 
         /// <summary>The tool/route path reads the whole corpus, but a search still has to end.</summary>
@@ -194,27 +200,27 @@ namespace Omnipotent.Services.KliveRAG
         /// Budget-fitted knowledge block for automatic prompt injection. Returns "" when the deadline
         /// passes or on not-ready / any error, so a slow or cold index never holds up a prompt build.
         /// </summary>
-        public async Task<string> SearchForPromptAsync(string query, int maxTokens, TimeSpan timeout, string? excludeProjectId = null)
+        public async Task<string> SearchForPromptAsync(string query, int maxTokens, TimeSpan timeout, string? excludeStewardId = null)
         {
             if (!ready || string.IsNullOrWhiteSpace(query)) return "";
-            var hits = await SearchForInjectionAsync(query, 6, timeout, excludeProjectId);
+            var hits = await SearchForInjectionAsync(query, 6, timeout, excludeStewardId);
             return HybridRetriever.FormatForPrompt(hits, maxTokens,
                 "[Relevant Knowledge] (Klives' cross-system knowledge base — search_knowledge / read_knowledge_doc for more)");
         }
 
-        /// <summary>Injection hits for Projects wake seeds (rendered + budgeted by the caller).</summary>
-        public async Task<List<KnowledgeHit>> SearchKnowledgeHitsAsync(string query, int maxResults, TimeSpan timeout, string? excludeProjectId = null)
+        /// <summary>Injection hits for Demiurge wake seeds (rendered + budgeted by the caller).</summary>
+        public async Task<List<KnowledgeHit>> SearchKnowledgeHitsAsync(string query, int maxResults, TimeSpan timeout, string? excludeStewardId = null)
         {
             if (!ready || string.IsNullOrWhiteSpace(query)) return new List<KnowledgeHit>();
-            return HybridRetriever.ToKnowledgeHits(await SearchForInjectionAsync(query, maxResults, timeout, excludeProjectId));
+            return HybridRetriever.ToKnowledgeHits(await SearchForInjectionAsync(query, maxResults, timeout, excludeStewardId));
         }
 
-        private async Task<List<RagHit>> SearchForInjectionAsync(string query, int maxResults, TimeSpan timeout, string? excludeProjectId)
+        private async Task<List<RagHit>> SearchForInjectionAsync(string query, int maxResults, TimeSpan timeout, string? excludeStewardId)
         {
             var opts = new RagSearchOptions
             {
                 MaxResults = maxResults,
-                ExcludeProjectId = excludeProjectId,
+                ExcludeStewardId = excludeStewardId,
                 ExcludeSources = InjectionExcludedSources,
                 Deadline = timeout,
                 RecentWindow = InjectionRecentWindow,
@@ -324,8 +330,8 @@ namespace Omnipotent.Services.KliveRAG
                     await RunConnectorSafe(omniscience, cts.Token);
                     await RunConnectorSafe(omniscienceV3, cts.Token);
                 }
-                if (source == null || source == RagSource.ProjectsEvents || source == RagSource.ProjectsDigests)
-                    await RunConnectorSafe(projectsEvents, cts.Token);
+                if (source == null || source == RagSource.DemiurgeEvents || source == RagSource.DemiurgeDigests)
+                    await RunConnectorSafe(demiurgeEvents, cts.Token);
                 if (source == null || source == RagSource.OmniLogs) await RunConnectorSafe(omniLogs, cts.Token);
                 return true;
             }
@@ -354,40 +360,53 @@ namespace Omnipotent.Services.KliveRAG
             return list;
         }
 
-        /// <summary>Per-source counts + health for /kliverag/stats.</summary>
-        public object GetStats()
+        /// <summary>How long a stats request waits for the store before it answers with the previous
+        /// reading. The read is one page, so only a disk too busy to serve it gets this far.</summary>
+        internal static readonly TimeSpan StatsDeadline = TimeSpan.FromSeconds(2);
+
+        /// <summary>The count of existing rows is the least urgent thing the service does, and the minutes
+        /// after a start are when every service is reading its store cold from the same disk.</summary>
+        private static readonly TimeSpan CountExistingStartDelay = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan CountExistingRetryDelay = TimeSpan.FromMinutes(10);
+
+        /// <summary>
+        /// Per-source counts + health for /kliverag/stats, from the counters the store keeps
+        /// (<see cref="RagCounters"/>). It used to count the tables on every call, which read every
+        /// chunk row; now it reads one page, and answers inside <see cref="StatsDeadline"/> regardless.
+        /// </summary>
+        public async Task<RagStats> GetStatsAsync()
         {
-            var perSource = new Dictionary<string, int>();
-            int docs = 0, chunks = 0, embedded = 0;
-            try
+            var reading = await Counters.CurrentAsync(StatsDeadline).ConfigureAwait(false);
+            return RagStats.Compose(reading, Counters.CountingStatus, ready, Db.FtsAvailable, Embed.IsWarm, Searxng.IsReady);
+        }
+
+        /// <summary>Synchronous form of <see cref="GetStatsAsync"/> for callers that cannot await; bounded
+        /// by the same deadline.</summary>
+        public object GetStats() => GetStatsAsync().GetAwaiter().GetResult();
+
+        /// <summary>
+        /// Counts the rows that were indexed before the store kept counts, once, in the background,
+        /// retrying until it lands. On a store that has already been counted (or was created with the
+        /// counters) this returns at once.
+        /// </summary>
+        private async Task CountExistingRowsAsync()
+        {
+            var startAfter = CountExistingStartDelay;
+            while (!cts.IsCancellationRequested)
             {
-                using var conn = Db.Open();
-                using (var cmd = conn.CreateCommand())
+                try
                 {
-                    cmd.CommandText = "SELECT source, COUNT(*) FROM rag_documents GROUP BY source";
-                    using var r = cmd.ExecuteReader();
-                    while (r.Read()) { perSource[r.GetString(0)] = r.GetInt32(1); docs += r.GetInt32(1); }
+                    if (await Counters.CountExistingRowsAsync(startAfter, cts.Token) is { } took)
+                        await ServiceLog($"[KliveRAG] Counted the rows already in the index in {took.TotalSeconds:0.0} s; /kliverag/stats is exact from here.");
+                    return;
                 }
-                using (var cmd = conn.CreateCommand())
+                catch (Exception) when (cts.IsCancellationRequested) { return; }
+                catch (Exception ex)
                 {
-                    cmd.CommandText = "SELECT COUNT(*), COUNT(embedded_at) FROM rag_chunks";
-                    using var r = cmd.ExecuteReader();
-                    if (r.Read()) { chunks = r.GetInt32(0); embedded = r.GetInt32(1); }
+                    _ = ServiceLogError(ex, $"[KliveRAG] Counting the rows already in the index failed; trying again in {CountExistingRetryDelay.TotalMinutes:0} minutes");
                 }
+                startAfter = CountExistingRetryDelay;
             }
-            catch { }
-            return new
-            {
-                ready,
-                ftsAvailable = Db.FtsAvailable,
-                embedderWarm = Embed.IsWarm,
-                searxngReady = Searxng.IsReady,
-                documents = docs,
-                chunks,
-                embeddedChunks = embedded,
-                pendingEmbeds = chunks - embedded,
-                perSource,
-            };
         }
     }
 }

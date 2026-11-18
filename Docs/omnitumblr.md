@@ -29,7 +29,7 @@ Three loops run inside the service. Nothing uses TimeManager.
 
 | Loop | Cadence | Job |
 |---|---|---|
-| plan | every 45 s, each blog at least every 10 min, and on any change | Fills the blog's weekly slots up to `PlanAheadDays` ahead: picks content, makes a thumbnail, writes the caption and tags, then marks the post Ready (or Awaiting approval) |
+| plan | every 45 s, each blog at least every 10 min, and on any change | Fills the blog's weekly slots up to `PlanAheadDays` ahead: picks content, makes a thumbnail, writes the caption and tags, then marks the post Ready (or Awaiting approval). Also picks curated reblogs for blogs that have them on |
 | publish | sleeps until the next due post, at most 20 s | Claims the post under the store lock, uploads it as an NPF post (multipart, media parts named by identifier), records the Tumblr id and URL |
 | sync | every 60 s, within the API budget | Refreshes user info and limits, blog info, posts, notes and the activity feed |
 
@@ -72,7 +72,64 @@ Instagram meme accounts repost each other's videos, so one clip often arrives as
 - **AI**: KliveLLM writes the caption from the blog's persona, extra instructions and example captions. For videos it sends 4 frames (512 px wide) to a vision model, plus the original caption as context. Output is strict JSON (caption, alt text, suggested tags). If the model fails, the blog's fallback applies: post without a caption, use the fixed caption, or hold the post until it works. Failed attempts retry with backoff.
 - **Fixed**, **Rotate** (a pool used in turn) or **None**.
 - **Try it on the next video** (Strategy tab) previews a caption with unsaved settings, without creating a post. In the queue, **Rewrite with AI** takes an optional one-line direction.
-- Tags are the blog's fixed tags, a sample of `RotatingTagsPerPost` from the rotating pool, and the AI's suggestions, capped at `MaxTags` (Tumblr allows 30).
+- Tags are the blog's fixed tags, a sample of `RotatingTagsPerPost` from the rotating pool, and the AI's suggestions, capped at `MaxTags` (Tumblr allows 30 and lists a post under its first 20). With tag research on, the suggestions are checked against Tumblr first (see Reach).
+- A reply cut off after the caption still gives a caption, but no tags. The tags that arrived whole are kept, and a reply with none is asked for once more.
+- Swapping a post's content takes the old clip's tags off, and a rewritten caption replaces the tags the earlier caption added. Until November 2026 both stayed on the post.
+
+### Reach: tag research
+
+A blog with few followers is seen through its tags and little else. On 10 November 2026 the three blogs had 113 notes on 51 posts and 7 followers after a month. The public tag pages showed why:
+
+- Every post led with `#memes` and `#funny`. Those had 36 and 119 new posts an hour, so a post left the first page within minutes, and the typical post there had no notes.
+- Most other tags were phrases the caption model made up ("the shirt is the alibi", "stacked books desk"). The blog's own post was the only one ever filed under them.
+- The posts that did get notes carried a tag with a following: `#real madrid` and `#kylian mbappe` (under one post an hour, 6 notes typical), `#joker`, `#assassins creed`, `#politics`.
+- The blogs were listed in search. The tags were the problem, not a ban.
+
+So tags are now judged from Tumblr's own listing of them (`GET /v2/tagged`, an API-key call), with this account's own posts left out (`OmniTumblrTagResearch`, `OmniTumblrTagMath`):
+
+| Verdict | Rule | Used on posts |
+|---|---|---|
+| Dead | Fewer than 3 posts by other blogs in the last 90 days | Never |
+| Quiet | Under 1 post a day | Yes, marked down |
+| Active | 1 to 480 posts a day | Yes |
+| Crowded | 480 a day or more (20 an hour: the first page turns over within the hour) | Yes, but it scores low |
+
+- **Score (0–100).** From the notes on other blogs' posts that are 12 hours to 60 days old: the geometric mean, so one post with thousands of notes does not carry a tag. It is scaled down when fewer than 6 such posts were seen, and for tags slower than a post a day. A busy tag's first page is too young to judge, so a second page from 24 hours back is read.
+- **On a post.** The caption model is asked for about twice as many tags as the post will carry, and told to name people, shows, games, teams and communities, not what the frame looks like. Each candidate is looked up. Dead ones are left out, the rest go on best first, up to `MaxSuggestedTags`. A hyphenated tag nobody uses is tried with spaces. The post records what was left out, and the event log has a `tags.dropped` line.
+- **Never in the way.** Answers are remembered in `tags.json` (5 days, 14 for dead tags, 30 minutes after a failed lookup). One post costs at most 16 lookups. With no app key, the API budget nearly spent, Tumblr's edge refusing the server, or more than 75 seconds gone, the post gets the model's own first choices, as before.
+- **The blog's own tags.** Sync looks up each blog's fixed and rotating tags daily (only stale ones cost a call), and at once after a strategy change or **Refresh from Tumblr**.
+- **Listed in search?** Once a day sync looks for one of the blog's recent posts in the listing of one of its own quieter tags, choosing a post that must still be on the first page if it is listed at all. Three different posts missing in a row marks the blog as not listed (`reach.unlisted` in the event log); one found clears it. Nothing is paused or changed on that signal.
+- **Switches.** Per blog: **Check suggested tags on Tumblr first** on the Strategy tab (`ResearchTags`, on by default, also for existing blogs). Globally: `OmniTumblr_TagResearchEnabled`.
+
+The blog page's **Reach** tab puts this together: how many recent posts got any notes, whether the blog is listed, findings worst first (flooded or dead tags, too few tags per post, posting once a day or less, all-video posts in tags that are mostly images, an unfinished blog page), every tag with its verdict next to what this blog's posts under it averaged, and a box to look tags up before adding them.
+
+### Reach: curated reblogs
+
+In their first month the blogs reblogged nothing. On Tumblr a reblog is how a blog takes part: the original poster is told, the blog's name sits in the post's notes, and the blog's page is more than one account's uploads. So a blog can now reblog a few well-liked posts a day from the tags it lives in (`OmniTumblrCurator`). It is **off until switched on** per blog (Strategy → Curated reblogs) and needs autopilot on. Liking and following in bulk were left out on purpose: that is the pattern Tumblr treats as spam.
+
+These are other people's posts going onto the blogs, so every pick is screened:
+
+| Step | Rule |
+|---|---|
+| Hard rules | An original post (not a reblog), not from one of our blogs, no older than `MaxAgeHours` (72), at least `MinNotes` (50) notes, not marked mature, reblogs allowed by its author |
+| No repeats | Never a post any of our blogs has reblogged or queued, never one this blog already turned down, and not a blog this one reblogged in the last 7 days |
+| The model | Shown the post's picture, text and tags. It turns down anything that does not fit the blog, or is sexual, violent, demeaning, political, personal, an advert, or unreadable. When unsure it says no. A post it turns down is never asked about again. Only a clear "reblog" counts: an unusable reply means no reblog |
+| Not seen | A post the model could not look at (its picture would not load, the model cannot see, or it is a video, where only one frame can be shown) always waits for approval |
+| Approval | **On by default** (`RequireApproval`): each pick waits in the queue. A pick nobody approves is dropped after two days, and no more than two days' worth wait at once |
+
+- **Finding candidates.** Tumblr lists a tag's posts newest first only, so the curator reads pages from 6, 14 and 26 hours back (then more if those gave too little), where posts have had time to collect notes. Listings are kept for three hours and shared between blogs. Candidates are ranked by notes for their age. Tags come from the blog's reblog tags, or its fixed and rotating tags when none are set; dead tags are skipped.
+- **When.** `PerDay` (3) reblog times are spread between `StartHour` and `EndHour` (9–23) of the blog's local day, each nudged by a few stable minutes. A pick is made at most four hours ahead, so it is still fresh. The usual spacing rules apply when it goes out. Reblogs do not use up `MaxPostsPerDay`.
+- **In the queue.** A reblog is a post of kind `Reblog`: it can be approved, cancelled, given a comment, or swapped (**Pick another**). Approving one after its time sends it now.
+- **Tumblr refuses** (400.8002 or a 403: the original was deleted, or its author does not allow it): the reblog is dropped and that post is never picked again. No alert, and it does not count against the blog's health.
+- **Notes.** Tumblr reports the original's notes on every reblog of it. A reblog's notes are therefore never recorded or counted: not in notes per post, top posts, best times, tag averages or the Reach figures. The daily listing check ignores reblogs too, since Tumblr lists only original posts under a tag.
+- **Switches.** Per blog as above; globally `OmniTumblr_ReblogsEnabled`.
+
+### Reach: not yet run against Tumblr
+
+Tag research and reblogging have only run against fakes. After the first deploy:
+
+- The Reach tab should show a verdict for each of the blog's tags, and Settings → API usage should list `tagged` calls.
+- Switch curated reblogs on for one blog with approval left on, and look at the first picks in the queue before approving any. Approve one and check that it appears on the blog as a reblog of the original.
 
 ### Publishing and failures
 
@@ -115,6 +172,8 @@ If the blocks keep coming back, the cause is the server's IP or network, not Omn
 | Likes / reblogs / replies per post | `/blog/{blog}/notes` | read 1, 3, 7 and 30 days after publishing |
 | Activity (follows, likes, reblogs, replies) | `/blog/{blog}/notifications` | 30 min |
 | Account limits | `/user/limits` | 1 h |
+| Tag listings (see Reach) | `/tagged` | when a post is prepared; the blog's own tags daily |
+| Avatar and header (default look?) | `/blog/{blog}/info` | 6 h |
 
 From these the website shows follower growth, notes per post (mean and median), engagement (notes per post ÷ followers), notes by publishing day, best weekday and hour (in the blog's time zone), top posts (including ones made outside OmniTumblr), and average notes by tag, content source and caption style.
 
@@ -133,6 +192,10 @@ The second has a v2 name on purpose: OmniSettings writes a default on first read
 
 `OmniTumblr_FleetSpacingMinutes` (default 20, 0 turns it off, at most 360) is the minimum gap between autopilot posts on any two blogs. It takes effect within a minute.
 
+`OmniTumblr_TagResearchEnabled` (default true) turns tag research off everywhere when false: suggested tags go on posts unchecked, and the daily tag and listing checks stop. It takes effect within a minute.
+
+`OmniTumblr_ReblogsEnabled` (default true) stops every blog's curated reblogs when false: nothing new is picked. Reblogs are still off for each blog until switched on in its strategy.
+
 `OmniTumblr_Proxy` (default empty, which means direct) sends every Tumblr call through a proxy: `http://host:port`, `https://…` or `socks5://host:port`, optionally with `user:pass@`. It takes effect within a minute. A value that cannot be parsed is ignored and logged once.
 
 ## Data
@@ -145,6 +208,8 @@ connections.json    connected accounts (tokens encrypted), limits, health
 auth-flows.json     pending authorizations (survive restarts; expire after 30 minutes)
 engine.json         engine state, migration result
 events.jsonl        event log
+fingerprints.json   what each clip looks like (repeat detection)
+tags.json           what Tumblr's listing showed for each tag looked up
 secrets.key         root key for the vault: back it up together with the rest
 blogs/{blogId}/     blog.json (settings, strategy, health), posts.json, insights.json
 library/  uploads/  thumbs/  cache/
@@ -158,6 +223,7 @@ On first start, v2 imports v1 data once: app keys, OAuth 1.0a tokens, each blog 
 
 All routes are under `/omnitumblr/`, registered with typed `CreateRoute`. Live GETs are marked uncacheable for the response cache.
 
+- **Reach:** `reach` (GET, one blog's findings and tag table, from memory), `tags/research` (POST, looks up to 20 tags up on Tumblr now)
 - **Read:** `overview`, `dashboard-stats`, `blog`, `analytics`, `post`, `posts`, `events`, `settings`, `library`, `memescraper/options`, `media` (thumbnails and video), `content/thumb`
 - **Accounts:** `settings/app`, `connect/begin`, `connect/status`, `oauth/callback`, `connections/refresh`, `connections/remove`
 - **Blogs:** `blogs/add`, `blogs/update` (autopilot, pause, approval, strategy, notes), `blogs/plan-now`, `blogs/refresh`, `blogs/remove`
@@ -169,7 +235,7 @@ All routes are under `/omnitumblr/`, registered with typed `CreateRoute`. Live G
 `pages/schemery/omnitumblr/` in the KM site, on the OmniTrader design system:
 
 - **Overview**: needs-attention items, KPIs, blog cards, the queue, recently published, followers chart, activity log
-- **Blog**: tabs for overview, queue, published, analytics, strategy and activity
+- **Blog**: tabs for overview, queue, published, analytics, reach, strategy and activity
 - **Compose**: video, photo, text or link posts to one or more blogs, now or scheduled
 - **Settings**: Tumblr app, connected accounts and their limits, engine status
 
@@ -179,6 +245,6 @@ All routes are under `/omnitumblr/`, registered with typed `CreateRoute`. Live G
 DOTNET_ROLL_FORWARD=Major dotnet test Omnipotent.Tests/Omnipotent.Tests.csproj -c Release --filter "FullyQualifiedName~OmniTumblr"
 ```
 
-These cover the OAuth 1.0a signature vectors, error classification, NPF multipart, schedule maths (including DST), the planner, the publisher (idempotency and every failure policy), the captioner's output parsing, the store and vault, migration, and analytics.
+These cover the OAuth 1.0a signature vectors, error classification, NPF multipart, schedule maths (including DST), the planner, the publisher (idempotency and every failure policy), the captioner's output parsing, the store and vault, migration, analytics, tag research (verdicts, choosing a post's tags, the listing check, the reach findings), and curated reblogs (what is and is not picked, screening, approval, publishing, and keeping a reblog's notes out of the blog's figures).
 
 Website: `npx playwright test tests/e2e/omnitumblr.spec.ts` runs every page against a stateful API mock. It checks that request bodies are real JSON (v1's `"[object Object]"` bug), and that nothing scrolls sideways at phone width.

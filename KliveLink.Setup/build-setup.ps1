@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)][string]$Agent,
     [Parameter(Mandatory = $true)][string]$Config,
     [string]$Output = "artifacts/klive-setup",
@@ -14,8 +14,8 @@ New-Item -ItemType Directory -Force -Path $outPath | Out-Null
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vsPath = if (Test-Path $vswhere) { & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } else { "" }
 if (-not $vsPath) { $vsPath = "D:\VSIDE\Product" }
-$vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
-if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found." }
+$vcvars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars32.bat"
+if (-not (Test-Path $vcvars)) { throw "vcvars32.bat not found." }
 
 $source = Join-Path $repo "KliveLink.Setup"
 $setupExe = Join-Path $outPath "setup.exe"
@@ -67,3 +67,4 @@ try {
     }
 }
 finally { Pop-Location }
+

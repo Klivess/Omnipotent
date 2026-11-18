@@ -193,7 +193,7 @@ namespace Omnipotent.Tests.KliveLLM
                 for (int i = 0; i < options.Conversations; i++)
                     conversations.Add(new Conversation
                     {
-                        Id = $"projects-agent-p1-w{i}",
+                        Id = $"demiurge-agent-p1-w{i}",
                         ReadyAt = Start.AddSeconds(i * 7),
                         TurnsLeft = options.TurnsPerWake,
                         LastCompletedAt = Start,

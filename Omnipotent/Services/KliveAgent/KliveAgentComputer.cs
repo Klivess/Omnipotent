@@ -5,8 +5,8 @@ using Omnipotent.Services.ComputerControl;
 using Omnipotent.Services.HostControl;
 using Omnipotent.Services.KliveAgent.Models;
 using Omnipotent.Services.KliveLLM;
-using Omnipotent.Services.Projects;
-using Omnipotent.Services.Projects.Containers;
+using Omnipotent.Services.Demiurge;
+using Omnipotent.Services.Demiurge.Containers;
 
 namespace Omnipotent.Services.KliveAgent;
 
@@ -15,7 +15,7 @@ public enum KliveAgentComputerTarget
 {
     /// <summary>No computer is available (feature off, or neither controller is running).</summary>
     None,
-    /// <summary>KliveAgent's own isolated, persistent Linux desktop (the Projects container stack).</summary>
+    /// <summary>KliveAgent's own isolated, persistent Linux desktop (the Demiurge container stack).</summary>
     Container,
     /// <summary>The Windows desktop Omnipotent itself runs on (HostControl, SendInput).</summary>
     Host,
@@ -25,7 +25,7 @@ public enum KliveAgentComputerTarget
 /// KliveAgent's computer.
 ///
 /// By default this is an isolated, persistent Docker desktop of its own — the same desktop image,
-/// fleet, capacity policy and browser stack every Project agent uses. That stack is far stronger for
+/// fleet, capacity policy and browser stack every Steward agent uses. That stack is far stronger for
 /// real web work than driving the host with pixel clicks: a structured view of the live page
 /// (controls, frames, shadow DOM), fills that read back what actually landed, cookie walls and
 /// modals dismissed automatically, a free CAPTCHA solver, uploads, a container-local terminal, and a
@@ -37,17 +37,17 @@ public enum KliveAgentComputerTarget
 /// </summary>
 public sealed class KliveAgentComputer
 {
-    /// <summary>Desktop owner id (in the registry's ProjectID slot) — see <see cref="ExternalDesktopOwners"/>.</summary>
+    /// <summary>Desktop owner id (in the registry's StewardID slot) — see <see cref="ExternalDesktopOwners"/>.</summary>
     public const string OwnerID = ExternalDesktopOwners.KliveAgentOwnerID;
     public const string AgentID = "kliveagent";
 
-    /// <summary>The desktop subsystem keys desktops by project; this stands in for KliveAgent.</summary>
-    internal static readonly Project OwnerProject = new()
+    /// <summary>The desktop subsystem keys desktops by Steward; this stands in for KliveAgent.</summary>
+    internal static readonly Steward OwnerSteward = new()
     {
-        ProjectID = OwnerID,
+        StewardID = OwnerID,
         Name = "KliveAgent",
         Goal = "KliveAgent's own computer.",
-        Status = ProjectStatus.Active,
+        Status = StewardStatus.Active,
         DesktopAllocation = DesktopAllocationMode.PerAgentContainers,
     };
 
@@ -61,14 +61,14 @@ public sealed class KliveAgentComputer
     private DateTime readyUntilUtc = DateTime.MinValue;
     private string? knownContainerID;
     private byte[]? lastFrameJpeg;
-    private Projects.Projects? subscribedProjects;
+    private Demiurge.Demiurge? subscribedDemiurge;
 
     public KliveAgentComputer(KliveAgent agent) => this.agent = agent;
 
     // ── Target ──
 
-    internal Projects.Projects? ResolveProjects() =>
-        agent.GetActiveServices().OfType<Projects.Projects>().FirstOrDefault(p => p.IsServiceActive() && p.Desktops != null);
+    internal Demiurge.Demiurge? ResolveDemiurge() =>
+        agent.GetActiveServices().OfType<Demiurge.Demiurge>().FirstOrDefault(p => p.IsServiceActive() && p.Desktops != null);
 
     internal HostControlManager? ResolveHost() =>
         OperatingSystem.IsWindows()
@@ -86,7 +86,7 @@ public sealed class KliveAgentComputer
     /// </summary>
     public KliveAgentComputerTarget ResolveTarget(string? setting)
     {
-        bool container = OperatingSystem.IsWindows() && ResolveProjects() != null;
+        bool container = OperatingSystem.IsWindows() && ResolveDemiurge() != null;
         bool host = ResolveHost() != null;
         return ChooseTarget(KliveAgentRunSettings.NormalizeTarget(setting), container, host);
     }
@@ -106,7 +106,7 @@ public sealed class KliveAgentComputer
     private DesktopContainerRecord? FindDesktopRecord()
     {
         if (!OperatingSystem.IsWindows()) return null;
-        return ResolveProjects()?.Desktops?.Registry.ForProject(OwnerID)
+        return ResolveDemiurge()?.Desktops?.Registry.ForSteward(OwnerID)
             .Where(r => r.AgentID == AgentID && !r.Lost)
             .OrderByDescending(r => r.LastUsedAt)
             .FirstOrDefault();
@@ -138,7 +138,7 @@ public sealed class KliveAgentComputer
     };
 
     /// <summary>
-    /// The container desktop's tool surface: the Projects computer catalogue (visual tools, structured
+    /// The container desktop's tool surface: the Demiurge computer catalogue (visual tools, structured
     /// browser control, uploads, terminal) with the approval tools reworded for KliveAgent, plus human
     /// takeover and the encrypted credential vault. Raw-image perception tools are dropped when the
     /// model cannot receive images; DOM, OCR and terminal perception remain.
@@ -154,7 +154,7 @@ public sealed class KliveAgentComputer
         var str = new { type = "string" };
         var integer = new { type = "integer" };
 
-        var tools = ProjectCommanderAgent.BuildComputerToolDefinitions(visionEnabled)
+        var tools = StewardCommanderAgent.BuildComputerToolDefinitions(visionEnabled)
             .Where(t => t.function.name is not ("computer_confirm_action" or "computer_confirm_and_click"))
             .ToList();
 
@@ -261,14 +261,14 @@ public sealed class KliveAgentComputer
         string toolName, string? argsJson, CancellationToken ct, Action<HostControlProgress> onProgress)
     {
         const ContainerToolAdapter.ContainerToolFailureKind failed = ContainerToolAdapter.ContainerToolFailureKind.Infrastructure;
-        var projects = ResolveProjects();
-        var desktops = projects?.Desktops;
-        if (projects == null || desktops == null)
-            return (ComputerToolResult.Fail("KliveAgent's desktop is unavailable: the Projects desktop subsystem is not running on this host."), failed);
-        EnsureSubscribed(projects);
+        var demiurge = ResolveDemiurge();
+        var desktops = demiurge?.Desktops;
+        if (demiurge == null || desktops == null)
+            return (ComputerToolResult.Fail("KliveAgent's desktop is unavailable: the Demiurge desktop subsystem is not running on this host."), failed);
+        EnsureSubscribed(demiurge);
 
-        var settings = projects.Settings?.Get(OwnerID) ?? new ProjectSettings { ProjectID = OwnerID };
-        bool framebufferIndependent = ProjectTierRouter.CanRunWithoutFramebuffer(toolName);
+        var settings = demiurge.Settings?.Get(OwnerID) ?? new StewardSettings { StewardID = OwnerID };
+        bool framebufferIndependent = StewardTierRouter.CanRunWithoutFramebuffer(toolName);
         if (framebufferIndependent)
         {
             // Terminal and structured browser control keep working through a framebuffer outage;
@@ -283,7 +283,7 @@ public sealed class KliveAgentComputer
             if (problem != null) return (ComputerToolResult.Fail(problem), failed);
         }
 
-        var adapter = await desktops.GetAdapterForAgentAsync(OwnerProject, AgentID,
+        var adapter = await desktops.GetAdapterForAgentAsync(OwnerSteward, AgentID,
             resolveSecretsAsync: ResolveSecretsAsync,
             actionSettleMs: settings.ComputerActionSettleMs,
             typingDelayMs: settings.ComputerTypingDelayMs,
@@ -317,7 +317,7 @@ public sealed class KliveAgentComputer
                 Note = "Starting my computer…",
                 Activity = new AgentActivityEvent { Kind = "action", Text = "starting KliveAgent's desktop" },
             });
-            var readiness = await desktops.EnsureDesktopReadyAsync(OwnerProject, AgentID, image, ct);
+            var readiness = await desktops.EnsureDesktopReadyAsync(OwnerSteward, AgentID, image, ct);
             if (!readiness.Ok)
             {
                 readyUntilUtc = DateTime.MinValue;
@@ -468,7 +468,7 @@ public sealed class KliveAgentComputer
         long lastHeartbeat = 0;
         bool reminded = reminderMinutes == 0 || reminderMinutes >= maxMinutes;
         string outcome = "timeout";
-        var desktops = ResolveProjects()?.Desktops;
+        var desktops = ResolveDemiurge()?.Desktops;
         try
         {
             while (handoff.IsPending)
@@ -542,26 +542,26 @@ public sealed class KliveAgentComputer
 
     /// <summary>Tracks Klives' input on KliveAgent's desktop (idle-after-interaction auto-resume) and
     /// resumes a takeover when his remote-control session ends after he actually did something.</summary>
-    private void EnsureSubscribed(Projects.Projects projects)
+    private void EnsureSubscribed(Demiurge.Demiurge demiurge)
     {
-        if (ReferenceEquals(subscribedProjects, projects)) return;
+        if (ReferenceEquals(subscribedDemiurge, demiurge)) return;
         lock (handoffs)
         {
-            if (ReferenceEquals(subscribedProjects, projects)) return;
-            if (subscribedProjects != null)
+            if (ReferenceEquals(subscribedDemiurge, demiurge)) return;
+            if (subscribedDemiurge != null)
             {
-                subscribedProjects.ExternalDesktopInputApplied -= OnExternalInput;
-                subscribedProjects.ExternalDesktopRemoteControlEnded -= OnExternalSessionEnded;
+                subscribedDemiurge.ExternalDesktopInputApplied -= OnExternalInput;
+                subscribedDemiurge.ExternalDesktopRemoteControlEnded -= OnExternalSessionEnded;
             }
-            projects.ExternalDesktopInputApplied += OnExternalInput;
-            projects.ExternalDesktopRemoteControlEnded += OnExternalSessionEnded;
-            subscribedProjects = projects;
+            demiurge.ExternalDesktopInputApplied += OnExternalInput;
+            demiurge.ExternalDesktopRemoteControlEnded += OnExternalSessionEnded;
+            subscribedDemiurge = demiurge;
         }
     }
 
     private void OnExternalInput(DesktopContainerRecord record)
     {
-        if (!ExternalDesktopOwners.IsExternal(record.ProjectID)) return;
+        if (!ExternalDesktopOwners.IsExternal(record.StewardID)) return;
         foreach (var handoff in handoffs.Values.Where(h => h.IsPending && h.ContainerID == record.ContainerID))
         {
             Interlocked.Exchange(ref handoff.Interacted, 1);
@@ -571,7 +571,7 @@ public sealed class KliveAgentComputer
 
     private void OnExternalSessionEnded(DesktopContainerRecord record, int inputEvents)
     {
-        if (!ExternalDesktopOwners.IsExternal(record.ProjectID) || inputEvents <= 0) return;
+        if (!ExternalDesktopOwners.IsExternal(record.StewardID) || inputEvents <= 0) return;
         foreach (var handoff in handoffs.Values.Where(h => h.IsPending && h.ContainerID == record.ContainerID))
             handoff.Completion.TrySetResult("done");
     }

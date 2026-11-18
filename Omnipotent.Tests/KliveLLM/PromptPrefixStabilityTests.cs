@@ -1,5 +1,5 @@
 using Omnipotent.Services.KliveLLM;
-using Omnipotent.Services.Projects;
+using Omnipotent.Services.Demiurge;
 using LlmService = Omnipotent.Services.KliveLLM.KliveLLM;
 
 namespace Omnipotent.Tests.KliveLLM;
@@ -20,7 +20,7 @@ namespace Omnipotent.Tests.KliveLLM;
 ///   • per-request or per-agent text (a wall-clock, a relative age, an agent id) sitting in the
 ///     opening lines of a prompt, which discards the cache for everything behind it.
 /// </summary>
-[Collection("ProjectsSerial")]
+[Collection("DemiurgeSerial")]
 public class PromptPrefixStabilityTests
 {
     // ── helpers ──
@@ -28,7 +28,7 @@ public class PromptPrefixStabilityTests
     private static LlmService.KliveLLMSession NewSession(string systemPrompt = "SYSTEM DOCTRINE", string seed = "WAKE SEED")
     {
         // The real constructor wires up a live KliveLLM service; these paths only ever touch
-        // structuredMessages, so build the object without running it (as ProjectContextRetentionTests does).
+        // structuredMessages, so build the object without running it (as StewardContextRetentionTests does).
         var session = (LlmService.KliveLLMSession)System.Runtime.CompilerServices.RuntimeHelpers
             .GetUninitializedObject(typeof(LlmService.KliveLLMSession));
         session.sessionId = "prefix-test";
@@ -222,20 +222,20 @@ public class PromptPrefixStabilityTests
         // The regression: the prompt opened "You are a {Tier}-tier SUB-AGENT (role: {Role}, ID: {AgentID})",
         // so two workers diverged about ten tokens in and shared no cached prefix at all — and a
         // respawned worker shared nothing with the agent it replaced, because its id was new.
-        var project = new Project { ProjectID = "p1", Name = "P", Goal = "Ship the thing" };
-        string a = ProjectSubAgentRunner.BuildSystemPrompt(project, new ProjectAgentRecord
+        var steward = new Steward { StewardID = "p1", Name = "P", Goal = "Ship the thing" };
+        string a = StewardSubAgentRunner.BuildSystemPrompt(steward, new StewardAgentRecord
         {
             AgentID = "agent-aaaaaaaa",
-            Tier = ProjectAgentTier.Text,
+            Tier = StewardAgentTier.Text,
             Role = "market-researcher",
-            MissionKind = ProjectAgentMissionKind.Task,
+            MissionKind = StewardAgentMissionKind.Task,
         }, visionEnabled: true);
-        string b = ProjectSubAgentRunner.BuildSystemPrompt(project, new ProjectAgentRecord
+        string b = StewardSubAgentRunner.BuildSystemPrompt(steward, new StewardAgentRecord
         {
             AgentID = "agent-bbbbbbbb",
-            Tier = ProjectAgentTier.TextImageVideo,
+            Tier = StewardAgentTier.TextImageVideo,
             Role = "content-writer",
-            MissionKind = ProjectAgentMissionKind.Standing,
+            MissionKind = StewardAgentMissionKind.Standing,
         }, visionEnabled: true);
 
         int shared = SharedPrefixLength(a, b);
@@ -263,21 +263,21 @@ public class PromptPrefixStabilityTests
     [Fact]
     public void CommanderWakeSeed_KeepsTheWallClockOutOfItsHead()
     {
-        // The regression: the seed's SECOND line was a second-precision clock, so the project header,
+        // The regression: the seed's SECOND line was a second-precision clock, so the Steward header,
         // capability truth, directives and grand plan behind it could never be served from cache on a
         // later wake — even when none of them had changed.
-        var project = new Project
+        var steward = new Steward
         {
-            ProjectID = "p1",
+            StewardID = "p1",
             Name = "Test",
             Goal = "Do the thing",
             CreatedAt = new DateTime(2026, 7, 12, 18, 4, 33, DateTimeKind.Utc),
         };
-        string seed = ProjectCommanderPrompts.BuildWakeSeed(
-            project,
-            new ProjectDigest { ProjectID = "p1" },
-            new List<ProjectEvent>(),
-            new List<ProjectRetrievalIndex.RetrievalHit>(),
+        string seed = StewardCommanderPrompts.BuildWakeSeed(
+            steward,
+            new StewardDigest { StewardID = "p1" },
+            new List<StewardEvent>(),
+            new List<StewardRetrievalIndex.RetrievalHit>(),
             "keepalive",
             directivesBlock: "RULE: never use bot accounts.");
 
@@ -291,7 +291,7 @@ public class PromptPrefixStabilityTests
 
         // The header's stamps are absolute — a recomputed relative age would churn the same bytes.
         string header = seed[..seed.IndexOf("STANDING DIGEST", StringComparison.Ordinal)];
-        Assert.Contains("project created 2026-07-12 18:04 UTC", header, StringComparison.Ordinal);
+        Assert.Contains("Steward created 2026-07-12 18:04 UTC", header, StringComparison.Ordinal);
         Assert.DoesNotContain(" ago)", header, StringComparison.Ordinal);
     }
 
@@ -299,8 +299,8 @@ public class PromptPrefixStabilityTests
     public void CacheStableWakeAppend_DoesNotPutASecondClockAtByteZero()
     {
         var llm = new LlmService();
-        const string sessionId = "projects-commander-prefix-test";
-        const string seed = "PROJECT: Test\n── THIS WAKE'S TRIGGER ──\nNow: 2026-09-04 12:00:00 UTC\nkeepalive";
+        const string sessionId = "demiurge-commander-prefix-test";
+        const string seed = "STEWARD: Test\n── THIS WAKE'S TRIGGER ──\nNow: 2026-09-04 12:00:00 UTC\nkeepalive";
 
         llm.StartToolSession(sessionId, "SYSTEM");
         llm.AppendCacheStableWakeSeedToToolSession(sessionId, seed);
@@ -311,7 +311,7 @@ public class PromptPrefixStabilityTests
             sessionsField!.GetValue(llm));
         var appended = Assert.IsType<string>(sessions[sessionId].structuredMessages[1].content);
 
-        Assert.StartsWith("PROJECT: Test", appended, StringComparison.Ordinal);
+        Assert.StartsWith("STEWARD: Test", appended, StringComparison.Ordinal);
         Assert.False(appended.StartsWith("[", StringComparison.Ordinal),
             "a receipt timestamp at byte zero invalidates the whole provider prefix cache");
         Assert.Equal(1, appended.Split("Now:", StringSplitOptions.None).Length - 1);
@@ -323,10 +323,10 @@ public class PromptPrefixStabilityTests
     }
 
     [Fact]
-    public void ProjectsAppendMode_NeverRewritesAnAlreadySentToolResult()
+    public void DemiurgeAppendMode_NeverRewritesAnAlreadySentToolResult()
     {
         var llm = new LlmService();
-        const string sessionId = "projects-prefix-immutable-test";
+        const string sessionId = "demiurge-prefix-immutable-test";
         llm.StartToolSession(sessionId, "SYSTEM");
 
         for (int index = 0; index < 40; index++)
@@ -341,7 +341,7 @@ public class PromptPrefixStabilityTests
         var first = sessions[sessionId].structuredMessages.First(message => message.role == "tool");
 
         Assert.True(HFWrapper.ContentToText(first.content).Count(character => character == 'x') >= 4_000,
-            "Projects mode rewrote a prior tool result; the next provider request would lose its prefix hit.");
+            "Demiurge mode rewrote a prior tool result; the next provider request would lose its prefix hit.");
     }
 
     /// Serialises a session the way a provider sees it: one flat byte sequence, roles included, in
@@ -466,18 +466,18 @@ public class PromptPrefixStabilityTests
         // The agent measures staleness against the seed's 'Now:' line instead — which both system
         // prompts tell it to do.
         string pid = "prefix-approvals-" + Guid.NewGuid().ToString("N");
-        var gates = new ProjectGateManager(new ProjectEventLogStore(_ => { }), _ => { });
+        var gates = new StewardGateManager(new StewardEventLogStore(_ => { }), _ => { });
 
-        var pending = new ProjectGate
+        var pending = new StewardGate
         {
-            GateID = Guid.NewGuid().ToString("N"), ProjectID = pid,
+            GateID = Guid.NewGuid().ToString("N"), StewardID = pid,
             Title = "Buy the domain?", Description = "costs $12", Kind = "money",
         };
         _ = gates.OpenGateAndWaitAsync(pending, CancellationToken.None);
 
-        var resolved = new ProjectGate
+        var resolved = new StewardGate
         {
-            GateID = Guid.NewGuid().ToString("N"), ProjectID = pid,
+            GateID = Guid.NewGuid().ToString("N"), StewardID = pid,
             Title = "Publish the first post?", Description = "Draft is ready.", Kind = "action",
         };
         _ = gates.OpenGateAndWaitAsync(resolved, CancellationToken.None);

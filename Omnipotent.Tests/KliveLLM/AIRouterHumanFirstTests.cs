@@ -16,11 +16,11 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal("Fifo", limiter.Describe().Mode);
             var held = new List<AIRouterFairUseLease>();
             for (int i = 0; i < 3; i++)
-                held.Add(await limiter.AcquireAsync(10, Ticket($"projects-agent-{i}", AIRouterWorkClass.Agent)));
+                held.Add(await limiter.AcquireAsync(10, Ticket($"demiurge-agent-{i}", AIRouterWorkClass.Agent)));
 
-            var earlierAgent = limiter.AcquireAsync(10, Ticket("projects-agent-x", AIRouterWorkClass.Agent));
+            var earlierAgent = limiter.AcquireAsync(10, Ticket("demiurge-agent-x", AIRouterWorkClass.Agent));
             await Task.Delay(50);
-            var klives = limiter.AcquireAsync(10, Ticket("projects-commander-p#1", AIRouterWorkClass.Interactive));
+            var klives = limiter.AcquireAsync(10, Ticket("demiurge-commander-p#1", AIRouterWorkClass.Interactive));
             await Task.Delay(50);
 
             held[0].Dispose();
@@ -38,10 +38,10 @@ namespace Omnipotent.Tests.KliveLLM
         public async Task InFifoMode_BackgroundWorkKeepsArrivalOrderAmongItself()
         {
             var limiter = new AIRouterFairUseLimiter(maxParallelRequests: 1);
-            var holder = await limiter.AcquireAsync(10, Ticket("projects-agent-0", AIRouterWorkClass.Agent));
-            var first = limiter.AcquireAsync(10, Ticket("projects-agent-1", AIRouterWorkClass.Agent));
+            var holder = await limiter.AcquireAsync(10, Ticket("demiurge-agent-0", AIRouterWorkClass.Agent));
+            var first = limiter.AcquireAsync(10, Ticket("demiurge-agent-1", AIRouterWorkClass.Agent));
             await Task.Delay(50);
-            var second = limiter.AcquireAsync(10, Ticket("projects-agent-2", AIRouterWorkClass.OneShot));
+            var second = limiter.AcquireAsync(10, Ticket("demiurge-agent-2", AIRouterWorkClass.OneShot));
             await Task.Delay(50);
 
             holder.Dispose();

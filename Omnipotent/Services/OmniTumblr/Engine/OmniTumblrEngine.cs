@@ -35,6 +35,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private readonly OmniTumblrPlanner planner;
         private readonly OmniTumblrPublisher publisher;
         private readonly OmniTumblrAnalyticsSync sync;
+        private readonly OmniTumblrCurator? curator;
         private readonly Func<DateTime> clock;
         private readonly Action<Exception, string> logError;
         private readonly SemaphoreSlim publishWake = new(0, int.MaxValue);
@@ -51,8 +52,9 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         public bool Running => cts != null && !cts.IsCancellationRequested;
 
         public OmniTumblrEngine(OmniTumblrStore store, OmniTumblrPlanner planner, OmniTumblrPublisher publisher,
-            OmniTumblrAnalyticsSync sync, Func<DateTime> clock, Action<Exception, string> logError)
+            OmniTumblrAnalyticsSync sync, Func<DateTime> clock, Action<Exception, string> logError, OmniTumblrCurator? curator = null)
         {
+            this.curator = curator;
             this.store = store;
             this.planner = planner;
             this.publisher = publisher;
@@ -168,6 +170,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
         private async Task<string?> PlanTickAsync(CancellationToken token)
         {
             DateTime now = clock();
+            // A blog with no content source plans nothing here, but may still have reblogs to pick (below).
             var blogIds = store.Read(s => s.Blogs.Values.Where(b => b.Autopilot && !b.Paused).Select(b => b.BlogId).ToList());
             int planned = 0;
             foreach (string blogId in blogIds)
@@ -192,9 +195,18 @@ namespace Omnipotent.Services.OmniTumblr.Engine
 
             int repeats = await planner.SwapRepeatsAsync(token);
             int prepared = await planner.PrepareDueAsync(4, token);
-            if (prepared > 0) WakePublisher();
-            if (planned == 0 && prepared == 0 && repeats == 0) return null;
-            return repeats == 0 ? $"planned {planned}, prepared {prepared}" : $"planned {planned}, prepared {prepared}, replaced {repeats} repeated clip(s)";
+            int reblogs = 0;
+            if (curator != null)
+            {
+                try { reblogs = await curator.CurateDueAsync(token); }
+                catch (OperationCanceledException) when (token.IsCancellationRequested) { throw; }
+                catch (Exception ex) { logError(ex, "OmniTumblr: picking reblogs failed"); }
+            }
+            if (prepared > 0 || reblogs > 0) WakePublisher();
+            if (planned == 0 && prepared == 0 && repeats == 0 && reblogs == 0) return null;
+            return $"planned {planned}, prepared {prepared}"
+                + (repeats == 0 ? "" : $", replaced {repeats} repeated clip(s)")
+                + (reblogs == 0 ? "" : $", picked {reblogs} reblog(s)");
         }
 
         private async Task<string?> SyncTickAsync(CancellationToken token)

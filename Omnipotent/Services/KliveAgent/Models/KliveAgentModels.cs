@@ -275,6 +275,40 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         [JsonProperty("executionTimeMs")]
         public long ExecutionTimeMs { get; set; }
+
+        /// <summary>How long compiling took, repairs included. Null on records from before 2026-11-11.</summary>
+        [JsonProperty("compileMs", NullValueHandling = NullValueHandling.Ignore)]
+        public long? CompileMs { get; set; }
+
+        /// <summary>How long the script waited for the script engine to finish starting (first scripts after a
+        /// restart only), kept out of <see cref="CompileMs"/>. Null when the engine was already up.</summary>
+        [JsonProperty("hostWaitMs", NullValueHandling = NullValueHandling.Ignore)]
+        public long? HostWaitMs { get; set; }
+
+        /// <summary>How long the compiled script ran. Null when nothing ran.</summary>
+        [JsonProperty("runMs", NullValueHandling = NullValueHandling.Ignore)]
+        public long? RunMs { get; set; }
+
+        /// <summary>True for the first script a session compiled (the one that used to be slow).</summary>
+        [JsonProperty("coldStart", DefaultValueHandling = DefaultValueHandling.Ignore)]
+        public bool ColdStart { get; set; }
+
+        /// <summary>"compile" | "runtime" | "timeout" | "compile-timeout" | "stopped"; null on success.</summary>
+        [JsonProperty("failureKind", NullValueHandling = NullValueHandling.Ignore)]
+        public string? FailureKind { get; set; }
+
+        /// <summary>Fixes the engine made before running (see KliveAgentScriptRepair). <see cref="Code"/>
+        /// stays what the model wrote; <see cref="ExecutedCode"/> is what ran.</summary>
+        [JsonProperty("repairs", NullValueHandling = NullValueHandling.Ignore)]
+        public List<string>? Repairs { get; set; }
+
+        [JsonProperty("executedCode", NullValueHandling = NullValueHandling.Ignore)]
+        public string? ExecutedCode { get; set; }
+
+        /// <summary>What this script left in the session ("new variables: …"), for the model's next step
+        /// only. Not stored: it describes a session that is gone by the time history is read back.</summary>
+        [JsonIgnore]
+        public string? SessionNote { get; set; }
     }
 
     /// <summary>
@@ -973,6 +1007,16 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("autoResumePending")]
         public bool AutoResumePending { get; set; }
 
+        /// <summary>Nobody is waiting on this run: another service started it (OmniTrader's Alpha Lab,
+        /// a scheduled task). It queues behind live chat for a model slot, a clean finish is not news,
+        /// and a failure is.</summary>
+        [JsonProperty("background", DefaultValueHandling = DefaultValueHandling.Ignore)]
+        public bool Background { get; set; }
+
+        /// <summary>The run's working notes as last published (a copy, never the live object).</summary>
+        [JsonProperty("ledger", NullValueHandling = NullValueHandling.Ignore)]
+        public AgentRunLedger? Ledger { get; set; }
+
         /// <summary>Last time a client polled this run. A run that finishes while someone is watching
         /// does not need an unread "finished" notification.</summary>
         [JsonIgnore]
@@ -1003,6 +1047,10 @@ namespace Omnipotent.Services.KliveAgent.Models
         /// <summary>Whether a run interrupted by a shutdown will be continued automatically at the
         /// next start (the setting is on and the resume chain is not exhausted).</summary>
         public bool ResumesAfterShutdown { get; init; }
+
+        /// <summary>The run's working notes (plan, done steps, facts). A continuation starts with the
+        /// notes of the run it continues.</summary>
+        public AgentRunLedger Ledger { get; init; } = new();
 
         /// <summary>Why the run's token was cancelled (user | stall | shutdown), recorded BEFORE the
         /// cancellation so the brain's closing message can say what actually happened.</summary>
@@ -1156,8 +1204,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("clientJobId")]
         public string? ClientJobId { get; set; }
 
+        [JsonProperty("stewardId")]
+        public string StewardId { get; set; } = string.Empty;
+
+        /// <summary>Reads links saved before Projects became Demiurge (written as "projectId").</summary>
         [JsonProperty("projectId")]
-        public string ProjectId { get; set; } = string.Empty;
+        private string? LegacyProjectId { set { if (!string.IsNullOrEmpty(value) && string.IsNullOrEmpty(StewardId)) StewardId = value; } }
 
         [JsonProperty("directiveId")]
         public string DirectiveId { get; set; } = string.Empty;
@@ -1189,8 +1241,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("clientJobId")]
         public string? ClientJobId { get; set; }
 
+        [JsonProperty("stewardId")]
+        public string StewardId { get; set; } = string.Empty;
+
+        /// <summary>Reads links saved before Projects became Demiurge (written as "projectId").</summary>
         [JsonProperty("projectId")]
-        public string ProjectId { get; set; } = string.Empty;
+        private string? LegacyProjectId { set { if (!string.IsNullOrEmpty(value) && string.IsNullOrEmpty(StewardId)) StewardId = value; } }
 
         [JsonProperty("directiveId")]
         public string DirectiveId { get; set; } = string.Empty;
@@ -1258,8 +1314,12 @@ namespace Omnipotent.Services.KliveAgent.Models
         [JsonProperty("jobId")]
         public string? JobId { get; set; }
 
+        [JsonProperty("stewardId")]
+        public string? StewardId { get; set; }
+
+        /// <summary>Reads links saved before Projects became Demiurge (written as "projectId").</summary>
         [JsonProperty("projectId")]
-        public string? ProjectId { get; set; }
+        private string? LegacyProjectId { set { if (!string.IsNullOrEmpty(value) && string.IsNullOrEmpty(StewardId)) StewardId = value; } }
 
         [JsonProperty("artifactPaths")]
         public List<string> ArtifactPaths { get; set; } = new();
@@ -1347,5 +1407,8 @@ namespace Omnipotent.Services.KliveAgent.Models
 
         /// <summary>The container desktop the run is driving, once known (null = unchanged).</summary>
         public string? ComputerContainerId { get; set; }
+
+        /// <summary>A copy of the run's ledger, when it changed since the last update (null = unchanged).</summary>
+        public AgentRunLedger? Ledger { get; set; }
     }
 }

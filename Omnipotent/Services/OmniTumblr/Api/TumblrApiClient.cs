@@ -172,7 +172,24 @@ namespace Omnipotent.Services.OmniTumblr.Api
                 Posts = Long(b["posts"]) ?? Long(b["total_posts"]),
                 Likes = Long(b["likes"]),
                 UpdatedUtc = updated is > 0 ? DateTimeOffset.FromUnixTimeSeconds(updated.Value).UtcDateTime : null,
+                AvatarUrl = (b["avatar"] as JArray)?.OrderByDescending(a => Long(a["width"]) ?? 0).Select(a => Str(a["url"])).FirstOrDefault(u => !string.IsNullOrEmpty(u)),
+                HeaderImageUrl = Str(b["theme"]?["header_image"]),
             };
+        }
+
+        public async Task<List<TumblrPostSummary>> GetTaggedAsync(TumblrCredentials creds, string tag, long? before, CancellationToken ct)
+        {
+            // npf is documented for "any endpoint that returns posts"; where it is ignored, ParsePost reads the legacy shape.
+            var query = new List<KeyValuePair<string, string>> { new("tag", tag), new("limit", "20"), new("npf", "true") };
+            if (before is > 0) query.Add(new("before", before.Value.ToString()));
+            var response = await SendApiAsync(creds, HttpMethod.Get, "/v2/tagged", query, null, "tagged", ct, appKey: true);
+            var posts = new List<TumblrPostSummary>();
+            // The listing is a bare array; tolerate an object wrapping it.
+            var items = response as JArray ?? (response as JObject)?["posts"] as JArray;
+            if (items != null)
+                foreach (var p in items)
+                    if (p is JObject) posts.Add(ParsePost(p));
+            return posts;
         }
 
         public async Task<long?> GetFollowerCountAsync(TumblrCredentials creds, string blog, CancellationToken ct)
@@ -214,9 +231,25 @@ namespace Omnipotent.Services.OmniTumblr.Api
             if (p["tags"] is JArray tags)
                 summary.Tags = tags.Select(t => Str(t) ?? "").Where(t => t.Length > 0).ToList();
 
+            summary.BlogUuid = Str(p["blog"]?["uuid"]) ?? Str(p["tumblelog_uuid"]);
+            summary.ReblogKey = Str(p["reblog_key"]);
+            // A legacy trail lists the post's own content too (is_current_item); a Neue trail holds only what came before.
+            summary.IsReblog = Present(p["reblogged_from_id"]) || Present(p["reblogged_root_id"]) || Present(p["parent_post_id"])
+                || Present(p["parent_tumblelog_uuid"]) || Present(p["parent_post_url"])
+                || (p["trail"] is JArray history && history.Any(t => Bool(t["is_current_item"]) != true));
+            summary.ReblogsOpen = !string.Equals(Str(p["interactability_reblog"]), "noone", StringComparison.OrdinalIgnoreCase);
+            string? classification = Str(p["classification"]);
+            summary.Mature = Bool(p["is_nsfw"]) == true || Bool(p["blog"]?["is_adult"]) == true || Bool(p["blog"]?["is_nsfw"]) == true
+                || Bool(p["community_labels"]?["has_community_label"]) == true
+                || (!string.IsNullOrEmpty(classification) && !classification.Equals("clean", StringComparison.OrdinalIgnoreCase));
+
             // NPF posts report type "blocks"; derive a meaningful type from the content blocks.
             string? type = Str(p["type"]);
-            if (p["content"] is JArray blocks && blocks.Count > 0)
+            var blocks = (p["content"] as JArray)?.ToList() ?? new List<JToken>();
+            // A plain reblog adds no content of its own: what it shows is in the trail.
+            if (blocks.Count == 0 && p["trail"] is JArray trail)
+                blocks = trail.SelectMany(t => t["content"] as JArray ?? new JArray()).ToList();
+            if (blocks.Count > 0)
             {
                 var kinds = blocks.Select(b => Str(b["type"])).ToList();
                 type = kinds.Contains("video") ? "video"
@@ -226,10 +259,43 @@ namespace Omnipotent.Services.OmniTumblr.Api
                     : "text";
                 if (string.IsNullOrWhiteSpace(summary.Summary))
                     summary.Summary = blocks.Where(b => Str(b["type"]) == "text").Select(b => Str(b["text"])).FirstOrDefault(t => !string.IsNullOrWhiteSpace(t));
+                // The first picture: an image block's sizes, or a video's poster.
+                var picture = blocks.FirstOrDefault(b => Str(b["type"]) == "image")?["media"]
+                    ?? blocks.FirstOrDefault(b => Str(b["type"]) == "video")?["poster"];
+                if (picture is JArray sizes) summary.Images = sizes.Select(ParseImage).Where(i => i != null).Select(i => i!).ToList();
+                else if (ParseImage(picture) is TumblrImage only) summary.Images.Add(only);
+            }
+            else
+            {
+                if (type is "text" or "regular" or "blocks" && Str(p["body"]) is { Length: > 0 } body)
+                {
+                    // Legacy shape: a post made in the current editor comes back as "text" with its media in the HTML.
+                    if (body.Contains("<video", StringComparison.OrdinalIgnoreCase)) type = "video";
+                    else if (body.Contains("<img", StringComparison.OrdinalIgnoreCase)) type = "photo";
+                    var img = System.Text.RegularExpressions.Regex.Match(body, "<img[^>]+src=\"(https://[^\"]+)\"", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                    if (img.Success) summary.Images.Add(new TumblrImage { Url = WebUtility.HtmlDecode(img.Groups[1].Value) });
+                }
+                if (p["photos"] is JArray photos && photos.Count > 0)
+                {
+                    var first = photos[0];
+                    var alt = (first["alt_sizes"] as JArray ?? new JArray()).Append(first["original_size"]);
+                    summary.Images.AddRange(alt.Select(ParseImage).Where(i => i != null).Select(i => i!));
+                }
+                if (summary.Images.Count == 0 && Str(p["thumbnail_url"]) is { Length: > 0 } thumbnail)
+                    summary.Images.Add(new TumblrImage { Url = thumbnail, Width = (int)(Long(p["thumbnail_width"]) ?? 0) });
             }
             summary.Type = type;
             if (summary.Summary is { Length: > 280 }) summary.Summary = summary.Summary[..280];
             return summary;
+        }
+
+        private static bool Present(JToken? t) => t != null && t.Type is not (JTokenType.Null or JTokenType.Undefined) && t.ToString().Length > 0 && t.ToString() != "0";
+
+        private static TumblrImage? ParseImage(JToken? t)
+        {
+            string? url = Str(t?["url"]);
+            if (string.IsNullOrEmpty(url) || !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase)) return null;
+            return new TumblrImage { Url = url, Type = Str(t!["type"]), Width = (int)(Long(t["width"]) ?? 0) };
         }
 
         public async Task<TumblrNotesSummary> GetNotesSummaryAsync(TumblrCredentials creds, string blog, string postId, CancellationToken ct)

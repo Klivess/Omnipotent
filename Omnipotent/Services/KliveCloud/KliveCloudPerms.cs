@@ -25,7 +25,7 @@ namespace Omnipotent.Profiles.Permissions
             implies: new[] { "files.browse" });
 
         public static readonly PermissionDef FilesOrganize = G.Define("files.organize", "Files", PermissionTier.Act,
-            "Move files", "Move items between folders where you are an editor.", ProfileRank.Guest,
+            "Move and rename files", "Move items between folders, and rename them, where you are an editor.", ProfileRank.Guest,
             implies: new[] { "files.browse" });
 
         public static readonly PermissionDef FilesDelete = G.Define("files.delete", "Files", PermissionTier.Manage,
@@ -38,7 +38,7 @@ namespace Omnipotent.Profiles.Permissions
 
         public static readonly PermissionDef SharingManageAny = G.Define("sharing.manage-any", "Sharing", PermissionTier.Manage,
             "Manage anyone's share links", "List, change and delete share links other profiles created.", ProfileRank.Admin,
-            implies: new[] { "sharing.manage" }, refines: new[] { "/KliveCloud/ListShareLinks", "/KliveCloud/DeleteShareLink", "/KliveCloud/UpdateShareLinkPermission" });
+            implies: new[] { "sharing.manage" }, refines: new[] { "/KliveCloud/ListShareLinks", "/KliveCloud/DeleteShareLink", "/KliveCloud/UpdateShareLinkPermission", "/KliveCloud/UpdateShareLink" });
 
         public static readonly PermissionDef FilesAll = G.Define("files.all", "Files", PermissionTier.Critical,
             "Access every file", "Ignore access lists: see and edit every item in KliveCloud.", ProfileRank.Klives,

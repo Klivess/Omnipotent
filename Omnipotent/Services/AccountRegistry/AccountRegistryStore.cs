@@ -8,13 +8,13 @@ namespace Omnipotent.Services.AccountRegistry
 {
     /// <summary>
     /// The single GLOBAL registry of accounts agents create on external services, shared by
-    /// KliveAgent and every Project so nobody re-creates a duplicate. One JSON index behind one
-    /// lock, atomic tmp+move writes (same shape as ProjectStore/ProjectObservableStore).
+    /// KliveAgent and every Steward so nobody re-creates a duplicate. One JSON index behind one
+    /// lock, atomic tmp+move writes (same shape as StewardStore/StewardObservableStore).
     ///
     /// Secrets at rest use AES-256-GCM with a portable root key + per-account HKDF derivation —
-    /// the exact scheme ProjectVault uses (authenticated, tamper-detected, survives Windows
+    /// the exact scheme StewardVault uses (authenticated, tamper-detected, survives Windows
     /// account changes, cross-platform), but with its OWN root key so this standalone service
-    /// never depends on the Projects subsystem's key file. Plaintext is only ever produced
+    /// never depends on the Demiurge subsystem's key file. Plaintext is only ever produced
     /// host-side at input-injection time (<see cref="ResolveAccountPlaceholders"/>) or the
     /// Klives-only reveal route — never returned to a model.
     ///
@@ -482,7 +482,7 @@ namespace Omnipotent.Services.AccountRegistry
                 $"Malformed account reference '{{account:{body}}}'. Use {{account:service/field}} or {{account:service/username/field}}.");
         }
 
-        // ── crypto (copied from ProjectVault: AES-256-GCM + HKDF-SHA256) ──
+        // ── crypto (copied from StewardVault: AES-256-GCM + HKDF-SHA256) ──
 
         private byte[] RootKey()
         {
@@ -643,12 +643,32 @@ namespace Omnipotent.Services.AccountRegistry
             // read beforehand would save that stale copy straight back over the repair.
             RootKey();
             if (!File.Exists(indexPath)) return new();
-            try { return JsonConvert.DeserializeObject<List<RegisteredAccount>>(File.ReadAllText(indexPath)) ?? new(); }
+            try { return WithCurrentOwners(JsonConvert.DeserializeObject<List<RegisteredAccount>>(File.ReadAllText(indexPath)) ?? new()); }
             catch (Exception ex)
             {
                 log($"AccountRegistryStore: failed to load {indexPath} ({ex.Message}) — starting empty, file preserved.");
                 return new();
             }
+        }
+
+        /// <summary>A Steward owns accounts as "steward:&lt;id&gt;"; records written before Projects
+        /// became Demiurge say "project:&lt;id&gt;" and read as the same owner (saved in the new form
+        /// with the next write).</summary>
+        internal static string CurrentOwner(string? owner) =>
+            owner != null && owner.StartsWith("project:", StringComparison.OrdinalIgnoreCase)
+                ? "steward:" + owner["project:".Length..]
+                : owner ?? "";
+
+        private static List<RegisteredAccount> WithCurrentOwners(List<RegisteredAccount> accounts)
+        {
+            foreach (var account in accounts)
+            {
+                if (account == null) continue;
+                account.CreatedBy = CurrentOwner(account.CreatedBy);
+                account.Owners = (account.Owners ?? new()).Select(CurrentOwner)
+                    .Where(o => o.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+            }
+            return accounts;
         }
 
         private void SaveLocked(List<RegisteredAccount> all)

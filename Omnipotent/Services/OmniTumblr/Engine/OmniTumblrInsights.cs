@@ -74,6 +74,7 @@ namespace Omnipotent.Services.OmniTumblr.Engine
                 entry.Slug = p.Slug ?? entry.Slug;
                 entry.Summary = p.Summary ?? entry.Summary;
                 entry.OmniPostId = omniPostIdFor(p) ?? entry.OmniPostId;
+                entry.IsReblog = entry.IsReblog || p.IsReblog;
             }
             insights.Index = byId.Values.OrderByDescending(p => p.PublishedUtc).Take(MaxIndexedPosts).ToList();
             return added;

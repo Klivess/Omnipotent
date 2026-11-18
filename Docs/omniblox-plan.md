@@ -289,15 +289,15 @@ Build order isn't pipeline order. The riskiest question, whether the agent can b
 
 ## 10. Notes for the coding agent
 
-- OmniBlox belongs in Omnipotent next to the other Omni services (OmniTumblr, OmniGram), with its dashboard on the KM website. Settle early whether it is its own service that drives the Projects runtime, or a specialized Project with Roblox tools. The first gives a purpose-built pipeline; the second gets the most reuse.
+- OmniBlox belongs in Omnipotent next to the other Omni services (OmniTumblr, OmniGram), with its dashboard on the KM website. Settle early whether it is its own service that drives the Demiurge runtime, or a specialized Steward with Roblox tools. The first gives a purpose-built pipeline; the second gets the most reuse.
 - **Design around AIRouter's rules from day one.** Read `KliveLLM/PromptPrefixStability.cs` and the fair-use scheduler in `KliveLLM/AIRouterFairUse.cs` before designing OmniBlox's model calls, the asset labeler most of all. A suspension for cache misses hits every agent that shares the key.
-- **AIRouter only.** Projects can also route model calls through OpenRouter, which is paid. Whatever runtime OmniBlox uses must be pinned to AIRouter.
+- **AIRouter only.** Demiurge can also route model calls through OpenRouter, which is paid. Whatever runtime OmniBlox uses must be pinned to AIRouter.
 - **Reuse; don't build parallel versions** of what already exists:
   - LLM calls: the AIRouter in `KliveLLM`.
-  - Long-running agents, sub-agents, digests and compaction, loop recovery, budgets and schedules: the **Projects** runtime. Study it before designing §4.9, because it already solves much of it.
+  - Long-running agents, sub-agents, digests and compaction, loop recovery, budgets and schedules: the **Demiurge** runtime. Study it before designing §4.9, because it already solves much of it.
   - Search over assets, code and lessons: **KliveRAG**.
   - Roblox and other accounts and credentials: **AccountRegistry**.
-  - Steps with no API (for example parts of Roblox's creator dashboard): the Projects computer-use desktops.
+  - Steps with no API (for example parts of Roblox's creator dashboard): the Demiurge computer-use desktops.
   - Trailers and clips: OmniTube's `VideoFactory`, which already wraps FFmpeg.
   - Social posting: the existing posting services (OmniTumblr, OmniGram).
 - **Stratum** already uses the pattern OmniBlox needs: the agent works from a curated catalog, and a deterministic verifier checks everything it produces. Read it before designing Build and Test.

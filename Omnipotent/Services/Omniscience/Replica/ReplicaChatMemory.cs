@@ -80,11 +80,11 @@ namespace Omnipotent.Services.Omniscience.Replica
             if (older.Count < SummariseAfterNewRows) return;
 
             string prompt = BuildSummaryPrompt(previousSummary, older);
-            var response = await llm.QueryLLM(prompt, sessionId: null, maxTokensOverride: 360,
-                systemPrompt: "You compress an AI-simulation chat into durable interaction memory. " +
-                              "Retain unresolved topics, references, preferences expressed by the user and commitments made in the chat. " +
-                              "Do not turn simulation statements into facts about any real person. Output at most 180 words.",
-                useFreeModel: false, cancellationToken: ct);
+            var response = await OmniscienceLlm.AskAsync(llm, prompt,
+                "You compress an AI-simulation chat into durable interaction memory. " +
+                "Retain unresolved topics, references, preferences expressed by the user and commitments made in the chat. " +
+                "Do not turn simulation statements into facts about any real person. Output at most 180 words.",
+                useFreeModel: false, ct);
             if (!response.Success || string.IsNullOrWhiteSpace(response.Response)) return;
 
             await db.WriteLock.WaitAsync(ct);

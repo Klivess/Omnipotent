@@ -111,6 +111,12 @@ namespace Omnipotent.Services.MemeScraper
         {
             CacheDeps.MarkUncacheable("memescraper live summary");
             var summary = MemeScraperInsights.BuildSummary(SourceManager.InstagramSources, mediaManager.allScrapedReels, Param(request, "tz"), DateTime.UtcNow);
+            var settings = settingsCache;
+            summary.ScrapeIntervalHours = scrapeIntervalHoursCache;
+            // Unknown until the scheduler has read its settings once.
+            summary.Paused = settings.ReadUtc != null ? settings.Paused : null;
+            summary.SchedulerState = schedulerState;
+            summary.LastSchedulerTickUtc = lastSchedulerTickUtc;
             await Json(request, summary);
         }
 

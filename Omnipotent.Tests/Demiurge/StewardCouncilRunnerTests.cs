@@ -1,0 +1,324 @@
+using System.Collections.Concurrent;
+using Omnipotent.Services.Demiurge;
+
+namespace Omnipotent.Tests.Demiurge
+{
+    /// <summary>
+    /// Council orchestration, driven by scripted LLM turns (no real model). Verifies the
+    /// three-round adversarial structure, spend booking, event emission, graceful degradation,
+    /// cancellation, and the per-wake/per-day caps.
+    /// </summary>
+    [Collection("DemiurgeSerial")]
+    public class StewardCouncilRunnerTests
+    {
+        private static string NewStewardId() => "test_" + Guid.NewGuid().ToString("N");
+        private static Steward NewSteward(string pid) => new()
+        {
+            StewardID = pid, Name = "t", Goal = "win", Status = StewardStatus.Planning,
+            TokenBudgetUsd = 100,
+        };
+
+        private sealed class Harness
+        {
+            public StewardCouncilStore Store = new(_ => { });
+            public StewardEventLogStore Log = new(_ => { });
+            public StewardCouncilRunner Runner = null!;
+            public List<(string sid, string user)> QueryCalls = new();
+            public List<(string sid, string user)> ContinueCalls = new();
+            public int SpendCalls;
+            public HashSet<string> ReturnNullForSessionSubstring = new();
+
+            public Harness()
+            {
+                Runner = new StewardCouncilRunner(Store, Log, _ => { })
+                {
+                    QueryAsync = (pid_, sid, sys, user, routes, max, ct) =>
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        lock (QueryCalls) QueryCalls.Add((sid, user));
+                        if (ReturnNullForSessionSubstring.Any(sid.Contains))
+                            return Task.FromResult<CouncilTurn?>(null);
+                        string text = sid.EndsWith("-chair") ? "CHAIR-VERDICT" : $"OPENING:{sid}";
+                        return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, text, 100, 50, "gen", 0.001));
+                    },
+                    ContinueAsync = (pid_, sid, user, routes, max, ct) =>
+                    {
+                        ct.ThrowIfCancellationRequested();
+                        lock (ContinueCalls) ContinueCalls.Add((sid, user));
+                        return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, $"REBUTTAL:{sid}", 80, 40, "gen", 0.001));
+                    },
+                    RecordSpendAsync = (pid, p, c, g, cost) => { Interlocked.Increment(ref SpendCalls); return Task.CompletedTask; },
+                };
+            }
+        }
+
+        [Fact]
+        public async Task FullCouncil_ThreeRounds_SevenStatements_AndVerdict()
+        {
+            var h = new Harness();
+            string pid = NewStewardId();
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "Pivot?", "briefing text",
+                roles: null, "elevated", "planning", "test/model", maxPerWake: 5, maxPerDay: 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, session.Status);
+            Assert.Equal(3, session.Roles.Count); // default panel
+            Assert.Equal(3, session.Statements.Count(s => s.Round == 1));
+            Assert.Equal(3, session.Statements.Count(s => s.Round == 2));
+            Assert.Equal(1, session.Statements.Count(s => s.Round == 3));
+            Assert.Equal("CHAIR-VERDICT", session.VerdictText);
+            Assert.Equal(7, h.SpendCalls); // every model turn booked to the ledger
+            Assert.True(session.TotalCostUsd > 0);
+        }
+
+        [Fact]
+        public async Task LegacyHardPolicyBlock_IsDowngradedToNonVetoingOwnerDecision()
+        {
+            var h = new Harness();
+            h.Runner.QueryAsync = (pid_, sid, sys, user, routes, max, ct) =>
+                Task.FromResult<CouncilTurn?>(new CouncilTurn(true,
+                    sid.EndsWith("-chair")
+                        ? "DECISION CLASS: HARD_POLICY_BLOCK\nRECOMMENDATION: stop the Steward"
+                        : "OPENING", 1, 1, null, 0));
+            string pid = NewStewardId();
+
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null,
+                "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, session.Status);
+            Assert.Equal(CouncilRecommendationClass.NeedsUserDecision, session.RecommendationClass);
+            Assert.Contains("This is advisory", StewardCouncilRunner.FormatForCommander(session));
+        }
+
+        [Fact]
+        public void LegacyHardPolicyBlock_IsNormalizedBeforePersistence()
+        {
+            var store = new StewardCouncilStore(_ => { });
+            string pid = NewStewardId();
+#pragma warning disable CS0618 // This verifies migration behavior for the persisted legacy enum value.
+            var created = store.Create(new CouncilSession
+            {
+                StewardID = pid,
+                RecommendationClass = CouncilRecommendationClass.HardPolicyBlock,
+            });
+            created.RecommendationClass = CouncilRecommendationClass.HardPolicyBlock;
+            store.Update(created);
+#pragma warning restore CS0618
+
+            Assert.Equal(CouncilRecommendationClass.NeedsUserDecision, created.RecommendationClass);
+            Assert.Equal(CouncilRecommendationClass.NeedsUserDecision,
+                store.List(pid).Single().RecommendationClass);
+        }
+
+        [Fact]
+        public async Task RebuttalPrompts_ContainOtherOpenings()
+        {
+            var h = new Harness();
+            string pid = NewStewardId();
+            await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null, "routine", "decision",
+                "m", 5, 10, CancellationToken.None);
+
+            // The Strategist's rebuttal must include the Skeptic's and Pragmatist's opening text.
+            var strategistRebuttal = h.ContinueCalls.First(c => c.sid.EndsWith("-strategist")).user;
+            Assert.Contains("skeptic", strategistRebuttal, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("pragmatist", strategistRebuttal, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("-strategist", strategistRebuttal); // not its own opening
+        }
+
+        [Fact]
+        public async Task Events_EmittedInOrder()
+        {
+            var h = new Harness();
+            string pid = NewStewardId();
+            await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null, "routine", "decision",
+                "m", 5, 10, CancellationToken.None);
+
+            var types = h.Log.ReadSince(pid, 0).Select(e => e.Type).ToList();
+            Assert.Equal(StewardEventTypes.CouncilConvened, types.First());
+            Assert.Equal(StewardEventTypes.CouncilVerdict, types.Last());
+            Assert.Equal(7, types.Count(t => t == StewardEventTypes.CouncilStatement));
+        }
+
+        [Fact]
+        public async Task OnePanelistFails_StillCompletesWithRemaining()
+        {
+            var h = new Harness();
+            h.ReturnNullForSessionSubstring.Add("-skeptic"); // skeptic never opens
+            string pid = NewStewardId();
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null, "routine", "decision",
+                "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, session.Status);
+            Assert.Equal(2, session.Statements.Count(s => s.Round == 1)); // 2 openings survived
+            Assert.Equal(2, session.Statements.Count(s => s.Round == 2)); // only respondents rebut
+            Assert.Equal("CHAIR-VERDICT", session.VerdictText);
+        }
+
+        [Fact]
+        public async Task TooFewOpenings_Fails()
+        {
+            var h = new Harness();
+            h.ReturnNullForSessionSubstring.Add("-skeptic");
+            h.ReturnNullForSessionSubstring.Add("-pragmatist"); // only strategist opens → <2
+            string pid = NewStewardId();
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null, "routine", "decision",
+                "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Failed, session.Status);
+            Assert.Contains("panelists", session.Error!, StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Fact]
+        public async Task Cancellation_MarksCancelled_AndRethrows()
+        {
+            var h = new Harness();
+            using var cts = new CancellationTokenSource();
+            cts.Cancel();
+            string pid = NewStewardId();
+            await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+                h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null, "routine", "decision", "m", 5, 10, cts.Token));
+
+            var stored = h.Store.List(pid).FirstOrDefault();
+            Assert.NotNull(stored);
+            Assert.Equal(CouncilStatus.Cancelled, stored!.Status);
+        }
+
+        [Fact]
+        public async Task CustomRoles_AreClampedAndUsed()
+        {
+            var h = new Harness();
+            string pid = NewStewardId();
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B",
+                roles: new[] { "Economist", "Engineer", "Lawyer", "Chair", "Economist" }, // Chair stripped, dupes removed
+                "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(new[] { "Economist", "Engineer", "Lawyer" }, session.Roles);
+        }
+
+        [Fact]
+        public async Task PerWakeCap_LeavesStewardFreeToProceed_WithoutPersistingAnotherCouncil()
+        {
+            var h = new Harness();
+            string pid = NewStewardId();
+            h.Store.Create(new CouncilSession { StewardID = pid, WakeID = "w1", Topic = "prior" });
+            h.Store.Create(new CouncilSession { StewardID = pid, WakeID = "w1", Topic = "prior2" });
+
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null, "routine", "decision",
+                "m", maxPerWake: 2, maxPerDay: 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Failed, session.Status);
+            Assert.Contains("wake", session.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(2, h.Store.List(pid).Count); // no new session persisted
+        }
+
+        [Fact]
+        public async Task PerDayCap_LeavesStewardFreeToProceed()
+        {
+            var h = new Harness();
+            string pid = NewStewardId();
+            h.Store.Create(new CouncilSession { StewardID = pid, WakeID = "wX", Topic = "prior" });
+
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null, "routine", "decision",
+                "m", maxPerWake: 5, maxPerDay: 1, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Failed, session.Status);
+            Assert.Contains("daily", session.Error!, StringComparison.OrdinalIgnoreCase);
+        }
+
+        [Fact]
+        public async Task DuplicateTopicAndBriefing_CanBeRetestedOnALaterWake()
+        {
+            var h = new Harness();
+            string pid = NewStewardId();
+            var first = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "Choose launch path", "Evidence A and B",
+                null, "routine", "decision", "m", 5, 10, CancellationToken.None);
+            Assert.Equal(CouncilStatus.Completed, first.Status);
+
+            var duplicate = await h.Runner.ConveneAsync(NewSteward(pid), "w2", "  CHOOSE   launch path ", " evidence a AND b ",
+                null, "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, duplicate.Status);
+            Assert.Equal(2, h.Store.List(pid).Count);
+        }
+
+        [Fact]
+        public async Task DuplicateTopicAndBriefing_IsDeduplicatedWithinTheSameWake()
+        {
+            var h = new Harness();
+            string pid = NewStewardId();
+            var first = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "Choose launch path", "Evidence A and B",
+                null, "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            var duplicate = await h.Runner.ConveneAsync(NewSteward(pid), "w1", " choose LAUNCH path ", " evidence a and B ",
+                null, "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, first.Status);
+            Assert.Equal(CouncilStatus.Failed, duplicate.Status);
+            Assert.Contains("wake", duplicate.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.Single(h.Store.List(pid));
+        }
+
+        [Fact]
+        public async Task CostCeiling_StopsLaunchingTurnsAndReturnsPartialEvidence()
+        {
+            var h = new Harness();
+            h.Runner.QueryAsync = (pid_, sid, sys, user, routes, max, ct) =>
+            {
+                lock (h.QueryCalls) h.QueryCalls.Add((sid, user));
+                return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, "OPENING", 100, 50, "gen", 0.03));
+            };
+            string pid = NewStewardId();
+
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null,
+                "routine", "decision", new[] { "m" }, 5, 10, maxCostUsd: 0.05, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Partial, session.Status);
+            Assert.Equal(2, h.QueryCalls.Count);
+            Assert.Empty(h.ContinueCalls);
+            Assert.Contains("cost ceiling", session.Error!, StringComparison.OrdinalIgnoreCase);
+            Assert.StartsWith("COUNCIL PARTIAL VERDICT", StewardCouncilRunner.FormatForCommander(session));
+            Assert.Equal(StewardEventTypes.CouncilVerdict, h.Log.ReadSince(pid, 0).Last().Type);
+        }
+
+        [Fact]
+        public async Task MidCouncilBudgetPause_IsPartialRatherThanFailed()
+        {
+            var h = new Harness();
+            h.Runner.IsBudgetPaused = _ => h.SpendCalls > 0;
+            string pid = NewStewardId();
+
+            var session = await h.Runner.ConveneAsync(NewSteward(pid), "w1", "T", "B", null,
+                "routine", "decision", "m", 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Partial, session.Status);
+            Assert.NotEmpty(session.VerdictText!);
+            Assert.StartsWith("COUNCIL PARTIAL VERDICT", StewardCouncilRunner.FormatForCommander(session));
+        }
+
+        [Fact]
+        public async Task Council_PassesItsConfiguredRouteListToEveryTurn()
+        {
+            var routeLists = new ConcurrentBag<string>();
+            var runner = new StewardCouncilRunner(new StewardCouncilStore(_ => { }), new StewardEventLogStore(_ => { }), _ => { })
+            {
+                QueryAsync = (pid_, sid, sys, user, routes, max, ct) =>
+                {
+                    routeLists.Add(string.Join("|", routes));
+                    return Task.FromResult<CouncilTurn?>(new CouncilTurn(true,
+                        sid.EndsWith("-chair") ? "VERDICT" : "OPENING", 1, 1, null, 0));
+                },
+                ContinueAsync = (pid_, sid, user, routes, max, ct) =>
+                {
+                    routeLists.Add(string.Join("|", routes));
+                    return Task.FromResult<CouncilTurn?>(new CouncilTurn(true, "REBUTTAL", 1, 1, null, 0));
+                },
+            };
+
+            var session = await runner.ConveneAsync(NewSteward(NewStewardId()), "w", "T", "B", null,
+                "routine", "decision", new[] { "bad/model", "good/model", "unused/model" }, 5, 10, CancellationToken.None);
+
+            Assert.Equal(CouncilStatus.Completed, session.Status);
+            Assert.Equal(7, routeLists.Count);
+            Assert.All(routeLists, routes => Assert.Equal("bad/model|good/model|unused/model", routes));
+        }
+    }
+}

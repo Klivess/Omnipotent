@@ -153,7 +153,10 @@ public sealed class ActivityStoreTests : IDisposable
         }).ToList();
         store.WriteBatch(requests.Cast<object>().ToList());
 
-        var summary = store.GetSummary("p1", TimeSpan.FromDays(7), now.AddMinutes(1));
+        // The raw-row pass (what summaries read until the rollups are backfilled). Here a route has
+        // no fixed permission or service, which the rollups (keyed by route) assume; ActivityRollupTests
+        // holds the rollups to this answer with realistic routes.
+        var summary = store.GetSummaryFromRows("p1", TimeSpan.FromDays(7), now.AddMinutes(1));
         Assert.Equal(requests.Count, summary.Requests);
         Assert.Equal(requests.Count(r => r.Status is 401 or 403), summary.Denied);
         Assert.Equal(requests.Count(r => r.Status >= 500), summary.Errors);

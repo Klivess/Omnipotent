@@ -37,6 +37,8 @@ namespace Omnipotent.Services.Omniscience
         public KlivesRadar Radar { get; private set; } = null!;
         public AnalyticsEngine Analytics { get; private set; } = null!;
         public ActivitySummaryStore ActivitySummaries { get; private set; } = null!;
+        /// <summary>Per-person embedding counts behind Replica readiness and data health, recounted in the background.</summary>
+        internal Replica.ReplicaReadinessCounts ReplicaReadiness { get; private set; } = null!;
         public PersonalityProfiler Profiler { get; private set; } = null!;
         public OmniscienceScheduler Scheduler { get; private set; } = null!;
         public MaintenanceJobs Maintenance { get; private set; } = null!;
@@ -111,6 +113,8 @@ namespace Omnipotent.Services.Omniscience
 
             Analytics = new AnalyticsEngine(this, Db);
             ActivitySummaries = new ActivitySummaryStore(Db, msg => _ = ServiceLog(msg));
+            ReplicaReadiness = Replica.ReplicaReadinessCounts.ForDatabase(Db,
+                (personId, ex) => _ = ServiceLogError(ex, $"[Replica] Readiness count failed for person {personId}.", false));
             Profiler = new PersonalityProfiler(this, Db);
             Scheduler = new OmniscienceScheduler(this, Analytics, Profiler);
             Maintenance = new MaintenanceJobs(this, Db, Ocr);

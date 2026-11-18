@@ -50,6 +50,13 @@ namespace Omnipotent.Logging
         // buffer itself became permanent gen2/LOH pressure that slowed every request.
         private const int MaxRetainedLogs = 4000;
         private int logPositionCounter;
+        private long totalErrorsLogged;
+
+        /// <summary>
+        /// Errors logged since the process started. Unlike a count over the retained buffer, this never
+        /// falls when old entries are evicted, so two readings give a true error rate.
+        /// </summary>
+        public long TotalErrorsLogged => Interlocked.Read(ref totalErrorsLogged);
 
         public event EventHandler<LoggedMessage> OnLogMessage;
 
@@ -238,6 +245,7 @@ Data:
             int updateCount = 0;
             DateTime? latestLogAt = null;
             DateTime? latestErrorAt = null;
+            DateTime? oldestLogAt = null;
 
             foreach (var log in logs)
             {
@@ -248,6 +256,11 @@ Data:
                 if (log.TimeOfLog != default && (latestLogAt == null || log.TimeOfLog > latestLogAt))
                 {
                     latestLogAt = log.TimeOfLog;
+                }
+
+                if (log.TimeOfLog != default && (oldestLogAt == null || log.TimeOfLog < oldestLogAt))
+                {
+                    oldestLogAt = log.TimeOfLog;
                 }
 
                 if (log.type == LogType.Error && log.TimeOfLog != default && (latestErrorAt == null || log.TimeOfLog > latestErrorAt))
@@ -312,6 +325,10 @@ Data:
                 ErrorsLast24Hours = logs.Count(log => log.type == LogType.Error && log.TimeOfLog >= now.AddHours(-24)),
                 LatestLogAt = latestLogAt,
                 LatestErrorAt = latestErrorAt,
+                // The buffer is capped, so on a busy day it reaches back far less than the window asked
+                // for: a reader needs this to know what "errors in 24 hours" was actually counted over.
+                OldestLogAt = oldestLogAt,
+                RetainedCapacity = MaxRetainedLogs,
                 Timeline = timeline,
                 TopServices = topServices,
                 ErrorFamilies = errorFamilies
@@ -374,6 +391,7 @@ Data:
         private void EnqueueOverall(ref LoggedMessage message)
         {
             message.position = Interlocked.Increment(ref logPositionCounter);
+            if (message.type == LogType.Error) Interlocked.Increment(ref totalErrorsLogged);
             overallMessages.Enqueue(message);
             while (overallMessages.Count > MaxRetainedLogs && overallMessages.TryDequeue(out _)) { }
         }
