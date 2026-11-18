@@ -83,6 +83,8 @@ namespace Omnipotent.Services.KliveLLM
             public static readonly LlmCaller OmniTumblrCaptions = new("OmniTumblr", "captions");
             public static readonly LlmCaller OmniGramCaptions = new("OmniGram", "captions");
             public static readonly LlmCaller KliveBotChat = new("KliveBot", "discord-chat");
+            public static readonly LlmCaller OmniscienceV3Background = new("OmniscienceV3", "background");
+            public static readonly LlmCaller OmniscienceV3Interactive = new("OmniscienceV3", "interactive");
             public static readonly LlmCaller Internal = new("KliveLLM", "internal");
         }
 
@@ -150,6 +152,13 @@ namespace Omnipotent.Services.KliveLLM
             new("Omniscience", "other", "Other", "Omniscience calls from anywhere else.",
                 AIRouterWorkClass.OneShot),
 
+            // The rewrite, which runs beside Omniscience until cutover. Neither lane spends per token unless that is
+            // changed on the KliveLLM page: the engine reads a whole corpus on its own, and nobody has priced that yet.
+            new("OmniscienceV3", "background", "Background", "What the v3 engine does on its own: extraction, deduction, digests, captions, translation.",
+                AIRouterWorkClass.Background, DefaultSpending: LlmSpending.Never),
+            new("OmniscienceV3", "interactive", "Interactive", "v3 answers someone is waiting for: questions, briefs on request, replica replies.",
+                AIRouterWorkClass.Interactive, DefaultSpending: LlmSpending.Never),
+
             new("Stratum", "engineer", "Engineer", "The Stratum Engineer's tool loop.",
                 AIRouterWorkClass.Agent, NeedsToolCalling: true, ModelSource: "StratumEngineerModelID", ModelSourceLink: "/administration/omnisettings"),
             new("Stratum", "summary", "Summaries", "Turn summaries.",
@@ -177,6 +186,8 @@ namespace Omnipotent.Services.KliveLLM
             ("/services/demiurge/", Callers.DemiurgeUtility),
             ("/services/omniblox/assets/", Callers.OmniBloxLabeller),
             ("/services/omniblox/", Callers.OmniBloxAgents),
+            // v3's calls name their own lane (the gateway passes it); this is the fallback for a call that does not.
+            ("/services/omnisciencev3/", Callers.OmniscienceV3Background),
             ("/services/omniscience/profiling/", new LlmCaller("Omniscience", "profiling")),
             ("/services/omniscience/deduction/detective", new LlmCaller("Omniscience", "detective")),
             ("/services/omniscience/deduction/", new LlmCaller("Omniscience", "extraction")),

@@ -2380,9 +2380,9 @@ namespace Omnipotent.Services.KliveLLM
                     model = primaryModel,
                     stream = false,
                     max_tokens = maxTokensOverride,
-                    // An empty array is rejected by OpenAI-compatible APIs ("tools: [] is too short");
-                    // omitting the key is the same request semantically.
-                    tools = tools is { Count: > 0 } ? tools : null,
+                    // Sent as given, an empty list included: no caller's request bytes change here. A caller
+                    // that must not send an empty array passes none (the gateway does), and the key is left out.
+                    tools = tools,
                     tool_choice = toolChoice,
                     response_format = responseFormat,
                 };

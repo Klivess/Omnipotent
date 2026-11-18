@@ -209,5 +209,87 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.True(call.Has(LlmCallFlags.Redirected));
             Assert.Equal("Qwen3.8", call.ModelRequested);
         }
+
+        private static LlmRequest GatewayRequest(string session, AIRouterWorkClass workClass) => Omnipotent.Services.OmniscienceV3.Llm.KliveLlmClient.Named(new LlmRequest
+        {
+            Purpose = "extract.slice", SessionKey = session, SystemPrompt = "SYSTEM", Turns = new[] { new LlmTurn("user", "Read this.") }, WorkClass = workClass,
+        });
+
+        [Fact]
+        public async Task AGatewayCall_IsRoutedAndLoggedAsItsCaller_NotAsKliveLLM()
+        {
+            // Omniscience v3 reaches the models through the gateway, whose own file is inside Services/KliveLLM. The caller
+            // it passes on is what the plan, the spending rule and the ledger row hang off.
+            var service = Service(new LlmRoutingDocument(), LlmService.LLMProvider.AIRouter);
+            var result = await service.QueryAsync(GatewayRequest("omniscience-bg-routed-1", AIRouterWorkClass.Background));
+            Assert.True(result.Success, result.ErrorMessage);
+            Assert.Single(requests);
+
+            await ledger.FlushAsync();
+            var call = ledger.Db.QueryCalls(new LlmCallFilter { FromMs = 0, ToMs = long.MaxValue }, out _).Single();
+            Assert.Equal("OmniscienceV3", call.Service);
+            Assert.Equal("background", call.Lane);
+            Assert.Equal("extract.slice", call.Operation);
+        }
+
+        [Fact]
+        public async Task AnEmptyToolList_IsSentAsTheCallerGaveIt_AndOnlyTheGatewayLeavesTheKeyOut()
+        {
+            // Demiurge's front desk and summaries and Stratum's summary pass an empty list, and always have: their
+            // request stays what it was. The gateway must not send an empty array, so it passes no list at all.
+            var service = Service(new LlmRoutingDocument(), LlmService.LLMProvider.AIRouter);
+            Seed(service, "stratum-engineer-p-tools", LlmConsumerCatalog.Callers.StratumEngineer);
+            var direct = await service.QueryToolSessionAsync("stratum-engineer-p-tools", new List<HFWrapper.HFTool>(), maxTokensOverride: 50);
+            Assert.True(direct.Success);
+            var sent = Newtonsoft.Json.Linq.JObject.Parse(requests.Single().Body)["tools"] as Newtonsoft.Json.Linq.JArray;
+            Assert.NotNull(sent);
+            Assert.Empty(sent!);
+
+            lock (requests) requests.Clear();
+            var result = await service.QueryAsync(GatewayRequest("omniscience-bg-tools-1", AIRouterWorkClass.Background));
+            Assert.True(result.Success, result.ErrorMessage);
+            Assert.Null(Newtonsoft.Json.Linq.JObject.Parse(requests.Single().Body)["tools"]);
+        }
+
+        [Fact]
+        public async Task TheWindowAPromptIsPackedFor_IsThatOfTheModelTheCallersLaneIsRoutedTo()
+        {
+            // Omniscience v3 packs each prompt to the model's context window. Asked without a caller, the answer was
+            // always the default route's model: a lane routed elsewhere was packed for a model it is never sent to.
+            var doc = new LlmRoutingDocument();
+            doc.Routers.Add(Router("wide", LlmBilling.Flat));
+            doc.Lanes["OmniscienceV3/background"] = new LlmRoutePolicy { Router = "wide", Model = "wide-large" };
+            var service = Service(doc, LlmService.LLMProvider.AIRouter);
+
+            var (routed, routedModel) = await service.ServedByAsync(LlmConsumerCatalog.Callers.OmniscienceV3Background, null, default);
+            Assert.Equal("wide", routed.RouterId);
+            Assert.Equal("wide-large", routedModel);
+
+            // The lane that is not routed goes where everything goes by default.
+            var (unrouted, unroutedModel) = await service.ServedByAsync(LlmConsumerCatalog.Callers.OmniscienceV3Interactive, null, default);
+            Assert.Equal(LlmRouterIds.AIRouter, unrouted.RouterId);
+            Assert.Equal(unrouted.Model, unroutedModel);
+
+            // And it is the model the call itself is sent with.
+            var result = await service.QueryAsync(GatewayRequest("omniscience-bg-window-1", AIRouterWorkClass.Background));
+            Assert.True(result.Success, result.ErrorMessage);
+            Assert.Equal("wide.test", requests.Single().Host);
+            Assert.Equal(routedModel, result.Model);
+        }
+
+        [Fact]
+        public async Task OmniscienceV3_OnAPerTokenProvider_IsStoppedBeforeAnythingIsSent()
+        {
+            // Neither v3 lane spends per token unless that is changed on the KliveLLM page: on a billed router the call
+            // is refused with the reason, and nothing leaves the machine.
+            var service = Service(new LlmRoutingDocument(), LlmService.LLMProvider.OpenRouter);
+            foreach (var workClass in new[] { AIRouterWorkClass.Background, AIRouterWorkClass.Interactive })
+            {
+                var result = await service.QueryAsync(GatewayRequest("omniscience-routed-" + workClass, workClass));
+                Assert.False(result.Success);
+                Assert.Contains("free or flat-fee", result.ErrorMessage);
+            }
+            Assert.Empty(requests);
+        }
     }
 }

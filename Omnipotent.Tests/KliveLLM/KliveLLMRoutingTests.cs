@@ -287,6 +287,46 @@ namespace Omnipotent.Tests.KliveLLM
             Assert.Equal("KliveBot/discord-chat", LlmConsumerCatalog.FromCallSite(@"C:\src\Omnipotent\Services\KliveBot Discord\KliveBotDiscord.cs").Key);
             Assert.Equal("NewThing/default", LlmConsumerCatalog.FromCallSite(@"C:\src\Omnipotent\Services\NewThing\Engine.cs").Key);
             Assert.Equal("Other/default", LlmConsumerCatalog.FromCallSite(null).Key);
+            // The rewrite lives in its own folder and is its own service: neither name swallows the other.
+            Assert.Equal("OmniscienceV3/background", LlmConsumerCatalog.FromCallSite(@"C:\src\Omnipotent\Services\OmniscienceV3\Llm\LlmClient.cs").Key);
+            Assert.Equal("Omniscience/other", LlmConsumerCatalog.FromCallSite(@"C:\src\Omnipotent\Services\Omniscience\OmniscienceLlm.cs").Key);
+        }
+
+        [Fact]
+        public void OmniscienceV3_NamesItsLaneByWhatIsWaitedFor_AndNeitherLaneSpendsByDefault()
+        {
+            static LlmRequest Request(AIRouterWorkClass workClass, LlmCaller? caller = null) => new()
+            {
+                Purpose = "extract.slice", SessionKey = "omniscience-bg-test", Turns = new[] { new LlmTurn("user", "hello") }, WorkClass = workClass, Caller = caller,
+            };
+            var named = Omnipotent.Services.OmniscienceV3.Llm.KliveLlmClient.Named;
+
+            Assert.Equal("OmniscienceV3/background", named(Request(AIRouterWorkClass.Background)).Caller!.Key);
+            Assert.Equal("OmniscienceV3/background", named(Request(AIRouterWorkClass.Burst)).Caller!.Key);
+            Assert.Equal("OmniscienceV3/interactive", named(Request(AIRouterWorkClass.Interactive)).Caller!.Key);
+            // A request that names its caller keeps it.
+            var own = new LlmCaller("OmniscienceV3", "background", Operation: "own");
+            Assert.Same(own, named(Request(AIRouterWorkClass.Interactive, own)).Caller);
+
+            foreach (var caller in new[] { LlmConsumerCatalog.Callers.OmniscienceV3Background, LlmConsumerCatalog.Callers.OmniscienceV3Interactive })
+            {
+                var lane = LlmConsumerCatalog.Find(caller);
+                Assert.NotNull(lane);
+                Assert.Equal(LlmSpending.Never, lane!.DefaultSpending);
+            }
+            Assert.Equal(AIRouterWorkClass.Background, LlmConsumerCatalog.DefaultWorkClass(LlmConsumerCatalog.Callers.OmniscienceV3Background));
+            Assert.Equal(AIRouterWorkClass.Interactive, LlmConsumerCatalog.DefaultWorkClass(LlmConsumerCatalog.Callers.OmniscienceV3Interactive));
+
+            // The gateway's own file is inside Services/KliveLLM. Without the caller it passes on, a v3 call would be
+            // filed under KliveLLM itself and follow that lane's spending rule.
+            string gatewayFile = @"C:\src\Omnipotent\Services\KliveLLM\KliveLLM.Gateway.cs";
+            Assert.Equal("KliveLLM/internal", LlmConsumerCatalog.FromCallSite(gatewayFile).Key);
+            var passedOn = Omnipotent.Services.KliveLLM.KliveLLM.GatewayCaller(named(Request(AIRouterWorkClass.Background)), gatewayFile);
+            Assert.Equal("OmniscienceV3/background", passedOn.Key);
+            Assert.Equal("extract.slice", passedOn.Operation);
+            // A request without a caller is named from the file that made the call.
+            Assert.Equal("OmniscienceV3/background",
+                Omnipotent.Services.KliveLLM.KliveLLM.GatewayCaller(Request(AIRouterWorkClass.Background), @"C:\src\Omnipotent\Services\OmniscienceV3\Modules\Translate\TranslateModule.cs").Key);
         }
 
         /// <summary>

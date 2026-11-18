@@ -47,6 +47,9 @@ public sealed record LlmRequest
     public string? ReasoningEffort { get; init; }
     public Action<string>? OnToken { get; init; }
     public bool KeepSession { get; init; }
+    /// <summary>Who is asking. KliveLLM routes, budgets and logs by caller; left empty, the caller is named from the
+    /// file that made the call.</summary>
+    public LlmCaller? Caller { get; init; }
 }
 
 public enum LlmErrorKind
@@ -103,15 +106,44 @@ public partial class KliveLLM
         }
     }
 
-    /// <summary>Context limits of the model a request would be served by right now.</summary>
-    public async Task<ModelContextInfo> GetActiveModelContextAsync(string? modelOverride = null, CancellationToken ct = default)
+    /// <summary>Context limits of the model a request would be served by right now. KliveLLM routes by caller, so
+    /// with <paramref name="caller"/> this is the model that caller's calls go out to; without one it is the default
+    /// route's, as it was before per-service routing.</summary>
+    public async Task<ModelContextInfo> GetActiveModelContextAsync(string? modelOverride = null, CancellationToken ct = default,
+        LlmCaller? caller = null)
     {
         await RefreshContextSettingsAsync().ConfigureAwait(false);
-        var provider = await GetRemoteProviderConfigurationAsync(false).ConfigureAwait(false);
-        string model = string.IsNullOrWhiteSpace(modelOverride) ? provider.Model : modelOverride.Trim();
+        var (provider, model) = await ServedByAsync(caller, modelOverride, ct).ConfigureAwait(false);
         if (provider.Provider == LLMProvider.AIRouter)
             model = await ResolveAIRouterModelAsync(model, provider, ct).ConfigureAwait(false);
         return await ContextRegistry.ResolveAsync(provider.Provider.ToString(), model, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// The router and model a call from <paramref name="caller"/> would go out to first: its lane's route, with the
+    /// model chosen exactly as the call itself chooses it. A caller whose route cannot be read (paused, over its
+    /// budget, not allowed to spend, no key) is answered with the default route: the call itself reports why it
+    /// cannot run, and a prompt packed for the default model is the same prompt that was packed before routing.
+    /// </summary>
+    internal async Task<(RemoteLLMProviderConfiguration Provider, string Model)> ServedByAsync(LlmCaller? caller, string? modelOverride, CancellationToken ct)
+    {
+        if (caller != null)
+        {
+            var decision = await ResolveRouteAsync(caller).ConfigureAwait(false);
+            if (!decision.IsBlocked && decision.Primary is { IsLocal: false } router)
+            {
+                RemoteLLMProviderConfiguration? config;
+                try { config = await BuildRouterConfigurationAsync(router, decision).ConfigureAwait(false); }
+                catch (InvalidOperationException) { config = null; }
+                if (config != null)
+                {
+                    var (served, _) = await ChooseModelAsync(new LlmPlannedRoute(router, config, decision.Model, decision.Pin, false), modelOverride, ct).ConfigureAwait(false);
+                    return (config, served);
+                }
+            }
+        }
+        var byDefault = await GetRemoteProviderConfigurationAsync(false).ConfigureAwait(false);
+        return (byDefault, string.IsNullOrWhiteSpace(modelOverride) ? byDefault.Model : modelOverride.Trim());
     }
 
     private async Task RefreshContextSettingsAsync()
@@ -166,6 +198,15 @@ public partial class KliveLLM
         catch (Exception) { return null; }
     }
 
+    /// <summary>The caller of a gateway request: the one it names, else the one its call site implies. The purpose is
+    /// kept as the operation, so the call ledger can tell an extraction from a digest. It is a code-defined label,
+    /// never a person or a message.</summary>
+    internal static LlmCaller GatewayCaller(LlmRequest request, string? callerFile)
+    {
+        var who = LlmConsumerCatalog.Resolve(request.Caller, callerFile);
+        return who.Operation == null && !string.IsNullOrWhiteSpace(request.Purpose) ? who with { Operation = request.Purpose } : who;
+    }
+
     /// <summary>
     /// The structured gateway Omniscience v3 builds on (plan "LLM gateway"). Unlike <see cref="QueryLLM"/>:
     /// <list type="bullet">
@@ -177,15 +218,20 @@ public partial class KliveLLM
     /// <item>it never leaks sessions: stateless calls reset in finally; KeepSession sessions are the caller's to end.</item>
     /// </list>
     /// </summary>
-    public async Task<LlmResult> QueryAsync(LlmRequest request, CancellationToken ct = default)
+    public async Task<LlmResult> QueryAsync(LlmRequest request, CancellationToken ct = default,
+        [System.Runtime.CompilerServices.CallerFilePath] string callerFile = "")
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(request.SessionKey);
         if (request.Turns.Count == 0 || request.Turns[^1].Role != "user")
             throw new ArgumentException("A request must end with a user turn.", nameof(request));
 
+        // Named here and passed down: left to the entry points below, every gateway call would be filed under
+        // KliveLLM itself (this file is where they are made from) and follow that lane's spending rule, not the caller's.
+        LlmCaller who = GatewayCaller(request, callerFile);
+
         string sid = request.SessionKey;
         bool fresh = !request.KeepSession || !CanContinueToolSession(sid);
-        if (fresh) StartToolSession(sid, request.SystemPrompt);
+        if (fresh) StartToolSession(sid, request.SystemPrompt, caller: who);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
         string provider = "", model = request.Model ?? "";
@@ -204,12 +250,14 @@ public partial class KliveLLM
                 toolChoice = new { type = "function", function = new { name = schema.Name } };
             }
 
-            var resp = await QueryToolSessionAsync(sid, tools, request.MaxOutputTokens, request.Model, ct, request.OnToken,
+            // Without a schema there are no tools, and the key is left out: OpenAI-compatible APIs reject an empty
+            // array ("tools: [] is too short"). Left out here, not in the sender, so no other caller's request changes.
+            var resp = await QueryToolSessionAsync(sid, tools.Count > 0 ? tools : null!, request.MaxOutputTokens, request.Model, ct, request.OnToken,
                 request.ReasoningEffort, onToolCallComplete: null, modelRoutes: null,
                 compactAboveTokensOverride: 0, compactKeepRecentMessagesOverride: null, contextWindowTokensOverride: null,
                 enableOpenRouterContextCompression: false, samplingParameters: request.Sampling, compactProtectPrefixMessages: 0,
                 workClass: request.WorkClass, honourThinkingOnAIRouter: request.ReasoningEffort != null,
-                toolChoice: toolChoice, responseFormat: null).ConfigureAwait(false);
+                toolChoice: toolChoice, responseFormat: null, caller: who).ConfigureAwait(false);
             sw.Stop();
             provider = resp.Provider ?? "";
             model = resp.Model ?? model;

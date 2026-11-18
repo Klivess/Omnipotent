@@ -20,6 +20,17 @@ every lane with its label, AIRouter work class, whether it needs tool calling, i
 its own model setting lives, and a fixed router if it has one (KliveAgent › speech is always AIRouter).
 `KliveLLMRoutingTests.EveryCallSite_ResolvesToACataloguedLane` fails if a new call site falls through.
 
+The structured gateway (`KliveLLM.Gateway.cs`, `QueryAsync(LlmRequest)`), which Omniscience v3 calls through,
+is the one entry point whose own file is inside `Services/KliveLLM`: named from the call site, everything sent
+through it would be filed under KliveLLM › internal and follow that lane's spending rule. So a request says
+who is asking (`LlmRequest.Caller`; without it, the file that called the gateway), and its purpose is kept as
+the operation. Omniscience v3 has two lanes, named by what is being waited for
+(`OmniscienceV3/Llm/LlmClient.cs`): `OmniscienceV3/background` for what the engine does on its own and
+`OmniscienceV3/interactive` for answers someone is waiting for. Neither spends per token unless that is
+changed on the page. `GetActiveModelContextAsync(caller:)` answers with the limits of the model that caller's
+lane is routed to, so a prompt is packed for the model it is sent to. v3 asks for its background lane: if
+its two lanes are ever routed to models with different windows, that question has to carry the work class.
+
 ## How a route is chosen
 
 `Routing/LlmRouteResolver.cs` (pure; the page shows its reasons as "How this route was chosen"):
@@ -43,7 +54,7 @@ call fails before anything is sent, with `RemoteLLMFailureKind` `Paused`, `Budge
 
 | Value | Meaning |
 |---|---|
-| `Never` | Free and flat-fee routers only, as primary and as fallback (OmniBlox, Omniscience's free lanes). |
+| `Never` | Free and flat-fee routers only, as primary and as fallback (OmniBlox, Omniscience's free lanes, both Omniscience v3 lanes). |
 | `PrimaryOnly` (default) | May be routed to a per-token router, but never *falls* from a free or flat-fee router onto one. |
 | `Anywhere` | Falls back onto per-token routers too. |
 
