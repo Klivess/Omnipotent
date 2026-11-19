@@ -141,6 +141,14 @@ CREATE TRIGGER trg_link_words_delete AFTER DELETE ON link_urls BEGIN
   DELETE FROM link_words WHERE rowid = OLD.rowid;
 END;
 """),
+            // The first hours on the server (19 Nov, evening): a search for a common word still took 150 seconds. Every
+            // match was looked up in link_urls only to be sorted by when it was last shared, and a kind or topic had no
+            // index to be read newest-first from. A search now starts from an index on whichever filter it has.
+            new Migration(ModuleId, 3, "search: links newest first by kind, topic and host", """
+CREATE INDEX ix_link_urls_kind ON link_urls(kind, last_shared_ms DESC);
+CREATE INDEX ix_link_urls_topic ON link_urls(topic, last_shared_ms DESC) WHERE topic IS NOT NULL;
+CREATE INDEX ix_link_urls_host ON link_urls(host, last_shared_ms DESC);
+"""),
         };
 
         internal ModuleContext Ctx => Context;

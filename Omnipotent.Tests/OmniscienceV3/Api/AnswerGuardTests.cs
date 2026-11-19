@@ -79,6 +79,34 @@ namespace Omnipotent.Tests.OmniscienceV3.Api
             Assert.Equal(2L, guard.Deferred);
         }
 
+        /// <summary>
+        /// Most v3 handlers have no await in them: <c>req => OkAsync(req, module.Search(...))</c> runs the whole search
+        /// before it returns a task. The first deployment of the guard called the handler directly, so its clock only
+        /// started once such a handler had finished: on the server two searches still held their requests for over a minute.
+        /// </summary>
+        [Fact]
+        public async Task AHandlerThatNeverAwaits_IsStillAnsweredInTime()
+        {
+            var guard = Guard();
+            using var release = new ManualResetEventSlim(false);
+            var first = new Request();
+            Func<Task> synchronous = () =>
+            {
+                var slot = ApiResponses.Slot!;
+                release.Wait(TimeSpan.FromSeconds(30)); // a query on a busy disk: no await anywhere
+                return slot.AnswerAsync("""{"items":[7]}""", HttpStatusCode.OK, () => first.Write("""{"items":[7]}""", HttpStatusCode.OK));
+            };
+            var asked = System.Diagnostics.Stopwatch.StartNew();
+            await guard.RunAsync("k", synchronous, first.Write, first.Pending);
+            Assert.True(asked.ElapsedMilliseconds < 5_000, $"answered after {asked.ElapsedMilliseconds} ms");
+            Assert.Equal(HttpStatusCode.Accepted, Assert.Single(first.Written).Status);
+
+            release.Set();
+            var second = new Request();
+            await guard.RunAsync("k", Handler(second, Task.CompletedTask, "never"), second.Write, second.Pending);
+            Assert.Equal(("""{"items":[7]}""", HttpStatusCode.OK), Assert.Single(second.Written));
+        }
+
         [Fact]
         public async Task TheAskThatWaits_IsGivenTheAnswerAsSoonAsItIsThere()
         {

@@ -125,12 +125,23 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Links
         /// <summary>How many links a search with words, a site, a kind or a topic looks at: the most recently shared that match.</summary>
         public const int SearchLinkCap = 400;
 
+        /// <summary>How many of the newest links matching the words are considered at all.</summary>
+        public const int SearchWordCap = 2_000;
+
         /// <summary>
         /// "What did X share about Y": shares filtered by who, what words (in the address, title, author, description or
         /// summary; a word also matches the words it begins), site, kind, topic and time. Newest first.
-        /// <para>Every path is a walk along an index. With nothing said about the link, the shares are read newest first.
-        /// Otherwise the links that match are found first (the <see cref="SearchLinkCap"/> shared most recently), then
-        /// their shares. It used to join and sort every share on each request.</para>
+        /// <para>Nothing here reads more than a bounded number of rows, however common the word or the site:</para>
+        /// <list type="bullet">
+        /// <item>With nothing said about the link, the shares are read newest first and the read stops at the limit.</item>
+        /// <item>Words are looked up in the full-text index from its newest entries (a link's rowid rises with when it
+        /// was first seen), <see cref="SearchWordCap"/> at most; only those links are then read.</item>
+        /// <item>A site, kind or topic is read newest first from its own index.</item>
+        /// <item>Of each candidate link only its newest shares are read, and the candidates are walked from the most
+        /// recently shared until none left could hold a share newer than the ones already found.</item>
+        /// </list>
+        /// The first version of this joined and sorted every share per request; the second still looked up every match of
+        /// a common word in order to sort it, and read every share of every candidate (150 seconds on the server's busy disk).
         /// </summary>
         public LinkSearchDto Search(string? query, string? personId, string? site, string? kind, string? topic, long? fromMs, long? toMs, int limit = 50)
         {
@@ -145,52 +156,100 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Links
             if (fromMs != null) { shareWhere.Add("s.at_ms >= $f"); shareArgs.Add(("$f", fromMs)); }
             if (toMs != null) { shareWhere.Add("s.at_ms < $e"); shareArgs.Add(("$e", toMs)); }
 
-            var linkWhere = new List<string>();
-            var linkArgs = new List<(string, object?)>();
             var words = (query ?? "").ToLowerInvariant()
                 .Split(new[] { ' ', ',', '"', '\'', '(', ')', '*', '^', '+', '{', '}', '[', ']' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                 .Where(w => w.Any(char.IsLetterOrDigit)).Take(6).ToList();
-            if (words.Count > 0)
-            {
-                // Each word is a quoted string to the index (nothing in it is read as query syntax); all of them must be there.
-                linkWhere.Add("u.rowid IN (SELECT rowid FROM link_words WHERE link_words MATCH $q)");
-                linkArgs.Add(("$q", string.Join(" AND ", words.Select(w => "\"" + w + "\"*"))));
-            }
-            if (!string.IsNullOrWhiteSpace(site)) { linkWhere.Add("(u.site=$s OR u.host=$s)"); linkArgs.Add(("$s", SiteKey(site))); }
-            if (!string.IsNullOrWhiteSpace(kind)) { linkWhere.Add("u.kind=$k"); linkArgs.Add(("$k", kind.Trim().ToLowerInvariant())); }
-            if (!string.IsNullOrWhiteSpace(topic)) { linkWhere.Add("u.topic=$t"); linkArgs.Add(("$t", topic.Trim().ToLowerInvariant())); }
+            string? siteKey = string.IsNullOrWhiteSpace(site) ? null : SiteKey(site);
+            string? kindKey = string.IsNullOrWhiteSpace(kind) ? null : kind.Trim().ToLowerInvariant();
+            string? topicKey = string.IsNullOrWhiteSpace(topic) ? null : topic.Trim().ToLowerInvariant();
 
             const string columns = "s.message_id, s.person_id, s.conversation_id, s.guild_id, s.at_ms, ";
             static ShareRow Row(SqliteDataReader r) => new(r.GetString(0), r.GetStringOrNull(1), r.GetString(2), r.GetStringOrNull(3), r.GetInt64(4), ReadUrl(r, 5));
-            List<ShareRow> rows;
-            bool capped = false;
-            using (var c = Context.Stores.Intel.OpenRead())
+            string shareFilter = shareWhere.Count == 0 ? "" : " AND " + string.Join(" AND ", shareWhere);
+            using var c = Context.Stores.Intel.OpenRead();
+
+            if (words.Count == 0 && siteKey == null && kindKey == null && topicKey == null)
             {
-                if (linkWhere.Count == 0)
-                {
-                    // CROSS JOIN keeps the shares as the outer loop: they are read in time order and the read stops at the limit.
-                    rows = c.Query(null, $"""
-                        SELECT {columns}{UrlColumns} FROM link_shares s CROSS JOIN link_urls u ON u.url_id=s.url_id
-                        {(shareWhere.Count == 0 ? "" : "WHERE " + string.Join(" AND ", shareWhere))}
-                        ORDER BY s.at_ms DESC, s.message_id LIMIT $lim
-                        """, Row, shareArgs.Append(("$lim", (object?)(limit + 1))).ToArray());
-                }
-                else
-                {
-                    var links = c.Query(null, $"SELECT u.url_id FROM link_urls u WHERE {string.Join(" AND ", linkWhere)} ORDER BY u.last_shared_ms DESC LIMIT {SearchLinkCap + 1}",
-                        r => r.GetString(0), linkArgs.ToArray());
-                    capped = links.Count > SearchLinkCap;
-                    if (capped) links.RemoveAt(links.Count - 1);
-                    if (links.Count == 0) return new LinkSearchDto(Array.Empty<LinkShareDto>(), false);
-                    var (list, inArgs) = SqlHelpers.InList(links, "$u");
-                    rows = c.Query(null, $"""
-                        SELECT {columns}{UrlColumns} FROM link_shares s JOIN link_urls u ON u.url_id=s.url_id
-                        WHERE s.url_id IN ({list}){(shareWhere.Count == 0 ? "" : " AND " + string.Join(" AND ", shareWhere))}
-                        ORDER BY s.at_ms DESC, s.message_id LIMIT $lim
-                        """, Row, inArgs.Concat(shareArgs).Append(("$lim", (object?)(limit + 1))).ToArray());
-                }
+                // CROSS JOIN keeps the shares as the outer loop: they are read in time order and the read stops at the limit.
+                var newest = c.Query(null, $"""
+                    SELECT {columns}{UrlColumns} FROM link_shares s CROSS JOIN link_urls u ON u.url_id=s.url_id
+                    {(shareWhere.Count == 0 ? "" : "WHERE " + string.Join(" AND ", shareWhere))}
+                    ORDER BY s.at_ms DESC, s.message_id LIMIT $lim
+                    """, Row, shareArgs.Append(("$lim", (object?)(limit + 1))).ToArray());
+                return new LinkSearchDto(Present(newest.Take(limit).ToList()), newest.Count > limit);
             }
-            return new LinkSearchDto(Present(rows.Take(limit).ToList()), rows.Count > limit || capped);
+
+            // 1. The links that match, most recently shared first.
+            var (links, capped) = MatchingLinks(c, words, siteKey, kindKey, topicKey);
+            if (links.Count == 0) return new LinkSearchDto(Array.Empty<LinkShareDto>(), false);
+
+            // 2. Their newest shares. A link whose last share is older than the oldest share kept so far cannot add one.
+            var best = new List<ShareRow>();
+            foreach (var (urlId, lastShared) in links)
+            {
+                if (best.Count > limit && lastShared < best[^1].At) break;
+                best.AddRange(c.Query(null, $"""
+                    SELECT {columns}{UrlColumns} FROM link_shares s INDEXED BY ix_link_shares_url CROSS JOIN link_urls u ON u.url_id=s.url_id
+                    WHERE s.url_id=$u{shareFilter}
+                    ORDER BY s.at_ms DESC, s.message_id DESC LIMIT $lim
+                    """, Row, shareArgs.Append(("$u", urlId)).Append(("$lim", (object?)(limit + 1))).ToArray()));
+                best = best.OrderByDescending(r => r.At).ThenBy(r => r.Message, StringComparer.Ordinal).Take(limit + 1).ToList();
+            }
+            return new LinkSearchDto(Present(best.Take(limit).ToList()), best.Count > limit || capped);
+        }
+
+        /// <summary>
+        /// Up to <see cref="SearchLinkCap"/> links matching the words and filters, most recently shared first, and whether
+        /// more matched than were looked at. Each path starts from one index and stops at a cap.
+        /// </summary>
+        private static (List<(string UrlId, long LastSharedMs)> Links, bool Capped) MatchingLinks(SqliteConnection c, List<string> words, string? site, string? kind, string? topic)
+        {
+            var rest = new List<string>();
+            var args = new List<(string, object?)>();
+            void Also(string clause, string name, object value) { rest.Add(clause); args.Add((name, value)); }
+            static (string, long) Link(SqliteDataReader r) => (r.GetString(0), r.GetInt64(1));
+            const string select = "SELECT u.url_id, COALESCE(u.last_shared_ms, 0) FROM link_urls u";
+
+            if (words.Count > 0)
+            {
+                // Each word is a quoted string to the index (nothing in it is read as query syntax); all of them must be there.
+                string match = string.Join(" AND ", words.Select(w => "\"" + w + "\"*"));
+                var rowids = c.Query(null, "SELECT rowid FROM link_words WHERE link_words MATCH $q ORDER BY rowid DESC LIMIT $cap", r => r.GetInt64(0),
+                    ("$q", match), ("$cap", SearchWordCap + 1));
+                bool more = rowids.Count > SearchWordCap;
+                if (site != null) Also("(u.site=$s OR u.host=$s)", "$s", site);
+                if (kind != null) Also("u.kind=$k", "$k", kind);
+                if (topic != null) Also("u.topic=$t", "$t", topic);
+                var found = new List<(string UrlId, long LastSharedMs)>();
+                foreach (var chunk in rowids.Take(SearchWordCap).Chunk(400))
+                    found.AddRange(c.Query(null, $"{select} WHERE u.rowid IN ({string.Join(",", chunk)}){(rest.Count == 0 ? "" : " AND " + string.Join(" AND ", rest))}", Link, args.ToArray()));
+                var ordered = found.OrderByDescending(l => l.LastSharedMs).ThenBy(l => l.UrlId, StringComparer.Ordinal).ToList();
+                return (ordered.Take(SearchLinkCap).ToList(), more || ordered.Count > SearchLinkCap);
+            }
+
+            // No words: newest first from the index of one filter, the others checked on the rows it yields.
+            List<(string UrlId, long LastSharedMs)> Walk(string index, string first, string name, object value)
+            {
+                var all = new List<(string, object?)>(args) { (name, value), ("$lim", SearchLinkCap + 1) };
+                return c.Query(null, $"{select} INDEXED BY {index} WHERE {first}{(rest.Count == 0 ? "" : " AND " + string.Join(" AND ", rest))} ORDER BY u.last_shared_ms DESC LIMIT $lim",
+                    Link, all.ToArray());
+            }
+            List<(string UrlId, long LastSharedMs)> links;
+            if (site != null)
+            {
+                if (kind != null) Also("u.kind=$k", "$k", kind);
+                if (topic != null) Also("u.topic=$t", "$t", topic);
+                // A site is matched as the site or as the exact host: one walk of each index, then the newer of the two.
+                links = Walk("ix_link_urls_site", "u.site=$s", "$s", site).Concat(Walk("ix_link_urls_host", "u.host=$s", "$s", site))
+                    .DistinctBy(l => l.UrlId).OrderByDescending(l => l.LastSharedMs).ThenBy(l => l.UrlId, StringComparer.Ordinal).ToList();
+            }
+            else if (kind != null)
+            {
+                if (topic != null) Also("u.topic=$t", "$t", topic);
+                links = Walk("ix_link_urls_kind", "u.kind=$k", "$k", kind);
+            }
+            else links = Walk("ix_link_urls_topic", "u.topic=$t", "$t", topic!);
+            return (links.Take(SearchLinkCap).ToList(), links.Count > SearchLinkCap);
         }
 
         /// <summary>A site as it is stored: no scheme, no path, no "www.".</summary>

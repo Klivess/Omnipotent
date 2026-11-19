@@ -115,7 +115,11 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             var slot = new AnswerSlot();
             ApiResponses.Slot = slot;
             Task work;
-            try { work = handle(); }
+            // On the pool, not called here: most handlers are plain synchronous code (read, then answer), and a call
+            // made here would not come back until they were done, so the wait below would never begin. That is how
+            // the first deployment of this guard still left two searches open for a minute. The slot, the response
+            // cache's notes and the request's trace are all carried by the execution context, which Task.Run keeps.
+            try { work = Task.Run(handle); }
             finally { ApiResponses.Slot = null; }
 
             if (await Task.WhenAny(work, Task.Delay(AnswerWithin)).ConfigureAwait(false) == work || !slot.TryDefer())
