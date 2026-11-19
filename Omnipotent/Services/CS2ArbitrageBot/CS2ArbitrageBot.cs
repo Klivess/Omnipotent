@@ -263,6 +263,11 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             catch (Exception ex) { await ServiceLogError(ex, "Couldn't read the saved trade timeline; using the measured defaults.", false); }
         }
 
+        // OmniSettings names of the seller failure-rate veto (the console's settings drawer keys its labels on them).
+        public const string SellerFailureGateSettingName = "CS2ArbitrageRejectHighFailureSellers";
+        public const string SellerFailureLimitSettingName = "CS2ArbitrageMaxSellerFailurePercent";
+        public const string SellerFailureSampleSettingName = "CS2ArbitrageSellerFailureMinimumTrades";
+
         private async Task<EngineSettings> LoadEngineSettingsAsync()
         {
             var s = new EngineSettings();
@@ -279,6 +284,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot
             s.Evaluation.MaximumPriceCents = maxDollars > 0 ? maxDollars * 100 : int.MaxValue;
             s.Evaluation.SteamPriceHaircutPercent = Math.Clamp(await GetIntOmniSetting("CS2ArbitrageSteamPriceHaircutPercent", 3), 0, 50);
             s.Evaluation.MinimumSteamBuyOrders = Math.Max(0, await GetIntOmniSetting("CS2ArbitrageMinimumSteamBuyOrders", 15));
+            // The seller failure-rate veto. Off, the exit model still prices the chance the trade falls through.
+            s.Evaluation.RejectHighFailureSellers = await GetBoolOmniSetting(SellerFailureGateSettingName, true);
+            s.Evaluation.MaximumSellerFailureRate = Math.Clamp(await GetIntOmniSetting(SellerFailureLimitSettingName, 5), 0, 100) / 100.0;
+            s.Evaluation.MinimumSellerTradesForFailureRate = Math.Max(1, await GetIntOmniSetting(SellerFailureSampleSettingName, 20));
             s.MaxSpendPerItemFraction = Math.Clamp(await GetIntOmniSetting("CS2ArbitrageMaxSpendPerItemPercent", 40), 1, 100) / 100.0;
             s.MaxUnitsPerItem = Math.Max(1, await GetIntOmniSetting("CS2ArbitrageMaxUnitsPerItem", 3));
             s.DailySpendLimitPence = Math.Max(0, await GetIntOmniSetting("CS2ArbitrageDailySpendLimitPounds", 0)) * 100;

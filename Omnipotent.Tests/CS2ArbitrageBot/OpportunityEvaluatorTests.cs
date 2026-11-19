@@ -114,6 +114,66 @@ public class OpportunityEvaluatorTests
     }
 
     [Fact]
+    public void TheSellerFailureVetoCanBeSwitchedOff()
+    {
+        // 20 failed of 100: refused by default, bought with the veto off. The other seller checks still apply.
+        var off = Settings();
+        off.RejectHighFailureSellers = false;
+        var flaky = OpportunityEvaluator.Evaluate(Listing(1000, 1500, trades: 100, failed: 20), null, 0.9, Fx, off, Now);
+        Assert.True(flaky.ShouldBuy);
+        Assert.DoesNotContain("failure rate", flaky.Reason);
+        Assert.Null(OpportunityEvaluator.ListingGate(Listing(1000, 1500, trades: 100, failed: 20), off));
+
+        var away = OpportunityEvaluator.Evaluate(Listing(1000, 1500, away: true, trades: 100, failed: 20), null, 0.9, Fx, off, Now);
+        Assert.False(away.ShouldBuy);
+        Assert.Contains("away", away.Reason);
+    }
+
+    [Fact]
+    public void TheSellerFailureLimitAndSampleAreConfigurable()
+    {
+        // 9 failed of 100 (the 9% the console showed): over the default 5%, under a 10% limit.
+        var nine = Listing(1000, 1500, trades: 100, failed: 9);
+        Assert.Equal("seller failure rate 9% (limit 5%)", OpportunityEvaluator.ListingGate(nine, Settings()));
+        var lenient = Settings();
+        lenient.MaximumSellerFailureRate = 0.10;
+        Assert.Null(OpportunityEvaluator.ListingGate(nine, lenient));
+        Assert.True(OpportunityEvaluator.Evaluate(nine, null, 0.9, Fx, lenient, Now).ShouldBuy);
+        // The limit is "more than": a seller exactly on it passes.
+        Assert.Null(OpportunityEvaluator.ListingGate(Listing(1000, 1500, trades: 100, failed: 10), lenient));
+        Assert.NotNull(OpportunityEvaluator.ListingGate(Listing(1000, 1500, trades: 100, failed: 11), lenient));
+
+        // 2 failed of 5 is ignored at the default 20-trade sample, and judged once the sample is lowered to 5.
+        var newSeller = Listing(1000, 1500, trades: 5, failed: 2);
+        Assert.Null(OpportunityEvaluator.ListingGate(newSeller, Settings()));
+        var smallSample = Settings();
+        smallSample.MinimumSellerTradesForFailureRate = 5;
+        Assert.Contains("failure rate 40%", OpportunityEvaluator.ListingGate(newSeller, smallSample));
+        // A raised sample spares a 100-trade seller.
+        var bigSample = Settings();
+        bigSample.MinimumSellerTradesForFailureRate = 500;
+        Assert.Null(OpportunityEvaluator.ListingGate(Listing(1000, 1500, trades: 100, failed: 20), bigSample));
+        // A sample of zero never judges a seller with no trades at all.
+        var zeroSample = Settings();
+        zeroSample.MinimumSellerTradesForFailureRate = 0;
+        zeroSample.MaximumSellerFailureRate = 0;
+        Assert.Null(OpportunityEvaluator.ListingGate(Listing(1000, 1500, trades: 0, failed: 0), zeroSample));
+    }
+
+    [Fact]
+    public void TheSellerFailureSettingsAreNotHiddenAsCredentials()
+    {
+        // A setting whose name reads as a credential is stored encrypted and shown as ********: it could not be switched.
+        foreach (string name in new[]
+                 {
+                     global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.SellerFailureGateSettingName,
+                     global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.SellerFailureLimitSettingName,
+                     global::Omnipotent.Services.CS2ArbitrageBot.CS2ArbitrageBot.SellerFailureSampleSettingName,
+                 })
+            Assert.False(global::Omnipotent.Service_Manager.OmniGlobalSettingsManager.IsCredentialName(name), name);
+    }
+
+    [Fact]
     public void TheMoreProfitableExitWinsWhenBothQualify()
     {
         var e = OpportunityEvaluator.Evaluate(Listing(1000, 1500, predicted: 1500), Book(1600, 1650), 0.95, Fx, Settings(), Now);

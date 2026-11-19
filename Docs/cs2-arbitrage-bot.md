@@ -39,7 +39,9 @@ Structural scan (all ~28k items, hourly) ─┤
 - **Steam market.** Sell into Steam buy orders, then carry the wallet back to CSFloat through the conversion plan. Steam's exact fee rounding applies, and the wallet is worth *k* per pound.
 - **CSFloat relist.** List on CSFloat once trade protection lifts and wait for a buyer.
 
-Choosing between them, and the relist price, is the exit model's job (next section). Listings first pass a cheap **screen** that runs on every new listing with no network calls. It values the Steam exit 3 units deep into a cached buy book with a 3% haircut, and the relist at 95% of the lower of CSFloat's base and float-adjusted value, net of the 2% fee. Extreme discounts (under 60% of value) must be corroborated by Steam's ask. Sellers who are away, fail over 5% of trades, or have a slow median trade time are skipped. Only listings that pass the screen reach the exit model.
+Choosing between them, and the relist price, is the exit model's job (next section). Listings first pass a cheap **screen** that runs on every new listing with no network calls. It values the Steam exit 3 units deep into a cached buy book with a 3% haircut, and the relist at 95% of the lower of CSFloat's base and float-adjusted value, net of the 2% fee. Extreme discounts (under 60% of value) must be corroborated by Steam's ask. Sellers who are away, fail too many trades, or have a slow median trade time are skipped. Only listings that pass the screen reach the exit model.
+
+The failure-rate check is a veto with its own settings: it can be switched off (`CS2ArbitrageRejectHighFailureSellers`), its limit is `CS2ArbitrageMaxSellerFailurePercent` (5: failed plus avoided trades as a share of the seller's total, refused when above it), and it only judges sellers with at least `CS2ArbitrageSellerFailureMinimumTrades` trades (20). A refused listing reads "seller failure rate 9% (limit 5%)" in the deal flow. Switching it off does not make the bot blind to the seller: the exit model prices the chance the trade falls through from the same statistics (see "Trade locks in every decision"), so a listing from a seller who fails often must still clear the bar after that risk.
 
 ## Exit model
 
@@ -177,6 +179,9 @@ The result is published as the "liquidity plan" (KM page and `/produceliquidityp
 | `CS2ArbitrageMinimumProfitPence` | 40 | Minimum absolute profit per trade (each trade costs a manual trade accept) |
 | `CS2ArbitrageMinimumListingPriceCents` | 200 | Feed and sweep price floor (USD cents) |
 | `CS2ArbitrageMaximumListingPriceDollars` | 0 | Absolute price cap (0 = none) |
+| `CS2ArbitrageRejectHighFailureSellers` | true | Refuse listings from sellers whose failure rate is over the limit (off: never refused for it; the exit model still prices the risk) |
+| `CS2ArbitrageMaxSellerFailurePercent` | 5 | The limit: failed plus avoided trades as a percentage of the seller's total (0–100) |
+| `CS2ArbitrageSellerFailureMinimumTrades` | 20 | Sellers with fewer trades are not judged on their failure rate |
 | `CS2ArbitrageMaxSpendPerItemPercent` | 40 | Largest share of the CSFloat balance one item may cost |
 | `CS2ArbitrageMaxUnitsPerItem` | 3 | Units of one item held at once |
 | `CS2ArbitrageDailySpendLimitPounds` | 0 | Daily spend cap (0 = none) |

@@ -36,7 +36,15 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
         public double CSFloatSellerFee { get; set; } = 0.02;
 
         public bool RejectAwaySellers { get; set; } = true;
+        /// <summary>
+        /// Turns the seller failure-rate veto on or off. Off, no listing is refused for it; the exit model still
+        /// prices the chance the trade falls through from the same seller statistics.
+        /// </summary>
+        public bool RejectHighFailureSellers { get; set; } = true;
+        /// <summary>Share of a seller's trades that failed or were avoided, above which their listings are refused.</summary>
         public double MaximumSellerFailureRate { get; set; } = 0.05;
+        /// <summary>Trades a seller needs before their failure rate is judged at all (a tiny sample says nothing).</summary>
+        public int MinimumSellerTradesForFailureRate { get; set; } = 20;
         public int MaximumSellerMedianTradeSeconds { get; set; } = 12 * 3600;
     }
 
@@ -221,8 +229,10 @@ namespace Omnipotent.Services.CS2ArbitrageBot.Engine
             if (listing.PriceCents < settings.MinimumPriceCents) return "below minimum price";
             if (listing.PriceCents > settings.MaximumPriceCents) return "above spend limit";
             if (settings.RejectAwaySellers && listing.SellerAway) return "seller is away (trade would likely stall)";
-            if (listing.SellerTotalTrades >= 20 && listing.SellerFailureRate > settings.MaximumSellerFailureRate)
-                return $"seller failure rate {listing.SellerFailureRate:P0}";
+            if (settings.RejectHighFailureSellers
+                && listing.SellerTotalTrades >= Math.Max(1, settings.MinimumSellerTradesForFailureRate)
+                && listing.SellerFailureRate > settings.MaximumSellerFailureRate)
+                return $"seller failure rate {listing.SellerFailureRate:0.#%} (limit {settings.MaximumSellerFailureRate:0.#%})";
             if (settings.MaximumSellerMedianTradeSeconds > 0 && listing.SellerMedianTradeTimeSeconds > settings.MaximumSellerMedianTradeSeconds)
                 return $"seller median trade time {TimeSpan.FromSeconds(listing.SellerMedianTradeTimeSeconds):g}";
             return null;
