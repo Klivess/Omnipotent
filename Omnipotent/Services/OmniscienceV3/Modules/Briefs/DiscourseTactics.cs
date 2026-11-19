@@ -145,14 +145,15 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
                     var args = new List<(string, object?)> { ("$q", "\"" + term.Replace("\"", "\"\"") + "\""), ("$s", guild ?? m.Conversation), ("$asof", context.AsOfMs) };
                     var (notIn, notInArgs) = SqlHelpers.InList(selected.ToList(), "$x");
                     args.AddRange(notInArgs);
-                    string where = $"messages_fts MATCH $q AND {scope} AND m.sent_at_ms <= $asof AND m.message_id NOT IN ({notIn}) AND {BriefsModule.Readable}";
+                    // The match is run once (rowid IN): joined, the planner walked every message of the place and ran it again for each.
+                    string where = $"m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH $q) AND {scope} AND m.sent_at_ms <= $asof AND m.message_id NOT IN ({notIn}) AND {BriefsModule.Readable}";
                     if (off.Any)
                     {
                         var (offList, offArgs) = SqlHelpers.InList(off.Identities.ToList(), "$o");
                         where += $" AND m.author_identity_id NOT IN ({offList})";
                         args.AddRange(offArgs);
                     }
-                    const string From = " JOIN messages_fts f ON f.rowid = m.rowid WHERE ";
+                    const string From = " WHERE ";
                     var earliest = corpus.Query(null, "SELECT " + BriefsModule.MessageColumns + From + where + " ORDER BY m.sent_at_ms, m.message_id LIMIT 3", BriefsModule.ReadMessage, args.ToArray());
                     var latest = corpus.Query(null, "SELECT " + BriefsModule.MessageColumns + From + where + " ORDER BY m.sent_at_ms DESC, m.message_id LIMIT 5", BriefsModule.ReadMessage, args.ToArray());
                     var (count, people) = corpus.Query(null, "SELECT COUNT(*), COUNT(DISTINCT COALESCE(pc.canonical_id, i.person_id)) FROM messages m LEFT JOIN identities i ON i.identity_id=m.author_identity_id " +

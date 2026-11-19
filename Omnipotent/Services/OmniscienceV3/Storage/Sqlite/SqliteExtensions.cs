@@ -47,15 +47,17 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
         public static double? GetDoubleOrNull(this SqliteDataReader r, int ordinal) => r.IsDBNull(ordinal) ? null : r.GetDouble(ordinal);
 
         /// <summary>Runs <paramref name="sql"/> once per chunk of <paramref name="keys"/> with the chunk bound as
-        /// <c>$k0..$kN</c> in place of the <c>{keys}</c> token (keeps IN lists under SQLite's variable limit).</summary>
+        /// <c>$k0..$kN</c> in place of the <c>{keys}</c> token (keeps IN lists under SQLite's variable limit).
+        /// Any other parameter the statement names must be passed in <paramref name="extra"/>, which is bound on every chunk:
+        /// SQLite refuses a statement with an unbound parameter ("Must add values for the following parameters").</summary>
         public static List<T> QueryIn<T>(this SqliteConnection conn, SqliteTransaction? tx, string sql, IReadOnlyCollection<string> keys,
-            Func<SqliteDataReader, T> map, int chunk = 500)
+            Func<SqliteDataReader, T> map, int chunk = 500, params (string Name, object? Value)[] extra)
         {
             var result = new List<T>();
             foreach (var part in keys.Chunk(Math.Clamp(chunk, 1, 900)))
             {
                 var names = part.Select((_, i) => "$k" + i).ToArray();
-                var args = part.Select((k, i) => (names[i], (object?)k)).ToArray();
+                var args = part.Select((k, i) => (names[i], (object?)k)).Concat(extra).ToArray();
                 result.AddRange(conn.Query(tx, sql.Replace("{keys}", string.Join(",", names)), map, args));
             }
             return result;

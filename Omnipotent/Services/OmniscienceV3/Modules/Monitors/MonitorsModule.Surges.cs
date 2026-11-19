@@ -73,7 +73,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                 {
                     // An FTS5 phrase: the words in order; the phrase is data, never query syntax.
                     args.Add(("$q", "\"" + d.Phrase.Replace("\"", "\"\"") + "\""));
-                    hits = corpus.Query(null, Select + "JOIN messages_fts f ON f.rowid = m.rowid WHERE messages_fts MATCH $q AND " + string.Join(" AND ", where) + " LIMIT 200000",
+                    hits = corpus.Query(null, Select + "WHERE m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH $q) AND " + string.Join(" AND ", where) + " LIMIT 200000",
                         r => (Id: r.GetString(0), At: r.GetInt64(1), Live: r.GetInt64(2) == 1, Author: r.GetString(3)), args.ToArray()).Where(x => !off.Author(x.Author)).Select(x => (x.Id, x.At, x.Live)).ToList();
                 }
                 else

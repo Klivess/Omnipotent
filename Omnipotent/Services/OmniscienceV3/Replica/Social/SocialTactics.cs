@@ -626,7 +626,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             {
                 string query = "\"" + term.Replace("\"", "\"\"") + "\"";
                 var rows = corpus.Query(null, """
-                    SELECT m.message_id, m.author_identity_id FROM messages_fts f JOIN messages m ON m.rowid=f.rowid
+                    SELECT m.message_id, m.author_identity_id FROM messages_fts f CROSS JOIN messages m ON m.rowid=f.rowid
                     WHERE messages_fts MATCH $q AND m.sent_at_ms <= $t AND m.is_bot=0 AND m.deleted_at_ms IS NULL LIMIT 400
                     """, r => (Id: r.GetString(0), Author: r.GetString(1)), ("$q", query), ("$t", asOf));
                 directory.Load(rows.Select(r => r.Author));

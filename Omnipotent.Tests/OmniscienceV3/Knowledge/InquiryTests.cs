@@ -6,6 +6,7 @@ using Omnipotent.Services.OmniscienceV3.Knowledge.Deduction;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Quality;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Store;
+using Omnipotent.Services.OmniscienceV3.Ml.Vectors;
 using Omnipotent.Services.OmniscienceV3.Storage.Sqlite;
 using Omnipotent.Services.OmniscienceV3.Temporal;
 
@@ -190,6 +191,36 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             // Corpus text reaches the model fenced as data.
             Assert.Contains("<corpus-data>", reason[0].Prompt);
             Assert.Equal(TacticRunStates.Succeeded, run.State);
+        }
+
+        /// <summary>
+        /// 18 Nov 2026 on the server: with the shared encoder installed, x01 failed in its gather stage ("Must add values for the
+        /// following parameters: $model") after 23 minutes and three attempts. Every test above runs without an encoder.
+        /// </summary>
+        [Fact]
+        public async Task YesNo_WithTheSharedEncoderInstalled_AlsoSearchesTheMessageVectors()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            await PlantedFactCorpus.WriteAsync(h.Stores, Now);
+            var encoder = new FakeEncoder();
+            h.Kit.Encoder = encoder;
+            List<(string Id, string Text)> messages;
+            using (var c = h.Stores.Corpus.OpenRead())
+                messages = c.Query(null, "SELECT message_id, content FROM messages WHERE content IS NOT NULL", r => (r.GetString(0), r.GetString(1)));
+            // Every message embedded as the classifier files it (under the encoder's version). Ava's Portuguese message shares no
+            // word with the plan's queries; filed with the vector of "cat", only the vector half can bring it into the dossier.
+            var portuguese = messages.Single(m => m.Text.StartsWith("I speak Portuguese", StringComparison.Ordinal));
+            await h.Context.Vectors!.UpsertAsync(VectorSpaces.Message, encoder.ModelVersion,
+                messages.Select(m => new VectorItem(m.Id, m.Id == portuguese.Id ? FakeEncoder.Embed("cat") : FakeEncoder.Embed(m.Text), 1)).ToList());
+            var model = new ScriptedInquirer();
+            model.Wire(h.Llm);
+
+            var (run, report, _) = await RunAsync(h, "x01.ask_yes_no", Ask("Ava's obviously a crazy cat lady, right?"));
+
+            Assert.Equal(TacticRunStates.Succeeded, run.State);
+            Assert.True(report!.Coverage.VectorSearch);
+            Assert.DoesNotContain(report.Coverage.Notes, n => n.Contains("Vector search was not available"));
+            Assert.Contains(model.Dossiers[0].Values, line => line.Contains("I speak Portuguese"));
         }
 
         [Fact]

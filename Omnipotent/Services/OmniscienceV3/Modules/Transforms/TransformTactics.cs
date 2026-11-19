@@ -270,7 +270,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Transforms
             using (var corpus = ctx.Stores.Corpus.OpenRead())
             {
                 uses = corpus.Query(null, "SELECT " + TransformsModule.InfoColumns + """
-                     JOIN messages_fts f ON f.rowid = m.rowid WHERE messages_fts MATCH $q AND m.deleted_at_ms IS NULL AND m.sent_at_ms <= $asof ORDER BY m.sent_at_ms, m.order_key LIMIT $l
+                     WHERE m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH $q) AND m.deleted_at_ms IS NULL AND m.sent_at_ms <= $asof ORDER BY m.sent_at_ms, m.order_key LIMIT $l
                     """, TransformsModule.ReadInfo, ("$q", match), ("$asof", context.AsOfMs), ("$l", cap + 1))
                     .Where(m => !m.Bot && !off.Author(m.AuthorIdentity) && scope.Matches(m.Person, m.Conversation, m.Guild, m.AtMs)).ToList();
                 names = TransformsModule.PersonNames(corpus, uses.Select(m => m.Person));

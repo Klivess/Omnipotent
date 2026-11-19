@@ -14,6 +14,11 @@ namespace Omnipotent.Tests.OmniscienceV3
         private static readonly Regex AsyncVoid = new(@"\basync\s+void\b", RegexOptions.Compiled);
         private static readonly Regex FireAndForget = new(@"_\s*=\s*Task\.Run\s*\(", RegexOptions.Compiled);
         private static readonly Regex BareTaskRun = new(@"^\s*Task\.Run\s*\(", RegexOptions.Compiled | RegexOptions.Multiline);
+        /// <summary>messages_fts joined to messages with the join order left to the planner: on the right of any JOIN, or on the
+        /// left of a plain/INNER/LEFT one (CROSS JOIN fixes the full-text index as the outer loop).</summary>
+        private static readonly Regex FtsJoinOrderLeftToThePlanner = new(
+            @"\bJOIN\s+messages_fts\b|\bmessages_fts(?:\s+(?!CROSS\b|JOIN\b|INNER\b|LEFT\b)\w+)?\s+(?:INNER\s+|LEFT\s+(?:OUTER\s+)?)?JOIN\s+messages\b",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
         /// <summary>Found from this source file's location, so the rules run from any build output folder.</summary>
         private static string V3Root([System.Runtime.CompilerServices.CallerFilePath] string source = "")
@@ -71,6 +76,21 @@ namespace Omnipotent.Tests.OmniscienceV3
                 .Where(s => FireAndForget.IsMatch(s.Text) || BareTaskRun.IsMatch(s.Text))
                 .Select(s => s.Rel).ToList();
             Assert.True(offenders.Count == 0, "Submit work to the kernel job queue instead (plan R4). Offenders: " + string.Join(", ", offenders));
+        }
+
+        /// <summary>
+        /// Left to choose, SQLite (without statistics, and no statistics say that one person wrote a third of the corpus) walks
+        /// every message in scope through an index and runs the full-text match again for each one: about three minutes per
+        /// query over Klives's own messages on two million messages. An x01 inquiry failed after 23 minutes that way on
+        /// 18 Nov 2026. A statement that searches messages_fts with messages must run the match once.
+        /// </summary>
+        [Fact]
+        public void FullTextSearchesOfMessagesRunTheMatchOnce()
+        {
+            var offenders = V3Sources().Where(s => FtsJoinOrderLeftToThePlanner.IsMatch(s.Text)).Select(s => s.Rel).ToList();
+            Assert.True(offenders.Count == 0,
+                "Write FROM messages_fts CROSS JOIN messages m ON m.rowid = messages_fts.rowid, or m.rowid IN (SELECT rowid FROM messages_fts WHERE messages_fts MATCH $q). Offenders: "
+                + string.Join(", ", offenders));
         }
     }
 }

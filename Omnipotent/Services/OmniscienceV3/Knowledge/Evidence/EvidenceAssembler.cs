@@ -193,9 +193,11 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                     var names2 = chunk.Select((conv, i) => { args.Add(("$c" + i, conv)); return "$c" + i; }).ToList();
                     try
                     {
+                        // The full-text index drives (CROSS JOIN): with one conversation in the chunk the planner otherwise walks
+                        // every message of it and runs the match again for each.
                         foreach (var a in c.Query(null, $"""
                                      SELECT m.message_id, m.current_version, m.sent_at_ms, m.order_key, m.conversation_id, m.ingest_seq, m.author_identity_id
-                                     FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid
+                                     FROM messages_fts CROSS JOIN messages m ON m.rowid = messages_fts.rowid
                                      WHERE messages_fts MATCH $q AND m.conversation_id IN ({string.Join(",", names2)}) AND m.sent_at_ms <= $t LIMIT $l
                                      """, r => (Anchor: new EvidenceAnchor(r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4), r.GetInt64(5), EvidenceRelation.Mention),
                                          Author: r.GetString(6)), args.ToArray()))

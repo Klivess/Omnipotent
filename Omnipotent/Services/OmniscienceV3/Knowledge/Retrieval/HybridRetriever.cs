@@ -1,5 +1,7 @@
+using System.Collections.Concurrent;
 using System.Numerics.Tensors;
 using System.Text;
+using Microsoft.Data.Sqlite;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Evidence;
 using Omnipotent.Services.OmniscienceV3.Ml;
 using Omnipotent.Services.OmniscienceV3.Storage;
@@ -38,10 +40,19 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
     {
         public const string MessageSpace = "message";
         private const int RrfK = 60;
+        /// <summary>A word found in more than this share of all messages is left out of full-text queries (with at least
+        /// <see cref="CommonTermFloor"/> messages): it tells nothing apart, and an OR query costs as much as its commonest term.</summary>
+        internal const double CommonShare = 0.01;
+        private const long CommonTermTtlMs = 10 * 60_000;
+        private const int CommonTermCacheLimit = 8_192;
 
         private readonly OmniscienceStores stores;
         private readonly CorpusReader corpus;
         private readonly Func<IEmbeddingEncoder?> encoder;
+        private readonly ConcurrentDictionary<string, (bool Common, long AtTick)> commonTerms = new(StringComparer.OrdinalIgnoreCase);
+        private CommonCapReading? commonCap;
+
+        private sealed record CommonCapReading(long Cap, long AtTick);
 
         public HybridRetriever(OmniscienceStores stores, CorpusReader corpus, Func<IEmbeddingEncoder?> encoder)
         {
@@ -50,6 +61,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             this.encoder = encoder;
         }
 
+        /// <summary>The fewest messages a word must appear in before it can count as too common (a small corpus prunes nothing).</summary>
+        internal long CommonTermFloor { get; init; } = 2_000;
+
         public async Task<(IReadOnlyList<RetrievedMessage> Results, RetrievalCoverage Coverage)> SearchAsync(IReadOnlyList<string> queries, RetrievalScope scope, CancellationToken ct)
         {
             var clean = queries.Where(q => !string.IsNullOrWhiteSpace(q)).Select(q => q.Trim()).Distinct(StringComparer.OrdinalIgnoreCase).Take(16).ToList();
@@ -57,6 +71,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             int perQuery = Math.Clamp(scope.Limit * 3, 20, 300);
             foreach (var q in clean)
             {
+                ct.ThrowIfCancellationRequested();
                 var hits = FullText(q, scope, perQuery);
                 for (int i = 0; i < hits.Count; i++)
                 {
@@ -98,30 +113,42 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
         }
 
         /// <summary>
-        /// An FTS5 query from free text: quoted phrases stay phrases; every other word becomes a term, OR-joined. A word of five
-        /// letters or more is a prefix term, so its inflections are found ("football" finds "footballer"). A shorter word is
-        /// matched whole, with its plain plural: as a prefix it would find unrelated words ("cat" would find "Catholic").
+        /// An FTS5 query from free text: quoted phrases stay phrases; every other word becomes a term, OR-joined. Words are split
+        /// where the index's tokenizer splits them, apostrophes and hyphens included, so "don't" is the word "don" and never a
+        /// phrase ending in a one-letter prefix (t*, every word starting with t). A word of five letters or more is a prefix
+        /// term, so its inflections are found ("football" finds "footballer"). A shorter word is matched whole, with its plain
+        /// plural: as a prefix it would find unrelated words ("cat" would find "Catholic").
         /// </summary>
-        public static string? FtsQuery(string text)
+        public static string? FtsQuery(string text) => FtsQuery(text, null);
+
+        /// <summary>As <see cref="FtsQuery(string)"/>, leaving out every word (and its plural) that <paramref name="tooCommon"/>
+        /// says is in too many messages: "is", "my", "lol" match a large share of a chat corpus.</summary>
+        internal static string? FtsQuery(string text, Func<string, bool>? tooCommon)
         {
             var terms = new List<string>();
             var phrases = System.Text.RegularExpressions.Regex.Matches(text, "\"([^\"]{2,80})\"");
-            foreach (System.Text.RegularExpressions.Match p in phrases) terms.Add("\"" + Clean(p.Groups[1].Value) + "\"");
+            foreach (System.Text.RegularExpressions.Match p in phrases)
+            {
+                // Word by word, spaces kept: cleaned whole, "the end" became the one word "theend" and no phrase ever matched.
+                string phrase = string.Join(" ", p.Groups[1].Value.Split(WordSeparators, StringSplitOptions.RemoveEmptyEntries).Select(Clean).Where(w => w.Length > 0));
+                if (phrase.Length > 0) terms.Add("\"" + phrase + "\"");
+            }
             string rest = System.Text.RegularExpressions.Regex.Replace(text, "\"[^\"]*\"", " ");
-            foreach (var word in rest.Split(new[] { ' ', '\t', '\n', ',', '.', '?', '!', ';', ':', '(', ')', '[', ']', '/', '\\' }, StringSplitOptions.RemoveEmptyEntries))
+            foreach (var word in rest.Split(WordSeparators, StringSplitOptions.RemoveEmptyEntries))
             {
                 string w = Clean(word);
                 if (w.Length < 2) continue;
-                if (w.Length >= 5) terms.Add("\"" + w + "\"*");
-                else
-                {
-                    terms.Add("\"" + w + "\"");
-                    if (w.Length >= 3 && !w.EndsWith('s')) terms.Add("\"" + w + "s\"");
-                }
+                string term = w.Length >= 5 ? "\"" + w + "\"*" : "\"" + w + "\"";
+                if (terms.Contains(term, StringComparer.OrdinalIgnoreCase) || (tooCommon != null && tooCommon(term))) continue;
+                terms.Add(term);
+                if (w.Length is >= 3 and < 5 && !w.EndsWith('s')) terms.Add("\"" + w + "s\"");
             }
             terms = terms.Distinct(StringComparer.OrdinalIgnoreCase).Take(24).ToList();
             return terms.Count == 0 ? null : string.Join(" OR ", terms);
         }
+
+        /// <summary>Where words end: whitespace and punctuation, and the apostrophes and hyphens unicode61 also splits on.</summary>
+        private static readonly char[] WordSeparators = { ' ', '\t', '\n', '\r', ',', '.', '?', '!', ';', ':', '(', ')', '[', ']', '/', '\\', '\'', '-', '\u2019' };
 
         private static string Clean(string s)
         {
@@ -132,8 +159,30 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
 
         private List<string> FullText(string query, RetrievalScope scope, int limit)
         {
-            string? fts = FtsQuery(query);
+            using var c = stores.Corpus.OpenRead();
+            long cap = CommonCap(c);
+            string? fts = FtsQuery(query, term => TooCommon(c, term, cap));
             if (fts == null) return new List<string>();
+            var (sql, args) = FullTextStatement(fts, scope, limit);
+            try
+            {
+                return c.Query(null, sql, r => r.GetString(0), args);
+            }
+            catch (SqliteException ex) when (ex.Message.Contains("fts5", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("syntax", StringComparison.OrdinalIgnoreCase))
+            {
+                // A query the FTS grammar rejects (odd symbols) finds nothing by full text; vectors may still find it.
+                return new List<string>();
+            }
+        }
+
+        /// <summary>
+        /// The statement <see cref="FullText"/> runs. The full-text index drives it (CROSS JOIN fixes the join order): left to
+        /// choose, the planner, which cannot know that one person or conversation holds hundreds of thousands of messages, walked
+        /// every message in scope and ran the match again for each one. For Klives's own messages that was about three minutes
+        /// per query on two million messages, and an inquiry runs dozens (an x01 run failed after 23 minutes on 18 Nov 2026).
+        /// </summary>
+        internal static (string Sql, (string Name, object? Value)[] Args) FullTextStatement(string fts, RetrievalScope scope, int limit)
+        {
             var where = new List<string> { "messages_fts MATCH $q" };
             var args = new List<(string, object?)> { ("$q", fts), ("$l", limit) };
             if (scope.FromMs is long f) { where.Add("m.sent_at_ms >= $f"); args.Add(("$f", f)); }
@@ -141,17 +190,42 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             AddIn(where, args, "m.author_identity_id", "$a", scope.AuthorIdentityIds);
             AddIn(where, args, "m.conversation_id", "$c", scope.ConversationIds);
             AddIn(where, args, "m.message_id", "$mi", scope.MessageIds);
-            string sql = $"SELECT m.message_id FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid WHERE {string.Join(" AND ", where)} ORDER BY bm25(messages_fts) LIMIT $l";
-            using var c = stores.Corpus.OpenRead();
+            string sql = $"SELECT m.message_id FROM messages_fts CROSS JOIN messages m ON m.rowid = messages_fts.rowid WHERE {string.Join(" AND ", where)} ORDER BY bm25(messages_fts) LIMIT $l";
+            return (sql, args.ToArray());
+        }
+
+        /// <summary>How many messages a word may appear in before it is too common to search for: <see cref="CommonShare"/> of
+        /// the corpus, at least <see cref="CommonTermFloor"/>. Read again every ten minutes.</summary>
+        private long CommonCap(SqliteConnection c)
+        {
+            long now = Environment.TickCount64;
+            var known = Volatile.Read(ref commonCap);
+            if (known != null && now - known.AtTick < CommonTermTtlMs) return known.Cap;
+            // MAX(rowid) reads one page; it counts every message ever stored, which is near enough for a share.
+            long messages = c.Scalar<long?>(null, "SELECT MAX(rowid) FROM messages") ?? 0;
+            long cap = Math.Max(CommonTermFloor, (long)(messages * CommonShare));
+            Volatile.Write(ref commonCap, new CommonCapReading(cap, now));
+            return cap;
+        }
+
+        /// <summary>Whether more than <paramref name="cap"/> messages contain <paramref name="term"/>. The count stops at cap + 1,
+        /// so it reads at most that many index entries; answers are kept for ten minutes.</summary>
+        private bool TooCommon(SqliteConnection c, string term, long cap)
+        {
+            long now = Environment.TickCount64;
+            if (commonTerms.TryGetValue(term, out var known) && now - known.AtTick < CommonTermTtlMs) return known.Common;
+            bool common;
             try
             {
-                return c.Query(null, sql, r => r.GetString(0), args.ToArray());
+                common = c.Scalar<long>(null, "SELECT COUNT(*) FROM (SELECT 1 FROM messages_fts WHERE messages_fts MATCH $t LIMIT $l)", ("$t", term), ("$l", cap + 1)) > cap;
             }
-            catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("fts5", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("syntax", StringComparison.OrdinalIgnoreCase))
+            catch (SqliteException)
             {
-                // A query the FTS grammar rejects (odd symbols) finds nothing by full text; vectors may still find it.
-                return new List<string>();
+                return false; // a term the FTS grammar rejects: the whole query then finds nothing by full text, as before
             }
+            if (commonTerms.Count >= CommonTermCacheLimit) commonTerms.Clear();
+            commonTerms[term] = (common, now);
+            return common;
         }
 
         private static void AddIn(List<string> where, List<(string, object?)> args, string column, string prefix, IReadOnlyCollection<string>? values)
@@ -181,8 +255,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             var vectors = new Dictionary<string, float[]>(StringComparer.Ordinal);
             using (var v = stores.Vectors.OpenRead())
             {
-                foreach (var row in v.QueryIn(null, $"SELECT item_id, dims, quant, scale, vec FROM vectors WHERE space='{MessageSpace}' AND model=$model AND item_id IN ({{keys}})",
-                             ids, r => (Id: r.GetString(0), Dims: r.GetInt32(1), Quant: r.GetString(2), Scale: r.GetDouble(3), Blob: (byte[])r.GetValue(4)), chunk: 400))
+                // Message vectors are filed under the encoder's model VERSION (the classifier writes them so, and a new build of a
+                // model never mixes with the old one's vectors), not its model id. Both parameters are bound on every chunk: the
+                // model was once left unbound, and every inquiry with the encoder installed failed here (18 Nov 2026).
+                foreach (var row in v.QueryIn(null, "SELECT item_id, dims, quant, scale, vec FROM vectors WHERE space=$space AND model=$model AND item_id IN ({keys})",
+                             ids, r => (Id: r.GetString(0), Dims: r.GetInt32(1), Quant: r.GetString(2), Scale: r.GetDouble(3), Blob: (byte[])r.GetValue(4)), 400,
+                             ("$space", MessageSpace), ("$model", enc.ModelVersion)))
                 {
                     var decoded = Decode(row.Dims, row.Quant, row.Scale, row.Blob);
                     if (decoded != null && decoded.Length == enc.Dimensions) vectors[row.Id] = decoded;
