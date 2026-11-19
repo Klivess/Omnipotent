@@ -234,7 +234,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Vision
             int size = ClipCatalog.ImageSize, n = images.Count;
             var batch = new float[n * 3 * size * size];
             for (int i = 0; i < n; i++) ClipPreprocess.Pixels(images[i]).CopyTo(batch, i * 3 * size * size);
-            return await RunAsync(t.Vision, new[] { t.VisionInput }, new[] { OrtValue.CreateTensorValueFromMemory(batch, new long[] { n, 3, size, size }) }, t.VisionOutput, n, ct)
+            return await RunAsync(t.Vision, new[] { t.VisionInput }, new[] { OrtValue.CreateTensorValueFromMemory(batch, new long[] { n, 3, size, size }) }, t.VisionOutput, n, throttled: true, ct)
                 .ConfigureAwait(false);
         }
 
@@ -259,14 +259,15 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Vision
                 long[] data = name == "attention_mask" ? mask : ids;
                 return t.TextInt32 ? OrtValue.CreateTensorValueFromMemory(data.Select(x => (int)x).ToArray(), shape) : OrtValue.CreateTensorValueFromMemory(data, shape);
             }).ToArray();
-            return await RunAsync(t.Text, t.TextInputs, values, t.TextOutput, n, ct).ConfigureAwait(false);
+            // A text is a search someone is waiting for; only the image backlog yields to a busy host.
+            return await RunAsync(t.Text, t.TextInputs, values, t.TextOutput, n, throttled: false, ct).ConfigureAwait(false);
         }
 
-        private async Task<float[][]> RunAsync(SharedOnnxSession session, string[] inputNames, OrtValue[] values, string outputName, int rows, CancellationToken ct)
+        private async Task<float[][]> RunAsync(SharedOnnxSession session, string[] inputNames, OrtValue[] values, string outputName, int rows, bool throttled, CancellationToken ct)
         {
             try
             {
-                if (throttle != null) await throttle.WaitAsync(ct).ConfigureAwait(false);
+                if (throttled && throttle != null) await throttle.WaitAsync(ct).ConfigureAwait(false);
                 await session.Gate.WaitAsync(ct).ConfigureAwait(false);
                 try
                 {

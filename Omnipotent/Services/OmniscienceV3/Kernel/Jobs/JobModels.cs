@@ -97,6 +97,10 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
     /// <summary>Counts per (lane, state) for health pages.</summary>
     public sealed record JobCount(Lane Lane, string State, long Count);
 
+    /// <summary>One module's jobs by state, with when it last succeeded and last dead-lettered.</summary>
+    public sealed record ModuleJobStats(long Queued = 0, long Leased = 0, long Dead = 0, long Succeeded = 0,
+        long? LastSucceededMs = null, long? LastFailedMs = null, string? LastError = null);
+
     /// <summary>Filters for <see cref="JobQueue.Query"/>; all optional, combined with AND. Times are UTC epoch ms;
     /// <see cref="CreatedToMs"/> is exclusive.</summary>
     public sealed record JobQuery

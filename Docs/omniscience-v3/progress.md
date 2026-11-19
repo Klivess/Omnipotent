@@ -13,7 +13,8 @@ Fix-by-fix status is in [traceability.md](traceability.md).
   - no `DateTime.Now/UtcNow/Today` in v3 code outside `Temporal/SystemClock`;
   - no empty `catch {}`;
   - no `async void` outside OmniService entry points;
-  - no fire-and-forget `Task.Run`.
+  - no fire-and-forget `Task.Run`;
+  - no statement that joins `messages_fts` with `messages` and leaves the join order to the planner (since 2026-11-19, item 5).
 
   An architecture test enforces these.
 - **Data:** all instants are UTC epoch milliseconds (T1). Every derived row records its source watermark (R3).
@@ -241,7 +242,106 @@ Since 2026-11-18 `master` contains the branch, with v3 switched off. Later v3 wo
    `Microsoft.ML.Tokenizers` goes from 1.0.2 to 2.0.1 (the old engine's `ReplicaEmbedder` is its only other user and
    compiles unchanged); the website's menu gains "Omniscience v3", whose pages say the engine is off. No request another
    service sends changes.
-5. Still to do: faces (N1) and the image pivot X24; the shadow run on live data (`OmniscienceV3_ShadowEnabled=true` on the
+5. **First failure on the server, fixed 2026-11-19** (not yet pulled by the server). With the engine running there, an
+   `x01.ask_yes_no` run about Klives failed on 2026-11-18 after 23 minutes and three attempts, in its gather stage:
+   `InvalidOperationException: Must add values for the following parameters: $model`. Two faults in the inquiry's evidence
+   search (`Knowledge/Retrieval/HybridRetriever`), both out of reach of the tests, which ran without an encoder and on corpora of
+   a few dozen messages:
+   - **The vector half never bound its model.** It read `vectors.db` with `model=$model` through `QueryIn`, which could only
+     bind the keys. It would also have found nothing: it meant the encoder's model id, while the classifier files message
+     vectors under the encoder's model version. `QueryIn` now binds extra parameters on every chunk; the read uses
+     `ModelVersion`.
+   - **The full-text half took minutes per query.** With no statistics (and none would say that one person wrote a third of the
+     corpus), SQLite walked every message in scope through `ix_messages_author_time` and ran the FTS match again for each one.
+     On a synthetic corpus of two million messages (30% by one author, dev machine, warm cache) that was 179 s for the
+     first query of a facet; an inquiry runs dozens. Now the index drives (`messages_fts CROSS JOIN messages`), words in more
+     than 1% of messages (at least 2,000) are left out of the query ("is", "my", "lol"; bounded counts, kept ten minutes),
+     and words are split where the tokenizer splits them ("don't" was a phrase ending in the prefix `t*`). Same corpus:
+     0.17 s for fifteen queries. Quoted phrases had lost their spaces ("the end" searched for "theend"); they keep them now,
+     which also lets the alias engine's common-word check see multi-word aliases.
+   - The same join shape in five other places (the evidence assembler's mentions by name, the X22 phrase tracker, X64 who
+     can help, the X32 slang decoder, phrase surge monitors) now runs the match once (`CROSS JOIN`, or `m.rowid IN (SELECT
+     rowid FROM messages_fts …)`). On the synthetic corpus X32's statements went from 1.7–3.5 s to 15–50 ms; the others
+     already had the fast plan there, but could flip with other inputs. An architecture test now forbids the plain join.
+   - Tests: `Knowledge/RetrievalTests` (the vector half with an encoder, vectors of another model ignored, the plan for three
+     scopes, query terms, common words, `QueryIn`) and an x01 run with the encoder installed. Not checked on the server.
+6. **Two days in shadow mode on the server, and what they showed (2026-11-19; fixes not yet pulled by the server).**
+   The engine had run since 2026-11-18 17:59 UTC. Read from its own routes and the API's telemetry on the 19th at 20:15:
+   no facts, no communities, people as of 01:00, the copy of v2's messages last completed at 10:41, the first replica
+   build failed, 87 of 141 extraction calls failed, `GET status` with a p95 of 20 minutes (576 calls, 30 hours of
+   request time in total), link and image search not answering within a minute. Causes and changes:
+   - **One CPU worker for 450,000 jobs.** `Math.Max(1, Math.Min(4, cores - 4))` is 1 on the four-core server. Now half
+     the cores, between two and four (`KernelOptions.DefaultLanes`).
+   - **A backlog outranked everything.** Importing v2 queued 650,000 media jobs (probe, text, image embedding) at
+     priorities above most other work, and ageing raised every queued job by one every ten minutes (a rewrite of
+     650,000 rows each time; intel.db's write-ahead log stood at 309 MB). The deduction sweep (priority 50), the
+     projections, insights and the copy of v2 waited behind them. Leasing now keeps strict priority among modules with an
+     ordinary amount of work, where waiting counts as priority without any write; a module with more than 1,000 jobs
+     queued in a lane is a backlog, which gets the lane when nobody else is ready and one lease in four when somebody
+     is, several backlogs taking turns (`JobQueue.LeaseNextAsync`, index `ix_jobs_fair`). One module holds at most one
+     worker fewer than its lane has. Ageing is off, and maintenance checkpoints each store every two minutes.
+   - **A job that hung kept its worker for ever.** The heartbeat is a timer, so a handler stuck in a native call never
+     lost its lease: all four Io workers sat on media-text jobs from 16:27 until the read at 20:15, which is why the
+     copy of v2 could not run. Each lane now has a limit on time without a progress report (Cpu 2 h, Io 30 min, the model
+     lanes 60 min): the job is told to stop, and if it does not, its worker leaves it behind and the job is failed as
+     transient. OCR gets 90 seconds an image; an engine that does not come back is abandoned and a new one made (three
+     such images and OCR stops until the next start).
+   - **The status page counted the jobs table on every request**, once per module, behind one lock. Counts per lane,
+     module and state, and each module's last success and last dead job, are now kept by triggers (`job_counts`,
+     `job_module_last`, intel migration 3, which builds them from the existing rows once). `GET status` answers the last
+     snapshot while a new one is built.
+   - **Extraction slices filled the model's window.** A slice was packed to the 260,000-token window with 12,000 tokens
+     for the answer; the answer to "extract every claim" is about as long as the evidence (0.4 to 2.6 output tokens per
+     evidence token on the calls that succeeded). Every large slice was cut off, split in half three times (15 calls of
+     two to five minutes), and then recorded as "too large" and never read. Slices are now sized to the answer
+     (`knowledge.deduction.slice_tokens`, 5,000; output 16,000). The prompt is `deduction.extract@2` (asks for an
+     economical answer), so what @1 marked as read without reading is read again.
+   - **Cut off before the answer began was read as "invalid"**, asked again at the same size, and then failed the job.
+     It is a truncation now (the slice is split). The retry of an invalid answer also says the request again: after a
+     failed call the session is started afresh, and "answer the same request again" named a request the model had
+     never seen.
+   - **Facts were only made when a job returned.** A job read for hours and failed on a later slice, so 300 and more
+     verified claims never became facts. Claims are consolidated after every slice, and a run that fails is closed as
+     failed, not left "running".
+   - **The adjudicator and the critic never saw the evidence.** `KliveLLM.QueryAsync` continued a kept session only when
+     its last message was a plain assistant message; a structured answer is a tool call followed by the recorded tool
+     result, so every follow-up started a new session, and `CacheShapedSession` then sent only the question. Live: the
+     follow-up calls had 0 cached tokens and a smaller prompt than the call before them, and the critic said
+     "insufficient" for 145 of 158 claims. `CanContinueGatewaySession` accepts a tool result as the last message, and a
+     session is ended after a failed question. The tests could not see it: their fake kept every session.
+   - **Thinking was billed against the answer.** No v3 call said how hard to think, so the router's default applied
+     ("medium" for Qwen3.8), inside the same output ceiling: link filing (200 + 45 a link) failed 10 times out of 10,
+     and 33 extraction calls spent all 12,000 tokens before starting their answer. `OmniLlm.Shape` gives every call an
+     effort ("off" up to 2,000 answer tokens, else "low"; a caller may ask for more) and adds headroom for it on top of
+     the ceiling the caller asked for. One reading a slice by default (`knowledge.deduction.second_reading`), followed
+     by the verifier and the critic on the same session; extraction now outranks image captions in the model lane.
+   - **The replica build**: one message held half of an emoji, and `char.ConvertToUtf32` throws on that
+     ("Found a low surrogate char…"). It was called by the token estimate, which sizes every prompt (extraction slices
+     too), by the classifier's content gate and by the replica's text features: all go through
+     `UnicodeText.CodePointAt` now, and `UnicodeText.WellFormed` repairs text before every tokenizer and every model call. Starting a build
+     counted every message the person wrote (twelve minutes for 140,000 on the busy disk); it now counts no further
+     than the number it needs.
+   - **Search.** Link search joined and sorted every share per request and matched words with LIKE; image search ran
+     LIKE over the JSON of every attachment label and, before that, waited in the host-load throttle (up to a minute
+     when the server is busy, which it is all day) to encode one line of text. Both read full-text indexes kept by
+     triggers now (`link_words`, `media_words`), shares have an index by time, and a request of a few texts is not
+     throttled. The throttle's longest pause is 15 seconds, down from 60.
+   - **Every read answers.** Klives, the same day: "Timeouts are not an acceptable solution. There must always be a
+     response." `AnswerGuard` (Api/AnswerGuard.cs) gives every GET four seconds. A handler that has not answered by then
+     is not cancelled: the request is answered 202 `{"code":"pending","retryAfterMs":1500}` at once, the handler carries
+     on, and the next request for the same thing by the same profile waits on that same work and is handed its answer
+     (an error included). Slow work is done once however often it is asked for. Streams and files claim their response
+     as they start (`ApiResponses.BeginDirect`) and are left alone. Commands (POST) are not answered early. The
+     website's `omniGet` asks a "pending" read again until its answer is there, with the loading state up meanwhile.
+   - **Seeing it.** Two health checks: `tail_stalled` (the copy of v2 has not completed for 30 minutes) and
+     `module_stalled` (a job has been ready for six hours and its module has finished nothing). On the pages: a card with
+     nothing to show yet is a skeleton (it was a blank box unless the page had also called it empty), a bar under the
+     top row for any request that takes more than a moment, and "Still loading · 12 s · links/search" after four.
+   - Tests: `Kernel/KernelFairnessTests`, `Knowledge/DeductionRunTests`, `KliveLLM/GatewayContinuationTests`,
+     `Ml/UnicodeTextTests`, `Api/AnswerGuardTests`, one more in `WsC/MonitorsTests`, three more in the website's domain spec. Not checked on the
+     server: the first start after the pull runs intel migration 3 over about a million job rows (two index builds
+     and two scans; the engine says "Starting" until it is done).
+7. Still to do: faces (N1) and the image pivot X24; the shadow run on live data (`OmniscienceV3_ShadowEnabled=true` on the
    server, once it has pulled and rebuilt); parity gates,
    Quality Lab gates, and cutover, which switches `OmniscienceV3_FeedsKliveRag` and
    `ingest.discord_bot.enabled` on; then the website branch. Smaller open items: the general search does not union

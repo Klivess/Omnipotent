@@ -60,7 +60,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                 if (isLetter)
                 {
                     letters++;
-                    int cp = char.ConvertToUtf32(g, 0);
+                    int cp = Omnipotent.Services.OmniscienceV3.Ml.UnicodeText.CodePointAt(g, 0);
                     if (TextFeatures.ScriptOf(cp) == Script.Latin) latin++;
                     if (char.IsUpper(g, 0)) { upper++; cased++; firstCased ??= "U"; }
                     else if (char.IsLower(g, 0)) { lower++; cased++; firstCased ??= "L"; }
@@ -222,7 +222,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                     foreach (var g in TextFeatures.Graphemes(TextFeatures.StripMarkup(StyleLine.Prose(line))))
                         if (char.IsLetter(g, 0))
                         {
-                            string sc = TextFeatures.ScriptOf(char.ConvertToUtf32(g, 0)).ToString();
+                            string sc = TextFeatures.ScriptOf(Omnipotent.Services.OmniscienceV3.Ml.UnicodeText.CodePointAt(g, 0)).ToString();
                             scripts[sc] = scripts.GetValueOrDefault(sc) + 1;
                         }
                 foreach (var k in scripts.Keys.ToList()) scripts[k] /= letters;

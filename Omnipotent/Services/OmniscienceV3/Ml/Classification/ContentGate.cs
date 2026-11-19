@@ -72,7 +72,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Classification
         /// <summary>Emoji by Unicode property: symbols (So), regional indicators, keycaps and ZWJ sequences.</summary>
         public static bool IsEmoji(string grapheme)
         {
-            int cp = char.ConvertToUtf32(grapheme, 0);
+            int cp = Omnipotent.Services.OmniscienceV3.Ml.UnicodeText.CodePointAt(grapheme, 0);
+            if (cp == 0xFFFD) return false; // half of a surrogate pair (or the replacement character itself): broken text, not an emoji
             if (cp is >= 0x1F000 and <= 0x1FAFF) return true; // emoji blocks incl. regional indicators and flags
             if (cp is >= 0x2600 and <= 0x27BF) return true;   // misc symbols, dingbats (☀ ✨ ❤)
             if (cp is >= 0x2B00 and <= 0x2BFF) return true;   // ⭐ ⬆

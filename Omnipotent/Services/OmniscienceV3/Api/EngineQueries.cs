@@ -37,7 +37,9 @@ namespace Omnipotent.Services.OmniscienceV3.Api
         private readonly IClock clock;
         private readonly Func<IReadOnlyCollection<string>> routes;
         private readonly object statusGate = new();
-        private (V3StatusDto Dto, long AtMs)? lastStatus;
+        private volatile StatusSnapshot? lastStatus;
+
+        private sealed record StatusSnapshot(V3StatusDto Dto, long AtMs);
 
         public EngineQueries(V3Host host, IClock clock, Func<IReadOnlyCollection<string>> routes)
         {
@@ -57,12 +59,27 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                 return new V3StatusDto(host.Phase, host.Stage, host.Failure, now, host.StartedAtMs, host.ReadyAtMs, null,
                     Array.Empty<StoreHealthDto>(), Array.Empty<LaneJobsDto>(), Array.Empty<ModuleHealth>(), null, null, routes().ToList());
             }
-            lock (statusGate)
+            // Nobody waits behind a build that is already running: while one request assembles the snapshot the others
+            // are answered with the last one. Queued behind a single lock, the dashboard's ten-second poll once piled up
+            // for twenty minutes at a time.
+            if (lastStatus is { } fresh && now - fresh.AtMs < (long)StatusMaxAge.TotalMilliseconds) return fresh.Dto with { NowMs = now };
+            bool taken = false;
+            try
             {
+                Monitor.TryEnter(statusGate, ref taken);
+                if (!taken)
+                {
+                    if (lastStatus is { } stale) return stale.Dto with { NowMs = now };
+                    Monitor.Enter(statusGate, ref taken); // the very first snapshot: there is nothing older to answer with
+                }
                 if (lastStatus is { } cached && now - cached.AtMs < (long)StatusMaxAge.TotalMilliseconds) return cached.Dto with { NowMs = now };
                 var dto = BuildStatus(rt, now);
-                lastStatus = (dto, now);
+                lastStatus = new StatusSnapshot(dto, now);
                 return dto;
+            }
+            finally
+            {
+                if (taken) Monitor.Exit(statusGate);
             }
         }
 

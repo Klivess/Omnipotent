@@ -48,7 +48,15 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         public Task WaitAsync(Lane lane, CancellationToken ct) => Task.CompletedTask;
     }
 
-    public sealed record LaneOptions(Lane Lane, int Concurrency, TimeSpan LeaseDuration, TimeSpan IdlePoll);
+    /// <param name="StallAfter">How long a job may run without reporting progress before it is told to stop (and, if it
+    /// does not, left behind so the worker can move on). Null: never. A heartbeat only proves the worker is alive; without
+    /// this a handler stuck inside a native call or a hung request kept its lease, and its worker, for ever.</param>
+    /// <param name="MaxPerModule">How many jobs one module may run in this lane at once. Null: one less than the lane's
+    /// workers (at least one), so a module whose jobs are slow or stuck always leaves a worker for the others.</param>
+    public sealed record LaneOptions(Lane Lane, int Concurrency, TimeSpan LeaseDuration, TimeSpan IdlePoll, TimeSpan? StallAfter = null, int? MaxPerModule = null)
+    {
+        public int ModuleLimit => Math.Max(1, MaxPerModule ?? (Concurrency > 1 ? Concurrency - 1 : 1));
+    }
 
     /// <summary>
     /// Worker pools, one per lane. Each worker leases a job, runs its handler with a heartbeat that extends
@@ -115,7 +123,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                 try
                 {
                     await gate.WaitAsync(lane.Lane, token).ConfigureAwait(false);
-                    job = await queue.LeaseNextAsync(lane.Lane, owner, lane.LeaseDuration, token).ConfigureAwait(false);
+                    job = await queue.LeaseNextAsync(lane.Lane, owner, lane.LeaseDuration, token, lane.ModuleLimit).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
                 catch (Exception ex)
@@ -148,11 +156,22 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             catch (OperationCanceledException) { /* stopping */ return; }
         }
 
+        /// <summary>How long a job told to stop for making no progress gets to stop before its worker leaves it behind.</summary>
+        internal static TimeSpan StallGrace { get; set; } = TimeSpan.FromSeconds(30);
+
+        private long stalled;
+
+        /// <summary>Jobs stopped because they made no progress for their lane's <see cref="LaneOptions.StallAfter"/>.</summary>
+        public long Stalled => Interlocked.Read(ref stalled);
+
         private async Task RunJobAsync(JobRecord job, LaneOptions lane, string owner, CancellationToken stopToken)
         {
-            using var jobCts = CancellationTokenSource.CreateLinkedTokenSource(stopToken);
+            // Not in a using: a handler that is left behind (see below) still holds this token.
+            var jobCts = CancellationTokenSource.CreateLinkedTokenSource(stopToken);
+            long lastSign = System.Diagnostics.Stopwatch.GetTimestamp();
             async Task<bool> Beat(string? progress)
             {
+                if (progress != null) Volatile.Write(ref lastSign, System.Diagnostics.Stopwatch.GetTimestamp());
                 bool ok = await queue.HeartbeatAsync(job.JobId, owner, lane.LeaseDuration, progress).ConfigureAwait(false);
                 if (!ok) jobCts.Cancel(); // lease lost or job cancelled from the UI
                 return ok;
@@ -162,15 +181,47 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             if (handler == null)
             {
                 await SafeFail(job, owner, ErrorClass.Permanent, $"No handler registered for {job.ModuleId}/{job.Kind}.").ConfigureAwait(false);
+                jobCts.Dispose();
                 return;
             }
 
             var context = new JobContext(job, clock, jobCts.Token, p => Beat(p));
             using var heartbeatTimer = new PeriodicTimer(TimeSpan.FromMilliseconds(Math.Max(50, lane.LeaseDuration.TotalMilliseconds / 3)));
             var heartbeatLoop = HeartbeatLoopAsync(heartbeatTimer, () => Beat(null), jobCts.Token);
+            // On the pool, so a handler that blocks before its first await cannot keep the watch below from running.
+            var run = Task.Run(() => handler(context));
+            bool stopped = false, leftBehind = false;
             try
             {
-                string? result = await handler(context).ConfigureAwait(false);
+                if (lane.StallAfter is { } stall && stall > TimeSpan.Zero)
+                {
+                    while (!run.IsCompleted)
+                    {
+                        var quiet = System.Diagnostics.Stopwatch.GetElapsedTime(Volatile.Read(ref lastSign));
+                        if (quiet >= stall) break;
+                        var wait = stall - quiet;
+                        await Task.WhenAny(run, Task.Delay(wait < TimeSpan.FromSeconds(30) ? wait : TimeSpan.FromSeconds(30))).ConfigureAwait(false);
+                    }
+                    if (!run.IsCompleted && !jobCts.IsCancellationRequested)
+                    {
+                        stopped = true;
+                        Interlocked.Increment(ref stalled);
+                        jobCts.Cancel();
+                        if (await Task.WhenAny(run, Task.Delay(StallGrace)).ConfigureAwait(false) != run)
+                        {
+                            // It did not stop when asked (a native call, a request with no timeout). The worker goes on to
+                            // the next job; the handler is left to finish, or not, on its own.
+                            leftBehind = true;
+                            _ = run.ContinueWith(t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+                            log($"[OmniscienceV3] job {job.JobId} ({job.ModuleId}/{job.Kind}) made no progress for {Describe(stall)} and did not stop when asked; its worker has moved on.", null);
+                            await SafeFail(job, owner, ErrorClass.Transient,
+                                $"Made no progress for {Describe(stall)} and did not stop when asked. The worker moved on; the stuck work was left behind.").ConfigureAwait(false);
+                            return;
+                        }
+                    }
+                }
+
+                string? result = await run.ConfigureAwait(false);
                 jobCts.Token.ThrowIfCancellationRequested();
                 await queue.CompleteAsync(job.JobId, owner, result).ConfigureAwait(false);
             }
@@ -178,6 +229,11 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             {
                 // Graceful shutdown: give the job back without counting the attempt.
                 await SafeRelease(job, owner).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (stopped)
+            {
+                log($"[OmniscienceV3] job {job.JobId} ({job.ModuleId}/{job.Kind}) made no progress for {Describe(lane.StallAfter!.Value)}; stopped.", null);
+                await SafeFail(job, owner, ErrorClass.Transient, $"Made no progress for {Describe(lane.StallAfter!.Value)}; stopped.").ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (jobCts.IsCancellationRequested)
             {
@@ -198,8 +254,12 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             {
                 if (!jobCts.IsCancellationRequested) jobCts.Cancel();
                 await heartbeatLoop.ConfigureAwait(false);
+                if (!leftBehind) jobCts.Dispose();
             }
         }
+
+        private static string Describe(TimeSpan t) =>
+            t.TotalMinutes >= 1 ? $"{t.TotalMinutes:0.#} min" : $"{t.TotalSeconds:0.#} s";
 
         private static async Task HeartbeatLoopAsync(PeriodicTimer timer, Func<Task<bool>> beat, CancellationToken token)
         {

@@ -180,6 +180,60 @@ CREATE INDEX ix_labels_task_label ON labels(task, label);
             new Migration(ModuleId, 2, "llm_calls.images", """
 ALTER TABLE llm_calls ADD COLUMN images INTEGER NOT NULL DEFAULT 0;
 """),
+            // Two days after launch the queue held 650,000 media jobs. Leasing by priority alone let that backlog outrank
+            // every other module in its lane, and the status page recounted a million rows on each request. Workers now
+            // take turns between modules (ix_jobs_fair), and the counts every page shows are kept by triggers, so reading
+            // them is a lookup in a table of a few dozen rows. The seeding statements read the jobs table once.
+            new Migration(ModuleId, 3, "fair leasing index, job counters kept by triggers", """
+CREATE INDEX ix_jobs_fair ON jobs(lane, state, module_id, priority DESC, not_before_ms, job_id);
+DROP INDEX ix_jobs_ready;
+CREATE INDEX ix_jobs_state ON jobs(state, job_id);
+
+CREATE TABLE job_counts(
+  lane TEXT NOT NULL,
+  module_id TEXT NOT NULL,
+  state TEXT NOT NULL,
+  n INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(lane, module_id, state)
+) WITHOUT ROWID;
+INSERT INTO job_counts(lane, module_id, state, n)
+  SELECT lane, module_id, state, COUNT(*) FROM jobs GROUP BY lane, module_id, state;
+
+CREATE TABLE job_module_last(
+  module_id TEXT PRIMARY KEY,
+  last_ok_ms INTEGER,
+  last_fail_ms INTEGER,
+  last_error TEXT
+) WITHOUT ROWID;
+INSERT INTO job_module_last(module_id, last_ok_ms, last_fail_ms)
+  SELECT module_id, MAX(CASE WHEN state='succeeded' THEN finished_at_ms END), MAX(CASE WHEN state='dead' THEN finished_at_ms END)
+  FROM jobs GROUP BY module_id;
+UPDATE job_module_last SET last_error = (
+  SELECT j.error_message FROM jobs j WHERE j.module_id = job_module_last.module_id AND j.state = 'dead'
+  ORDER BY j.finished_at_ms DESC LIMIT 1)
+WHERE last_fail_ms IS NOT NULL;
+
+CREATE TRIGGER trg_jobs_count_insert AFTER INSERT ON jobs BEGIN
+  INSERT OR IGNORE INTO job_counts(lane, module_id, state, n) VALUES(NEW.lane, NEW.module_id, NEW.state, 0);
+  UPDATE job_counts SET n = n + 1 WHERE lane = NEW.lane AND module_id = NEW.module_id AND state = NEW.state;
+END;
+CREATE TRIGGER trg_jobs_count_delete AFTER DELETE ON jobs BEGIN
+  UPDATE job_counts SET n = n - 1 WHERE lane = OLD.lane AND module_id = OLD.module_id AND state = OLD.state;
+END;
+CREATE TRIGGER trg_jobs_count_state AFTER UPDATE OF state ON jobs WHEN OLD.state <> NEW.state BEGIN
+  UPDATE job_counts SET n = n - 1 WHERE lane = OLD.lane AND module_id = OLD.module_id AND state = OLD.state;
+  INSERT OR IGNORE INTO job_counts(lane, module_id, state, n) VALUES(NEW.lane, NEW.module_id, NEW.state, 0);
+  UPDATE job_counts SET n = n + 1 WHERE lane = NEW.lane AND module_id = NEW.module_id AND state = NEW.state;
+END;
+CREATE TRIGGER trg_jobs_last_outcome AFTER UPDATE OF state ON jobs WHEN OLD.state <> NEW.state AND NEW.state IN ('succeeded', 'dead') BEGIN
+  INSERT OR IGNORE INTO job_module_last(module_id) VALUES(NEW.module_id);
+  UPDATE job_module_last SET
+    last_ok_ms = CASE WHEN NEW.state = 'succeeded' THEN NEW.finished_at_ms ELSE last_ok_ms END,
+    last_fail_ms = CASE WHEN NEW.state = 'dead' THEN NEW.finished_at_ms ELSE last_fail_ms END,
+    last_error = CASE WHEN NEW.state = 'dead' THEN NEW.error_message ELSE last_error END
+  WHERE module_id = NEW.module_id;
+END;
+"""),
         };
     }
 }

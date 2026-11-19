@@ -10,7 +10,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
 {
     /// <summary>
     /// A problem with Omniscience's own data or machinery (X51). <c>kind</c>: source_down, source_stalled, backfill_stalled,
-    /// llm_errors, llm_circuit, cache_floor or jobs_dead. Open while <c>resolvedMs</c> is null.
+    /// llm_errors, llm_circuit, cache_floor, jobs_dead, tail_stalled (v2's messages have stopped arriving) or module_stalled
+    /// (a module has work queued and has finished none for hours). Open while <c>resolvedMs</c> is null.
     /// </summary>
     [Api.ApiContract]
     public sealed record HealthIssueDto(string IssueId, string Kind, string? Subject, string Severity, JsonElement Detail, long FirstMs, long LastMs, long? ResolvedMs);
@@ -25,6 +26,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
         private static readonly HashSet<string> Working = new(StringComparer.OrdinalIgnoreCase) { "active", "ok", "connected", "idle", "running", "live", "syncing" };
 
         private sealed record Issue(string Id, string Kind, string? Subject, object Detail, string Severity);
+
+        /// <summary>When this engine first checked its health (the stall checks count from here after a start).</summary>
+        private long healthSinceMs;
 
         private async Task<string?> HealthAsync(JobContext job)
         {
@@ -98,6 +102,40 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                     string? error = c.Scalar<string>(null, "SELECT error_message FROM jobs WHERE state='dead' AND module_id=$m ORDER BY finished_at_ms DESC LIMIT 1", ("$m", module));
                     issues.Add(new Issue("jobs_dead|" + module, "jobs_dead", module, new { moduleId = module, jobs = n, lastMs = last, lastError = error is { Length: > 300 } e ? e[..300] : error }, NoticeSeverity.Attention));
                 }
+
+            // 5. Work that is queued and going nowhere, from the job counters (a few dozen rows). Two days after launch the
+            //    tail of v2's messages had not completed for nine hours and the deduction sweep not at all, each waiting
+            //    behind another module's backlog, and nothing said so: every job in sight was merely "queued".
+            double moduleStallHours = Context.Settings.Get("monitors.health.module_stall_hours", 6.0);
+            double tailStallMinutes = Context.Settings.Get("monitors.health.tail_stall_minutes", 30.0);
+            // Measured from the last success, or from this engine's first check when that is later: a module is given the
+            // full time after every start before it is called stalled. A job that is running is not stalled (one that hangs
+            // is stopped by the lane's own watch).
+            if (healthSinceMs == 0) healthSinceMs = now;
+            // Since when each module's next job has been ready to run. A job waiting for its start time (a schedule, a
+            // retry backing off) is not waiting on anyone.
+            var readySince = Context.Jobs.WaitingHeads().GroupBy(h => h.Module, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.Min(h => h.ReadySinceMs), StringComparer.Ordinal);
+            foreach (var (module, stats) in Context.Jobs.ModuleStats())
+            {
+                if (stats.Leased > 0) continue;
+                long since = Math.Max(stats.LastSucceededMs ?? 0, healthSinceMs);
+                if (module == Storage.Legacy.LegacyImportModule.ModuleId)
+                {
+                    // The only way messages reach this engine until Discord capture is switched on. It is due every two
+                    // minutes, so with none completed for this long it has stopped, queued or not.
+                    if (Context.Settings.Get(Storage.Legacy.LegacyImportModule.EnabledSetting, true) && now - since >= (long)(tailStallMinutes * 60_000))
+                        issues.Add(new Issue("tail_stalled", "tail_stalled", module,
+                            new { moduleId = module, lastSucceededMs = stats.LastSucceededMs, minutes = Math.Round((now - since) / 60_000.0), queued = stats.Queued }, NoticeSeverity.Urgent));
+                    continue;
+                }
+                // Stalled: a job has been ready all that time, and the module finished nothing in it. (A backlog that is
+                // being worked through has old jobs waiting too, but it keeps finishing others.)
+                if (!readySince.TryGetValue(module, out long ready)) continue;
+                long waiting = now - Math.Max(ready, since);
+                if (waiting >= (long)(moduleStallHours * Hour))
+                    issues.Add(new Issue("module_stalled|" + module, "module_stalled", module,
+                        new { moduleId = module, queued = stats.Queued, lastSucceededMs = stats.LastSucceededMs, hours = Math.Round(waiting / (double)Hour, 1) }, NoticeSeverity.Attention));
+            }
 
             // Open what is new, keep what is still there, close what went away. A problem that comes back is told again.
             var open = new Dictionary<string, (long First, long? Resolved)>(StringComparer.Ordinal);

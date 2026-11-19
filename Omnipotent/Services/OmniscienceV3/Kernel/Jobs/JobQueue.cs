@@ -16,8 +16,8 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
     /// after a crash.</item>
     /// <item><b>Classified failure:</b> transient errors retry with exponential backoff and jitter; permanent
     /// errors and exhausted retries go to the dead-letter state with their last error, retryable from the UI.</item>
-    /// <item><b>Ordering:</b> highest priority first, then earliest eligible, then oldest. Queued jobs gain
-    /// priority as they age (<see cref="AgePriorities"/>), so nothing starves.</item>
+    /// <item><b>Ordering:</b> highest priority first, then earliest eligible, then oldest; a job counts as higher the
+    /// longer it has waited, and a module with a backlog cannot crowd out the others (<see cref="LeaseNextAsync"/>).</item>
     /// </list>
     /// All mutations go through intel.db's single writer, so lease/complete races resolve in one place.
     /// </summary>
@@ -70,24 +70,97 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             return c.Scalar<long>(tx, "SELECT last_insert_rowid()");
         }
 
-        /// <summary>Leases the best eligible job in <paramref name="lane"/>, or null when none is ready.</summary>
-        public Task<JobRecord?> LeaseNextAsync(Lane lane, string owner, TimeSpan leaseDuration, CancellationToken ct = default) =>
+        /// <summary>A module with more jobs than this queued in one lane is working through a backlog.</summary>
+        public const int BacklogJobs = 1_000;
+
+        /// <summary>While other modules have work, a backlog still gets one lease in this many.</summary>
+        public const int BacklogShare = 4;
+
+        /// <summary>A waiting job counts as one priority step higher for every ten minutes it has waited.</summary>
+        private const long AgeStepMs = 10 * 60 * 1000;
+
+        private const int AgeCap = 1_000;
+
+        /// <summary>Per lane: the backlog module served last, and how many leases went by since a backlog was served.</summary>
+        private readonly Dictionary<Lane, (string? LastBacklog, int SinceBacklog)> rotation = new();
+
+        private readonly record struct Candidate(string Module, long JobId, int Priority, long NotBeforeMs, long CreatedAtMs);
+
+        /// <summary>
+        /// Leases the next job in <paramref name="lane"/>, or null when none is ready.
+        /// <para>Among modules with an ordinary amount of work the order is what it always was: highest priority first
+        /// (a job gains a step for every ten minutes it has waited), then earliest eligible, then oldest. A module with
+        /// more than <see cref="BacklogJobs"/> queued is a backlog, and a backlog does not compete on priority: it gets
+        /// the lane whenever nobody else has a job ready, and one lease in <see cref="BacklogShare"/> when somebody
+        /// does; several backlogs take turns. On the server 650,000 media jobs outranked everything else in two lanes,
+        /// so the deduction sweep, the projections and the tail of v2's messages waited behind all of them.</para>
+        /// <para><paramref name="maxPerModule"/> is how many jobs one module may hold leased in this lane at once, so a
+        /// module whose jobs are slow or stuck cannot occupy every worker.</para>
+        /// </summary>
+        public Task<JobRecord?> LeaseNextAsync(Lane lane, string owner, TimeSpan leaseDuration, CancellationToken ct = default, int maxPerModule = int.MaxValue) =>
             intel.WriteAsync<JobRecord?>((c, tx) =>
             {
                 long now = clock.NowMs;
-                long? id = c.Scalar<long?>(tx, """
-                    SELECT job_id FROM jobs
-                    WHERE lane=$l AND state='queued' AND not_before_ms <= $now
+                string laneName = lane.ToString();
+                // job_counts is kept by triggers: a few rows per module, read in place of a scan of the queue.
+                var modules = c.Query(tx, """
+                    SELECT module_id, SUM(CASE WHEN state='queued' THEN n ELSE 0 END), SUM(CASE WHEN state='leased' THEN n ELSE 0 END)
+                    FROM job_counts WHERE lane=$l AND state IN ('queued','leased') GROUP BY module_id ORDER BY module_id
+                    """, r => (Module: r.GetString(0), Queued: r.GetInt64(1), Leased: r.GetInt64(2)), ("$l", laneName))
+                    .Where(m => m.Queued > 0 && m.Leased < maxPerModule).ToList();
+                if (modules.Count == 0) return null;
+
+                Candidate? Best(string module) => c.Query(tx, """
+                    SELECT job_id, priority, not_before_ms, created_at_ms FROM jobs INDEXED BY ix_jobs_fair
+                    WHERE lane=$l AND state='queued' AND module_id=$m AND not_before_ms <= $now
                     ORDER BY priority DESC, not_before_ms, job_id
                     LIMIT 1
-                    """, ("$l", lane.ToString()), ("$now", now));
-                if (id == null) return null;
+                    """, r => (Candidate?)new Candidate(module, r.GetInt64(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3)),
+                    ("$l", laneName), ("$m", module), ("$now", now)).FirstOrDefault();
+
+                // The ordinary modules' best ready jobs, compared as one queue.
+                Candidate? ordinary = null;
+                long ordinaryRank = long.MinValue;
+                foreach (var m in modules.Where(m => m.Queued <= BacklogJobs))
+                {
+                    if (Best(m.Module) is not { } candidate) continue; // everything it has queued is still backing off
+                    long rank = candidate.Priority + Math.Min(AgeCap, Math.Max(0, now - candidate.CreatedAtMs) / AgeStepMs);
+                    bool better = ordinary is not { } held || rank > ordinaryRank
+                                  || (rank == ordinaryRank && (candidate.NotBeforeMs < held.NotBeforeMs
+                                                              || (candidate.NotBeforeMs == held.NotBeforeMs && candidate.JobId < held.JobId)));
+                    if (better) (ordinary, ordinaryRank) = (candidate, rank);
+                }
+
+                // The backlogs, starting after the one served last.
+                Candidate? NextBacklog(string? last)
+                {
+                    var backlogs = modules.Where(m => m.Queued > BacklogJobs).Select(m => m.Module).ToList();
+                    if (backlogs.Count == 0) return null;
+                    int from = last == null ? 0 : backlogs.FindIndex(b => string.CompareOrdinal(b, last) > 0);
+                    if (from < 0) from = 0;
+                    for (int i = 0; i < backlogs.Count; i++)
+                        if (Best(backlogs[(from + i) % backlogs.Count]) is { } candidate) return candidate;
+                    return null;
+                }
+
+                var state = rotation.GetValueOrDefault(lane);
+                Candidate? chosen;
+                bool fromBacklog;
+                if (ordinary != null && state.SinceBacklog < BacklogShare - 1) (chosen, fromBacklog) = (ordinary, false);
+                else
+                {
+                    var backlog = NextBacklog(state.LastBacklog);
+                    (chosen, fromBacklog) = backlog != null ? (backlog, true) : (ordinary, false);
+                }
+                if (chosen is not { } job) return null;
+                rotation[lane] = fromBacklog ? (job.Module, 0) : (state.LastBacklog, state.SinceBacklog + 1);
+
                 c.Exec(tx, """
                     UPDATE jobs SET state='leased', lease_owner=$o, lease_expires_ms=$exp, heartbeat_ms=$now,
                                     attempts=attempts+1, started_at_ms=COALESCE(started_at_ms, $now)
                     WHERE job_id=$id
-                    """, ("$o", owner), ("$exp", now + (long)leaseDuration.TotalMilliseconds), ("$now", now), ("$id", id.Value));
-                return Read(c, tx, id.Value);
+                    """, ("$o", owner), ("$exp", now + (long)leaseDuration.TotalMilliseconds), ("$now", now), ("$id", job.JobId));
+                return Read(c, tx, job.JobId);
             }, ct);
 
         /// <summary>Extends the lease (and optionally records progress). False when the lease was lost.</summary>
@@ -223,12 +296,73 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             return Read(c, null, jobId);
         }
 
+        /// <summary>Jobs per lane and state, from the counters the triggers keep (never a scan of the jobs table).</summary>
         public IReadOnlyList<JobCount> Counts()
         {
             using var c = intel.OpenRead();
-            return c.Query(null, "SELECT lane, state, COUNT(*) FROM jobs GROUP BY lane, state",
+            return c.Query(null, "SELECT lane, state, SUM(n) FROM job_counts GROUP BY lane, state HAVING SUM(n) > 0",
                 r => new JobCount(Enum.Parse<Lane>(r.GetString(0)), r.GetString(1), r.GetInt64(2)));
         }
+
+        /// <summary>Jobs per module and state, and each module's last success and last dead-lettered failure, from the
+        /// same counters.</summary>
+        public IReadOnlyDictionary<string, ModuleJobStats> ModuleStats()
+        {
+            using var c = intel.OpenRead();
+            var stats = new Dictionary<string, ModuleJobStats>(StringComparer.Ordinal);
+            foreach (var (module, state, n) in c.Query(null, "SELECT module_id, state, SUM(n) FROM job_counts GROUP BY module_id, state",
+                         r => (r.GetString(0), r.GetString(1), r.GetInt64(2))))
+            {
+                var s = stats.GetValueOrDefault(module) ?? new ModuleJobStats();
+                stats[module] = state switch
+                {
+                    JobStates.Queued => s with { Queued = n },
+                    JobStates.Leased => s with { Leased = n },
+                    JobStates.Dead => s with { Dead = n },
+                    JobStates.Succeeded => s with { Succeeded = n },
+                    _ => s,
+                };
+            }
+            foreach (var row in c.Query(null, "SELECT module_id, last_ok_ms, last_fail_ms, last_error FROM job_module_last",
+                         r => (Module: r.GetString(0), Ok: r.GetInt64OrNull(1), Fail: r.GetInt64OrNull(2), Error: r.GetStringOrNull(3))))
+            {
+                var s = stats.GetValueOrDefault(row.Module) ?? new ModuleJobStats();
+                stats[row.Module] = s with { LastSucceededMs = row.Ok, LastFailedMs = row.Fail, LastError = row.Error };
+            }
+            return stats;
+        }
+
+        /// <summary>
+        /// For every module with a job ready to run: since when its next job (the one a worker would take first) has been
+        /// ready. A job waiting for its start time or backing off is not ready. One index seek per module with queued
+        /// work, so this costs the same whether ten jobs are queued or a million.
+        /// </summary>
+        public IReadOnlyList<(Lane Lane, string Module, long ReadySinceMs)> WaitingHeads()
+        {
+            long now = clock.NowMs;
+            using var c = intel.OpenRead();
+            var result = new List<(Lane, string, long)>();
+            foreach (var (lane, module) in c.Query(null, "SELECT lane, module_id FROM job_counts WHERE state='queued' AND n > 0", r => (r.GetString(0), r.GetString(1))))
+            {
+                var head = c.Query(null, """
+                    SELECT created_at_ms, not_before_ms FROM jobs INDEXED BY ix_jobs_fair
+                    WHERE lane=$l AND state='queued' AND module_id=$m AND not_before_ms <= $now
+                    ORDER BY priority DESC, not_before_ms, job_id
+                    LIMIT 1
+                    """, r => (Found: true, Created: r.GetInt64(0), NotBefore: r.GetInt64(1)), ("$l", lane), ("$m", module), ("$now", now)).FirstOrDefault();
+                if (head.Found) result.Add((Enum.Parse<Lane>(lane), module, Math.Max(head.Created, head.NotBefore)));
+            }
+            return result;
+        }
+
+        /// <summary>Recounts <c>job_counts</c> from the jobs table. The triggers keep it exact; this is the repair for a
+        /// database edited by hand, and what the tests compare the triggers against.</summary>
+        public Task RecountAsync(CancellationToken ct = default) =>
+            intel.WriteAsync((c, tx) =>
+            {
+                c.Exec(tx, "DELETE FROM job_counts");
+                c.Exec(tx, "INSERT INTO job_counts(lane, module_id, state, n) SELECT lane, module_id, state, COUNT(*) FROM jobs GROUP BY lane, module_id, state");
+            }, ct);
 
         public IReadOnlyList<JobRecord> List(string? state, string? moduleId, int limit) =>
             Query(new JobQuery { State = state, ModuleId = moduleId, Limit = limit }).Items;

@@ -85,8 +85,34 @@ namespace Omnipotent.Services.OmniscienceV3.Api
         public static Task OkAsync(UserRequest req, object body, HttpStatusCode status = HttpStatusCode.OK)
         {
             CacheDeps.MarkUncacheable("omniscience-v3: stores are not version-tracked");
-            return req.ReturnResponse(JsonSerializer.Serialize(body, ApiJson.Options), JsonContentType, NoHeaders, status);
+            return JsonAsync(req, JsonSerializer.Serialize(body, ApiJson.Options), status);
         }
+
+        private static readonly AsyncLocal<AnswerSlot?> slot = new();
+
+        /// <summary>The answer of the request this code runs for (set by <see cref="AnswerGuard"/>; null outside a guarded read).</summary>
+        public static AnswerSlot? Slot
+        {
+            get => slot.Value;
+            set => slot.Value = value;
+        }
+
+        /// <summary>
+        /// Answers with JSON that is already serialised. Every JSON answer of a v3 route ends here: when the request was
+        /// answered "pending" in the meantime (<see cref="AnswerGuard"/>), the answer is kept for the next ask instead of
+        /// being written to a response that has gone.
+        /// </summary>
+        public static Task JsonAsync(UserRequest req, string json, HttpStatusCode status = HttpStatusCode.OK)
+        {
+            var s = slot.Value;
+            return s == null
+                ? req.ReturnResponse(json, JsonContentType, NoHeaders, status)
+                : s.AnswerAsync(json, status, () => req.ReturnResponse(json, JsonContentType, NoHeaders, status));
+        }
+
+        /// <summary>A handler that writes its response itself (a stream, a file) says so before it starts. False: the
+        /// request has been answered "pending" already and nothing may be written.</summary>
+        public static bool BeginDirect() => slot.Value?.TryWriteDirect() ?? true;
 
         /// <summary>KliveAPI's parameter is declared non-nullable but treats null as "no extra headers".</summary>
         private static readonly NameValueCollection NoHeaders = null!;
@@ -94,7 +120,7 @@ namespace Omnipotent.Services.OmniscienceV3.Api
         public static Task ErrorAsync(UserRequest req, HttpStatusCode status, string code, string message)
         {
             CacheDeps.MarkUncacheable("omniscience-v3: error response");
-            return req.ReturnResponse(JsonSerializer.Serialize(new ApiError(code, message), ApiJson.Options), JsonContentType, NoHeaders, status);
+            return JsonAsync(req, JsonSerializer.Serialize(new ApiError(code, message), ApiJson.Options), status);
         }
     }
 
@@ -229,6 +255,9 @@ namespace Omnipotent.Services.OmniscienceV3.Api
         private readonly ConcurrentDictionary<string, byte> registered = new(StringComparer.Ordinal);
         private KliveAPI.KliveAPI? api;
 
+        /// <summary>Answers every read within a few seconds, with its data or with "pending" (see <see cref="AnswerGuard"/>).</summary>
+        public AnswerGuard Answers { get; } = new();
+
         public RouteRegistrar(KliveAPI.KliveAPI? direct, Func<IEnumerable<object>> activeServices, Action<string, Exception?> logError)
         {
             this.direct = direct;
@@ -307,7 +336,39 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             }
         }
 
-        private async Task GuardAsync(string path, HttpMethod method, Func<UserRequest, Task> handler, UserRequest req)
+        private Task GuardAsync(string path, HttpMethod method, Func<UserRequest, Task> handler, UserRequest req)
+        {
+            if (method != HttpMethod.Get) return HandleAsync(path, method, handler, req);
+            return Answers.RunAsync(AnswerKey(path, req), () => HandleAsync(path, method, handler, req),
+                (json, status) => WriteKeptAsync(req, json, status), () => WriteKeptAsync(req, AnswerGuard.PendingJson, HttpStatusCode.Accepted));
+        }
+
+        /// <summary>Who asks, and for what: the route and its parameters in a fixed order.</summary>
+        private static string AnswerKey(string path, UserRequest req)
+        {
+            var sb = new StringBuilder(req.user?.UserID ?? "-").Append('|').Append(path);
+            var parameters = req.userParameters;
+            if (parameters != null)
+                foreach (string? name in parameters.AllKeys.OrderBy(k => k, StringComparer.Ordinal))
+                    sb.Append('&').Append(name).Append('=').Append(parameters[name]);
+            return sb.ToString();
+        }
+
+        private static async Task WriteKeptAsync(UserRequest req, string json, HttpStatusCode status)
+        {
+            CacheDeps.MarkUncacheable("omniscience-v3: an answer given after its request, or a pending one");
+            try
+            {
+                await req.ReturnResponse(json, ApiResponses.JsonContentType, null!, status).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is HttpListenerException or IOException or ObjectDisposedException or InvalidOperationException)
+            {
+                // The client left before it was answered: nothing more can be sent.
+                return;
+            }
+        }
+
+        private async Task HandleAsync(string path, HttpMethod method, Func<UserRequest, Task> handler, UserRequest req)
         {
             try
             {
@@ -359,6 +420,7 @@ namespace Omnipotent.Services.OmniscienceV3.Api
         public static async Task WriteAsync(UserRequest req, IAsyncEnumerable<object> events, CancellationToken ct)
         {
             CacheDeps.MarkUncacheable("omniscience-v3: streaming");
+            if (!ApiResponses.BeginDirect()) return; // already answered "pending": the page asks again
             var headers = new NameValueCollection { ["Cache-Control"] = "no-store", ["X-Accel-Buffering"] = "no" };
             var stream = req.PrepareStreamResponse(ContentType, -1, HttpStatusCode.OK, headers);
             await using var writer = new StreamWriter(stream, new UTF8Encoding(false), 16 * 1024) { NewLine = "\n" };

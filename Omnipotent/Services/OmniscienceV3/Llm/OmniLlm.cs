@@ -44,16 +44,58 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
 
         public Task<ModelContextInfo> ContextAsync(string? model, CancellationToken ct) => client.GetContextAsync(model, ct);
 
+        /// <summary>An answer this short is a label or a line: the call is sent with thinking off unless it asks otherwise.</summary>
+        public const int ShortAnswerTokens = 2_000;
+
+        /// <summary>The effort a longer call gets when it names none ("off", "low", "medium", "high").</summary>
+        public string DefaultReasoningEffort { get; set; } = "low";
+
+        /// <summary>
+        /// Says how hard the model should think, and leaves room for it. The model's thinking is billed against the same
+        /// output ceiling as its answer, and left unsaid the router's default was "medium": a call whose ceiling was sized
+        /// for the answer alone (a few hundred tokens for a label, 12,000 for a slice of claims) spent it thinking and came
+        /// back cut off with no answer at all. Every call now carries an effort, and a ceiling with that effort's
+        /// headroom on top of what the caller asked for the answer.
+        /// </summary>
+        internal LlmRequest Shape(LlmRequest request)
+        {
+            string effort = (request.ReasoningEffort ?? (request.MaxOutputTokens is int cap && cap <= ShortAnswerTokens ? "off" : DefaultReasoningEffort))
+                .Trim().ToLowerInvariant();
+            int headroom = effort switch { "off" => 256, "low" => 1_500, "medium" => 4_000, _ => 8_000 };
+            return request with
+            {
+                ReasoningEffort = effort,
+                MaxOutputTokens = request.MaxOutputTokens is int max ? max + headroom : null,
+                SystemPrompt = request.SystemPrompt == null ? null : Ml.UnicodeText.WellFormed(request.SystemPrompt),
+                Turns = WellFormed(request.Turns),
+            };
+        }
+
+        /// <summary>The turns with any half surrogate pair replaced (chat text is not always well-formed, and a request body
+        /// that is not valid Unicode is refused or mangled on the way). The same list when nothing needed replacing.</summary>
+        private static IReadOnlyList<LlmTurn> WellFormed(IReadOnlyList<LlmTurn> turns)
+        {
+            List<LlmTurn>? changed = null;
+            for (int i = 0; i < turns.Count; i++)
+            {
+                string clean = Ml.UnicodeText.WellFormed(turns[i].Content);
+                if (ReferenceEquals(clean, turns[i].Content)) continue;
+                changed ??= new List<LlmTurn>(turns);
+                changed[i] = turns[i] with { Content = clean };
+            }
+            return changed ?? turns;
+        }
+
         public async Task<LlmResult> CallAsync(LlmCall call, CancellationToken ct)
         {
-            var request = call.Request;
+            var request = Shape(call.Request);
             LlmResult result = await client.QueryAsync(request, ct).ConfigureAwait(false);
             await LogAsync(call, request, result, ct).ConfigureAwait(false);
 
             if (!result.Success && call.Repack != null && result.ErrorKind is LlmErrorKind.ContextOverflow or LlmErrorKind.RequestTooLarge)
             {
                 double shrink = result.ErrorKind == LlmErrorKind.ContextOverflow ? 0.85 : 0.7;
-                request = call.Repack(shrink);
+                request = Shape(call.Repack(shrink));
                 result = await client.QueryAsync(request, ct).ConfigureAwait(false);
                 await LogAsync(call, request, result, ct).ConfigureAwait(false);
             }
@@ -83,9 +125,11 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         }
 
         /// <summary>Opens a "prefill once, ask many" session over a large stable prefix.</summary>
+        /// <param name="reasoningEffort">How hard every question of the session is thought about ("off", "low", "medium",
+        /// "high"); null leaves it to <see cref="Shape"/>.</param>
         public CacheShapedSession OpenSession(string moduleId, string purpose, string sessionKey, string systemPrompt, string stablePrefix,
-            AIRouterWorkClass workClass, string? promptVersion = null, long? jobId = null) =>
-            new(this, client, moduleId, purpose, sessionKey, systemPrompt, stablePrefix, workClass, promptVersion, jobId);
+            AIRouterWorkClass workClass, string? promptVersion = null, long? jobId = null, string? reasoningEffort = null) =>
+            new(this, client, moduleId, purpose, sessionKey, systemPrompt, stablePrefix, workClass, promptVersion, jobId) { ReasoningEffort = reasoningEffort };
 
         private static bool HasImages(LlmRequest request) => request.Turns.Any(t => t.Images is { Count: > 0 });
 
@@ -151,6 +195,12 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
 
         public int Passes { get; private set; }
 
+        /// <summary>The effort every question of this session is sent with; null leaves it to <see cref="OmniLlm.Shape"/>.</summary>
+        public string? ReasoningEffort { get; init; }
+
+        /// <summary>True while the provider-side session holds the stable prefix, so the next question travels alone.</summary>
+        public bool PrefixSent => prefixSent;
+
         public async Task<LlmResult> AskAsync(string question, LlmOutputSchema? schema, int? maxOutputTokens, ModelSamplingParameters? sampling, CancellationToken ct)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
@@ -173,10 +223,19 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
                     Sampling = sampling,
                     WorkClass = workClass,
                     OutputSchema = schema,
+                    ReasoningEffort = ReasoningEffort,
                     KeepSession = true,
                 },
             }, ct).ConfigureAwait(false);
             if (result.Success) prefixSent = true;
+            else
+            {
+                // A failed question leaves the provider-side session holding a turn with no answer (or a cut-off one).
+                // It is ended here, so the next question starts a clean session and carries the prefix again, instead
+                // of being appended to the wreck or sent without its evidence.
+                client.EndSession(sessionKey);
+                prefixSent = false;
+            }
             Passes++;
             return result;
         }

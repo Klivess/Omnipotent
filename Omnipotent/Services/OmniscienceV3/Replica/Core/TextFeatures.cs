@@ -76,7 +76,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             int regional = 0, firstPictographic = -1;
             for (int i = 0; i < cluster.Length; i += char.IsSurrogatePair(cluster, i) ? 2 : 1)
             {
-                int cp = char.ConvertToUtf32(cluster, i);
+                int cp = Omnipotent.Services.OmniscienceV3.Ml.UnicodeText.CodePointAt(cluster, i);
                 if (cp == Vs16) vs16 = true;
                 else if (cp == Keycap) keycap = true;
                 else if (cp == Zwj) zwj = true;
@@ -198,7 +198,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             }
             foreach (var g in Graphemes(StripMarkup(text)))
             {
-                int cp = char.ConvertToUtf32(g, 0);
+                int cp = Omnipotent.Services.OmniscienceV3.Ml.UnicodeText.CodePointAt(g, 0);
                 if (IsEmojiCluster(g)) { Flush(); tokens.Add(g); continue; }
                 if (char.IsLetterOrDigit(g, 0))
                 {

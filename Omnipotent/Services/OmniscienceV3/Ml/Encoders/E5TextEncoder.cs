@@ -98,6 +98,10 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
             var result = new float[inputs.Count][];
             if (inputs.Count == 0) return result;
             var sw = Stopwatch.StartNew();
+            // A handful of texts is someone's question (a search, a watch rule, a concept), not the backlog: it does not
+            // wait for the host to be idle. Waiting did: a search asked while the server was busy sat in the throttle for
+            // up to a minute before its one line of text was encoded.
+            bool bulk = inputs.Count > InteractiveTexts;
 
             // 1. Windows: every text becomes one or more token windows, each remembered with its owner and weight.
             var all = new List<Window>(inputs.Count);
@@ -120,7 +124,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
                     longest = widest;
                     count++;
                 }
-                await RunWithSplitsAsync(all, order, start, count, pooled, ct).ConfigureAwait(false);
+                await RunWithSplitsAsync(all, order, start, count, pooled, bulk, ct).ConfigureAwait(false);
                 start += count;
             }
 
@@ -144,10 +148,13 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
         private readonly record struct Window(int Owner, long[] Ids, double Weight);
 
         /// <summary>Runs order[start..start+count) as one batch, halving it on allocation failure down to single rows.</summary>
-        private async Task RunWithSplitsAsync(List<Window> all, int[] order, int start, int count, float[][] pooled, CancellationToken ct)
+        /// <summary>Requests of at most this many texts are answered without the host-load throttle.</summary>
+        public const int InteractiveTexts = 4;
+
+        private async Task RunWithSplitsAsync(List<Window> all, int[] order, int start, int count, float[][] pooled, bool bulk, CancellationToken ct)
         {
             ct.ThrowIfCancellationRequested();
-            await throttle.WaitAsync(ct).ConfigureAwait(false);
+            if (bulk) await throttle.WaitAsync(ct).ConfigureAwait(false);
             await onnx.Gate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
@@ -164,8 +171,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
                 onnx.Gate.Release();
             }
             int half = count / 2;
-            await RunWithSplitsAsync(all, order, start, half, pooled, ct).ConfigureAwait(false);
-            await RunWithSplitsAsync(all, order, start + half, count - half, pooled, ct).ConfigureAwait(false);
+            await RunWithSplitsAsync(all, order, start, half, pooled, bulk, ct).ConfigureAwait(false);
+            await RunWithSplitsAsync(all, order, start + half, count - half, pooled, bulk, ct).ConfigureAwait(false);
         }
 
         internal static bool IsAllocationFailure(Exception ex) =>
@@ -274,7 +281,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
         /// <summary>Model-ready windows (with &lt;s&gt; … &lt;/s&gt;) and each window's share of the text.</summary>
         public IEnumerable<(long[] Ids, double Weight)> Windows(string text, int maxTokens, int maxChunks)
         {
-            string clean = text.Replace('\0', ' ');
+            string clean = UnicodeText.WellFormed(text);
             long[] full = Fairseq(spm.EncodeToIds(prefix + clean, addBeginningOfSentence: false, addEndOfSentence: false));
             // The prefix normally tokenises to the same leading ids alone and inside the full string. If it does not
             // (an unusual first character fused with it), treat the whole string as body: correct, just not windowed per prefix.

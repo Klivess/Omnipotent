@@ -122,35 +122,75 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Links
                 Counts("u.topic", where, args, 20), Present(Shares(where, args, "s.at_ms DESC, s.message_id", Math.Clamp(limit, 1, 200))));
         }
 
+        /// <summary>How many links a search with words, a site, a kind or a topic looks at: the most recently shared that match.</summary>
+        public const int SearchLinkCap = 400;
+
         /// <summary>
-        /// "What did X share about Y": shares filtered by who, what words (in the address, title, description or summary),
-        /// site, kind, topic and time. Newest first.
+        /// "What did X share about Y": shares filtered by who, what words (in the address, title, author, description or
+        /// summary; a word also matches the words it begins), site, kind, topic and time. Newest first.
+        /// <para>Every path is a walk along an index. With nothing said about the link, the shares are read newest first.
+        /// Otherwise the links that match are found first (the <see cref="SearchLinkCap"/> shared most recently), then
+        /// their shares. It used to join and sort every share on each request.</para>
         /// </summary>
         public LinkSearchDto Search(string? query, string? personId, string? site, string? kind, string? topic, long? fromMs, long? toMs, int limit = 50)
         {
             limit = Math.Clamp(limit, 1, 500);
-            var where = new List<string> { "1=1" };
-            var args = new List<(string, object?)>();
+            var shareWhere = new List<string>();
+            var shareArgs = new List<(string, object?)>();
             if (!string.IsNullOrWhiteSpace(personId))
             {
-                where.Add("s.person_id=$p");
-                args.Add(("$p", RequirePerson(personId, out _)));
+                shareWhere.Add("s.person_id=$p");
+                shareArgs.Add(("$p", RequirePerson(personId, out _)));
             }
-            int n = 0;
-            foreach (string word in (query ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(6))
+            if (fromMs != null) { shareWhere.Add("s.at_ms >= $f"); shareArgs.Add(("$f", fromMs)); }
+            if (toMs != null) { shareWhere.Add("s.at_ms < $e"); shareArgs.Add(("$e", toMs)); }
+
+            var linkWhere = new List<string>();
+            var linkArgs = new List<(string, object?)>();
+            var words = (query ?? "").ToLowerInvariant()
+                .Split(new[] { ' ', ',', '"', '\'', '(', ')', '*', '^', '+', '{', '}', '[', ']' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+                .Where(w => w.Any(char.IsLetterOrDigit)).Take(6).ToList();
+            if (words.Count > 0)
             {
-                string name = "$q" + (n++).ToString(CultureInfo.InvariantCulture);
-                // The word is data: LIKE's own wildcards in it are escaped.
-                where.Add($"(u.url LIKE {name} ESCAPE '\\' OR u.title LIKE {name} ESCAPE '\\' OR u.description LIKE {name} ESCAPE '\\' OR u.summary LIKE {name} ESCAPE '\\' OR u.author LIKE {name} ESCAPE '\\')");
-                args.Add((name, "%" + word.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%"));
+                // Each word is a quoted string to the index (nothing in it is read as query syntax); all of them must be there.
+                linkWhere.Add("u.rowid IN (SELECT rowid FROM link_words WHERE link_words MATCH $q)");
+                linkArgs.Add(("$q", string.Join(" AND ", words.Select(w => "\"" + w + "\"*"))));
             }
-            if (!string.IsNullOrWhiteSpace(site)) { where.Add("(u.site=$s OR u.host=$s)"); args.Add(("$s", SiteKey(site))); }
-            if (!string.IsNullOrWhiteSpace(kind)) { where.Add("u.kind=$k"); args.Add(("$k", kind.Trim().ToLowerInvariant())); }
-            if (!string.IsNullOrWhiteSpace(topic)) { where.Add("u.topic=$t"); args.Add(("$t", topic.Trim().ToLowerInvariant())); }
-            if (fromMs != null) { where.Add("s.at_ms >= $f"); args.Add(("$f", fromMs)); }
-            if (toMs != null) { where.Add("s.at_ms < $e"); args.Add(("$e", toMs)); }
-            var rows = Shares(string.Join(" AND ", where), args, "s.at_ms DESC, s.message_id", limit + 1);
-            return new LinkSearchDto(Present(rows.Take(limit).ToList()), rows.Count > limit);
+            if (!string.IsNullOrWhiteSpace(site)) { linkWhere.Add("(u.site=$s OR u.host=$s)"); linkArgs.Add(("$s", SiteKey(site))); }
+            if (!string.IsNullOrWhiteSpace(kind)) { linkWhere.Add("u.kind=$k"); linkArgs.Add(("$k", kind.Trim().ToLowerInvariant())); }
+            if (!string.IsNullOrWhiteSpace(topic)) { linkWhere.Add("u.topic=$t"); linkArgs.Add(("$t", topic.Trim().ToLowerInvariant())); }
+
+            const string columns = "s.message_id, s.person_id, s.conversation_id, s.guild_id, s.at_ms, ";
+            static ShareRow Row(SqliteDataReader r) => new(r.GetString(0), r.GetStringOrNull(1), r.GetString(2), r.GetStringOrNull(3), r.GetInt64(4), ReadUrl(r, 5));
+            List<ShareRow> rows;
+            bool capped = false;
+            using (var c = Context.Stores.Intel.OpenRead())
+            {
+                if (linkWhere.Count == 0)
+                {
+                    // CROSS JOIN keeps the shares as the outer loop: they are read in time order and the read stops at the limit.
+                    rows = c.Query(null, $"""
+                        SELECT {columns}{UrlColumns} FROM link_shares s CROSS JOIN link_urls u ON u.url_id=s.url_id
+                        {(shareWhere.Count == 0 ? "" : "WHERE " + string.Join(" AND ", shareWhere))}
+                        ORDER BY s.at_ms DESC, s.message_id LIMIT $lim
+                        """, Row, shareArgs.Append(("$lim", (object?)(limit + 1))).ToArray());
+                }
+                else
+                {
+                    var links = c.Query(null, $"SELECT u.url_id FROM link_urls u WHERE {string.Join(" AND ", linkWhere)} ORDER BY u.last_shared_ms DESC LIMIT {SearchLinkCap + 1}",
+                        r => r.GetString(0), linkArgs.ToArray());
+                    capped = links.Count > SearchLinkCap;
+                    if (capped) links.RemoveAt(links.Count - 1);
+                    if (links.Count == 0) return new LinkSearchDto(Array.Empty<LinkShareDto>(), false);
+                    var (list, inArgs) = SqlHelpers.InList(links, "$u");
+                    rows = c.Query(null, $"""
+                        SELECT {columns}{UrlColumns} FROM link_shares s JOIN link_urls u ON u.url_id=s.url_id
+                        WHERE s.url_id IN ({list}){(shareWhere.Count == 0 ? "" : " AND " + string.Join(" AND ", shareWhere))}
+                        ORDER BY s.at_ms DESC, s.message_id LIMIT $lim
+                        """, Row, inArgs.Concat(shareArgs).Append(("$lim", (object?)(limit + 1))).ToArray());
+                }
+            }
+            return new LinkSearchDto(Present(rows.Take(limit).ToList()), rows.Count > limit || capped);
         }
 
         /// <summary>A site as it is stored: no scheme, no path, no "www.".</summary>

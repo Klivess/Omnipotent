@@ -398,5 +398,75 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             await RunAsync(h, minutes: 11);
             Assert.Equal("switched off", h.Driver.LastResult(MonitorsModule.HealthKind)!.Value.GetProperty("skipped").GetString());
         }
+
+        /// <summary>
+        /// 19 Nov 2026, two days after launch: the copy of v2's messages had not completed for nine hours and the insights
+        /// job had waited a day, each behind another module's backlog. Every job was "queued", which no check called a problem.
+        /// </summary>
+        [Fact]
+        public async Task DataHealth_SaysWhenTheMessageCopyOrAModuleHasStopped()
+        {
+            await using var h = await SignalsHarness.StartAsync(monitors: true);
+            await RunAsync(h);
+            await RunAsync(h, minutes: 11); // the first health check: stalls are counted from here
+            long now = h.Clock.NowMs;
+            // Work that is ready and never gets a worker (as behind a backlog): the two-minute copy of v2, and the insights
+            // refresh. Each sits at the back of its lane; the driver below runs everything else and hands these two back.
+            await h.Runtime.Stores.Intel.WriteAsync((c, tx) =>
+            {
+                foreach (var (module, kind, lane) in new[] { ("ingest.legacy", "sync", "Io"), ("insights", "refresh", "Cpu") })
+                    c.Exec(tx, """
+                        INSERT INTO jobs(module_id, kind, priority, lane, state, attempts, max_attempts, not_before_ms, created_at_ms)
+                        VALUES($m,$k,-1000,$l,'queued',0,3,0,$n)
+                        """, ("$m", module), ("$k", kind), ("$l", lane), ("$n", now));
+            });
+            async Task DriveAsync(SignalsHarness harness, int minutes)
+            {
+                harness.Clock.Advance(TimeSpan.FromMinutes(minutes));
+                for (int round = 0; round < 20; round++)
+                {
+                    while (await harness.Runtime.Host.PumpChangesOnceAsync() > 0) { }
+                    await harness.Runtime.Host.PlanOnceAsync();
+                    bool any = false;
+                    foreach (var lane in Enum.GetValues<Lane>())
+                        while (await harness.Runtime.Host.Jobs.LeaseNextAsync(lane, "test-driver", TimeSpan.FromMinutes(10)) is { } job)
+                        {
+                            if (job.ModuleId is "ingest.legacy" or "insights")
+                            {
+                                await harness.Runtime.Host.Jobs.ReleaseAsync(job.JobId, "test-driver");
+                                break;
+                            }
+                            any = true;
+                            await harness.Driver.RunAsync(job);
+                        }
+                    if (!any) break;
+                }
+                harness.Driver.AssertNoFailures();
+            }
+
+            await DriveAsync(h, minutes: 22);
+            Assert.DoesNotContain(h.Monitors!.Health().Open, i => i.Kind is "tail_stalled" or "module_stalled");
+
+            // Half an hour without the copy completing is already urgent: nothing newer than that is on any page.
+            await DriveAsync(h, minutes: 22);
+            var tail = h.Monitors.Health().Open.Single(i => i.Kind == "tail_stalled");
+            Assert.Equal(("ingest.legacy", "urgent"), (tail.Subject, tail.Severity.ToLowerInvariant()));
+            Assert.True(tail.Detail.GetProperty("minutes").GetDouble() >= 30);
+            Assert.DoesNotContain(h.Monitors.Health().Open, i => i.Kind == "module_stalled");
+
+            // A module gets six hours.
+            await DriveAsync(h, minutes: 6 * 60);
+            var allStalled = h.Monitors.Health().Open.Where(i => i.Kind == "module_stalled").ToList();
+            Assert.True(allStalled.Count == 1, "stalled: " + string.Join(" | ", allStalled.Select(i => i.Subject + " " + i.Detail.GetRawText())));
+            var stalled = allStalled[0];
+            Assert.Equal(("insights", 1), (stalled.Subject, stalled.Detail.GetProperty("queued").GetInt32()));
+
+            // The copy completes again: its problem closes on the next check.
+            await h.Runtime.Stores.Intel.WriteAsync((c, tx) =>
+                c.Exec(tx, "UPDATE jobs SET state='succeeded', finished_at_ms=$n WHERE module_id='ingest.legacy'", ("$n", h.Clock.NowMs)));
+            await DriveAsync(h, minutes: 11);
+            Assert.DoesNotContain(h.Monitors.Health().Open, i => i.Kind == "tail_stalled");
+            Assert.Contains(h.Monitors.Health().Resolved, i => i.Kind == "tail_stalled");
+        }
     }
 }

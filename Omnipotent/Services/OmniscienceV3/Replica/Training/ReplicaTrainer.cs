@@ -120,7 +120,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             using (var corpus = s.Stores.Corpus.OpenRead())
             {
                 person = People.Resolve(corpus, personId) ?? throw new ReplicaRefusedException($"No person '{personId}' in the corpus.", notFound: true);
-                authored = AuthoredCount(corpus, person);
+                authored = AuthoredUpTo(corpus, person, s.Settings.MinRepliesExperimental);
             }
             long now = s.Clock.NowMs;
             var band = s.Kernel.Policy.BandOf(person.CanonicalId, now);
@@ -395,8 +395,23 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             return first;
         }
 
-        private static int AuthoredCount(SqliteConnection corpus, PersonScope person) =>
-            (int)Math.Min(int.MaxValue, person.IdentityIds.Sum(id => corpus.Scalar<long>(null, "SELECT COUNT(*) FROM messages WHERE author_identity_id=$i AND deleted_at_ms IS NULL", ("$i", id))));
+        /// <summary>
+        /// How many messages the person has written, counted no further than <paramref name="enough"/>. The request that
+        /// starts a build only asks whether there are enough; counting them all read every message row the person ever
+        /// wrote (the author index does not say which are deleted), and for 140,000 messages on a busy disk the request
+        /// took twelve minutes to answer.
+        /// </summary>
+        private static int AuthoredUpTo(SqliteConnection corpus, PersonScope person, int enough)
+        {
+            int total = 0;
+            foreach (string id in person.IdentityIds)
+            {
+                if (total >= enough) break;
+                total += (int)corpus.Scalar<long>(null,
+                    "SELECT COUNT(*) FROM (SELECT 1 FROM messages WHERE author_identity_id=$i AND deleted_at_ms IS NULL LIMIT $n)", ("$i", id), ("$n", enough - total));
+            }
+            return total;
+        }
 
         private static long ChangeLogSeq(SqliteConnection corpus) => Storage.ChangeLog.MaxSeq(corpus);
 

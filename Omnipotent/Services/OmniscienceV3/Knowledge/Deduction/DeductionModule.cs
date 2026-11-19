@@ -42,6 +42,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
 
         public const string TiersSetting = Id + ".tiers";
         public const string MaxOutputSetting = Id + ".max_output_tokens";
+        public const string SliceTokensSetting = Id + ".slice_tokens";
+        public const string SecondReadingSetting = Id + ".second_reading";
+        public const string ReasoningSetting = Id + ".reasoning_effort";
         public const string SlicesPerJobSetting = Id + ".max_slices_per_job";
         public const string CriticThresholdSetting = Id + ".critic_threshold";
         public const string AcceptThresholdSetting = Id + ".accept_threshold";
@@ -85,7 +88,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             Settings = new[]
             {
                 new SettingDescriptor(TiersSetting, SettingTypes.Json, "[\"tracked\"]", "Tiers whose people are extracted continuously (tracked, watch)."),
-                new SettingDescriptor(MaxOutputSetting, SettingTypes.Int, "12000", "Output tokens reserved per extraction pass (the prompt fills the rest of the model's window).", 1_000, 64_000),
+                new SettingDescriptor(MaxOutputSetting, SettingTypes.Int, "16000", "Output tokens one extraction pass may use for its claims (the model's own limit applies when it is lower).", 1_000, 64_000),
+                new SettingDescriptor(SliceTokensSetting, SettingTypes.Int, "5000", "Evidence tokens read per model call. Claims come out about as long as the evidence goes in, so this must stay well under the output tokens; a slice that is cut off is split in two and read again.", 500, 60_000),
+                new SettingDescriptor(SecondReadingSetting, SettingTypes.Bool, "false", "Read every slice twice and adjudicate what only one reading found. More careful, and twice the model calls: with it off a slice is read once, then checked by the verifier and the critic."),
+                new SettingDescriptor(ReasoningSetting, SettingTypes.String, "\"low\"", "How hard the model thinks while extracting (off, low, medium, high). Thinking is billed against the output tokens."),
                 new SettingDescriptor(SlicesPerJobSetting, SettingTypes.Int, "4", "Slices one job processes before yielding to other people (fair rotation).", 1, 50),
                 new SettingDescriptor(CriticThresholdSetting, SettingTypes.Number, "0.4", "Claims at or above this probability go through the critic.", 0, 1),
                 new SettingDescriptor(AcceptThresholdSetting, SettingTypes.Number, "0.55", "Calibrated probability at which a fact is shown as accepted.", 0, 1),
@@ -100,6 +106,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         };
 
         public const string ProfileReadModel = "knowledge.profile";
+
+        /// <summary>
+        /// The priority of reading a tracked person's messages for facts. Above the image captions that share the
+        /// background model lane (110 to 125): at 70 to 110 a sweep of captions ran for hours before any extraction did.
+        /// </summary>
+        public const int ExtractPriority = 150;
 
         public override IReadOnlyList<Storage.Sqlite.Migration> IntelMigrations => KnowledgeSchema.Deduction;
 
@@ -161,7 +173,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     {
                         string canonical = kit.Corpus.Canonical(d.Id);
                         // Nothing is extracted about someone whose analysis is switched off (N20).
-                        if (tracked.Contains(canonical) && !kit.Corpus.AnalysisOff.Person(canonical)) jobs.Add(Job(ExtractKind, "person", canonical, 100));
+                        if (tracked.Contains(canonical) && !kit.Corpus.AnalysisOff.Person(canonical)) jobs.Add(Job(ExtractKind, "person", canonical, ExtractPriority));
                         break;
                     }
                     case "conversation":
@@ -169,7 +181,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                         trackedIdentities ??= kit.Corpus.IdentitiesOf(tracked.SelectMany(kit.Corpus.PersonIdsOf).ToList()).Select(i => i.IdentityId).ToHashSet(StringComparer.Ordinal);
                         if (trackedIdentities.Count == 0) break;
                         foreach (var identity in kit.Corpus.MembersOf(d.Id).Where(trackedIdentities.Contains))
-                            if (kit.Corpus.PersonOfIdentity(identity) is { } p && tracked.Contains(p)) jobs.Add(Job(ExtractKind, "person", p, 90));
+                            if (kit.Corpus.PersonOfIdentity(identity) is { } p && tracked.Contains(p)) jobs.Add(Job(ExtractKind, "person", p, ExtractPriority - 10));
                         break;
                     }
                     case "message":
@@ -185,7 +197,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     {
                         string canonical = kit.Corpus.Canonical(d.Id);
                         jobs.Add(Job(ConsolidateKind, "person", canonical, 160));
-                        if (tracked.Contains(canonical)) jobs.Add(Job(ExtractKind, "person", canonical, 120));
+                        if (tracked.Contains(canonical)) jobs.Add(Job(ExtractKind, "person", canonical, ExtractPriority + 5));
                         // The merged-away id (unmerged again, or the survivor) is consolidated too, so nothing stays orphaned (F264).
                         if (d.Id != canonical) jobs.Add(Job(ConsolidateKind, "person", d.Id, 160));
                         break;
@@ -198,7 +210,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 if (name == "calibrate") jobs.Add(Job(CalibrateKind, lane: Lane.Cpu, priority: 40));
             }
             if (context.VersionChanged)
-                foreach (var p in tracked) jobs.Add(Job(ExtractKind, "person", p, 80));
+                foreach (var p in tracked) jobs.Add(Job(ExtractKind, "person", p, ExtractPriority - 20));
             return jobs.GroupBy(j => j.DedupeKey).Select(g => g.OrderByDescending(j => j.Priority).First()).ToList();
         }
 
@@ -219,7 +231,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
 
         private ExtractionOptions ExtractionSettings() => new()
         {
-            MaxOutputTokens = Context.Settings.Get(MaxOutputSetting, 12_000),
+            MaxOutputTokens = Context.Settings.Get(MaxOutputSetting, 16_000),
+            SliceTokens = Math.Clamp(Context.Settings.Get(SliceTokensSetting, 5_000), 500, 60_000),
+            SecondReading = Context.Settings.Get(SecondReadingSetting, false),
+            ReasoningEffort = Context.Settings.Get(ReasoningSetting, "low") is "off" or "low" or "medium" or "high" ? Context.Settings.Get(ReasoningSetting, "low") : "low",
             MaxSlicesPerJob = Context.Settings.Get(SlicesPerJobSetting, 4),
             CriticThreshold = Context.Settings.Get(CriticThresholdSetting, 0.4),
             DefaultEducationSystem = AgeEvidenceBuilder.ParseSystem(Context.Settings.Get(EducationSetting, "england_wales")) ?? EducationSystem.Unknown,
@@ -237,15 +252,22 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             if (Quality.QualityModule.LatestGate(Context.Stores, "deduction.extract", ExtractionPrompt.Version) is { Decision: "block" } gate)
                 throw new JobFailureException(ErrorClass.Permanent, $"Prompt {ExtractionPrompt.Version} is blocked by the Quality Lab gate: {string.Join(" ", gate.Reasons)}");
             var pipeline = new ExtractionPipeline(kit, claims, ExtractionSettings());
-            var stats = await pipeline.RunAsync(person, job).ConfigureAwait(false);
-            long seq = kit.Corpus.MaxSeq();
-            await SetStateAsync(person, tracked: true, pending: stats.Pending, extracted: true, error: null, ct: job.Cancellation).ConfigureAwait(false);
-            if (stats.Slices > 0 || stats.TouchedSubjects.Count > 0)
+            // Facts follow every slice, not the job: a job reads for hours, and when a later slice failed, the claims of
+            // the slices before it were never consolidated. Two days in, the server held hundreds of verified claims and
+            // not one fact.
+            int consolidated = 0;
+            var queued = new HashSet<string>(StringComparer.Ordinal);
+            async Task FactsAsync(ExtractionRunStats s)
             {
-                await ConsolidateAndProjectAsync(person, job, seq).ConfigureAwait(false);
-                foreach (var other in stats.TouchedSubjects.Where(s => s != person))
+                if (s.Slices == consolidated && s.TouchedSubjects.All(queued.Contains)) return;
+                consolidated = s.Slices;
+                await ConsolidateAndProjectAsync(person, job, kit.Corpus.MaxSeq()).ConfigureAwait(false);
+                foreach (var other in s.TouchedSubjects.Where(o => o != person && queued.Add(o)))
                     await Context.Jobs.EnqueueAsync(Job(ConsolidateKind, "person", other, 120), job.Cancellation).ConfigureAwait(false);
             }
+            var stats = await pipeline.RunAsync(person, job, FactsAsync).ConfigureAwait(false);
+            await SetStateAsync(person, tracked: true, pending: stats.Pending, extracted: true, error: null, ct: job.Cancellation).ConfigureAwait(false);
+            await FactsAsync(stats).ConfigureAwait(false);
             return Result(new
             {
                 person, stats.RunId, stats.Slices, stats.Messages, stats.ClaimsRaw, stats.ClaimsAgreed, stats.ClaimsVerified, stats.ClaimsRejected, stats.Refusals,
@@ -515,7 +537,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             {
                 if (!state.TryGetValue(p, out var s) || s.Pending || s.LastExtract == null)
                 {
-                    await Context.Jobs.EnqueueAsync(Job(ExtractKind, "person", p, s.LastExtract == null ? 110 : 70), ct).ConfigureAwait(false);
+                    await Context.Jobs.EnqueueAsync(Job(ExtractKind, "person", p, s.LastExtract == null ? ExtractPriority + 10 : ExtractPriority - 20), ct).ConfigureAwait(false);
                     enqueued++;
                 }
             }

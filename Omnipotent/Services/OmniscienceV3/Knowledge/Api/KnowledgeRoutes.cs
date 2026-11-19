@@ -422,7 +422,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                        ?? throw new ApiException(HttpStatusCode.NotFound, "not_built", "This view has not been built yet; it is computed in the background."));
 
         private static Task Serve(UserRequest req, ReadModelRow row) =>
-            req.ReturnResponse(DataRoutesEnvelope(row), ApiResponses.JsonContentType, null!, HttpStatusCode.OK);
+            ApiResponses.JsonAsync(req, DataRoutesEnvelope(row));
 
         /// <summary>
         /// A stored profile as it may be served now (MinorGuard): without inferences and restricted facts when the person is

@@ -13,6 +13,61 @@ namespace Omnipotent.Services.OmniscienceV3.Ml
     }
 
     /// <summary>
+    /// Text as a tokenizer can take it. Chat text is not always well-formed UTF-16: a message cut in the middle of an emoji,
+    /// or stored broken by the app that sent it, carries half of a surrogate pair. The tokenizers throw on that
+    /// (ArgumentException "Found a low surrogate char without a preceding high surrogate"), and one such message among
+    /// 140,000 failed a whole replica build. A lone surrogate becomes U+FFFD, the replacement character; a NUL becomes a
+    /// space. Well-formed text is returned as it is, without a copy.
+    /// </summary>
+    public static class UnicodeText
+    {
+        public static string WellFormed(string? text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            int bad = FirstBad(text, 0);
+            if (bad < 0) return text;
+            var sb = new System.Text.StringBuilder(text.Length);
+            int from = 0;
+            while (bad >= 0)
+            {
+                sb.Append(text, from, bad - from).Append(text[bad] == '\0' ? ' ' : '�');
+                from = bad + 1;
+                bad = FirstBad(text, from);
+            }
+            return sb.Append(text, from, text.Length - from).ToString();
+        }
+
+        /// <summary>
+        /// The code point at <paramref name="index"/>, where <c>char.ConvertToUtf32</c> would throw: half of a surrogate
+        /// pair reads as U+FFFD. Every place that looks at chat text by code point goes through this (the token estimate,
+        /// the classifier's content gate, the replica's text features): the framework call throws an ArgumentException
+        /// on such text, which the job queue takes for bad input and never retries.
+        /// </summary>
+        public static int CodePointAt(string text, int index)
+        {
+            char ch = text[index];
+            if (!char.IsSurrogate(ch)) return ch;
+            return char.IsHighSurrogate(ch) && index + 1 < text.Length && char.IsLowSurrogate(text[index + 1])
+                ? char.ConvertToUtf32(ch, text[index + 1])
+                : 0xFFFD;
+        }
+
+        /// <summary>Index of the next NUL or unpaired surrogate at or after <paramref name="start"/>, or -1.</summary>
+        private static int FirstBad(string text, int start)
+        {
+            for (int i = start; i < text.Length; i++)
+            {
+                char ch = text[i];
+                if (ch == '\0') return i;
+                if (!char.IsSurrogate(ch)) continue;
+                if (char.IsHighSurrogate(ch) && i + 1 < text.Length && char.IsLowSurrogate(text[i + 1])) { i++; continue; }
+                return i;
+            }
+            return -1;
+        }
+    }
+
+    /// <summary>
     /// Head+tail truncation (plan A5: long messages keep their beginning and end with a marker position),
     /// replacing v2's head-only truncation that dropped [SEP] and the tail (F329).
     /// </summary>
@@ -44,7 +99,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ml
 
         public EncodedText Encode(string text, int maxTokens)
         {
-            var raw = tokenizer.EncodeToIds(text ?? "", addSpecialTokens: false);
+            var raw = tokenizer.EncodeToIds(UnicodeText.WellFormed(text), addSpecialTokens: false);
             int budget = Math.Max(1, maxTokens - 2);
             var body = Truncation.HeadTail(raw, budget);
             var ids = new long[body.Count + 2];
@@ -81,7 +136,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ml
 
         public EncodedText Encode(string text, int maxTokens)
         {
-            var raw = tokenizer.EncodeToIds(prefix + (text ?? ""), addBeginningOfSentence: false, addEndOfSentence: false);
+            var raw = tokenizer.EncodeToIds(prefix + UnicodeText.WellFormed(text), addBeginningOfSentence: false, addEndOfSentence: false);
             int budget = Math.Max(1, maxTokens - 2);
             var body = Truncation.HeadTail(raw, budget);
             var ids = new long[body.Count + 2];

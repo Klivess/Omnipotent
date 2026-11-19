@@ -12,19 +12,36 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
 {
     public sealed record KernelOptions
     {
-        public IReadOnlyList<LaneOptions> Lanes { get; init; } = new[]
+        public IReadOnlyList<LaneOptions> Lanes { get; init; } = DefaultLanes(Environment.ProcessorCount);
+
+        /// <summary>
+        /// The worker pools for a host with <paramref name="processors"/> cores. CPU work gets half the cores, between two
+        /// and four workers: the first formula (cores minus four) left the four-core server with a single worker for
+        /// 450,000 queued jobs, and whatever that one worker was doing, nothing else in the lane ran. Each lane also says
+        /// how long a job may go without a sign of progress before it is stopped. The limits are set for a hang, not for
+        /// slowness: a replica's index stage took fifty minutes on the loaded server without reporting anything, and that
+        /// is work, so CPU jobs get two hours; I/O that goes quiet for half an hour is waiting on something that will not
+        /// come (on the server it was four workers, for four hours).
+        /// </summary>
+        public static IReadOnlyList<LaneOptions> DefaultLanes(int processors) => new[]
         {
-            new LaneOptions(Lane.Cpu, Math.Max(1, Math.Min(4, Environment.ProcessorCount - 4)), TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2)),
-            new LaneOptions(Lane.Io, 4, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2)),
-            new LaneOptions(Lane.LlmBackground, 1, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(5)),
-            new LaneOptions(Lane.LlmInteractive, 2, TimeSpan.FromMinutes(5), TimeSpan.FromMilliseconds(500)),
-            new LaneOptions(Lane.Coordinator, 4, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(1)),
+            new LaneOptions(Lane.Cpu, Math.Clamp(processors / 2, 2, 4), TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2), StallAfter: TimeSpan.FromHours(2)),
+            new LaneOptions(Lane.Io, 4, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2), StallAfter: TimeSpan.FromMinutes(30)),
+            new LaneOptions(Lane.LlmBackground, 1, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(5), StallAfter: TimeSpan.FromMinutes(60)),
+            // Klives started these himself and watches them: two of the same kind may run side by side.
+            new LaneOptions(Lane.LlmInteractive, 2, TimeSpan.FromMinutes(5), TimeSpan.FromMilliseconds(500), StallAfter: TimeSpan.FromMinutes(60), MaxPerModule: 2),
+            new LaneOptions(Lane.Coordinator, 4, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(1), StallAfter: TimeSpan.FromHours(24)),
         };
         public TimeSpan LoopInterval { get; init; } = TimeSpan.FromSeconds(1);
         public int ChangeBatch { get; init; } = 5_000;
         public int PlanBatch { get; init; } = 500;
         public TimeSpan MaintenanceInterval { get; init; } = TimeSpan.FromSeconds(15);
-        public TimeSpan PriorityAgeAfter { get; init; } = TimeSpan.FromMinutes(10);
+        /// <summary>Zero (the default): queued jobs are not aged. Workers take turns between modules, so no module can be
+        /// starved by another's priorities, and ageing rewrote every queued row every ten minutes (650,000 rows on the
+        /// server, a 300 MB write-ahead log). A positive value brings the old behaviour back.</summary>
+        public TimeSpan PriorityAgeAfter { get; init; } = TimeSpan.Zero;
+        /// <summary>How often each store's write-ahead log is checkpointed by maintenance.</summary>
+        public TimeSpan CheckpointInterval { get; init; } = TimeSpan.FromMinutes(2);
         public int PriorityCap { get; init; } = 1_000;
         public TimeSpan StreamRetention { get; init; } = TimeSpan.FromDays(7);
         public TimeSpan SucceededJobRetention { get; init; } = TimeSpan.FromDays(14);
@@ -68,6 +85,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
         private long lastMaintenanceMs;
         private long lastAgingMs;
         private long lastPruneMs;
+        private long lastCheckpointMs;
         private int started;
 
         public ModuleHost(OmniscienceStores stores, IClock clock, KernelOptions options, Action<string> log,
@@ -454,10 +472,15 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             long now = clock.NowMs;
             int reclaimed = await Jobs.ReclaimExpiredAsync(ct).ConfigureAwait(false);
             if (reclaimed > 0) log($"[OmniscienceV3] reclaimed {reclaimed} expired job lease(s).");
-            if (now - lastAgingMs >= (long)options.PriorityAgeAfter.TotalMilliseconds)
+            if (options.PriorityAgeAfter > TimeSpan.Zero && now - lastAgingMs >= (long)options.PriorityAgeAfter.TotalMilliseconds)
             {
                 lastAgingMs = now;
                 await Jobs.AgePriorities(options.PriorityAgeAfter, options.PriorityCap, ct).ConfigureAwait(false);
+            }
+            if (options.CheckpointInterval > TimeSpan.Zero && now - lastCheckpointMs >= (long)options.CheckpointInterval.TotalMilliseconds)
+            {
+                lastCheckpointMs = now;
+                CheckpointStores();
             }
             if (now - lastPruneMs >= (long)TimeSpan.FromHours(6).TotalMilliseconds)
             {
@@ -473,30 +496,51 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             }
         }
 
+        /// <summary>
+        /// Copies each store's write-ahead log back into its file. SQLite does this by itself only when a commit finds no
+        /// reader in the way; on the server intel.db's log had grown to 309 MB, and every read pays for a long log. A
+        /// passive checkpoint never blocks a reader or the writer, and a store that cannot be checkpointed now is tried
+        /// again on the next round.
+        /// </summary>
+        private void CheckpointStores()
+        {
+            foreach (var store in stores.All)
+            {
+                try { store.CheckpointPassive(); }
+                catch (SqliteException ex) { logError($"[OmniscienceV3] could not checkpoint {store.Name}.db; it is tried again shortly.", ex); }
+            }
+        }
+
         // ── health ───────────────────────────────────────────────────────────────
 
+        /// <summary>Jobs stopped by the stall watch since this engine started.</summary>
+        public long StalledJobs => workers?.Stalled ?? 0;
+
+        /// <summary>
+        /// Per-module health. Everything here is a read of a small table: the job figures come from the counters the
+        /// triggers keep (<see cref="JobQueue.ModuleStats"/>). It used to count and sort the jobs table once per module
+        /// on every call, which took minutes with a million jobs in it and was what the status page waited for.
+        /// </summary>
         public IReadOnlyList<ModuleHealth> Health()
         {
             long maxSeq;
             using (var cr = stores.Corpus.OpenRead()) maxSeq = ChangeLog.MaxSeq(cr);
             var states = ReadModuleStates();
-            using var c = stores.Intel.OpenRead();
+            var jobs = Jobs.ModuleStats();
+            Dictionary<string, long> dirty;
+            using (var c = stores.Intel.OpenRead())
+                dirty = c.Query(null, "SELECT module_id, COUNT(*) FROM module_dirty GROUP BY module_id", r => (r.GetString(0), r.GetInt64(1)))
+                    .ToDictionary(x => x.Item1, x => x.Item2, StringComparer.Ordinal);
             var result = new List<ModuleHealth>();
             foreach (var m in ordered)
             {
                 string id = m.Manifest.Id;
                 states.TryGetValue(id, out var st);
-                long dirty = c.Scalar<long>(null, "SELECT COUNT(*) FROM module_dirty WHERE module_id=$m", ("$m", id));
-                var byState = c.Query(null, "SELECT state, COUNT(*) FROM jobs WHERE module_id=$m GROUP BY state",
-                    r => (r.GetString(0), r.GetInt64(1)), ("$m", id)).ToDictionary(x => x.Item1, x => x.Item2);
-                long? lastOk = c.Scalar<long?>(null, "SELECT MAX(finished_at_ms) FROM jobs WHERE module_id=$m AND state='succeeded'", ("$m", id));
-                var lastFail = c.Query(null, "SELECT finished_at_ms, error_message FROM jobs WHERE module_id=$m AND state='dead' ORDER BY finished_at_ms DESC LIMIT 1",
-                    r => (r.GetInt64OrNull(0), r.GetStringOrNull(1)), ("$m", id)).FirstOrDefault();
+                var j = jobs.GetValueOrDefault(id) ?? new ModuleJobStats();
                 bool hasSubs = m.Manifest.SubscribedChangeKinds.Count > 0;
                 result.Add(new ModuleHealth(id, m.Manifest.Title, m.Manifest.Version, st.Enabled, st.Watermark,
-                    hasSubs ? Math.Max(0, maxSeq - st.Watermark) : 0, dirty,
-                    byState.GetValueOrDefault(JobStates.Queued), byState.GetValueOrDefault(JobStates.Leased), byState.GetValueOrDefault(JobStates.Dead),
-                    lastOk, lastFail.Item1, lastFail.Item2));
+                    hasSubs ? Math.Max(0, maxSeq - st.Watermark) : 0, dirty.GetValueOrDefault(id),
+                    j.Queued, j.Leased, j.Dead, j.LastSucceededMs, j.LastFailedMs, j.LastError));
             }
             return result;
         }

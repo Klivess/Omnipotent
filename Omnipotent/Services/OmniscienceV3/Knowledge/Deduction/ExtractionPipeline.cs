@@ -15,7 +15,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
 {
     public sealed record ExtractionOptions
     {
-        public int MaxOutputTokens { get; init; } = 12_000;
+        public int MaxOutputTokens { get; init; } = 16_000;
+        /// <summary>
+        /// Evidence tokens in one slice, at most. Claims come out about as long as the evidence goes in (measured on the
+        /// server: 0.4 to 2.6 output tokens per evidence token), so what bounds a slice is the output ceiling, not the
+        /// model's window. Slices that filled the window (150,000 tokens) were cut off at the ceiling every time.
+        /// </summary>
+        public int SliceTokens { get; init; } = 5_000;
+        /// <summary>Read every slice a second time and adjudicate the difference. Off: one reading, then the verifier and the
+        /// critic. Each reading is a model call of minutes on the background queue, and the second doubles them.</summary>
+        public bool SecondReading { get; init; }
+        /// <summary>How hard the model thinks on these calls ("off", "low", "medium", "high").</summary>
+        public string ReasoningEffort { get; init; } = "low";
         public int MaxSlicesPerJob { get; init; } = 4;
         public double CriticThreshold { get; init; } = 0.4;
         public EducationSystem DefaultEducationSystem { get; init; } = EducationSystem.EnglandWales;
@@ -81,14 +92,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         /// <summary>What one reading runs under: cancellation, the job its model calls are audited against (none for a tactic
         /// run), and the class AIRouter schedules them in (background for the continuous pipeline; interactive when Klives asked
         /// and is waiting).</summary>
-        private sealed record SliceRun(CancellationToken Ct, long? JobId, AIRouterWorkClass WorkClass);
+        private sealed record SliceRun(CancellationToken Ct, long? JobId, AIRouterWorkClass WorkClass, Func<ExtractionRunStats, Task>? AfterSlice = null);
 
-        public async Task<ExtractionRunStats> RunAsync(string personId, JobContext job)
+        /// <param name="afterSlice">Called after every slice whose claims were committed, so the caller can turn them into
+        /// facts while the job is still reading. A job reads for hours and can fail on a later slice; claims that waited
+        /// for the job to return never became facts at all.</param>
+        public async Task<ExtractionRunStats> RunAsync(string personId, JobContext job, Func<ExtractionRunStats, Task>? afterSlice = null)
         {
             var ct = job.Cancellation;
             string canonical = kit.Corpus.Canonical(personId);
             var stats = new ExtractionRunStats { RunId = NaturalKeys.Id("xr", canonical + "|" + job.Job.JobId.ToString(CultureInfo.InvariantCulture) + "|" + job.Job.Attempts.ToString(CultureInfo.InvariantCulture), 20), PersonId = canonical };
             long started = kit.Context.Clock.NowMs;
+            await CloseAbandonedRunsAsync(canonical, stats.RunId, started, ct).ConfigureAwait(false);
             await RecordRunAsync(stats, job.Job.JobId, started, null, ct).ConfigureAwait(false);
 
             var ids = kit.Corpus.PersonIdsOf(canonical);
@@ -106,10 +121,27 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             anchors = anchors.OrderBy(a => a.SentAtMs).ThenBy(a => a.OrderKey).ThenBy(a => a.IngestSeq).ThenBy(a => a.MessageId, StringComparer.Ordinal).ToList();
             var uncovered = assembler.Uncovered(canonical, anchors, ExtractionPrompt.Version);
             stats.AlreadyRead = anchors.Count - uncovered.Count;
-            await ReadAsync(canonical, asOf, uncovered, stats, new SliceRun(ct, job.Job.JobId, AIRouterWorkClass.Background), job.ReportProgressAsync).ConfigureAwait(false);
+            try
+            {
+                await ReadAsync(canonical, asOf, uncovered, stats, new SliceRun(ct, job.Job.JobId, AIRouterWorkClass.Background, afterSlice), job.ReportProgressAsync).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                // The run is closed with what it managed, so it is not listed as running for ever; the job still fails.
+                stats.Outcome = "failed";
+                await RecordRunAsync(stats, job.Job.JobId, started, kit.Context.Clock.NowMs, CancellationToken.None).ConfigureAwait(false);
+                throw;
+            }
             await RecordRunAsync(stats, job.Job.JobId, started, kit.Context.Clock.NowMs, ct).ConfigureAwait(false);
             return stats;
         }
+
+        /// <summary>Runs of this person still marked as running belong to an attempt that is gone (the service stopped, or
+        /// the job was stopped): they are closed as interrupted, with whatever they had recorded.</summary>
+        private Task CloseAbandonedRunsAsync(string person, string currentRunId, long nowMs, CancellationToken ct) =>
+            kit.Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx,
+                "UPDATE kn_extraction_runs SET outcome='interrupted', finished_at_ms=$n WHERE person_id=$p AND outcome='running' AND run_id<>$r",
+                ("$n", nowMs), ("$p", person), ("$r", currentRunId)), ct);
 
         /// <summary>
         /// X17 (extract from a selection): the same reading, limited to chosen messages — the subject's anchors among them
@@ -148,12 +180,14 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             var segments = assembler.Segments(planned);
 
             var info = await Llm.ContextAsync(null, ct).ConfigureAwait(false);
-            int output = Math.Min(options.MaxOutputTokens, Math.Max(1_024, info.MaxOutputTokens));
+            maxOutput = Math.Min(options.MaxOutputTokens, Math.Max(1_024, info.MaxOutputTokens));
             var estimator = Llm.Estimator;
             string profile = ProfileText(canonical, asOf);
             int overhead = estimator.Estimate(ExtractionPrompt.System) + estimator.Estimate(profile) + estimator.Estimate(ExtractionPrompt.ExtractSchema.Schema.ToString())
                            + estimator.Estimate(ExtractionPrompt.ExtractQuestion) + 2_000; // roster and headers
-            int budget = Math.Max(2_000, (int)((ContextPacker.Budget(info, output) - overhead) * 0.95));
+            // The window bounds what can be sent; the output ceiling bounds what can come back, and it is the tighter one.
+            int window = Math.Max(2_000, (int)((ContextPacker.Budget(info, maxOutput) - overhead) * 0.95));
+            int budget = Math.Min(window, Math.Max(1_000, Math.Min(options.SliceTokens, maxOutput / 2)));
             var slices = assembler.Pack(canonical, segments, budget, estimator);
             long sourceSeq = kit.Corpus.MaxSeq();
             int done = 0;
@@ -168,6 +202,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 await ProcessSliceAsync(canonical, slice, profile, budget, estimator, stats, run, sourceSeq, 0).ConfigureAwait(false);
                 done++;
                 await progress(new { person = canonical, slice = done, slices = slices.Count, claims = stats.ClaimsVerified, rejected = stats.ClaimsRejected }).ConfigureAwait(false);
+                if (run.AfterSlice != null) await run.AfterSlice(stats).ConfigureAwait(false);
             }
             if (uncovered.Count > planned.Count) stats.Pending = true;
         }
@@ -183,12 +218,13 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
 
             // Pass A: its own session.
             StructuredAnswer<ExtractionAnswer> a;
-            using (var s1 = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
-                       ExtractionPrompt.Version, run.JobId))
-            {
-                a = await StructuredLlm.AskAsync<ExtractionAnswer>(s1, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(1), ExtractionPrompt.Validate, ct).ConfigureAwait(false);
-                stats.LlmCalls += a.Calls;
-            }
+            // With one reading only, the critic's question follows on this same session (the evidence is sent once).
+            var s1 = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
+                ExtractionPrompt.Version, run.JobId, options.ReasoningEffort);
+            using var firstSession = s1;
+            a = await StructuredLlm.AskAsync<ExtractionAnswer>(s1, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(1), ExtractionPrompt.Validate, ct).ConfigureAwait(false);
+            stats.LlmCalls += a.Calls;
+            if (options.SecondReading) s1.Dispose();
             if (a.Outcome is StructuredOutcome.Overflow or StructuredOutcome.Truncated)
             {
                 await SplitAsync(subject, slice, profile, budget, estimator, stats, run, sourceSeq, depth).ConfigureAwait(false);
@@ -208,10 +244,14 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             List<(RawClaim Claim, string Agreement)> agreed;
             var verified = new List<VerifiedClaim>();
             var rejected = new List<RejectedClaim>();
-            using (var s2 = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
-                       ExtractionPrompt.Version, run.JobId))
+            using (var s2 = options.SecondReading
+                       ? Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
+                           ExtractionPrompt.Version, run.JobId, options.ReasoningEffort)
+                       : s1)
             {
-                var b = await StructuredLlm.AskAsync<ExtractionAnswer>(s2, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(2), ExtractionPrompt.Validate, ct).ConfigureAwait(false);
+                var b = options.SecondReading
+                    ? await StructuredLlm.AskAsync<ExtractionAnswer>(s2, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(2), ExtractionPrompt.Validate, ct).ConfigureAwait(false)
+                    : new StructuredAnswer<ExtractionAnswer>(null, StructuredOutcome.Ok, null, null, 0);
                 stats.LlmCalls += b.Calls;
                 var aClaims = a.Value?.Claims ?? new List<RawClaim>();
                 stats.ClaimsRaw += aClaims.Count + (b.Value?.Claims.Count ?? 0);
@@ -342,7 +382,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             return c.Query(null, "SELECT conversation_id FROM conversation_members WHERE identity_id=$i", r => r.GetString(0), ("$i", identity));
         }
 
-        private int MaxOutput() => options.MaxOutputTokens;
+        /// <summary>The output ceiling of this run: the setting, or the model's own limit when that is lower.</summary>
+        private int maxOutput;
+
+        private int MaxOutput() => maxOutput > 0 ? maxOutput : options.MaxOutputTokens;
 
         private ModelSamplingParameters Sampling(int seed) => new(Temperature: options.Temperature, Seed: seed);
 

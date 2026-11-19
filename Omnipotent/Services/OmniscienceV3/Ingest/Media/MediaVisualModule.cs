@@ -70,6 +70,34 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
             },
         };
 
+        /// <summary>
+        /// The words of every caption and of every text read from an image, in a full-text index kept by triggers on the
+        /// labels that hold them. The search used to run LIKE over the JSON of every attachment label on each request,
+        /// which grew with the corpus and took over a minute on the server.
+        /// </summary>
+        public override IReadOnlyList<Migration> IntelMigrations { get; } = new[]
+        {
+            new Migration(ModuleId, 1, "full-text index over captions and the text in images", """
+CREATE VIRTUAL TABLE media_words USING fts5(item_id UNINDEXED, task UNINDEXED, body, tokenize='unicode61 remove_diacritics 2');
+INSERT INTO media_words(rowid, item_id, task, body)
+  SELECT rowid, item_id, task, CASE WHEN NOT json_valid(signals_json) THEN '' WHEN task='caption' THEN COALESCE(json_extract(signals_json,'$.caption'),'') || ' ' || COALESCE(json_extract(signals_json,'$.tags'),'') ELSE COALESCE(json_extract(signals_json,'$.text'),'') END
+  FROM labels WHERE item_kind='attachment' AND task IN ('caption','ocr') AND abstained=0;
+CREATE TRIGGER trg_media_words_insert AFTER INSERT ON labels WHEN NEW.item_kind='attachment' AND NEW.task IN ('caption','ocr') BEGIN
+  DELETE FROM media_words WHERE rowid = NEW.rowid;
+  INSERT INTO media_words(rowid, item_id, task, body)
+    SELECT NEW.rowid, NEW.item_id, NEW.task, CASE WHEN NOT json_valid(NEW.signals_json) THEN '' WHEN NEW.task='caption' THEN COALESCE(json_extract(NEW.signals_json,'$.caption'),'') || ' ' || COALESCE(json_extract(NEW.signals_json,'$.tags'),'') ELSE COALESCE(json_extract(NEW.signals_json,'$.text'),'') END WHERE NEW.abstained=0;
+END;
+CREATE TRIGGER trg_media_words_update AFTER UPDATE ON labels WHEN NEW.item_kind='attachment' AND NEW.task IN ('caption','ocr') BEGIN
+  DELETE FROM media_words WHERE rowid = OLD.rowid;
+  INSERT INTO media_words(rowid, item_id, task, body)
+    SELECT NEW.rowid, NEW.item_id, NEW.task, CASE WHEN NOT json_valid(NEW.signals_json) THEN '' WHEN NEW.task='caption' THEN COALESCE(json_extract(NEW.signals_json,'$.caption'),'') || ' ' || COALESCE(json_extract(NEW.signals_json,'$.tags'),'') ELSE COALESCE(json_extract(NEW.signals_json,'$.text'),'') END WHERE NEW.abstained=0;
+END;
+CREATE TRIGGER trg_media_words_delete AFTER DELETE ON labels WHEN OLD.item_kind='attachment' AND OLD.task IN ('caption','ocr') BEGIN
+  DELETE FROM media_words WHERE rowid = OLD.rowid;
+END;
+"""),
+        };
+
         public override async Task InitializeAsync(ModuleContext context, CancellationToken ct)
         {
             await base.InitializeAsync(context, ct).ConfigureAwait(false);
@@ -234,7 +262,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
                 }
             }
             Add(looks, "looks", _ => "looks like it");
-            Add(words.Select(w => w.Id).ToList(), "words", id => words.First(w => w.Id == id).Where);
+            var saidWhere = words.ToDictionary(w => w.Id, w => w.Where, StringComparer.Ordinal);
+            Add(words.Select(w => w.Id).ToList(), "words", id => saidWhere[id]);
 
             var ranked = score.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Key).Take(limit * 3).ToList();
             var hits = Hydrate(ranked, off).Select(h => h with { Score = Math.Round(score[h.AttachmentId], 6), Why = why[h.AttachmentId] }).Take(limit).ToList();
@@ -267,44 +296,29 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
                 """, r => r.GetString(0), args.ToArray()).ToHashSet(StringComparer.Ordinal);
         }
 
-        /// <summary>Images whose caption, tags or read text contain the query's words, most words first.</summary>
-        private List<(string Id, int Hits, string Where)> WordMatches(string text, HashSet<string>? scope, int limit)
+        /// <summary>Images whose caption, tags or read text contain the query's words, best match first (the full-text index
+        /// ranks them: more of the words, and rarer ones, come first). A word also matches the words it begins.</summary>
+        private List<(string Id, string Where)> WordMatches(string text, HashSet<string>? scope, int limit)
         {
-            var terms = text.ToLowerInvariant().Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '"', '\'', '(', ')' }, StringSplitOptions.RemoveEmptyEntries)
-                .Where(t => t.Length >= 2).Distinct(StringComparer.Ordinal).Take(6).ToList();
+            var terms = text.ToLowerInvariant().Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '"', '\'', '(', ')', '*', '^', '-', '+', '{', '}', '[', ']', '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
+                .Where(t => t.Length >= 2 && t.Any(char.IsLetterOrDigit)).Distinct(StringComparer.Ordinal).Take(6).ToList();
             if (terms.Count == 0) return new();
-            var args = new List<(string, object?)>();
-            var likes = terms.Select((t, i) => { args.Add(("$w" + i, "%" + t.Replace("%", "").Replace("_", "") + "%")); return $"lower(signals_json) LIKE $w{i}"; }).ToList();
-            List<(string Id, string Task, string Json)> rows;
+            // Each term is a quoted string to the index, so nothing in it is read as query syntax.
+            string match = string.Join(" OR ", terms.Select(t => "\"" + t + "\"*"));
+            List<(string Id, string Task)> rows;
             using (var c = Context.Stores.Intel.OpenRead())
-                rows = c.Query(null, $"""
-                    SELECT item_id, task, signals_json FROM labels WHERE item_kind='attachment' AND task IN ('caption','ocr') AND ({string.Join(" OR ", likes)}) LIMIT 5000
-                    """, r => (r.GetString(0), r.GetString(1), r.GetStringOrNull(2) ?? "{}"), args.ToArray());
-            var best = new Dictionary<string, (int Hits, string Where)>(StringComparer.Ordinal);
-            foreach (var (id, task, json) in rows)
+                rows = c.Query(null, "SELECT item_id, task FROM media_words WHERE media_words MATCH $q ORDER BY bm25(media_words) LIMIT $l",
+                    r => (r.GetString(0), r.GetString(1)), ("$q", match), ("$l", scope == null ? limit * 2 : 5_000));
+            var best = new List<(string Id, string Where)>();
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            foreach (var (id, task) in rows)
             {
                 if (scope != null && !scope.Contains(id)) continue;
-                string hay;
-                try
-                {
-                    using var doc = JsonDocument.Parse(json);
-                    var root = doc.RootElement;
-                    hay = task == "caption"
-                        ? (Str(root, "caption") + " " + string.Join(" ", root.TryGetProperty("tags", out var tags) && tags.ValueKind == JsonValueKind.Array
-                            ? tags.EnumerateArray().Select(t => t.GetString() ?? "") : Array.Empty<string>()))
-                        : Str(root, "text");
-                }
-                catch (JsonException)
-                {
-                    continue; // a label this build cannot read matches nothing
-                }
-                hay = hay.ToLowerInvariant();
-                int n = terms.Count(t => hay.Contains(t, StringComparison.Ordinal));
-                if (n == 0) continue;
-                string where = task == "caption" ? "the caption says so" : "the text in it says so";
-                if (!best.TryGetValue(id, out var b) || n > b.Hits) best[id] = (n, b.Where is { } prior && prior != where && n == b.Hits ? prior : where);
+                if (!seen.Add(id)) continue;
+                best.Add((id, task == "caption" ? "the caption says so" : "the text in it says so"));
+                if (best.Count >= limit) break;
             }
-            return best.OrderByDescending(kv => kv.Value.Hits).ThenBy(kv => kv.Key, StringComparer.Ordinal).Take(limit).Select(kv => (kv.Key, kv.Value.Hits, kv.Value.Where)).ToList();
+            return best;
         }
 
         private static string Str(JsonElement root, string name) =>

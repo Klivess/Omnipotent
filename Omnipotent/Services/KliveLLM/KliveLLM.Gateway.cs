@@ -230,7 +230,7 @@ public partial class KliveLLM
         LlmCaller who = GatewayCaller(request, callerFile);
 
         string sid = request.SessionKey;
-        bool fresh = !request.KeepSession || !CanContinueToolSession(sid);
+        bool fresh = !request.KeepSession || !CanContinueGatewaySession(sid);
         if (fresh) StartToolSession(sid, request.SystemPrompt, caller: who);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -313,6 +313,26 @@ public partial class KliveLLM
 
     /// <summary>Ends a KeepSession conversation (releases its message log).</summary>
     public void EndGatewaySession(string sessionKey) => ResetSession(sessionKey);
+
+    /// <summary>
+    /// Whether a kept gateway session can take another question on top of what it already holds: its last message is the
+    /// model's answer, or the tool results this gateway records after a structured answer. A structured answer IS a tool
+    /// call, so <see cref="CanContinueToolSession"/> (which wants a plain assistant message last) said no after every one
+    /// of them: the session was started again, and a caller that had already sent its evidence then sent only the
+    /// follow-up question. Omniscience's adjudicator and critic were judging claims without the messages they cite.
+    /// A session whose last message is a user turn was left by a failed call and is started again.
+    /// </summary>
+    internal bool CanContinueGatewaySession(string sessionId)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return false;
+        lock (sessions)
+        {
+            if (!sessions.TryGetValue(sessionId, out var session) || session.structuredMessages.Count == 0) return false;
+            var last = session.structuredMessages[^1];
+            if (last.role == "tool") return true;
+            return last.role == "assistant" && (last.tool_calls == null || last.tool_calls.Count == 0);
+        }
+    }
 
     /// <summary>
     /// Appends a request's turns to its session, stamped as the request says. A user turn with images goes in as one

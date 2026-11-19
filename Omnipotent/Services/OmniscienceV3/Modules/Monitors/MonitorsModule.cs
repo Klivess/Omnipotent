@@ -87,6 +87,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                 new SettingDescriptor("monitors.health.source_stall_hours", SettingTypes.Number, "12", "A busy source with no new message for this long has stalled.", 1, 168),
                 new SettingDescriptor("monitors.health.source_min_daily", SettingTypes.Int, "20", "A source counts as busy when it brought at least this many messages a day over the last week.", 1, 100000),
                 new SettingDescriptor("monitors.health.backfill_stall_hours", SettingTypes.Number, "24", "A backfill of a conversation that has not moved for this long is stuck.", 1, 720),
+                new SettingDescriptor("monitors.health.module_stall_hours", SettingTypes.Number, "6", "A module with work queued that has finished none of it for this long is stalled.", 0.5, 720),
+                new SettingDescriptor("monitors.health.tail_stall_minutes", SettingTypes.Number, "30", "The copy of v2's new messages runs every two minutes; with none completed for this long it has stalled.", 5, 10080),
                 new SettingDescriptor("monitors.health.llm_error_share", SettingTypes.Number, "0.3", "The share of failed model calls in an hour that is worth telling.", 0.05, 1),
                 new SettingDescriptor("monitors.health.cache_floor", SettingTypes.Number, "0.5", "The prefix-cache efficiency of background model work (over six hours) below which Klives is told.", 0, 1),
                 new SettingDescriptor("monitors.health.cache_min_calls", SettingTypes.Int, "20", "How many background model calls in six hours the cache efficiency needs before it is judged.", 1, 100000),

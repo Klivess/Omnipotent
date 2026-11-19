@@ -40,8 +40,28 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         /// <summary>Registers the JSON answer for a purpose (null = the model refuses).</summary>
         public void On(string purpose, Func<FakeCall, string?> handler) => handlers[purpose] = handler;
 
+        /// <summary>Every request as the gateway received it (effort, output ceiling, turns).</summary>
+        public readonly ConcurrentQueue<LlmRequest> Requests = new();
+
+        /// <summary>Answers a request in place of the handlers when it returns a result (a cut-off answer, an outage on the
+        /// third call…). A failure it returns leaves the session as the real gateway does: holding a turn with no answer.</summary>
+        public Func<LlmRequest, LlmResult?>? Intercept { get; set; }
+
+        /// <summary>Sessions ended by the caller, in order.</summary>
+        public readonly ConcurrentQueue<string> Ended = new();
+
         public Task<LlmResult> QueryAsync(LlmRequest request, CancellationToken ct)
         {
+            Requests.Enqueue(request);
+            if (Intercept?.Invoke(request) is { } forced)
+            {
+                if (!forced.Success)
+                {
+                    var broken = sessions.GetOrAdd(request.SessionKey, _ => new List<string>());
+                    lock (broken) foreach (var t in request.Turns) broken.Add(t.Content);
+                }
+                return Task.FromResult(forced);
+            }
             var history = sessions.GetOrAdd(request.SessionKey, _ => new List<string>());
             string question;
             lock (history)
@@ -78,7 +98,11 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         public Task<ModelContextInfo> GetContextAsync(string? model, CancellationToken ct) =>
             Task.FromResult(new ModelContextInfo("fake", "fake-model", ContextWindow, MaxOutput, "test", null, 0, null));
 
-        public void EndSession(string sessionKey) => sessions.TryRemove(sessionKey, out _);
+        public void EndSession(string sessionKey)
+        {
+            Ended.Enqueue(sessionKey);
+            sessions.TryRemove(sessionKey, out _);
+        }
 
         /// <summary>Thrown by a handler to make the call fail as a provider outage would (a transient failure, not an answer).</summary>
         public sealed class OutageException : Exception { }

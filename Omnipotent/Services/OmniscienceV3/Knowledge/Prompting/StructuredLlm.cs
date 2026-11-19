@@ -38,8 +38,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Prompting
             var first = await session.AskAsync(question, schema, maxOutputTokens, sampling, ct).ConfigureAwait(false);
             var (value, outcome, problem) = Interpret(first, validate);
             if (outcome is not (StructuredOutcome.Invalid)) return new StructuredAnswer<T>(value, outcome, first, problem, 1);
-            // One retry on the same cached prefix with the exact validation problem.
-            string retry = "Your previous answer could not be used: " + problem + "\nAnswer the same request again, strictly as JSON matching the schema, and nothing else.";
+            // One retry with the exact validation problem. The request itself is said again: when the first call failed
+            // outright the session was started afresh, and "answer the same request again" would name a request the
+            // model has never seen.
+            string retry = question + "\n\nYour previous answer to this could not be used: " + problem + "\nAnswer again, strictly as JSON matching the schema, and nothing else.";
             var second = await session.AskAsync(retry, schema, maxOutputTokens, sampling, ct).ConfigureAwait(false);
             var (value2, outcome2, problem2) = Interpret(second, validate);
             return new StructuredAnswer<T>(value2, outcome2 == StructuredOutcome.Ok ? StructuredOutcome.Repaired : outcome2, second, problem2, 2);
@@ -49,6 +51,11 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Prompting
         {
             if (!result.Success)
             {
+                // Cut off at the output ceiling before the structured answer had even begun (the ceiling went on thinking):
+                // that is a truncation, to be answered with a smaller request. Read as "invalid" it was asked again at the
+                // same size, failed the same way, and took the whole job down with it.
+                if (result.ErrorKind == LlmErrorKind.NoStructuredOutput && string.Equals(result.FinishReason, "length", StringComparison.OrdinalIgnoreCase))
+                    return (null, StructuredOutcome.Truncated, "The answer was cut off at the output limit before it began.");
                 return result.ErrorKind switch
                 {
                     LlmErrorKind.Refused => (null, StructuredOutcome.Refused, result.ErrorMessage ?? "The model refused."),

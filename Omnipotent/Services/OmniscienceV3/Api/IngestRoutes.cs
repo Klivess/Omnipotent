@@ -147,6 +147,7 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             await using var file = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read, 81920, useAsync: true);
             // Content never changes under an attachment id once stored, so the browser may keep it; never a shared cache.
             var headers = new System.Collections.Specialized.NameValueCollection { ["Cache-Control"] = "private, max-age=86400", ["X-Content-Type-Options"] = "nosniff" };
+            if (!ApiResponses.BeginDirect()) return; // already answered "pending": the page asks again
             await using var output = req.PrepareStreamResponse(mime, file.Length, HttpStatusCode.OK, headers);
             await file.CopyToAsync(output, host.Stopping).ConfigureAwait(false);
         }

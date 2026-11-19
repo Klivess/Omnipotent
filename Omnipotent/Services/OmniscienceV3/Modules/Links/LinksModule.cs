@@ -118,6 +118,29 @@ CREATE TABLE link_state(
   value INTEGER NOT NULL
 );
 """),
+            // Search (19 Nov 2026: the page gave up after a minute). The newest shares had no index to be read in order
+            // from, so every search sorted all of them; and words were matched with LIKE over five columns of every link.
+            // Shares can now be walked newest first, links newest first, and words are looked up in a full-text index
+            // that triggers keep in step with the link's address, title, author, description and summary.
+            new Migration(ModuleId, 2, "search: shares and links by time, words in a full-text index", """
+CREATE INDEX ix_link_shares_time ON link_shares(at_ms DESC, message_id);
+CREATE INDEX ix_link_urls_recent ON link_urls(last_shared_ms DESC);
+CREATE VIRTUAL TABLE link_words USING fts5(url, title, author, description, summary, tokenize='unicode61 remove_diacritics 2');
+INSERT INTO link_words(rowid, url, title, author, description, summary)
+  SELECT rowid, url, COALESCE(title,''), COALESCE(author,''), COALESCE(description,''), COALESCE(summary,'') FROM link_urls;
+CREATE TRIGGER trg_link_words_insert AFTER INSERT ON link_urls BEGIN
+  INSERT INTO link_words(rowid, url, title, author, description, summary)
+    VALUES(NEW.rowid, NEW.url, COALESCE(NEW.title,''), COALESCE(NEW.author,''), COALESCE(NEW.description,''), COALESCE(NEW.summary,''));
+END;
+CREATE TRIGGER trg_link_words_update AFTER UPDATE OF url, title, author, description, summary ON link_urls BEGIN
+  DELETE FROM link_words WHERE rowid = OLD.rowid;
+  INSERT INTO link_words(rowid, url, title, author, description, summary)
+    VALUES(NEW.rowid, NEW.url, COALESCE(NEW.title,''), COALESCE(NEW.author,''), COALESCE(NEW.description,''), COALESCE(NEW.summary,''));
+END;
+CREATE TRIGGER trg_link_words_delete AFTER DELETE ON link_urls BEGIN
+  DELETE FROM link_words WHERE rowid = OLD.rowid;
+END;
+"""),
         };
 
         internal ModuleContext Ctx => Context;

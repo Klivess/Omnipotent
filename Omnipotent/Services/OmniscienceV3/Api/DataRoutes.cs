@@ -100,7 +100,7 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             ",\"sourceSeq\":" + row.SourceSeq + ",\"computedAtMs\":" + row.ComputedAtMs + ",\"body\":" + row.BodyJson + "}";
 
         private static Task ServeAsync(UserRequest req, ReadModelRow row) =>
-            req.ReturnResponse(Envelope(row), ApiResponses.JsonContentType, null!, HttpStatusCode.OK);
+            ApiResponses.JsonAsync(req, Envelope(row));
 
         private Task Get(string path, PermissionDef permission, Func<UserRequest, Task> handler, CancellationToken ct) =>
             registrar.RouteAsync(V3Routes.Prefix + "/" + path, HttpMethod.Get, permission, handler, RouteRegistrar.DefaultMaxBodyBytes, ct);

@@ -99,6 +99,9 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
     /// head-scoring chunk) the caller waits while the host load is above <see cref="PauseAbove"/>, up to
     /// <see cref="MaxPause"/>; then the unit runs anyway, so a host that is permanently busy still makes slow progress
     /// instead of none. Pauses are counted for the Modules page.
+    /// <para>The longest pause was a minute. The server sits above the threshold nearly all day (its other services, and this
+    /// engine's own work, which the measure includes), so every unit waited the full minute: 1,440 images a day against
+    /// a backlog of 226,000. Fifteen seconds still gives way four times out of five and finishes in weeks, not months.</para>
     /// </summary>
     public sealed class CpuThrottle
     {
@@ -110,7 +113,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
         {
             this.load = load;
             PauseAbove = pauseAbove;
-            MaxPause = maxPause ?? TimeSpan.FromSeconds(60);
+            MaxPause = maxPause ?? TimeSpan.FromSeconds(15);
             Poll = poll ?? TimeSpan.FromMilliseconds(500);
         }
 

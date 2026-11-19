@@ -43,7 +43,10 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
             while (e.MoveNext())
             {
                 string el = e.GetTextElement();
-                int cp = char.ConvertToUtf32(el, 0);
+                // Not char.ConvertToUtf32: half of a surrogate pair (a message cut inside an emoji, or stored broken by
+                // the app that sent it) makes it throw "Found a low surrogate char without a preceding high surrogate",
+                // and one such message among 140,000 failed the first replica build on the server.
+                int cp = Ml.UnicodeText.CodePointAt(el, 0);
                 if (cp < 0x0250 || (cp >= 0x1E00 && cp < 0x2000)) latin++;
                 else if ((cp >= 0x3040 && cp < 0x30FF) || (cp >= 0x3400 && cp < 0x9FFF) || (cp >= 0xAC00 && cp < 0xD7AF)) cjk++;
                 else other += el.Length > 2 ? 2 : 1; // emoji sequences cost more than one token

@@ -305,6 +305,18 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
         private readonly IReadOnlyList<string> languages;
         private readonly SemaphoreSlim gate = new(1, 1);
         private Tesseract.TesseractEngine? engine;
+        private int abandoned;
+
+        /// <summary>How long one image may take. Tesseract cannot be interrupted, and on some images it does not come back:
+        /// on 19 Nov 2026 one of them held the engine, and so every worker waiting for it, from 16:27 until the service
+        /// was restarted.</summary>
+        public TimeSpan PerImageLimit { get; init; } = TimeSpan.FromSeconds(90);
+
+        /// <summary>After this many images that never came back, OCR stops until the next start: each one left a thread running.</summary>
+        public const int MaxAbandoned = 3;
+
+        /// <summary>Images the engine did not come back from since this engine was created.</summary>
+        public int Abandoned => Volatile.Read(ref abandoned);
 
         /// <param name="languages">Tesseract language codes ("eng", "nld", "deu"…); the first is the primary one.</param>
         public TesseractOcr(ModelHub hub, IReadOnlyList<string> languages)
@@ -327,6 +339,8 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
             await gate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
+                if (Abandoned >= MaxAbandoned)
+                    throw new MediaTextUnavailableException($"OCR has stopped for now: {Abandoned} images never came back from the engine. It starts again with the service.");
                 if (engine == null)
                 {
                     string? folder = null;
@@ -342,28 +356,66 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
                     }
                 }
 
-                var texts = new List<string>();
-                double confidence = 0;
-                int read = 0;
+                // The pixels are encoded here, on this side of the limit: the frames belong to the caller, who disposes
+                // them when this returns, and a recognition that is left behind must not be reading them then.
+                var images = new List<byte[]>(frames.Count);
                 foreach (var frame in frames)
                 {
-                    ct.ThrowIfCancellationRequested();
                     using var png = frame.Encode(SKEncodedImageFormat.Png, 100);
-                    if (png == null) continue;
-                    using var pix = Tesseract.Pix.LoadFromMemory(png.ToArray());
-                    using var page = engine.Process(pix);
-                    string text = (page.GetText() ?? "").Trim();
-                    confidence += page.GetMeanConfidence();
-                    read++;
-                    // Frames of an animation mostly repeat each other's text.
-                    if (text.Length > 0 && !texts.Contains(text)) texts.Add(text);
+                    if (png != null) images.Add(png.ToArray());
                 }
-                return new MediaTextResult(string.Join("\n", texts), read == 0 ? 0 : confidence / read, languages[0]);
+                var current = engine;
+                var work = Task.Run(() => Recognise(current, images, languages[0], ct), CancellationToken.None);
+                bool finished;
+                try
+                {
+                    finished = await Task.WhenAny(work, Task.Delay(PerImageLimit, ct)).ConfigureAwait(false) == work;
+                }
+                catch (OperationCanceledException)
+                {
+                    finished = work.IsCompleted;
+                    if (!finished) LeaveBehind(work);
+                    throw;
+                }
+                if (!finished)
+                {
+                    LeaveBehind(work);
+                    throw new ImageUnreadableException($"OCR did not finish within {PerImageLimit.TotalSeconds:0} seconds; the image is skipped.");
+                }
+                return await work.ConfigureAwait(false);
             }
             finally
             {
                 gate.Release();
             }
+        }
+
+        /// <summary>The engine is still inside the image and cannot be stopped: it is never used again, and the next image
+        /// gets a new one.</summary>
+        private void LeaveBehind(Task work)
+        {
+            engine = null;
+            Interlocked.Increment(ref abandoned);
+            _ = work.ContinueWith(t => _ = t.Exception, CancellationToken.None, TaskContinuationOptions.OnlyOnFaulted, TaskScheduler.Default);
+        }
+
+        private static MediaTextResult Recognise(Tesseract.TesseractEngine engine, IReadOnlyList<byte[]> images, string language, CancellationToken ct)
+        {
+            var texts = new List<string>();
+            double confidence = 0;
+            int read = 0;
+            foreach (var image in images)
+            {
+                if (ct.IsCancellationRequested) break;
+                using var pix = Tesseract.Pix.LoadFromMemory(image);
+                using var page = engine.Process(pix);
+                string text = (page.GetText() ?? "").Trim();
+                confidence += page.GetMeanConfidence();
+                read++;
+                // Frames of an animation mostly repeat each other's text.
+                if (text.Length > 0 && !texts.Contains(text)) texts.Add(text);
+            }
+            return new MediaTextResult(string.Join("\n", texts), read == 0 ? 0 : confidence / read, language);
         }
 
         public void Dispose()
