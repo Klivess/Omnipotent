@@ -139,6 +139,98 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
         }
 
         [Fact]
+        public async Task AHitSaysWhereItWasPosted_WhatWasSaidWithIt_AboutTheFile_AndLinksToTheMessage()
+        {
+            var store = new MediaStore(rt.Stores.Paths);
+            var redFile = await store.PutAsync(new MemoryStream(Picture(SKColors.Red)), null, 1 << 24);
+            var blueFile = await store.PutAsync(new MemoryStream(Picture(SKColors.Blue)), null, 1 << 24);
+            long sent = clock.NowMs - 60_000;
+            var ada = new IngestIdentity("discord", "700000000000000001", DisplayName: "Synthetic Ada");
+            await rt.Stores.Corpus.WriteAsync((c, tx) =>
+            {
+                using var w = new CorpusWriter(c, tx, Source, SourceKinds.Live, clock.NowMs);
+                // A server channel: two pictures in one message, with words and reactions.
+                w.Message(new IngestMessage
+                {
+                    PlatformMessageId = "1024709476269436948",
+                    Conversation = new IngestConversation("discord", "900000000000000001", ConversationKinds.Text, "general", GuildId: "800000000000000001", GuildName: "Synthetic server"),
+                    Author = ada, SentAtMs = sent, OrderKey = sent, EditedAtMs = sent + 5_000, Content = "look at this " + new string('x', 700),
+                    Attachments = new[]
+                    {
+                        new IngestAttachment("blue.png", "image/png", SizeBytes: 2048) { Stored = blueFile },
+                        new IngestAttachment("red.png", "image/png", SizeBytes: 1024, Width: 96, Height: 64, AltText: "a red square", Spoiler: true) { Stored = redFile },
+                    },
+                    Reactions = new[] { new IngestReaction("thumbsup", Count: 3) },
+                });
+                // The same red file again, in a direct chat and with nothing said.
+                w.Message(new IngestMessage
+                {
+                    PlatformMessageId = "1024709476269436949", Conversation = new IngestConversation("discord", "900000000000000002", ConversationKinds.Dm),
+                    Author = ada, SentAtMs = sent + 1, OrderKey = sent + 1, Attachments = new[] { new IngestAttachment("red-again.png") { Stored = redFile } },
+                });
+                return w.Complete();
+            });
+            const string inServer = "discord:1024709476269436948#1", inDm = "discord:1024709476269436949#0";
+            foreach (var id in new[] { "discord:1024709476269436948#0", inServer, inDm }) Assert.Equal("embedded", await module.EmbedAsync(id, CancellationToken.None));
+            await rt.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, """
+                INSERT INTO labels(item_kind, item_id, item_version, task, label, abstained, signals_json, model, model_version, prompt_version, as_of_ms, source_seq)
+                VALUES('attachment',$i,1,'caption','drawing',0,$s,'vision-test','caption-1','caption-1',$n,1)
+                """, ("$i", inServer), ("$s", """{"caption":"A plain red square.","kind":"drawing","tags":["red"],"hasText":false,"nsfw":true,"origin":"ai_caption"}"""), ("$n", clock.NowMs - 1_000)));
+
+            var found = await module.SearchAsync(new MediaSearchQuery("red"), CancellationToken.None);
+            var hit = found.Hits.Single(h => h.AttachmentId == inServer);
+            Assert.Equal("discord", hit.Platform);
+            Assert.Equal((ConversationKinds.Text, "general", "discord:800000000000000001", "Synthetic server"), (hit.ConversationKind, hit.ConversationTitle, hit.GuildId, hit.GuildName));
+            Assert.Equal("https://discord.com/channels/800000000000000001/900000000000000001/1024709476269436948", hit.MessageUrl);
+            Assert.StartsWith("look at this xxx", hit.MessageText);
+            Assert.Equal(600, hit.MessageText!.Length);
+            Assert.True(hit.MessageTextCut);
+            Assert.True(hit.Edited);
+            Assert.Equal(3, hit.Reactions);
+            Assert.Equal((2, 2), (hit.Position, hit.InMessage));
+            // The size is the stored file's own, not the one the platform claimed.
+            Assert.Equal(("red.png", "image/png", (long)Picture(SKColors.Red).Length, 96, 64), (hit.Filename, hit.Mime, hit.SizeBytes, hit.Width, hit.Height));
+            Assert.True(hit.Spoiler);
+            Assert.Equal("a red square", hit.AltText);
+            Assert.Equal(("drawing", true, "vision-test", clock.NowMs - 1_000), (hit.Kind, hit.Nsfw, hit.CaptionModel, hit.CaptionedAtMs));
+            Assert.Equal(2, hit.TimesPosted);
+
+            // A direct chat links through "@me"; nothing was said with it, and it is the only picture there.
+            var dm = found.Hits.Single(h => h.AttachmentId == inDm);
+            Assert.Equal("https://discord.com/channels/@me/900000000000000002/1024709476269436949", dm.MessageUrl);
+            Assert.Equal((ConversationKinds.Dm, null, null), (dm.ConversationKind, dm.ConversationTitle, dm.GuildName));
+            Assert.Null(dm.MessageText);
+            Assert.False(dm.MessageTextCut);
+            Assert.Equal((1, 1, 0, 2), (dm.Position, dm.InMessage, dm.Reactions, dm.TimesPosted));
+            Assert.Null(dm.Kind);
+
+            // Another platform has no message links.
+            string elsewhere = await AttachAsync("m9", Picture(SKColors.Red), "u-ada");
+            Assert.Equal("embedded", await module.EmbedAsync(elsewhere, CancellationToken.None));
+            var plain = (await module.SearchAsync(new MediaSearchQuery("red"), CancellationToken.None)).Hits.Single(h => h.AttachmentId == elsewhere);
+            Assert.Equal("testnet", plain.Platform);
+            Assert.Null(plain.MessageUrl);
+            Assert.Equal(3, plain.TimesPosted);
+        }
+
+        [Theory]
+        [InlineData("discord:900", "text", "discord:800", "discord:1000", "https://discord.com/channels/800/900/1000")]
+        [InlineData("discord:900", "thread", "discord:800", null, "https://discord.com/channels/800/900")]
+        [InlineData("discord:900", "dm", null, "discord:1000", "https://discord.com/channels/@me/900/1000")]
+        [InlineData("discord:900", "group_dm", null, "discord:1000", "https://discord.com/channels/@me/900/1000")]
+        [InlineData("discord:900", null, null, "discord:1000", "https://discord.com/channels/@me/900/1000")]
+        // A server channel whose server is not on record: "@me" would open nothing, so there is no link.
+        [InlineData("discord:900", "guild_channel", null, "discord:1000", null)]
+        [InlineData("discord:900", "text", null, "discord:1000", null)]
+        // Ids Discord did not issue (an import that made them up), and other platforms.
+        [InlineData("discord:dm-with-ada", "dm", null, "discord:1000", null)]
+        [InlineData("discord:900", "text", "discord:server", "discord:1000", null)]
+        [InlineData("discord:900", "dm", null, "discord:row-7", "https://discord.com/channels/@me/900")]
+        [InlineData("whatsapp:900", "dm", null, "whatsapp:1000", null)]
+        public void DiscordLinks_AreOnlyBuiltWhereDiscordWouldOpenThem(string conversation, string? kind, string? guild, string? message, string? expected) =>
+            Assert.Equal(expected, PlatformLinks.Discord(conversation, kind, guild, message));
+
+        [Fact]
         public async Task ImagesOfPeopleWithAnalysisOff_OrWhoMayBeMinors_AreNeitherEmbeddedNorReturned()
         {
             string ada = await AttachAsync("m1", Picture(SKColors.Red), "u-ada");

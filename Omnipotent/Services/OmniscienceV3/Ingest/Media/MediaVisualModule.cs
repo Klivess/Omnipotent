@@ -14,10 +14,50 @@ using SkiaSharp;
 
 namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
 {
-    /// <summary>One image found by a visual search, with why it was found.</summary>
+    /// <summary>
+    /// One image found by a visual search, with why it was found and what is on record about it: where it was posted, the
+    /// words posted with it, the file itself, and a link that opens the message where it was sent.
+    /// </summary>
     [ApiContract]
     public sealed record MediaSearchHitDto(string AttachmentId, string MessageId, string ConversationId, string? AuthorPersonId, string? AuthorName, long SentAtMs,
-        bool Deleted, string? Caption, IReadOnlyList<string> Tags, string? ImageText, double Score, IReadOnlyList<string> Why);
+        bool Deleted, string? Caption, IReadOnlyList<string> Tags, string? ImageText, double Score, IReadOnlyList<string> Why)
+    {
+        /// <summary>The platform it was posted on ("discord", "whatsapp", …).</summary>
+        public string Platform { get; init; } = "";
+        public string? ConversationKind { get; init; }
+        public string? ConversationTitle { get; init; }
+        public string? GuildId { get; init; }
+        public string? GuildName { get; init; }
+        /// <summary>Opens the message where it was sent (a Discord message link). Null when there is no such link: see <see cref="PlatformLinks.Discord"/>.</summary>
+        public string? MessageUrl { get; init; }
+        /// <summary>The words posted with the image, cut short when long (<see cref="MessageTextCut"/> says so).</summary>
+        public string? MessageText { get; init; }
+        public bool MessageTextCut { get; init; }
+        public bool Edited { get; init; }
+        /// <summary>Reactions on the message it was posted in.</summary>
+        public int Reactions { get; init; }
+        /// <summary>Which of the message's attachments this is, counting from 1.</summary>
+        public int Position { get; init; } = 1;
+        /// <summary>How many attachments the message has.</summary>
+        public int InMessage { get; init; } = 1;
+        public string? Filename { get; init; }
+        public string? Mime { get; init; }
+        public long? SizeBytes { get; init; }
+        public int? Width { get; init; }
+        public int? Height { get; init; }
+        public bool Spoiler { get; init; }
+        /// <summary>The description the person who posted it wrote for it, when they wrote one.</summary>
+        public string? AltText { get; init; }
+        /// <summary>When the picture was taken, read from the file itself. Most platforms strip it, so it is usually absent.</summary>
+        public long? TakenAtMs { get; init; }
+        /// <summary>What the caption model took the image to be: photo, screenshot, meme, drawing, chart, document or other.</summary>
+        public string? Kind { get; init; }
+        public bool Nsfw { get; init; }
+        public string? CaptionModel { get; init; }
+        public long? CaptionedAtMs { get; init; }
+        /// <summary>How many times this exact file has been posted, this time included.</summary>
+        public int TimesPosted { get; init; } = 1;
+    }
 
     /// <summary>A visual search: images ranked by how they look (CLIP) and by what their captions and the text in them say.</summary>
     [ApiContract]
@@ -266,7 +306,7 @@ END;
             Add(words.Select(w => w.Id).ToList(), "words", id => saidWhere[id]);
 
             var ranked = score.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Select(kv => kv.Key).Take(limit * 3).ToList();
-            var hits = Hydrate(ranked, off).Select(h => h with { Score = Math.Round(score[h.AttachmentId], 6), Why = why[h.AttachmentId] }).Take(limit).ToList();
+            var hits = Hydrate(ranked, off, limit).Select(h => h with { Score = Math.Round(score[h.AttachmentId], 6), Why = why[h.AttachmentId] }).ToList();
             string? note = embedder == null ? "This engine has no image model: only captions and the text in images are searched."
                 : embedded == 0 ? "No image has its embedding yet: only captions and the text in images are searched for now." : null;
             return new MediaSearchDto(text, hits, visual, embedded, note);
@@ -324,39 +364,86 @@ END;
         private static string Str(JsonElement root, string name) =>
             root.TryGetProperty(name, out var v) && v.ValueKind == JsonValueKind.String ? v.GetString() ?? "" : "";
 
-        /// <summary>The ranked images with what is shown about them, leaving out anyone whose images may not be used.</summary>
-        private List<MediaSearchHitDto> Hydrate(List<string> ids, AnalysisOffSet off)
+        /// <summary>How much of the message an image was posted with is sent along with it.</summary>
+        private const int MessageTextMax = 600;
+
+        private sealed record Posted(string Id, string Message, string Conversation, string? Person, long Sent, bool Deleted, string Platform, string? Guild, string? Text, bool Edited,
+            int Index, string? Filename, string? Mime, long? Size, int? Width, int? Height, bool Spoiler, string? Alt, long? Taken, string? Sha);
+
+        private static int? Int(Microsoft.Data.Sqlite.SqliteDataReader r, int ordinal) => r.IsDBNull(ordinal) ? null : r.GetInt32(ordinal);
+
+        /// <summary>
+        /// The best <paramref name="limit"/> of the ranked images with what is shown about them, leaving out anyone whose
+        /// images may not be used. Who may be shown is settled first, so everything else is read for the kept images only.
+        /// </summary>
+        private List<MediaSearchHitDto> Hydrate(List<string> ids, AnalysisOffSet off, int limit)
         {
             if (ids.Count == 0) return new();
-            List<(string Id, string Message, string Conversation, string? Person, long Sent, bool Deleted)> rows;
+            Dictionary<string, Posted> byId;
             using (var c = Context.Stores.Corpus.OpenRead())
-                rows = c.QueryIn(null, """
-                    SELECT a.attachment_id, m.message_id, m.conversation_id, i.person_id, m.sent_at_ms, m.deleted_at_ms IS NOT NULL
+                byId = c.QueryIn(null, $$"""
+                    SELECT a.attachment_id, m.message_id, m.conversation_id, i.person_id, m.sent_at_ms, m.deleted_at_ms IS NOT NULL, m.platform, m.guild_id,
+                           substr(m.content, 1, {{MessageTextMax + 1}}), m.edited_at_ms IS NOT NULL, a.idx, a.filename, a.mime, a.size_bytes, a.width, a.height,
+                           a.is_spoiler, a.alt_text, a.taken_at_ms, a.cas_sha256
                     FROM attachments a JOIN messages m ON m.message_id = a.message_id LEFT JOIN identities i ON i.identity_id = m.author_identity_id
                     WHERE a.attachment_id IN ({keys})
-                    """, ids, r => (r.GetString(0), r.GetString(1), r.GetString(2), r.GetStringOrNull(3), r.GetInt64(4), r.GetInt64(5) == 1));
-            var byId = rows.ToDictionary(r => r.Id, StringComparer.Ordinal);
-            Dictionary<string, (string Task, string Json)[]> labels;
-            using (var c = Context.Stores.Intel.OpenRead())
-                labels = c.QueryIn(null, "SELECT item_id, task, signals_json FROM labels WHERE item_kind='attachment' AND task IN ('caption','ocr') AND item_id IN ({keys})", ids,
-                        r => (Id: r.GetString(0), Task: r.GetString(1), Json: r.GetStringOrNull(2) ?? "{}"))
-                    .GroupBy(x => x.Id, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.Select(x => (x.Task, x.Json)).ToArray(), StringComparer.Ordinal);
+                    """, ids, r => new Posted(r.GetString(0), r.GetString(1), r.GetString(2), r.GetStringOrNull(3), r.GetInt64(4), r.GetInt64(5) == 1, r.GetString(6),
+                        r.GetStringOrNull(7), r.GetStringOrNull(8), r.GetInt64(9) == 1, r.GetInt32(10), r.GetStringOrNull(11), r.GetStringOrNull(12), r.GetInt64OrNull(13),
+                        Int(r, 14), Int(r, 15), r.GetInt64(16) == 1, r.GetStringOrNull(17), r.GetInt64OrNull(18), r.GetStringOrNull(19)))
+                    .ToDictionary(r => r.Id, StringComparer.Ordinal);
+            var kept = ids.Where(id => byId.TryGetValue(id, out var p) && MayUse(p.Person, off)).Select(id => byId[id]).Take(limit).ToList();
+            if (kept.Count == 0) return new();
+
+            var keptIds = kept.Select(p => p.Id).ToList();
+            var messageIds = kept.Select(p => p.Message).Distinct(StringComparer.Ordinal).ToList();
+            var people = kept.Where(p => p.Person != null).Select(p => p.Person!).Distinct(StringComparer.Ordinal).ToDictionary(p => p, p => Context.Policy.Canonical(p), StringComparer.Ordinal);
             var names = new Dictionary<string, string?>(StringComparer.Ordinal);
-            var hits = new List<MediaSearchHitDto>();
-            foreach (var id in ids)
+            var places = new Dictionary<string, (string Kind, string? Guild, string? Title, string? GuildName)>(StringComparer.Ordinal);
+            var inMessage = new Dictionary<string, int>(StringComparer.Ordinal);
+            var reactions = new Dictionary<string, int>(StringComparer.Ordinal);
+            var timesPosted = new Dictionary<string, int>(StringComparer.Ordinal);
+            using (var c = Context.Stores.Corpus.OpenRead())
             {
-                if (!byId.TryGetValue(id, out var r)) continue;
-                if (!MayUse(r.Person, off)) continue;
-                string? person = r.Person == null ? null : Context.Policy.Canonical(r.Person);
-                string? name = null;
-                if (person != null && !names.TryGetValue(person, out name))
-                {
-                    using var c = Context.Stores.Corpus.OpenRead();
-                    names[person] = name = c.Scalar<string>(null, "SELECT display_name FROM persons WHERE person_id=$p", ("$p", person));
-                }
-                string? caption = null, imageText = null;
+                foreach (var (id, name) in c.QueryIn(null, "SELECT person_id, display_name FROM persons WHERE person_id IN ({keys})", people.Values.Distinct(StringComparer.Ordinal).ToList(),
+                             r => (r.GetString(0), r.GetStringOrNull(1))))
+                    names[id] = name;
+                // A conversation's name is the one it carries now: the names table follows renames, the title column is the fallback.
+                foreach (var row in c.QueryIn(null, """
+                             SELECT cv.conversation_id, cv.kind, cv.guild_id, g.name,
+                                    COALESCE((SELECT n.name FROM conversation_names n WHERE n.conversation_id = cv.conversation_id AND n.valid_to_ms IS NULL ORDER BY n.valid_from_ms DESC LIMIT 1), cv.title)
+                             FROM conversations cv LEFT JOIN guilds g ON g.guild_id = cv.guild_id
+                             WHERE cv.conversation_id IN ({keys})
+                             """, kept.Select(p => p.Conversation).Distinct(StringComparer.Ordinal).ToList(),
+                             r => (Id: r.GetString(0), Kind: r.GetString(1), Guild: r.GetStringOrNull(2), GuildName: r.GetStringOrNull(3), Title: r.GetStringOrNull(4))))
+                    places[row.Id] = (row.Kind, row.Guild, row.Title, row.GuildName);
+                foreach (var (m, n) in c.QueryIn(null, "SELECT message_id, COUNT(*) FROM attachments WHERE message_id IN ({keys}) GROUP BY message_id", messageIds, r => (r.GetString(0), r.GetInt32(1))))
+                    inMessage[m] = n;
+                // The counts the platform reported, or the reactions seen one by one, whichever knows of more.
+                foreach (var (m, n) in c.QueryIn(null, "SELECT message_id, SUM(count) FROM reaction_counts WHERE message_id IN ({keys}) GROUP BY message_id", messageIds, r => (r.GetString(0), r.GetInt32(1))))
+                    reactions[m] = n;
+                foreach (var (m, n) in c.QueryIn(null, "SELECT message_id, COUNT(*) FROM reactions WHERE removed_at_ms IS NULL AND message_id IN ({keys}) GROUP BY message_id", messageIds, r => (r.GetString(0), r.GetInt32(1))))
+                    reactions[m] = Math.Max(reactions.GetValueOrDefault(m), n);
+                // "IS NOT NULL" is what lets the index of stored files (a partial one) answer this.
+                foreach (var (sha, n) in c.QueryIn(null, "SELECT cas_sha256, COUNT(*) FROM attachments WHERE cas_sha256 IS NOT NULL AND cas_sha256 IN ({keys}) GROUP BY cas_sha256",
+                             kept.Where(p => p.Sha != null).Select(p => p.Sha!).Distinct(StringComparer.Ordinal).ToList(), r => (r.GetString(0), r.GetInt32(1))))
+                    timesPosted[sha] = n;
+            }
+            Dictionary<string, (string Task, string Json, string? Model, long AsOf)[]> labels;
+            using (var c = Context.Stores.Intel.OpenRead())
+                labels = c.QueryIn(null, "SELECT item_id, task, signals_json, model, as_of_ms FROM labels WHERE item_kind='attachment' AND task IN ('caption','ocr') AND item_id IN ({keys})", keptIds,
+                        r => (Id: r.GetString(0), Task: r.GetString(1), Json: r.GetStringOrNull(2) ?? "{}", Model: r.GetStringOrNull(3), AsOf: r.GetInt64(4)))
+                    // Oldest first, so where a newer model has described the image again its words are the ones kept.
+                    .GroupBy(x => x.Id, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.OrderBy(x => x.AsOf).Select(x => (x.Task, x.Json, x.Model, x.AsOf)).ToArray(), StringComparer.Ordinal);
+
+            var hits = new List<MediaSearchHitDto>(kept.Count);
+            foreach (var p in kept)
+            {
+                string? person = p.Person == null ? null : people[p.Person];
+                string? caption = null, imageText = null, kind = null, captionModel = null;
+                long? captionedAt = null;
+                bool nsfw = false;
                 IReadOnlyList<string> tags = Array.Empty<string>();
-                foreach (var (task, json) in labels.GetValueOrDefault(id) ?? Array.Empty<(string, string)>())
+                foreach (var (task, json, model, asOf) in labels.GetValueOrDefault(p.Id) ?? Array.Empty<(string, string, string?, long)>())
                 {
                     try
                     {
@@ -366,6 +453,9 @@ END;
                             caption = Str(doc.RootElement, "caption");
                             if (doc.RootElement.TryGetProperty("tags", out var t) && t.ValueKind == JsonValueKind.Array)
                                 tags = t.EnumerateArray().Select(x => x.GetString() ?? "").Where(x => x.Length > 0).ToList();
+                            kind = Str(doc.RootElement, "kind") is { Length: > 0 } k ? k : null;
+                            nsfw = doc.RootElement.TryGetProperty("nsfw", out var n) && n.ValueKind == JsonValueKind.True;
+                            (captionModel, captionedAt) = (model, asOf);
                         }
                         else imageText = Str(doc.RootElement, "text") is { Length: > 0 } s ? (s.Length > 300 ? s[..300] : s) : null;
                     }
@@ -374,7 +464,41 @@ END;
                         continue; // shown without what this label held
                     }
                 }
-                hits.Add(new MediaSearchHitDto(id, r.Message, r.Conversation, person, name, r.Sent, r.Deleted, caption, tags, imageText, 0, Array.Empty<string>()));
+                places.TryGetValue(p.Conversation, out var place);
+                string? guild = p.Guild ?? place.Guild;
+                string? text = string.IsNullOrWhiteSpace(p.Text) ? null : p.Text.Trim();
+                bool cut = text != null && text.Length > MessageTextMax;
+                // A cut never lands between the two halves of a character outside the basic plane (an emoji): half of one cannot be sent as JSON.
+                if (cut) text = text![..(char.IsHighSurrogate(text[MessageTextMax - 1]) ? MessageTextMax - 1 : MessageTextMax)];
+                hits.Add(new MediaSearchHitDto(p.Id, p.Message, p.Conversation, person, person == null ? null : names.GetValueOrDefault(person), p.Sent, p.Deleted, caption, tags, imageText, 0,
+                    Array.Empty<string>())
+                {
+                    Platform = p.Platform,
+                    ConversationKind = place.Kind,
+                    ConversationTitle = place.Title,
+                    GuildId = guild,
+                    GuildName = place.GuildName,
+                    MessageUrl = PlatformLinks.Discord(p.Conversation, place.Kind, guild, p.Message),
+                    MessageText = text,
+                    MessageTextCut = cut,
+                    Edited = p.Edited,
+                    Reactions = reactions.GetValueOrDefault(p.Message),
+                    Position = p.Index + 1,
+                    InMessage = Math.Max(inMessage.GetValueOrDefault(p.Message), p.Index + 1),
+                    Filename = p.Filename,
+                    Mime = p.Mime,
+                    SizeBytes = p.Size,
+                    Width = p.Width,
+                    Height = p.Height,
+                    Spoiler = p.Spoiler,
+                    AltText = string.IsNullOrWhiteSpace(p.Alt) ? null : p.Alt,
+                    TakenAtMs = p.Taken,
+                    Kind = kind,
+                    Nsfw = nsfw,
+                    CaptionModel = captionModel,
+                    CaptionedAtMs = captionedAt,
+                    TimesPosted = p.Sha == null ? 1 : Math.Max(1, timesPosted.GetValueOrDefault(p.Sha)),
+                });
             }
             return hits;
         }

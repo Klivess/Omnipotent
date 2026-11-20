@@ -1590,6 +1590,31 @@ export interface MediaSearchHitDto {
   imageText?: string | null;
   score: number;
   why: string[];
+  platform: string;
+  conversationKind?: string | null;
+  conversationTitle?: string | null;
+  guildId?: string | null;
+  guildName?: string | null;
+  messageUrl?: string | null;
+  messageText?: string | null;
+  messageTextCut: boolean;
+  edited: boolean;
+  reactions: number;
+  position: number;
+  inMessage: number;
+  filename?: string | null;
+  mime?: string | null;
+  sizeBytes?: number | null;
+  width?: number | null;
+  height?: number | null;
+  spoiler: boolean;
+  altText?: string | null;
+  takenAtMs?: number | null;
+  kind?: string | null;
+  nsfw: boolean;
+  captionModel?: string | null;
+  captionedAtMs?: number | null;
+  timesPosted: number;
 }
 
 export interface MergeRequest {

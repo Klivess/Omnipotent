@@ -168,10 +168,9 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
         public static string? DeepLink(SqliteConnection corpus, string conversationId, string? messageId)
         {
             if (!conversationId.StartsWith("discord:", StringComparison.Ordinal)) return null;
-            string? guild = corpus.Scalar<string>(null, "SELECT guild_id FROM conversations WHERE conversation_id=$c", ("$c", conversationId));
-            string channel = Storage.CorpusIds.Native(conversationId);
-            string g = guild == null ? "@me" : Storage.CorpusIds.Native(guild);
-            return "https://discord.com/channels/" + g + "/" + channel + (messageId != null && messageId.StartsWith("discord:", StringComparison.Ordinal) ? "/" + Storage.CorpusIds.Native(messageId) : "");
+            var (kind, guild) = corpus.Query(null, "SELECT kind, guild_id FROM conversations WHERE conversation_id=$c", r => (r.GetStringOrNull(0), r.GetStringOrNull(1)), ("$c", conversationId))
+                .FirstOrDefault();
+            return Ingest.PlatformLinks.Discord(conversationId, kind, guild, messageId);
         }
 
         public static JsonElement Json(object value) => JsonSerializer.SerializeToElement(value, Kernel.Jobs.KernelJson.Options);
