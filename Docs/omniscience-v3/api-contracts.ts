@@ -492,6 +492,11 @@ export interface DayCountDto {
 
 export type DayOfWeek = "Sunday" | "Monday" | "Tuesday" | "Wednesday" | "Thursday" | "Friday" | "Saturday";
 
+export interface DeadJobsRetriedDto {
+  retried: number;
+  closed: number;
+}
+
 export interface DigestDto {
   digestId: string;
   scopeKind: string;
@@ -2632,6 +2637,10 @@ export interface RetentionDto {
 
 export interface RetentionListDto {
   streams: RetentionDto[];
+}
+
+export interface RetryDeadJobsRequest {
+  moduleId?: string | null;
 }
 
 export interface ReviewResolveRequest {

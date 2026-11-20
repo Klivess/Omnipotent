@@ -19,6 +19,14 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         /// prefix again (a later question of a <see cref="CacheShapedSession"/>). Zero for a call that sends nothing the
         /// provider has seen from it before. It is what the call's cached tokens are measured against.</summary>
         public int PriorPromptTokens { get; init; }
+        /// <summary>
+        /// When the answer comes back cut off at its ceiling, ask once more with twice the room (as far as the model
+        /// allows). For calls whose answer has a size of its own (a summary of so many points, a label per message), where
+        /// the ceiling is an estimate: sent again unchanged, such a call gets the same cut-off answer back, from the
+        /// router's cache, however often the job retries (a digest died that way, three identical calls, 20 Nov 2026).
+        /// Not for calls that shrink their input instead (extraction splits its slice).
+        /// </summary>
+        public bool LongerWhenCutOff { get; init; }
     }
 
     /// <summary>
@@ -105,6 +113,18 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
                 await LogAsync(call, request, result, ct).ConfigureAwait(false);
             }
 
+            if (!result.Success && call.LongerWhenCutOff && request.MaxOutputTokens is int sent && CutOff(result, sent))
+            {
+                var info = await client.GetContextAsync(null, ct).ConfigureAwait(false);
+                int longer = Math.Min(sent * 2, Math.Max(sent, info.MaxOutputTokens));
+                if (longer > sent)
+                {
+                    request = request with { MaxOutputTokens = longer };
+                    result = await client.QueryAsync(request, ct).ConfigureAwait(false);
+                    await LogAsync(call, request, result, ct).ConfigureAwait(false);
+                }
+            }
+
             if (result.Success)
             {
                 if (HoldsItsWholePrompt(request)) Estimator.Calibrate(PromptText(request), result.PromptTokens);
@@ -127,6 +147,16 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
                     return result;
             }
         }
+
+        /// <summary>
+        /// Whether a failed call ended at its output ceiling: said outright (truncated, finish reason "length"), or a missing
+        /// structured answer from a call that used all the tokens it was allowed. The router reports the second kind as
+        /// "no structured output", which reads like the model ignoring the schema when it simply ran out of room.
+        /// </summary>
+        public static bool CutOff(LlmResult result, int? maxOutputTokens) =>
+            !result.Success && (result.ErrorKind == LlmErrorKind.Truncated
+                                || string.Equals(result.FinishReason, "length", StringComparison.OrdinalIgnoreCase)
+                                || (result.ErrorKind == LlmErrorKind.NoStructuredOutput && maxOutputTokens is int max && result.CompletionTokens >= max - 16));
 
         /// <summary>Opens a "prefill once, ask many" session over a large stable prefix.</summary>
         /// <param name="reasoningEffort">How hard every question of the session is thought about ("off", "low", "medium",

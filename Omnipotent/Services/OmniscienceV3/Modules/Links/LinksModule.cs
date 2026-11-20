@@ -426,6 +426,7 @@ CREATE INDEX ix_link_shares_guild ON link_shares(guild_id, at_ms);
                 var answer = await llm.CallAsync(new LlmCall
                 {
                     ModuleId = ModuleId, Purpose = "links.categorise", PromptVersion = PromptVersion, JobId = job.Job.JobId,
+                    LongerWhenCutOff = true,
                     Request = new LlmRequest
                     {
                         Purpose = "links.categorise", SessionKey = "omniscience-links-categorise", SystemPrompt = system, Turns = new[] { new LlmTurn("user", user) },

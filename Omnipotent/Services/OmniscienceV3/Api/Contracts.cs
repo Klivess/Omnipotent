@@ -76,6 +76,14 @@ namespace Omnipotent.Services.OmniscienceV3.Api
     [ApiContract]
     public sealed record JobActionResultDto(long JobId, bool Changed, string State);
 
+    /// <summary>Retry every dead job; <c>moduleId</c> narrows it to one module.</summary>
+    [ApiContract]
+    public sealed record RetryDeadJobsRequest(string? ModuleId = null);
+
+    /// <summary>How many dead jobs were queued again, and how many were closed because the same work already was.</summary>
+    [ApiContract]
+    public sealed record DeadJobsRetriedDto(int Retried, int Closed);
+
     [ApiContract]
     public sealed record LlmCallDto(
         long CallId,

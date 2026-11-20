@@ -110,8 +110,19 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
             _ => null,
         };
 
+        /// <summary>How long the speech service gets for one piece of audio (under a minute of sound).</summary>
+        internal static TimeSpan PieceLimit { get; set; } = TimeSpan.FromMinutes(5);
+
+        /// <summary>When the speech service last transcribed a piece (0: not yet in this process).</summary>
+        private long speechAnsweredMs;
+
         /// <summary>Reads one attachment. Returns what happened in a few words (for the job result).</summary>
-        public async Task<string> ProcessAsync(string attachmentId, long sourceSeq, CancellationToken ct)
+        /// <param name="progress">Told after every piece of audio, so a long recording is seen to be moving.</param>
+        /// <param name="lastAttemptSinceMs">Set on a job's last attempt, to when the job first started. A recording the
+        /// speech service fails on every time, while it goes on transcribing others, is the recording's fault: it is filed
+        /// as unreadable with the reason instead of leaving a dead job (two such files did, 19 and 20 Nov 2026). If the
+        /// service has answered nothing since then it is the service that is down, and the job fails as before.</param>
+        public async Task<string> ProcessAsync(string attachmentId, long sourceSeq, CancellationToken ct, Func<object, Task>? progress = null, long? lastAttemptSinceMs = null)
         {
             var cfg = settings();
             (bool Found, string? Sha, string Kind, string State) row;
@@ -153,13 +164,18 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
                 {
                     var result = task == MediaTextTasks.Ocr
                         ? await ReadImageAsync(ocrEngine!, path, cfg, ct).ConfigureAwait(false)
-                        : await ReadSpeechAsync(speech!, path, cfg, ct).ConfigureAwait(false);
+                        : await ReadSpeechAsync(speech!, path, cfg, ct, progress).ConfigureAwait(false);
                     cached = (result.Text.Length > cfg.MaxChars ? result.Text[..cfg.MaxChars] : result.Text, result.Confidence, result.Language, "ok", null);
                 }
                 catch (MediaTextUnavailableException ex)
                 {
                     // Nothing is recorded: a later sweep tries again once the engine can run.
                     return "skipped: " + ex.Message;
+                }
+                catch (JobFailureException ex) when (task == MediaTextTasks.Transcript && ex.Class == ErrorClass.Transient
+                                                     && lastAttemptSinceMs is long since && Volatile.Read(ref speechAnsweredMs) > since)
+                {
+                    cached = ("", 0, null, "unreadable", "The speech service failed on this recording every time it was tried, while it transcribed others: " + ex.Message);
                 }
                 catch (ImageUnreadableException ex)
                 {
@@ -190,18 +206,35 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
             }
         }
 
-        private async Task<MediaTextResult> ReadSpeechAsync(ITranscriber speech, string path, MediaTextSettings cfg, CancellationToken ct)
+        private async Task<MediaTextResult> ReadSpeechAsync(ITranscriber speech, string path, MediaTextSettings cfg, CancellationToken ct, Func<object, Task>? progress)
         {
             var segments = await segmenter.SegmentAsync(path, cfg.MaxAudio, ct).ConfigureAwait(false);
             var parts = new List<string>(segments.Count);
             string? language = null;
             double confidence = 0;
-            int spoken = 0;
+            int spoken = 0, done = 0;
             foreach (var segment in segments)
             {
                 ct.ThrowIfCancellationRequested();
-                // Later pieces are told the language the first piece was in, so a quiet stretch is not re-guessed.
-                var piece = await speech.TranscribeAsync(segment, language, ct).ConfigureAwait(false);
+                // Half an hour of sound is some forty pieces, each a request of its own: the job says where it is after
+                // every one (it used to say nothing until the end, and a long recording looked like a job that had hung).
+                if (progress != null) await progress(new { stage = "transcribe", piece = done + 1, of = segments.Count }).ConfigureAwait(false);
+                SpeechResult piece;
+                using (var limit = CancellationTokenSource.CreateLinkedTokenSource(ct))
+                {
+                    limit.CancelAfter(PieceLimit);
+                    try
+                    {
+                        // Later pieces are told the language the first piece was in, so a quiet stretch is not re-guessed.
+                        piece = await speech.TranscribeAsync(segment, language, limit.Token).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+                    {
+                        throw new JobFailureException(ErrorClass.Transient, $"the speech service did not answer within {PieceLimit.TotalMinutes:0.#} minutes");
+                    }
+                }
+                Volatile.Write(ref speechAnsweredMs, clock.NowMs);
+                done++;
                 if (piece.NoSpeechProbability >= NoSpeechThreshold || string.IsNullOrWhiteSpace(piece.Text)) continue;
                 language ??= piece.Language;
                 parts.Add(Clean(piece.Text));

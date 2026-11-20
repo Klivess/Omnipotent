@@ -38,6 +38,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                 new SettingDescriptor("datacontrols.retention.voice_days", SettingTypes.Int, "0", "Voice sessions that ended longer ago than this are deleted (0 keeps them for ever).", 0, 36500),
                 new SettingDescriptor("datacontrols.backup.enabled", SettingTypes.Bool, "true", "Take an encrypted backup of corpus.db and operator.db every night."),
                 new SettingDescriptor("datacontrols.backup.keep", SettingTypes.Int, "7", "How many backups are kept; older ones are deleted.", 1, 365),
+                new SettingDescriptor(BackupFolderSetting, SettingTypes.String, "\"\"", "Folder the backups are written to (a full path, for example on another drive). Empty: the backups folder beside the databases. A backup needs about twice the size of corpus.db free while it is taken, and its size again for every backup kept."),
             },
         };
 
@@ -70,14 +71,16 @@ CREATE TABLE dc_retention(
         {
             if (!context.DueSchedules.Any(s => s.Name == "nightly")) yield break;
             yield return Job(RetentionKind, "all", "all", priority: 40, lane: Lane.Cpu);
-            if (Context.Settings.Get("datacontrols.backup.enabled", true)) yield return Job(BackupKind, "all", "scheduled", priority: 30);
+            // Two attempts: each one copies the whole corpus, and what stops a backup (no room, a folder that cannot be
+            // written) is still there a minute later.
+            if (Context.Settings.Get("datacontrols.backup.enabled", true)) yield return Job(BackupKind, "all", "scheduled", priority: 30) with { MaxAttempts = 2 };
         }
 
         public override async Task<string?> ExecuteAsync(JobContext job) => job.Job.Kind switch
         {
             ForgetKind => await RunForgetAsync(job).ConfigureAwait(false),
             RetentionKind => await RunRetentionAsync(job).ConfigureAwait(false),
-            BackupKind => Json(await BackupAsync(job.Job.SubjectId ?? "scheduled", job.Cancellation).ConfigureAwait(false)),
+            BackupKind => await RunBackupAsync(job).ConfigureAwait(false),
             _ => throw new JobFailureException(ErrorClass.Permanent, $"Unknown data-controls job kind '{job.Job.Kind}'."),
         };
 

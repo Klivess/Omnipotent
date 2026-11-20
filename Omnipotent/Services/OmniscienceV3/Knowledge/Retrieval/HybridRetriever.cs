@@ -22,8 +22,45 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
         /// <summary>Upper bound on sent time (an inquiry's as-of: nothing after it is evidence).</summary>
         public long? ToMs { get; init; }
         public int Limit { get; init; } = 40;
-        /// <summary>How many of the scope's most recent messages the vector pass compares against (bounded work per query).</summary>
-        public int VectorCandidates { get; init; } = 40_000;
+        /// <summary>How many of the scope's most recent messages the vector pass compares against (bounded work per query).
+        /// Each one costs a row read and its vector in memory; full-text search still covers the whole scope.</summary>
+        public int VectorCandidates { get; init; } = 12_000;
+
+        /// <summary>The same messages in scope: same people, conversations, messages and period. What a scope's row set and
+        /// vector candidates are kept under while an inquiry asks its many questions of the one scope.</summary>
+        internal string Signature()
+        {
+            static string Ids(IReadOnlyCollection<string>? ids) => ids == null ? "*" : Store.NaturalKeys.Sha256Hex(string.Join("\n", ids.OrderBy(x => x, StringComparer.Ordinal)))[..24];
+            return string.Join("|", Ids(AuthorIdentityIds), Ids(ConversationIds), Ids(MessageIds), FromMs, ToMs);
+        }
+    }
+
+    /// <summary>A set of message rows (by rowid) as one bit each: the whole corpus is under a megabyte, and asking whether a
+    /// row is in scope reads no page of the database.</summary>
+    internal sealed class RowSet
+    {
+        private readonly System.Collections.BitArray bits;
+
+        public RowSet(long maxRowId) => bits = new System.Collections.BitArray((int)Math.Min(int.MaxValue - 64, Math.Max(0, maxRowId) + 1));
+
+        public int Count { get; private set; }
+
+        public void Add(long rowId)
+        {
+            if (rowId < 0 || rowId >= bits.Length || bits[(int)rowId]) return;
+            bits[(int)rowId] = true;
+            Count++;
+        }
+
+        public bool Contains(long rowId) => rowId >= 0 && rowId < bits.Length && bits[(int)rowId];
+
+        public void IntersectWith(RowSet other)
+        {
+            bits.And(other.bits);
+            int n = 0;
+            for (int i = 0; i < bits.Length; i++) if (bits[i]) n++;
+            Count = n;
+        }
     }
 
     public sealed record RetrievedMessage(string MessageId, double Score, int? FtsRank, int? VectorRank, double? Similarity);
@@ -157,16 +194,54 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             return sb.ToString().Replace("\"", "");
         }
 
+        /// <summary>The matches of a full-text query, best first, read from the full-text index alone.</summary>
+        internal const string RankedMatches = "SELECT rowid FROM messages_fts WHERE messages_fts MATCH $q ORDER BY rank";
+
+        private const long ScopeTtlMs = 5 * 60_000;
+        private readonly ConcurrentDictionary<string, (RowSet Rows, bool PeriodApplied, long AtTick)> scopeRows = new(StringComparer.Ordinal);
+        private sealed record KeptVectors(string Key, List<string> Ids, List<float[]> Vectors, long AtTick);
+        private volatile KeptVectors? vectorCandidates;
+
+        /// <summary>
+        /// The best matches of a full-text query within a scope, reading a message's row only for the few that are returned.
+        /// <para>The matches come best first from the full-text index. Which rows are in scope is known beforehand as a set of
+        /// row numbers, read from the index that covers the scope (author and time, or conversation and time), so a match is
+        /// kept or passed over without touching the messages table. The statement this replaces joined every match to its
+        /// message row to test the scope and then sorted: a query of two dozen words, each in up to one message in a hundred,
+        /// was over a million row reads in a 15 GB table, and an inquiry asks dozens of such queries of each scope. On the
+        /// server two tactic runs spent an hour in this stage three times over and were given up on (20 Nov 2026). Before
+        /// that the planner walked the scope instead and ran the match per message (18 Nov 2026).</para>
+        /// </summary>
         private List<string> FullText(string query, RetrievalScope scope, int limit)
         {
             using var c = stores.Corpus.OpenRead();
             long cap = CommonCap(c);
             string? fts = FtsQuery(query, term => TooCommon(c, term, cap));
             if (fts == null) return new List<string>();
-            var (sql, args) = FullTextStatement(fts, scope, limit);
             try
             {
-                return c.Query(null, sql, r => r.GetString(0), args);
+                var (rows, periodApplied) = ScopeRows(c, scope);
+                if (rows is { Count: 0 }) return new List<string>();
+                // Where the row set could not carry the period (no scope, or chosen messages), it is checked on the rows that
+                // are read at the end, and a few more are taken to allow for the ones it turns away.
+                bool checkPeriod = !periodApplied && (scope.FromMs != null || scope.ToMs != null);
+                int want = checkPeriod ? limit * 3 : limit;
+                var hits = new List<long>(want);
+                c.Scan(null, RankedMatches, r =>
+                {
+                    long row = r.GetInt64(0);
+                    if (rows == null || rows.Contains(row)) hits.Add(row);
+                    return hits.Count < want;
+                }, ("$q", fts));
+                if (hits.Count == 0) return new List<string>();
+                var found = new Dictionary<long, (string Id, long SentAtMs)>(hits.Count);
+                foreach (var chunk in hits.Chunk(500))
+                    foreach (var (row, id, at) in c.Query(null, $"SELECT rowid, message_id, sent_at_ms FROM messages WHERE rowid IN ({string.Join(",", chunk)})",
+                                 r => (r.GetInt64(0), r.GetString(1), r.GetInt64(2))))
+                        found[row] = (id, at);
+                return hits.Where(found.ContainsKey).Select(h => found[h])
+                    .Where(m => !checkPeriod || ((scope.FromMs == null || m.SentAtMs >= scope.FromMs) && (scope.ToMs == null || m.SentAtMs <= scope.ToMs)))
+                    .Select(m => m.Id).Take(limit).ToList();
             }
             catch (SqliteException ex) when (ex.Message.Contains("fts5", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("syntax", StringComparison.OrdinalIgnoreCase))
             {
@@ -175,23 +250,54 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             }
         }
 
-        /// <summary>
-        /// The statement <see cref="FullText"/> runs. The full-text index drives it (CROSS JOIN fixes the join order): left to
-        /// choose, the planner, which cannot know that one person or conversation holds hundreds of thousands of messages, walked
-        /// every message in scope and ran the match again for each one. For Klives's own messages that was about three minutes
-        /// per query on two million messages, and an inquiry runs dozens (an x01 run failed after 23 minutes on 18 Nov 2026).
-        /// </summary>
-        internal static (string Sql, (string Name, object? Value)[] Args) FullTextStatement(string fts, RetrievalScope scope, int limit)
+        /// <summary>The statement that reads the rows of one part of a scope (its authors, or its conversations) within the
+        /// scope's period, from the index that covers it: no row of the messages table is read.</summary>
+        internal static string ScopeRowsStatement(string column, string keys, RetrievalScope scope) =>
+            $"SELECT rowid FROM messages INDEXED BY {(column == "author_identity_id" ? "ix_messages_author_time" : "ix_messages_conv_time")} WHERE {column} IN ({keys})"
+            + (scope.FromMs != null ? " AND sent_at_ms >= $f" : "") + (scope.ToMs != null ? " AND sent_at_ms <= $t" : "");
+
+        /// <summary>The rows a scope covers (null: every row), and whether the scope's period is already applied to them.
+        /// Kept for a few minutes: an inquiry asks every one of its questions of the same few scopes.</summary>
+        private (RowSet? Rows, bool PeriodApplied) ScopeRows(SqliteConnection c, RetrievalScope scope)
         {
-            var where = new List<string> { "messages_fts MATCH $q" };
-            var args = new List<(string, object?)> { ("$q", fts), ("$l", limit) };
-            if (scope.FromMs is long f) { where.Add("m.sent_at_ms >= $f"); args.Add(("$f", f)); }
-            if (scope.ToMs is long t) { where.Add("m.sent_at_ms <= $t"); args.Add(("$t", t)); }
-            AddIn(where, args, "m.author_identity_id", "$a", scope.AuthorIdentityIds);
-            AddIn(where, args, "m.conversation_id", "$c", scope.ConversationIds);
-            AddIn(where, args, "m.message_id", "$mi", scope.MessageIds);
-            string sql = $"SELECT m.message_id FROM messages_fts CROSS JOIN messages m ON m.rowid = messages_fts.rowid WHERE {string.Join(" AND ", where)} ORDER BY bm25(messages_fts) LIMIT $l";
-            return (sql, args.ToArray());
+            if (scope.AuthorIdentityIds == null && scope.ConversationIds == null && scope.MessageIds == null) return (null, false);
+            string key = scope.Signature();
+            long now = Environment.TickCount64;
+            if (scopeRows.TryGetValue(key, out var kept) && now - kept.AtTick < ScopeTtlMs) return (kept.Rows, kept.PeriodApplied);
+
+            long max = c.Scalar<long?>(null, "SELECT MAX(rowid) FROM messages") ?? 0;
+            RowSet? rows = null;
+            bool periodApplied = false;
+            var period = new List<(string, object?)>();
+            if (scope.FromMs is long f) period.Add(("$f", f));
+            if (scope.ToMs is long t) period.Add(("$t", t));
+            void Narrow(RowSet part)
+            {
+                if (rows == null) rows = part;
+                else rows.IntersectWith(part);
+            }
+            void ByIndex(string column, IReadOnlyCollection<string> ids)
+            {
+                var part = new RowSet(max);
+                foreach (var chunk in ids.Take(200).Chunk(100))
+                {
+                    var args = chunk.Select((id, i) => ("$k" + i, (object?)id)).Concat(period).ToArray();
+                    c.Scan(null, ScopeRowsStatement(column, string.Join(",", chunk.Select((_, i) => "$k" + i)), scope), r => { part.Add(r.GetInt64(0)); return true; }, args);
+                }
+                Narrow(part);
+                periodApplied = true;
+            }
+            if (scope.AuthorIdentityIds != null) ByIndex("author_identity_id", scope.AuthorIdentityIds);
+            if (scope.ConversationIds != null) ByIndex("conversation_id", scope.ConversationIds);
+            if (scope.MessageIds != null)
+            {
+                var part = new RowSet(max);
+                foreach (long row in c.QueryIn(null, "SELECT rowid FROM messages WHERE message_id IN ({keys})", scope.MessageIds.Take(800).ToList(), r => r.GetInt64(0))) part.Add(row);
+                Narrow(part);
+            }
+            if (scopeRows.Count >= 8) scopeRows.Clear();
+            scopeRows[key] = (rows!, periodApplied, now);
+            return (rows, periodApplied);
         }
 
         /// <summary>How many messages a word may appear in before it is too common to search for: <see cref="CommonShare"/> of
@@ -237,8 +343,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             foreach (var (name, value) in names) args.Add((name, value));
         }
 
+        /// <summary>
+        /// The scope's most recent messages that have a vector, with their vectors. Kept for a few minutes under the scope:
+        /// an inquiry searches the same scope once per facet and again for counter-evidence, and each search used to read
+        /// the candidates' rows and vectors anew (40,000 row reads a time).
+        /// </summary>
         private (List<string> Ids, List<float[]> Vectors) LoadCandidateVectors(IEmbeddingEncoder enc, RetrievalScope scope)
         {
+            if (scope.AuthorIdentityIds == null && scope.ConversationIds == null && scope.MessageIds == null) return (new List<string>(), new List<float[]>()); // never scan the whole corpus per query
+            string key = scope.Signature() + "|" + scope.VectorCandidates + "|" + enc.ModelVersion;
+            long now = Environment.TickCount64;
+            if (vectorCandidates is { } kept && kept.Key == key && now - kept.AtTick < ScopeTtlMs) return (kept.Ids, kept.Vectors);
+
             var ids = new List<string>();
             using (var c = stores.Corpus.OpenRead())
             {
@@ -249,8 +365,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
                 AddIn(where, args, "m.author_identity_id", "$a", scope.AuthorIdentityIds);
                 AddIn(where, args, "m.conversation_id", "$c", scope.ConversationIds);
                 AddIn(where, args, "m.message_id", "$mi", scope.MessageIds);
-                if (scope.AuthorIdentityIds == null && scope.ConversationIds == null && scope.MessageIds == null) return (ids, new List<float[]>()); // never scan the whole corpus per query
-                ids = c.Query(null, $"SELECT m.message_id FROM messages m WHERE {string.Join(" AND ", where)} ORDER BY m.sent_at_ms DESC LIMIT $l", r => r.GetString(0), args.ToArray());
+                if (scope.MessageIds != null)
+                    ids = c.Query(null, $"SELECT m.message_id FROM messages m WHERE {string.Join(" AND ", where)} ORDER BY m.sent_at_ms DESC LIMIT $l", r => r.GetString(0), args.ToArray());
+                else
+                {
+                    // Which rows are the newest is settled in the index (it holds the time and the row number), and only
+                    // those rows are then read for their ids. Asked for ids outright, with several accounts or conversations
+                    // in scope, the statement read every row in scope to sort them.
+                    string index = scope.AuthorIdentityIds != null ? "ix_messages_author_time" : "ix_messages_conv_time";
+                    var newest = c.Query(null, $"SELECT m.rowid FROM messages m INDEXED BY {index} WHERE {string.Join(" AND ", where)} ORDER BY m.sent_at_ms DESC LIMIT $l", r => r.GetInt64(0), args.ToArray());
+                    foreach (var chunk in newest.Chunk(500))
+                        ids.AddRange(c.Query(null, $"SELECT message_id FROM messages WHERE rowid IN ({string.Join(",", chunk)})", r => r.GetString(0)));
+                }
             }
             var vectors = new Dictionary<string, float[]>(StringComparer.Ordinal);
             using (var v = stores.Vectors.OpenRead())
@@ -267,7 +393,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
                 }
             }
             var keptIds = ids.Where(vectors.ContainsKey).ToList();
-            return (keptIds, keptIds.Select(id => vectors[id]).ToList());
+            var keptVectors = keptIds.Select(id => vectors[id]).ToList();
+            vectorCandidates = new KeptVectors(key, keptIds, keptVectors, now);
+            return (keptIds, keptVectors);
         }
 
         /// <summary>Decodes a stored vector (contract: vectors.db quant "i8" = int8 × scale, "f32" = little-endian floats).</summary>

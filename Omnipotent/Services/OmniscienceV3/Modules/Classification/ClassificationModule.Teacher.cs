@@ -169,6 +169,13 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
             int perDay = Setting(TeacherCallsPerDaySetting, 80);
             int calls = 0, labelled = 0, problems = 0;
             var results = new List<object>();
+            // Messages that were given up on because the teacher's answer was cut off are put back. That was never about the
+            // messages: the answer for a full batch did not fit its ceiling, so every call failed, and the third failure
+            // parked the whole batch (120 messages every three calls; nothing was ever labelled, 20 Nov 2026).
+            await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, """
+                UPDATE classify_teacher_queue SET state='queued', attempts=0, done_at_ms=NULL, note=NULL
+                WHERE state='failed' AND (note LIKE 'NoStructuredOutput%' OR note LIKE 'Truncated%')
+                """), ct).ConfigureAwait(false);
             for (int round = 0; round < 3; round++)
             {
                 string day = TeacherDay(Context.Clock.NowMs);
@@ -189,9 +196,17 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
             return JsonSerializer.Serialize(new { calls, labelled, problems, results });
         }
 
+        /// <summary>Room for the teacher's answer: a base, and so much per message it labels (a label for each task and a few
+        /// words of why). At 40 tokens a message every full batch was cut off.</summary>
+        internal const int TeacherAnswerBase = 600, TeacherAnswerPerTarget = 110;
+
+        /// <summary>The share of a full batch the next teacher call takes. Halved whenever an answer is cut off even after
+        /// being given more room, and brought back up a step with every call that works.</summary>
+        private double teacherBatchShare = 1.0;
+
         private async Task<(int Labelled, int Problems)?> TeacherCallAsync(JobContext job, OmniLlm llm, CancellationToken ct)
         {
-            int maxTargets = Setting(TeacherBatchSetting, 120);
+            int maxTargets = Math.Max(8, (int)(Setting(TeacherBatchSetting, 120) * teacherBatchShare));
             List<(string Id, string Reason)> queued;
             using (var c = Context.Stores.Intel.OpenRead())
                 queued = c.Query(null, "SELECT message_id, reason FROM classify_teacher_queue WHERE state='queued' ORDER BY priority DESC, enqueued_at_ms, message_id LIMIT $l",
@@ -199,8 +214,8 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
             if (queued.Count == 0) return null;
 
             var info = await llm.ContextAsync(null, ct).ConfigureAwait(false);
-            // Output dominates slot time (R1): budget ~40 tokens per target plus headroom.
-            int outputBudget = Math.Min(info.MaxOutputTokens, 400 + 40 * queued.Count);
+            // Output dominates slot time (R1), so the answer gets what it needs and no thinking on top.
+            int outputBudget = Math.Min(info.MaxOutputTokens, TeacherAnswerBase + TeacherAnswerPerTarget * queued.Count);
             int tokenBudget = ContextPacker.Budget(info, outputBudget) - llm.Estimator.Estimate(TeacherPrompt.System);
             long byteBudget = ContextPacker.ByteBudget(info) - System.Text.Encoding.UTF8.GetByteCount(TeacherPrompt.System);
 
@@ -268,6 +283,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                 Purpose = "classify.teacher",
                 PromptVersion = TeacherPromptVersion,
                 JobId = job.Job.JobId,
+                LongerWhenCutOff = true,
                 Request = new LlmRequest
                 {
                     Purpose = "classify.teacher",
@@ -279,15 +295,27 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                     WorkClass = AIRouterWorkClass.Background,
                     OutputSchema = TeacherPrompt.Schema,
                     Sampling = new ModelSamplingParameters(Temperature: 0),
+                    ReasoningEffort = "off",
                 },
             }, ct).ConfigureAwait(false);
 
             if (!result.Success)
             {
+                if (OmniLlm.CutOff(result, null) || result.ErrorKind == LlmErrorKind.NoStructuredOutput && result.CompletionTokens >= outputBudget)
+                {
+                    // The answer did not fit even with more room: the batch was too large, which is not the messages' doing.
+                    // They stay queued with their attempts as they were, and the next call takes half as many.
+                    teacherBatchShare = Math.Max(0.05, teacherBatchShare / 2);
+                    await job.ReportProgressAsync(new { teacherCutOff = true, targets = refs.Count, nextShare = teacherBatchShare }).ConfigureAwait(false);
+                    return (0, 1);
+                }
                 string state = result.ErrorKind == LlmErrorKind.Refused ? "refused" : "queued";
-                await BumpAttemptsAsync(refs.Values, state, $"{result.ErrorKind}: {result.ErrorMessage}", ct).ConfigureAwait(false);
+                // Worded so that the put-back in TeacherAsync (which looks for the notes cut-off answers used to leave) never
+                // takes these for one of them.
+                await BumpAttemptsAsync(refs.Values, state, $"teacher call failed ({result.ErrorKind}): {result.ErrorMessage}", ct).ConfigureAwait(false);
                 return (0, 1);
             }
+            teacherBatchShare = Math.Min(1.0, teacherBatchShare * 1.5);
             var parse = TeacherPrompt.Parse(result.StructuredJson ?? result.Text, refs);
             long now = Context.Clock.NowMs;
             var byId = targets.ToDictionary(t => t.MessageId, StringComparer.Ordinal);

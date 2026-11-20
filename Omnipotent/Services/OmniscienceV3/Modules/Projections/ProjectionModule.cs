@@ -223,23 +223,48 @@ CREATE TABLE projection_cursors(
             return JsonSerializer.Serialize(new { people = rows.Count });
         }
 
-        /// <summary>Sliding windows (30/90/365 days) move every day: every person and the overview are re-projected.</summary>
+        /// <summary>The cursor of the daily pass: the day it is for and how many people of that day's list are done, as one
+        /// number (day × <see cref="DailyStride"/> + done) so it only ever grows.</summary>
+        internal const string DailyCursor = "daily";
+        internal const long DailyStride = 10_000_000;
+
+        /// <summary>How many people the daily pass projects between two notes of how far it is.</summary>
+        internal static int DailyCheckpoint { get; set; } = 100;
+
+        /// <summary>
+        /// Sliding windows (30/90/365 days) move every day: every person and the overview are re-projected.
+        /// <para>The pass keeps its place. People are taken in id order and how far the day's pass has come is written down
+        /// as it goes, so an attempt that is interrupted (a restart, a lost lease, the next attempt after a failure) carries
+        /// on from there. Each attempt used to start again at the first person: on the server the pass had 45,969 people
+        /// to do, got through about 800 an attempt, and died after its fifth (20 Nov 2026).</para>
+        /// </summary>
         private async Task<string?> DailyAsync(JobContext job)
         {
             var ct = job.Cancellation;
             List<string> persons;
             using (var corpus = Context.Stores.Corpus.OpenRead())
-                persons = corpus.Query(null, "SELECT p.person_id FROM persons p LEFT JOIN person_canonical pc ON pc.person_id=p.person_id WHERE COALESCE(pc.canonical_id, p.person_id)=p.person_id",
-                    r => r.GetString(0));
-            int n = 0;
-            foreach (var p in persons)
+                persons = corpus.Query(null, """
+                    SELECT p.person_id FROM persons p LEFT JOIN person_canonical pc ON pc.person_id=p.person_id
+                    WHERE COALESCE(pc.canonical_id, p.person_id)=p.person_id ORDER BY p.person_id
+                    """, r => r.GetString(0));
+            long day = long.Parse(Today().Replace("-", ""), CultureInfo.InvariantCulture);
+            long cursor = Cursor(DailyCursor);
+            int resumedAt = cursor / DailyStride == day ? (int)Math.Min(persons.Count, cursor % DailyStride) : 0;
+            int n = resumedAt;
+            if (resumedAt > 0) await job.ReportProgressAsync(new { projected = n, of = persons.Count, resumedAt }).ConfigureAwait(false);
+            for (int i = resumedAt; i < persons.Count; i++)
             {
                 ct.ThrowIfCancellationRequested();
-                await ProjectPersonAsync(p, ct).ConfigureAwait(false);
-                if (++n % 200 == 0) await job.ReportProgressAsync(new { projected = n, of = persons.Count }).ConfigureAwait(false);
+                await ProjectPersonAsync(persons[i], ct).ConfigureAwait(false);
+                if (++n % DailyCheckpoint == 0)
+                {
+                    await SetCursorAsync(DailyCursor, day * DailyStride + n, ct).ConfigureAwait(false);
+                    await job.ReportProgressAsync(new { projected = n, of = persons.Count, resumedAt }).ConfigureAwait(false);
+                }
             }
+            await SetCursorAsync(DailyCursor, day * DailyStride + n, ct).ConfigureAwait(false);
             await ProjectOverviewAsync(ct).ConfigureAwait(false);
-            return JsonSerializer.Serialize(new { persons = n });
+            return JsonSerializer.Serialize(new { persons = n, resumedAt });
         }
 
         // ── helpers ──────────────────────────────────────────────────────────────

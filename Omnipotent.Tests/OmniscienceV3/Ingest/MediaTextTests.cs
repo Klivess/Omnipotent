@@ -74,11 +74,18 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
         {
             public List<string?> LanguagesAsked { get; } = new();
             public string Model => "fake-whisper";
+            /// <summary>A piece the service answers 500 to, every time (as AiRouterTranscriber reports it).</summary>
+            public string? FailsOn;
+            /// <summary>The service is down: every piece fails.</summary>
+            public bool Down;
 
             public Task<SpeechResult> TranscribeAsync(AudioSegment segment, string? language, CancellationToken ct)
             {
                 LanguagesAsked.Add(language);
                 string heard = Encoding.UTF8.GetString(segment.Bytes);
+                if (Down || heard == FailsOn)
+                    throw new Omnipotent.Services.OmniscienceV3.Kernel.Jobs.JobFailureException(Omnipotent.Services.OmniscienceV3.Kernel.Jobs.ErrorClass.Transient,
+                        "the speech service did not answer: AIRouter transcription failed with 500.");
                 return Task.FromResult(heard == "(silence)" ? new SpeechResult("", null, 0.95, -2.0) : new SpeechResult(heard, "en", 0.02, -0.2));
             }
         }
@@ -252,6 +259,59 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
             Assert.Equal("en", label.Signals.GetProperty("language").GetString());
             // The first piece is heard cold; the rest are told the language it was in.
             Assert.Equal(new string?[] { null, "en", "en" }, speech.LanguagesAsked);
+        }
+
+        [Fact]
+        public async Task ARecordingTheServiceFailsOnEveryTime_IsFiledUnreadable_WhenItHasAnsweredOthersMeanwhile()
+        {
+            // Two jobs died on the server after five attempts each, "AIRouter transcription failed with 500", while the
+            // service transcribed other recordings between their attempts (19 and 20 Nov 2026).
+            var processor = Processor();
+            string broken = await AttachAsync("m1", Encoding.ASCII.GetBytes("a recording the service cannot take"), "voice-message.ogg", MediaKinds.Voice);
+            string fine = await AttachAsync("m2", Encoding.ASCII.GetBytes("an ordinary recording"), "other.ogg", MediaKinds.Voice);
+            long firstStarted = clock.NowMs;
+            speech.FailsOn = "static and a click";
+            var progress = new List<string>();
+
+            // Its earlier attempts fail as the service's failure: the job is retried.
+            segmenter.Pieces = new[] { "hello", "static and a click" };
+            var failed = await Assert.ThrowsAsync<Omnipotent.Services.OmniscienceV3.Kernel.Jobs.JobFailureException>(() =>
+                processor.ProcessAsync(broken, 1, default, p => { progress.Add(JsonSerializer.Serialize(p)); return Task.CompletedTask; }));
+            Assert.Contains("failed with 500", failed.Message);
+            // It said which piece it was on before each one: a long recording is seen to be moving.
+            Assert.Equal(2, progress.Count);
+            Assert.Contains("\"piece\":2", progress[1]);
+
+            // Meanwhile another recording goes through.
+            clock.Advance(TimeSpan.FromMinutes(5));
+            segmenter.Pieces = new[] { "see you on saturday" };
+            await processor.ProcessAsync(fine, 2, default);
+
+            // The last attempt fails the same way; the service has answered since this job began, so it is the recording.
+            segmenter.Pieces = new[] { "hello", "static and a click" };
+            string outcome = await processor.ProcessAsync(broken, 3, default, null, lastAttemptSinceMs: firstStarted);
+            Assert.StartsWith("unreadable: The speech service failed on this recording every time", outcome);
+            // Filed once: asking again does not go back to the service.
+            int asked = speech.LanguagesAsked.Count;
+            Assert.StartsWith("unreadable:", await processor.ProcessAsync(broken, 4, default));
+            Assert.Equal(asked, speech.LanguagesAsked.Count);
+            Assert.Equal(fine, Assert.Single(Labels()).Item);
+        }
+
+        [Fact]
+        public async Task WhenTheServiceIsDown_TheLastAttemptStillFails_AndNothingIsFiledAgainstTheRecording()
+        {
+            var processor = Processor();
+            string note = await AttachAsync("m1", Encoding.ASCII.GetBytes("an ordinary recording"), "voice-message.ogg", MediaKinds.Voice);
+            long firstStarted = clock.NowMs;
+            speech.Down = true;
+            clock.Advance(TimeSpan.FromMinutes(5));
+
+            // Nothing was transcribed since this job began: that is an outage, not this recording.
+            await Assert.ThrowsAsync<Omnipotent.Services.OmniscienceV3.Kernel.Jobs.JobFailureException>(() => processor.ProcessAsync(note, 1, default, null, lastAttemptSinceMs: firstStarted));
+
+            speech.Down = false;
+            Assert.Equal("11 characters", await processor.ProcessAsync(note, 2, default));
         }
 
         [Fact]

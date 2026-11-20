@@ -147,11 +147,12 @@ CREATE TABLE media_text(
                     string id = job.Job.SubjectId ?? throw new JobFailureException(ErrorClass.Permanent, "The job names no attachment.");
                     long seq;
                     using (var c = Context.Stores.Corpus.OpenRead()) seq = ChangeLog.MaxSeq(c);
-                    string outcome = await Processor.ProcessAsync(id, seq, job.Cancellation).ConfigureAwait(false);
+                    string outcome = await Processor.ProcessAsync(id, seq, job.Cancellation, job.ReportProgressAsync,
+                        job.Job.Attempts >= job.Job.MaxAttempts ? job.Job.StartedAtMs ?? job.Job.CreatedAtMs : null).ConfigureAwait(false);
                     return JsonSerializer.Serialize(new { outcome }, KernelJson.Options);
                 }
                 case SweepKind:
-                    return JsonSerializer.Serialize(await SweepAsync(job.Cancellation).ConfigureAwait(false), KernelJson.Options);
+                    return JsonSerializer.Serialize(await SweepAsync(job).ConfigureAwait(false), KernelJson.Options);
                 default:
                     throw new JobFailureException(ErrorClass.Permanent, $"Unknown job kind '{job.Job.Kind}'.");
             }
@@ -164,14 +165,16 @@ CREATE TABLE media_text(
         /// Plan R2: the backlog of the people Klives tracks (and his own) is queued first and runs first, then that of
         /// the people he watches, then everyone else's in attachment order.
         /// </summary>
-        private async Task<object> SweepAsync(CancellationToken ct)
+        private async Task<object> SweepAsync(JobContext job)
         {
+            var ct = job.Cancellation;
             var cfg = ReadSettings();
             bool images = cfg.OcrEnabled && Ocr() != null;
             bool sound = cfg.TranscribeEnabled && await transcriber().ConfigureAwait(false) != null;
             if (!images && !sound) return new { queued = 0, reason = "no engine is available" };
 
             int budget = Math.Clamp(Context.Settings.Get(SweepBatchSetting, 500), 10, 100000), queued = 0, first = 0;
+            var clock = MediaSweep.Start();
 
             // 1. The people who come first. One full pass per set of people (and engines): media of theirs that arrives
             //    later is announced by the change log, so once their backlog has been walked there is nothing left to find.
@@ -179,9 +182,11 @@ CREATE TABLE media_text(
             if (authors.Count > 0 && key != priorityDoneKey)
             {
                 if (key != priorityKey) { priorityKey = key; priorityCursor = ""; }
-                for (int pages = 0; pages < PriorityPagesPerSweep && queued < budget; pages++)
+                var part = clock.Part(0.6);
+                for (int pages = 0; pages < PriorityPagesPerSweep && queued < budget && !part.Spent; pages++)
                 {
                     ct.ThrowIfCancellationRequested();
+                    await job.ReportProgressAsync(new { stage = "priority", pages, queued }).ConfigureAwait(false);
                     var page = Page(priorityCursor, images, sound);
                     var theirs = page.Where(p => p.Author != null && authors.ContainsKey(p.Author)).Select(p => p.Id).ToList();
                     var labelled = Labelled(theirs);
@@ -199,11 +204,17 @@ CREATE TABLE media_text(
                 }
             }
 
-            // 2. Everyone, in attachment order, with what is left of the budget.
+            // 2. Everyone, in attachment order, with what is left of the budget. A top-up: while more is already waiting
+            //    than a sweep would add there is nothing to top up (on the server 180,000 extractions were queued, and each
+            //    sweep still walked the attachments to find more).
+            long waiting = Context.Jobs.ModuleStats().GetValueOrDefault(ModuleId)?.Queued ?? 0;
+            if (waiting >= budget) return new { queued, first, skipped = "enough is already queued", waiting };
             bool wrapped = sweepCursor.Length == 0;
-            while (queued < budget)
+            int pagesRead = 0;
+            while (queued < budget && !clock.Spent)
             {
                 ct.ThrowIfCancellationRequested();
+                if (++pagesRead % 4 == 0) await job.ReportProgressAsync(new { stage = "everyone", pages = pagesRead, queued }).ConfigureAwait(false);
                 var page = Page(sweepCursor, images, sound);
                 if (page.Count > 0)
                 {

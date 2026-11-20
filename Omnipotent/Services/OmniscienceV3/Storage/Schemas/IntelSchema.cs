@@ -239,6 +239,24 @@ END;
             new Migration(ModuleId, 4, "llm_calls.resent_tokens", """
 ALTER TABLE llm_calls ADD COLUMN resent_tokens INTEGER NOT NULL DEFAULT 0;
 """),
+            // The Jobs page lists one module's jobs, newest first. The only index on the module was (module_id, state), which
+            // cannot hand rows back in job order across states, so every such listing read and sorted all of the module's jobs:
+            // for projections, the media store and captions the request was still open after 60 seconds (20 Nov 2026).
+            // module_problems: what a part of the engine reports as standing in its way (Kernel.ModuleProblems).
+            new Migration(ModuleId, 5, "job listings by module, and by module and kind, in job order; standing problems", """
+CREATE INDEX ix_jobs_module ON jobs(module_id, job_id);
+CREATE INDEX ix_jobs_module_kind ON jobs(module_id, kind, job_id);
+
+CREATE TABLE module_problems(
+  module_id TEXT NOT NULL,
+  problem TEXT NOT NULL,
+  severity TEXT NOT NULL,
+  detail_json TEXT NOT NULL,
+  since_ms INTEGER NOT NULL,
+  last_ms INTEGER NOT NULL,
+  PRIMARY KEY(module_id, problem)
+) WITHOUT ROWID;
+"""),
         };
     }
 }

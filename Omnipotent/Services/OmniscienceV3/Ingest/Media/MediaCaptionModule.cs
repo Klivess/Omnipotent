@@ -130,7 +130,7 @@ CREATE TABLE media_caption(
                     return JsonSerializer.Serialize(new { outcome = await CaptionAsync(id, job).ConfigureAwait(false) }, KernelJson.Options);
                 }
                 case SweepKind:
-                    return JsonSerializer.Serialize(await SweepAsync(job.Cancellation).ConfigureAwait(false), KernelJson.Options);
+                    return JsonSerializer.Serialize(await SweepAsync(job).ConfigureAwait(false), KernelJson.Options);
                 default:
                     throw new JobFailureException(ErrorClass.Permanent, $"Unknown job kind '{job.Job.Kind}'.");
             }
@@ -190,6 +190,7 @@ CREATE TABLE media_caption(
                 var result = await Context.Llm.CallAsync(new LlmCall
                 {
                     ModuleId = ModuleId, Purpose = CaptionPrompt.Purpose, PromptVersion = CaptionPrompt.Version, JobId = job.Job.JobId,
+                    LongerWhenCutOff = true,
                     Request = new LlmRequest
                     {
                         Purpose = CaptionPrompt.Purpose,
@@ -315,39 +316,64 @@ CREATE TABLE media_caption(
         /// Queues stored images that have no caption yet, at most what is left of today's budget: the people Klives tracks or
         /// watches, and his own, first (plan R2), then everyone else's in attachment order.
         /// </summary>
-        private async Task<object> SweepAsync(CancellationToken ct)
+        private async Task<object> SweepAsync(JobContext job)
         {
+            var ct = job.Cancellation;
             if (!Context.Settings.Get(EnabledSetting, true)) return new { queued = 0, reason = "captions are off" };
             if (Context.Llm == null) return new { queued = 0, reason = "no LLM gateway in this engine" };
             int budget = Math.Min(BudgetLeft(), Math.Clamp(Context.Settings.Get(SweepBatchSetting, 100), 1, 5000));
             if (budget == 0) return new { queued = 0, reason = "today's caption budget is used" };
-            int queued = 0, first = 0;
+            // What is already waiting counts against what a sweep adds: the budget is a few hundred captions a day.
+            long waiting = Context.Jobs.ModuleStats().GetValueOrDefault(ModuleId)?.Queued ?? 0;
+            if (waiting >= budget) return new { queued = 0, reason = "enough is already queued", waiting };
+            int queued = 0, first = 0, pages = 0;
+            var clock = MediaSweep.Start();
 
-            // 1. Theirs first.
+            // 1. Theirs first: a walk over the stored images, a page at a time from where the last sweep stopped, taking the
+            //    ones the people who come first posted. It used to load every image any of them ever posted before queueing
+            //    the first hundred: for Klives and the people he tracks that is all of their messages joined to their
+            //    attachments, each sweep, and two sweeps ran for two hours without finishing (20 Nov 2026).
             var priority = PriorityIdentities();
             if (priority.Count > 0)
             {
-                List<string> theirs;
-                using (var c = Context.Stores.Corpus.OpenRead())
-                    theirs = c.QueryIn(null, """
-                        SELECT a.attachment_id FROM attachments a JOIN messages m ON m.message_id = a.message_id
-                        WHERE m.author_identity_id IN ({keys}) AND a.media_kind='image' AND a.download_state='done' AND a.cas_sha256 IS NOT NULL
-                        """, priority.ToList(), r => r.GetString(0)).Distinct(StringComparer.Ordinal).OrderBy(x => x, StringComparer.Ordinal).ToList();
-                var done = Captioned(theirs);
-                foreach (var id in theirs.Where(x => !done.Contains(x)))
+                var part = clock.Part(0.6);
+                bool wrappedPriority = priorityCursor.Length == 0;
+                while (queued < budget && !part.Spent)
                 {
-                    if (queued >= budget) break;
-                    await Context.Jobs.EnqueueAsync(Job(CaptionKind, "attachment", id, priority: TrackedPriority), ct).ConfigureAwait(false);
-                    queued++;
-                    first++;
+                    ct.ThrowIfCancellationRequested();
+                    if (++pages % 4 == 0) await job.ReportProgressAsync(new { stage = "priority", pages, queued }).ConfigureAwait(false);
+                    List<(string Id, string? Author)> page;
+                    using (var c = Context.Stores.Corpus.OpenRead())
+                        page = c.Query(null, $"""
+                            SELECT a.attachment_id, m.author_identity_id FROM attachments a LEFT JOIN messages m ON m.message_id = a.message_id
+                            WHERE a.attachment_id > $after AND a.media_kind='image' AND a.download_state='done' AND a.cas_sha256 IS NOT NULL
+                            ORDER BY a.attachment_id LIMIT {PageSize}
+                            """, r => (r.GetString(0), r.GetStringOrNull(1)), ("$after", priorityCursor));
+                    var theirs = page.Where(p => p.Author != null && priority.Contains(p.Author)).Select(p => p.Id).ToList();
+                    var done = Captioned(theirs);
+                    foreach (var (id, author) in page)
+                    {
+                        priorityCursor = id;
+                        if (author == null || !priority.Contains(author) || done.Contains(id)) continue;
+                        await Context.Jobs.EnqueueAsync(Job(CaptionKind, "attachment", id, priority: TrackedPriority), ct).ConfigureAwait(false);
+                        first++;
+                        if (++queued >= budget) break;
+                    }
+                    if (page.Count < PageSize && queued < budget)
+                    {
+                        priorityCursor = "";
+                        if (wrappedPriority) break;
+                        wrappedPriority = true;
+                    }
                 }
             }
 
             // 2. Everyone, in attachment order, with what is left.
             bool wrapped = sweepCursor.Length == 0;
-            while (queued < budget)
+            while (queued < budget && !clock.Spent)
             {
                 ct.ThrowIfCancellationRequested();
+                if (++pages % 4 == 0) await job.ReportProgressAsync(new { stage = "everyone", pages, queued }).ConfigureAwait(false);
                 List<string> page;
                 using (var c = Context.Stores.Corpus.OpenRead())
                     page = c.Query(null, $"""
@@ -391,9 +417,14 @@ CREATE TABLE media_caption(
             using var c = Context.Stores.Corpus.OpenRead();
             foreach (string self in c.Query(null, "SELECT person_id FROM persons WHERE is_self=1", r => r.GetString(0))) people.Add(Context.Policy.Canonical(self));
             if (people.Count == 0) return identities;
-            foreach (var (identity, person) in c.Query(null, "SELECT identity_id, person_id FROM identities", r => (r.GetString(0), r.GetString(1))))
-                if (people.Contains(Context.Policy.Canonical(person))) identities.Add(identity);
+            // Their identities, and those of anyone merged into them: two lookups by person, not a pass over every identity.
+            var ids = new HashSet<string>(people, StringComparer.Ordinal);
+            foreach (string merged in c.QueryIn(null, "SELECT person_id FROM person_canonical WHERE canonical_id IN ({keys})", people.ToList(), r => r.GetString(0))) ids.Add(merged);
+            foreach (string identity in c.QueryIn(null, "SELECT identity_id FROM identities WHERE person_id IN ({keys})", ids.ToList(), r => r.GetString(0))) identities.Add(identity);
             return identities;
         }
+
+        /// <summary>Where the walk for the people who come first has got to (attachment id; empty: from the start).</summary>
+        private string priorityCursor = "";
     }
 }

@@ -71,29 +71,90 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.Equal(new[] { cats }, results.Select(r => r.MessageId).ToArray());
         }
 
+        [Fact]
+        public async Task FullText_ReadsNoMessageRow_ToRankAMatchOrToTellWhetherItIsInScope()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            using var c = h.Stores.Corpus.OpenRead();
+
+            // The matches, best first, come from the full-text index alone: the messages table is not in the plan at all.
+            // (The statement before this one joined every match to its row before sorting; on the server that was over a
+            // million row reads for one query, and two tactic runs died in it, 20 Nov 2026.)
+            var ranked = c.Query(null, "EXPLAIN QUERY PLAN " + HybridRetriever.RankedMatches, r => r.GetString(3), ("$q", "\"cat\" OR \"cats\""));
+            Assert.Contains(ranked, p => p.Contains("messages_fts"));
+            Assert.DoesNotContain(ranked, p => p.Contains("ix_messages") || p.Contains(" messages ") || p.EndsWith(" messages") || p.Contains(" m "));
+
+            // Which rows a scope holds comes from an index that has everything asked of it: again no row is read.
+            var scope = new RetrievalScope { FromMs = 0, ToMs = Now };
+            foreach (string column in new[] { "author_identity_id", "conversation_id" })
+            {
+                var plan = c.Query(null, "EXPLAIN QUERY PLAN " + HybridRetriever.ScopeRowsStatement(column, "$k0,$k1", scope), r => r.GetString(3),
+                    ("$k0", "a"), ("$k1", "b"), ("$f", 0L), ("$t", Now));
+                Assert.All(plan, p => Assert.Contains("COVERING INDEX", p));
+            }
+        }
+
         [Theory]
         [InlineData("author")]
         [InlineData("conversations")]
         [InlineData("messages")]
-        public async Task FullText_TheIndexDrivesTheStatement_WhateverTheScope(string kind)
+        [InlineData("everywhere")]
+        public async Task FullText_FindsWhatIsInScopeAndInThePeriod_AndNothingElse(string kind)
         {
             await using var h = await KnowledgeHarness.StartAsync(Now);
-            var scope = kind switch
+            var corpus = new CorpusBuilder(h.Stores);
+            await corpus.PersonAsync("p-ana", "Ana");
+            await corpus.PersonAsync("p-ben", "Ben");
+            await corpus.ConversationAsync("discord:c-ana", "dm", "p-ana");
+            await corpus.ConversationAsync("discord:c-ben", "dm", "p-ben");
+            string old = await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 9_000_000, "the cat is asleep");
+            string recent = await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 1_000_000, "the cat woke up");
+            string bens = await corpus.MessageAsync("p-ben", "discord:c-ben", Now - 2_000_000, "my cat ignores me");
+            await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 500_000, "train was late again");
+            RetrievalScope Scope(long? from = null, long? to = null) => kind switch
             {
-                "author" => new RetrievalScope { AuthorIdentityIds = new[] { CorpusBuilder.Identity("p-ana") }, ToMs = Now },
-                "conversations" => new RetrievalScope { ConversationIds = new[] { "discord:c-ana" }, FromMs = 0, ToMs = Now },
-                _ => new RetrievalScope { MessageIds = new[] { "discord:1", "discord:2" }, ToMs = Now },
+                "author" => new RetrievalScope { AuthorIdentityIds = new[] { CorpusBuilder.Identity("p-ana") }, FromMs = from, ToMs = to ?? Now, Limit = 10 },
+                "conversations" => new RetrievalScope { ConversationIds = new[] { "discord:c-ana" }, FromMs = from, ToMs = to ?? Now, Limit = 10 },
+                "messages" => new RetrievalScope { MessageIds = new[] { old, recent }, FromMs = from, ToMs = to ?? Now, Limit = 10 },
+                _ => new RetrievalScope { FromMs = from, ToMs = to ?? Now, Limit = 10 },
             };
-            var (sql, args) = HybridRetriever.FullTextStatement("\"cat\" OR \"cats\"", scope, 42);
-            using var c = h.Stores.Corpus.OpenRead();
+            // A fresh retriever per search: the rows of a scope are kept for a few minutes, and each of these is another scope.
+            HybridRetriever Retriever() => new(h.Stores, h.Kit.Corpus, () => null);
 
-            var plan = c.Query(null, "EXPLAIN QUERY PLAN " + sql, r => r.GetString(3), args);
+            var (all, _) = await Retriever().SearchAsync(new[] { "cat" }, Scope(), CancellationToken.None);
+            var expected = kind == "everywhere" ? new[] { old, recent, bens } : new[] { old, recent };
+            Assert.Equal(expected.OrderBy(x => x), all.Select(r => r.MessageId).OrderBy(x => x));
 
-            // The outer loop reads the full-text index once; each match is then looked up in messages by rowid. Never a walk over
-            // the scope's messages through one of their indexes with the match run again per message.
-            Assert.Contains("messages_fts", plan[0]);
-            Assert.Contains(plan, p => p.Contains("INTEGER PRIMARY KEY"));
-            Assert.DoesNotContain(plan, p => p.Contains("ix_messages"));
+            var (later, _) = await Retriever().SearchAsync(new[] { "cat" }, Scope(from: Now - 3_000_000), CancellationToken.None);
+            Assert.Equal((kind == "everywhere" ? new[] { recent, bens } : new[] { recent }).OrderBy(x => x), later.Select(r => r.MessageId).OrderBy(x => x));
+
+            var (earlier, _) = await Retriever().SearchAsync(new[] { "cat" }, Scope(to: Now - 5_000_000), CancellationToken.None);
+            Assert.Equal(new[] { old }, earlier.Select(r => r.MessageId));
+        }
+
+        [Fact]
+        public async Task TheSameScope_IsReadOnce_ForAllTheQuestionsAskedOfIt()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            var (cats, tabby, train) = await AnaAsync(h);
+            var encoder = new FakeEncoder();
+            h.Kit.Encoder = encoder;
+            await h.Context.Vectors!.UpsertAsync(VectorSpaces.Message, encoder.ModelVersion, new[]
+            {
+                new VectorItem(cats, FakeEncoder.Embed("my cat knocked the plant over again"), 1),
+                new VectorItem(tabby, FakeEncoder.Embed("cat"), 1),
+            });
+            var (first, coverage) = await h.Kit.Retriever.SearchAsync(new[] { "cat" }, AnasOwn(), CancellationToken.None);
+            Assert.Equal(2, coverage.Candidates);
+
+            // A vector filed after the scope was first read is not seen by the next question of the same scope (an inquiry's
+            // many searches read its candidates once), and is by a search of another scope.
+            await h.Context.Vectors!.UpsertAsync(VectorSpaces.Message, encoder.ModelVersion, new[] { new VectorItem(train, FakeEncoder.Embed("train was late again"), 1) });
+            var (_, again) = await h.Kit.Retriever.SearchAsync(new[] { "plant" }, AnasOwn(), CancellationToken.None);
+            Assert.Equal(2, again.Candidates);
+            var (_, other) = await h.Kit.Retriever.SearchAsync(new[] { "plant" }, AnasOwn() with { FromMs = 1 }, CancellationToken.None);
+            Assert.Equal(3, other.Candidates);
+            Assert.NotEmpty(first);
         }
 
         [Fact]

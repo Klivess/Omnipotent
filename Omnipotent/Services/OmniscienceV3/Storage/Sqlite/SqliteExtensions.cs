@@ -24,20 +24,61 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
 
         public static T? Scalar<T>(this SqliteConnection conn, SqliteTransaction? tx, string sql, params (string Name, object? Value)[] args)
         {
-            using var cmd = conn.Cmd(tx, sql, args);
-            object? v = cmd.ExecuteScalar();
-            if (v == null || v is DBNull) return default;
-            var target = Nullable.GetUnderlyingType(typeof(T)) ?? typeof(T);
-            return (T)Convert.ChangeType(v, target, System.Globalization.CultureInfo.InvariantCulture);
+            // A read made by work that has been cancelled does not start, and one that is cut short says so as a
+            // cancellation (see AmbientCancellation). Writes run on the writer's own thread, outside any such work.
+            if (tx == null) AmbientCancellation.ThrowIfCancelled();
+            try
+            {
+                using var cmd = conn.Cmd(tx, sql, args);
+                object? v = cmd.ExecuteScalar();
+                if (v == null || v is DBNull) return default;
+                var target = Nullable.GetUnderlyingType(typeof(T)) ?? typeof(T);
+                return (T)Convert.ChangeType(v, target, System.Globalization.CultureInfo.InvariantCulture);
+            }
+            catch (SqliteException ex) when (AmbientCancellation.IsInterrupt(ex))
+            {
+                throw new OperationCanceledException("The read was stopped because the work it belongs to was cancelled.", ex, AmbientCancellation.Token);
+            }
         }
 
         public static List<T> Query<T>(this SqliteConnection conn, SqliteTransaction? tx, string sql, Func<SqliteDataReader, T> map, params (string Name, object? Value)[] args)
         {
-            using var cmd = conn.Cmd(tx, sql, args);
-            using var reader = cmd.ExecuteReader();
-            var list = new List<T>();
-            while (reader.Read()) list.Add(map(reader));
-            return list;
+            if (tx == null) AmbientCancellation.ThrowIfCancelled();
+            try
+            {
+                using var cmd = conn.Cmd(tx, sql, args);
+                using var reader = cmd.ExecuteReader();
+                var list = new List<T>();
+                while (reader.Read()) list.Add(map(reader));
+                return list;
+            }
+            catch (SqliteException ex) when (AmbientCancellation.IsInterrupt(ex))
+            {
+                throw new OperationCanceledException("The read was stopped because the work it belongs to was cancelled.", ex, AmbientCancellation.Token);
+            }
+        }
+
+        /// <summary>Reads rows one at a time and stops as soon as <paramref name="row"/> returns false, without fetching the
+        /// rest (a ranked list of which only the first few that pass a test are wanted). Returns the rows read.</summary>
+        public static int Scan(this SqliteConnection conn, SqliteTransaction? tx, string sql, Func<SqliteDataReader, bool> row, params (string Name, object? Value)[] args)
+        {
+            if (tx == null) AmbientCancellation.ThrowIfCancelled();
+            try
+            {
+                using var cmd = conn.Cmd(tx, sql, args);
+                using var reader = cmd.ExecuteReader();
+                int read = 0;
+                while (reader.Read())
+                {
+                    read++;
+                    if (!row(reader)) break;
+                }
+                return read;
+            }
+            catch (SqliteException ex) when (AmbientCancellation.IsInterrupt(ex))
+            {
+                throw new OperationCanceledException("The read was stopped because the work it belongs to was cancelled.", ex, AmbientCancellation.Token);
+            }
         }
 
         public static string? GetStringOrNull(this SqliteDataReader r, int ordinal) => r.IsDBNull(ordinal) ? null : r.GetString(ordinal);

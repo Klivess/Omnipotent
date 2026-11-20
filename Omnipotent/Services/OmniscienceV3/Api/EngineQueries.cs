@@ -308,12 +308,27 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             return new JobActionResultDto(jobId, changed, job.State);
         }
 
+        /// <summary>Retries every dead job (of one module, or of all) in one go; see <see cref="JobQueue.RetryAllDeadAsync"/>.</summary>
+        public async Task<DeadJobsRetriedDto> RetryDeadJobsAsync(string? moduleId, string actor, CancellationToken ct)
+        {
+            var rt = host.Require();
+            string? module = string.IsNullOrWhiteSpace(moduleId) ? null : moduleId.Trim();
+            var (retried, closed) = await rt.Host.Jobs.RetryAllDeadAsync(module, ct).ConfigureAwait(false);
+            if (retried + closed > 0)
+            {
+                await OperatorAudit.WriteAsync(rt.Stores.Operator, clock, actor, "job.retry_dead", module ?? "all", new { retried, closed }, ct).ConfigureAwait(false);
+                rt.Host.Kick();
+            }
+            return new DeadJobsRetriedDto(retried, closed);
+        }
+
         public async Task<JobActionResultDto> RetryJobAsync(long jobId, string actor, CancellationToken ct)
         {
             var rt = host.Require();
             if (jobId <= 0) throw ApiException.BadRequest("'jobId' is required.");
             bool changed = await rt.Host.Jobs.RetryDeadAsync(jobId, ct).ConfigureAwait(false);
             var job = rt.Host.Jobs.Get(jobId) ?? throw ApiException.NotFound($"Job {jobId} does not exist.");
+            // "changed" and cancelled: the same work was already queued again, so this one was closed rather than retried.
             if (!changed && job.State != JobStates.Dead && job.State != JobStates.Queued)
                 throw ApiException.Conflict($"Job {jobId} is {job.State}; only dead jobs can be retried.");
             if (changed)

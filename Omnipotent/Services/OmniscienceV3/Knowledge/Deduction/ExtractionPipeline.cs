@@ -109,18 +109,28 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             var ids = kit.Corpus.PersonIdsOf(canonical);
             var identities = kit.Corpus.IdentitiesOf(ids).Select(i => i.IdentityId).ToList();
             long asOf = kit.Context.Clock.NowMs;
+            // The job says where it is while it works out what there is to read. For someone with a hundred thousand
+            // messages that takes a while, and until 20 Nov 2026 it said nothing before its first slice: five such jobs
+            // were stopped for "no progress" before they had read anything.
+            await job.ReportProgressAsync(new { person = canonical, stage = "evidence" }).ConfigureAwait(false);
             var anchors = assembler.Anchors(identities, asOf).ToList();
+            ct.ThrowIfCancellationRequested();
+            await job.ReportProgressAsync(new { person = canonical, stage = "mentions", anchors = anchors.Count }).ConfigureAwait(false);
             // Mentions by name or alias (not only @-mentions), scoped to the subject's own conversations.
             var names = kit.Corpus.NamesOf(identities).SelectMany(n => new[] { n.Value, n.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "" })
                 .Concat(new Entities.AliasEngine(kit, new ReviewQueue(kit.Context.Stores, kit.Context.Clock)).Aliases(canonical, asOf).Where(a => a.Status is "accepted" or "confirmed").Select(a => a.Alias))
                 .Where(n => n.Length >= 3).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            var conversations = kit.Corpus.ConversationsOf(identities).Select(c => c.ConversationId)
+            // Where they write, from the conversations of the anchors already in hand (no second pass over their messages),
+            // and where they are a member.
+            var conversations = anchors.Where(a => a.Relation == EvidenceRelation.Authored).Select(a => a.ConversationId)
                 .Concat(identities.SelectMany(MemberConversations)).Distinct(StringComparer.Ordinal).ToList();
             var seen = anchors.Select(a => a.MessageId).ToHashSet(StringComparer.Ordinal);
             anchors.AddRange(assembler.NameMentions(names, conversations, identities, asOf).Where(a => seen.Add(a.MessageId)));
             anchors = anchors.OrderBy(a => a.SentAtMs).ThenBy(a => a.OrderKey).ThenBy(a => a.IngestSeq).ThenBy(a => a.MessageId, StringComparer.Ordinal).ToList();
+            ct.ThrowIfCancellationRequested();
             var uncovered = assembler.Uncovered(canonical, anchors, ExtractionPrompt.Version);
             stats.AlreadyRead = anchors.Count - uncovered.Count;
+            await job.ReportProgressAsync(new { person = canonical, stage = "planning", anchors = anchors.Count, unread = uncovered.Count }).ConfigureAwait(false);
             try
             {
                 await ReadAsync(canonical, asOf, uncovered, stats, new SliceRun(ct, job.Job.JobId, AIRouterWorkClass.Background, afterSlice), job.ReportProgressAsync).ConfigureAwait(false);
@@ -177,7 +187,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 return;
             }
             var planned = uncovered.Take(options.Assembly.MaxAnchorsPerJob).ToList();
-            var segments = assembler.Segments(planned);
 
             var info = await Llm.ContextAsync(null, ct).ConfigureAwait(false);
             maxOutput = Math.Min(options.MaxOutputTokens, Math.Max(1_024, info.MaxOutputTokens));
@@ -188,7 +197,23 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             // The window bounds what can be sent; the output ceiling bounds what can come back, and it is the tighter one.
             int window = Math.Max(2_000, (int)((ContextPacker.Budget(info, maxOutput) - overhead) * 0.95));
             int budget = Math.Min(window, Math.Max(1_000, Math.Min(options.SliceTokens, maxOutput / 2)));
-            var slices = assembler.Pack(canonical, segments, budget, estimator);
+            // Only as much is prepared as this job will read. A job reads a few slices (MaxSlicesPerJob), each a few thousand
+            // tokens, so a few hundred messages; preparing a slice means reading the conversation around every anchor in it
+            // and rendering it. All of the planned anchors used to be prepared first, up to 4,000 of them (a limit from when
+            // a slice filled the model's whole window), of which the job then read the first hundred or so and threw the
+            // rest away, on every job. The anchors are now taken a page at a time, oldest first, until there are enough
+            // slices for this job and one more (to know that something is left).
+            var slices = new List<EvidenceSlice>();
+            int prepared = 0;
+            while (prepared < planned.Count && slices.Count <= options.MaxSlicesPerJob)
+            {
+                ct.ThrowIfCancellationRequested();
+                var page = planned.Skip(prepared).Take(PlanPage).ToList();
+                prepared += page.Count;
+                foreach (var slice in assembler.Pack(canonical, assembler.Segments(page), budget, estimator)) slices.Add(slice with { Index = slices.Count });
+                await progress(new { person = canonical, stage = "preparing", anchors = prepared, of = planned.Count, slices = slices.Count }).ConfigureAwait(false);
+            }
+            PreparedAnchors = prepared;
             long sourceSeq = kit.Corpus.MaxSeq();
             int done = 0;
             foreach (var slice in slices)
@@ -204,8 +229,14 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 await progress(new { person = canonical, slice = done, slices = slices.Count, claims = stats.ClaimsVerified, rejected = stats.ClaimsRejected }).ConfigureAwait(false);
                 if (run.AfterSlice != null) await run.AfterSlice(stats).ConfigureAwait(false);
             }
-            if (uncovered.Count > planned.Count) stats.Pending = true;
+            if (prepared < planned.Count || uncovered.Count > planned.Count) stats.Pending = true;
         }
+
+        /// <summary>How many anchors are prepared at a time while a job's slices are put together.</summary>
+        internal static int PlanPage { get; set; } = 200;
+
+        /// <summary>How many anchors the last run prepared slices for (what its planning cost).</summary>
+        internal int PreparedAnchors { get; private set; }
 
         private async Task ProcessSliceAsync(string subject, EvidenceSlice slice, string profile, int budget, TokenEstimator estimator, ExtractionRunStats stats,
             SliceRun run, long sourceSeq, int depth)

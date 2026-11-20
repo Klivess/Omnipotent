@@ -277,7 +277,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
             foreach (var subject in spec.Subjects)
             {
                 var identities = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(subject.PersonId)).Select(i => i.IdentityId).ToList();
-                var conversations = kit.Corpus.ConversationsOf(identities).Take(60).Select(c => c.ConversationId).ToList();
+                // The sixty conversations they have lately been most active in (from their newest messages, a bounded read).
+                var conversations = kit.Corpus.ConversationsOf(identities, newest: 5_000).Take(60).Select(c => c.ConversationId).ToList();
                 List<string> reacted;
                 using (var c = kit.Context.Stores.Corpus.OpenRead())
                     reacted = c.QueryIn(null, "SELECT message_id, added_at_ms FROM reactions WHERE identity_id IN ({keys}) ORDER BY added_at_ms DESC LIMIT 2000",

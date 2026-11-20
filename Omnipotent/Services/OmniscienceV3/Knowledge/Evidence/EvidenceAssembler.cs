@@ -102,11 +102,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
             var anchors = new Dictionary<string, EvidenceAnchor>(StringComparer.Ordinal);
             using var c = Stores.Corpus.OpenRead();
             var authored = new List<EvidenceAnchor>();
+            // What each message replies to is read with the message: asked for separately, it was a second lookup of every
+            // one of the person's rows (140,000 for the busiest people, on every job).
+            var parents = new HashSet<string>(StringComparer.Ordinal);
             foreach (var identity in identityIds)
                 authored.AddRange(c.Query(null, """
-                    SELECT message_id, current_version, sent_at_ms, order_key, conversation_id, ingest_seq FROM messages
+                    SELECT message_id, current_version, sent_at_ms, order_key, conversation_id, ingest_seq, reply_to_message_id FROM messages
                     WHERE author_identity_id=$a AND sent_at_ms <= $t
-                    """, r => new EvidenceAnchor(r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4), r.GetInt64(5), EvidenceRelation.Authored),
+                    """, r =>
+                    {
+                        if (!r.IsDBNull(6)) parents.Add(r.GetString(6));
+                        return new EvidenceAnchor(r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4), r.GetInt64(5), EvidenceRelation.Authored);
+                    },
                     ("$a", identity), ("$t", asOfMs)));
             foreach (var a in authored) anchors[a.MessageId] = a;
             var authoredIds = authored.Select(a => a.MessageId).ToList();
@@ -118,9 +125,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                 if (a.SentAtMs <= asOfMs) anchors.TryAdd(a.MessageId, a);
 
             // Messages the subject replied to.
-            var parents = c.QueryIn(null, "SELECT reply_to_message_id FROM messages WHERE message_id IN ({keys}) AND reply_to_message_id IS NOT NULL", authoredIds, r => r.GetString(0))
-                .Distinct(StringComparer.Ordinal).ToList();
-            foreach (var a in c.QueryIn(null, "SELECT message_id, current_version, sent_at_ms, order_key, conversation_id, ingest_seq FROM messages WHERE message_id IN ({keys})", parents,
+            foreach (var a in c.QueryIn(null, "SELECT message_id, current_version, sent_at_ms, order_key, conversation_id, ingest_seq FROM messages WHERE message_id IN ({keys})", parents.ToList(),
                          r => new EvidenceAnchor(r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4), r.GetInt64(5), EvidenceRelation.RepliedBySubject)))
                 if (a.SentAtMs <= asOfMs) anchors.TryAdd(a.MessageId, a);
 
@@ -176,38 +181,48 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         /// scoped to the conversations the subject belongs to (names are community-scoped: another "Sam" elsewhere is not them),
         /// excluding the subject's own messages. The model decides relevance; this only widens what it reads.
         /// </summary>
+        /// <param name="scanPerName">How many of a name's most recent matches are looked at (each is one row read).</param>
         public IReadOnlyList<EvidenceAnchor> NameMentions(IReadOnlyCollection<string> names, IReadOnlyCollection<string> conversations, IReadOnlyCollection<string> ownIdentities,
-            long asOfMs, int limitPerName = 400)
+            long asOfMs, int limitPerName = 400, int scanPerName = 4_000)
         {
             var result = new Dictionary<string, EvidenceAnchor>(StringComparer.Ordinal);
             if (names.Count == 0 || conversations.Count == 0) return Array.Empty<EvidenceAnchor>();
             var own = ownIdentities.ToHashSet(StringComparer.Ordinal);
+            var theirs = conversations.ToHashSet(StringComparer.Ordinal);
             using var c = Stores.Corpus.OpenRead();
             foreach (var name in names.Select(n => n.Trim()).Where(n => n.Length >= 3).Distinct(StringComparer.OrdinalIgnoreCase).Take(12))
             {
                 string phrase = "\"" + new string(name.Where(ch => char.IsLetterOrDigit(ch) || ch == ' ' || ch == '-' || ch == '\'').ToArray()).Trim() + "\"";
                 if (phrase.Length <= 2) continue;
-                foreach (var chunk in conversations.Chunk(200))
+                // One pass per name: its most recent matches, from the full-text index alone, and then only those rows.
+                // Whether a match is in one of the subject's conversations is settled in memory. This ran once for every 200
+                // of the subject's conversations before, each run matching the name again over the whole archive and reading
+                // the row of every match to test the conversation: for someone in thousands of conversations with a name that
+                // is also a word, millions of row reads before a single slice was read.
+                var rows = new List<long>();
+                try
                 {
-                    var args = new List<(string, object?)> { ("$q", phrase), ("$t", asOfMs), ("$l", limitPerName) };
-                    var names2 = chunk.Select((conv, i) => { args.Add(("$c" + i, conv)); return "$c" + i; }).ToList();
-                    try
+                    c.Scan(null, "SELECT rowid FROM messages_fts WHERE messages_fts MATCH $q ORDER BY rowid DESC LIMIT $n", r => { rows.Add(r.GetInt64(0)); return true; },
+                        ("$q", phrase), ("$n", scanPerName));
+                }
+                catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("fts5", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("syntax", StringComparison.OrdinalIgnoreCase))
+                {
+                    // A name the full-text grammar cannot express finds nothing by name; @-mentions still work.
+                    continue;
+                }
+                int found = 0;
+                foreach (var chunk in rows.Chunk(500))
+                {
+                    foreach (var a in c.Query(null, $"""
+                                 SELECT message_id, current_version, sent_at_ms, order_key, conversation_id, ingest_seq, author_identity_id
+                                 FROM messages WHERE rowid IN ({string.Join(",", chunk)})
+                                 """, r => (Anchor: new EvidenceAnchor(r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4), r.GetInt64(5), EvidenceRelation.Mention),
+                                     Author: r.GetString(6))).OrderByDescending(x => x.Anchor.SentAtMs))
                     {
-                        // The full-text index drives (CROSS JOIN): with one conversation in the chunk the planner otherwise walks
-                        // every message of it and runs the match again for each.
-                        foreach (var a in c.Query(null, $"""
-                                     SELECT m.message_id, m.current_version, m.sent_at_ms, m.order_key, m.conversation_id, m.ingest_seq, m.author_identity_id
-                                     FROM messages_fts CROSS JOIN messages m ON m.rowid = messages_fts.rowid
-                                     WHERE messages_fts MATCH $q AND m.conversation_id IN ({string.Join(",", names2)}) AND m.sent_at_ms <= $t LIMIT $l
-                                     """, r => (Anchor: new EvidenceAnchor(r.GetString(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3), r.GetString(4), r.GetInt64(5), EvidenceRelation.Mention),
-                                         Author: r.GetString(6)), args.ToArray()))
-                            if (!own.Contains(a.Author)) result.TryAdd(a.Anchor.MessageId, a.Anchor);
+                        if (found >= limitPerName) break;
+                        if (a.Anchor.SentAtMs <= asOfMs && theirs.Contains(a.Anchor.ConversationId) && !own.Contains(a.Author) && result.TryAdd(a.Anchor.MessageId, a.Anchor)) found++;
                     }
-                    catch (Microsoft.Data.Sqlite.SqliteException ex) when (ex.Message.Contains("fts5", StringComparison.OrdinalIgnoreCase) || ex.Message.Contains("syntax", StringComparison.OrdinalIgnoreCase))
-                    {
-                        // A name the full-text grammar cannot express finds nothing by name; @-mentions still work.
-                        break;
-                    }
+                    if (found >= limitPerName) break;
                 }
             }
             return result.Values.ToList();

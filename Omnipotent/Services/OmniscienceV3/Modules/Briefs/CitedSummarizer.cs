@@ -94,6 +94,13 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
         private sealed record Batch(List<(string GroupRef, SummaryGroup Group, List<(string Ref, SummaryItem Item)> Items)> Groups);
 
         /// <summary>
+        /// Room for the answer: a base, and so much for every point asked for. A point is a sentence, the references it cites
+        /// and its share of the JSON around them. At 90 tokens a point a digest of thirteen points was cut off at its ceiling
+        /// (2,026 tokens) on every attempt.
+        /// </summary>
+        internal const int PointsBase = 800, PointTokens = 160;
+
+        /// <summary>
         /// Summarises the groups. Items are shown oldest first as given; when they do not fit the calls allowed, the newest of
         /// each group are kept and the result says how many were shown (never hidden).
         /// </summary>
@@ -105,7 +112,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             if (total == 0) return new GroupedSummary(empty, Array.Empty<CitedPoint>(), Array.Empty<string>(), 0, 0, 0, 0, null);
 
             var info = await llm.ContextAsync(null, ct).ConfigureAwait(false);
-            int reservedOutput = Math.Min(info.MaxOutputTokens, 600 + 90 * (groups.Count * focus.MaxPointsPerGroup + (overall ? focus.MaxOverallPoints : 0)));
+            int reservedOutput = Math.Min(info.MaxOutputTokens, PointsBase + PointTokens * (groups.Count * focus.MaxPointsPerGroup + (overall ? focus.MaxOverallPoints : 0)));
             string system = SystemPrompt(focus, overall);
             int budget = Math.Max(512, ContextPacker.Budget(info, reservedOutput) - llm.Estimator.Estimate(system));
             long byteBudget = ContextPacker.ByteBudget(info);
@@ -154,7 +161,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             var merge = focus with { Purpose = focus.Purpose + ".merge", Instruction = focus.Instruction.Trim() + "\nThe items are points of summaries one level down; combine them, keep what matters most, and cite the points you used." };
             // A merge is small (points, not messages): one call, the newest points kept if it ever does not fit.
             var info = await llm.ContextAsync(null, ct).ConfigureAwait(false);
-            int reservedOutput = Math.Min(info.MaxOutputTokens, 600 + 90 * (groups.Count * merge.MaxPointsPerGroup + merge.MaxOverallPoints));
+            int reservedOutput = Math.Min(info.MaxOutputTokens, PointsBase + PointTokens * (groups.Count * merge.MaxPointsPerGroup + merge.MaxOverallPoints));
             string system = SystemPrompt(merge, true);
             int budget = Math.Max(512, ContextPacker.Budget(info, reservedOutput) - llm.Estimator.Estimate(system));
             var batches = Pack(groups, budget, ContextPacker.ByteBudget(info), out int shown, maxCalls: 1);
@@ -247,10 +254,13 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             var result = await llm.CallAsync(new LlmCall
             {
                 ModuleId = moduleId, Purpose = focus.Purpose, PromptVersion = focus.PromptVersion, JobId = jobId,
+                // The ceiling is an estimate of how long so many points come out; a summary that hits it is asked for again
+                // with more room instead of failing the job with the same request three times.
+                LongerWhenCutOff = true,
                 Request = new LlmRequest
                 {
                     Purpose = focus.Purpose, SessionKey = sessionKey, SystemPrompt = system, Turns = new[] { new LlmTurn("user", sb.ToString()) }, MaxOutputTokens = reservedOutput,
-                    WorkClass = workClass, OutputSchema = Schema, Sampling = new ModelSamplingParameters(Temperature: 0.2),
+                    WorkClass = workClass, OutputSchema = Schema, Sampling = new ModelSamplingParameters(Temperature: 0.2), ReasoningEffort = "off",
                 },
             }, ct).ConfigureAwait(false);
             if (!result.Success) throw new JobFailureException(ErrorClass.Transient, $"The model could not write the summary ({result.ErrorKind}).");

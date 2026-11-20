@@ -144,6 +144,16 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                         new { moduleId = module, queued = stats.Queued, lastSucceededMs = stats.LastSucceededMs, hours = Math.Round(waiting / (double)Hour, 1) }, NoticeSeverity.Attention));
             }
 
+            // 6. What parts of the engine say stands in their own way (no room for a backup, handlers that would not stop).
+            foreach (var p in Kernel.ModuleProblems.Open(Context.Stores.Intel))
+            {
+                object detail;
+                try { detail = JsonSerializer.Deserialize<JsonElement>(p.DetailJson); }
+                catch (JsonException) { detail = p.DetailJson; }
+                issues.Add(new Issue($"module_problem|{p.ModuleId}|{p.Problem}", "module_problem", p.ModuleId,
+                    new { moduleId = p.ModuleId, problem = p.Problem, sinceMs = p.SinceMs, lastMs = p.LastMs, detail }, p.Severity == NoticeSeverity.Urgent ? NoticeSeverity.Urgent : NoticeSeverity.Attention));
+            }
+
             // Open what is new, keep what is still there, close what went away. A problem that comes back is told again.
             var open = new Dictionary<string, (long First, long? Resolved)>(StringComparer.Ordinal);
             using (var c = Context.Stores.Intel.OpenRead())

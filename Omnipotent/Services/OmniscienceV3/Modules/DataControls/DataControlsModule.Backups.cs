@@ -119,7 +119,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
 
         /// <summary>AES-256-GCM over 1 MiB chunks. Each chunk is authenticated with its index and whether it is the last, so a
         /// truncated, reordered or altered file fails to open instead of restoring silently wrong.</summary>
-        private static async Task<(long Plain, long Encrypted, string Sha256)> EncryptFileAsync(string source, string target, byte[] key, CancellationToken ct)
+        private static async Task<(long Plain, long Encrypted, string Sha256)> EncryptFileAsync(string source, string target, byte[] key, CancellationToken ct, Func<long, Task>? progress = null)
         {
             using var aes = new AesGcm(key, 16);
             byte[] baseNonce = RandomNumberGenerator.GetBytes(12);
@@ -150,6 +150,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                 total += read;
                 index++;
                 if (last) break;
+                if (progress != null && index % 64 == 0) await progress(total).ConfigureAwait(false);
                 (plain, next) = (next, plain);
                 read = nextRead;
             }
@@ -220,34 +221,149 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
 
         private sealed record BackupManifest(string BackupId, long CreatedAtMs, string Trigger, string KeyId, List<BackupFileDto> Files);
 
+        public const string BackupFolderSetting = "datacontrols.backup.folder";
+        /// <summary>The standing problem a backup that could not be taken reports (see <see cref="Kernel.ModuleProblems"/>).</summary>
+        public const string BackupProblem = "backup";
+
+        /// <summary>Pages copied per step of the online backup: 32 MB with 4 KiB pages. Between steps the job says how far it
+        /// is and can be stopped.</summary>
+        internal static int CopyPagesPerStep { get; set; } = 8_192;
+
+        /// <summary>Free bytes on the volume that holds a folder. Where that cannot be told (a network share has no drive to
+        /// ask) the backup is attempted: running out of room then fails it with the system's own message. Replaced in tests.</summary>
+        internal Func<string, long> FreeSpace { get; set; } = folder =>
+        {
+            try { return new DriveInfo(Path.GetPathRoot(Path.GetFullPath(folder)) ?? folder).AvailableFreeSpace; }
+            catch (Exception ex) when (ex is ArgumentException or IOException or UnauthorizedAccessException) { return long.MaxValue; }
+        };
+
+        /// <summary>Where new backups are written: the folder Klives set, or the backups folder beside the databases.</summary>
+        private string BackupRoot
+        {
+            get
+            {
+                string custom = (Context.Settings.Get(BackupFolderSetting, "") ?? "").Trim();
+                return custom.Length > 0 && Path.IsPathFullyQualified(custom) ? custom : Context.Stores.Paths.Backups;
+            }
+        }
+
+        /// <summary>Every folder backups may be in: where they are written now, and beside the databases (where they were
+        /// written before the folder was set).</summary>
+        private IReadOnlyList<string> BackupRoots =>
+            new[] { BackupRoot, Context.Stores.Paths.Backups }.Select(Path.GetFullPath).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+        /// <summary>There is not room for a backup where backups go. Nothing was written.</summary>
+        public sealed class BackupSpaceException : Exception
+        {
+            public BackupSpaceException(string folder, long neededBytes, long freeBytes)
+                : base($"There is not enough room for a backup in {folder}: it needs about {Gb(neededBytes)} GB free while it is taken and {Gb(freeBytes)} GB are free.")
+            {
+                Folder = folder;
+                NeededBytes = neededBytes;
+                FreeBytes = freeBytes;
+            }
+
+            public string Folder { get; }
+            public long NeededBytes { get; }
+            public long FreeBytes { get; }
+
+            private static string Gb(long bytes) => (bytes / 1_073_741_824.0).ToString("0.#", CultureInfo.InvariantCulture);
+        }
+
+        private static long StoreBytes(SqliteStore store)
+        {
+            var health = store.GetHealth();
+            return health.FileBytes + health.WalBytes;
+        }
+
+        /// <summary>
+        /// The most room a backup takes while it is made. Each store is copied in the clear and then encrypted, and the clear
+        /// copy is removed only after that: so at its largest it holds the stores already encrypted plus two copies of the
+        /// one in hand, and a margin.
+        /// </summary>
+        internal static long BytesNeeded(IReadOnlyList<long> storeBytes)
+        {
+            long peak = 0, done = 0;
+            foreach (long size in storeBytes)
+            {
+                peak = Math.Max(peak, done + 2 * size);
+                done += size;
+            }
+            return peak + 256L * 1024 * 1024;
+        }
+
+        /// <summary>
+        /// The backup job. A backup that cannot be taken for want of room is not attempted and not retried: copying the corpus
+        /// is the heaviest thing this engine does to the disk, and the room does not come back by trying again. On the server
+        /// the nightly backup needed 30 GB on a drive with 21 GB free; it was started ten times over two nights, each copy
+        /// was left running when the job was stopped for making no progress, and it ended as a dead job each night
+        /// (20 Nov 2026). It now says what it needs, as a standing problem on the health page, and ends.
+        /// </summary>
+        private async Task<string?> RunBackupAsync(JobContext job)
+        {
+            var ct = job.Cancellation;
+            try
+            {
+                var backup = await BackupAsync(job.Job.SubjectId ?? "scheduled", ct, job.ReportProgressAsync).ConfigureAwait(false);
+                await Kernel.ModuleProblems.ClearAsync(Context.Stores.Intel, ModuleId, BackupProblem, CancellationToken.None).ConfigureAwait(false);
+                return Json(backup);
+            }
+            catch (BackupSpaceException ex)
+            {
+                long? last = Backups().Backups.Select(b => (long?)b.CreatedAtMs).FirstOrDefault();
+                await Kernel.ModuleProblems.ReportAsync(Context.Stores.Intel, Context.Clock, ModuleId, BackupProblem, Kernel.Modules.NoticeSeverity.Attention, new
+                {
+                    reason = "no_space", message = ex.Message, folder = ex.Folder, neededBytes = ex.NeededBytes, freeBytes = ex.FreeBytes, lastBackupMs = last,
+                    fix = $"Free space there, lower datacontrols.backup.keep, or set {BackupFolderSetting} to a folder on a drive with room.",
+                }, CancellationToken.None).ConfigureAwait(false);
+                return Json(new { skipped = ex.Message, neededBytes = ex.NeededBytes, freeBytes = ex.FreeBytes, folder = ex.Folder });
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or SqliteException or CryptographicException)
+            {
+                long? last = Backups().Backups.Select(b => (long?)b.CreatedAtMs).FirstOrDefault();
+                await Kernel.ModuleProblems.ReportAsync(Context.Stores.Intel, Context.Clock, ModuleId, BackupProblem, Kernel.Modules.NoticeSeverity.Attention,
+                    new { reason = "failed", message = ex.Message, folder = BackupRoot, lastBackupMs = last }, CancellationToken.None).ConfigureAwait(false);
+                throw new JobFailureException(ErrorClass.Transient, "The backup could not be taken: " + ex.Message, ex);
+            }
+        }
+
         /// <summary>
         /// Takes a consistent snapshot of corpus.db and operator.db while the service runs (SQLite's online backup), encrypts
         /// each, and removes the plain copies. The manifest is written last: a folder without one is an interrupted backup and
         /// is cleaned up by the next run.
         /// </summary>
-        public async Task<BackupDto> BackupAsync(string trigger, CancellationToken ct)
+        /// <param name="progress">Told how far the copy is, every few seconds of work (a job's progress report).</param>
+        public async Task<BackupDto> BackupAsync(string trigger, CancellationToken ct, Func<object, Task>? progress = null)
         {
+            var stores = new[] { ("corpus", Context.Stores.Corpus), ("operator", Context.Stores.Operator) };
+            string root = BackupRoot;
+            Directory.CreateDirectory(root);
+            RemoveInterrupted();
+            long needed = BytesNeeded(stores.Select(s => StoreBytes(s.Item2)).ToList()), free = FreeSpace(root);
+            if (free < needed) throw new BackupSpaceException(root, needed, free);
+
             byte[] key = LoadOrCreateKey();
             long now = Context.Clock.NowMs;
             string id = "bk" + Instant.ToUtcDateTime(now).ToString("yyyyMMdd-HHmmss", CultureInfo.InvariantCulture) + "-" + Convert.ToHexString(RandomNumberGenerator.GetBytes(2)).ToLowerInvariant();
-            string dir = Path.Combine(Context.Stores.Paths.Backups, id);
+            string dir = Path.Combine(root, id);
             Directory.CreateDirectory(dir);
             var files = new List<BackupFileDto>();
-            foreach (var (store, sqlite) in new[] { ("corpus", Context.Stores.Corpus), ("operator", Context.Stores.Operator) })
+            foreach (var (store, sqlite) in stores)
             {
                 ct.ThrowIfCancellationRequested();
                 string plain = Path.Combine(dir, store + ".db.tmp"), encrypted = Path.Combine(dir, store + ".db.enc");
                 try
                 {
-                    // SQLite's online backup: a consistent copy of the database as of one moment, taken while it is in use.
-                    using (var source = sqlite.OpenRead())
-                    using (var copy = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = plain, Pooling = false }.ToString()))
-                    {
-                        copy.Open();
-                        source.BackupDatabase(copy);
-                    }
-                    var (plainBytes, encryptedBytes, sha) = await EncryptFileAsync(plain, encrypted, key, ct).ConfigureAwait(false);
+                    await CopyDatabaseAsync(sqlite, plain, store, progress, ct).ConfigureAwait(false);
+                    var (plainBytes, encryptedBytes, sha) = await EncryptFileAsync(plain, encrypted, key, ct,
+                        progress == null ? null : done => progress(new { stage = "encrypt", store, bytes = done })).ConfigureAwait(false);
                     files.Add(new BackupFileDto(store, Path.GetFileName(encrypted), plainBytes, encryptedBytes, sha));
+                }
+                catch
+                {
+                    // An unfinished encrypted copy is of no use to anyone and is as large as the database.
+                    if (File.Exists(encrypted)) File.Delete(encrypted);
+                    throw;
                 }
                 finally
                 {
@@ -263,36 +379,93 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
             return new BackupDto(id, now, trigger, manifest.KeyId, files);
         }
 
+        /// <summary>
+        /// SQLite's online backup, a piece at a time: a consistent copy of the database as of one moment, taken while it is in
+        /// use. The read transaction held on the source for the whole copy is what makes the pieces one snapshot (without it
+        /// every write to the live database between two pieces starts the copy over, and on a database that is always being
+        /// written it would never end). Done in one call, as it was, the copy of a 15 GB corpus could neither say how far it
+        /// was nor be stopped.
+        /// </summary>
+        private static async Task CopyDatabaseAsync(SqliteStore store, string target, string name, Func<object, Task>? progress, CancellationToken ct)
+        {
+            using var source = store.OpenRead();
+            using var copy = new SqliteConnection(new SqliteConnectionStringBuilder { DataSource = target, Pooling = false }.ToString());
+            copy.Open();
+            // The copy is thrown away unless it completes, so it needs no journal of its own.
+            copy.Exec(null, "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;");
+            using var snapshot = source.BeginTransaction(deferred: true);
+            source.Scalar<long?>(snapshot, "SELECT COUNT(*) FROM sqlite_schema"); // the first read is what fixes the snapshot
+            var backup = SQLitePCL.raw.sqlite3_backup_init(copy.Handle, "main", source.Handle, "main")
+                ?? throw new IOException($"The copy of {name}.db could not be started: {SQLitePCL.raw.sqlite3_errmsg(copy.Handle).utf8_to_string()}");
+            try
+            {
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    int rc = SQLitePCL.raw.sqlite3_backup_step(backup, CopyPagesPerStep);
+                    if (rc == SQLitePCL.raw.SQLITE_DONE) break;
+                    if (rc is SQLitePCL.raw.SQLITE_BUSY or SQLitePCL.raw.SQLITE_LOCKED)
+                    {
+                        await Task.Delay(50, ct).ConfigureAwait(false);
+                        continue;
+                    }
+                    if (rc != SQLitePCL.raw.SQLITE_OK)
+                        throw new IOException($"The copy of {name}.db stopped (SQLite result {rc}): {SQLitePCL.raw.sqlite3_errmsg(copy.Handle).utf8_to_string()}");
+                    if (progress != null)
+                    {
+                        int pages = SQLitePCL.raw.sqlite3_backup_pagecount(backup), left = SQLitePCL.raw.sqlite3_backup_remaining(backup);
+                        await progress(new { stage = "copy", store = name, pages, copied = pages - left }).ConfigureAwait(false);
+                    }
+                }
+            }
+            finally
+            {
+                SQLitePCL.raw.sqlite3_backup_finish(backup);
+            }
+        }
+
         private IEnumerable<(string Dir, BackupManifest? Manifest)> BackupFolders()
         {
-            string root = Context.Stores.Paths.Backups;
-            if (!Directory.Exists(root)) yield break;
-            foreach (string dir in Directory.GetDirectories(root, "bk*"))
+            foreach (string root in BackupRoots)
             {
-                string manifest = Path.Combine(dir, "manifest.json");
-                BackupManifest? m = null;
-                if (File.Exists(manifest))
+                if (!Directory.Exists(root)) continue;
+                foreach (string dir in Directory.GetDirectories(root, "bk*"))
                 {
-                    try { m = JsonSerializer.Deserialize<BackupManifest>(File.ReadAllText(manifest), KernelJson.Options); }
-                    catch (JsonException ex) { Context.LogError($"[DataControls] the manifest of backup {Path.GetFileName(dir)} cannot be read.", ex); }
+                    string manifest = Path.Combine(dir, "manifest.json");
+                    BackupManifest? m = null;
+                    if (File.Exists(manifest))
+                    {
+                        try { m = JsonSerializer.Deserialize<BackupManifest>(File.ReadAllText(manifest), KernelJson.Options); }
+                        catch (JsonException ex) { Context.LogError($"[DataControls] the manifest of backup {Path.GetFileName(dir)} cannot be read.", ex); }
+                    }
+                    yield return (dir, m);
                 }
-                yield return (dir, m);
             }
+        }
+
+        private void Remove(IEnumerable<string> folders)
+        {
+            foreach (string dir in folders.ToList())
+            {
+                try { Directory.Delete(dir, true); }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Context.LogError($"[DataControls] old backup {Path.GetFileName(dir)} could not be removed.", ex); }
+            }
+        }
+
+        /// <summary>Removes the folders an interrupted backup left behind (no manifest, older than an hour): each can hold a
+        /// copy of the corpus. Run before a backup measures the room it has, and after one is taken.</summary>
+        private void RemoveInterrupted()
+        {
+            long now = Context.Clock.NowMs;
+            Remove(BackupFolders().Where(b => b.Manifest == null && now - new DateTimeOffset(Directory.GetCreationTimeUtc(b.Dir), TimeSpan.Zero).ToUnixTimeMilliseconds() > 3_600_000L).Select(b => b.Dir));
         }
 
         /// <summary>Keeps the newest backups (<c>datacontrols.backup.keep</c>) and removes folders an interrupted run left behind.</summary>
         private void Prune()
         {
             int keep = Context.Settings.Get("datacontrols.backup.keep", 7);
-            long now = Context.Clock.NowMs;
-            var complete = BackupFolders().Where(b => b.Manifest != null).OrderByDescending(b => b.Manifest!.CreatedAtMs).ToList();
-            var doomed = complete.Skip(keep).Select(b => b.Dir)
-                .Concat(BackupFolders().Where(b => b.Manifest == null && now - new DateTimeOffset(Directory.GetCreationTimeUtc(b.Dir), TimeSpan.Zero).ToUnixTimeMilliseconds() > 3_600_000L).Select(b => b.Dir));
-            foreach (string dir in doomed.ToList())
-            {
-                try { Directory.Delete(dir, true); }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { Context.LogError($"[DataControls] old backup {Path.GetFileName(dir)} could not be removed.", ex); }
-            }
+            Remove(BackupFolders().Where(b => b.Manifest != null).OrderByDescending(b => b.Manifest!.CreatedAtMs).Skip(keep).Select(b => b.Dir));
+            RemoveInterrupted();
         }
 
         public BackupListDto Backups()
@@ -309,7 +482,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
                 Context.Settings.Get("datacontrols.backup.enabled", true));
         }
 
-        public Task<long> RequestBackupAsync(CancellationToken ct) => Context.Jobs.EnqueueAsync(Job(BackupKind, "all", "on_demand", priority: 300), ct);
+        public Task<long> RequestBackupAsync(CancellationToken ct) => Context.Jobs.EnqueueAsync(Job(BackupKind, "all", "on_demand", priority: 300) with { MaxAttempts = 2 }, ct);
 
         /// <summary>
         /// Decrypts a backup into a folder beside it and checks every file: the hash recorded when it was taken, and SQLite's

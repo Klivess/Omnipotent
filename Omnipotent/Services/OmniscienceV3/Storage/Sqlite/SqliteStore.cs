@@ -73,17 +73,21 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
             return WriteAsync((c, tx) => SchemaMigrator.Apply(c, tx, list, clock.NowMs), ct);
         }
 
-        /// <summary>A pooled read-only connection. Dispose it promptly: long-lived readers starve WAL checkpoints (F373).</summary>
+        /// <summary>A pooled read-only connection. Dispose it promptly: long-lived readers starve WAL checkpoints (F373).
+        /// Opened inside a job, its statements stop when the job is cancelled (<see cref="AmbientCancellation"/>).</summary>
         public SqliteConnection OpenRead()
         {
             EnsureLive();
+            var stopWith = AmbientCancellation.Token;
+            stopWith.ThrowIfCancellationRequested();
             for (int attempt = 0; ; attempt++)
             {
-                var conn = new SqliteConnection(readOnlyConnectionString);
+                var conn = new ReadConnection(readOnlyConnectionString);
                 try
                 {
                     conn.Open();
                     conn.Exec(null, "PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32768; PRAGMA mmap_size=268435456; PRAGMA busy_timeout=10000;");
+                    conn.StopWith(stopWith);
                     return conn;
                 }
                 catch (ObjectDisposedException) when (attempt < 3)

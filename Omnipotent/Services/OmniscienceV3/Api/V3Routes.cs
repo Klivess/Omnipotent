@@ -94,6 +94,11 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                 var body = ApiBody.Read<JobActionRequest>(req);
                 await ApiResponses.OkAsync(req, await queries.RetryJobAsync(body.JobId, ApiBody.Actor(req), host.Stopping).ConfigureAwait(false)).ConfigureAwait(false);
             }, ct).ConfigureAwait(false);
+            await Post("jobs/retry-dead", OmniscienceV3Perms.EngineManage, async req =>
+            {
+                var body = ApiBody.Read<RetryDeadJobsRequest>(req);
+                await ApiResponses.OkAsync(req, await queries.RetryDeadJobsAsync(body.ModuleId, ApiBody.Actor(req), host.Stopping).ConfigureAwait(false)).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
 
             await Get("llm/calls", OmnisciencePerms.OverviewView, req =>
             {

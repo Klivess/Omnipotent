@@ -369,10 +369,10 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Projections
             long? first, last;
             using (var corpus = Context.Stores.Corpus.OpenRead())
             {
-                totals = new CorpusTotalsDto(corpus.Scalar<long>(null, "SELECT COUNT(*) FROM messages"),
+                totals = new CorpusTotalsDto(messageCount.Read(corpus, now),
                     corpus.Scalar<long>(null, "SELECT COUNT(*) FROM persons p LEFT JOIN person_canonical pc ON pc.person_id=p.person_id WHERE COALESCE(pc.canonical_id,p.person_id)=p.person_id"),
                     corpus.Scalar<long>(null, "SELECT COUNT(*) FROM identities"), corpus.Scalar<long>(null, "SELECT COUNT(*) FROM conversations"),
-                    corpus.Scalar<long>(null, "SELECT COUNT(*) FROM guilds"), corpus.Scalar<long>(null, "SELECT COUNT(*) FROM attachments"),
+                    corpus.Scalar<long>(null, "SELECT COUNT(*) FROM guilds"), attachmentCount.Read(corpus, now),
                     corpus.Scalar<long>(null, "SELECT COUNT(*) FROM sources"));
                 sources = corpus.Query(null, "SELECT source_id, platform, kind, label, status, status_detail, updated_at_ms FROM sources ORDER BY source_id",
                     r => new SourceStatusDto(r.GetString(0), r.GetString(1), r.GetString(2), r.GetStringOrNull(3), r.GetString(4), r.GetStringOrNull(5), r.GetInt64(6)));
@@ -422,6 +422,40 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Projections
         public sealed record EngineHealthDto(IReadOnlyList<ModuleBacklogDto> Modules, IReadOnlyList<StoreSizeDto> Stores, Dictionary<string, long> JobsByState, long LlmCallsHour,
             long LlmFailuresHour, double LlmCacheEfficiencyHour, object? Encoder, long MessageVectors, long RollupDirty, long CorpusSeq, IReadOnlyList<string> Problems);
 
+        /// <summary>
+        /// The number of rows in a table that only grows (messages, attachments), without counting it all each time. The
+        /// overview is rebuilt every five minutes, and counting 6.3 million messages for each rebuild read the table's whole
+        /// index 288 times a day. The whole table is counted once; after that only the rows added since are (rows are added at
+        /// the end, so they are the ones past the last row seen). Rows that were removed in between (a person forgotten) are
+        /// caught by counting it all again every few hours.
+        /// </summary>
+        internal sealed class GrowingCount
+        {
+            private readonly string table;
+            private long count = -1, lastRow, countedAtMs;
+            internal static long RecountEveryMs { get; set; } = 6 * 3_600_000L;
+
+            public GrowingCount(string table) => this.table = table;
+
+            public long Read(SqliteConnection c, long nowMs)
+            {
+                lock (this)
+                {
+                    long top = c.Scalar<long?>(null, $"SELECT MAX(rowid) FROM {table}") ?? 0;
+                    if (count < 0 || top < lastRow || nowMs - countedAtMs >= RecountEveryMs || nowMs < countedAtMs)
+                    {
+                        count = c.Scalar<long>(null, $"SELECT COUNT(*) FROM {table}");
+                        countedAtMs = nowMs;
+                    }
+                    else if (top > lastRow) count += c.Scalar<long>(null, $"SELECT COUNT(*) FROM {table} WHERE rowid > $r", ("$r", lastRow));
+                    lastRow = top;
+                    return count;
+                }
+            }
+        }
+
+        private readonly GrowingCount messageCount = new("messages"), attachmentCount = new("attachments");
+
         /// <summary>The data-health view (F556) and its problems list, which the X51 monitor turns into alerts.</summary>
         internal async Task ProjectHealthAsync(CancellationToken ct)
         {
@@ -429,22 +463,25 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Projections
             long seq;
             using (var corpus = Context.Stores.Corpus.OpenRead()) seq = ChangeLog.MaxSeq(corpus);
             List<ModuleBacklogDto> modules;
-            Dictionary<string, long> jobs;
             long rollupDirty;
+            // The job figures come from the counters the queue's triggers keep. This view is rebuilt every minute, and it
+            // used to count each module's jobs and read every finished one for its latest time: with a million jobs in the
+            // table that is the same reading the status page was freed of, done here 1,440 times a day, and on the loaded
+            // server one rebuild went two hours without finishing (20 Nov 2026).
+            var stats = Context.Jobs.ModuleStats();
+            var jobs = Context.Jobs.Counts().GroupBy(c => c.State, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.Sum(c => c.Count), StringComparer.Ordinal);
             using (var c = Context.Stores.Intel.OpenRead())
             {
                 modules = c.Query(null, """
-                    SELECT s.module_id, s.enabled, s.watermark_seq,
-                           (SELECT COUNT(*) FROM module_dirty d WHERE d.module_id=s.module_id),
-                           (SELECT COUNT(*) FROM jobs j WHERE j.module_id=s.module_id AND j.state='queued'),
-                           (SELECT COUNT(*) FROM jobs j WHERE j.module_id=s.module_id AND j.state='leased'),
-                           (SELECT COUNT(*) FROM jobs j WHERE j.module_id=s.module_id AND j.state='dead'),
-                           (SELECT MAX(finished_at_ms) FROM jobs j WHERE j.module_id=s.module_id AND j.state='succeeded'),
-                           (SELECT error_message FROM jobs j WHERE j.module_id=s.module_id AND j.state='dead' ORDER BY finished_at_ms DESC LIMIT 1)
+                    SELECT s.module_id, s.enabled, s.watermark_seq, (SELECT COUNT(*) FROM module_dirty d WHERE d.module_id=s.module_id)
                     FROM module_state s ORDER BY s.module_id
-                    """, r => new ModuleBacklogDto(r.GetString(0), r.GetInt64(1) == 1, r.GetInt64(2), Math.Max(0, seq - r.GetInt64(2)), r.GetInt64(3), r.GetInt64(4), r.GetInt64(5),
-                        r.GetInt64(6), r.GetInt64OrNull(7), r.GetStringOrNull(8)));
-                jobs = c.Query(null, "SELECT state, COUNT(*) FROM jobs GROUP BY state", r => (r.GetString(0), r.GetInt64(1))).ToDictionary(x => x.Item1, x => x.Item2);
+                    """, r => (Id: r.GetString(0), Enabled: r.GetInt64(1) == 1, Watermark: r.GetInt64(2), Dirty: r.GetInt64(3)))
+                    .Select(m =>
+                    {
+                        var s = stats.GetValueOrDefault(m.Id) ?? new Kernel.Jobs.ModuleJobStats();
+                        return new ModuleBacklogDto(m.Id, m.Enabled, m.Watermark, Math.Max(0, seq - m.Watermark), m.Dirty, s.Queued, s.Leased, s.Dead, s.LastSucceededMs,
+                            s.Dead > 0 ? s.LastError : null);
+                    }).ToList();
                 rollupDirty = c.Scalar<long>(null, "SELECT COUNT(*) FROM rollup_dirty");
             }
             var stores = Context.Stores.All.Select(s => s.GetHealth()).Select(h => new StoreSizeDto(h.Name, h.FileBytes, h.WalBytes, h.PendingWrites)).ToList();

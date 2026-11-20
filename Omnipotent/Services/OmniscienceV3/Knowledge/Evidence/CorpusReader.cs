@@ -336,13 +336,23 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         }
 
         /// <summary>Distinct conversations a person's identities have authored in (with message counts).</summary>
-        public IReadOnlyList<(string ConversationId, long Messages, long FirstMs, long LastMs)> ConversationsOf(IReadOnlyCollection<string> identityIds)
+        /// <param name="newest">Count only each identity's most recent messages, this many at most. Which conversation a
+        /// message is in is on its row, so counting all of a person's messages reads every one of them (140,000 rows for
+        /// the busiest people); where the conversations someone is active in are wanted rather than an exact tally, the
+        /// recent ones are enough and cost a bounded number of reads.</param>
+        public IReadOnlyList<(string ConversationId, long Messages, long FirstMs, long LastMs)> ConversationsOf(IReadOnlyCollection<string> identityIds, int newest = int.MaxValue)
         {
             var map = new Dictionary<string, (long N, long First, long Last)>(StringComparer.Ordinal);
             using var c = stores.Corpus.OpenRead();
+            string sql = newest == int.MaxValue
+                ? "SELECT conversation_id, COUNT(*), MIN(sent_at_ms), MAX(sent_at_ms) FROM messages WHERE author_identity_id=$a GROUP BY conversation_id"
+                : """
+                  SELECT conversation_id, COUNT(*), MIN(sent_at_ms), MAX(sent_at_ms)
+                  FROM (SELECT conversation_id, sent_at_ms FROM messages WHERE author_identity_id=$a ORDER BY sent_at_ms DESC LIMIT $n) GROUP BY conversation_id
+                  """;
             foreach (var identity in identityIds)
-                foreach (var row in c.Query(null, "SELECT conversation_id, COUNT(*), MIN(sent_at_ms), MAX(sent_at_ms) FROM messages WHERE author_identity_id=$a GROUP BY conversation_id",
-                             r => (r.GetString(0), r.GetInt64(1), r.GetInt64(2), r.GetInt64(3)), ("$a", identity)))
+                foreach (var row in c.Query(null, sql, r => (r.GetString(0), r.GetInt64(1), r.GetInt64(2), r.GetInt64(3)),
+                             newest == int.MaxValue ? new (string, object?)[] { ("$a", identity) } : new (string, object?)[] { ("$a", identity), ("$n", newest) }))
                 {
                     map[row.Item1] = map.TryGetValue(row.Item1, out var e)
                         ? (e.N + row.Item2, Math.Min(e.First, row.Item3), Math.Max(e.Last, row.Item4))

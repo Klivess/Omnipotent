@@ -161,7 +161,7 @@ CREATE INDEX ix_media_objects_state ON media_objects(state) WHERE state <> 'ok';
                     return JsonSerializer.Serialize(new { sha256 = sha, state }, KernelJson.Options);
                 }
                 case SweepKind:
-                    return JsonSerializer.Serialize(await SweepAsync(job.Cancellation).ConfigureAwait(false), KernelJson.Options);
+                    return JsonSerializer.Serialize(await SweepAsync(job).ConfigureAwait(false), KernelJson.Options);
                 default:
                     throw new JobFailureException(ErrorClass.Permanent, $"Unknown job kind '{job.Job.Kind}'.");
             }
@@ -174,16 +174,25 @@ CREATE INDEX ix_media_objects_state ON media_objects(state) WHERE state <> 'ok';
         /// Queues work the change log did not: stored files never probed (one job per distinct content), and — when
         /// downloading is on — attachments still pending. Walks the corpus in id order from where the last sweep
         /// stopped and wraps around, so a large backlog is spread over sweeps without rescanning from the start.
+        /// <para>A sweep is a top-up, and it is given a short time (<see cref="MediaSweep.TimeLimit"/>): it carries on
+        /// from its cursor next time. While the module already has more queued than a sweep would add, it adds nothing.
+        /// On the server, with 217,000 probes waiting, every ten-minute sweep still walked every stored file and read
+        /// and sorted every pending attachment; two of them ran for half an hour and were stopped (20 Nov 2026).</para>
         /// </summary>
-        private async Task<object> SweepAsync(CancellationToken ct)
+        private async Task<object> SweepAsync(JobContext job)
         {
+            var ct = job.Cancellation;
             int budget = Math.Clamp(Context.Settings.Get(SweepBatchSetting, 2000), 10, 100000);
-            int probes = 0, downloads = 0;
+            long waiting = Context.Jobs.ModuleStats().GetValueOrDefault(ModuleId)?.Queued ?? 0;
+            if (waiting >= budget) return new { probesQueued = 0, downloadsQueued = 0, skipped = "enough is already queued", queued = waiting };
+            var clock = MediaSweep.Start();
+            int probes = 0, downloads = 0, pages = 0;
             // Starting from the beginning, one pass is the whole corpus.
             bool wrapped = sweepCursor.Length == 0;
-            while (probes < budget)
+            while (probes < budget && !clock.Spent)
             {
                 ct.ThrowIfCancellationRequested();
+                if (++pages % 4 == 0) await job.ReportProgressAsync(new { stage = "probes", pages, probesQueued = probes }).ConfigureAwait(false);
                 List<(string Sha, string AttachmentId)> page;
                 using (var c = Context.Stores.Corpus.OpenRead())
                     page = c.Query(null, """
@@ -219,14 +228,22 @@ CREATE INDEX ix_media_objects_state ON media_objects(state) WHERE state <> 'ok';
 
             if (DownloadsOn)
             {
+                await job.ReportProgressAsync(new { stage = "downloads", probesQueued = probes }).ConfigureAwait(false);
                 List<string> pending;
                 using (var c = Context.Stores.Corpus.OpenRead())
-                    pending = c.Query(null, "SELECT attachment_id FROM attachments WHERE download_state='pending' ORDER BY created_at_ms DESC LIMIT $n",
-                        r => r.GetString(0), ("$n", budget));
+                    // Newest first, by the order they were added: the index of attachments not yet downloaded answers that
+                    // from its end ("<> 'done'" is that index's own condition, and has to be said for it to be usable).
+                    // Without it, and ordered by creation time, every sweep read the whole attachments table and sorted
+                    // what was pending.
+                    pending = c.Query(null, """
+                        SELECT attachment_id FROM attachments INDEXED BY ix_attachments_pending
+                        WHERE download_state <> 'done' AND download_state='pending' ORDER BY rowid DESC LIMIT $n
+                        """, r => r.GetString(0), ("$n", budget));
                 foreach (var id in pending)
                 {
+                    if (clock.Spent) break;
                     await Context.Jobs.EnqueueAsync(Job(DownloadKind, "attachment", id, priority: 160), ct).ConfigureAwait(false);
-                    downloads++;
+                    if (++downloads % 200 == 0) await job.ReportProgressAsync(new { stage = "downloads", probesQueued = probes, downloadsQueued = downloads }).ConfigureAwait(false);
                 }
             }
             return new { probesQueued = probes, downloadsQueued = downloads };

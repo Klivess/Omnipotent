@@ -220,21 +220,39 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                 WHERE job_id=$id AND state='leased' AND lease_owner=$o
                 """, ("$id", jobId), ("$o", owner)) == 1, ct);
 
-        /// <summary>Requeues (or dead-letters, when out of attempts) every lease that expired: the crash-recovery path.
-        /// Returns the number reclaimed.</summary>
-        public Task<int> ReclaimExpiredAsync(CancellationToken ct = default) =>
+        /// <summary>Puts a leased job back without counting the attempt, not to be started again before
+        /// <paramref name="delay"/> has passed (a retry whose earlier attempt is still running in this process).</summary>
+        public Task<bool> DeferAsync(long jobId, string owner, TimeSpan delay, string reason, CancellationToken ct = default) =>
+            intel.WriteAsync((c, tx) => c.Exec(tx, """
+                UPDATE jobs SET state='queued', attempts=MAX(attempts-1,0), not_before_ms=$nb, lease_owner=NULL, lease_expires_ms=NULL, error_message=$why
+                WHERE job_id=$id AND state='leased' AND lease_owner=$o
+                """, ("$nb", clock.NowMs + (long)delay.TotalMilliseconds), ("$why", Truncate(reason)), ("$id", jobId), ("$o", owner)) == 1, ct);
+
+        /// <summary>
+        /// Requeues (or dead-letters, when out of attempts) every lease that expired: the crash-recovery path. Returns the
+        /// number reclaimed.
+        /// <para><paramref name="running"/> names the jobs whose handler is running in this process: their lease is not taken
+        /// away, whatever its expiry says. An expired lease is meant to tell that a worker is gone. Inside the one process
+        /// that works this queue (see <see cref="Storage.InstanceLock"/>) it only tells that the heartbeat could not run
+        /// for a while, and reclaiming then starts the same job a second time beside the first. On the server every running
+        /// job was "reclaimed" in the same second four times in one morning while the thread pool was backed up, and a
+        /// projection run and a media sweep spent their last attempts that way.</para>
+        /// </summary>
+        public Task<int> ReclaimExpiredAsync(IReadOnlyCollection<long>? running = null, CancellationToken ct = default) =>
             intel.WriteAsync((c, tx) =>
             {
                 long now = clock.NowMs;
-                int dead = c.Exec(tx, """
+                // A handful of ids at most (one per worker); written into the statement as numbers.
+                string keep = running is { Count: > 0 } ? " AND job_id NOT IN (" + string.Join(",", running.Select(id => id.ToString(System.Globalization.CultureInfo.InvariantCulture))) + ")" : "";
+                int dead = c.Exec(tx, $"""
                     UPDATE jobs SET state='dead', finished_at_ms=$now, lease_owner=NULL, lease_expires_ms=NULL,
                                     error_class='Transient', error_message='Lease expired on the final attempt (worker crashed or hung).'
-                    WHERE state='leased' AND lease_expires_ms < $now AND attempts >= max_attempts
+                    WHERE state='leased' AND lease_expires_ms < $now AND attempts >= max_attempts{keep}
                     """, ("$now", now));
-                int requeued = c.Exec(tx, """
+                int requeued = c.Exec(tx, $"""
                     UPDATE jobs SET state='queued', not_before_ms=$now, lease_owner=NULL, lease_expires_ms=NULL,
                                     error_class='Transient', error_message='Lease expired (worker crashed or hung); requeued.'
-                    WHERE state='leased' AND lease_expires_ms < $now
+                    WHERE state='leased' AND lease_expires_ms < $now{keep}
                     """, ("$now", now));
                 return dead + requeued;
             }, ct);
@@ -276,11 +294,50 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                 """, ("$now", clock.NowMs), ("$m", moduleId)), ct);
 
         /// <summary>Puts a dead-lettered job back in the queue with a fresh attempt budget (UI "retry").</summary>
-        public Task<bool> RetryDeadAsync(long jobId, CancellationToken ct = default) =>
-            intel.WriteAsync((c, tx) => c.Exec(tx, """
-                UPDATE jobs SET state='queued', attempts=0, not_before_ms=$now, finished_at_ms=NULL
-                WHERE job_id=$id AND state='dead'
-                """, ("$now", clock.NowMs), ("$id", jobId)) == 1, ct);
+        /// <remarks>True when the job is no longer dead: queued again, or closed because the same work already is (see
+        /// <see cref="RetryAllDeadAsync"/>).</remarks>
+        public async Task<bool> RetryDeadAsync(long jobId, CancellationToken ct = default)
+        {
+            var (retried, closed) = await intel.WriteAsync((c, tx) => RetryDeadCore(c, tx, jobId, null), ct).ConfigureAwait(false);
+            return retried + closed == 1;
+        }
+
+        /// <summary>
+        /// Puts every dead-lettered job back in the queue with a fresh attempt budget (of one module, or of all), newest
+        /// first. A dead job whose work is already queued or running again is closed instead (cancelled, with what it had
+        /// failed with): there is nothing left to retry, and two live jobs cannot stand for the same work. Recurring work is
+        /// like that as a rule (a sweep, the nightly backup, the daily projection each have one key), which is why retrying
+        /// such a job one at a time used to be refused by the database. Returns how many were queued again and how many closed.
+        /// </summary>
+        public Task<(int Retried, int Closed)> RetryAllDeadAsync(string? moduleId, CancellationToken ct = default) =>
+            intel.WriteAsync((c, tx) => RetryDeadCore(c, tx, null, moduleId), ct);
+
+        private (int Retried, int Closed) RetryDeadCore(SqliteConnection c, SqliteTransaction tx, long? jobId, string? moduleId)
+        {
+            long now = clock.NowMs;
+            var dead = c.Query(tx, """
+                SELECT job_id, dedupe_key FROM jobs
+                WHERE state='dead' AND ($id IS NULL OR job_id=$id) AND ($m IS NULL OR module_id=$m) ORDER BY job_id DESC LIMIT 5000
+                """, r => (Id: r.GetInt64(0), Key: r.GetStringOrNull(1)), ("$id", jobId), ("$m", moduleId));
+            var live = new HashSet<string>(StringComparer.Ordinal);
+            int retried = 0, closed = 0;
+            foreach (var (id, key) in dead)
+            {
+                bool queuedAgain = key != null && (live.Contains(key)
+                    || c.Scalar<long?>(tx, "SELECT 1 FROM jobs WHERE dedupe_key=$k AND state IN ('queued','leased') LIMIT 1", ("$k", key)) != null);
+                if (queuedAgain)
+                {
+                    closed += c.Exec(tx, """
+                        UPDATE jobs SET state='cancelled', error_message=substr('Closed: the same work was queued again. It had failed with: ' || COALESCE(error_message, 'no error on record'), 1, 2000)
+                        WHERE job_id=$id AND state='dead'
+                        """, ("$id", id));
+                    continue;
+                }
+                retried += c.Exec(tx, "UPDATE jobs SET state='queued', attempts=0, not_before_ms=$now, finished_at_ms=NULL WHERE job_id=$id AND state='dead'", ("$now", now), ("$id", id));
+                if (key != null) live.Add(key);
+            }
+            return (retried, closed);
+        }
 
         /// <summary>Raises the priority of jobs queued for longer than <paramref name="olderThan"/> by one step,
         /// up to <paramref name="cap"/>. Run periodically so low-priority work cannot starve.</summary>
@@ -395,7 +452,13 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             if (q.CreatedToMs is long to) { where.Add("created_at_ms < $to"); p.Add(("$to", to)); }
             if (q.BeforeJobId is long before) { where.Add("job_id < $before"); p.Add(("$before", before)); }
             p.Add(("$lim", limit + 1));
-            string sql = $"SELECT {Columns} FROM jobs {(where.Count == 0 ? "" : "WHERE " + string.Join(" AND ", where))} ORDER BY job_id DESC LIMIT $lim";
+            // The index that hands the rows back already in job order is named outright: with no statistics the planner took
+            // (module_id, state) for a module's jobs and sorted all of them (hundreds of thousands for the media modules).
+            string index = q.ModuleId == null ? ""
+                : q.Kind != null ? " INDEXED BY ix_jobs_module_kind"
+                : q.State != null ? " INDEXED BY ix_jobs_module_state"
+                : " INDEXED BY ix_jobs_module";
+            string sql = $"SELECT {Columns} FROM jobs{index} {(where.Count == 0 ? "" : "WHERE " + string.Join(" AND ", where))} ORDER BY job_id DESC LIMIT $lim";
 
             using var c = intel.OpenRead();
             var rows = c.Query(null, sql, Map, p.ToArray());

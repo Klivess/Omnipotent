@@ -470,8 +470,10 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
         public async Task RunMaintenanceOnceAsync(CancellationToken ct = default)
         {
             long now = clock.NowMs;
-            int reclaimed = await Jobs.ReclaimExpiredAsync(ct).ConfigureAwait(false);
+            // A job whose handler is running here keeps its lease even when its heartbeat could not run in time.
+            int reclaimed = await Jobs.ReclaimExpiredAsync(workers?.RunningJobIds, ct).ConfigureAwait(false);
             if (reclaimed > 0) log($"[OmniscienceV3] reclaimed {reclaimed} expired job lease(s).");
+            await ReportLeftBehindAsync(ct).ConfigureAwait(false);
             if (options.PriorityAgeAfter > TimeSpan.Zero && now - lastAgingMs >= (long)options.PriorityAgeAfter.TotalMilliseconds)
             {
                 lastAgingMs = now;
@@ -496,6 +498,27 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             }
         }
 
+        public const string LeftBehindProblem = "handlers_left_behind";
+        private string leftBehindReported = "";
+
+        /// <summary>Keeps the standing problem "handlers left behind" in step with what is still running on its own, so the
+        /// health page shows work that was told to stop and did not (it was only ever a line in the log).</summary>
+        private async Task ReportLeftBehindAsync(CancellationToken ct)
+        {
+            var behind = LeftBehindJobs;
+            string signature = string.Join(",", behind.Select(j => j.JobId));
+            if (signature == leftBehindReported) return;
+            if (behind.Count == 0) await ModuleProblems.ClearAsync(stores.Intel, ModuleProblems.Kernel, LeftBehindProblem, ct).ConfigureAwait(false);
+            else
+                await ModuleProblems.ReportAsync(stores.Intel, clock, ModuleProblems.Kernel, LeftBehindProblem, Kernel.Modules.NoticeSeverity.Attention, new
+                {
+                    count = behind.Count,
+                    jobs = behind.Select(j => new { jobId = j.JobId, moduleId = j.ModuleId, kind = j.Kind, sinceMs = j.SinceMs }).ToList(),
+                    message = "These handlers were told to stop and did not. Each still holds a thread and whatever it was reading or writing; a job among them is not started again until its handler ends.",
+                }, ct).ConfigureAwait(false);
+            leftBehindReported = signature;
+        }
+
         /// <summary>
         /// Copies each store's write-ahead log back into its file. SQLite does this by itself only when a commit finds no
         /// reader in the way; on the server intel.db's log had grown to 309 MB, and every read pays for a long log. A
@@ -515,6 +538,12 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
 
         /// <summary>Jobs stopped by the stall watch since this engine started.</summary>
         public long StalledJobs => workers?.Stalled ?? 0;
+
+        /// <summary>Handlers that did not stop when asked and are still running on their own (see <see cref="LaneWorkers.LeftBehind"/>).</summary>
+        public IReadOnlyList<LaneWorkers.LeftBehindJob> LeftBehindJobs => workers?.LeftBehind ?? Array.Empty<LaneWorkers.LeftBehindJob>();
+
+        /// <summary>Heartbeats that ran a whole interval late since the start (the process was held up, not a job).</summary>
+        public long LateHeartbeats => workers?.LateHeartbeats ?? 0;
 
         /// <summary>
         /// Per-module health. Everything here is a read of a small table: the job figures come from the counters the
