@@ -88,10 +88,17 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
             if (Context.Llm?.CircuitOpen == true) issues.Add(new Issue("llm_circuit", "llm_circuit", null, new { reason = "The model refused Omniscience's credentials; background model work is paused." }, NoticeSeverity.Urgent));
             if (Context.Llm != null)
             {
-                var (efficiency, samples) = Context.Llm.CacheEfficiency(TimeSpan.FromHours(6), "Background");
+                // Of what background work sent a second time, how much the provider served from cache: the part prompt
+                // assembly decides. The plain hit rate also counts evidence read for the first time, which nothing can
+                // serve from a cache, so it stood under this floor whenever extraction was simply busy.
+                var (efficiency, samples) = Context.Llm.ResentEfficiency(TimeSpan.FromHours(6), "Background");
                 double floor = Context.Settings.Get("monitors.health.cache_floor", 0.5);
                 if (samples >= Context.Settings.Get("monitors.health.cache_min_calls", 20) && efficiency < floor)
-                    issues.Add(new Issue("cache_floor", "cache_floor", null, new { efficiency = Math.Round(efficiency, 3), floor, calls = samples, hours = 6 }, NoticeSeverity.Attention));
+                    issues.Add(new Issue("cache_floor", "cache_floor", null, new
+                    {
+                        efficiency = Math.Round(efficiency, 3), floor, calls = samples, hours = 6,
+                        hitRate = Math.Round(Context.Llm.CacheEfficiency(TimeSpan.FromHours(6), "Background").Efficiency, 3),
+                    }, NoticeSeverity.Attention));
             }
 
             // 4. Jobs that failed for good in the last day, per module.

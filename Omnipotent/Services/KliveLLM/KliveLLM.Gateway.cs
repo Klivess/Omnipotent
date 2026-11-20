@@ -47,6 +47,23 @@ public sealed record LlmRequest
     public string? ReasoningEffort { get; init; }
     public Action<string>? OnToken { get; init; }
     public bool KeepSession { get; init; }
+    /// <summary>
+    /// Every schema the calls of one prompt family answer with, in one fixed order. All of them go out as tool
+    /// definitions on every structured call of the family, and <see cref="OutputSchema"/> names the one this call
+    /// must answer with. A provider lays the tool definitions out ahead of the conversation, so a call that sent only
+    /// its own schema shared nothing with the call before it past the system prompt: Omniscience's critic, asked with
+    /// another schema than the reading before it, had the whole evidence prefilled a second time. Null: the call's own
+    /// schema alone.
+    /// </summary>
+    public IReadOnlyList<LlmOutputSchema>? SchemaFamily { get; init; }
+    /// <summary>
+    /// With <see cref="KeepSession"/>: the session is taken back to its system prompt before this request's turns go
+    /// in, and keeps its cache identity. For a caller that asks several self-contained questions over one large
+    /// opening and sends that opening with each of them: the provider serves the opening from its prefix cache, the
+    /// scheduler sees a continuation of the same prefix (never parked, and measured as one), and none of the earlier
+    /// answers is sent back to be prefilled again.
+    /// </summary>
+    public bool Rewind { get; init; }
     /// <summary>Who is asking. KliveLLM routes, budgets and logs by caller; left empty, the caller is named from the
     /// file that made the call.</summary>
     public LlmCaller? Caller { get; init; }
@@ -230,7 +247,8 @@ public partial class KliveLLM
         LlmCaller who = GatewayCaller(request, callerFile);
 
         string sid = request.SessionKey;
-        bool fresh = !request.KeepSession || !CanContinueGatewaySession(sid);
+        bool fresh = !request.KeepSession
+                     || !(request.Rewind ? RewindGatewaySession(sid, request.SystemPrompt) : CanContinueGatewaySession(sid));
         if (fresh) StartToolSession(sid, request.SystemPrompt, caller: who);
 
         var sw = System.Diagnostics.Stopwatch.StartNew();
@@ -243,10 +261,11 @@ public partial class KliveLLM
             object? toolChoice = null;
             if (request.OutputSchema is { } schema)
             {
-                tools.Add(new HFWrapper.HFTool
-                {
-                    function = new HFWrapper.HFFunctionDefinition { name = schema.Name, description = schema.Description, parameters = schema.Schema },
-                });
+                foreach (var tool in GatewaySchemas(request))
+                    tools.Add(new HFWrapper.HFTool
+                    {
+                        function = new HFWrapper.HFFunctionDefinition { name = tool.Name, description = tool.Description, parameters = tool.Schema },
+                    });
                 toolChoice = new { type = "function", function = new { name = schema.Name } };
             }
 
@@ -331,6 +350,47 @@ public partial class KliveLLM
             var last = session.structuredMessages[^1];
             if (last.role == "tool") return true;
             return last.role == "assistant" && (last.tool_calls == null || last.tool_calls.Count == 0);
+        }
+    }
+
+    /// <summary>
+    /// The tool definitions a structured request goes out with, in the order they are sent: its family's, the same
+    /// list on every call of the family, or its own schema alone. A schema the family does not list is sent after it
+    /// (the call still works; its tool block is then its own, and so is everything the provider reads behind it).
+    /// </summary>
+    internal static IReadOnlyList<LlmOutputSchema> GatewaySchemas(LlmRequest request)
+    {
+        if (request.OutputSchema is not { } wanted) return Array.Empty<LlmOutputSchema>();
+        var family = request.SchemaFamily;
+        if (family == null || family.Count == 0) return new[] { wanted };
+        return family.Any(s => string.Equals(s.Name, wanted.Name, StringComparison.Ordinal)) ? family : family.Append(wanted).ToList();
+    }
+
+    /// <summary>
+    /// Takes a kept gateway session back to its system prompt, for a request that asks over the same opening again
+    /// (<see cref="LlmRequest.Rewind"/>). The session object stays, and with it the cache epoch: the next call is a
+    /// continuation of the prefix the provider already holds, which is what it is. Whatever the session held after the
+    /// system prompt goes, an unanswered question from a failed call included. False when there is nothing to go
+    /// back to (no such session, or one opened with another system prompt, which is another prefix): the caller
+    /// starts the session afresh.
+    /// </summary>
+    internal bool RewindGatewaySession(string sessionId, string? systemPrompt)
+    {
+        if (string.IsNullOrWhiteSpace(sessionId)) return false;
+        lock (sessions)
+        {
+            if (!sessions.TryGetValue(sessionId, out var session)) return false;
+            var log = session.structuredMessages;
+            int head = 0;
+            while (head < log.Count && log[head].role == "system") head++;
+            string? held = head == 0 ? null : HFWrapper.ContentToText(log[0].content);
+            string? wanted = string.IsNullOrWhiteSpace(systemPrompt) ? null : systemPrompt + ThinkingDirective;
+            if (head > 1 || !string.Equals(held, wanted, StringComparison.Ordinal)) return false;
+            log.RemoveRange(head, log.Count - head);
+            // What the provider can be told to keep is the system prompt; the rest of the shared opening sits inside
+            // the user turn, where an automatic prefix cache finds it by itself.
+            session.lastCacheMessageCount = Math.Min(session.lastCacheMessageCount, head);
+            return true;
         }
     }
 

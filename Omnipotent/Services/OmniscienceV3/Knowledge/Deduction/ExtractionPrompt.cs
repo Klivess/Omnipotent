@@ -49,15 +49,23 @@ Rules
 Answer only with JSON that matches the schema.
 """;
 
+        /// <summary>
+        /// What every question about a slice begins with. The order is by how long each part stays the same: the subject
+        /// and what is known about them are one text for every slice of a job, so they come first and the provider reads
+        /// them once per job; the roster and the evidence are the slice's own and come last. With the roster ahead of the
+        /// profile (as it was until 20 Nov 2026) the first roster line that differed ended the match, and a profile of
+        /// a few thousand tokens was prefilled again for every slice. Same sections, same wording: this is not a new
+        /// prompt version, and coverage kept under <see cref="Version"/> stands.
+        /// </summary>
         public static string Prefix(EvidenceSlice slice, string subjectHandle, string profileText, IReadOnlyList<string> extraSubjects)
         {
             var sb = new StringBuilder();
             sb.Append("SUBJECT: ").Append(subjectHandle).Append('\n');
-            if (extraSubjects.Count > 0)
-                sb.Append("Also extract claims about these roster members when the evidence states them: ").Append(string.Join(", ", extraSubjects)).Append('\n');
-            sb.Append("\nROSTER (handles, the names each person used in this period, neutral metadata)\n").Append(slice.RosterText).Append('\n');
             sb.Append("\nKNOWN SO FAR ABOUT THE SUBJECT (read-only context from earlier conversations; do not cite it, use it to interpret)\n");
             sb.Append(string.IsNullOrWhiteSpace(profileText) ? "(nothing yet)" : profileText).Append('\n');
+            if (extraSubjects.Count > 0)
+                sb.Append("\nAlso extract claims about these roster members when the evidence states them: ").Append(string.Join(", ", extraSubjects)).Append('\n');
+            sb.Append("\nROSTER (handles, the names each person used in this period, neutral metadata)\n").Append(slice.RosterText).Append('\n');
             sb.Append("\nEVIDENCE (").Append(slice.Messages.Count).Append(" messages, oldest first)\n").Append(slice.EvidenceText);
             return sb.ToString();
         }
@@ -110,6 +118,17 @@ Answer only with JSON that matches the schema.
 
         public static readonly LlmOutputSchema CriticSchema = StructuredLlm.Schema("emit_verdicts", "Whether each fact is proven by its cited evidence.",
             """{"type":"object","required":["verdicts"],"properties":{"verdicts":{"type":"array","items":{"type":"object","required":["id","verdict"],"properties":{"id":{"type":"string"},"verdict":{"type":"string","enum":["supported","unsupported","insufficient"]},"reason":{"type":"string"}}}}}}""");
+
+        private static readonly IReadOnlyList<LlmOutputSchema> OneReading = new[] { ExtractSchema, CriticSchema };
+        private static readonly IReadOnlyList<LlmOutputSchema> TwoReadings = new[] { ExtractSchema, AdjudicateSchema, CriticSchema };
+
+        /// <summary>
+        /// Every schema a slice's questions answer with, in the order they are always sent. All of them go out with each
+        /// question (the one asked for is the one the model must call), so the reading and the critic that follows it
+        /// begin with the same bytes up to the end of the evidence. The adjudicator's schema repeats the whole claim
+        /// schema, so it is only carried when a second reading can call for it.
+        /// </summary>
+        public static IReadOnlyList<LlmOutputSchema> Schemas(bool secondReading) => secondReading ? TwoReadings : OneReading;
 
         /// <summary>Basic shape checks before verification (the verifier does the evidence checks).</summary>
         public static string? Validate(ExtractionAnswer answer)

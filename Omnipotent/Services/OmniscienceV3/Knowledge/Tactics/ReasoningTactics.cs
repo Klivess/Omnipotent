@@ -601,7 +601,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Tactics
                 {
                     if (step == MaxSteps) next += "\nYou have used every tool action: answer now.";
                     var r = await StructuredLlm.AskAsync<ResearchStep>(s, next, schema, 1_500, new ModelSamplingParameters(Temperature: 0.2, Seed: step + 1),
-                        a => a.Action is "search" or "read" or "facts" or "answer" ? null : "action must be search, read, facts or answer", ct).ConfigureAwait(false);
+                        a => a.Action is "search" or "read" or "facts" or "answer" ? null : "action must be search, read, facts or answer", ct, followUp: true).ConfigureAwait(false);
                     var a = r.Value;
                     if (a == null) break;
                     await ctx.ReportAsync(new { stage = "research", step = step + 1, a.Action, a.Query }).ConfigureAwait(false);

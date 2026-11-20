@@ -345,12 +345,14 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             });
             await h.Runtime.Stores.Intel.WriteAsync((c, tx) =>
             {
-                void Call(long at, string outcome, int prompt, int cached) => c.Exec(tx, """
-                    INSERT INTO llm_calls(at_ms, module_id, purpose, model, work_class, prompt_tokens, cached_tokens, completion_tokens, outcome) VALUES($a,'links','links.categorise','m','Background',$p,$c,10,$o)
-                    """, ("$a", at), ("$p", prompt), ("$c", cached), ("$o", outcome));
-                for (int i = 0; i < 6; i++) Call(now - 10 * 60_000L, "ok", 1000, 900);
+                void Call(long at, string outcome, int prompt, int cached, int resent = 0) => c.Exec(tx, """
+                    INSERT INTO llm_calls(at_ms, module_id, purpose, model, work_class, prompt_tokens, cached_tokens, completion_tokens, outcome, resent_tokens) VALUES($a,'links','links.categorise','m','Background',$p,$c,10,$o,$r)
+                    """, ("$a", at), ("$p", prompt), ("$c", cached), ("$o", outcome), ("$r", resent));
+                for (int i = 0; i < 6; i++) Call(now - 10 * 60_000L, "ok", 1000, 900, resent: 950);
                 for (int i = 0; i < 4; i++) Call(now - 10 * 60_000L, "RateLimited", 0, 0);
-                for (int i = 0; i < 24; i++) Call(now - 2 * Hour, "ok", 1000, 100);
+                // Later questions over evidence the model had been sent, a tenth of it served from cache: the prompts no longer
+                // match what was sent before. Calls that send nothing a second time (resent 0) are no sign of anything.
+                for (int i = 0; i < 24; i++) Call(now - 2 * Hour, "ok", 1000, 100, resent: 950);
                 c.Exec(tx, """
                     INSERT INTO jobs(module_id, kind, priority, lane, state, attempts, max_attempts, not_before_ms, error_class, error_message, created_at_ms, finished_at_ms)
                     VALUES('links','unfurl',1,'Io','dead',3,3,0,'Transient','HttpRequestException: 503',$n,$n)
@@ -369,6 +371,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Equal(1, health.Open.Single(i => i.Kind == "backfill_stalled").Detail.GetProperty("conversations").GetInt32());
             Assert.Equal((10, 4), (health.Open.Single(i => i.Kind == "llm_errors").Detail.GetProperty("calls").GetInt32(), health.Open.Single(i => i.Kind == "llm_errors").Detail.GetProperty("failed").GetInt32()));
             Assert.True(health.Open.Single(i => i.Kind == "cache_floor").Detail.GetProperty("efficiency").GetDouble() < 0.5);
+            Assert.Equal(0.26, health.Open.Single(i => i.Kind == "cache_floor").Detail.GetProperty("hitRate").GetDouble(), 2);
             Assert.Equal("HttpRequestException: 503", health.Open.Single(i => i.Kind == "jobs_dead").Detail.GetProperty("lastError").GetString());
             Assert.Equal(6, Notices(h, "data_health").Count);
             Assert.All(Notices(h, "data_health"), n => Assert.Null(n.PersonId));

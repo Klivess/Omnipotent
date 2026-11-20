@@ -15,13 +15,18 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         public string? PromptVersion { get; init; }
         public long? JobId { get; init; }
         public Func<double, LlmRequest>? Repack { get; init; }
+        /// <summary>The size of the request before this one on the same provider-side prefix, when this one sends that
+        /// prefix again (a later question of a <see cref="CacheShapedSession"/>). Zero for a call that sends nothing the
+        /// provider has seen from it before. It is what the call's cached tokens are measured against.</summary>
+        public int PriorPromptTokens { get; init; }
     }
 
     /// <summary>
     /// The Omniscience side of the LLM gateway: audit trail (intel.db <c>llm_calls</c>), recovery
     /// (overflow → learn + repack + retry once; 413 → repack smaller + retry once; 429 → transient retry via
     /// the job queue; 401/403 → permanent, plus a circuit breaker that pauses background LLM work), token
-    /// estimator calibration, cache-shaped sessions, and Omniscience's own prefix-cache efficiency.
+    /// estimator calibration, cache-shaped sessions, and Omniscience's own prefix-cache figures (the hit rate, and
+    /// how much of what it re-sends is served from cache).
     /// </summary>
     public sealed class OmniLlm
     {
@@ -102,8 +107,7 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
 
             if (result.Success)
             {
-                // Image tokens are not text: a call that carried images would teach the estimator a wrong ratio.
-                if (!HasImages(request)) Estimator.Calibrate(string.Concat(request.Turns.Select(t => t.Content)) + request.SystemPrompt, result.PromptTokens);
+                if (HoldsItsWholePrompt(request)) Estimator.Calibrate(PromptText(request), result.PromptTokens);
                 return result;
             }
 
@@ -127,16 +131,37 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         /// <summary>Opens a "prefill once, ask many" session over a large stable prefix.</summary>
         /// <param name="reasoningEffort">How hard every question of the session is thought about ("off", "low", "medium",
         /// "high"); null leaves it to <see cref="Shape"/>.</param>
+        /// <param name="schemas">Every schema the session's questions answer with, in one fixed order: all of them are sent
+        /// with each question, so the tool definitions ahead of the prefix never change between two questions
+        /// (<see cref="LlmRequest.SchemaFamily"/>). Null for a session whose questions all use one schema.</param>
         public CacheShapedSession OpenSession(string moduleId, string purpose, string sessionKey, string systemPrompt, string stablePrefix,
-            AIRouterWorkClass workClass, string? promptVersion = null, long? jobId = null, string? reasoningEffort = null) =>
-            new(this, client, moduleId, purpose, sessionKey, systemPrompt, stablePrefix, workClass, promptVersion, jobId) { ReasoningEffort = reasoningEffort };
+            AIRouterWorkClass workClass, string? promptVersion = null, long? jobId = null, string? reasoningEffort = null,
+            IReadOnlyList<LlmOutputSchema>? schemas = null) =>
+            new(this, client, moduleId, purpose, sessionKey, systemPrompt, stablePrefix, workClass, promptVersion, jobId) { ReasoningEffort = reasoningEffort, Schemas = schemas };
 
         private static bool HasImages(LlmRequest request) => request.Turns.Any(t => t.Images is { Count: > 0 });
 
         /// <summary>
-        /// Omniscience's own prefix-cache efficiency over a window (cached / prompt tokens). Calls that carried images are
-        /// left out: each sends a different picture, which no prefix cache can serve, so they would only drag the measure
-        /// down and pause the background work it guards.
+        /// Whether the provider's token count for a request is a count of the text in that request, which is what the
+        /// estimator may learn from. Not with images (their tokens are not text), and not for a follow-up on a kept
+        /// session: its request holds the last question while the provider counted the whole conversation. From 19 to
+        /// 20 Nov 2026 every critic call was such a follow-up: a question of a thousand tokens came back counted as
+        /// twelve thousand, the estimator took its text to be 2.5 times denser than it is (it rises fast and falls
+        /// slowly), and extraction slices planned at 5,000 tokens held about 2,000.
+        /// </summary>
+        internal static bool HoldsItsWholePrompt(LlmRequest request) => !HasImages(request) && !(request.KeepSession && !request.Rewind);
+
+        /// <summary>The text of everything a request sends: its turns, its system prompt and its tool definitions.</summary>
+        internal static string PromptText(LlmRequest request) =>
+            string.Concat(request.Turns.Select(t => t.Content)) + request.SystemPrompt
+            + string.Concat(KliveLLM.KliveLLM.GatewaySchemas(request).Select(s => s.Name + s.Description + s.Schema.ToString(Newtonsoft.Json.Formatting.None)));
+
+        /// <summary>
+        /// Omniscience's own prefix-cache hit rate over a window (cached / prompt tokens). Calls that carried images are
+        /// left out: each sends a different picture, which no prefix cache can serve. This is the figure a dashboard
+        /// shows. It cannot reach 100%: whatever is read for the first time has to be prefilled once, so it says how much
+        /// of the traffic is new evidence as much as how well the prompts are built. What says the latter is
+        /// <see cref="ResentEfficiency"/>.
         /// </summary>
         public (double Efficiency, int Samples) CacheEfficiency(TimeSpan window, string? workClass = null)
         {
@@ -149,23 +174,56 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
             return (row.Prompt == 0 ? 1.0 : (double)row.Cached / row.Prompt, row.N);
         }
 
+        /// <summary>
+        /// Of the tokens Omniscience sent a second time (a later question over a prefix the provider had already been
+        /// sent), the share the provider served from its cache. This is the part of the hit rate that prompt assembly
+        /// decides, and the one that should read 100%: a low figure means a later question no longer begins with the
+        /// bytes of the one before it (a tool list that changed, text moved ahead of the evidence), or reached the
+        /// provider after it had dropped the prefix. Calls that re-sent nothing are not samples.
+        /// </summary>
+        public (double Efficiency, int Samples) ResentEfficiency(TimeSpan window, string? workClass = null)
+        {
+            using var c = intel.OpenRead();
+            var row = c.Query(null, """
+                SELECT COALESCE(SUM(MIN(cached_tokens, resent_tokens)),0), COALESCE(SUM(resent_tokens),0), COUNT(*) FROM llm_calls
+                WHERE at_ms >= $since AND outcome='ok' AND ($w IS NULL OR work_class=$w) AND resent_tokens > 0
+                """, r => (Served: r.GetInt64(0), Resent: r.GetInt64(1), N: r.GetInt32(2)),
+                ("$since", clock.NowMs - (long)window.TotalMilliseconds), ("$w", workClass)).Single();
+            return (row.Resent == 0 ? 1.0 : (double)row.Served / row.Resent, row.N);
+        }
+
         private Task LogAsync(LlmCall call, LlmRequest request, LlmResult r, CancellationToken ct) =>
             intel.WriteAsync((c, tx) => c.Exec(tx, """
                 INSERT INTO llm_calls(at_ms, module_id, purpose, job_id, model, provider, work_class, prompt_tokens, cached_tokens,
-                                      completion_tokens, request_bytes, latency_ms, outcome, finish_reason, prompt_version, error, images)
-                VALUES($at,$m,$p,$j,$model,$prov,$wc,$pt,$ct,$cpt,$b,$lat,$o,$fr,$pv,$err,$img)
+                                      completion_tokens, request_bytes, latency_ms, outcome, finish_reason, prompt_version, error, images, resent_tokens)
+                VALUES($at,$m,$p,$j,$model,$prov,$wc,$pt,$ct,$cpt,$b,$lat,$o,$fr,$pv,$err,$img,$rs)
                 """,
                 ("$at", clock.NowMs), ("$m", call.ModuleId), ("$p", call.Purpose), ("$j", call.JobId), ("$model", r.Model), ("$prov", r.Provider),
                 ("$wc", request.WorkClass.ToString()), ("$pt", r.PromptTokens), ("$ct", r.CachedTokens), ("$cpt", r.CompletionTokens),
                 ("$b", r.RequestBytes), ("$lat", r.LatencyMs), ("$o", r.Success ? "ok" : r.ErrorKind.ToString()), ("$fr", r.FinishReason),
                 ("$pv", call.PromptVersion), ("$err", r.ErrorMessage is { Length: > 2000 } e ? e[..2000] : r.ErrorMessage),
-                ("$img", request.Turns.Sum(t => t.Images?.Count ?? 0))), ct);
+                ("$img", request.Turns.Sum(t => t.Images?.Count ?? 0)),
+                // What the request before it held is, at most, what this one could have had back from the cache.
+                ("$rs", Math.Max(0, Math.Min(call.PriorPromptTokens, r.PromptTokens)))), ct);
     }
 
     /// <summary>
-    /// "Prefill once, ask many" (plan "CacheShapedSession"): the first question carries the large stable
-    /// prefix (system + evidence); later questions append only themselves, so AIRouter serves the prefix
-    /// from cache and the passes stay in one residency cohort. Dispose ends the provider-side session.
+    /// "Prefill once, ask many" (plan "CacheShapedSession"): several questions over one large stable prefix (system +
+    /// evidence), built so that each of them begins with exactly the bytes the provider was sent before.
+    ///
+    /// A question is one of two kinds. <see cref="AskAsync"/> is a question of its own: it travels as the prefix plus
+    /// the question and nothing else, so everything up to the question comes out of the provider's prefix cache and
+    /// none of the earlier answers is sent back. <see cref="FollowUpAsync"/> is a question about the answers so far:
+    /// it is appended to the conversation, which the provider also holds up to its last question. Until 20 Nov 2026
+    /// every question was of the second kind and went out with its own schema as the only tool. The tool definitions
+    /// sit ahead of the evidence in what the provider reads, so the second question of a session shared nothing with
+    /// the first past the system prompt: the evidence was prefilled again, with the first answer (often as long as
+    /// the evidence) on top. The extraction critic ran at a tenth of its prompt cached, and each of those calls was
+    /// counted by AIRouter's scheduler as a warm prefix lost, which shortens the cache lifetime it plans every
+    /// service's turns around.
+    ///
+    /// All questions of a session share its key and cache identity, so AIRouter's scheduler sees one conversation and
+    /// never parks a later question behind other work. Dispose ends the provider-side session.
     /// </summary>
     public sealed class CacheShapedSession : IDisposable
     {
@@ -176,6 +234,8 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         private readonly string? promptVersion;
         private readonly long? jobId;
         private bool prefixSent;
+        private int priorPromptTokens;
+        private int priorQuestionChars;
         private bool disposed;
 
         internal CacheShapedSession(OmniLlm owner, ILlmClient client, string moduleId, string purpose, string sessionKey, string systemPrompt,
@@ -198,44 +258,74 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         /// <summary>The effort every question of this session is sent with; null leaves it to <see cref="OmniLlm.Shape"/>.</summary>
         public string? ReasoningEffort { get; init; }
 
-        /// <summary>True while the provider-side session holds the stable prefix, so the next question travels alone.</summary>
+        /// <summary>Every schema the session's questions answer with (see <see cref="OmniLlm.OpenSession"/>).</summary>
+        public IReadOnlyList<LlmOutputSchema>? Schemas { get; init; }
+
+        /// <summary>True while the provider-side session holds the stable prefix and an answer, so a follow-up travels alone.</summary>
         public bool PrefixSent => prefixSent;
 
-        public async Task<LlmResult> AskAsync(string question, LlmOutputSchema? schema, int? maxOutputTokens, ModelSamplingParameters? sampling, CancellationToken ct)
+        /// <summary>
+        /// A question of its own over the prefix: it must say everything it is about, because the model sees the prefix
+        /// and this question only, not what was asked or answered before.
+        /// </summary>
+        public Task<LlmResult> AskAsync(string question, LlmOutputSchema? schema, int? maxOutputTokens, ModelSamplingParameters? sampling, CancellationToken ct) =>
+            SendAsync(question, schema, maxOutputTokens, sampling, followUp: false, ct);
+
+        /// <summary>
+        /// A question about the answers so far (a step of a research loop, "now argue the opposite"): the model sees the
+        /// prefix, every question and answer since the last <see cref="AskAsync"/>, and this. When the session holds
+        /// nothing to follow up on (nothing was asked yet, or the last question failed) it is asked over the prefix alone.
+        /// </summary>
+        public Task<LlmResult> FollowUpAsync(string question, LlmOutputSchema? schema, int? maxOutputTokens, ModelSamplingParameters? sampling, CancellationToken ct) =>
+            SendAsync(question, schema, maxOutputTokens, sampling, followUp: true, ct);
+
+        private async Task<LlmResult> SendAsync(string question, LlmOutputSchema? schema, int? maxOutputTokens, ModelSamplingParameters? sampling, bool followUp, CancellationToken ct)
         {
             ObjectDisposedException.ThrowIf(disposed, this);
-            var turns = new List<LlmTurn>();
-            turns.Add(new LlmTurn("user", prefixSent ? question : stablePrefix + "\n\n" + question));
+            // Only a follow-up to an answered question travels alone. Everything else carries the prefix and takes the
+            // provider-side session back to its system prompt first: that also clears a turn a failed question left
+            // without an answer, so nothing is ever appended to one or sent without its evidence.
+            bool alone = followUp && prefixSent;
+            // AIRouter's scheduler measures a later question against the whole request before it on the session: it takes
+            // that request to be the start of this one. For questions over one opening that is as good as true while one
+            // of the two questions is small beside the opening (a reading's one line, then the critic). Two long ones in
+            // a row (an adjudication of many claims, then a critic of many facts) share the opening and nothing after it,
+            // and nine tenths of the shorter request would not come back from cache: a warm prefix scored as lost, though
+            // nothing was. Such a question gets a cache identity of its own. The provider serves the opening all the
+            // same, and the scheduler sees a first call, which it does not score.
+            if (!alone && Math.Min(priorQuestionChars, question.Length) > (systemPrompt.Length + stablePrefix.Length) / 12)
+                client.EndSession(sessionKey);
+            // A follow-up's request is the whole conversation: beside it, any question asked next is the shorter one.
+            priorQuestionChars = alone ? int.MaxValue : question.Length;
+            // Not until this one is answered: a call that throws (an outage, a cancellation) leaves its question unanswered too.
+            prefixSent = false;
             var result = await owner.CallAsync(new LlmCall
             {
                 ModuleId = moduleId,
                 Purpose = purpose,
                 PromptVersion = promptVersion,
                 JobId = jobId,
+                PriorPromptTokens = priorPromptTokens,
                 Request = new LlmRequest
                 {
                     Purpose = purpose,
                     SessionKey = sessionKey,
                     SystemPrompt = systemPrompt,
-                    Turns = turns,
+                    Turns = new[] { new LlmTurn("user", alone ? question : stablePrefix + "\n\n" + question) },
                     Stamp = LlmStamp.None,
                     MaxOutputTokens = maxOutputTokens,
                     Sampling = sampling,
                     WorkClass = workClass,
                     OutputSchema = schema,
+                    SchemaFamily = Schemas,
                     ReasoningEffort = ReasoningEffort,
                     KeepSession = true,
+                    Rewind = !alone,
                 },
             }, ct).ConfigureAwait(false);
-            if (result.Success) prefixSent = true;
-            else
-            {
-                // A failed question leaves the provider-side session holding a turn with no answer (or a cut-off one).
-                // It is ended here, so the next question starts a clean session and carries the prefix again, instead
-                // of being appended to the wreck or sent without its evidence.
-                client.EndSession(sessionKey);
-                prefixSent = false;
-            }
+            prefixSent = result.Success;
+            // A call the provider read (it counted the prompt) left the prefix in its cache, answered or not.
+            if (result.PromptTokens > 0) priorPromptTokens = result.PromptTokens;
             Passes++;
             return result;
         }
@@ -249,9 +339,14 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
     }
 
     /// <summary>
-    /// Admission control for the LLM-background lane (plan R1): background LLM work pauses while the
-    /// credential circuit is open, or while Omniscience's own prefix-cache efficiency over the last hour is
-    /// below the floor (so it can never quietly drag down the fleet's rate and get the key suspended again).
+    /// Admission control for the LLM-background lane (plan R1): background LLM work pauses while the credential
+    /// circuit is open, or while the provider is not serving what Omniscience sends it a second time (so a prompt that
+    /// stops matching its own prefix can never quietly drag down the fleet's rate and get the key suspended again).
+    ///
+    /// It judges <see cref="OmniLlm.ResentEfficiency"/>, not the plain hit rate. The plain rate counts evidence that
+    /// is read for the first time as a miss, and pausing cannot change that: for two days the lane stopped whenever
+    /// twenty calls of the last hour averaged under 60% cached, which extraction did by construction, and each pause
+    /// let the shared head of its prompts go cold as well.
     /// </summary>
     public sealed class LlmBackgroundGate : ILaneGate
     {
@@ -260,7 +355,7 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         private readonly int minSamples;
         private readonly TimeSpan pause;
 
-        public LlmBackgroundGate(OmniLlm llm, double efficiencyFloor = 0.6, int minSamples = 20, TimeSpan? pause = null)
+        public LlmBackgroundGate(OmniLlm llm, double efficiencyFloor = 0.8, int minSamples = 20, TimeSpan? pause = null)
         {
             this.llm = llm;
             this.efficiencyFloor = efficiencyFloor;
@@ -271,7 +366,7 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         public bool ShouldPause()
         {
             if (llm.CircuitOpen) return true;
-            var (eff, n) = llm.CacheEfficiency(TimeSpan.FromHours(1), AIRouterWorkClass.Background.ToString());
+            var (eff, n) = llm.ResentEfficiency(TimeSpan.FromHours(1), AIRouterWorkClass.Background.ToString());
             return n >= minSamples && eff < efficiencyFloor;
         }
 

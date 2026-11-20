@@ -84,6 +84,13 @@ Answer only with JSON matching the schema.
 {"type":"object","required":["checks"],"properties":{"checks":{"type":"array","items":{"type":"object","required":["id","supports"],"properties":{"id":{"type":"string"},"point":{"type":"string"},"supports":{"type":"boolean"},"reason":{"type":"string"}}}}}}
 """);
 
+        /// <summary>
+        /// Every schema asked over a dossier, in the order they are always sent: the passes, the devil's advocate and the
+        /// citation check each go out with all three, so the tool definitions ahead of the dossier never change between
+        /// two of them and the dossier is prefilled once for the whole inquiry.
+        /// </summary>
+        public static readonly IReadOnlyList<LlmOutputSchema> ReasonSchemas = new[] { ReasonSchema, AdvocateSchema, VerifySchema };
+
         public static string AnswerInstruction(InquirySpec spec, IReadOnlyList<string> readingOrder)
         {
             var sb = new StringBuilder();

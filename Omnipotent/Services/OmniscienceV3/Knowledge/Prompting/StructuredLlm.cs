@@ -19,6 +19,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Prompting
     /// answer is then parsed leniently (code fences, surrounding prose, trailing commas), validated by the caller's rules,
     /// and on failure the same cached session is asked once more with the exact problem, so the retry costs only the
     /// correction, never another prefill.
+    ///
+    /// A question is asked on its own over the session's prefix unless the caller says it is a follow-up to the answers
+    /// so far (<see cref="CacheShapedSession.AskAsync"/> and <see cref="CacheShapedSession.FollowUpAsync"/>).
     /// </summary>
     public static class StructuredLlm
     {
@@ -32,17 +35,22 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Prompting
 
         public static LlmOutputSchema Schema(string name, string description, string jsonSchema) => new(name, description, JObject.Parse(jsonSchema));
 
+        /// <param name="followUp">True for a question about the answers so far (it is appended to the conversation); false,
+        /// the default, for a question that stands on its own over the prefix.</param>
         public static async Task<StructuredAnswer<T>> AskAsync<T>(CacheShapedSession session, string question, LlmOutputSchema schema, int? maxOutputTokens,
-            ModelSamplingParameters? sampling, Func<T, string?> validate, CancellationToken ct) where T : class
+            ModelSamplingParameters? sampling, Func<T, string?> validate, CancellationToken ct, bool followUp = false) where T : class
         {
-            var first = await session.AskAsync(question, schema, maxOutputTokens, sampling, ct).ConfigureAwait(false);
+            Task<LlmResult> Send(string text) => followUp
+                ? session.FollowUpAsync(text, schema, maxOutputTokens, sampling, ct)
+                : session.AskAsync(text, schema, maxOutputTokens, sampling, ct);
+            var first = await Send(question).ConfigureAwait(false);
             var (value, outcome, problem) = Interpret(first, validate);
             if (outcome is not (StructuredOutcome.Invalid)) return new StructuredAnswer<T>(value, outcome, first, problem, 1);
-            // One retry with the exact validation problem. The request itself is said again: when the first call failed
-            // outright the session was started afresh, and "answer the same request again" would name a request the
-            // model has never seen.
+            // One retry with the exact validation problem. The request itself is said again: a question of its own is
+            // asked over the prefix without the answer that failed, and a follow-up whose call failed outright starts
+            // from the prefix too, so "answer the same request again" would name a request the model has never seen.
             string retry = question + "\n\nYour previous answer to this could not be used: " + problem + "\nAnswer again, strictly as JSON matching the schema, and nothing else.";
-            var second = await session.AskAsync(retry, schema, maxOutputTokens, sampling, ct).ConfigureAwait(false);
+            var second = await Send(retry).ConfigureAwait(false);
             var (value2, outcome2, problem2) = Interpret(second, validate);
             return new StructuredAnswer<T>(value2, outcome2 == StructuredOutcome.Ok ? StructuredOutcome.Repaired : outcome2, second, problem2, 2);
         }

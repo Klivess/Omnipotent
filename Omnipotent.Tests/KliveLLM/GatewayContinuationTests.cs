@@ -79,4 +79,74 @@ public class GatewayContinuationTests
         Assert.False(new Llm().CanContinueGatewaySession("omniscience-bg-never-started"));
         Assert.False(llm.CanContinueGatewaySession(""));
     }
+
+    // ── a second question over the same opening ──────────────────────────────
+    // Seen live on 20 Nov 2026: with the fix above in place the critic did get the evidence, as a continuation on top of
+    // the reading's answer and with its own schema as the only tool. The tool definitions come before the conversation
+    // in what the provider reads, so nothing past the system prompt matched: the evidence was prefilled twice, and the
+    // scheduler counted every such call as a warm prefix lost.
+
+    private static string EpochOf(Llm llm) =>
+        (string)typeof(Llm.KliveLLMSession).GetField("cacheEpochID", BindingFlags.Instance | BindingFlags.NonPublic)!.GetValue(Session(llm))!;
+
+    [Fact]
+    public void ARewind_TakesTheSessionBackToItsSystemPrompt_AndKeepsItsCacheIdentity()
+    {
+        var llm = Asked("EVIDENCE …\n\nExtract every claim.");
+        AnswerWithToolCall(llm);
+        string epoch = EpochOf(llm);
+
+        Assert.True(llm.RewindGatewaySession(Id, "system"));
+        Assert.Equal(new[] { "system" }, Session(llm).structuredMessages.Select(m => m.role).ToArray());
+        // The same session object and epoch: the scheduler and the ledger see the next call as a continuation of the
+        // prefix the provider already holds, not as a cold start to be parked behind other work.
+        Assert.Equal(epoch, EpochOf(llm));
+
+        llm.AppendGatewayTurns(Id, new LlmRequest { Purpose = "test", SessionKey = Id, Turns = new[] { new LlmTurn("user", "EVIDENCE …\n\nIs each fact proven?") } });
+        Assert.Equal(new[] { "system", "user" }, Session(llm).structuredMessages.Select(m => m.role).ToArray());
+        Assert.DoesNotContain(Session(llm).structuredMessages, m => m.role is "assistant" or "tool");
+    }
+
+    [Fact]
+    public void ARewind_AlsoClearsAQuestionAFailedCallLeftUnanswered()
+    {
+        var llm = Asked("EVIDENCE …\n\nExtract every claim.");
+        Assert.False(llm.CanContinueGatewaySession(Id));
+        Assert.True(llm.RewindGatewaySession(Id, "system"));
+        Assert.Single(Session(llm).structuredMessages);
+    }
+
+    [Fact]
+    public void ARewind_IsRefusedWhenThereIsNothingToGoBackTo()
+    {
+        // No such session, or one opened with another system prompt (another prefix altogether): the caller starts afresh.
+        Assert.False(new Llm().RewindGatewaySession("omniscience-bg-never-started", "system"));
+        var llm = Asked("EVIDENCE …\n\nExtract every claim.");
+        Assert.False(llm.RewindGatewaySession(Id, "another system prompt"));
+        Assert.False(llm.RewindGatewaySession(Id, null));
+        Assert.False(llm.RewindGatewaySession("", "system"));
+        Assert.Equal(2, Session(llm).structuredMessages.Count);
+    }
+
+    [Fact]
+    public void EveryCallOfAFamily_GoesOutWithTheSameToolDefinitions_InTheSameOrder()
+    {
+        var claims = new LlmOutputSchema("emit_claims", "claims", new Newtonsoft.Json.Linq.JObject());
+        var verdicts = new LlmOutputSchema("emit_verdicts", "verdicts", new Newtonsoft.Json.Linq.JObject());
+        var family = new[] { claims, verdicts };
+        LlmRequest Ask(LlmOutputSchema? schema, IReadOnlyList<LlmOutputSchema>? schemas) => new()
+        {
+            Purpose = "test", SessionKey = Id, Turns = new[] { new LlmTurn("user", "q") }, OutputSchema = schema, SchemaFamily = schemas,
+        };
+
+        Assert.Equal(new[] { "emit_claims", "emit_verdicts" }, Llm.GatewaySchemas(Ask(claims, family)).Select(s => s.Name).ToArray());
+        Assert.Equal(new[] { "emit_claims", "emit_verdicts" }, Llm.GatewaySchemas(Ask(verdicts, family)).Select(s => s.Name).ToArray());
+        // Without a family a call sends its own schema alone, as every caller did before.
+        Assert.Equal(new[] { "emit_verdicts" }, Llm.GatewaySchemas(Ask(verdicts, null)).Select(s => s.Name).ToArray());
+        // A schema its family forgot still reaches the model (after the family's).
+        var other = new LlmOutputSchema("emit_other", "other", new Newtonsoft.Json.Linq.JObject());
+        Assert.Equal(new[] { "emit_claims", "emit_verdicts", "emit_other" }, Llm.GatewaySchemas(Ask(other, family)).Select(s => s.Name).ToArray());
+        // A plain-text call has no tools at all: an empty or unforced tool list would let the model call one.
+        Assert.Empty(Llm.GatewaySchemas(Ask(null, family)));
+    }
 }

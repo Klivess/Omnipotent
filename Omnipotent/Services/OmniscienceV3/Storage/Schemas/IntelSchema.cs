@@ -234,6 +234,11 @@ CREATE TRIGGER trg_jobs_last_outcome AFTER UPDATE OF state ON jobs WHEN OLD.stat
   WHERE module_id = NEW.module_id;
 END;
 """),
+            // How much of a call's prompt the provider had been sent before (a later question over the same evidence):
+            // what its cached tokens are measured against. Zero for every call made before this column existed.
+            new Migration(ModuleId, 4, "llm_calls.resent_tokens", """
+ALTER TABLE llm_calls ADD COLUMN resent_tokens INTEGER NOT NULL DEFAULT 0;
+"""),
         };
     }
 }

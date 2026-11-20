@@ -108,11 +108,34 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.All(asks, a => Assert.Equal("low", a.ReasoningEffort));
             Assert.All(asks, a => Assert.Equal(16_000 + 1_500, a.MaxOutputTokens));
 
-            // One reading by default; the critic is asked on the session that already holds the evidence, so its question
-            // travels alone and the model still has the messages in front of it.
+            // One reading by default. The critic is a question of its own on the reading's session: it carries the evidence
+            // (which the provider serves from its cache: the same bytes as the reading, up to the question) and nothing of
+            // the reading's answer, which its question already lists fact by fact.
             var critic = h.Llm.Calls.Where(c => c.Purpose == "deduction.extract" && IsCritic(c.Question)).ToList();
             Assert.NotEmpty(critic);
-            Assert.All(critic, c => { Assert.True(c.TurnInSession > 1); Assert.Contains("EVIDENCE (", c.Prompt); Assert.DoesNotContain("EVIDENCE (", c.Question); });
+            Assert.All(critic, c => { Assert.Equal(1, c.TurnInSession); Assert.Contains("EVIDENCE (", c.Question); Assert.DoesNotContain("\"claims\"", c.Prompt); });
+            var requests = h.Llm.Requests.Where(r => r.Purpose == "deduction.extract").ToList();
+            foreach (var review in requests.Where(r => IsCritic(r.Turns[^1].Content)))
+            {
+                var reading = asks.Single(a => a.SessionKey == review.SessionKey);
+                // The same opening, byte for byte, up to where the two questions begin.
+                string opening = reading.Turns[^1].Content[..^ExtractionPrompt.ExtractQuestion.Length];
+                Assert.StartsWith(opening, review.Turns[^1].Content);
+                // And the same tool definitions ahead of it, whichever of them each must answer with.
+                Assert.Same(reading.SchemaFamily, review.SchemaFamily);
+                Assert.Equal(new[] { "emit_claims", "emit_verdicts" }, review.SchemaFamily!.Select(s => s.Name).ToArray());
+                Assert.Equal(("emit_claims", "emit_verdicts"), (reading.OutputSchema!.Name, review.OutputSchema!.Name));
+                Assert.True(reading.Rewind && review.Rewind && review.KeepSession);
+            }
+            // What stays the same for every slice of the job comes first: the subject and what is known about them, then
+            // the slice's own roster and evidence.
+            Assert.All(asks, a =>
+            {
+                string text = a.Turns[^1].Content;
+                Assert.StartsWith("SUBJECT: ", text);
+                Assert.True(text.IndexOf("KNOWN SO FAR ABOUT THE SUBJECT", StringComparison.Ordinal) < text.IndexOf("ROSTER (", StringComparison.Ordinal));
+                Assert.True(text.IndexOf("ROSTER (", StringComparison.Ordinal) < text.IndexOf("EVIDENCE (", StringComparison.Ordinal));
+            });
 
             // More is left to read, and the person is marked for the next job.
             using var intel = h.Stores.Intel.OpenRead();
@@ -288,10 +311,19 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
                     Assert.Contains("could not be used", retry);
                     Assert.True(s.PrefixSent);
 
-                    // A follow-up after a success travels alone: the provider-side session holds the evidence.
+                    // A follow-up after a success travels alone: the provider-side session holds the evidence and the
+                    // answer it is about.
                     client.Answers.Enqueue(ScriptedLlm.Ok("""{"items":["b"]}"""));
-                    await StructuredLlm.AskAsync(s, "And the rest?", schema, 4_000, null, validate, default);
+                    await StructuredLlm.AskAsync(s, "And the rest?", schema, 4_000, null, validate, default, followUp: true);
                     Assert.Equal("And the rest?", client.Requests[2].Turns[^1].Content);
+                    Assert.False(client.Requests[2].Rewind);
+
+                    // A question of its own carries the evidence again (the provider has it cached) and starts from the
+                    // system prompt, so none of the answers before it is sent back.
+                    client.Answers.Enqueue(ScriptedLlm.Ok("""{"items":["c"]}"""));
+                    await StructuredLlm.AskAsync(s, "List them again.", schema, 4_000, null, validate, default);
+                    Assert.Equal("EVIDENCE one two three\n\nList them again.", client.Requests[3].Turns[^1].Content);
+                    Assert.True(client.Requests[3].Rewind);
                 }
             }
             finally { await CloseAsync(stores, root); }

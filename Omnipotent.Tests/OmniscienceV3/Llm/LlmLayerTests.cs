@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using Microsoft.Data.Sqlite;
+using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveLLM;
 using Omnipotent.Services.OmniscienceV3.Kernel.Jobs;
 using Omnipotent.Services.OmniscienceV3.Knowledge.Policy;
@@ -104,26 +105,117 @@ namespace Omnipotent.Tests.OmniscienceV3.Llm
         }
 
         [Fact]
-        public async Task CacheShapedSession_SendsThePrefixOnceAndEndsTheSession()
+        public async Task CacheShapedSession_AsksEachQuestionOverThePrefix_AndAFollowUpOnTopOfTheAnswers()
         {
             var fake = new FakeClient();
             var llm = new OmniLlm(fake, stores.Intel, clock, new TokenEstimator());
-            using (var s = llm.OpenSession("m", "extract", "omniscience-bg-x", "system", "BIG EVIDENCE PREFIX", AIRouterWorkClass.Background))
+            var schemas = new[] { new LlmOutputSchema("emit_a", "a", new JObject()), new LlmOutputSchema("emit_b", "b", new JObject()) };
+            using (var s = llm.OpenSession("m", "extract", "omniscience-bg-x", "system", Evidence, AIRouterWorkClass.Background, schemas: schemas))
             {
-                await s.AskAsync("question 1", null, 100, null, CancellationToken.None);
-                await s.AskAsync("question 2", null, 100, null, CancellationToken.None);
-                Assert.Equal(2, s.Passes);
+                await s.AskAsync("question 1", schemas[0], 100, null, CancellationToken.None);
+                await s.AskAsync("question 2", schemas[1], 100, null, CancellationToken.None);
+                await s.FollowUpAsync("and why?", schemas[1], 100, null, CancellationToken.None);
+                Assert.Equal(3, s.Passes);
             }
             var reqs = fake.Requests.ToArray();
-            Assert.StartsWith("BIG EVIDENCE PREFIX", reqs[0].Turns[0].Content);
-            Assert.Equal("question 2", reqs[1].Turns[0].Content);
+            // A question of its own is the prefix and the question, asked from the session's system prompt again: what the
+            // provider reads begins with exactly what it read for the question before, and no answer is sent back.
+            Assert.Equal(Evidence + "\n\nquestion 1", reqs[0].Turns[0].Content);
+            Assert.Equal(Evidence + "\n\nquestion 2", reqs[1].Turns[0].Content);
+            Assert.True(reqs[0].Rewind && reqs[1].Rewind);
+            // A follow-up travels alone, on top of the question before it and its answer.
+            Assert.Equal("and why?", reqs[2].Turns[0].Content);
+            Assert.False(reqs[2].Rewind);
+            // Every question carries every schema of the session, whichever one it must answer with: the tool definitions
+            // come before the prefix in what the provider reads, and one that changed would end the match there.
+            Assert.All(reqs, r => Assert.Same(schemas, r.SchemaFamily));
+            Assert.Equal(new[] { "emit_a", "emit_b", "emit_b" }, reqs.Select(r => r.OutputSchema!.Name).ToArray());
             Assert.All(reqs, r => Assert.True(r.KeepSession));
             Assert.All(reqs, r => Assert.Equal(LlmStamp.None, r.Stamp));
             Assert.Equal(new[] { "omniscience-bg-x" }, fake.Ended.ToArray());
+            // What each call sent a second time is kept with it: nothing for the first, the request before it for the rest.
+            using var c = stores.Intel.OpenRead();
+            Assert.Equal(new long[] { 0, 1000, 1000 }, c.Query(null, "SELECT resent_tokens FROM llm_calls ORDER BY call_id", r => r.GetInt64(0)).ToArray());
+        }
+
+        /// <summary>A prefix the size of a small slice of evidence (a question is a line or two beside it).</summary>
+        private static readonly string Evidence = "BIG EVIDENCE PREFIX " + string.Concat(Enumerable.Repeat("[m:1] p3fa2: nothing much happened today. ", 60));
+
+        [Fact]
+        public async Task TwoLongQuestionsInARow_AreNotPassedOffAsOneContinuingTheOther()
+        {
+            var fake = new FakeClient();
+            var llm = new OmniLlm(fake, stores.Intel, clock, new TokenEstimator());
+            string adjudicate = "Decide each disputed claim. " + new string('d', Evidence.Length / 4);
+            string criticise = "Is each fact proven? " + new string('f', Evidence.Length / 4);
+            using (var s = llm.OpenSession("m", "extract", "omniscience-bg-long", "system", Evidence, AIRouterWorkClass.Background))
+            {
+                await s.AskAsync("Extract every claim.", null, 100, null, CancellationToken.None);
+                await s.AskAsync(adjudicate, null, 100, null, CancellationToken.None);
+                // A short question before a long one: the long one begins with nearly all of the short one's request.
+                Assert.Empty(fake.Ended);
+                await s.AskAsync(criticise, null, 100, null, CancellationToken.None);
+                // Two long ones share the evidence and nothing after it. The scheduler would measure the second against the
+                // whole of the first and count a warm prefix as lost, so the second is sent under a cache identity of its
+                // own (the provider still serves the evidence from cache; the scheduler sees a first call and scores nothing).
+                Assert.Equal(new[] { "omniscience-bg-long" }, fake.Ended.ToArray());
+                // After a follow-up the session's last request is the whole conversation: the same goes for whatever is asked next.
+                await s.FollowUpAsync("Why?", null, 100, null, CancellationToken.None);
+                await s.AskAsync("Extract every claim.", null, 100, null, CancellationToken.None);
+                Assert.Single(fake.Ended);
+                await s.FollowUpAsync("Why?", null, 100, null, CancellationToken.None);
+                await s.AskAsync(criticise, null, 100, null, CancellationToken.None);
+                Assert.Equal(2, fake.Ended.Count);
+            }
+            // Every one of them carried the evidence, whichever identity it went under.
+            Assert.All(fake.Requests.Where(r => r.Rewind), r => Assert.StartsWith(Evidence, r.Turns[0].Content));
         }
 
         [Fact]
-        public async Task CacheEfficiency_IsMeasuredPerWorkClassAndGatesBackgroundWork()
+        public async Task AQuestionThatFailed_IsNotFollowedUpWithoutItsEvidence()
+        {
+            int n = 0;
+            var fake = new FakeClient { Respond = (_, _) => ++n == 2 ? new LlmResult(false, "", null, LlmErrorKind.Truncated, "cut off", "length", "Qwen3.8", "AIRouter", 900, 0, 0, 0, 5) : FakeClient.Ok("{}") };
+            var llm = new OmniLlm(fake, stores.Intel, clock, new TokenEstimator());
+            using var s = llm.OpenSession("m", "research", "omniscience-ia-x", "system", "QUESTION AND PEOPLE", AIRouterWorkClass.Interactive);
+            await s.FollowUpAsync("Begin.", null, 100, null, CancellationToken.None);
+            Assert.True(s.PrefixSent);
+            await s.FollowUpAsync("SEARCH RESULTS …", null, 100, null, CancellationToken.None);
+            Assert.False(s.PrefixSent);
+            await s.FollowUpAsync("SEARCH RESULTS again", null, 100, null, CancellationToken.None);
+            var reqs = fake.Requests.ToArray();
+            // Nothing to follow up on yet: the first one is asked over the prefix.
+            Assert.Equal(("QUESTION AND PEOPLE\n\nBegin.", true), (reqs[0].Turns[0].Content, reqs[0].Rewind));
+            Assert.Equal(("SEARCH RESULTS …", false), (reqs[1].Turns[0].Content, reqs[1].Rewind));
+            // The one after a failure starts from the prefix again, instead of being appended to a turn with no answer.
+            Assert.Equal(("QUESTION AND PEOPLE\n\nSEARCH RESULTS again", true), (reqs[2].Turns[0].Content, reqs[2].Rewind));
+        }
+
+        [Fact]
+        public async Task TheEstimator_LearnsOnlyFromRequestsThatHoldTheirWholePrompt()
+        {
+            string evidence = string.Concat(Enumerable.Repeat("The quick brown fox jumps over the lazy dog. ", 400));
+            string followUp = string.Concat(Enumerable.Repeat("Is each of these facts proven by the messages it cites? ", 40));
+            var estimator = new TokenEstimator();
+            // The provider counts what it read: the request's own text for a question over the prefix, and the whole
+            // conversation (prefix, first question, its answer) for a follow-up whose request holds one question.
+            var fake = new FakeClient
+            {
+                Respond = (r, _) => FakeClient.Ok("{}", prompt: (int)TokenEstimator.Raw(r.Rewind ? OmniLlm.PromptText(r) : evidence + OmniLlm.PromptText(r))),
+            };
+            var llm = new OmniLlm(fake, stores.Intel, clock, estimator);
+            using var s = llm.OpenSession("m", "extract", "omniscience-bg-est", "system", evidence, AIRouterWorkClass.Background);
+            await s.AskAsync("Extract every claim.", null, 100, null, CancellationToken.None);
+            double learned = estimator.Factor;
+            Assert.True(learned < 1.15, "an exact count should bring the starting factor down");
+            for (int i = 0; i < 5; i++) await s.FollowUpAsync(followUp, null, 100, null, CancellationToken.None);
+            // Learned from, the follow-ups read as text more than ten times denser than it is, and every prompt packed
+            // afterwards held less than half of what it was sized for.
+            Assert.Equal(learned, estimator.Factor);
+        }
+
+        [Fact]
+        public async Task TheBackgroundGate_JudgesWhatWasSentASecondTime_NotEvidenceReadForTheFirstTime()
         {
             var fake = new FakeClient { Respond = (_, _) => FakeClient.Ok("x", prompt: 10_000, cached: 1_000) };
             var llm = new OmniLlm(fake, stores.Intel, clock, new TokenEstimator());
@@ -131,8 +223,28 @@ namespace Omnipotent.Tests.OmniscienceV3.Llm
             var (eff, n) = llm.CacheEfficiency(TimeSpan.FromHours(1), AIRouterWorkClass.Background.ToString());
             Assert.Equal(25, n);
             Assert.Equal(0.1, eff, 3);
-            Assert.True(new LlmBackgroundGate(llm).ShouldPause());
             Assert.Equal(0, llm.CacheEfficiency(TimeSpan.FromHours(1), AIRouterWorkClass.Interactive.ToString()).Samples);
+            // Twenty-five calls a tenth cached, none of which sent anything a second time: new evidence has to be prefilled
+            // once, and pausing the lane would change nothing about that. (Until 20 Nov 2026 this paused it.)
+            Assert.Equal(0, llm.ResentEfficiency(TimeSpan.FromHours(1), AIRouterWorkClass.Background.ToString()).Samples);
+            Assert.False(new LlmBackgroundGate(llm).ShouldPause());
+
+            // Later questions over a prefix the provider has been sent, and it serves a tenth of them: something in the
+            // prompt stopped matching, or the questions arrive after the prefix is gone. That is what the gate is for.
+            using (var s = llm.OpenSession("m", "p", "omniscience-bg-cold", "system", Evidence, AIRouterWorkClass.Background))
+                for (int i = 0; i < 21; i++) await s.AskAsync("q" + i, null, 100, null, CancellationToken.None);
+            var (resent, samples) = llm.ResentEfficiency(TimeSpan.FromHours(1), AIRouterWorkClass.Background.ToString());
+            Assert.Equal(20, samples);
+            Assert.Equal(0.1, resent, 3);
+            Assert.True(new LlmBackgroundGate(llm).ShouldPause());
+
+            // An hour on, the same questions come back served from cache: the lane runs.
+            clock.Advance(TimeSpan.FromHours(2));
+            fake.Respond = (_, _) => FakeClient.Ok("x", prompt: 10_000, cached: 9_700);
+            using (var s = llm.OpenSession("m", "p", "omniscience-bg-warm", "system", Evidence, AIRouterWorkClass.Background))
+                for (int i = 0; i < 21; i++) await s.AskAsync("q" + i, null, 100, null, CancellationToken.None);
+            Assert.Equal(0.97, llm.ResentEfficiency(TimeSpan.FromHours(1), AIRouterWorkClass.Background.ToString()).Efficiency, 3);
+            Assert.False(new LlmBackgroundGate(llm).ShouldPause());
         }
 
         [Fact]

@@ -60,9 +60,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
     /// <summary>
     /// One extraction job for one tracked person (plan "Extraction"; replaces v2's ExtractionJob, F020–F025, F176–F205).
     /// Uncovered evidence (per message version, on the ingest sequence) is assembled into whole-conversation slices that
-    /// fill the model's real window; each slice is read twice by independent sampled passes that share one cached prefix
-    /// (the second pass is served from AIRouter's prefix cache: a fresh session on the same key and identical bytes), the
-    /// claims only one reading found are adjudicated in the same cohort, everything left is verified deterministically and
+    /// fill the model's real window; each slice is read once, or twice by independent sampled passes that share one cached
+    /// prefix (the second pass is the same bytes on the same session, served from AIRouter's prefix cache), the claims
+    /// only one reading found are adjudicated over that same prefix, everything left is verified deterministically and
     /// then judged by the critic, MinorGuard redacts restricted values before anything is written, and the slice's claims,
     /// age evidence and coverage commit in one transaction. Overflow or truncation splits the slice; a refusal is recorded
     /// as a refusal, never as "no facts".
@@ -216,15 +216,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             string prefix = ExtractionPrompt.Prefix(slice, subjectHandle, profile, extra);
             string sessionKey = "omniscience-bg-deduction-" + NaturalKeys.Sha256Hex(subject + "|" + slice.Index.ToString(CultureInfo.InvariantCulture) + "|" + stats.RunId)[..16];
 
-            // Pass A: its own session.
-            StructuredAnswer<ExtractionAnswer> a;
-            // With one reading only, the critic's question follows on this same session (the evidence is sent once).
-            var s1 = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
-                ExtractionPrompt.Version, run.JobId, options.ReasoningEffort);
-            using var firstSession = s1;
-            a = await StructuredLlm.AskAsync<ExtractionAnswer>(s1, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(1), ExtractionPrompt.Validate, ct).ConfigureAwait(false);
+            // One session for everything asked about this slice. Every question (the reading, a second reading, the
+            // adjudicator, the critic) is a question of its own over the same prefix and says everything it is about, so
+            // each goes out as the prefix plus itself: the provider prefills the evidence once, for the first reading,
+            // and serves it from cache for the rest, and no reading's answer is ever sent back. They all carry the same
+            // schemas, because the tool definitions sit ahead of the evidence in what the provider reads.
+            using var s = Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
+                ExtractionPrompt.Version, run.JobId, options.ReasoningEffort, ExtractionPrompt.Schemas(options.SecondReading));
+            var a = await StructuredLlm.AskAsync<ExtractionAnswer>(s, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(1), ExtractionPrompt.Validate, ct).ConfigureAwait(false);
             stats.LlmCalls += a.Calls;
-            if (options.SecondReading) s1.Dispose();
             if (a.Outcome is StructuredOutcome.Overflow or StructuredOutcome.Truncated)
             {
                 await SplitAsync(subject, slice, profile, budget, estimator, stats, run, sourceSeq, depth).ConfigureAwait(false);
@@ -240,17 +240,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 throw new JobFailureException(ErrorClass.Transient, $"Extraction pass A failed ({a.Outcome}): {a.Problem}");
             stats.Model ??= a.Result?.Model;
 
-            // Pass B (fresh session, same key and bytes: served from the prefix cache), then adjudication and the critic as continuations.
+            // Pass B (the same bytes as pass A, another seed: served from the prefix cache), then adjudication and the critic
+            // (each the prefix and its own question; the session sees to it that a long critic after a long adjudication is
+            // not measured against it by AIRouter's scheduler).
             List<(RawClaim Claim, string Agreement)> agreed;
             var verified = new List<VerifiedClaim>();
             var rejected = new List<RejectedClaim>();
-            using (var s2 = options.SecondReading
-                       ? Llm.OpenSession(KnowledgeSchema.DeductionModule, "deduction.extract", sessionKey, ExtractionPrompt.System, prefix, run.WorkClass,
-                           ExtractionPrompt.Version, run.JobId, options.ReasoningEffort)
-                       : s1)
             {
                 var b = options.SecondReading
-                    ? await StructuredLlm.AskAsync<ExtractionAnswer>(s2, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(2), ExtractionPrompt.Validate, ct).ConfigureAwait(false)
+                    ? await StructuredLlm.AskAsync<ExtractionAnswer>(s, ExtractionPrompt.ExtractQuestion, ExtractionPrompt.ExtractSchema, MaxOutput(), Sampling(2), ExtractionPrompt.Validate, ct).ConfigureAwait(false)
                     : new StructuredAnswer<ExtractionAnswer>(null, StructuredOutcome.Ok, null, null, 0);
                 stats.LlmCalls += b.Calls;
                 var aClaims = a.Value?.Claims ?? new List<RawClaim>();
@@ -266,7 +264,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     agreed = both.Select(c => (c, Agreement.Both)).ToList();
                     if (disputed.Count > 0)
                     {
-                        var adjudication = await StructuredLlm.AskAsync<AdjudicationAnswer>(s2, ExtractionPrompt.AdjudicateQuestion(disputed), ExtractionPrompt.AdjudicateSchema,
+                        var adjudication = await StructuredLlm.AskAsync<AdjudicationAnswer>(s, ExtractionPrompt.AdjudicateQuestion(disputed), ExtractionPrompt.AdjudicateSchema,
                             MaxOutput(), Sampling(3), x => x.Decisions == null ? "No decisions." : null, ct).ConfigureAwait(false);
                         stats.LlmCalls += adjudication.Calls;
                         var decisions = adjudication.Value?.Decisions.Where(d => d.Id != null).GroupBy(d => d.Id!).ToDictionary(g => g.Key, g => g.Last()) ?? new();
@@ -291,7 +289,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 if (toJudge.Count > 0)
                 {
                     var items = toJudge.Select((v, i) => ("f" + (i + 1).ToString(CultureInfo.InvariantCulture), Describe(v, slice), (IReadOnlyList<string>)v.Evidence.Select(e => e.Ref).ToList())).ToList();
-                    var critic = await StructuredLlm.AskAsync<CriticAnswer>(s2, ExtractionPrompt.CriticQuestion(items), ExtractionPrompt.CriticSchema, Math.Min(MaxOutput(), 4_000),
+                    var critic = await StructuredLlm.AskAsync<CriticAnswer>(s, ExtractionPrompt.CriticQuestion(items), ExtractionPrompt.CriticSchema, Math.Min(MaxOutput(), 4_000),
                         Sampling(4), x => x.Verdicts == null ? "No verdicts." : null, ct).ConfigureAwait(false);
                     stats.LlmCalls += critic.Calls;
                     var verdicts = critic.Value?.Verdicts.Where(v => v.Id != null).GroupBy(v => v.Id!).ToDictionary(g => g.Key, g => g.Last()) ?? new();

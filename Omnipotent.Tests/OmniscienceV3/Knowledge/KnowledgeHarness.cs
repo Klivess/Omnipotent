@@ -24,8 +24,9 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
 {
     /// <summary>
     /// A session-aware fake LLM for the knowledge tests. KliveLLM keeps a session's turns provider-side when KeepSession is set;
-    /// this fake does the same (per session key, cleared on EndSession), so a handler sees the whole prompt of a continuation —
-    /// the stable prefix of the first ask plus every later question — exactly as the real model would.
+    /// this fake does the same (per session key, cleared on EndSession and by a request that rewinds), so a handler sees the
+    /// whole prompt the real model would: the prefix and the question for a question of its own, and for a follow-up
+    /// everything asked and answered since.
     /// </summary>
     public sealed class FakeLlm : ILlmClient
     {
@@ -50,7 +51,20 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         /// <summary>Sessions ended by the caller, in order.</summary>
         public readonly ConcurrentQueue<string> Ended = new();
 
-        public Task<LlmResult> QueryAsync(LlmRequest request, CancellationToken ct)
+        /// <summary>One thing the gateway was told, in the order it happened: a question (with how it was answered) or the end
+        /// of a session. <see cref="PrefixCacheReplay"/> rebuilds from it what the provider was sent each time.</summary>
+        public sealed record JournalEntry(string SessionKey, LlmRequest? Request, string? Answer, bool Success);
+
+        public readonly ConcurrentQueue<JournalEntry> Journal = new();
+
+        public async Task<LlmResult> QueryAsync(LlmRequest request, CancellationToken ct)
+        {
+            var result = await AnswerAsync(request).ConfigureAwait(false);
+            Journal.Enqueue(new JournalEntry(request.SessionKey, request, result.StructuredJson ?? result.Text, result.Success));
+            return result;
+        }
+
+        private Task<LlmResult> AnswerAsync(LlmRequest request)
         {
             Requests.Enqueue(request);
             if (Intercept?.Invoke(request) is { } forced)
@@ -66,6 +80,8 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             string question;
             lock (history)
             {
+                // A question of its own over the prefix: the gateway takes the session back to its system prompt first.
+                if (request.Rewind) history.Clear();
                 foreach (var t in request.Turns) history.Add(t.Content);
                 question = request.Turns[^1].Content;
             }
@@ -101,6 +117,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         public void EndSession(string sessionKey)
         {
             Ended.Enqueue(sessionKey);
+            Journal.Enqueue(new JournalEntry(sessionKey, null, null, true));
             sessions.TryRemove(sessionKey, out _);
         }
 

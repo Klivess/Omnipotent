@@ -412,16 +412,21 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                 var order = Shuffle(included, i);
                 string instruction = InquiryPrompts.AnswerInstruction(spec, order) + (req.Framing == null ? "" : "\n" + req.Framing);
                 bool last = i == k - 1;
-                using var s = Llm.OpenSession(KnowledgeSchema.InquiryModule, "inquiry.reason", key, InquiryPrompts.ReasonSystem, prefix, WorkClass(req), InquiryPrompts.ReasonVersion, null);
+                // A session per pass, all with the same key, dossier and schemas: the provider prefills the dossier for the
+                // first pass and serves it from cache for the rest. (Not one session for all: each pass lists the evidence
+                // in its own reading order, and AIRouter's scheduler would measure a pass against the whole of the one
+                // before it, reading order included.)
+                using var s = Llm.OpenSession(KnowledgeSchema.InquiryModule, "inquiry.reason", key, InquiryPrompts.ReasonSystem, prefix, WorkClass(req), InquiryPrompts.ReasonVersion, null,
+                    schemas: InquiryPrompts.ReasonSchemas);
                 var answer = await StructuredLlm.AskAsync<PassAnswer>(s, instruction, InquiryPrompts.ReasonSchema, 3_000, new ModelSamplingParameters(Temperature: i == 0 ? 0.3 : 0.8, Seed: 100 + i),
                     a => a.Probability is null or < 0 or > 1 ? "probability must be between 0 and 1" : null, ct).ConfigureAwait(false);
                 if (answer.Value != null) results.Add(new PassResult(i, answer.Value, answer.Result?.Model));
                 await ctx.ReportAsync(new { stage = "pass", pass = i + 1, of = k, answer = answer.Value?.Answer, probability = answer.Value?.Probability }).ConfigureAwait(false);
                 if (last && results.Count > 0)
                 {
-                    // The devil's advocate argues the opposite inside the same cohort (a continuation of the last pass's session).
+                    // The devil's advocate argues the opposite of the last pass's answer: a follow-up to it, on top of the dossier.
                     var devil = await StructuredLlm.AskAsync<AdvocateAnswer>(s, InquiryPrompts.AdvocateQuestion, InquiryPrompts.AdvocateSchema, 1_500,
-                        new ModelSamplingParameters(Temperature: 0.5, Seed: 999), a => a.Argument == null ? "argument is required" : null, ct).ConfigureAwait(false);
+                        new ModelSamplingParameters(Temperature: 0.5, Seed: 999), a => a.Argument == null ? "argument is required" : null, ct, followUp: true).ConfigureAwait(false);
                     if (devil.Value != null)
                         results.Add(new PassResult(-1, new PassAnswer { Answer = "devil", Reasoning = devil.Value.Argument, EvidenceFor = devil.Value.Cites, Distribution = devil.Value.Strength == null ? null : new() { [devil.Value.Strength] = 1 } },
                             devil.Result?.Model, Devil: true));
@@ -471,8 +476,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                 var info = await Llm.ContextAsync(null, ct).ConfigureAwait(false);
                 int budget = ContextPacker.Budget(info, 4_000) - Llm.Estimator.Estimate(InquiryPrompts.ReasonSystem) - Llm.Estimator.Estimate(InquiryPrompts.ReasonSchema.Schema.ToString()) - 1_500;
                 var (prefix, _) = Dossier(spec, g, Math.Max(2_000, budget), ContextPacker.ByteBudget(info));
-                // Same key and prefix as the passes: the dossier is served from the prefix cache.
-                using var s = Llm.OpenSession(KnowledgeSchema.InquiryModule, "inquiry.verify", SessionKey(ctx, req, "r"), InquiryPrompts.ReasonSystem, prefix, WorkClass(req), InquiryPrompts.VerifyVersion, null);
+                // Same key, prefix and schemas as the passes: the dossier is served from the prefix cache.
+                using var s = Llm.OpenSession(KnowledgeSchema.InquiryModule, "inquiry.verify", SessionKey(ctx, req, "r"), InquiryPrompts.ReasonSystem, prefix, WorkClass(req), InquiryPrompts.VerifyVersion, null,
+                    schemas: InquiryPrompts.ReasonSchemas);
                 var checks = await StructuredLlm.AskAsync<CitationVerdicts>(s, InquiryPrompts.VerifyQuestion(toCheck), InquiryPrompts.VerifySchema, 4_000,
                     new ModelSamplingParameters(Temperature: 0.0, Seed: 1), a => a.Checks == null ? "checks is required" : null, ct).ConfigureAwait(false);
                 if (checks.Value != null)
