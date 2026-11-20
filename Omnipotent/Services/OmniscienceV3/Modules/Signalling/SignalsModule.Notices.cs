@@ -102,11 +102,15 @@ CREATE INDEX ix_sig_notices_person ON sig_notices(person_id);
         }
 
         /// <summary>Notices, newest first, keyset-paged.</summary>
-        public NoticePageDto Notices(AlertState? state, string? kind, string? personId, string? cursor, int limit)
+        public NoticePageDto Notices(AlertState? state, string? kind, string? personId, string? cursor, int limit, Api.ScopeFilter? scope = null)
         {
             limit = Math.Clamp(limit, 1, 200);
             var where = new List<string>();
             var args = new List<(string, object?)>();
+            // The filters every search shares. A notice can be about two people (a relationship): either one counts.
+            if (scope != null)
+                Api.ScopeSql.Apply(scope, new Api.ScopeColumns(Person: "person_id", SecondPerson: "other_person_id", Guild: "guild_id", Conversation: "conversation_id", Time: "occurred_at_ms"),
+                    new Api.ScopeResolver(Context.Stores, Context.Policy), where, args);
             if (state != null) { where.Add("state=$state"); args.Add(("$state", state.Value.ToString().ToLowerInvariant())); }
             if (kind != null) { where.Add("kind=$kind"); args.Add(("$kind", kind)); }
             if (personId != null) { where.Add("(person_id=$person OR other_person_id=$person)"); args.Add(("$person", Context.Policy.Canonical(personId))); }

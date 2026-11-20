@@ -140,11 +140,15 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Signalling
         }
 
         /// <summary>Alerts, newest first, keyset-paged. Texts, names and titles are read from the corpus as it is now.</summary>
-        public AlertPageDto Alerts(AlertState? state, string? kind, string? ruleId, string? personId, string? cursor, int limit)
+        public AlertPageDto Alerts(AlertState? state, string? kind, string? ruleId, string? personId, string? cursor, int limit, Api.ScopeFilter? scope = null)
         {
             limit = Math.Clamp(limit, 1, 200);
             var where = new List<string>();
             var args = new List<(string, object?)>();
+            // The filters every search shares: who it is about, where it was said, and when it last matched.
+            if (scope != null)
+                Api.ScopeSql.Apply(scope, new Api.ScopeColumns(Person: "person_id", Guild: "guild_id", Conversation: "conversation_id", Platform: "platform", Time: "last_hit_ms"),
+                    new Api.ScopeResolver(Context.Stores, Context.Policy), where, args);
             if (state != null) { where.Add("state=$state"); args.Add(("$state", state.Value.ToString().ToLowerInvariant())); }
             if (kind != null) { where.Add("kind=$kind"); args.Add(("$kind", kind)); }
             if (ruleId != null) { where.Add("rule_id=$rule"); args.Add(("$rule", ruleId)); }

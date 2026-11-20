@@ -149,6 +149,12 @@ CREATE INDEX ix_link_urls_kind ON link_urls(kind, last_shared_ms DESC);
 CREATE INDEX ix_link_urls_topic ON link_urls(topic, last_shared_ms DESC) WHERE topic IS NOT NULL;
 CREATE INDEX ix_link_urls_host ON link_urls(host, last_shared_ms DESC);
 """),
+            // Search by where a link was shared (20 Nov 2026: the filters every search shares). A person's shares could
+            // already be read newest first; a conversation's and a server's could only be found by walking every share.
+            new Migration(ModuleId, 4, "search: shares newest first by conversation and by server", """
+CREATE INDEX ix_link_shares_conversation ON link_shares(conversation_id, at_ms);
+CREATE INDEX ix_link_shares_guild ON link_shares(guild_id, at_ms);
+"""),
         };
 
         internal ModuleContext Ctx => Context;

@@ -168,19 +168,65 @@ namespace Omnipotent.Services.OmniscienceV3.Api
         /// <summary>
         /// The people directory (F005/F545): one index range read of <c>projection_people</c> per page, keyset on (sort value, id).
         /// <c>q</c> searches current and past names on every platform (prefix, accent- and case-folded).
+        /// <para>Filters, all optional: <c>tiers</c> and <c>platforms</c> (any of), <c>guilds</c> and <c>conversations</c>
+        /// (people who have written there, any of), <c>seenFrom</c>/<c>seenTo</c> (when they were last seen),
+        /// <c>minMessages</c>/<c>maxMessages</c>, and <c>bands</c> (age bands, any of).</para>
         /// </summary>
         private DirectoryPageDto Directory(ApiQuery q)
         {
             var rt = host.Require();
             var sort = q.Enum<DirectorySort>("sort") ?? DirectorySort.LastSeen;
-            string? tier = q.Str("tier", 32), platform = q.Str("platform", 32), search = q.Str("q", 100), cursor = q.Str("cursor", 300);
+            string? search = q.Str("q", 100), cursor = q.Str("cursor", 300);
             int limit = q.Int("limit", 50, 1, 200);
             string column = sort switch { DirectorySort.Messages => "msgs_total", DirectorySort.Recent => "msgs_30d", DirectorySort.Name => "sort_name", _ => "last_seen_ms" };
             bool ascending = sort == DirectorySort.Name;
             var where = new List<string>();
             var args = new List<(string, object?)>();
-            if (tier != null) { where.Add("tier=$tier"); args.Add(("$tier", tier)); }
-            if (platform != null) { where.Add("(',' || platforms || ',') LIKE $pl"); args.Add(("$pl", "%," + platform.ToLowerInvariant() + ",%")); }
+
+            IReadOnlyList<string> Many(string list, string? single)
+            {
+                var values = q.List(list, ScopeFilter.MaxValues).ToList();
+                if (single != null && q.Str(single, 64) is { } one) values.Add(one);
+                return values.Distinct(StringComparer.Ordinal).ToList();
+            }
+            var tiers = Many("tiers", "tier");
+            if (tiers.Count > 0)
+            {
+                var (list, inArgs) = SqlHelpers.InList(tiers, "$tier");
+                where.Add($"tier IN ({list})");
+                args.AddRange(inArgs);
+            }
+            var platforms = Many("platforms", "platform").Select(p => p.ToLowerInvariant()).Distinct(StringComparer.Ordinal).ToList();
+            if (platforms.Count > 0)
+            {
+                // The row keeps a person's platforms as one comma-separated text.
+                where.Add("(" + string.Join(" OR ", platforms.Select((_, i) => $"(',' || platforms || ',') LIKE $pl{i} ESCAPE '\\'")) + ")");
+                for (int i = 0; i < platforms.Count; i++) args.Add(("$pl" + i, "%," + platforms[i].Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + ",%"));
+            }
+            var bands = Many("bands", null);
+            if (bands.Count > 0)
+            {
+                var (list, inArgs) = SqlHelpers.InList(bands, "$band");
+                where.Add($"band IN ({list})");
+                args.AddRange(inArgs);
+            }
+            var (seenFrom, seenTo) = q.Window("seenFrom", "seenTo");
+            if (seenFrom != null) { where.Add("last_seen_ms >= $seenFrom"); args.Add(("$seenFrom", seenFrom)); }
+            if (seenTo != null) { where.Add("last_seen_ms < $seenTo"); args.Add(("$seenTo", seenTo)); }
+            if (q.Long("minMessages") is { } min) { where.Add("msgs_total >= $minMsgs"); args.Add(("$minMsgs", min)); }
+            if (q.Long("maxMessages") is { } max) { where.Add("msgs_total <= $maxMsgs"); args.Add(("$maxMsgs", max)); }
+
+            var guilds = q.List("guilds", ScopeFilter.MaxValues);
+            var conversations = q.List("conversations", ScopeFilter.MaxValues);
+            if (guilds.Count > 0 || conversations.Count > 0)
+            {
+                // Who has written in any of these places: the daily rollups already name them, so no message is read.
+                var there = WroteIn(rt.Stores, guilds, conversations);
+                if (there.Count == 0) return new DirectoryPageDto(Array.Empty<ProjectionModule.PersonCardDto>(), null, null);
+                var (list, inArgs) = SqlHelpers.InList(there, "$in");
+                where.Add($"person_id IN ({list})");
+                args.AddRange(inArgs);
+            }
             if (search != null)
             {
                 string folded = ProjectionModule.SortName(search);
@@ -215,6 +261,34 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             var cards = page.Select(p => JsonSerializer.Deserialize<ProjectionModule.PersonCardDto>(p.Card, Kernel.Jobs.KernelJson.Options)!).ToList();
             string? next = rows.Count > limit ? page[^1].Sort + "|" + page[^1].Id : null;
             return new DirectoryPageDto(cards, next, page.Count == 0 ? null : page.Max(p => p.AsOf));
+        }
+
+        /// <summary>How many people a "has written in" filter names at most (the most active there first).</summary>
+        public const int MaxWroteIn = 20_000;
+
+        /// <summary>
+        /// Everyone who has written in any of these servers or conversations, the most active there first, read from the
+        /// daily rollups of each place (one row per place and day, each naming who wrote that day).
+        /// </summary>
+        public static List<string> WroteIn(Storage.OmniscienceStores stores, IReadOnlyList<string> guilds, IReadOnlyList<string> conversations)
+        {
+            var counts = new Dictionary<string, long>(StringComparer.Ordinal);
+            using var c = stores.Intel.OpenRead();
+            void Read(string scope, IReadOnlyList<string> keys)
+            {
+                foreach (string key in keys)
+                    foreach (string json in c.Query(null, "SELECT persons FROM rollup_scope_day WHERE scope=$s AND key=$k", r => r.GetString(0), ("$s", scope), ("$k", key)))
+                    {
+                        Dictionary<string, int>? day;
+                        try { day = JsonSerializer.Deserialize<Dictionary<string, int>>(json); }
+                        catch (JsonException) { continue; } // a day that cannot be read names nobody
+                        if (day == null) continue;
+                        foreach (var (person, n) in day) counts[person] = counts.GetValueOrDefault(person) + n;
+                    }
+            }
+            Read("guild", guilds);
+            Read("conversation", conversations);
+            return counts.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Take(MaxWroteIn).Select(kv => kv.Key).ToList();
         }
 
         private Task Get(string path, PermissionDef permission, Func<UserRequest, Task> handler, CancellationToken ct) =>

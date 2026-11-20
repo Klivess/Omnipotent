@@ -148,6 +148,7 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             await new InsightsRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
             await new DataControlsRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
             await new LinksRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
+            await new LookupRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
             await new TranslateRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
             await new MonitorsRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);
             await new Knowledge.Api.KnowledgeRoutes(host, registrar).RegisterAsync(ct).ConfigureAwait(false);

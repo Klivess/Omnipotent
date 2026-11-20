@@ -100,15 +100,19 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             // An attachment's bytes, by attachment id. Whoever may read messages may see what was attached to them.
             await Get("media/file", OmnisciencePerms.MessagesRead, req => ServeMediaAsync(req, thumbnail: false), ct).ConfigureAwait(false);
             await Get("media/thumb", OmnisciencePerms.MessagesRead, req => ServeMediaAsync(req, thumbnail: true), ct).ConfigureAwait(false);
-            // Visual search (N2): images by how they look and by what their captions and the text in them say.
+            // Visual search (N2): images by how they look and by what their captions and the text in them say. Filters: the
+            // shared ones (ScopeFilter: who, platform, server, conversation, place, when) and what the image is: kinds,
+            // formats, hasText, deleted, nsfw (each true for "only these", false for "leave these out").
             await Get("media/search", OmnisciencePerms.MessagesRead, async req =>
             {
                 var q = ApiQuery.Of(req);
-                var (from, to) = q.Window();
                 var module = host.Require().Host.Modules.OfType<Ingest.Media.MediaVisualModule>().FirstOrDefault()
                              ?? throw ApiException.Unavailable(ApiErrors.Unavailable, "Visual search is not part of this build.");
-                var result = await module.SearchAsync(new Ingest.Media.MediaSearchQuery(q.Required("q", 300), q.Str("person", 256), q.Str("conversation", 256), from, to,
-                    q.Int("limit", 40, 1, 100)), host.Stopping).ConfigureAwait(false);
+                var result = await module.SearchAsync(new Ingest.Media.MediaSearchQuery(q.Required("q", 300), Limit: q.Int("limit", 40, 1, 100))
+                {
+                    Filter = ScopeFilter.Parse(q, singlePerson: new[] { "person" }, singleConversation: new[] { "conversation" }),
+                    ImageKinds = q.List("kinds", 20), ImageFormats = q.List("formats", 20), HasText = q.Bool("hasText"), Deleted = q.Bool("deleted"), Nsfw = q.Bool("nsfw"),
+                }, host.Stopping).ConfigureAwait(false);
                 await ApiResponses.OkAsync(req, result).ConfigureAwait(false);
             }, ct).ConfigureAwait(false);
         }

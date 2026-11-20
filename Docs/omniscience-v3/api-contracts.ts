@@ -1552,6 +1552,29 @@ export interface LlmSummaryRowDto {
   lastAtMs?: number | null;
 }
 
+export interface LookupLabelsDto {
+  persons: Record<string, string>;
+  guilds: Record<string, string>;
+  conversations: Record<string, string>;
+}
+
+export interface LookupOptionDto {
+  id: string;
+  label: string;
+  detail?: string | null;
+  platform?: string | null;
+  kind?: string | null;
+  groupId?: string | null;
+  groupLabel?: string | null;
+  count?: number | null;
+  lastMs?: number | null;
+}
+
+export interface LookupPageDto {
+  items: LookupOptionDto[];
+  truncated: boolean;
+}
+
 export interface MapPointDto {
   personId: string;
   name?: string | null;

@@ -291,11 +291,32 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
         public sealed record InquiryRow(string InquiryId, string RunId, string TacticKey, string Question, string? Restatement, string AnswerType, string? PrimarySubjectId, long AsOfMs,
             string? Verdict, double? Probability, string State, string? Feedback, string? StandingId, long CreatedAtMs);
 
-        public (IReadOnlyList<InquiryRow> Items, string? NextCursor) Page(string? personId, string? state, string? standingId, long? fromMs, long? toMs, string? cursor, int limit)
+        public (IReadOnlyList<InquiryRow> Items, string? NextCursor) Page(string? personId, string? state, string? standingId, long? fromMs, long? toMs, string? cursor, int limit,
+            IReadOnlyList<string>? persons = null, string? words = null, IReadOnlyList<string>? verdicts = null)
         {
             var where = new List<string>();
             var args = new List<(string, object?)>();
             if (personId != null) { where.Add("primary_subject_id=$p"); args.Add(("$p", kit.Corpus.Canonical(personId))); }
+            if (persons is { Count: > 0 })
+            {
+                var (list, inArgs) = Modules.SqlHelpers.InList(persons.Select(kit.Corpus.Canonical).Distinct(StringComparer.Ordinal).ToList(), "$ps");
+                where.Add($"primary_subject_id IN ({list})");
+                args.AddRange(inArgs);
+            }
+            if (verdicts is { Count: > 0 })
+            {
+                var (list, inArgs) = Modules.SqlHelpers.InList(verdicts.ToList(), "$vd");
+                where.Add($"verdict IN ({list})");
+                args.AddRange(inArgs);
+            }
+            // Every word asked for must be in the question as it was asked or as it was understood.
+            int wordIndex = 0;
+            foreach (string word in (words ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).Take(8))
+            {
+                string name = "$w" + wordIndex++;
+                where.Add($"(question LIKE {name} ESCAPE '\\' OR COALESCE(restatement,'') LIKE {name} ESCAPE '\\')");
+                args.Add((name, "%" + word.Replace("\\", "\\\\").Replace("%", "\\%").Replace("_", "\\_") + "%"));
+            }
             if (state != null) { where.Add("state=$s"); args.Add(("$s", state)); }
             if (standingId != null) { where.Add("standing_id=$sq"); args.Add(("$sq", standingId)); }
             if (fromMs is long f) { where.Add("created_at_ms >= $f"); args.Add(("$f", f)); }

@@ -64,13 +64,36 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
     public sealed record MediaSearchDto(string Query, IReadOnlyList<MediaSearchHitDto> Hits, bool VisualAvailable, long ImagesEmbedded, string? Note);
 
     /// <summary>What a visual search asks for. Every filter is optional.</summary>
-    public sealed record MediaSearchQuery(string Text, string? PersonId = null, string? ConversationId = null, long? FromMs = null, long? ToMs = null, int Limit = 40);
+    public sealed record MediaSearchQuery(string Text, string? PersonId = null, string? ConversationId = null, long? FromMs = null, long? ToMs = null, int Limit = 40)
+    {
+        /// <summary>The filters every search shares (who, platform, server, conversation, kind of place, when). They add to the single person, conversation and window above.</summary>
+        public ScopeFilter? Filter { get; init; }
+        /// <summary>What the caption model took the image to be: any of <see cref="Kinds"/>. An image with no caption yet has no kind and is left out.</summary>
+        public IReadOnlyList<string>? ImageKinds { get; init; }
+        /// <summary>File formats: any of <see cref="Formats"/>.</summary>
+        public IReadOnlyList<string>? ImageFormats { get; init; }
+        /// <summary>True: only images with text read from them. False: only images without.</summary>
+        public bool? HasText { get; init; }
+        /// <summary>True: only images whose message was deleted at the source. False: leave those out.</summary>
+        public bool? Deleted { get; init; }
+        /// <summary>True: only images the caption model marked as not safe for work. False: leave those out.</summary>
+        public bool? Nsfw { get; init; }
+
+        public static readonly IReadOnlyList<string> Kinds = new[] { "photo", "screenshot", "meme", "drawing", "chart", "document", "other" };
+
+        /// <summary>The formats a search can be narrowed to, and the media types each one covers.</summary>
+        public static readonly IReadOnlyDictionary<string, string[]> Formats = new Dictionary<string, string[]>(StringComparer.Ordinal)
+        {
+            ["png"] = new[] { "image/png" }, ["jpeg"] = new[] { "image/jpeg", "image/jpg" }, ["gif"] = new[] { "image/gif" }, ["webp"] = new[] { "image/webp" },
+        };
+    }
 
     /// <summary>
     /// Visual search (plan N2): every stored image gets a local CLIP embedding (Ml/Vision, run on this machine; nothing leaves
     /// it), so a description ("the screenshot of the trade") finds images by how they look. That ranking is fused with matches
-    /// in the images' captions and in the text read from them. Filters: who posted it, the conversation and when. Images posted
-    /// by someone whose analysis is switched off, or who is or may be a minor, are neither embedded nor returned.
+    /// in the images' captions and in the text read from them. Filters: who posted it, on which platform, in which server and
+    /// conversation, when, and what the image is (its kind, its format, whether it has text in it). Images posted by someone
+    /// whose analysis is switched off, or who is or may be a minor, are neither embedded nor returned.
     /// </summary>
     public sealed class MediaVisualModule : IntelModuleBase, IDisposable
     {
@@ -276,19 +299,20 @@ END;
             if (text.Length == 0) throw ApiException.BadRequest("Describe what to look for ('q').");
             if (text.Length > 300) text = text[..300];
             int limit = Math.Clamp(query.Limit, 1, 100);
-            var scope = Scope(query);
+            var (scope, without) = Scope(query);
             var off = AnalysisOff.Load(Context.Stores);
 
             long embedded = Embedded;
             bool visual = embedder != null && Context.Vectors != null && embedded > 0;
             var looks = new List<string>();
-            if (visual)
+            // A filter that leaves no image to look at is answered without asking the model anything.
+            if (visual && scope is not { Count: 0 })
             {
                 var vector = (await embedder!.EmbedTextsAsync(new[] { text }, ct).ConfigureAwait(false))[0];
                 looks = Context.Vectors!.Search(VectorSpaces.Image, embedder.ModelVersion, vector, Math.Min(500, limit * 5),
-                    scope == null ? null : new VectorFilter(Candidates: scope)).Select(h => h.ItemId).ToList();
+                    scope == null && without == null ? null : new VectorFilter(Candidates: scope, Accept: without == null ? null : id => !without.Contains(id))).Select(h => h.ItemId).ToList();
             }
-            var words = WordMatches(text, scope, limit * 5);
+            var words = WordMatches(text, scope, without, limit * 5);
 
             // Reciprocal-rank fusion of the two rankings.
             var score = new Dictionary<string, double>(StringComparer.Ordinal);
@@ -312,34 +336,91 @@ END;
             return new MediaSearchDto(text, hits, visual, embedded, note);
         }
 
-        /// <summary>The images a filtered search may return (the newest when there are very many); null when nothing is filtered.</summary>
-        private HashSet<string>? Scope(MediaSearchQuery q)
+        /// <summary>
+        /// What a filtered search may return: the images it is limited to (the newest when there are very many; null when
+        /// nothing limits it), and the images it must leave out (null when there are none).
+        /// <para>Who, where, when, the format and "deleted" are read from the corpus. The kind of image, whether it has text
+        /// and "not safe for work" are what the caption and text-reading models recorded, so an image they have not reached
+        /// yet matches none of those.</para>
+        /// </summary>
+        private (HashSet<string>? Only, HashSet<string>? Without) Scope(MediaSearchQuery q)
         {
-            if (q.PersonId == null && q.ConversationId == null && q.FromMs == null && q.ToMs == null) return null;
+            var filter = q.Filter ?? ScopeFilter.None;
+            if (q.PersonId != null) filter = filter with { Persons = filter.Persons.Append(q.PersonId).Distinct(StringComparer.Ordinal).ToList() };
+            if (q.ConversationId != null) filter = filter with { Conversations = filter.Conversations.Append(q.ConversationId).Distinct(StringComparer.Ordinal).ToList() };
+            if (q.FromMs != null) filter = filter with { FromMs = q.FromMs };
+            if (q.ToMs != null) filter = filter with { ToMs = q.ToMs };
+            var kinds = (q.ImageKinds ?? Array.Empty<string>()).Select(k => k.Trim().ToLowerInvariant()).Where(k => k.Length > 0).Distinct(StringComparer.Ordinal).ToList();
+            foreach (string kind in kinds)
+                if (!MediaSearchQuery.Kinds.Contains(kind)) throw ApiException.BadRequest($"An image kind must be one of: {string.Join(", ", MediaSearchQuery.Kinds)}.");
+            var formats = (q.ImageFormats ?? Array.Empty<string>()).Select(f => f.Trim().ToLowerInvariant()).Where(f => f.Length > 0).Distinct(StringComparer.Ordinal).ToList();
+            foreach (string format in formats)
+                if (!MediaSearchQuery.Formats.ContainsKey(format)) throw ApiException.BadRequest($"An image format must be one of: {string.Join(", ", MediaSearchQuery.Formats.Keys)}.");
+
+            HashSet<string>? only = null, without = null;
+            void Keep(IEnumerable<string> ids)
+            {
+                if (only == null) only = ids.ToHashSet(StringComparer.Ordinal);
+                else only.IntersectWith(ids);
+            }
+            void Drop(IEnumerable<string> ids) => (without ??= new HashSet<string>(StringComparer.Ordinal)).UnionWith(ids);
+
+            // What the models recorded about the images. Each read starts from the index on the label's task.
+            if (kinds.Count > 0 || q.HasText != null || q.Nsfw != null)
+            {
+                using var intel = Context.Stores.Intel.OpenRead();
+                if (kinds.Count > 0)
+                    Keep(intel.QueryIn(null, "SELECT item_id FROM labels WHERE task='caption' AND label IN ({keys}) AND item_kind='attachment' AND abstained=0", kinds, r => r.GetString(0)));
+                if (q.HasText != null)
+                {
+                    var withText = intel.Query(null, """
+                        SELECT item_id FROM labels WHERE task='ocr' AND item_kind='attachment' AND abstained=0
+                          AND json_valid(signals_json) AND COALESCE(json_extract(signals_json,'$.text'),'') <> ''
+                        """, r => r.GetString(0));
+                    if (q.HasText == true) Keep(withText);
+                    else Drop(withText);
+                }
+                if (q.Nsfw != null)
+                {
+                    var marked = intel.Query(null, """
+                        SELECT item_id FROM labels WHERE task='caption' AND item_kind='attachment' AND abstained=0
+                          AND json_valid(signals_json) AND json_extract(signals_json,'$.nsfw') = 1
+                        """, r => r.GetString(0));
+                    if (q.Nsfw == true) Keep(marked);
+                    else Drop(marked);
+                }
+                if (only is { Count: 0 }) return (only, null);
+            }
+
+            if (filter.IsEmpty && formats.Count == 0 && q.Deleted == null) return (only, without);
+
             var where = new List<string> { "a.media_kind='image'", "a.download_state='done'" };
             var args = new List<(string, object?)>();
-            if (q.ConversationId != null) { where.Add("m.conversation_id=$c"); args.Add(("$c", q.ConversationId)); }
-            if (q.FromMs != null) { where.Add("m.sent_at_ms >= $f"); args.Add(("$f", q.FromMs)); }
-            if (q.ToMs != null) { where.Add("m.sent_at_ms < $t"); args.Add(("$t", q.ToMs)); }
-            using var c = Context.Stores.Corpus.OpenRead();
-            if (q.PersonId != null)
+            ScopeSql.Apply(filter, new ScopeColumns(Person: "i.person_id", Guild: "m.guild_id", Conversation: "m.conversation_id", Platform: "m.platform", Time: "m.sent_at_ms", Kind: "cv.kind"),
+                new ScopeResolver(Context.Stores, Context.Policy), where, args);
+            // Naming a server also says "in a server", which is what lets the index of server messages (a partial one) be used.
+            if (filter.Guilds.Count > 0) where.Add("m.guild_id IS NOT NULL");
+            if (formats.Count > 0)
             {
-                string person = Context.Policy.Canonical(q.PersonId);
-                var people = c.Query(null, "SELECT person_id FROM person_canonical WHERE canonical_id=$p", r => r.GetString(0), ("$p", person)).Append(person).Distinct().ToList();
-                var (list, inArgs) = Modules.SqlHelpers.InList(people, "$p");
-                where.Add($"i.person_id IN ({list})");
+                var (list, inArgs) = Modules.SqlHelpers.InList(formats.SelectMany(f => MediaSearchQuery.Formats[f]).ToList(), "$mime");
+                where.Add($"lower(a.mime) IN ({list})");
                 args.AddRange(inArgs);
             }
-            return c.Query(null, $"""
-                SELECT a.attachment_id FROM attachments a JOIN messages m ON m.message_id = a.message_id LEFT JOIN identities i ON i.identity_id = m.author_identity_id
+            if (q.Deleted != null) where.Add(q.Deleted == true ? "m.deleted_at_ms IS NOT NULL" : "m.deleted_at_ms IS NULL");
+            string places = filter.Places.Count > 0 ? " JOIN conversations cv ON cv.conversation_id = m.conversation_id" : "";
+            using var c = Context.Stores.Corpus.OpenRead();
+            Keep(c.Query(null, $"""
+                SELECT a.attachment_id FROM attachments a JOIN messages m ON m.message_id = a.message_id LEFT JOIN identities i ON i.identity_id = m.author_identity_id{places}
                 WHERE {string.Join(" AND ", where)} ORDER BY m.sent_at_ms DESC LIMIT {MaxScope}
-                """, r => r.GetString(0), args.ToArray()).ToHashSet(StringComparer.Ordinal);
+                """, r => r.GetString(0), args.ToArray()));
+            return (only, without);
         }
 
         /// <summary>Images whose caption, tags or read text contain the query's words, best match first (the full-text index
         /// ranks them: more of the words, and rarer ones, come first). A word also matches the words it begins.</summary>
-        private List<(string Id, string Where)> WordMatches(string text, HashSet<string>? scope, int limit)
+        private List<(string Id, string Where)> WordMatches(string text, HashSet<string>? scope, HashSet<string>? without, int limit)
         {
+            if (scope is { Count: 0 }) return new();
             var terms = text.ToLowerInvariant().Split(new[] { ' ', ',', '.', '!', '?', ';', ':', '"', '\'', '(', ')', '*', '^', '-', '+', '{', '}', '[', ']', '/', '\\' }, StringSplitOptions.RemoveEmptyEntries)
                 .Where(t => t.Length >= 2 && t.Any(char.IsLetterOrDigit)).Distinct(StringComparer.Ordinal).Take(6).ToList();
             if (terms.Count == 0) return new();
@@ -348,12 +429,13 @@ END;
             List<(string Id, string Task)> rows;
             using (var c = Context.Stores.Intel.OpenRead())
                 rows = c.Query(null, "SELECT item_id, task FROM media_words WHERE media_words MATCH $q ORDER BY bm25(media_words) LIMIT $l",
-                    r => (r.GetString(0), r.GetString(1)), ("$q", match), ("$l", scope == null ? limit * 2 : 5_000));
+                    r => (r.GetString(0), r.GetString(1)), ("$q", match), ("$l", scope == null && without == null ? limit * 2 : 5_000));
             var best = new List<(string Id, string Where)>();
             var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var (id, task) in rows)
             {
                 if (scope != null && !scope.Contains(id)) continue;
+                if (without != null && without.Contains(id)) continue;
                 if (!seen.Add(id)) continue;
                 best.Add((id, task == "caption" ? "the caption says so" : "the text in it says so"));
                 if (best.Count >= limit) break;

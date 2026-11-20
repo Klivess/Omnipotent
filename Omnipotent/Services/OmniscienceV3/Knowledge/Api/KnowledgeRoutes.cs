@@ -364,7 +364,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                 var (from, to) = q.Window();
                 try
                 {
-                    var (items, next) = Module<InquiryModule>().Page(q.Str("person", 256), q.Str("state", 32), q.Str("standing", 128), from, to, q.Str("cursor", 128), q.Int("limit", 50, 1, 500));
+                    var (items, next) = Module<InquiryModule>().Page(q.Str("person", 256), q.Str("state", 32), q.Str("standing", 128), from, to, q.Str("cursor", 128), q.Int("limit", 50, 1, 500),
+                        q.List("persons", ScopeFilter.MaxValues), q.Str("q", 200), q.List("verdicts", 10));
                     return ApiResponses.OkAsync(req, new InquiryPageDto(items.Select(i => new InquiryRowDto(i.InquiryId, i.RunId, i.TacticKey, i.Question, i.Restatement, i.AnswerType, i.PrimarySubjectId,
                         i.AsOfMs, i.Verdict, i.Probability, i.State, i.Feedback, i.StandingId, i.CreatedAtMs)).ToList(), next));
                 }

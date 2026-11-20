@@ -29,18 +29,24 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                 return ApiResponses.OkAsync(req, Guard(() => Module.PersonLinks(q.Required("personId", 200), q.Int("days", 90, 1, 3650), q.Int("limit", 30, 1, 200))));
             }, ct).ConfigureAwait(false);
 
+            // Filters: the shared ones (ScopeFilter: who, platform, server, conversation, place, when), and any of several
+            // sites, kinds and topics. The one-value "personId", "site", "kind" and "topic" still work.
             await Get("links/search", OmnisciencePerms.MessagesRead, req =>
             {
                 var q = ApiQuery.Of(req);
-                long? Ms(string name) => long.TryParse(q.Str(name, 20), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out long v) ? v : null;
-                return ApiResponses.OkAsync(req, Guard(() => Module.Search(q.Str("q", 200), q.Str("personId", 200), q.Str("site", 200), q.Str("kind", 20), q.Str("topic", 20), Ms("from"), Ms("to"),
-                    q.Int("limit", 50, 1, 500))));
+                IReadOnlyList<string> Many(string list, string single) => q.Str(single, 200) is { } one ? q.List(list, ScopeFilter.MaxValues).Append(one).ToList() : q.List(list, ScopeFilter.MaxValues);
+                var filter = ScopeFilter.Parse(q, singlePerson: new[] { "personId" });
+                return ApiResponses.OkAsync(req, Guard(() => Module.Search(new LinkSearchQuery(q.Str("q", 200), q.Int("limit", 50, 1, 500))
+                {
+                    Filter = filter, Sites = Many("sites", "site"), Kinds = Many("kinds", "kind"), Topics = Many("topics", "topic"),
+                })));
             }, ct).ConfigureAwait(false);
 
             await Get("links/track", OmnisciencePerms.MessagesRead, req =>
             {
                 var q = ApiQuery.Of(req);
-                return ApiResponses.OkAsync(req, Guard(() => Module.Track(q.Str("url", 2000), q.Str("site", 200), limit: q.Int("limit", 200, 1, 1000))));
+                var filter = ScopeFilter.Parse(q);
+                return ApiResponses.OkAsync(req, Guard(() => Module.Track(q.Str("url", 2000), q.Str("site", 200), limit: q.Int("limit", 200, 1, 1000), scope: filter)));
             }, ct).ConfigureAwait(false);
         }
 

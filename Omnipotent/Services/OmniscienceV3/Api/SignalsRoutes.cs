@@ -71,8 +71,9 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             await Get("signals/alerts", OmnisciencePerms.PersonsRead, req =>
             {
                 var q = ApiQuery.Of(req);
+                var scope = ScopeFilter.Parse(q);
                 return ApiResponses.OkAsync(req, Guard(() => Signals.Alerts(q.Enum<AlertState>("state"), q.Str("kind", 16), q.Str("rule", 64), q.Str("person", 200), q.Str("cursor", 400),
-                    q.Int("limit", 50, 1, 200))));
+                    q.Int("limit", 50, 1, 200), scope)));
             }, ct).ConfigureAwait(false);
 
             await Post("signals/alerts/state", OmniscienceV3Perms.AlertsManage, async req =>
@@ -102,7 +103,9 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             await Get("signals/notices", OmnisciencePerms.PersonsRead, req =>
             {
                 var q = ApiQuery.Of(req);
-                return ApiResponses.OkAsync(req, Guard(() => Signals.Notices(q.Enum<AlertState>("state"), q.Str("kind", 32), q.Str("person", 200), q.Str("cursor", 400), q.Int("limit", 50, 1, 200))));
+                var scope = ScopeFilter.Parse(q);
+                return ApiResponses.OkAsync(req, Guard(() => Signals.Notices(q.Enum<AlertState>("state"), q.Str("kind", 32), q.Str("person", 200), q.Str("cursor", 400), q.Int("limit", 50, 1, 200),
+                    scope)));
             }, ct).ConfigureAwait(false);
 
             await Post("signals/notices/state", OmniscienceV3Perms.AlertsManage, async req =>
