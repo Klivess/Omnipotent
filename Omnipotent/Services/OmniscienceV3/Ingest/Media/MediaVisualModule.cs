@@ -124,7 +124,6 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
             SubscribedChangeKinds = new[] { ChangeKinds.AttachmentStored },
             Schedules = new[] { new ScheduleTrigger("sweep", Every: TimeSpan.FromMinutes(30)) },
             DefaultLane = Lane.Cpu,
-            MinorRestricted = true,
             Settings = new[]
             {
                 new SettingDescriptor(EnabledSetting, SettingTypes.Bool, "true", "Embed stored images with the local CLIP model for visual search (downloads 155 MB of model files once)."),

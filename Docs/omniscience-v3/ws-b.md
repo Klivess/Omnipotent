@@ -1,5 +1,8 @@
 # WS-B — Knowledge, deduction & inquiry (progress)
 
+> **Removed features (2026-11-21):** the minor-safety guard and the sensitive-trait inference ban are gone; the age
+> band is informational. Historical references below describe the code before removal. See [safety-removals.md](safety-removals.md).
+
 Branch `claude/omniscience-v3-ws-b-49da68` (worktree `.claude/worktrees/omniscience-v3-ws-b-49da68`), cut from Phase 1 (ac223e6).
 Charter: [workstreams.md](workstreams.md). Status of every traceability row of these areas: [traceability.md](traceability.md).
 
@@ -12,7 +15,7 @@ Charter: [workstreams.md](workstreams.md). Status of every traceability row of t
 | `Prompting/` | `StructuredLlm` (schema → parse → validate → one retry on the cached prefix) |
 | `Deduction/` | extraction pipeline, verifier, consolidator, critic, detective, calibration, the `knowledge.deduction` module |
 | `Entities/` | aliases, entities, relations, identity links (X67), merges, the `knowledge.identity` module |
-| `Policy/EvidencePolicyOracle.cs` | age evidence → MinorGuard band (stricter, never looser) |
+| `Policy/EvidencePolicyOracle.cs` | age evidence → age band (informational only) |
 | `Timeline/`, `Plans/`, `Quality/` | N7, N8, N18 modules |
 | `Inquiry/`, `Tactics/` | the inquiry engine, standing questions, X01–X16 |
 | `KnowledgeKit.cs` | per-engine shared services + plug-in points |
@@ -45,11 +48,11 @@ coordinating session works here. Everything below is committed; `219` v3 tests p
 | Area | State |
 |---|---|
 | Knowledge store, evidence assembly, retrieval, temporal resolver | built; unit-tested (`KnowledgeUnitTests`) and exercised by every pipeline test |
-| Deduction: extraction (two readings, agreement, adjudication), verifier, consolidator, critic, age evidence, MinorGuard | built; **accuracy gate passes** on the planted-fact corpus with a deliberately noisy model (`DeductionAccuracyTests`) |
+| Deduction: extraction (two readings, agreement, adjudication), verifier, consolidator, critic, age evidence | built; **accuracy gate passes** on the planted-fact corpus with a deliberately noisy model (`DeductionAccuracyTests`) |
 | Detective, hypothesis watcher, calibration job, sweeps | built; run through the kernel loop with a model that infers nothing (`KnowledgeLoopTests`). **Not tested with real inferences or a resolved hypothesis.** |
 | Inquiry engine (understand → policy → plan → gather → reason → verify → aggregate → persist) | built; tested end to end (`InquiryTests`, 11 tests) |
 | Reasoning tactics X01–X16 | built; each tested as a job (`InquiryTests`, `ReasoningTacticsTests`). X11 (explain a chart point) is only tested for its refusal path: it needs the Explore engine, which is on WS-C's branch. |
-| Standing questions (X14) | built; tested: backfill ignored, unrelated evidence set aside without a model call, a flip alerts, the minimum interval defers, minors are never watched |
+| Standing questions (X14) | built; tested: backfill ignored, unrelated evidence set aside without a model call, a flip alerts, the minimum interval defers, minors are watched like anyone else |
 | Identity links, merges, X67 | built; tested: two signals, never merged unasked, merge, undo. **Not tested:** that a merge re-attributes every person-keyed derived row. |
 | Life timeline (N7), plans and dates (N8) | built; run through the kernel loop on the planted corpus (an overdue promise, a birthday, a relocation). **Not tested:** reminders being sent, cancellations and reschedules, Feb 29 beyond the date arithmetic. |
 | Quality Lab (N18) | built; the lab job runs in the kernel loop, the gate and the metrics are unit-tested. **Not tested:** the planted-evaluation job, per-category precision from gold, prompt A/B. |

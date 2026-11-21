@@ -267,52 +267,17 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
         private static string SqlList(IEnumerable<string> values) => string.Join(",", values.Select(v => "'" + v.ToLowerInvariant().Replace("'", "''") + "'"));
 
         /// <summary>
-        /// Policy at query planning time (plan D4 "MinorGuard: minors' presence/voice/typing and per-person time-of-day/weekday
-        /// patterns are excluded"), applied by what a dataset holds rather than by its name, so datasets other modules
-        /// declare are covered too:
-        /// <list type="bullet">
-        /// <item>presence, voice and typing events of minors are never counted;</item>
-        /// <item>a dataset that carries fact attributes never shows special-category attributes (they are not inferred, and
-        /// not offered as a dimension to slice people by), nor the restricted identity attributes of a minor;</item>
-        /// <item>time-of-day and weekday buckets leave out every row a minor wrote or was written to, whatever the query
-        /// filters on: a filter on one direct chat, one small channel or a cohort of one narrows an aggregate to a person
-        /// as surely as a person filter does, so the rule does not depend on how the query is phrased.</item>
-        /// </list>
+        /// Query-planning policy. The only remaining filter is analysis switched off for a person (N20): no row that
+        /// names them is in any answer, however the query is phrased and whatever the dataset. The former minor and
+        /// sensitive-trait exclusions were removed on 2026-11-21.
         /// </summary>
-        private static void ApplyPolicy(SqlParts p, TimeBucket bucket)
+        private static void ApplyPolicy(SqlParts p)
         {
             var ds = p.Dataset;
-            // Analysis switched off for a person (N20): no row that names them is in any answer, however the query is phrased
-            // and whatever the dataset. This holds for every dataset, including the ones other modules declare.
             foreach (var dim in ds.Dimensions.Select(b => b.DimensionId).Where(d => DimensionCatalog.Get(d).EntityType == "person").Distinct(StringComparer.Ordinal).ToList())
             {
                 string e = p.Expr(dim);
                 p.Where.Add($"({e} IS NULL OR {e} NOT IN (SELECT person_id FROM off_persons))");
-            }
-            if (!ds.MinorFiltered) return;
-            const string Restricted = "(SELECT person_id FROM restricted_persons)";
-            if (p.Bound.Table == ExploreDatasets.Events)
-            {
-                string person = p.Expr("person.subject");
-                p.Where.Add($"NOT (t.kind IN ('presence','voice','typing') AND {person} IN {Restricted})");
-            }
-            var attribute = ds.Dimensions.FirstOrDefault(b => b.DimensionId is "content.attribute" or "knowledge.attribute");
-            if (attribute != null)
-            {
-                string col = $"lower(t.{attribute.Column})";
-                if (ds.Dimensions.Any(b => b.DimensionId == "person.subject"))
-                    p.Where.Add($"NOT ({p.Expr("person.subject")} IN {Restricted} AND {col} IN ({SqlList(MinorGuard.RestrictedAttributes)}))");
-                p.Where.Add($"(t.{attribute.Column} IS NULL OR {col} NOT IN ({SqlList(SensitiveTraits.Categories)}))");
-            }
-            if (bucket is TimeBucket.HourOfDay or TimeBucket.DayOfWeek or TimeBucket.Hour)
-            {
-                var personDims = ds.Dimensions.Select(b => b.DimensionId).Where(d => DimensionCatalog.Get(d).EntityType == "person").Distinct(StringComparer.Ordinal).ToList();
-                foreach (var dim in personDims)
-                {
-                    string e = p.Expr(dim);
-                    p.Where.Add($"({e} IS NULL OR {e} NOT IN {Restricted})");
-                }
-                if (personDims.Count > 0) p.Notes.Add("People under 18 (or likely) are left out of time-of-day and weekday statistics (MinorGuard).");
             }
         }
 
@@ -371,7 +336,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                 groupExprs.Insert(0, bucketExpr);
                 columns.Insert(0, new ExploreColumn(ExploreColumnKinds.BucketDimension, q.Bucket.ToString(), ExploreColumnKinds.Bucket));
             }
-            ApplyPolicy(p, q.Bucket);
+            ApplyPolicy(p);
             foreach (var mid in q.Measures)
             {
                 var m = ds.Measures.First(x => x.Id == mid);
@@ -551,7 +516,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             foreach (var f in d.Filters) AddFilter(p, f);
             foreach (var f in narrow ?? Array.Empty<ExploreFilter>()) AddFilter(p, f, bucketExpr, d.Bucket);
             if (d.AsOfMs is long a) AddAsOf(p, a);
-            ApplyPolicy(p, d.Bucket);
+            ApplyPolicy(p);
             return (p, d);
         }
 
@@ -644,7 +609,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             {
                 var p = new SqlParts { Bound = b };
                 foreach (var f in probe.Filters) AddFilter(p, f);
-                ApplyPolicy(p, TimeBucket.None);
+                ApplyPolicy(p);
                 string e = p.Expr(dim);
                 string sql = $"SELECT {e}, COUNT(*) {p.From} {p.WhereSql} GROUP BY 1 ORDER BY 2 DESC, 1 LIMIT {Math.Clamp(request.Limit, 1, 200).ToString(CultureInfo.InvariantCulture)}";
                 var rows = await RunAsync(sql, p.Params, 2, ct).ConfigureAwait(false);

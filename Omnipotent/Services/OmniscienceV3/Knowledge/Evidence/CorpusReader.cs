@@ -143,6 +143,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
                 r => new IdentityInfo(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4)), ("$i", identityId)).FirstOrDefault();
         }
 
+        /// <summary>An identity by its platform handle, including an anonymous account not yet linked to a person by name.</summary>
+        public IdentityInfo? FindIdentity(string platform, string platformUserId)
+        {
+            using var c = stores.Corpus.OpenRead();
+            return c.Query(null, "SELECT identity_id, platform, platform_user_id, person_id, kind FROM identities WHERE platform=$p AND platform_user_id=$u LIMIT 1",
+                r => new IdentityInfo(r.GetString(0), r.GetString(1), r.GetString(2), r.GetString(3), r.GetString(4)),
+                ("$p", platform.Trim().ToLowerInvariant()), ("$u", platformUserId.Trim())).FirstOrDefault();
+        }
+
         /// <summary>Names (display, username, nickname…) of identities valid at any point of [fromMs, toMs].</summary>
         public IReadOnlyList<IdentityName> NamesOf(IReadOnlyCollection<string> identityIds, long fromMs = long.MinValue, long toMs = long.MaxValue)
         {

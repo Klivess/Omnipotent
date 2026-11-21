@@ -60,7 +60,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Links
                 new ScheduleTrigger("categorise", Every: TimeSpan.FromMinutes(30)),
             },
             DefaultLane = Lane.Cpu,
-            MinorRestricted = true,
             Settings = new[]
             {
                 new SettingDescriptor("links.unfurl.enabled", SettingTypes.Bool, "true",

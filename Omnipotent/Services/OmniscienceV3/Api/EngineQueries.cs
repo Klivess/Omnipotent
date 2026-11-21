@@ -118,7 +118,7 @@ namespace Omnipotent.Services.OmniscienceV3.Api
                 var mf = m.Manifest;
                 return new ModuleDto(mf.Id, mf.Version, mf.Title, mf.Category, mf.Description, mf.DependsOn, mf.SubscribedChangeKinds,
                     mf.Schedules.Select(s => new ScheduleDto(s.Name, s.DailyAtLocal?.ToString("HH:mm"), s.Every is { } e ? (long)e.TotalMilliseconds : null)).ToList(),
-                    mf.DefaultLane, mf.MinorRestricted, mf.Datasets, mf.Settings, health.GetValueOrDefault(mf.Id));
+                    mf.DefaultLane, mf.Datasets, mf.Settings, health.GetValueOrDefault(mf.Id));
             }).ToList();
         }
 

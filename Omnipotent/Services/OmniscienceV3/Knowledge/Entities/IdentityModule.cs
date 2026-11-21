@@ -155,7 +155,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
             r.GetInt64(10), r.GetInt64(11), r.GetInt64OrNull(12), r.GetInt64OrNull(13), r.GetStringOrNull(14));
     }
 
-    /// <summary>X67 — same-person check: two people already in the corpus → link evidence and a verdict (a merge suggestion, never a merge).</summary>
+    /// <summary>X67 — same-person check: two people, or a person and an anonymous platform identity, → link evidence and a
+    /// verdict (a merge suggestion, never a merge). The former "only identities already in the corpus, never unmasking"
+    /// restriction was removed on 2026-11-21.</summary>
     public sealed class SamePersonTactic : TacticBase
     {
         public const string Key = "x67.same_person";
@@ -166,10 +168,11 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
             Code = "X67",
             Title = "Same-person check",
             Category = TacticCategory.Investigation,
-            Description = "Compares two people already in the corpus: measured signals (names over time, rare shared links, avatars, alt claims, activity hand-off, writing style) and a model verdict. Produces a merge suggestion for review, never a merge.",
+            Description = "Compares two people, or a person and an anonymous platform identity: measured signals (names over time, rare shared links, avatars, alt claims, activity hand-off, writing style) and a model verdict. Produces a merge suggestion for review, never a merge.",
             Accepts = new[] { SelectionKind.Person },
             MinSelections = 1,
             MaxSelections = 2,
+            ParameterSchemaJson = """{"type":"object","properties":{"platform":{"type":"string"},"platform_user_id":{"type":"string"}}}""",
             Outputs = new[] { TacticOutputKind.Report, TacticOutputKind.ActionProposal },
             Lane = Lane.LlmInteractive,
             RequiredPermission = "omniscience.review.act",
@@ -180,19 +183,36 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
         public override string? Validate(TacticInput input)
         {
             var people = input.Selections.SelectMany(s => s.Items).Select(i => i.Id).Distinct(StringComparer.Ordinal).ToList();
-            return people.Count == 2 ? null : "Choose exactly two people.";
+            if (people.Count == 2) return null;
+            if (people.Count == 1 && !string.IsNullOrWhiteSpace(input.Param<string>("platform")) && !string.IsNullOrWhiteSpace(input.Param<string>("platform_user_id")))
+                return null;
+            return "Choose two people, or one person and the platform + platform user id of an anonymous account.";
         }
 
         public override async Task<IReadOnlyList<TacticOutput>> RunAsync(TacticRunContext context)
         {
             var kit = KnowledgeKit.For(context.Module);
             var people = context.Input.Selections.SelectMany(s => s.Items).Select(i => kit.Corpus.Canonical(i.Id)).Distinct(StringComparer.Ordinal).ToList();
+            string? platform = context.Input.Param<string>("platform");
+            string? platformUserId = context.Input.Param<string>("platform_user_id");
+            string? anonymousIdentity = null;
+            if (people.Count == 1 && !string.IsNullOrWhiteSpace(platform) && !string.IsNullOrWhiteSpace(platformUserId))
+            {
+                var target = kit.Corpus.FindIdentity(platform, platformUserId)
+                    ?? throw new TacticRefusedException($"No {platform} identity '{platformUserId}' exists in the archive.");
+                anonymousIdentity = target.IdentityId;
+                string targetPerson = kit.Corpus.Canonical(target.PersonId);
+                if (targetPerson == people[0]) throw new TacticRefusedException("That account already belongs to the selected person.");
+                people.Add(targetPerson);
+            }
             if (people.Count < 2) throw new TacticRefusedException("Those two selections are already the same person.");
             var engine = new IdentityLinkEngine(kit);
             var assessments = await context.StageAsync("assess", async ct =>
             {
                 var idsA = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(people[0])).Select(i => i.IdentityId).ToList();
-                var idsB = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(people[1])).Select(i => i.IdentityId).ToList();
+                var idsB = anonymousIdentity != null
+                    ? new List<string> { anonymousIdentity }
+                    : kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(people[1])).Select(i => i.IdentityId).ToList();
                 var list = new List<LinkAssessment>();
                 foreach (var a in idsA.Take(10))
                     foreach (var b in idsB.Take(10))
@@ -213,7 +233,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
                 : best.JudgeVerdict == "different" ? "Probably different people."
                 : best.JudgeVerdict == "same" ? "Likely the same person: a merge suggestion is waiting in review."
                 : "Unclear: a suggestion is waiting in review with the evidence.";
-            var report = new { verdict, best?.Probability, best?.IndependentSignals, best?.JudgeVerdict, best?.JudgeReason, assessments = assessments.Select(a => new { a.IdentityA, a.IdentityB, a.Probability, a.Signals }) };
+            var report = new { verdict, anonymous = anonymousIdentity != null, best?.Probability, best?.IndependentSignals, best?.JudgeVerdict, best?.JudgeReason, assessments = assessments.Select(a => new { a.IdentityA, a.IdentityB, a.Probability, a.Signals }) };
             return new[]
             {
                 new TacticOutput(TacticOutputKind.Report, Data: Json(report), Summary: verdict),

@@ -328,7 +328,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         }
 
         [Fact]
-        public async Task SpecialCategoryQuestions_AreRefused_QuotingOnlyThePersonsOwnStatement()
+        public async Task SpecialCategoryQuestions_AreAnsweredLikeAnyOther()
         {
             await using var h = await KnowledgeHarness.StartAsync(Now);
             var corpus = await PlantedFactCorpus.WriteAsync(h.Stores, Now);
@@ -338,23 +338,16 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
                 Understand = _ => new { restatement = "Is Ben Okafor religious?", answer_type = "binary", subjects = new[] { new { person_id = "planted-ben" } }, sensitive_category = "religion" },
             };
             model.Wire(h.Llm);
-            var (_, report, outputs) = await RunAsync(h, "x01.ask_yes_no", Ask("Is Ben religious?"));
-            Assert.Equal(InquiryVerdict.Refused, report!.Verdict);
-            Assert.Contains("doesn't infer", report.PolicyNote);
-            Assert.Null(report.Probability);
-            // What he explicitly said about himself may be quoted, with its message; the hearsay about him is not.
-            Assert.All(report.EvidenceFor, e => Assert.Equal("quote", e.Kind));
-            Assert.Contains(report.EvidenceFor, e => e.Quote.Contains("Catholic"));
-            Assert.DoesNotContain(report.EvidenceFor, e => e.Quote.Contains("might be religious"));
-            Assert.Equal(0, h.Llm.CountPurpose("inquiry.reason"));
-            Assert.Null(report.AssertionId);
-            Assert.DoesNotContain(outputs, o => o.Kind == TacticOutputKind.FactSet);
+            var (_, report, _) = await RunAsync(h, "x01.ask_yes_no", Ask("Is Ben religious?"));
+            Assert.NotEqual(InquiryVerdict.Refused, report!.Verdict);
+            Assert.DoesNotContain("doesn't infer", report.PolicyNote ?? "");
+            Assert.True(h.Llm.CountPurpose("inquiry.reason") > 0);
             using var c = h.Stores.Intel.OpenRead();
-            Assert.Equal("refused", c.Scalar<string>(null, "SELECT state FROM kn_inquiries WHERE inquiry_id=$i", ("$i", report.InquiryId)));
+            Assert.NotEqual("refused", c.Scalar<string>(null, "SELECT state FROM kn_inquiries WHERE inquiry_id=$i", ("$i", report.InquiryId)));
         }
 
         [Fact]
-        public async Task QuestionsAboutAMinorsRestrictedFactsOrRoutine_AreRefused_OtherQuestionsAreAnswered()
+        public async Task QuestionsAboutAMinorsFactsOrRoutine_AreAnswered_LikeAnyOther()
         {
             await using var h = await KnowledgeHarness.StartAsync(Now);
             var corpus = await PlantedFactCorpus.WriteAsync(h.Stores, Now);
@@ -372,17 +365,15 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             model.Wire(h.Llm);
 
             var (_, school, _) = await RunAsync(h, "x02.ask_open", Ask("Which school does Cam go to?"));
-            Assert.Equal(InquiryVerdict.Refused, school!.Verdict);
-            Assert.Contains("under 18", school.PolicyNote);
-            Assert.Contains("Cam", school.PolicyNote);
+            Assert.NotEqual(InquiryVerdict.Refused, school!.Verdict);
             var (_, routine, _) = await RunAsync(h, "x02.ask_open", Ask("When is Cam usually online?"));
-            Assert.Equal(InquiryVerdict.Refused, routine!.Verdict);
-            Assert.Equal(0, h.Llm.CountPurpose("inquiry.reason"));
+            Assert.NotEqual(InquiryVerdict.Refused, routine!.Verdict);
+            Assert.True(h.Llm.CountPurpose("inquiry.reason") > 0);
 
             var (_, likes, _) = await RunAsync(h, "x01.ask_yes_no", Ask("Does Cam like Minecraft?"));
             Assert.Equal(InquiryVerdict.Yes, likes!.Verdict);
-            // The dossier a minor's inquiry reads never carries his restricted facts.
-            Assert.All(model.Dossiers, d => Assert.DoesNotContain(d.Values, v => v.Contains("[fact about") && (v.Contains("Hillcrest") || v.Contains("Rotherham"))));
+            // The dossier a minor's inquiry reads carries his school and city like anyone else's facts.
+            Assert.Contains(model.Dossiers, d => d.Values.Any(v => v.Contains("[fact about") && (v.Contains("Hillcrest") || v.Contains("Rotherham"))));
         }
 
         [Fact]

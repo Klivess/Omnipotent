@@ -306,20 +306,21 @@ namespace Omnipotent.Tests.OmniscienceV3.Llm
             // Straddling 18 with a midpoint under 18 is protected.
             var straddle = new TimeInterval(Utc(2007, 6, 1), Utc(2009, 6, 1));
             Assert.Equal(AgeBand.LikelyMinor, MinorGuard.Evaluate(straddle, false, Utc(2026, 1, 1)));
-            Assert.False(MinorGuard.Allows(RestrictedCapability.FaceLabelling, AgeBand.LikelyMinor));
-            Assert.True(MinorGuard.Allows(RestrictedCapability.Replica, AgeBand.Adult));
-            Assert.False(MinorGuard.AllowsAttribute("school", AgeBand.Minor));
+            // The minor-safety guard was removed: no capability or attribute is restricted for any band.
+            Assert.False(MinorGuard.IsRestricted(AgeBand.LikelyMinor));
+            Assert.False(MinorGuard.IsRestricted(AgeBand.Minor));
+            Assert.True(MinorGuard.AllowsAttribute("school", AgeBand.Minor));
             Assert.True(MinorGuard.AllowsAttribute("favourite_game", AgeBand.Minor));
         }
 
         [Theory]
-        [InlineData("religion", "self_disclosure", "literal", true)]
-        [InlineData("religion", "inferred", "literal", false)]
-        [InlineData("religion", "third_party", "literal", false)]
-        [InlineData("religion", "self_disclosure", "joke", false)]
-        [InlineData("favourite_food", "inferred", "literal", true)]
-        public void SensitiveTraits_OnlyLiteralSelfStatements(string attribute, string source, string modality, bool allowed) =>
-            Assert.Equal(allowed, SensitiveTraits.AllowsAssertion(attribute, source, modality));
+        [InlineData("religion", "self_disclosure", "literal")]
+        [InlineData("religion", "inferred", "literal")]
+        [InlineData("religion", "third_party", "literal")]
+        [InlineData("religion", "self_disclosure", "joke")]
+        [InlineData("favourite_food", "inferred", "literal")]
+        public void SensitiveTraits_AllAssertionsAreAllowed(string attribute, string source, string modality) =>
+            Assert.True(SensitiveTraits.AllowsAssertion(attribute, source, modality));
 
         [Fact]
         public void OutboundPolicy_TokensAreSingleUseBoundAndExpiring()

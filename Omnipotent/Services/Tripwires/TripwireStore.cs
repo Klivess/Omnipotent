@@ -119,7 +119,24 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
                 await ExecuteAsync(conn, @"UPDATE tripwire_targets SET retained_event_count=
                     (SELECT COUNT(*) FROM tripwire_events WHERE target_id=tripwire_targets.id);", ct);
             }
+            // Visits a closed tripwire refused, and bots it sent on unrecorded: counters only, no visitor data.
+            foreach (var (column, type) in new[]
+            {
+                ("closed_visits", "INTEGER NOT NULL DEFAULT 0"), ("last_closed_utc", "TEXT NULL"),
+                ("preview_visits", "INTEGER NOT NULL DEFAULT 0"), ("last_preview_utc", "TEXT NULL"), ("last_preview_agent", "TEXT NULL"),
+            })
+            {
+                if (!await ColumnExistsAsync(conn, "tripwires", column, ct))
+                    await ExecuteAsync(conn, $"ALTER TABLE tripwires ADD COLUMN {column} {type};", ct);
+            }
+            // The overview's recent trips across every tripwire read newest first.
+            await ExecuteAsync(conn, "CREATE INDEX IF NOT EXISTS idx_tripwire_events_time ON tripwire_events(tripped_utc DESC);", ct);
         }
+
+        private const string TripwireColumns = @"id, name, created_by, created_utc, updated_utc,
+                    last_tripped_utc, last_discord_utc, total_trips, settings_json,
+                    closed_visits, last_closed_utc, preview_visits, last_preview_utc, last_preview_agent";
+        private const int TripwireColumnCount = 14;
 
         public async Task<List<TripwireRecord>> ListAsync(CancellationToken ct = default)
         {
@@ -127,9 +144,7 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
             await using var conn = await OpenAsync(ct);
             await using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = @"SELECT id, name, created_by, created_utc, updated_utc,
-                    last_tripped_utc, last_discord_utc, total_trips, settings_json
-                    FROM tripwires ORDER BY created_utc DESC";
+                cmd.CommandText = $"SELECT {TripwireColumns} FROM tripwires ORDER BY created_utc DESC";
                 await using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct)) items.Add(ReadTripwire(reader));
             }
@@ -143,9 +158,7 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
             TripwireRecord? item = null;
             await using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = @"SELECT id, name, created_by, created_utc, updated_utc,
-                    last_tripped_utc, last_discord_utc, total_trips, settings_json
-                    FROM tripwires WHERE id=$id";
+                cmd.CommandText = $"SELECT {TripwireColumns} FROM tripwires WHERE id=$id";
                 cmd.Parameters.AddWithValue("$id", id);
                 await using var reader = await cmd.ExecuteReaderAsync(ct);
                 if (await reader.ReadAsync(ct)) item = ReadTripwire(reader);
@@ -163,6 +176,7 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
             await using var cmd = conn.CreateCommand();
             cmd.CommandText = @"SELECT w.id, w.name, w.created_by, w.created_utc, w.updated_utc,
                 w.last_tripped_utc, w.last_discord_utc, w.total_trips, w.settings_json,
+                w.closed_visits, w.last_closed_utc, w.preview_visits, w.last_preview_utc, w.last_preview_agent,
                 t.id, t.tripwire_id, t.token, t.label, t.destination_url, t.enabled,
                 t.sort_order, t.trip_count, t.created_utc
                 FROM tripwire_targets t JOIN tripwires w ON w.id=t.tripwire_id
@@ -172,7 +186,7 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
             if (await reader.ReadAsync(ct))
             {
                 tripwire = ReadTripwire(reader);
-                target = ReadTarget(reader, 9);
+                target = ReadTarget(reader, TripwireColumnCount);
                 tripwire.Targets.Add(target);
             }
             return tripwire == null || target == null ? null : (tripwire, target);
@@ -359,7 +373,8 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
                 }
                 await using var reset = conn.CreateCommand();
                 reset.Transaction = tx;
-                reset.CommandText = "UPDATE tripwires SET total_trips=0,retained_event_count=0,last_tripped_utc=NULL WHERE id=$id";
+                reset.CommandText = @"UPDATE tripwires SET total_trips=0,retained_event_count=0,last_tripped_utc=NULL,
+                    closed_visits=0,last_closed_utc=NULL,preview_visits=0,last_preview_utc=NULL,last_preview_agent=NULL WHERE id=$id";
                 reset.Parameters.AddWithValue("$id", id);
                 bool found = await reset.ExecuteNonQueryAsync(ct) > 0;
                 await tx.CommitAsync(ct);
@@ -488,44 +503,215 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
             }, ct);
         }
 
+        /// <summary>Counts a visit that reached a closed tripwire. Nothing about the visitor is kept.</summary>
+        public async Task RecordClosedVisitAsync(string tripwireId, DateTimeOffset at, CancellationToken ct = default)
+        {
+            await WithWriteLockAsync(async conn =>
+            {
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = "UPDATE tripwires SET closed_visits=closed_visits+1,last_closed_utc=$at WHERE id=$id";
+                cmd.Parameters.AddWithValue("$id", tripwireId);
+                cmd.Parameters.AddWithValue("$at", Iso(at));
+                await cmd.ExecuteNonQueryAsync(ct);
+            }, ct);
+        }
+
+        /// <summary>Counts a bot or link preview that was sent on without an event, and which agent it was.</summary>
+        public async Task RecordPreviewAsync(string tripwireId, DateTimeOffset at, string? agent, CancellationToken ct = default)
+        {
+            await WithWriteLockAsync(async conn =>
+            {
+                await using var cmd = conn.CreateCommand();
+                cmd.CommandText = @"UPDATE tripwires SET preview_visits=preview_visits+1,last_preview_utc=$at,
+                    last_preview_agent=$agent WHERE id=$id";
+                cmd.Parameters.AddWithValue("$id", tripwireId);
+                cmd.Parameters.AddWithValue("$at", Iso(at));
+                cmd.Parameters.AddWithValue("$agent", Db(agent));
+                await cmd.ExecuteNonQueryAsync(ct);
+            }, ct);
+        }
+
+        private const string EventColumns = @"e.id,e.tripwire_id,e.target_id,t.label,t.destination_url,e.tripped_utc,
+                    e.ip_address,e.visitor_hash,e.country_code,e.country,e.region,e.city,e.latitude,e.longitude,
+                    e.timezone,e.user_agent,e.browser,e.operating_system,e.device_type,e.referrer,e.language,
+                    e.query_parameters_json,e.do_not_track,e.is_bot,e.is_unique,e.discord_notified,e.notification_error";
+
         public async Task<TripwireEventPage> GetEventsAsync(
             string tripwireId,
             string? targetId,
             int limit,
             int offset,
-            CancellationToken ct = default)
+            CancellationToken ct = default,
+            string? visitorHash = null)
         {
             limit = Math.Clamp(limit, 1, 500);
             offset = Math.Max(0, offset);
+            bool byTarget = !string.IsNullOrWhiteSpace(targetId);
+            bool byVisitor = !string.IsNullOrWhiteSpace(visitorHash);
             await using var conn = await OpenAsync(ct);
             var page = new TripwireEventPage { Limit = limit, Offset = offset };
             await using (var count = conn.CreateCommand())
             {
-                count.CommandText = string.IsNullOrWhiteSpace(targetId)
-                    ? "SELECT retained_event_count FROM tripwires WHERE id=$id"
-                    : "SELECT retained_event_count FROM tripwire_targets WHERE tripwire_id=$id AND id=$target";
+                // A visitor's trips are few and indexed (tripwire_id, visitor_hash, time); everything else reads a kept counter.
+                count.CommandText = byVisitor
+                    ? "SELECT COUNT(*) FROM tripwire_events WHERE tripwire_id=$id AND visitor_hash=$visitor" + (byTarget ? " AND target_id=$target" : "")
+                    : byTarget
+                        ? "SELECT retained_event_count FROM tripwire_targets WHERE tripwire_id=$id AND id=$target"
+                        : "SELECT retained_event_count FROM tripwires WHERE id=$id";
                 count.Parameters.AddWithValue("$id", tripwireId);
-                if (!string.IsNullOrWhiteSpace(targetId)) count.Parameters.AddWithValue("$target", targetId);
+                if (byTarget) count.Parameters.AddWithValue("$target", targetId);
+                if (byVisitor) count.Parameters.AddWithValue("$visitor", visitorHash);
                 page.Total = Convert.ToInt64(await count.ExecuteScalarAsync(ct) ?? 0L);
             }
             if (offset >= page.Total) return page;
             await using (var cmd = conn.CreateCommand())
             {
-                cmd.CommandText = @"SELECT e.id,e.tripwire_id,e.target_id,t.label,t.destination_url,e.tripped_utc,
-                    e.ip_address,e.visitor_hash,e.country_code,e.country,e.region,e.city,e.latitude,e.longitude,
-                    e.timezone,e.user_agent,e.browser,e.operating_system,e.device_type,e.referrer,e.language,
-                    e.query_parameters_json,e.do_not_track,e.is_bot,e.is_unique,e.discord_notified,e.notification_error
+                cmd.CommandText = $@"SELECT {EventColumns}
                     FROM tripwire_events e LEFT JOIN tripwire_targets t ON t.id=e.target_id
-                    WHERE e.tripwire_id=$id" + (string.IsNullOrWhiteSpace(targetId) ? "" : " AND e.target_id=$target")
+                    WHERE e.tripwire_id=$id" + (byTarget ? " AND e.target_id=$target" : "")
+                    + (byVisitor ? " AND e.visitor_hash=$visitor" : "")
                     + " ORDER BY e.tripped_utc DESC LIMIT $limit OFFSET $offset";
                 cmd.Parameters.AddWithValue("$id", tripwireId);
-                if (!string.IsNullOrWhiteSpace(targetId)) cmd.Parameters.AddWithValue("$target", targetId);
+                if (byTarget) cmd.Parameters.AddWithValue("$target", targetId);
+                if (byVisitor) cmd.Parameters.AddWithValue("$visitor", visitorHash);
                 cmd.Parameters.AddWithValue("$limit", limit);
                 cmd.Parameters.AddWithValue("$offset", offset);
                 await using var reader = await cmd.ExecuteReaderAsync(ct);
                 while (await reader.ReadAsync(ct)) page.Items.Add(ReadEvent(reader));
             }
             return page;
+        }
+
+        /// <summary>The newest trips across every tripwire, each with its tripwire's name.</summary>
+        public async Task<List<TripwireEvent>> GetRecentEventsAsync(int limit, CancellationToken ct = default)
+        {
+            limit = Math.Clamp(limit, 1, 500);
+            var items = new List<TripwireEvent>();
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = $@"SELECT {EventColumns}, w.name
+                FROM tripwire_events e INDEXED BY idx_tripwire_events_time
+                LEFT JOIN tripwire_targets t ON t.id=e.target_id
+                JOIN tripwires w ON w.id=e.tripwire_id
+                ORDER BY e.tripped_utc DESC LIMIT $limit";
+            cmd.Parameters.AddWithValue("$limit", limit);
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+            {
+                var item = ReadEvent(reader);
+                item.TripwireName = Text(reader, 27);
+                items.Add(item);
+            }
+            return items;
+        }
+
+        /// <summary>
+        /// One row per visitor id on a tripwire, newest first, with that visitor's latest trip and every other
+        /// tripwire the same visitor id (or the same address from another browser) has tripped.
+        /// </summary>
+        public async Task<List<TripwireVisitor>> GetVisitorsAsync(string tripwireId, int limit, CancellationToken ct = default)
+        {
+            limit = Math.Clamp(limit, 1, 500);
+            var visitors = new List<TripwireVisitor>();
+            await using var conn = await OpenAsync(ct);
+            await using (var cmd = conn.CreateCommand())
+            {
+                cmd.CommandText = @"SELECT visitor_hash, COUNT(*), MIN(tripped_utc), MAX(tripped_utc)
+                    FROM tripwire_events WHERE tripwire_id=$id AND visitor_hash IS NOT NULL
+                    GROUP BY visitor_hash ORDER BY MAX(tripped_utc) DESC LIMIT $limit";
+                cmd.Parameters.AddWithValue("$id", tripwireId);
+                cmd.Parameters.AddWithValue("$limit", limit);
+                await using var reader = await cmd.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    visitors.Add(new TripwireVisitor
+                    {
+                        VisitorHash = reader.GetString(0), Trips = reader.GetInt64(1),
+                        FirstUtc = Date(reader.GetString(2)), LastUtc = Date(reader.GetString(3)),
+                    });
+                }
+            }
+            if (visitors.Count == 0) return visitors;
+
+            var byHash = visitors.ToDictionary(v => v.VisitorHash, StringComparer.Ordinal);
+            foreach (var visitor in visitors)
+            {
+                await using var latest = conn.CreateCommand();
+                latest.CommandText = $@"SELECT {EventColumns}
+                    FROM tripwire_events e LEFT JOIN tripwire_targets t ON t.id=e.target_id
+                    WHERE e.tripwire_id=$id AND e.visitor_hash=$visitor ORDER BY e.tripped_utc DESC LIMIT 1";
+                latest.Parameters.AddWithValue("$id", tripwireId);
+                latest.Parameters.AddWithValue("$visitor", visitor.VisitorHash);
+                await using var reader = await latest.ExecuteReaderAsync(ct);
+                if (await reader.ReadAsync(ct)) visitor.Latest = ReadEvent(reader);
+            }
+
+            // Same visitor id elsewhere.
+            var hashes = visitors.Select(v => v.VisitorHash).ToList();
+            await using (var also = conn.CreateCommand())
+            {
+                var names = hashes.Select((_, i) => "$h" + i).ToList();
+                also.CommandText = $@"SELECT e.visitor_hash, e.tripwire_id, w.name, COUNT(*)
+                    FROM tripwire_events e JOIN tripwires w ON w.id=e.tripwire_id
+                    WHERE e.tripwire_id<>$id AND e.visitor_hash IN ({string.Join(',', names)})
+                    GROUP BY e.visitor_hash, e.tripwire_id";
+                also.Parameters.AddWithValue("$id", tripwireId);
+                for (int i = 0; i < hashes.Count; i++) also.Parameters.AddWithValue("$h" + i, hashes[i]);
+                await using var reader = await also.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    if (!byHash.TryGetValue(reader.GetString(0), out var visitor)) continue;
+                    visitor.Also.Add(new TripwireAlsoTripped
+                    {
+                        TripwireId = reader.GetString(1), Name = reader.GetString(2), Trips = reader.GetInt64(3), Match = "visitor",
+                    });
+                }
+            }
+
+            // Same address from another browser elsewhere.
+            var byIp = visitors.Where(v => !string.IsNullOrWhiteSpace(v.Latest.IpAddress))
+                .GroupBy(v => v.Latest.IpAddress!, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.ToList(), StringComparer.Ordinal);
+            if (byIp.Count > 0)
+            {
+                var ips = byIp.Keys.ToList();
+                await using var also = conn.CreateCommand();
+                var names = ips.Select((_, i) => "$ip" + i).ToList();
+                also.CommandText = $@"SELECT e.ip_address, e.tripwire_id, w.name, COUNT(*)
+                    FROM tripwire_events e JOIN tripwires w ON w.id=e.tripwire_id
+                    WHERE e.tripwire_id<>$id AND e.ip_address IN ({string.Join(',', names)})
+                    GROUP BY e.ip_address, e.tripwire_id";
+                also.Parameters.AddWithValue("$id", tripwireId);
+                for (int i = 0; i < ips.Count; i++) also.Parameters.AddWithValue("$ip" + i, ips[i]);
+                await using var reader = await also.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct))
+                {
+                    string otherId = reader.GetString(1);
+                    foreach (var visitor in byIp[reader.GetString(0)])
+                    {
+                        if (visitor.Also.Any(a => a.TripwireId == otherId)) continue;
+                        visitor.Also.Add(new TripwireAlsoTripped
+                        {
+                            TripwireId = otherId, Name = reader.GetString(2), Trips = reader.GetInt64(3), Match = "address",
+                        });
+                    }
+                }
+            }
+            return visitors;
+        }
+
+        /// <summary>Retained trips per (tripwire, address): how many came from addresses OmniDefence recognises.</summary>
+        public async Task<List<TripwireIpCount>> GetIpCountsAsync(CancellationToken ct = default)
+        {
+            var rows = new List<TripwireIpCount>();
+            await using var conn = await OpenAsync(ct);
+            await using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"SELECT tripwire_id, ip_address, COUNT(*) FROM tripwire_events
+                WHERE ip_address IS NOT NULL GROUP BY tripwire_id, ip_address LIMIT 50000";
+            await using var reader = await cmd.ExecuteReaderAsync(ct);
+            while (await reader.ReadAsync(ct))
+                rows.Add(new TripwireIpCount { TripwireId = reader.GetString(0), Ip = reader.GetString(1), Count = reader.GetInt64(2) });
+            return rows;
         }
 
         public async Task<TripwireSummary> GetSummaryAsync(string tripwireId, CancellationToken ct = default)
@@ -537,7 +723,9 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
                 cmd.CommandText = @"SELECT w.total_trips, COALESCE(SUM(e.is_unique),0),
                     COALESCE(SUM(CASE WHEN e.tripped_utc >= $day THEN 1 ELSE 0 END),0),
                     COALESCE(SUM(CASE WHEN e.tripped_utc >= $week THEN 1 ELSE 0 END),0),
-                    w.last_tripped_utc FROM tripwires w LEFT JOIN tripwire_events e ON e.tripwire_id=w.id
+                    w.last_tripped_utc, COUNT(e.id), COUNT(DISTINCT e.visitor_hash),
+                    COALESCE(SUM(e.do_not_track),0), COALESCE(SUM(e.is_bot),0)
+                    FROM tripwires w LEFT JOIN tripwire_events e ON e.tripwire_id=w.id
                     WHERE w.id=$id GROUP BY w.id";
                 cmd.Parameters.AddWithValue("$id", tripwireId);
                 cmd.Parameters.AddWithValue("$day", Iso(DateTimeOffset.UtcNow.AddHours(-24)));
@@ -550,7 +738,22 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
                     result.TripsLast24Hours = reader.GetInt64(2);
                     result.TripsLast7Days = reader.GetInt64(3);
                     result.LastTrippedUtc = NullableDate(reader, 4);
+                    result.RetainedTrips = reader.GetInt64(5);
+                    result.Visitors = reader.GetInt64(6);
+                    result.PrivacySignalTrips = reader.GetInt64(7);
+                    result.BotTrips = reader.GetInt64(8);
                 }
+            }
+            await using (var hourly = conn.CreateCommand())
+            {
+                // UTC hours, so the page can put each trip on the viewer's own day.
+                hourly.CommandText = @"SELECT substr(tripped_utc,1,13),COUNT(*) FROM tripwire_events
+                    WHERE tripwire_id=$id AND tripped_utc >= $since
+                    GROUP BY substr(tripped_utc,1,13) ORDER BY 1";
+                hourly.Parameters.AddWithValue("$id", tripwireId);
+                hourly.Parameters.AddWithValue("$since", Iso(DateTimeOffset.UtcNow.AddDays(-30).AddHours(-1)));
+                await using var reader = await hourly.ExecuteReaderAsync(ct);
+                while (await reader.ReadAsync(ct)) result.Hourly.Add(new TripwireHourCount { H = reader.GetString(0), N = reader.GetInt64(1) });
             }
             await using (var daily = conn.CreateCommand())
             {
@@ -778,6 +981,11 @@ CREATE TABLE IF NOT EXISTS tripwire_summary_snapshots (
                 LastDiscordUtc = NullableDate(reader, offset + 6),
                 TotalTrips = reader.GetInt64(offset + 7),
                 Settings = settings,
+                ClosedVisits = reader.IsDBNull(offset + 9) ? 0 : reader.GetInt64(offset + 9),
+                LastClosedUtc = NullableDate(reader, offset + 10),
+                PreviewVisits = reader.IsDBNull(offset + 11) ? 0 : reader.GetInt64(offset + 11),
+                LastPreviewUtc = NullableDate(reader, offset + 12),
+                LastPreviewAgent = Text(reader, offset + 13),
             };
         }
 

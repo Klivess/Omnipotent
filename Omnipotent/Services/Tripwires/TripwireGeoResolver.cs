@@ -9,6 +9,9 @@ namespace Omnipotent.Services.Tripwires
     {
         private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(3) };
         private readonly ConcurrentDictionary<string, (DateTimeOffset Expires, TripwireGeoResult Value)> cache = new();
+        private readonly TripwireHealth? health;
+
+        public TripwireGeoResolver(TripwireHealth? health = null) => this.health = health;
 
         public TripwireGeoResult FromHeaders(NameValueCollection headers)
         {
@@ -36,10 +39,18 @@ namespace Omnipotent.Services.Tripwires
                 string encoded = Uri.EscapeDataString(ip);
                 using var response = await Client.GetAsync(
                     $"https://ipwho.is/{encoded}?fields=success,country_code,country,region,city,latitude,longitude,timezone.id", ct);
-                if (!response.IsSuccessStatusCode) return headerValue;
+                if (!response.IsSuccessStatusCode)
+                {
+                    health?.GeoFailed($"ipwho.is answered {(int)response.StatusCode}");
+                    return headerValue;
+                }
                 string json = await response.Content.ReadAsStringAsync(ct);
                 var body = JObject.Parse(json);
-                if ((bool?)body["success"] == false) return headerValue;
+                if ((bool?)body["success"] == false)
+                {
+                    health?.GeoFailed("ipwho.is: " + ((string?)body["message"] ?? "lookup refused"));
+                    return headerValue;
+                }
                 var value = new TripwireGeoResult
                 {
                     CountryCode = (string?)body["country_code"], Country = (string?)body["country"],
@@ -48,9 +59,15 @@ namespace Omnipotent.Services.Tripwires
                     Timezone = (string?)body["timezone"]?["id"],
                 };
                 cache[ip] = (DateTimeOffset.UtcNow.AddHours(24), value);
+                health?.GeoOk();
                 return Merge(headerValue, value);
             }
-            catch { return headerValue; }
+            catch (OperationCanceledException) when (ct.IsCancellationRequested) { return headerValue; }
+            catch (Exception ex)
+            {
+                health?.GeoFailed("ipwho.is: " + ex.Message);
+                return headerValue;
+            }
         }
 
         private static TripwireGeoResult Merge(TripwireGeoResult preferred, TripwireGeoResult fallback) => new()

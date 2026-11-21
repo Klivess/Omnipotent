@@ -54,7 +54,6 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             Category = "replica",
             Description = "Replicas of people from their real messages: versioned training (index, style, persona, reflexes, evaluation), chat, rehearsal, group simulation and social tactics. Fidelity is measured on held-out real replies.",
             DefaultLane = Lane.Cpu,
-            MinorRestricted = true,
             SubscribedChangeKinds = new[]
             {
                 ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete, ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge, ChangeKinds.PersonErase,

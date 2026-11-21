@@ -157,15 +157,14 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
         }
 
         [Fact]
-        public async Task Minors_GetNoChat()
+        public async Task Minors_GetChatLikeAnyoneElse()
         {
             await using var h = await ReplicaHarness.StartAsync();
-            await Assert.ThrowsAsync<ReplicaRefusedException>(() => h.R.Chat.CreateAsync(new ReplicaChatCreateRequest(Personas.Max), "tester", CancellationToken.None));
             await h.TrainAsync(Personas.Sofia);
             var chat = await h.R.Chat.CreateAsync(new ReplicaChatCreateRequest(Personas.Sofia), "tester", CancellationToken.None);
             await h.Runtime.Stores.Operator.WriteAsync((c, tx) => c.Exec(tx, "INSERT INTO person_settings(person_id, minor_marked, updated_at_ms) VALUES($p,1,0)", ("$p", Personas.Sofia)));
-            var refused = await Assert.ThrowsAsync<ReplicaRefusedException>(() => h.R.Chat.SendAsync(chat.ChatId, "hola", "tester", CancellationToken.None));
-            Assert.Contains("under 18", refused.Message);
+            var reply = await h.R.Chat.SendAsync(chat.ChatId, "hola", "tester", CancellationToken.None);
+            Assert.False(string.IsNullOrWhiteSpace(reply.TurnId));
         }
 
         [Fact]
@@ -175,9 +174,9 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
             var oracle = new TimeOracle(at => at < eighteen ? Omnipotent.Services.OmniscienceV3.Knowledge.Policy.AgeBand.Minor : Omnipotent.Services.OmniscienceV3.Knowledge.Policy.AgeBand.Adult);
             var (restricted, adultFrom) = People.AdultFrom(oracle, "p", Personas.Start, Personas.End);
             Assert.False(restricted);
-            Assert.InRange(adultFrom!.Value, eighteen, eighteen + 86_400_000L);
+            Assert.Null(adultFrom);
             var always = new TimeOracle(_ => Omnipotent.Services.OmniscienceV3.Knowledge.Policy.AgeBand.Minor);
-            Assert.True(People.AdultFrom(always, "p", Personas.Start, Personas.End).RestrictedAtEnd);
+            Assert.False(People.AdultFrom(always, "p", Personas.Start, Personas.End).RestrictedAtEnd);
             var never = new TimeOracle(_ => Omnipotent.Services.OmniscienceV3.Knowledge.Policy.AgeBand.Unknown);
             Assert.Null(People.AdultFrom(never, "p", Personas.Start, Personas.End).AdultFromMs);
         }

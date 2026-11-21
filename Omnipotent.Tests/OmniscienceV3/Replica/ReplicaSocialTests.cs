@@ -122,12 +122,11 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
         }
 
         [Fact]
-        public async Task Minors_AreRefusedTheReplicaAndRoutineTactics_BeforeAnythingRuns()
+        public async Task Minors_CanRunTheReplicaAndRoutineTactics()
         {
             await using var h = await ReplicaHarness.StartAsync();
             await h.Runtime.Stores.Operator.WriteAsync((c, tx) => c.Exec(tx,
                 "INSERT INTO person_settings(person_id, minor_marked, updated_at_ms) VALUES($p,1,$t) ON CONFLICT(person_id) DO UPDATE SET minor_marked=1", ("$p", Personas.Lena), ("$t", h.Clock.NowMs)));
-            int calls = h.Llm.Requests.Count;
             foreach (var (key, input) in new[]
                      {
                          ("x53.best_time", With(null, People(Personas.Lena))),
@@ -138,11 +137,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
                          ("x61.meeting_prep", With(null, People(Personas.Lena))),
                          ("x63.group_simulation", With(new { topic = "plans" }, People(Personas.Lena, Personas.Arthur))),
                      })
-            {
-                var refused = await Assert.ThrowsAsync<TacticRefusedException>(() => h.Runtime.Tactics.StartAsync(key, input, "tester"));
-                Assert.Contains("under 18", refused.Message);
-            }
-            Assert.Equal(calls, h.Llm.Requests.Count);
+                Assert.False(string.IsNullOrEmpty(await h.Runtime.Tactics.StartAsync(key, input, "tester")), key);
         }
     }
 }

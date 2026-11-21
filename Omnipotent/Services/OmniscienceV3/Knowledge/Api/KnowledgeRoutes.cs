@@ -79,7 +79,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                 var after = cursor == null ? views : views.SkipWhile(v => v.Record.AssertionId != cursor).Skip(1).ToList();
                 var page = after.Take(limit).ToList();
                 string? next = after.Count > limit ? page[^1].Record.AssertionId : null;
-                return ApiResponses.OkAsync(req, new KnowledgeFactsPageDto(person, mode.ToString(), at, MinorGuard.IsRestricted(band), page.Select(DeductionModule.ToFactDto).ToList(), next));
+                return ApiResponses.OkAsync(req, new KnowledgeFactsPageDto(person, mode.ToString(), at, page.Select(DeductionModule.ToFactDto).ToList(), next));
             }, ct).ConfigureAwait(false);
 
             await Get("facts/get", OmnisciencePerms.PersonsRead, req =>
@@ -251,7 +251,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
             {
                 var q = ApiQuery.Of(req);
                 string person = Kit.Corpus.Canonical(q.Required("person", 256));
-                if (!MinorGuard.Allows(RestrictedCapability.RoutineInference, Rt.Host.Policy.BandOf(person, Rt.Clock.NowMs))) return ApiResponses.OkAsync(req, Array.Empty<HypothesisDto>());
                 using var c = Rt.Stores.Intel.OpenRead();
                 return ApiResponses.OkAsync(req, c.Query(null, """
                     SELECT hypothesis_id, person_id, statement, attribute, probability, status, created_at_ms, expires_at_ms, resolved_at_ms, resolution_note, derived_from_json
@@ -436,7 +435,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
             if (!restricted && body.Inferences.All(Shown) && body.Categories.All(c => c.Facts.All(Shown))) return body;
             return body with
             {
-                MinorRestricted = body.MinorRestricted || restricted,
                 Inferences = restricted ? Array.Empty<KnowledgeFactDto>() : body.Inferences.Where(Shown).ToList(),
                 Categories = body.Categories.Select(c => c with { Facts = c.Facts.Where(Shown).ToList() }).Where(c => c.Facts.Count > 0).ToList(),
             };

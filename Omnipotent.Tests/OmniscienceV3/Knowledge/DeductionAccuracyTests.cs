@@ -267,21 +267,19 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
                             $"false positives: {string.Join("; ", eval.FalsePositives)}; missed: {string.Join("; ", eval.Missed)}";
             Assert.True(eval.LiteralSelfPrecision.Value >= DeductionEvaluation.LiteralSelfTarget, detail);
             Assert.True(eval.Precision.Value >= DeductionEvaluation.OverallTarget, detail);
-            Assert.Equal(0, eval.RestrictedFactsStoredForMinors);
             Assert.Equal(0, eval.HallucinatedEvidenceRefs);
-            Assert.Equal(0, eval.SensitiveInferencesStored);
             Assert.True(eval.RelocationClosed, "Bristol must be closed by Glasgow. " + detail);
             Assert.True(eval.Recall.Value >= 0.6, detail);
             Assert.True(eval.PassesGates, detail);
 
-            // MinorGuard: Cam is a minor from his own statements, and nothing restricted about him exists anywhere.
+            // The minor guard was removed: Cam is still a minor by his own statements, but his facts are ordinary facts.
             string ageDetail;
             using (var probe = h.Stores.Intel.OpenRead())
                 ageDetail = "age evidence: " + string.Join("; ", probe.Query(null, "SELECT person_id, kind, status, source_kind FROM kn_age_evidence",
                                 r => $"{r.GetString(0)} {r.GetString(1)} {r.GetString(2)} {r.GetString(3)}"))
                             + " | age claims: " + string.Join("; ", probe.Query(null, "SELECT person_id, attribute, verdict, COALESCE(reason,'') FROM kn_claims WHERE attribute IN ('age','school_year','birthday')",
                                 r => $"{r.GetString(0)} {r.GetString(1)} {r.GetString(2)} {r.GetString(3)}"));
-            Assert.True(MinorGuard.IsRestricted(h.Runtime.Host.Policy.BandOf(corpus.MinorPersonId, Now)), ageDetail);
+            Assert.False(MinorGuard.IsRestricted(h.Runtime.Host.Policy.BandOf(corpus.MinorPersonId, Now)), ageDetail);
             // The corrected age never counts; Ben is an adult.
             Assert.Equal(AgeBand.Adult, h.Runtime.Host.Policy.BandOf("planted-ben", Now));
             // Ben's own literal statement of a special-category trait is kept as sensitive_self; the hearsay is not.
@@ -292,9 +290,9 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             var reasons = c.Query(null, "SELECT reason, COUNT(*) FROM kn_claims WHERE verdict='rejected' GROUP BY reason", r => (r.GetString(0), r.GetInt64(1))).ToDictionary(x => x.Item1, x => x.Item2);
             Assert.True(reasons.GetValueOrDefault(RejectReasons.RefOutsideSlice) > 0, "hallucinated refs must be rejected and counted");
             Assert.True(reasons.GetValueOrDefault(RejectReasons.QuoteNotFound) > 0, "invented quotes must be rejected and counted");
-            Assert.True(reasons.GetValueOrDefault(RejectReasons.SensitiveInference) > 0);
-            Assert.True(reasons.GetValueOrDefault(RejectReasons.RestrictedForMinor) > 0);
-            Assert.Equal(0L, c.Scalar<long>(null, "SELECT COUNT(*) FROM kn_claims WHERE reason='restricted_for_minor' AND value_text IS NOT NULL"));
+            // The sensitive-trait and minor guard rejections no longer happen.
+            Assert.Equal(0, reasons.GetValueOrDefault(RejectReasons.SensitiveInference));
+            Assert.Equal(0, reasons.GetValueOrDefault(RejectReasons.RestrictedForMinor));
         }
 
         [Fact]

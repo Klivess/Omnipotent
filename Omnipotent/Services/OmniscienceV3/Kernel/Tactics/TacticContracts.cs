@@ -34,8 +34,6 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Tactics
         public required string RequiredPermission { get; init; }
         /// <summary>The tactic acts on the outside world: every run needs an outbound confirmation token.</summary>
         public bool Outbound { get; init; }
-        /// <summary>Refused (with the reason shown) when any person in the input is, or is likely, a minor.</summary>
-        public RestrictedCapability? MinorRestriction { get; init; }
         public int Version { get; init; } = 1;
         public long TypicalDurationMs { get; init; } = 1_000;
         public int TypicalLlmCalls { get; init; }

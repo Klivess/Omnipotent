@@ -178,7 +178,7 @@ the first navigation is a full load (`go()` in the specs): repeated full loads o
 9. **No pickers for places.** Watch rules, digests and subscriptions take server and chat ids typed by hand. People have a
    picker now (`PersonPick.vue`, on the directory search) and ids are shown as names (`GET people/names`, `useOmniNames`);
    the older pages do not use them yet. Still needed: a lookup route for servers and conversations by name.
-10. **Messages by id.** See "Citations open nothing yet": `messages/get?ids=` (minor- and analysis-off-aware) would let every
+10. **Messages by id.** See "Citations open nothing yet": `messages/get?ids=` (analysis-off-aware) would let every
     cited point, alert hit and inbox item open its message.
 
 ## At cutover

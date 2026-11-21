@@ -1,5 +1,9 @@
 # WS-C — Classification, analytics, read models & signals
 
+> **Removed features (2026-11-21):** the minor-safety guard, the sensitive-trait inference ban and the
+> leverage/manipulation ban are gone. Historical references below describe the code before removal. See
+> [safety-removals.md](safety-removals.md).
+
 Branch `claude/omniscience-v3-ws-c-99fa83`, cut from the Phase 1 commit ac223e6. This file is the workstream's
 progress record: what is done, what is not and why, and what the integrator must know. It is kept current as work
 lands, so a restart can resume from it.
@@ -43,8 +47,8 @@ lands, so a restart can resume from it.
 - **Read models:** `person.dossier`, `overview`, `engine.health`, `conversation.card`, `guild.card`, served by the
   existing `GET /omniscience/v3/rm?model=&key=`; their body types are `[ApiContract]` (`DossierDto`, `OverviewDto`, …).
   Directory: `GET /omniscience/v3/people?sort=&tier=&platform=&q=&cursor=&limit=`.
-- **Policy at serving time:** `ReadModels.IReadModelServingFilter` — `DataRoutes` now applies every module's filter to
-  the rows it serves (defence in depth for MinorGuard). `ProjectionModule` filters the dossier.
+- **Policy at serving time:** `ReadModels.IReadModelServingFilter` — `DataRoutes` applies every module's filter to
+  the rows it serves (analysis-off, tiers). `ProjectionModule` no longer withholds anything for a minor.
 
 ## Explore (plan D4)
 - **Engine:** `Modules.Explore.ExploreModule` implements the frozen `IExploreEngine` on `analytics.duckdb`. `V3Runtime.Explore`
@@ -72,12 +76,11 @@ lands, so a restart can resume from it.
   offset at the instant; UTC while the zone is unknown), UTC, or any IANA zone. Offsets come from `Temporal.Zones.OffsetSegments`
   (the same time-zone data as everything else in v3), so DST days are right and no calendar library runs per row. Day-precision
   and legacy unknown-zone timestamps are left out of hour buckets (R4).
-- **Policy at planning time, by what a dataset holds (not its name):** presence, voice and typing events of minors are never
-  counted; a dataset that binds `content.attribute` (or WS-B's `knowledge.attribute`) never shows special-category attributes, nor
-  the restricted identity attributes of a minor; hour, hour-of-day and weekday buckets leave out every row a minor wrote or was
-  written to, **whatever the query filters on** (a filter on one direct chat narrows to a person as surely as a person filter).
-  Each exclusion is stated in the result's `explain`. A drill token only restates a query: permissions and policy are applied
-  again when it is used, and message-level records need `omniscience.messages.read`.
+- **Policy at planning time, by what a dataset holds (not its name):** the only remaining policy filter is analysis
+  switched off for a person. Presence, voice, typing, special-category attributes, a minor's identity attributes and
+  hour/weekday rows are all included; there is no minor or sensitive-trait exclusion. A drill token only restates a
+  query: permissions and policy are applied again when it is used, and message-level records need
+  `omniscience.messages.read`.
 - **Bounds:** 2 s timeout (`explore.timeout_ms`; a slower query is interrupted and answered `422 too_slow`), 10,000 groups, DuckDB
   memory limit and thread count as settings, a result cache of 256 answers keyed by query and mirror version.
 - **The mirror is derived data.** `ExploreDatasets.SchemaVersion` numbers its layout; a file with another number is emptied and
@@ -132,7 +135,7 @@ Nothing runs on the ingest path (F050, F366).
 - **Nudges (X49):** an open live item older than `signals.inbox.nudge_hours` (24) is pushed once as `nudge`, outside quiet
   hours. The tactic `x49.reply_nudges` gives the same list on demand.
 - **Watch rules (N11, X41):** a rule is plain text plus an optional scope (people, conversations, servers).
-  1. Policy: a rule scoped to someone who is or may be a minor is refused when saved (MinorGuard, person-targeted alerts);
+  1. Policy: a rule scoped to someone who is or may be a minor is saved and runs like any other (the minor guard is gone);
      the model then judges the text against the special categories and a rule aimed at one is refused with the standard
      refusal text. A rule whose scope later includes a minor stops.
   2. Calibration: the rule text is embedded with the shared encoder; the prefilter's gate starts where 3% of a random
@@ -180,7 +183,7 @@ Module id `briefs`, code in `Modules/Briefs/`. Tables `brief_digests`, `brief_pe
   `briefs.digest.max_days`. A period with no messages is "nothing new" and costs no model call. Normally two calls:
   one over the conversations, one that merges their points into server points and the overall points. A server with one
   active channel has that channel's points. `newFacts` lists assertions recorded in the period (person and `all` scopes),
-  with the dossier's filters (MinorGuard attributes, sensitive traits). A digest that cannot be written ends as `failed`
+  with the dossier's filters (none beyond analysis-off). A digest that cannot be written ends as `failed`
   with the reason (three attempts), never as "running" for ever.
 - **Scheduled (X52):** a daily catch-up at `briefs.digest.daily_at` (07:30 in Klives's zone; empty switches it off) and
   subscriptions (daily or weekly at HH:mm). A tick every five minutes runs what came due since its last run; a missed
@@ -191,8 +194,8 @@ Module id `briefs`, code in `Modules/Briefs/`. Tables `brief_digests`, `brief_pe
   of the last 30 days against the 60 before, facts (filtered), and what of theirs is waiting in the reply inbox. It is
   `stale` when the newest message it rests on is older than `briefs.person.stale_days`. **Not in it yet:** upcoming dates
   and plans, which come from WS-B's N8 after the merge.
-- **MinorGuard:** a digest, a subscription or a brief about one person is refused for someone who is or may be a minor,
-  and a brief written earlier is no longer shown. Server and chat digests include what minors said in those conversations
+- **Minors:** a digest, a subscription or a brief about one person works for a minor like anyone else, and a brief
+  written earlier stays shown. Server and chat digests include what minors said in those conversations
   (their conversations stay readable).
 - **Tactics:** `x18.summarise` (messages, conversations, a time range), `x30.topic_snapshot` (a server or conversation and
   a period), `x31.action_items` (plans, promises, unanswered questions, open loops), `x52.digest_subscription`.
@@ -221,7 +224,7 @@ vectors and the rollups, and keep bundles and charts in operator.db (`notes` kin
 | `x39.dataset_export` | an Explore drill selection → what to post to `explore/export` | The file is streamed by the route; the tactic exists so the export can be chained and offered by Ask. |
 | `x40.custom_chart` | a dataset, dimensions and measures → a chart saved on the dashboard | Checked against the dataset's own dimensions and measures before it is saved; the saved view records the permission the dataset needs. |
 
-MinorGuard: X28, X29, X34 and X37 are refused when a selected person is or may be a minor, and minors are left out of
+X28, X29, X34 and X37 work for a minor like anyone else, and minors are included in
 rankings, comparisons and member lists (counted, never named). `Stats.cs` holds the tests (Mann–Whitney with tie and
 continuity correction, chi-square with its exact tail, Benjamini–Hochberg), checked against textbook values.
 
@@ -251,7 +254,7 @@ Module id `insights`, code in `Modules/Insights/`; tables `ins_pair_week`, `ins_
   `x45.relationship_watch` switches this on and off and lists what was found; `x36.influence` shows whom a person brought
   together, which communities they bridge, and who turns to them far more than they turn back (direction of attention,
   **not** topics: "whose topics they amplify" needs the topic model and is not claimed).
-- **Minors** are in none of it: not in pairs, events, communities or tactic outputs.
+- **Minors** are in all of it: pairs, events, communities and tactic outputs like anyone else.
 - **Reply-time asymmetry** is computed when a pair is opened (`GET insights/pair`), from the rollups' latency histograms.
 - **Routes:** `GET insights/communities` (also read model `insights.communities`), `GET insights/person`,
   `GET insights/pair`, `POST insights/refresh`. Explore datasets `insights.pairs` and `insights.pair_events`.
@@ -272,7 +275,7 @@ Part of the `insights` module (`InsightsModule.Wellbeing.cs`, table `ins_wellbei
 after the nightly relationship job.
 
 - **Who:** the people Klives tracks or pinned, and the `insights.wellbeing.close_contacts` (30) people he interacts with
-  most. Never minors.
+  most. Minors are included.
 - **What is measured:** per person and week, the share of answered messages the ensemble read as negative (weeks with at
   least 10 answered), and how many messages they wrote (people who usually write at least 15 a week). Each is compared
   with that person's own previous 26 weeks by a robust z (median and MAD, with a floor so a perfectly regular history does
@@ -335,7 +338,7 @@ who is an adult and whose analysis is on.
 - **`GET insights/similar?personId=`**: the nearest people, each with the four part-similarities, the traits both share
   (both at least one standard deviation from the average in the same direction: "long messages", "up at night",
   "often negative (sentiment)", ...) and the servers both are most active in. A person's own strongest traits come with it.
-  Minors are refused; someone whose analysis is off is refused and never offered as a match.
+  Minors are compared like anyone else; someone whose analysis is off is refused and never offered as a match.
 - **`GET insights/map`**: everyone on a plane, coloured by their N12 community. The `insights.map.max_people` (2000) most
   active are laid out by an exact t-SNE (cosine distance) started from the principal components; everyone else is placed
   at the weighted centre of the five people they resemble most. There is no randomness. Each night starts from the
@@ -354,7 +357,7 @@ under 18 (not recorded, not told) or whose analysis is switched off; the event l
 
 - **X42 person activity watch** (`x42.person_activity_watch`, watches in `watchlists` kind `person_activity`): the selected
   people write again after `absenceDays` of silence (told once, with the gap), or post in a selected server (once a day per
-  server). Refused for minors (the tactic declares the person-targeted-alert restriction) and for analysis-off people.
+  server). Works for minors and is refused for analysis-off people.
 - **X43 topic surge** (`x43.topic_surge`, kind `topic_surge`): a phrase (FTS, words in order) or a concept taught with X19,
   everywhere or in selected servers and conversations. Its usual day is the median of the 28 complete days before today
   (any source); a surge is the live messages of the last 24 hours reaching `minCount` (10) and `factor` (3) times the usual
@@ -644,11 +647,10 @@ holds the corpus writer for its duration, seconds on a few million messages).
   sender's day; computing it on the receiver's day would need an all-time scan of the receiver's mentions per cell.
 - **Zones:** rhythm-based per month (diurnal-template correlation), mapped to IANA zones over the months (DST tells
   Berlin from Lagos); thin months stay unknown unless the nearest confident months on both sides agree; minors are
-  skipped (MinorGuard). A stated zone comes from a WS-B assertion with attribute `time_zone` (IANA value) — WS-B
+  included. A stated zone comes from a WS-B assertion with attribute `time_zone` (IANA value) — WS-B
   should use that attribute name.
 - **Wellbeing distress task:** a per-message reading used only for N14 check-in suggestions, never stored as a trait
-  and not exposed as an Explore dimension. MinorGuard applies to wellbeing suggestions (no person-targeted alerts for
-  minors); a crisis-language exception for minors would be Klives's call and is not built.
+  and not exposed as an Explore dimension. Wellbeing suggestions include minors like anyone else.
 
 ## Status
 | Area | State |

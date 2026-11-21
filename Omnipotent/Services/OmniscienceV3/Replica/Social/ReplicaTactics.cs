@@ -81,7 +81,6 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             Outputs = new[] { TacticOutputKind.Report },
             Lane = Lane.LlmInteractive,
             RequiredPermission = "omniscience.replica.chat",
-            MinorRestriction = RestrictedCapability.ReplicaBasedTactic,
             TypicalDurationMs = 45_000,
             TypicalLlmCalls = 8,
         };
@@ -384,7 +383,6 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             Outputs = new[] { TacticOutputKind.Report },
             Lane = Lane.LlmInteractive,
             RequiredPermission = "omniscience.replica.chat",
-            MinorRestriction = RestrictedCapability.ReplicaBasedTactic,
             TypicalDurationMs = 90_000,
             TypicalLlmCalls = 16,
         };

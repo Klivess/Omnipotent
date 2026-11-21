@@ -74,7 +74,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             Category = "knowledge",
             Description = "Extracts verified, bitemporal facts about tracked people from whole conversations, consolidates them with calibrated confidence, and derives labelled inferences and hypotheses.",
             DefaultLane = Lane.LlmBackground,
-            MinorRestricted = true,
             SubscribedChangeKinds = new[]
             {
                 ChangeKinds.MessageInsert, ChangeKinds.MessageVersion, ChangeKinds.MessageDelete, ChangeKinds.PersonMerge, ChangeKinds.PersonUnmerge, ChangeKinds.EvidenceRemoved,
@@ -523,7 +522,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             return Result(new { samples = samples.Count, curves = fitted });
         }
 
-        /// <summary>Every minute: continue backlogs, start newly tracked people, and enforce MinorGuard on already-stored facts.</summary>
+        /// <summary>Every minute: continue backlogs and start newly tracked people.</summary>
         private async Task<string?> SweepAsync(JobContext job)
         {
             var ct = job.Cancellation;
@@ -545,20 +544,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             foreach (var (p, s) in state.Where(kv => kv.Value.Tracked && !tracked.Contains(kv.Key)))
                 await SetStateAsync(p, tracked: false, pending: false, error: null, ct: ct).ConfigureAwait(false);
 
-            // MinorGuard on what is already stored: anyone now in a restricted band with restricted facts gets a purge.
-            var restricted = Attributes.All.Where(a => a.Sensitivity == AttributeSensitivity.RestrictedForMinors).Select(a => a.Id).ToList();
-            List<string> subjects;
-            using (var c = Context.Stores.Intel.OpenRead())
-                subjects = c.QueryIn(null, "SELECT DISTINCT subject_id FROM kn_assertion_dims WHERE live=1 AND attribute IN ({keys})", restricted, r => r.GetString(0));
-            long now = Context.Clock.NowMs;
-            int purges = 0;
-            foreach (var s in subjects.Select(kit.Corpus.Canonical).Distinct(StringComparer.Ordinal))
-            {
-                if (!MinorGuard.IsRestricted(Context.Policy.BandOf(s, now))) continue;
-                await Context.Jobs.EnqueueAsync(Job(ConsolidateKind, "person", s, 200), ct).ConfigureAwait(false);
-                purges++;
-            }
-            return Result(new { tracked = tracked.Count, enqueued, purges });
+            return Result(new { tracked = tracked.Count, enqueued });
         }
 
         private async Task FlagAgeConflictsAsync(string person, long seq, CancellationToken ct)
@@ -578,17 +564,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 await review.RaiseAsync(ReviewKinds.AgeConflict, person, key, "Age statements that cannot all be true",
                     new { band = band.ToString(), inconsistent = inconsistent.Select(r => new { r.EvidenceId, r.Kind, r.MessageId, r.AssertedAtMs }) }, 0.9, seq, ct).ConfigureAwait(false);
             }
-            if (MinorGuard.IsRestricted(band))
-            {
-                // Klives sees which statements restrict the person, so a misread can be rejected (which recomputes the band).
-                foreach (var r in consistent.Concat(inconsistent))
-                {
-                    keys.Add(r.NaturalKey);
-                    await review.RaiseAsync(ReviewKinds.AgeEvidence, person, r.NaturalKey, $"Age statement restricting this person ({band})",
-                        new { r.EvidenceId, r.Kind, r.MessageId, r.AssertedAtMs, band = band.ToString() }, 0.95, seq, ct).ConfigureAwait(false);
-                }
-            }
-            await review.AutoResolveAsync(ReviewKinds.AgeEvidence, person, keys, "No longer restricting.", ct).ConfigureAwait(false);
+            await review.AutoResolveAsync(ReviewKinds.AgeEvidence, person, keys, "Age evidence no longer raises a restriction.", ct).ConfigureAwait(false);
             await review.AutoResolveAsync(ReviewKinds.AgeConflict, person, keys, "Age statements are consistent again.", ct).ConfigureAwait(false);
         }
 
@@ -618,19 +594,16 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         {
             long now = Context.Clock.NowMs;
             var ids = kit.Corpus.PersonIdsOf(person);
-            var band = Context.Policy.BandOf(person, now);
             var facts = kit.Assertions.Query(new AssertionQuery { SubjectIds = ids, AtMs = now, Limit = 3_000 });
             (int Covered, long? LastExtract, bool Pending) coverage;
             using (var c = Context.Stores.Intel.OpenRead())
                 coverage = c.Query(null, "SELECT covered_messages, last_extract_ms, pending FROM kn_person_state WHERE person_id=$p",
                     r => (r.GetInt32(0), r.GetInt64OrNull(1), r.GetInt32(2) == 1), ("$p", person)).FirstOrDefault();
-            // MinorGuard: nothing restricted about this person or about someone a fact names, and no inference about a minor.
-            var named = MinorGuard.NamedBands(Context.Policy, now);
-            var shown = facts.Where(f => Attributes.IsShownFor(f.Record.Attribute, f.Record.Status, band, named(f.Record.ObjectId))).ToList();
+            // The minor guard was removed: every stored fact is shown, including inferences about minors.
+            var shown = facts.ToList();
             var body = new KnowledgeProfileDto(
                 person,
                 now,
-                MinorGuard.IsRestricted(band),
                 shown.Where(f => f.Record.Status != AssertionStatus.Inferred)
                     .GroupBy(f => f.Definition.Category, StringComparer.Ordinal)
                     .Select(g => new KnowledgeCategoryDto(g.Key, g.Select(ToFactDto).ToList())).OrderBy(c => c.Category, StringComparer.Ordinal).ToList(),

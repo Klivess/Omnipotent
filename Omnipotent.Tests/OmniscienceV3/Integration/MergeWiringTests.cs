@@ -291,7 +291,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
         // ── WS-B → WS-C: a due plan reminder is a notice (X48) ───────────────────────────────────────────────────────
 
         [Fact]
-        public async Task PlanReminder_IsANotice_AndOneWhosePlanIsGoneOrHeldBackIsCancelled()
+        public async Task PlanReminder_IsANotice_AndOneWhosePlanIsGoneIsCancelled()
         {
             long now = Instant.FromUtc(new DateTime(2026, 11, 9, 12, 0, 0, DateTimeKind.Utc));
             await using var h = await KnowledgeHarness.StartAsync(now);
@@ -299,7 +299,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
             h.Kit.Notices = notices;
             await h.Stores.Intel.WriteAsync((c, tx) =>
             {
-                foreach (var (plan, restricted) in new[] { ("plan-dinner", 0), ("plan-held", 1) })
+                foreach (var (plan, restricted) in new[] { ("plan-dinner", 0), ("plan-held", 0) })
                     c.Exec(tx, """
                         INSERT INTO kn_plans(plan_id, kind, owner_person_id, counterparty_person_id, involves_klives, klives_promised, title, all_day, firmness, status,
                             natural_key, evidence_json, minor_restricted, created_at_ms, updated_at_ms, source_seq)
@@ -310,19 +310,20 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
                         ("$i", id), ("$p", plan), ("$o", occurrence), ("$f", now - 60_000), ("$t", now));
                 Reminder("rm-due", "plan-dinner", now + 2 * 3_600_000L);
                 Reminder("rm-long-past", "plan-dinner", now - 3 * 86_400_000L); // the service was down past the occurrence itself
-                Reminder("rm-held", "plan-held", now + 2 * 3_600_000L);         // marked a minor after the reminder was set
+                Reminder("rm-held", "plan-held", now + 2 * 3_600_000L);         // an ordinary plan now: the minor guard is gone
                 Reminder("rm-gone", "plan-forgotten", now + 2 * 3_600_000L);    // the plan was removed by a forget run
             });
 
             var result = System.Text.Json.JsonSerializer.SerializeToElement(await h.Module<PlansModule>().FireRemindersAsync(CancellationToken.None));
-            Assert.Equal((1, 1, 2), (result.GetProperty("fired").GetInt32(), result.GetProperty("missed").GetInt32(), result.GetProperty("withheld").GetInt32()));
+            Assert.Equal((2, 1, 1), (result.GetProperty("fired").GetInt32(), result.GetProperty("missed").GetInt32(), result.GetProperty("withheld").GetInt32()));
 
-            var notice = Assert.Single(notices.Received);
+            Assert.Equal(2, notices.Received.Count);
+            var notice = notices.Received[0];
             Assert.Equal(("plan|rm-due", "plan_reminder", PlansModule.Id), (notice.NoticeId, notice.Kind, notice.ModuleId));
             Assert.Equal(("p-owner", "p-other"), (notice.PersonId, notice.OtherPersonId));
             Assert.Contains("synthetic dinner", System.Text.Json.JsonSerializer.Serialize(notice.Data));
             string State(string id) { using var c = h.Stores.Intel.OpenRead(); return c.Scalar<string>(null, "SELECT state FROM kn_reminders WHERE reminder_id=$i", ("$i", id))!; }
-            Assert.Equal(new[] { "fired", "missed", "cancelled", "cancelled" }, new[] { "rm-due", "rm-long-past", "rm-held", "rm-gone" }.Select(State));
+            Assert.Equal(new[] { "fired", "missed", "fired", "cancelled" }, new[] { "rm-due", "rm-long-past", "rm-held", "rm-gone" }.Select(State));
         }
     }
 }

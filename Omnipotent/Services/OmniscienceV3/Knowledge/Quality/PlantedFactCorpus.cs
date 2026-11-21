@@ -25,7 +25,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
         Roleplay,
         /// <summary>Hearsay about a special-category trait: must never be stored.</summary>
         SensitiveInference,
-        /// <summary>A fact about a minor in a MinorGuard-restricted category: must never be stored.</summary>
+        /// <summary>A fact about a minor that the former guard restricted. Now stored like any other fact.</summary>
         RestrictedMinor,
         /// <summary>Plain chatter with no fact in it.</summary>
         Filler,
@@ -110,7 +110,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
             M(B, dmB, t0 + 13 * day, "I'm Catholic, so Sundays are church", PlantKind.LiteralSelf, B, "religion", "Catholic");
             M(B, dmB, t0 + 14 * day, "I play chess most evenings", PlantKind.LiteralSelf, B, "hobby", "chess");
 
-            // Cam: a minor (age and school year), restricted facts that must never be stored, one allowed interest.
+            // Cam: a minor (age and school year), a school and city that are now ordinary facts, one interest.
             M(C, dmC, t0 + 20 * day, "I'm 14 and in year 9", PlantKind.LiteralSelf, C, "age", "14", age: 14);
             M(C, dmC, t0 + 20 * day + 60_000, "my school is Hillcrest Academy", PlantKind.RestrictedMinor, C, "school", "Hillcrest Academy");
             M(C, dmC, t0 + 20 * day + 120_000, "I live in Rotherham with my mum", PlantKind.RestrictedMinor, C, "city", "Rotherham");

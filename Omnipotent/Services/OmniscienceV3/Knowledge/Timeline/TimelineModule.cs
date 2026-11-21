@@ -38,7 +38,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Timeline
             Description = "Life events (moves, jobs, relationships, trips, purchases, achievements) on a time axis with uncertainty and evidence.",
             DefaultLane = Lane.Cpu,
             DependsOn = new[] { KnowledgeSchema.DeductionModule },
-            MinorRestricted = true,
             Datasets = new[] { KnowledgeSchema.LifeEventsDataset },
             ReadModels = new[] { new ReadModelDescriptor(ReadModel, "Life timeline", "omniscience.persons.read", 1, 600_000, "A person's life events, ordered by when they happened, with uncertainty.") },
         };

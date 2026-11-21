@@ -80,7 +80,6 @@ namespace Omnipotent.Services.OmniscienceV3.Ingest.Media
             SubscribedChangeKinds = new[] { ChangeKinds.AttachmentStored },
             Schedules = new[] { new ScheduleTrigger("sweep", Every: TimeSpan.FromMinutes(30)) },
             DefaultLane = Lane.LlmBackground,
-            MinorRestricted = true,
             Settings = new[]
             {
                 new SettingDescriptor(EnabledSetting, SettingTypes.Bool, "true", "Caption stored images through AIRouter's vision model."),

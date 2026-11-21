@@ -33,7 +33,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Insights
             Outputs = new[] { TacticOutputKind.Report, TacticOutputKind.Cohort },
             Lane = Lane.Cpu,
             RequiredPermission = "omniscience.persons.read",
-            MinorRestriction = RestrictedCapability.RoutineInference,
             TypicalDurationMs = 400,
         };
 

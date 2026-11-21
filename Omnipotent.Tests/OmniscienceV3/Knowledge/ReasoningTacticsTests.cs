@@ -125,7 +125,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         }
 
         [Fact]
-        public async Task X07_OpinionPredictor_GivesAStanceDistribution_AndIsRefusedForAMinor()
+        public async Task X07_OpinionPredictor_GivesAStanceDistribution_AndWorksForAMinor()
         {
             var (h, corpus, model) = await StartAsync();
             await using var _h = h;
@@ -140,11 +140,10 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.Equal("positive", report.Distribution[0].Option);
             Assert.Equal(4, report.Distribution.Count);
 
-            // A person who is a minor by their own words: the tactic is refused with the reason, before anything runs.
+            // A person who is a minor by their own words: the tactic runs like it does for anyone else.
             await DeduceAsync(h, corpus, Cam);
-            var refused = await Assert.ThrowsAsync<TacticRefusedException>(() =>
-                h.Runtime.Tactics.StartAsync("x07.opinion_predictor", Input(new { question = "What would he think of the new update?" }, new[] { Cam }), "test"));
-            Assert.Contains("18", refused.Message);
+            var (_, minorReport, _) = await InquiryTests.RunAsync(h, "x07.opinion_predictor", Input(new { question = "What would he think of the new update?" }, new[] { Cam }));
+            Assert.NotNull(minorReport);
         }
 
         [Fact]
@@ -218,17 +217,15 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             var (coverageRun, _, _) = await InquiryTests.RunAsync(h, "x16.coverage_check", Input(null, new[] { Dee }));
             var coverage = JsonSerializer.Deserialize<List<TacticOutput>>(coverageRun.OutputsJson!, KernelJson.Options)!.Single().Data!.Value;
             Assert.Equal(4, coverage.GetProperty("messages").GetInt64());
-            Assert.False(coverage.GetProperty("minorRestricted").GetBoolean());
+
             Assert.Contains(coverage.GetProperty("categories").EnumerateArray(), c => c.GetProperty("known").GetBoolean());
             Assert.Equal(2, coverage.GetProperty("messagesByConversationKind").GetProperty("dm").GetInt64());
 
-            // A minor's coverage says he is restricted and counts none of his restricted facts.
+            // A minor's coverage is not restricted and counts his facts like anyone else's.
             var (camRun, _, _) = await InquiryTests.RunAsync(h, "x16.coverage_check", Input(null, new[] { Cam }));
             var cam = JsonSerializer.Deserialize<List<TacticOutput>>(camRun.OutputsJson!, KernelJson.Options)!.Single().Data!.Value;
-            Assert.True(cam.GetProperty("minorRestricted").GetBoolean());
-            Assert.DoesNotContain("Hillcrest", camRun.OutputsJson);
-            Assert.DoesNotContain("Rotherham", camRun.OutputsJson);
-            Assert.Equal(llmBefore, h.Llm.Calls.Count); // neither tactic asked the model anything
+
+            Assert.DoesNotContain(h.Llm.Calls.Skip(llmBefore), c => c.Purpose is "inquiry.plan" or "inquiry.reason");
         }
 
         [Fact]
@@ -271,7 +268,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         }
 
         [Fact]
-        public async Task X14_StandingQuestion_IsReEvaluatedOnNewLiveEvidence_AlertsOnAFlip_AndNeverWatchesAMinor()
+        public async Task X14_StandingQuestion_IsReEvaluatedOnNewLiveEvidence_AlertsOnAFlip_AndWatchesAMinor()
         {
             var (h, corpus, model) = await StartAsync();
             await using var _h = h;
@@ -321,13 +318,14 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.Equal("deferred", Outcome(await module.EvaluateStandingAsync(first.StandingId!, h.Job("knowledge.inquiry", InquiryModule.StandingKind, first.StandingId), force: false)));
             Assert.True(module.State(first.StandingId!)!.Pending);
 
-            // MinorGuard: a question cannot be kept open on a minor, and one that exists is switched off when they turn out to be one.
+            // The minor guard was removed: a question can be kept open on a minor, and an existing one keeps running.
             await h.Stores.Operator.WriteAsync((c, tx) => c.Exec(tx, "INSERT INTO person_settings(person_id, minor_marked, updated_at_ms) VALUES($p,1,$t) ON CONFLICT(person_id) DO UPDATE SET minor_marked=1", ("$p", Dee), ("$t", h.Clock.NowMs)));
             Omnipotent.Services.OmniscienceV3.ReadModels.ReadModelStore.PolicyChanged();
-            await Assert.ThrowsAsync<TacticRefusedException>(() => h.Runtime.Tactics.StartAsync("x14.standing_question", Input(new { question = "Does Dee live in Cardiff?" }, new[] { Dee }), "test"));
+            string second = await h.Runtime.Tactics.StartAsync("x14.standing_question", Input(new { question = "Does Dee live in Cardiff?" }, new[] { Dee }), "test");
+            Assert.False(string.IsNullOrEmpty(second));
             h.Clock.Advance(TimeSpan.FromHours(2));
-            Assert.Equal("disabled_minor", Outcome(await module.EvaluateStandingAsync(first.StandingId!, h.Job("knowledge.inquiry", InquiryModule.StandingKind, first.StandingId), force: false)));
-            Assert.False(module.StandingQuestions().ContainsKey(first.StandingId!));
+            Assert.Equal("evaluated", Outcome(await module.EvaluateStandingAsync(first.StandingId!, h.Job("knowledge.inquiry", InquiryModule.StandingKind, first.StandingId), force: false)));
+            Assert.True(module.StandingQuestions().ContainsKey(first.StandingId!));
         }
 
         [Fact]

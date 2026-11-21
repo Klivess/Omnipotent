@@ -221,7 +221,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         }
 
         [Fact]
-        public async Task TeachConcept_LearnsFromADescriptionAppliesCorpusWideAndRefusesSensitiveConcepts()
+        public async Task TeachConcept_LearnsFromADescriptionAppliesCorpusWideAndAllowsSensitiveConcepts()
         {
             await ToActiveLabelsetAsync();
             var runner = rt.Tactics;
@@ -259,13 +259,12 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             await driver.RunUntilIdleAsync();
             Assert.Equal(1, Scalar<long>(rt.Stores.Intel, "SELECT COUNT(*) FROM labels WHERE item_id='discord:999000000000000001' AND task=$t", ("$t", ClassificationModule.ConceptTask(concept.ConceptId))));
 
-            string refused = await runner.StartAsync(TeachConceptTactic.Key, new TacticInput(Array.Empty<Selection>(),
+            string second = await runner.StartAsync(TeachConceptTactic.Key, new TacticInput(Array.Empty<Selection>(),
                 JsonSerializer.SerializeToElement(new { name = "religion talk", description = "people discussing their faith" })), "test");
             await driver.RunUntilIdleAsync();
-            var r2 = runner.Get(refused)!;
-            Assert.Equal(TacticRunStates.Failed, r2.State);
-            Assert.Contains("doesn't infer", r2.Error);
-            Assert.Single(module.Concepts());
+            var r2 = runner.Get(second)!;
+            Assert.Equal(TacticRunStates.Succeeded, r2.State);
+            Assert.Equal(2, module.Concepts().Count());
         }
 
         [Fact]

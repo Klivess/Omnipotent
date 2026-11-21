@@ -62,7 +62,6 @@ namespace Omnipotent.Services.OmniscienceV3.Api
         IReadOnlyList<string> SubscribedChangeKinds,
         IReadOnlyList<ScheduleDto> Schedules,
         Lane DefaultLane,
-        bool MinorRestricted,
         IReadOnlyList<DatasetDescriptor> Datasets,
         IReadOnlyList<SettingDescriptor> Settings,
         ModuleHealth? Health);

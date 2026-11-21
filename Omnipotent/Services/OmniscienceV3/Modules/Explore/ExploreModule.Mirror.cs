@@ -77,7 +77,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                     foreach (var b in bound.Values.Where(b => b.Source != null)) ClearState(SourceState(b.Dataset.Id) + ".whole_at");
                     MirrorSources(ct);
                 }
-                bool policyChanged = RefreshRestricted() | RefreshOff();
+                bool policyChanged = RefreshOff();
                 WriteState("as_of", Context.Clock.NowMs);
                 if (messages + events + relations > 0 || mapDirty || policyChanged || erased) Bump();
             }
@@ -356,31 +356,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             Exec("DELETE FROM off_persons");
             using (var appender = Db.CreateAppender("off_persons"))
                 foreach (var p in off) appender.CreateRow().AppendValue(p).EndRow();
-            tx.Commit();
-            return true;
-        }
-
-        /// <summary>Minors and likely minors (MinorGuard) as of now: Klives's marks plus every band the projections computed.</summary>
-        private bool RefreshRestricted()
-        {
-            var restricted = new HashSet<string>(StringComparer.Ordinal);
-            using (var op = Context.Stores.Operator.OpenRead())
-                foreach (var p in op.Query(null, "SELECT person_id FROM person_settings WHERE minor_marked=1", r => r.GetString(0))) restricted.Add(Context.Policy.Canonical(p));
-            using (var c = Context.Stores.Intel.OpenRead())
-                if (c.Scalar<long>(null, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='projection_people'") > 0)
-                    foreach (var p in c.Query(null, "SELECT person_id FROM projection_people WHERE band IN ('Minor','LikelyMinor')", r => r.GetString(0))) restricted.Add(p);
-            var current = new HashSet<string>(StringComparer.Ordinal);
-            using (var cmd = Db.CreateCommand())
-            {
-                cmd.CommandText = "SELECT person_id FROM restricted_persons";
-                using var r = cmd.ExecuteReader();
-                while (r.Read()) current.Add(r.GetString(0));
-            }
-            if (current.SetEquals(restricted)) return false;
-            using var tx = Db.BeginTransaction();
-            Exec("DELETE FROM restricted_persons");
-            using (var appender = Db.CreateAppender("restricted_persons"))
-                foreach (var p in restricted) appender.CreateRow().AppendValue(p).EndRow();
             tx.Commit();
             return true;
         }

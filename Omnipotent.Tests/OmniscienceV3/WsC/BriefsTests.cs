@@ -215,7 +215,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         }
 
         [Fact]
-        public async Task Digest_AboutOnePerson_IsRefusedForMinors_AndSubscriptionsRunOncePerOccurrence()
+        public async Task Digest_AboutOnePerson_WorksForMinors_AndSubscriptionsRunOncePerOccurrence()
         {
             await using var h = await SignalsHarness.StartAsync(briefs: true);
             await h.PostAsync(General, Ana, "pizza friday");
@@ -227,9 +227,9 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.DoesNotContain("pizza yes", h.Llm.Requests[0].Turns[^1].Content);
 
             await h.MarkMinorAsync("p-ana");
-            var refused = await Assert.ThrowsAsync<TacticRefusedException>(() => h.Briefs!.RequestDigestAsync("person", "p-ana", null, null, "tester", "on_demand", null, true, CancellationToken.None));
-            Assert.Equal(BriefsModule.MinorRefusal, refused.Message);
-            await Assert.ThrowsAsync<TacticRefusedException>(() => h.Briefs!.SaveSubscriptionAsync(null, "Ana daily", "person", "p-ana", "daily", "08:00", null, true, "tester", CancellationToken.None));
+            var minorDigest = await h.Briefs!.RequestDigestAsync("person", "p-ana", null, null, "tester", "on_demand", null, true, CancellationToken.None);
+            Assert.Equal("person", minorDigest.ScopeKind);
+            Assert.NotNull(await h.Briefs!.SaveSubscriptionAsync(null, "Ana daily", "person", "p-ana", "daily", "08:00", null, true, "tester", CancellationToken.None));
 
             // It is 13:00 in London. A daily subscription at 13:30 and a weekly one on Wednesdays at 09:00 (today is Monday).
             var daily = await h.Briefs!.SaveSubscriptionAsync(null, "Server 1 daily", "guild", "discord:g1", "daily", "13:30", null, true, "tester", CancellationToken.None);
@@ -320,14 +320,16 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.True(brief.ActiveDays30d >= 7);
             Assert.NotNull(brief.Style);
             Assert.True(brief.Style!.AverageWords > 2);
-            Assert.Equal(("city", "Leeds"), (Assert.Single(brief.Facts).Attribute, brief.Facts[0].Value));
+            Assert.Contains(brief.Facts, f => f.Attribute == "city" && f.Value == "Leeds");
+            Assert.Contains(brief.Facts, f => f.Attribute == "religion" && f.Value == "inferred from a joke");
             Assert.Equal((dm2, "question"), (Assert.Single(brief.OpenThreads).MessageId, brief.OpenThreads[0].Kind));
             Assert.NotNull(h.Runtime.Host.ReadModels.Get(BriefsModule.PersonModel, "p-ben"));
 
             // A digest about him lists what Omniscience concluded in its period (the same filters), and only then: the next one has nothing to repeat.
             h.Clock.Advance(Minute);
             var withFacts = await RunDigestAsync(h, "person", "p-ben", now - 86_400_000L);
-            Assert.Equal(("a1", "city", "Leeds", "Ben"), (Assert.Single(withFacts.NewFacts).AssertionId, withFacts.NewFacts[0].Attribute, withFacts.NewFacts[0].Value, withFacts.NewFacts[0].PersonName));
+            Assert.Contains(withFacts.NewFacts, f => f.AssertionId == "a1" && f.Attribute == "city" && f.Value == "Leeds" && f.PersonName == "Ben");
+            Assert.Contains(withFacts.NewFacts, f => f.AssertionId == "a2" && f.Attribute == "religion");
             h.Clock.Advance(Hour);
             Assert.Empty((await RunDigestAsync(h, "person", "p-ben", withFacts.ToMs)).NewFacts);
 
@@ -343,10 +345,11 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Equal(("done", 0, true), (empty.State, empty.Sections.Count, empty.Stale));
             Assert.Equal(calls, h.Llm.Requests.Count(r => r.Purpose.StartsWith("briefs.")));
 
-            // Minors: no brief is written, and one written earlier is no longer shown.
+            // Minors: a brief is written and shown like anyone else's.
             await h.MarkMinorAsync("p-ben");
-            Assert.Equal(BriefsModule.MinorRefusal, (await Assert.ThrowsAsync<TacticRefusedException>(() => h.Briefs.RequestPersonBriefAsync("p-ben", "tester", CancellationToken.None))).Message);
-            Assert.Throws<TacticRefusedException>(() => h.Briefs.PersonBrief("p-ben"));
+            Assert.Equal("queued", (await h.Briefs.RequestPersonBriefAsync("p-ben", "tester", CancellationToken.None)).State);
+            await h.Driver.RunUntilIdleAsync();
+            Assert.NotNull(h.Briefs.PersonBrief("p-ben"));
             await Assert.ThrowsAsync<KeyNotFoundException>(() => h.Briefs.RequestPersonBriefAsync("p-nobody", "tester", CancellationToken.None));
         }
 
@@ -421,14 +424,13 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             var subscription = Assert.Single(h.Briefs!.Subscriptions());
             Assert.Equal(("guild", "discord:g1", "weekly", "18:00", 5), (subscription.ScopeKind, subscription.ScopeId, subscription.Cadence, subscription.At, subscription.Weekday));
 
-            // Refusals: a time range alone for topics, a malformed range, a person who may be a minor.
+            // Refusals: a time range alone for topics, a malformed range. A person who is a minor is allowed.
             await Assert.ThrowsAsync<TacticRefusedException>(() => h.Runtime.Tactics.StartAsync(TopicSnapshotTactic.Key, new TacticInput(new[] { Selection.Window(t0, t0 + 1) }), "tester"));
             await Assert.ThrowsAsync<TacticRefusedException>(() => h.Runtime.Tactics.StartAsync(SummariseSelectionTactic.Key,
                 new TacticInput(new[] { new Selection(SelectionKind.TimeRange, new[] { new SelectionItem("yesterday") }) }), "tester"));
             await h.MarkMinorAsync("p-ana");
-            var refused = await Assert.ThrowsAsync<TacticRefusedException>(() => h.Runtime.Tactics.StartAsync(DigestSubscriptionTactic.Key,
-                new TacticInput(new[] { Selection.Of(SelectionKind.Person, new[] { "p-ana" }) }), "tester"));
-            Assert.Contains("under 18", refused.Message);
+            Assert.False(string.IsNullOrEmpty(await h.Runtime.Tactics.StartAsync(DigestSubscriptionTactic.Key,
+                new TacticInput(new[] { Selection.Of(SelectionKind.Person, new[] { "p-ana" }) }), "tester")));
         }
     }
 }

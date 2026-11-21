@@ -55,7 +55,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Insights
             SubscribedChangeKinds = new[] { Storage.ChangeKinds.PersonErase },
             Schedules = new[] { new ScheduleTrigger("nightly", DailyAtLocal: new TimeOnly(4, 15)) },
             DefaultLane = Lane.Cpu,
-            MinorRestricted = true,
             Settings = new[]
             {
                 new SettingDescriptor("insights.pair.weeks", SettingTypes.Int, "104", "How many weeks of history the relationship series cover.", 26, 520),

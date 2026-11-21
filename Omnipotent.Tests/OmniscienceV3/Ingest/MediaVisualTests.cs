@@ -231,7 +231,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
             Assert.Equal(expected, PlatformLinks.Discord(conversation, kind, guild, message));
 
         [Fact]
-        public async Task ImagesOfPeopleWithAnalysisOff_OrWhoMayBeMinors_AreNeitherEmbeddedNorReturned()
+        public async Task ImagesOfPeopleWithAnalysisOff_AreNotReturned_ButMinorsAreEmbeddedAndReturned()
         {
             string ada = await AttachAsync("m1", Picture(SKColors.Red), "u-ada");
             string cy = await AttachAsync("m2", Picture(SKColors.Red), "u-cy");
@@ -247,12 +247,13 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
             });
             ReadModelStore.PolicyChanged();
             int before = embedder.Images;
-            Assert.StartsWith("skipped:", await module.EmbedAsync(dee, CancellationToken.None));
-            Assert.Equal(before, embedder.Images);
+            Assert.Equal("embedded", await module.EmbedAsync(dee, CancellationToken.None));
+            Assert.Equal(before + 1, embedder.Images);
 
-            // Cy's image was embedded before analysis was switched off: it is still never returned.
+            // Cy's image was embedded before analysis was switched off: it is still never returned. Dee is a minor and
+            // is treated like anyone else.
             var found = await module.SearchAsync(new MediaSearchQuery("red"), CancellationToken.None);
-            Assert.Equal(new[] { ada }, found.Hits.Select(h => h.AttachmentId));
+            Assert.Equal(new[] { ada, dee }.OrderBy(x => x), found.Hits.Select(h => h.AttachmentId).OrderBy(x => x));
         }
     }
 

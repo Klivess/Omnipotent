@@ -21,23 +21,24 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
         public const double LiteralSelfTarget = 0.95;
         public const double OverallTarget = 0.85;
 
-        /// <summary>The plan's acceptance: literal self-disclosure precision ≥ 0.95, overall ≥ 0.85, zero restricted facts stored for
-        /// minors, zero hallucinated evidence references, zero sensitive inferences.</summary>
+        /// <summary>The acceptance gates: literal self-disclosure precision ≥ 0.95, overall ≥ 0.85, zero hallucinated evidence
+        /// references. Minor and sensitive-trait gates were removed on 2026-11-21; their counts remain as observability.</summary>
         public bool PassesGates => (double.IsNaN(LiteralSelfPrecision.Value) || LiteralSelfPrecision.Value >= LiteralSelfTarget)
                                    && (double.IsNaN(Precision.Value) || Precision.Value >= OverallTarget)
-                                   && RestrictedFactsStoredForMinors == 0 && HallucinatedEvidenceRefs == 0 && SensitiveInferencesStored == 0;
+                                   && HallucinatedEvidenceRefs == 0;
     }
 
     /// <summary>
     /// Scores what the deduction engine stored against a planted-fact corpus: precision of every fact shown as knowledge
-    /// (accepted or confirmed), precision of literal self-disclosures, recall of the planted facts, the MinorGuard and
-    /// sensitive-trait invariants, and that every stored evidence reference exists and quotes its message version.
+    /// (accepted or confirmed), precision of literal self-disclosures, recall of the planted facts, the legacy minor and
+    /// sensitive-trait counts, and that every stored evidence reference exists and quotes its message version.
     /// </summary>
     public static class DeductionEvaluator
     {
         public static DeductionEvaluation Evaluate(KnowledgeKit kit, PlantedCorpus corpus, long asOfMs)
         {
             var positives = corpus.Messages.Where(m => m.Kind is PlantKind.LiteralSelf or PlantKind.ThirdParty or PlantKind.Negated or PlantKind.Relocation
+                                                         or PlantKind.RestrictedMinor or PlantKind.SensitiveInference
                                                          && m.Attribute is not ("age" or "school_year")).ToList();
             var shown = new List<AssertionView>();
             foreach (var person in corpus.Persons)
@@ -64,7 +65,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
             var missed = positives.Where(p => !matchedPlants.Contains(p.MessageId) && !shown.Any(a => a.Record.Attribute == p.Attribute && Same(p.Value, a.Record.ValueText ?? "")))
                 .Select(p => $"{p.SubjectPersonId} {p.Attribute}={p.Value}").ToList();
 
-            // MinorGuard: no restricted fact of the minor anywhere (assertions of any status, claim values).
+            // Legacy minor-guard count (now informational: restricted attributes are ordinary attributes).
             int restricted = 0;
             var restrictedAttrs = Attributes.All.Where(x => x.Sensitivity == AttributeSensitivity.RestrictedForMinors).Select(x => x.Id).ToList();
             using (var c = kit.Context.Stores.Intel.OpenRead())
@@ -75,7 +76,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Quality
                     restricted += (int)c.Scalar<long>(null, "SELECT COUNT(*) FROM kn_claims WHERE person_id=$p AND attribute=$a AND value_text IS NOT NULL", ("$p", corpus.MinorPersonId), ("$a", attr));
                 }
             }
-            // Sensitive inference: hearsay about a special-category trait must never be stored.
+            // Legacy sensitive-inference count (now informational: hearsay about a special category may be stored).
             int sensitive = 0;
             foreach (var trap in corpus.Messages.Where(m => m.Kind == PlantKind.SensitiveInference))
                 sensitive += shown.Count(a => a.Record.SubjectId == trap.SubjectPersonId && a.Record.Attribute == trap.Attribute && a.Record.SourceKind != ClaimSource.SelfDisclosure);

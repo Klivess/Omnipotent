@@ -41,8 +41,6 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Modules
         public IReadOnlyList<string> SubscribedChangeKinds { get; init; } = Array.Empty<string>();
         public IReadOnlyList<ScheduleTrigger> Schedules { get; init; } = Array.Empty<ScheduleTrigger>();
         public Lane DefaultLane { get; init; } = Lane.Cpu;
-        /// <summary>The module builds person-identifying outputs and must consult MinorGuard.</summary>
-        public bool MinorRestricted { get; init; }
         public IReadOnlyList<DatasetDescriptor> Datasets { get; init; } = Array.Empty<DatasetDescriptor>();
         public IReadOnlyList<SettingDescriptor> Settings { get; init; } = Array.Empty<SettingDescriptor>();
         /// <summary>Read models this module's projections maintain (served by <c>GET /omniscience/v3/rm</c>).</summary>

@@ -232,9 +232,9 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Equal(1, links.Track(Video, null, scope: ScopeFilter.None with { Guilds = new[] { "discord:g2" } }).Shares);
             Assert.Equal(1, links.Track(Video, null, scope: ScopeFilter.None with { NotPersons = new[] { "p-cyd" } }).Shares);
 
-            // Someone who is or may be under 18 cannot be asked for by name; leaving them out is always allowed.
+            // Someone who is or may be under 18 can be asked for by name like anyone else.
             await h.MarkMinorAsync("p-ben");
-            Assert.Throws<TacticRefusedException>(() => Scoped(ScopeFilter.None with { Persons = new[] { "p-ana", "p-ben" } }));
+            Assert.Equal(Sorted(a1, b1, a2, g1), Scoped(ScopeFilter.None with { Persons = new[] { "p-ana", "p-ben" } }));
             Assert.Equal(Sorted(a1, c1, a2), Scoped(ScopeFilter.None with { NotPersons = new[] { "p-ben" } }));
             Assert.Throws<KeyNotFoundException>(() => Scoped(ScopeFilter.None with { Persons = new[] { "p-nobody" } }));
         }

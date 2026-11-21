@@ -262,7 +262,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
                 c.Exec(tx, "UPDATE messages SET current_version=2, content='omw see u soon', edited_at_ms=$e WHERE message_id=$m", ("$e", t1 + 60_000), ("$m", orig));
                 c.Exec(tx, "INSERT INTO message_versions(message_id, version, content, edited_at_ms, recorded_at_ms, source_id) VALUES($m,2,'omw see u soon',$e,$e,'synthetic')", ("$m", orig), ("$e", t1 + 60_000));
             }).ConfigureAwait(false);
-            // Max is a minor (Klives marked him): no replica, ever.
+            // Max is a minor (Klives marked him): now treated like anyone else.
             await stores.Operator.WriteAsync((c, tx) => c.Exec(tx, "INSERT INTO person_settings(person_id, tier, minor_marked, updated_at_ms) VALUES($p,'tracked',1,0)", ("$p", Max))).ConfigureAwait(false);
         }
 

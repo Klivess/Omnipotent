@@ -338,7 +338,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Transforms
             Outputs = new[] { TacticOutputKind.Cohort, TacticOutputKind.Report },
             Lane = Lane.Cpu,
             RequiredPermission = "omniscience.persons.read",
-            MinorRestriction = RestrictedCapability.RoutineInference,
             TypicalDurationMs = 500,
         };
 
@@ -418,7 +417,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Transforms
             Outputs = new[] { TacticOutputKind.Report, TacticOutputKind.Cohort },
             Lane = Lane.Cpu,
             RequiredPermission = "omniscience.persons.read",
-            MinorRestriction = RestrictedCapability.IdentityFacts,
             TypicalDurationMs = 800,
         };
 
@@ -535,7 +533,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Transforms
             Outputs = new[] { TacticOutputKind.Report },
             Lane = Lane.Cpu,
             RequiredPermission = "omniscience.persons.read",
-            MinorRestriction = RestrictedCapability.RoutineInference,
             TypicalDurationMs = 1_500,
         };
 
@@ -639,7 +636,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Transforms
             Outputs = new[] { TacticOutputKind.Report },
             Lane = Lane.Cpu,
             RequiredPermission = "omniscience.persons.read",
-            MinorRestriction = RestrictedCapability.RoutineInference,
             TypicalDurationMs = 800,
         };
 

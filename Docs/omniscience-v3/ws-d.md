@@ -1,5 +1,9 @@
 # WS-D — Replica (Omniscience v3 Phase 2)
 
+> **Removed features (2026-11-21):** the minor-safety guard is gone: minors get replicas, chats, social and routine
+> tactics, and their pre-18 messages are used like any others. Historical references below describe the code before
+> removal. See [safety-removals.md](safety-removals.md).
+
 Branch `claude/omniscience-v3-ws-d-21c7c3`, cut from the Phase 1 commit `ac223e6`. Code lives in
 `Omnipotent/Services/OmniscienceV3/Replica/` (module id `replica`, its own intel migration line `ReplicaSchema`).
 This file is the workstream's progress record: what is done, what is not, and why. It is kept current as work lands.
@@ -18,10 +22,10 @@ Everything below is committed; 194 v3 tests pass on this branch. The workstream'
 | Persona (dated opinions, relationships, self, interests, jokes; verified), reflex classifier, facts reader | done |
 | Composer (as-of, context, addressee, packed to the real window, cache-shaped prefix) | done |
 | Generator + judge (N candidates, burst sampling, LLM judge on the cached prefix, assistant-voice model) | done |
-| Versioned trainer, readiness, stale marking and retrain | done; `ReplicaTrainingTests` (14): every stage, refusals with the numbers, single flight, a crash mid-stage reclaimed, encoder failure degrades, the previous version keeps serving, cancel, minors blocked and purged |
+| Versioned trainer, readiness, stale marking and retrain | done; `ReplicaTrainingTests` (14): every stage, refusals with the numbers, single flight, a crash mid-stage reclaimed, encoder failure degrades, the previous version keeps serving, cancel, minors trained like anyone else |
 | Fidelity gates | done; `ReplicaFidelityGateTests` (5): zero post-cutoff tokens in an as-of prompt, the holdout never reaches a prompt-visible source, a stable stratified holdout, distinct personas stay distinct, tuning and reporting on separate splits |
 | Chat | done; `ReplicaChatTests` (10) |
-| Rehearsal (X55), drafts in Klives's voice (X57), Group Simulation (X63), social tactics X53, X54, X56, X58–X62, X64, X65 | done; `ReplicaSocialTests` (4): the catalogue is well formed, every tactic runs as a job on the seeded people, simulations and generated drafts are marked as such in their data, minors are refused before anything runs. **These are run-through tests with a scripted model: what each report says is not checked in depth.** |
+| Rehearsal (X55), drafts in Klives's voice (X57), Group Simulation (X63), social tactics X53, X54, X56, X58–X62, X64, X65 | done; `ReplicaSocialTests` (4): the catalogue is well formed, every tactic runs as a job on the seeded people, simulations and generated drafts are marked as such in their data, minors run like anyone else. **These are run-through tests with a scripted model: what each report says is not checked in depth.** |
 | Evaluator, auto-tune, blind test | built; the evaluator is covered by the split test above. **The blind test (Klives guesses real vs replica) has no test.** |
 | Routes (`ReplicaRoutes.cs`) | built, **never exercised** (no route test harness; first real exercise is the shadow run) |
 | Fidelity on real people | **not measured.** The acceptance target (median judge discrimination ≤ 65% for people with ≥ 1,000 replies) can only be checked on the real corpus, in the shadow run. |
@@ -43,6 +47,6 @@ its data now says `generated: true`.
   held out across versions and fidelity trends compare like with like.
 - **Persona visibility:** persona items are written per slice (≤ 4 months, one era, one model window) and become visible to an
   as-of only once their slice has ended; an as-of replica never sees a line written from later evidence.
-- **Minor periods:** messages a person wrote while MinorGuard says they were (likely) a minor are never read for their
+- **Minor periods (removed):** messages a person wrote while they were a minor are read for their
   replica, and as-of chats into that period are refused.
 - **Deleted messages** are never shown (a deleted stimulus becomes "[deleted message]").

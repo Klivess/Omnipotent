@@ -239,7 +239,7 @@ namespace Omnipotent.Services.KliveBot_Discord
         {
             DiscordMessageBuilder builder = new DiscordMessageBuilder();
             DiscordEmbedBuilder discordEmbed = new DiscordEmbedBuilder();
-            discordEmbed.Title = OmniPaths.CheckIfOnServer() == false ? "(Not Production) " : "" + title;
+            discordEmbed.Title = (OmniPaths.CheckIfOnServer() == false ? "(Not Production) " : "") + title;
             discordEmbed.Description = description;
             discordEmbed.Color = color;
             if (imagefilepath != "")

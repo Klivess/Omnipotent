@@ -36,7 +36,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Signalling
             Outputs = new[] { TacticOutputKind.AlertRule },
             Lane = Kernel.Jobs.Lane.LlmInteractive,
             RequiredPermission = "omniscience.alerts.manage",
-            MinorRestriction = RestrictedCapability.PersonTargetedAlert,
             TypicalDurationMs = 5_000,
             TypicalLlmCalls = 1,
         };

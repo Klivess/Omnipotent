@@ -1347,7 +1347,6 @@ export interface KnowledgeFactsPageDto {
   personId: string;
   mode: string;
   atMs: number;
-  minorRestricted: boolean;
   items: KnowledgeFactDto[];
   nextCursor?: string | null;
 }
@@ -1360,7 +1359,6 @@ export interface KnowledgeJobStartedDto {
 export interface KnowledgeProfileDto {
   personId: string;
   asOfMs: number;
-  minorRestricted: boolean;
   categories: KnowledgeCategoryDto[];
   inferences: KnowledgeFactDto[];
   coveredMessages: number;
@@ -1707,7 +1705,6 @@ export interface ModuleDto {
   subscribedChangeKinds: string[];
   schedules: ScheduleDto[];
   defaultLane: Lane;
-  minorRestricted: boolean;
   datasets: DatasetDescriptor[];
   settings: SettingDescriptor[];
   health?: ModuleHealth | null;
@@ -2624,8 +2621,6 @@ export interface RestoreDto {
   note: string;
 }
 
-export type RestrictedCapability = "FaceLabelling" | "Replica" | "PersonTargetedAlert" | "RoutineInference" | "IdentityFacts" | "TrackingSuggestion" | "ReplicaBasedTactic";
-
 export interface RetentionDto {
   stream: string;
   keptDays: number;
@@ -2991,7 +2986,6 @@ export interface TacticDescriptor {
   lane: Lane;
   requiredPermission: string;
   outbound: boolean;
-  minorRestriction?: RestrictedCapability | null;
   version: number;
   typicalDurationMs: number;
   typicalLlmCalls: number;

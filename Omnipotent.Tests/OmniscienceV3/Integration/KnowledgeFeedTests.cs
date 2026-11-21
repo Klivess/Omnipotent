@@ -25,7 +25,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
 
         private static Task PutProfileAsync(KnowledgeHarness h, string person, params KnowledgeCategoryDto[] categories) =>
             h.Context.ReadModels.PutAsync(DeductionModule.ProfileReadModel, person, 1, h.Clock.NowMs, 1,
-                new KnowledgeProfileDto(person, h.Clock.NowMs, false, categories, Array.Empty<KnowledgeFactDto>(), 0, null, false, "test"));
+                new KnowledgeProfileDto(person, h.Clock.NowMs, categories, Array.Empty<KnowledgeFactDto>(), 0, null, false, "test"));
 
         private static async Task<KnowledgeHarness> StartAsync()
         {
@@ -70,22 +70,25 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
 
             Assert.True(feed.MayHold(Ana, h.Clock.NowMs));
             Assert.False(feed.MayHold(Ben, h.Clock.NowMs));          // analysis off
-            Assert.False(feed.MayHold(Cam, h.Clock.NowMs));          // a minor
+            Assert.True(feed.MayHold(Cam, h.Clock.NowMs));           // the minor guard was removed
             Assert.False(feed.MayHold("p-nobody", h.Clock.NowMs));   // forgotten, or never known
 
             var page = feed.ChangedSince(0);
             Assert.Equal(new[] { Ana, Ben, Cam }.OrderBy(x => x), page.People.OrderBy(x => x));
-            Assert.All(page.Documents, d => Assert.Equal(Ana, d.PersonId));
             var byId = page.Documents.ToDictionary(d => d.DocId);
-            Assert.Equal(new[] { KnowledgeFeed.DocId(Ana, "family"), KnowledgeFeed.DocId(Ana, "location"), KnowledgeFeed.DocId(Ana, "work") }, byId.Keys.OrderBy(x => x));
+            Assert.Equal(new[]
+            {
+                KnowledgeFeed.DocId(Ana, "family"), KnowledgeFeed.DocId(Ana, "location"), KnowledgeFeed.DocId(Ana, "work"),
+                KnowledgeFeed.DocId(Cam, "work"),
+            }, byId.Keys.OrderBy(x => x));
             Assert.Equal("Ana Testwell — location:\n• City: Leeds", byId[KnowledgeFeed.DocId(Ana, "location")].Text);
             Assert.Contains("the library (confirmed by Klives)", byId[KnowledgeFeed.DocId(Ana, "work")].Text);
             Assert.Contains("Eve", byId[KnowledgeFeed.DocId(Ana, "family")].Text);
-            Assert.DoesNotContain("Cam", byId[KnowledgeFeed.DocId(Ana, "family")].Text);
+            Assert.Contains("Cam", byId[KnowledgeFeed.DocId(Ana, "family")].Text);
             Assert.Equal(Ana, KnowledgeFeed.PersonOf(KnowledgeFeed.DocId(Ana, "family")));
             Assert.Null(KnowledgeFeed.PersonOf("omnifact:x:y"));
             // A document says whom else it names, so its holder can tell when it names someone it may no longer hold.
-            Assert.Equal(new[] { Eve }, byId[KnowledgeFeed.DocId(Ana, "family")].Names);
+            Assert.Equal(new[] { Cam, Eve }, byId[KnowledgeFeed.DocId(Ana, "family")].Names.OrderBy(x => x));
             Assert.Empty(byId[KnowledgeFeed.DocId(Ana, "location")].Names);
 
             // Nothing new after the watermark; a rebuilt profile is picked up again.
@@ -114,20 +117,24 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
 
                 await connector.RunIncrementalAsync(CancellationToken.None);
                 var held = writer.GetDocIdsForSource(RagSource.Omniscience).OrderBy(x => x).ToList();
-                Assert.Equal(new[] { KnowledgeFeed.DocId(Ana, "family"), KnowledgeFeed.DocId(Ana, "location"), KnowledgeFeed.DocId(Ana, "work") }, held);
+                Assert.Equal(new[]
+                {
+                    KnowledgeFeed.DocId(Ana, "family"), KnowledgeFeed.DocId(Ana, "location"), KnowledgeFeed.DocId(Ana, "work"),
+                    KnowledgeFeed.DocId(Cam, "work"),
+                }, held);
                 Assert.Equal("0", writer.GetCursor("omniscience:facts")); // v2 re-reads from scratch if the switch goes back
 
                 // Analysis switched off for Ana: everything held about her goes on the next pass, rebuilt profile or not.
                 await h.Stores.Operator.WriteAsync((c, tx) => AnalysisOff.Set(c, tx, new[] { Ana }, h.Clock.NowMs));
                 await connector.RunIncrementalAsync(CancellationToken.None);
-                Assert.Empty(writer.GetDocIdsForSource(RagSource.Omniscience));
+                Assert.Equal(new[] { KnowledgeFeed.DocId(Cam, "work") }, writer.GetDocIdsForSource(RagSource.Omniscience));
 
                 // Back on, and her profile rebuilt: held again. A category she no longer has facts in is removed.
                 await h.Stores.Operator.WriteAsync((c, tx) => AnalysisOff.Clear(c, tx, new[] { Ana }));
                 h.Clock.Advance(TimeSpan.FromMinutes(1));
                 await PutProfileAsync(h, Ana, new KnowledgeCategoryDto("location", new[] { Fact("a1", "city", "City", "location", "Leeds") }));
                 await connector.RunIncrementalAsync(CancellationToken.None);
-                Assert.Equal(new[] { KnowledgeFeed.DocId(Ana, "location") }, writer.GetDocIdsForSource(RagSource.Omniscience));
+                Assert.Equal(new[] { KnowledgeFeed.DocId(Ana, "location"), KnowledgeFeed.DocId(Cam, "work") }.OrderBy(x => x), writer.GetDocIdsForSource(RagSource.Omniscience).OrderBy(x => x));
 
                 // Switched off (shadow mode): v3 lets go of what it held and starts again from the beginning next time.
                 on = false;
@@ -167,20 +174,21 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
                 var connector = new OmniscienceV3Connector(writer, _ => { }, () => Task.FromResult<Omnipotent.Services.OmniscienceV3.V3Runtime?>(h.Runtime), () => Task.FromResult(true));
                 await connector.RunIncrementalAsync(CancellationToken.None);
                 string family = KnowledgeFeed.DocId(Ana, "family"), location = KnowledgeFeed.DocId(Ana, "location"), work = KnowledgeFeed.DocId(Ana, "work");
-                Assert.Equal(new[] { family, location, work }, writer.GetDocIdsForSource(RagSource.Omniscience).OrderBy(x => x));
+                string camWork = KnowledgeFeed.DocId(Cam, "work");
+                Assert.Equal(new[] { family, location, work, camWork }.OrderBy(x => x), writer.GetDocIdsForSource(RagSource.Omniscience).OrderBy(x => x));
                 var feed = new KnowledgeFeed(h.Kit);
-                Assert.Empty(connector.Withheld(new[] { family, location, work }, v3Feeds: true, h.Runtime));
+                Assert.Empty(connector.Withheld(new[] { family, location, work, camWork }, v3Feeds: true, h.Runtime));
 
                 // Klives confirms forgetting Eve: the tombstone is written with the confirmation, and the run that removes her
                 // data has not started. From this moment nothing about her, and nothing naming her, may be shown.
                 await h.Stores.Operator.WriteAsync((c, tx) => Forgotten.Add(c, tx, Array.Empty<string>(), new[] { Eve }, Array.Empty<string>(), h.Clock.NowMs));
                 Assert.False(feed.MayHold(Eve, h.Clock.NowMs));
-                Assert.Equal(new[] { family }, connector.Withheld(new[] { family, location, work }, v3Feeds: true, h.Runtime));
+                Assert.Equal(new[] { family }, connector.Withheld(new[] { family, location, work, camWork }, v3Feeds: true, h.Runtime));
 
-                // The pass asked for by the forget: Ana's family document named only Eve and a minor, so nothing is left of
-                // it; her other documents are untouched. Her profile has not been rebuilt, so this cannot wait for that.
+                // The pass asked for by the forget: Ana's family document still names Cam, so it stays; Eve's name is
+                // dropped from it. Her other documents are untouched.
                 await connector.RunIncrementalAsync(CancellationToken.None);
-                Assert.Equal(new[] { location, work }, writer.GetDocIdsForSource(RagSource.Omniscience).OrderBy(x => x));
+                Assert.Equal(new[] { family, location, work, camWork }.OrderBy(x => x), writer.GetDocIdsForSource(RagSource.Omniscience).OrderBy(x => x));
 
                 // Who is not there to be asked, or does not feed, shows nothing of v3's; a document v3's index does not know is not shown either.
                 Assert.Equal(new[] { location }, connector.Withheld(new[] { location }, v3Feeds: true, runtime: null));
@@ -210,7 +218,8 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
 
                 await connector.RunIncrementalAsync(CancellationToken.None);
                 Assert.Empty(connector.Withheld(new[] { family }, v3Feeds: true, h.Runtime));
-                Assert.Contains("\"Names\":[\"" + Eve + "\"]", writer.GetDocMeta(new[] { family })[family]);
+                Assert.Contains("\"" + Cam + "\"", writer.GetDocMeta(new[] { family })[family]);
+                Assert.Contains("\"" + Eve + "\"", writer.GetDocMeta(new[] { family })[family]);
             }
             finally
             {
@@ -233,8 +242,8 @@ namespace Omnipotent.Tests.OmniscienceV3.Integration
             await h.Stores.Corpus.WriteAsync((c, tx) => c.Exec(tx, "UPDATE messages SET deleted_at_ms=$t WHERE message_id=$m", ("$t", h.Clock.NowMs), ("$m", gone)));
 
             var hits = await new KnowledgeFeed(h.Kit).SearchMessagesAsync("lighthouse", 4, CancellationToken.None);
-            Assert.Equal(new[] { ana }, hits.Select(x => x.MessageId));
-            Assert.Equal("Ana Testwell", hits[0].Author);
+            Assert.Equal(new[] { ana, "discord:500000000003" }, hits.Select(x => x.MessageId).OrderBy(x => x));
+            Assert.Contains(hits, x => x.Author == "Ana Testwell");
         }
     }
 }

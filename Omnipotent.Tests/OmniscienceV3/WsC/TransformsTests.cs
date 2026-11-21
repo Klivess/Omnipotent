@@ -274,12 +274,13 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.True(contacts[0].GetProperty("reciprocity").GetDouble() > 0.8);
             Assert.Equal(40, contacts[0].GetProperty("directMessages").GetInt32());
             Assert.Equal("p-klives", closest[0].Selection!.Items[0].Id);
-            // A minor among the contacts is left out, and the report says so.
+            // A minor among the contacts is included like anyone else.
             await h.MarkMinorAsync("p-cyd");
-            var withoutMinor = await RunAsync(h, ClosestContactsTactic.Key, new { days = 90 }, Selection.Of(SelectionKind.Person, new[] { "p-ben" }));
-            Assert.DoesNotContain(withoutMinor[1].Data!.Value.GetProperty("contacts").EnumerateArray(), c => c.GetProperty("personId").GetString() == "p-cyd");
-            Assert.Equal(1, withoutMinor[1].Data!.Value.GetProperty("leftOutAsMinors").GetInt32());
-            Assert.Contains("under 18", await RefusedAsync(h, ClosestContactsTactic.Key, null, Selection.Of(SelectionKind.Person, new[] { "p-cyd" })));
+            var withMinor = await RunAsync(h, ClosestContactsTactic.Key, new { days = 90 }, Selection.Of(SelectionKind.Person, new[] { "p-ben" }));
+            Assert.Contains(withMinor[1].Data!.Value.GetProperty("contacts").EnumerateArray(), c => c.GetProperty("personId").GetString() == "p-cyd");
+            Assert.Equal(0, withMinor[1].Data!.Value.GetProperty("leftOutAsMinors").GetInt32());
+            Assert.False(string.IsNullOrEmpty(await h.Runtime.Tactics.StartAsync(ClosestContactsTactic.Key,
+                new TacticInput(new[] { Selection.Of(SelectionKind.Person, new[] { "p-cyd" }) }), "tester")));
 
             var common = await RunAsync(h, CommonGroundTactic.Key, new { days = 90 }, Selection.Of(SelectionKind.Person, new[] { "p-ben", "p-ana" }));
             var ground = common[0].Data!.Value;
@@ -288,8 +289,8 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             var fact = Assert.Single(ground.GetProperty("sharedFacts").EnumerateArray());
             Assert.Equal("hobby", fact.GetProperty("attribute").GetString());
             Assert.Equal(5, Assert.Single(ground.GetProperty("between").EnumerateArray()).GetProperty("replies").GetInt32());
-            // Cyd is a mutual contact, but was marked as a minor above: not listed.
-            Assert.Equal(0, ground.GetProperty("mutualContacts").GetArrayLength());
+            // Cyd is a mutual contact and is listed, minor or not.
+            Assert.Equal(1, ground.GetProperty("mutualContacts").GetArrayLength());
             Assert.Contains("two to five", await RefusedAsync(h, CommonGroundTactic.Key, null, Selection.Of(SelectionKind.Person, new[] { "p-ben" })));
         }
 
@@ -385,15 +386,16 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Contains("**Klives**: got them, thanks", markdown);
             Assert.Contains("(deleted by its author): line one\n  line two", markdown);
             Assert.Contains("Ana: city = York (`a1`)", markdown);
-            Assert.Contains("`a2`: withheld (protected attribute)", markdown);
-            Assert.DoesNotContain("guessed", markdown);
+            Assert.Contains("Ana: religion = guessed (`a2`)", markdown);
+            Assert.Contains("guessed", markdown);
             Assert.Contains("author zone unknown", markdown);
             Assert.True(markdown.IndexOf("under the mat", StringComparison.Ordinal) < markdown.IndexOf("got them", StringComparison.Ordinal));
 
             using var json = JsonDocument.Parse(h.Transforms.ExportBundle(bundleId, "json"));
             Assert.Equal(3, json.RootElement.GetProperty("messages").GetArrayLength());
-            Assert.True(json.RootElement.GetProperty("facts").EnumerateArray().Single(f => f.GetProperty("assertionId").GetString() == "a2").GetProperty("withheld").GetBoolean());
-            Assert.DoesNotContain("guessed", json.RootElement.GetRawText());
+            var religion = json.RootElement.GetProperty("facts").EnumerateArray().Single(f => f.GetProperty("assertionId").GetString() == "a2");
+            Assert.False(religion.TryGetProperty("withheld", out var withheld) && withheld.GetBoolean());
+            Assert.Contains("guessed", json.RootElement.GetRawText());
             Assert.Throws<ArgumentException>(() => h.Transforms.ExportBundle(bundleId, "pdf"));
             Assert.Throws<KeyNotFoundException>(() => h.Transforms.ExportBundle("nope", "markdown"));
 
@@ -419,8 +421,6 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
                 Assert.Equal(0, d.TypicalLlmCalls);
                 Assert.Equal(Lane.Cpu, d.Lane);
             }
-            // The tactics that rank or profile people are closed to minors.
-            Assert.All(mine.Where(d => d.Code is "X28" or "X29" or "X34" or "X37"), d => Assert.NotNull(d.MinorRestriction));
 
             var export = await RunAsync(h, DatasetExportTactic.Key, new { format = "parquet" }, new Selection(SelectionKind.ExploreDrill, new[] { new SelectionItem("drill-token-1") }));
             var body = export[0].Data!.Value;

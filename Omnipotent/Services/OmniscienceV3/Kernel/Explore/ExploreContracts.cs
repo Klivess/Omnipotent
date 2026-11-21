@@ -55,7 +55,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Explore
 
     /// <summary>
     /// The Explore engine (implemented by the analytics workstream on the DuckDB mirror). Implementations must enforce
-    /// the dataset's permission and MinorGuard filtering, bound every query (time and rows) and never scan the corpus
+    /// the dataset's permission and analysis-off filtering, bound every query (time and rows) and never scan the corpus
     /// per request.
     /// </summary>
     public interface IExploreEngine

@@ -69,7 +69,6 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
             - Opinions: one item per topic and stance. If {name}'s stance changed within these excerpts, give one item per stance, each with its own evidence.
             - Relationships: how {name} talks to one specific person (tone, nicknames, teasing, inside jokes, formality), using that person's name exactly as it appears in the excerpts, and only from exchanges with that person.
             - Self: what {name} says about themselves: life, routines, likes, dislikes, plans.
-            - Never infer sexual orientation, gender identity, health or mental health, disability, religion, ethnicity, political affiliation or sex life. Include such a thing only if {name} explicitly said it about themselves; quote them and set "sensitive": true.
             - Never guess. A few well-evidenced items are better than many weak ones. Write items in English, keep quotes in the original language.
             """;
 
@@ -141,8 +140,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                 var evidence = Valid(evidenceRefs);
                 bool quoted = !string.IsNullOrWhiteSpace(quote) && evidence.Any(e => TextFeatures.QuoteMatches(quote, e.ReplyText));
                 bool quoteOk = string.IsNullOrWhiteSpace(quote) ? !requireQuote : quoted;
-                // A special category is kept only as the person's own literal statement (SensitiveTraits.AllowsAssertion).
-                if (text == null || evidence.Count == 0 || !quoteOk || (sensitive && !quoted)) { dropped++; return; }
+                if (text == null || evidence.Count == 0 || !quoteOk) { dropped++; return; }
                 string full = quoted ? $"{text} — \"{Clip(quote, 160)}\"" : text;
                 items.Add(Item(kind, subject, full, strength, evidence, sensitive));
             }
@@ -167,7 +165,7 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
     /// <summary>
     /// Stated facts about the person from the knowledge store (frozen contract R7 #6), as of a cutoff: only facts whose
     /// evidence existed by then (asserted_at ≤ as-of, F290: evidence time, not record time), valid at that instant (F291),
-    /// not retracted or superseded, never inferences, and special categories only as the person's own literal statement.
+    /// not retracted or superseded and never inferences.
     /// </summary>
     public static class PersonaFacts
     {
@@ -188,7 +186,6 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
                 .Where(r => r.Value != null && r.Status is not ("rejected" or "superseded" or "retracted") && r.Source != "inferred")
                 .Where(r => r.Asserted is null || r.Asserted <= asOfMs)
                 .Where(r => (r.FromLatest ?? r.FromEarliest ?? long.MinValue) <= asOfMs && (r.ToLatest is null || r.ToLatest > asOfMs))
-                .Where(r => SensitiveTraits.AllowsAssertion(r.Attr, r.Source, r.Modality))
                 .OrderByDescending(r => r.Asserted ?? 0).Take(limit)
                 .Select(r => new Fact(r.Attr, r.Value!.Trim().Trim('"'), r.FromLatest ?? r.FromEarliest, r.Asserted)).ToList();
         }

@@ -16,8 +16,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
     /// The deterministic verifier (plan "Verifier") with the A2 ensembles as second opinions. It rejects: references outside
     /// the slice (zero hallucinated refs), quotes not found (fuzzy ≥ 0.92) in the cited message version, self-disclosures
     /// whose cited author is not the subject, questions treated as statements, non-literal or insincere statements, claims
-    /// that rest only on forwarded/bot/system text, fiction-channel statements, inferred special-category traits, and
-    /// (with an NLI model installed) claims their own quote contradicts (dropped negations). Temporal resolutions are
+    /// that rest only on forwarded/bot/system text, fiction-channel statements, and (with an NLI model installed) claims
+    /// their own quote contradicts (dropped negations). Temporal resolutions are
     /// cross-checked with the deterministic resolver at the author-local reference time: a contradicted interval is replaced
     /// by the deterministic one and the claim's confidence lowered (T3), never silently kept.
     /// </summary>
@@ -38,12 +38,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             var def = Attributes.Get(raw.Attribute);
             string attribute = Attributes.TryGet(raw.Attribute, out var known) ? known.Id : Attributes.Other;
             string? other = attribute == Attributes.Other ? raw.AttributeOther?.Trim().ToLowerInvariant() : null;
-            // An "other" attribute that names a special category is that category (the guard cannot be sidestepped by naming).
-            if (other != null && (SensitiveTraits.IsSensitive(other) || other.Replace(' ', '_') is var o && SensitiveTraits.IsSensitive(o)))
-            {
-                attribute = SensitiveTraits.Categories.First(c => c == other || c == other.Replace(' ', '_'));
-                def = Attributes.Get(attribute);
-            }
 
             // Evidence: every reference must exist in this slice and every quote must be found in that message version.
             if (raw.Evidence == null || raw.Evidence.Count == 0) return Reject(RejectReasons.NoEvidence, null);
@@ -93,10 +87,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 // Only quoted/forwarded/OCR text: never a statement by anyone in the conversation.
                 return Reject(RejectReasons.NonAuthoredEvidence, null);
             }
-
-            // Special-category traits: only the person's own literal statement is ever kept (plan Guardrails).
-            if (Attributes.IsSensitive(attribute) && !SensitiveTraits.AllowsAssertion(attribute, source, modality))
-                return Reject(RejectReasons.SensitiveInference, attribute);
 
             // Second opinions from the A2 ensembles.
             foreach (var e in evidence)

@@ -27,7 +27,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
     public sealed record PlanRecord(
         string PlanId, string Kind, string? Subtype, string OwnerPersonId, string? CounterpartyPersonId, bool InvolvesKlives, bool KlivesPromised, string Title,
         TimeInterval? Scheduled, string? LocalZone, bool AllDay, string Firmness, bool Cancelled, bool Done, bool Rescheduled, string? Recurrence, int? Month, int? Day,
-        int? Year, string AssertionId, string NaturalKey, IReadOnlyList<EvidenceRef> Evidence, string? ConversationId, string? GuildId, string? Platform, bool MinorRestricted);
+        int? Year, string AssertionId, string NaturalKey, IReadOnlyList<EvidenceRef> Evidence, string? ConversationId, string? GuildId, string? Platform);
 
     /// <summary>
     /// <c>knowledge.plans</c> — Plans, Promises &amp; Dates (N8): commitments ("I'll send it tomorrow"), shared plans ("let's play
@@ -35,8 +35,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
     /// resolved in the speaker's local zone at extraction; status is recomputed against the as-of instant and follow-up
     /// evidence (cancelled, moved, done), never stored as a stale label; promises past their time without "done" evidence are
     /// overdue; birthdays recur yearly (Feb 29 falls on Feb 28 in other years, configurable); reminders fire in Klives's zone
-    /// (DST-safe, once late after downtime, never a catch-up storm). Minors get no reminders, and their birthdays are never
-    /// stored in the first place (MinorGuard). Klives's own promises are highlighted.
+    /// (DST-safe, once late after downtime, never a catch-up storm). Minors get reminders and birthday reminders like
+    /// anyone else. Klives's own promises are highlighted.
     /// </summary>
     public sealed class PlansModule : IntelModuleBase, Kernel.Explore.IExploreSourceProvider
     {
@@ -62,7 +62,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
             Description = "Plans, promises and important dates with status at as-of, recurring birthdays and reminders in Klives's zone.",
             DefaultLane = Lane.Cpu,
             DependsOn = new[] { KnowledgeSchema.DeductionModule },
-            MinorRestricted = true,
             Schedules = new[] { new ScheduleTrigger("reminders", Every: TimeSpan.FromMinutes(5)), new ScheduleTrigger("agenda", DailyAtLocal: new TimeOnly(0, 5)) },
             Datasets = new[] { KnowledgeSchema.PlansDataset },
             Settings = new[]
@@ -162,11 +161,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
                 }
                 bool allDay = kind == "birthday" || scheduled is not { } s || s.WidthMs > 3 * 3_600_000L;
                 var dims = Dims(r.AssertionId);
-                var ownerBand = owner == person ? band : Context.Policy.BandOf(owner, asOfMs);
                 string title = kind == "birthday" ? $"{kit.Corpus.DisplayName(person) ?? "Someone"}'s birthday" : (r.ValueText ?? r.Value.Text);
                 result.Add(new PlanRecord(NaturalKeys.Id("pl", r.NaturalKey, 20), kind, subtype, owner, counterparty, involvesKlives, klivesPromised, title, scheduled,
                     dims.Zone, allDay, firmness, cancelled, done, rescheduled, kind == "birthday" ? "yearly" : null, month, day, year, r.AssertionId, r.NaturalKey,
-                    kit.Assertions.Evidence(r.AssertionId), dims.Conversation, dims.Guild, dims.Platform, MinorGuard.IsRestricted(ownerBand) || MinorGuard.IsRestricted(band)));
+                    kit.Assertions.Evidence(r.AssertionId), dims.Conversation, dims.Guild, dims.Platform));
             }
             return result;
         }
@@ -251,20 +249,20 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
                     c.Exec(tx, """
                         INSERT INTO kn_plans(plan_id, kind, subtype, owner_person_id, counterparty_person_id, involves_klives, klives_promised, title, scheduled_earliest_ms,
                             scheduled_latest_ms, local_zone, all_day, firmness, status, recurrence, month, day, year, assertion_id, natural_key, evidence_json, conversation_id,
-                            guild_id, platform, minor_restricted, created_at_ms, updated_at_ms, source_seq)
-                        VALUES($id,$k,$st,$o,$cp,$ik,$kp,$t,$se,$sl,$z,$ad,$f,$status,$rec,$mo,$d,$y,$a,$key,$ev,$conv,$g,$pl,$minor,$n,$n,$seq)
+                            guild_id, platform, created_at_ms, updated_at_ms, source_seq)
+                        VALUES($id,$k,$st,$o,$cp,$ik,$kp,$t,$se,$sl,$z,$ad,$f,$status,$rec,$mo,$d,$y,$a,$key,$ev,$conv,$g,$pl,$n,$n,$seq)
                         ON CONFLICT(plan_id) DO UPDATE SET kind=excluded.kind, subtype=excluded.subtype, owner_person_id=excluded.owner_person_id,
                             counterparty_person_id=excluded.counterparty_person_id, involves_klives=excluded.involves_klives, klives_promised=excluded.klives_promised,
                             title=excluded.title, scheduled_earliest_ms=excluded.scheduled_earliest_ms, scheduled_latest_ms=excluded.scheduled_latest_ms,
                             local_zone=excluded.local_zone, all_day=excluded.all_day, firmness=excluded.firmness, status=excluded.status, recurrence=excluded.recurrence,
                             month=excluded.month, day=excluded.day, year=excluded.year, assertion_id=excluded.assertion_id, evidence_json=excluded.evidence_json,
-                            conversation_id=excluded.conversation_id, guild_id=excluded.guild_id, platform=excluded.platform, minor_restricted=excluded.minor_restricted,
+                            conversation_id=excluded.conversation_id, guild_id=excluded.guild_id, platform=excluded.platform,
                             updated_at_ms=excluded.updated_at_ms, source_seq=excluded.source_seq
                         """, ("$id", p.PlanId), ("$k", p.Kind), ("$st", p.Subtype), ("$o", p.OwnerPersonId), ("$cp", p.CounterpartyPersonId), ("$ik", p.InvolvesKlives ? 1 : 0),
                         ("$kp", p.KlivesPromised ? 1 : 0), ("$t", p.Title), ("$se", Bound(p.Scheduled?.EarliestMs)), ("$sl", Bound(p.Scheduled?.LatestMs)), ("$z", p.LocalZone),
                         ("$ad", p.AllDay ? 1 : 0), ("$f", p.Firmness), ("$status", status), ("$rec", p.Recurrence), ("$mo", p.Month), ("$d", p.Day), ("$y", p.Year),
                         ("$a", p.AssertionId), ("$key", p.NaturalKey), ("$ev", JsonSerializer.Serialize(p.Evidence.Take(20), KernelJson.Options)), ("$conv", p.ConversationId),
-                        ("$g", p.GuildId), ("$pl", p.Platform), ("$minor", p.MinorRestricted ? 1 : 0), ("$n", now), ("$seq", seq));
+                        ("$g", p.GuildId), ("$pl", p.Platform), ("$n", now), ("$seq", seq));
                     SyncReminders(c, tx, p, status, zone, now);
                 }
                 foreach (var stale in c.Query(tx, "SELECT plan_id FROM kn_plans WHERE owner_person_id=$p OR (counterparty_person_id IS NULL AND owner_person_id=$p)", r => r.GetString(0), ("$p", person))
@@ -284,7 +282,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
         /// two hours before a timed plan, and the due day for Klives's own promises. None for minors, none for cancelled or kept items.</summary>
         private void SyncReminders(Microsoft.Data.Sqlite.SqliteConnection c, Microsoft.Data.Sqlite.SqliteTransaction tx, PlanRecord p, string status, TimeZoneInfo zone, long now)
         {
-            bool eligible = !p.MinorRestricted && status is not (PlanStatuses.Cancelled or PlanStatuses.Kept or PlanStatuses.Past)
+            bool eligible = status is not (PlanStatuses.Cancelled or PlanStatuses.Kept or PlanStatuses.Past)
                             && (p.InvolvesKlives || p.Kind == "birthday" && kit.Corpus.TierOf(p.OwnerPersonId) is "tracked" or "watch");
             if (!eligible)
             {
@@ -324,12 +322,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
             int fired = 0, missed = 0, withheld = 0;
             foreach (var r in due)
             {
-                (bool Found, string Title, string Owner, string? Counterparty, bool Restricted) plan;
+                (bool Found, string Title, string Owner, string? Counterparty) plan;
                 using (var c = Context.Stores.Intel.OpenRead())
-                    plan = c.Query(null, "SELECT title, owner_person_id, counterparty_person_id, minor_restricted FROM kn_plans WHERE plan_id=$p",
-                        x => (true, x.GetString(0), x.GetString(1), x.GetStringOrNull(2), x.GetInt32(3) == 1), ("$p", r.Plan)).FirstOrDefault();
+                    plan = c.Query(null, "SELECT title, owner_person_id, counterparty_person_id FROM kn_plans WHERE plan_id=$p",
+                        x => (true, x.GetString(0), x.GetString(1), x.GetStringOrNull(2)), ("$p", r.Plan)).FirstOrDefault();
                 bool occurrencePast = now > r.Occurrence + 86_400_000L;
-                string state = !plan.Found || plan.Restricted ? "cancelled" : occurrencePast ? "missed" : "fired";
+                string state = !plan.Found ? "cancelled" : occurrencePast ? "missed" : "fired";
                 await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "UPDATE kn_reminders SET state=$s, fired_at_ms=$n WHERE reminder_id=$i AND state='pending'",
                     ("$s", state), ("$n", state == "cancelled" ? (long?)null : now), ("$i", r.Id)), ct).ConfigureAwait(false);
                 if (state == "cancelled") { withheld++; continue; }
@@ -359,7 +357,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
                 persons = c.Query(null, "SELECT DISTINCT owner_person_id FROM kn_plans WHERE status <> 'cancelled' AND (involves_klives=1 OR kind='birthday')", r => r.GetString(0));
             var all = persons.SelectMany(p => Build(p, now)).GroupBy(p => p.PlanId).Select(g => g.First()).ToList();
             long horizon = now + days * 86_400_000L;
-            var dtos = all.Where(p => !p.MinorRestricted || p.InvolvesKlives).Select(p => ToDto(p, now)).ToList();
+            var dtos = all.Select(p => ToDto(p, now)).ToList();
             var upcoming = dtos.Where(d => d.Status is PlanStatuses.Upcoming or PlanStatuses.Due or PlanStatuses.Recurring && d.NextOccurrenceMs is long t && t <= horizon && (d.InvolvesKlives || d.Kind == "birthday"))
                 .OrderBy(d => d.NextOccurrenceMs).ThenBy(d => d.PlanId, StringComparer.Ordinal).ToList();
             var overdue = dtos.Where(d => d.Status == PlanStatuses.Overdue && d.InvolvesKlives).OrderBy(d => d.ScheduledLatestMs).ToList();

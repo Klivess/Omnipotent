@@ -199,7 +199,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         }
 
         [Fact]
-        public async Task Minors_AreLeftOutOfPerPersonTimePatterns()
+        public async Task Minors_AreIncludedInPerPersonTimePatterns()
         {
             // The busiest person other than Klives himself (which people write at all depends on the generator's seed).
             string person;
@@ -211,9 +211,8 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             clock.Advance(TimeSpan.FromMinutes(1));
             await driver.RunUntilIdleAsync(3_000);
             var after = await explore.QueryAsync(q, All, CancellationToken.None);
-            Assert.Empty(after.Rows);
-            Assert.Contains("MinorGuard", after.Explain);
-            // Their messages stay countable without a time-of-day pattern (their history stays browsable).
+            Assert.NotEmpty(after.Rows);
+            Assert.DoesNotContain("MinorGuard", after.Explain);
             Assert.NotEmpty((await explore.QueryAsync(q with { Bucket = TimeBucket.None }, All, CancellationToken.None)).Rows);
         }
 
@@ -278,27 +277,27 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             await PassAsync();
             foreach (var dataset in new[] { "test.notes", "test.notes_whole" })
             {
-                // A special-category attribute is never offered as something to slice people by.
-                Assert.Equal(new[] { "city", "favourite_game", "school" }, (await ByAttributeAsync(dataset)).Keys.OrderBy(k => k, StringComparer.Ordinal));
+                // Special-category attributes are offered like any other attribute.
+                Assert.Equal(new[] { "city", "favourite_game", "religion", "school" }, (await ByAttributeAsync(dataset)).Keys.OrderBy(k => k, StringComparer.Ordinal));
             }
 
-            // A person marked as a minor: their restricted identity attributes leave every dataset that carries attributes.
+            // A person marked as a minor: their attributes stay in every dataset that carries attributes.
             await rt.Stores.Operator.WriteAsync((c, tx) => c.Exec(tx, "INSERT INTO person_settings(person_id, minor_marked, updated_at_ms) VALUES('synth-p5',1,$t)", ("$t", clock.NowMs)));
             await PassAsync();
             foreach (var dataset in new[] { "test.notes", "test.notes_whole" })
-                Assert.Equal(new[] { "city", "favourite_game" }, (await ByAttributeAsync(dataset)).Keys.OrderBy(k => k, StringComparer.Ordinal));
+                Assert.Equal(new[] { "city", "favourite_game", "religion", "school" }, (await ByAttributeAsync(dataset)).Keys.OrderBy(k => k, StringComparer.Ordinal));
 
             // A changed row and a new one arrive through the change column (and through the whole copy).
             await Notes(("n1", t0, "synth-p3", "hometown", 0.95, 1, 5), ("n5", t0 + 4_000, "synth-p3", "pet", 0.5, 0, 6));
             await PassAsync();
             foreach (var dataset in new[] { "test.notes", "test.notes_whole" })
-                Assert.Equal(new[] { "favourite_game", "hometown", "pet" }, (await ByAttributeAsync(dataset)).Keys.OrderBy(k => k, StringComparer.Ordinal));
+                Assert.Equal(new[] { "favourite_game", "hometown", "pet", "religion", "school" }, (await ByAttributeAsync(dataset)).Keys.OrderBy(k => k, StringComparer.Ordinal));
 
             // A row deleted at the source leaves the mirror too (the incremental copy notices it holds more than the source).
             await rt.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "DELETE FROM test_notes WHERE note_id='n4'"));
             await PassAsync();
             foreach (var dataset in new[] { "test.notes", "test.notes_whole" })
-                Assert.Equal(new[] { "hometown", "pet" }, (await ByAttributeAsync(dataset)).Keys.OrderBy(k => k, StringComparer.Ordinal));
+                Assert.Equal(new[] { "hometown", "pet", "religion", "school" }, (await ByAttributeAsync(dataset)).Keys.OrderBy(k => k, StringComparer.Ordinal));
 
             // Records: typed values, the module's own columns, no bookkeeping columns.
             var result = await explore.QueryAsync(new ExploreQuery("test.notes", new[] { F("content.attribute", FilterOp.Eq, "hometown") }, Array.Empty<string>(), new[] { "count" }), All, CancellationToken.None);

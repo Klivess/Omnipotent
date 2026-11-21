@@ -181,10 +181,10 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Equal(expected, page.Days.Sum(d => (long)d.Messages));
             Assert.Equal((50, 2), (page.Days.Single(d => d.Day == DayText(h, 40)).Messages, page.Days.Single(d => d.Day == DayText(h, 40)).People));
 
-            // Members: the regulars lead; the minor is counted but never named.
-            Assert.Equal(1, page.PeopleLeftOut);
-            Assert.DoesNotContain(page.Core.Concat<object>(page.Rising).Select(m => m is SpaceMemberDto c ? c.PersonId : ((SpaceRisingDto)m).PersonId), p => p == "p-kid");
-            Assert.Equal(new[] { "p-ana", "p-ben", "p-cyd" }, page.Core.Take(3).Select(m => m.PersonId));
+            // Members: the regulars lead; the minor is counted and named like anyone else.
+            Assert.Equal(0, page.PeopleLeftOut);
+            Assert.Contains(page.Core.Concat<object>(page.Rising).Select(m => m is SpaceMemberDto c ? c.PersonId : ((SpaceRisingDto)m).PersonId), p => p == "p-kid");
+            Assert.Equal(new[] { "p-ana", "p-ben", "p-kid" }, page.Core.Take(3).Select(m => m.PersonId));
             var ana = page.Core[0];
             Assert.Equal(("Ana", 70L, Math.Round(70.0 / expected, 4), 14), (ana.Name, ana.Messages, ana.Share, ana.ActiveDays));
             // She also wrote 30 messages in a group chat and 60 to Klives directly: under half of what she wrote was here.
@@ -261,12 +261,12 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Equal(regulars, IdOf(second, "p-dan"));
             Assert.True(second.AsOfMs > first.AsOfMs);
 
-            // Ben turns out to be under 18: he is taken out of what is served at once, before any rebuild.
+            // Ben turns out to be under 18: he stays in what is served, like anyone else.
             await h.MarkMinorAsync("p-ben");
             var served = h.Insights.Space("guild", Server)!;
-            Assert.DoesNotContain(served.Core, m => m.PersonId == "p-ben");
-            Assert.DoesNotContain(served.AboutKlives.People, m => m.PersonId == "p-ben");
-            Assert.DoesNotContain(served.Factions.SelectMany(f => f.Members), m => m.PersonId == "p-ben");
+            Assert.Contains(served.Core, m => m.PersonId == "p-ben");
+            Assert.Contains(served.AboutKlives.People, m => m.PersonId == "p-ben");
+            Assert.Contains(served.Factions.SelectMany(f => f.Members), m => m.PersonId == "p-ben");
             Assert.Contains(served.Core, m => m.PersonId == "p-ana");
 
             // Eve is forgotten: the page is rebuilt without her, and what is left of her circle is still the same circle.

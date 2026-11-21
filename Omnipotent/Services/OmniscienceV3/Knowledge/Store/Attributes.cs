@@ -25,13 +25,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
         Relation,
     }
 
-    /// <summary>Who may see or store an attribute.</summary>
+    /// <summary>Legacy visibility metadata. The minor guard and sensitive-trait ban were removed, so every
+    /// attribute is <see cref="Normal"/> in practice; the enum remains for stored-row compatibility.</summary>
     public enum AttributeSensitivity
     {
         Normal,
-        /// <summary>Neither stored, inferred nor shown for a minor (MinorGuard.RestrictedAttributes).</summary>
         RestrictedForMinors,
-        /// <summary>A special-category trait: only the person's own literal statement is ever kept, quoted with its date.</summary>
         SensitiveTrait,
     }
 
@@ -56,9 +55,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
 
     /// <summary>
     /// The controlled vocabulary the extractor must use (plus "other"). One definition per attribute: temporal class,
-    /// confidence half-life, category, privacy (DM evidence outweighs public evidence for private facts) and policy
-    /// sensitivity (MinorGuard restricted attributes and special-category traits). Categories drive the Quality Lab's
-    /// per-category precision and X16's coverage map.
+    /// confidence half-life, category and privacy (DM evidence outweighs public evidence for private facts). The
+    /// former policy-sensitivity metadata is inert. Categories drive the Quality Lab's per-category precision and
+    /// X16's coverage map.
     /// </summary>
     public static class Attributes
     {
@@ -84,7 +83,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
 
         private static AttributeDefinition D(string id, string title, string category, AttributeClass cls, double? halfLife,
             AttributeSensitivity sensitivity = AttributeSensitivity.Normal, bool isPrivate = false, string? lifeEvent = null, string? planKind = null, bool multi = false) =>
-            new(id, title, category, cls, halfLife, sensitivity, isPrivate, lifeEvent, planKind) { MultiValued = multi };
+            // Sensitivity is accepted for source compatibility but is always Normal: nothing is restricted now.
+            new(id, title, category, cls, halfLife, AttributeSensitivity.Normal, isPrivate, lifeEvent, planKind) { MultiValued = multi };
 
         private const AttributeSensitivity R = AttributeSensitivity.RestrictedForMinors;
         private const AttributeSensitivity S = AttributeSensitivity.SensitiveTrait;
@@ -183,19 +183,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
 
         private static readonly Dictionary<string, AttributeDefinition> byId = Build();
 
-        private static Dictionary<string, AttributeDefinition> Build()
-        {
-            var map = All.ToDictionary(a => a.Id, StringComparer.OrdinalIgnoreCase);
-            // The vocabulary must cover every attribute MinorGuard restricts and every special category SensitiveTraits names,
-            // so policy and storage can never disagree about what an attribute is.
-            foreach (var restricted in MinorGuard.RestrictedAttributes)
-                if (map.TryGetValue(restricted, out var d) && d.Sensitivity != AttributeSensitivity.RestrictedForMinors)
-                    throw new InvalidOperationException($"Attribute '{restricted}' is restricted by MinorGuard but not marked restricted in the vocabulary.");
-            foreach (var sensitive in SensitiveTraits.Categories)
-                if (map.TryGetValue(sensitive, out var d) && d.Sensitivity != AttributeSensitivity.SensitiveTrait)
-                    throw new InvalidOperationException($"Attribute '{sensitive}' is a special category but not marked sensitive in the vocabulary.");
-            return map;
-        }
+        private static Dictionary<string, AttributeDefinition> Build() =>
+            All.ToDictionary(a => a.Id, StringComparer.OrdinalIgnoreCase);
 
         public static bool TryGet(string? id, out AttributeDefinition definition)
         {
@@ -213,23 +202,13 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Store
 
         public static IReadOnlyList<string> Categories { get; } = All.Select(a => a.Category).Distinct(StringComparer.Ordinal).ToList();
 
-        /// <summary>Restricted for a person in this band (MinorGuard): neither stored, inferred nor shown.</summary>
-        public static bool IsBlockedFor(string attribute, AgeBand band) =>
-            MinorGuard.IsRestricted(band) && (Get(attribute).Sensitivity == AttributeSensitivity.RestrictedForMinors || MinorGuard.RestrictedAttributes.Contains(attribute));
+        /// <summary>Nothing is restricted for any age band.</summary>
+        public static bool IsBlockedFor(string attribute, AgeBand band) => false;
 
-        /// <summary>
-        /// MinorGuard on the read side, for one stored assertion. It is not shown when its attribute is restricted for its
-        /// subject or for the person it names, or when it is an inference about someone the guard covers. Writing refuses
-        /// these already; this covers what was stored before a band became restricted: an inference stays live until the
-        /// next detective run and stays in the history after it, and a fact that names someone stays until its subject
-        /// is consolidated again.
-        /// </summary>
-        public static bool IsShownFor(string attribute, string status, AgeBand subjectBand, AgeBand? namedBand = null) =>
-            !IsBlockedFor(attribute, subjectBand)
-            && (namedBand is not { } named || !IsBlockedFor(attribute, named))
-            && (status != AssertionStatus.Inferred || MinorGuard.Allows(RestrictedCapability.RoutineInference, subjectBand));
+        /// <summary>Every stored assertion is shown, whatever its attribute, status or the bands of the people it names.</summary>
+        public static bool IsShownFor(string attribute, string status, AgeBand subjectBand, AgeBand? namedBand = null) => true;
 
-        public static bool IsSensitive(string attribute) =>
-            Get(attribute).Sensitivity == AttributeSensitivity.SensitiveTrait || SensitiveTraits.IsSensitive(attribute);
+        /// <summary>No attribute is special-category any more.</summary>
+        public static bool IsSensitive(string attribute) => false;
     }
 }

@@ -40,15 +40,15 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
         }
 
         [Fact]
-        public async Task Train_RefusesBeforeQueueingWithTheReason()
+        public async Task Train_RefusesTheUnknownBeforeQueueing_ButAllowsAMinor()
         {
             await using var h = await ReplicaHarness.StartAsync();
             var unknown = await Assert.ThrowsAsync<ReplicaRefusedException>(() => h.R.Trainer.RequestAsync("p-nobody", "t", "tester", CancellationToken.None));
             Assert.True(unknown.NotFound);
             var minor = await Assert.ThrowsAsync<ReplicaRefusedException>(() => h.R.Trainer.RequestAsync(Personas.Max, "t", "tester", CancellationToken.None));
-            Assert.Contains("under 18", minor.Message);
-            Assert.Equal(PersonStatus.Blocked, h.R.Services.Versions.Person(Personas.Max)!.Status);
-            Assert.Empty(h.Runtime.Host.Jobs.Query(new JobQuery { ModuleId = ReplicaSchema.ModuleId, Kind = ReplicaTrainer.KindIndex }).Items);
+            Assert.DoesNotContain("under 18", minor.Message);
+            Assert.Contains("at least 100", minor.Message);
+            Assert.Null(h.R.Services.Versions.Person(Personas.Max)); // no build was queued, and nobody was blocked
         }
 
         [Fact]
@@ -205,7 +205,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
         }
 
         [Fact]
-        public async Task MinorEvidence_BlocksServingAndPurgesDerivedData()
+        public async Task MinorEvidence_LeavesServingAndDerivedDataAlone()
         {
             await using var h = await ReplicaHarness.StartAsync();
             var v = await h.TrainAsync(Personas.Lena);
@@ -213,16 +213,16 @@ namespace Omnipotent.Tests.OmniscienceV3.Replica
             await h.Runtime.Host.Jobs.EnqueueAsync(new JobRequest { ModuleId = ReplicaSchema.ModuleId, Kind = ReplicaModule.KindMaintenance, Lane = Lane.Cpu });
             await h.DrainAsync();
             var person = h.R.Services.Versions.Person(Personas.Lena)!;
-            Assert.Equal(PersonStatus.Blocked, person.Status);
-            Assert.Null(person.ServingVersionId);
+            Assert.NotEqual(PersonStatus.Blocked, person.Status);
+            Assert.NotNull(person.ServingVersionId);
             using (var c = h.Runtime.Stores.Intel.OpenRead())
             {
-                Assert.Equal(0L, c.Scalar<long>(null, "SELECT COUNT(*) FROM replica_pairs WHERE version_id=$v", ("$v", v.VersionId)));
-                Assert.Equal(0L, c.Scalar<long>(null, "SELECT COUNT(*) FROM replica_persona_items WHERE version_id=$v", ("$v", v.VersionId)));
-                Assert.Equal(0L, c.Scalar<long>(null, "SELECT COUNT(*) FROM replica_eval_items WHERE person_id=$p", ("$p", Personas.Lena)));
+                Assert.True(c.Scalar<long>(null, "SELECT COUNT(*) FROM replica_pairs WHERE version_id=$v", ("$v", v.VersionId)) > 0);
+                Assert.True(c.Scalar<long>(null, "SELECT COUNT(*) FROM replica_persona_items WHERE version_id=$v", ("$v", v.VersionId)) > 0);
+                Assert.True(c.Scalar<long>(null, "SELECT COUNT(*) FROM replica_eval_items WHERE person_id=$p", ("$p", Personas.Lena)) > 0);
             }
             using (var c = h.Runtime.Stores.Vectors.OpenRead())
-                Assert.Equal(0L, c.Scalar<long>(null, "SELECT COUNT(*) FROM vectors WHERE partition_key=$p", ("$p", Personas.Lena)));
+                Assert.True(c.Scalar<long>(null, "SELECT COUNT(*) FROM vectors WHERE partition_key=$p", ("$p", Personas.Lena)) > 0);
         }
 
         [Fact]

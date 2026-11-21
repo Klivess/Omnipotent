@@ -383,10 +383,7 @@ INSERT INTO ins_state(name, value) VALUES('people_style_dims', 0);
             }
             var off = Storage.AnalysisOff.Load(Context.Stores);
             // The full check ran when the map was built; what Klives marked since is applied here in one read.
-            HashSet<string> marked;
-            using (var op = Context.Stores.Operator.OpenRead())
-                marked = op.Query(null, "SELECT person_id FROM person_settings WHERE minor_marked=1", r => Context.Policy.Canonical(r.GetString(0))).ToHashSet(StringComparer.Ordinal);
-            rows = rows.Where(r => !off.Person(r.Person) && !marked.Contains(r.Person)).ToList();
+            rows = rows.Where(r => !off.Person(r.Person)).ToList();
             var names = Names(rows.Select(r => r.Person));
             return new PeopleMapDto(rows.Select(r => new MapPointDto(r.Person, names.GetValueOrDefault(r.Person), r.X, r.Y, community.GetValueOrDefault(r.Person), r.Messages)).ToList(),
                 rows.Count == 0 ? null : rows.Max(r => r.At), rows.Count);

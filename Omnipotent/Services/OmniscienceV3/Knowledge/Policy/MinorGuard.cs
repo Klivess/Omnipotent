@@ -15,46 +15,22 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
         Minor,
     }
 
-    /// <summary>Capabilities the minor-safety guard switches off for minors (plan Guardrails).</summary>
-    public enum RestrictedCapability
-    {
-        FaceLabelling,
-        Replica,
-        PersonTargetedAlert,
-        RoutineInference,
-        IdentityFacts,
-        TrackingSuggestion,
-        ReplicaBasedTactic,
-    }
-
     /// <summary>
-    /// The minor-safety guard. When the evidence says a person is under 18 (time-adjusted age claims,
-    /// school-year statements) or Klives marks them, Omniscience stops building an identity dossier on them:
-    /// no face labels, no replica, no person-targeted alerts or tracking suggestions, no schedule/routine
-    /// inference, and restricted identity facts are neither stored, inferred nor shown. Their messages and
-    /// conversations stay browsable. A misread age is corrected by rejecting the age fact in review, which
-    /// recomputes the band; there is deliberately no "mark as adult" override that bypasses the evidence.
+    /// Age-band reporting. The minor-safety guard was removed on 2026-11-21: age bands are still
+    /// computed for display (time-adjusted age claims and school-year evidence), but nothing is
+    /// restricted, refused, withheld or purged for a minor. Every method below is permissive.
     /// </summary>
     public static class MinorGuard
     {
         public const int AdultAge = 18;
 
-        /// <summary>Fact attributes never stored, inferred or shown for a minor.</summary>
-        public static readonly IReadOnlySet<string> RestrictedAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-        {
-            "real_name", "full_name", "surname", "legal_name",
-            "school", "college", "school_year", "class",
-            "home_location", "address", "city", "neighbourhood", "postcode",
-            "contact_handle", "phone", "email", "social_handle",
-            "family_member", "family_member_name", "parent", "sibling",
-            "birth_date", "exact_age",
-            "daily_routine", "sleep_schedule", "active_hours",
-        };
+        /// <summary>Formerly the attributes hidden for a minor. Now empty: nothing is restricted.</summary>
+        public static readonly IReadOnlySet<string> RestrictedAttributes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         /// <summary>
         /// Band at <paramref name="atMs"/> from a birth interval (intersection of all age evidence; null when
         /// none) and Klives's explicit mark. A straddling interval counts as a likely minor when its midpoint
-        /// age is under 18, so the guard errs towards protection.
+        /// age is under 18.
         /// </summary>
         public static AgeBand Evaluate(TimeInterval? birth, bool markedMinorByKlives, long atMs)
         {
@@ -68,16 +44,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
             return mid is { } m && m.Max < AdultAge ? AgeBand.LikelyMinor : AgeBand.Adult;
         }
 
-        public static bool IsRestricted(AgeBand band) => band is AgeBand.Minor or AgeBand.LikelyMinor;
+        /// <summary>No age band restricts anything.</summary>
+        public static bool IsRestricted(AgeBand band) => false;
 
-        public static bool Allows(RestrictedCapability capability, AgeBand band) => !IsRestricted(band);
-
-        public static bool AllowsAttribute(string attribute, AgeBand band) =>
-            !IsRestricted(band) || !RestrictedAttributes.Contains(attribute);
+        /// <summary>No attribute is restricted for any age band.</summary>
+        public static bool AllowsAttribute(string attribute, AgeBand band) => true;
 
         /// <summary>
-        /// The age band of whoever a fact names (null when it names nobody), looked up once per person. A fact about an
-        /// adult can still be an identity fact about a minor ("her brother is ..."), so reads check both ends.
+        /// The age band of whoever a fact names (null when it names nobody), looked up once per person.
+        /// Retained for API display; nothing is withheld from the result.
         /// </summary>
         public static Func<string?, AgeBand?> NamedBands(IPolicyOracle policy, long atMs)
         {

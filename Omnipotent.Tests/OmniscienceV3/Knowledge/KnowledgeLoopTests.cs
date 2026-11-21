@@ -78,11 +78,12 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
                      })
                 Assert.True(jobs.Any(j => j.Module == module && j.Kind == kind && j.State == JobStates.Succeeded), $"no succeeded {module}/{kind} job. Jobs: {summary}");
 
-            // Facts for the tracked people; nothing restricted for the minor; the relocation is a timeline entry.
+            // Facts for the tracked people, including the minor's school and city; the relocation is a timeline entry.
             var ava = h.Kit.Assertions.Query(new AssertionQuery { SubjectIds = new[] { "planted-ava" }, AtMs = h.Clock.NowMs, Statuses = new[] { AssertionStatus.Accepted, AssertionStatus.Confirmed }, Limit = 100 });
             Assert.Contains(ava, v => v.Record.Attribute == "city" && v.Record.ValueText == "Leeds");
             Assert.Contains(ava, v => v.Record.Attribute == "job");
-            Assert.Equal(0L, c.Scalar<long>(null, "SELECT COUNT(*) FROM assertions WHERE subject_id='planted-cam' AND attribute IN ('school','city')"));
+            Assert.True(c.Scalar<long>(null, "SELECT COUNT(*) FROM assertions WHERE subject_id='planted-cam' AND attribute IN ('school','city')") > 0,
+                "The minor's school and city are ordinary facts now.");
             Assert.True(c.Scalar<long>(null, "SELECT COUNT(*) FROM kn_life_events WHERE person_id='planted-dee'") > 0, "Dee's move should be a life event. Jobs: " + summary);
             // Ava's promise to Klives and her birthday are on the agenda.
             var plans = c.Query(null, "SELECT kind, status FROM kn_plans WHERE owner_person_id='planted-ava'", r => (Kind: r.GetString(0), Status: r.GetString(1)));
@@ -145,6 +146,14 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.Equal(TacticRunStates.Succeeded, run.State);
             Assert.NotEmpty(outputs);
             Assert.Equal("eve", h.Kit.Corpus.Canonical("eve"));
+
+            // X67 can also check an anonymous account by platform and user id (the former "never unmask" ban is gone).
+            var anonymous = new TacticInput(new[] { Selection.Of(SelectionKind.Person, new[] { "dee-a" }) },
+                System.Text.Json.JsonSerializer.SerializeToElement(new { platform = "discord", platform_user_id = "u-dee-b" }));
+            var (anonRun, _, anonOutputs) = await InquiryTests.RunAsync(h, SamePersonTactic.Key, anonymous);
+            Assert.Equal(TacticRunStates.Succeeded, anonRun.State);
+            Assert.True(anonOutputs[0].Data!.Value.GetProperty("anonymous").GetBoolean());
+            Assert.NotEmpty(anonOutputs[0].Data!.Value.GetProperty("assessments").EnumerateArray());
         }
     }
 }

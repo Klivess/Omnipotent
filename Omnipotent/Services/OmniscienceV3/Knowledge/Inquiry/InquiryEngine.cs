@@ -73,10 +73,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
             if (spec.Ambiguous.Count > 0 || (spec.Subjects.Count == 0 && req.TacticKey != "x15.ask_corpus"))
                 return await ctx.StageAsync("persist", ct => PersistAsync(ctx, req, spec, NeedsDisambiguation(ctx, spec), ct)).ConfigureAwait(false);
 
-            var refusal = Policy(spec, ctx.AsOfMs);
-            if (refusal != null)
-                return await ctx.StageAsync("persist", ct => PersistAsync(ctx, req, spec, Refused(ctx, spec, refusal), ct)).ConfigureAwait(false);
-
             var plan = await ctx.StageAsync("plan", ct => PlanAsync(ctx, req, spec, ct)).ConfigureAwait(false);
             var gathered = await ctx.StageAsync("gather", ct => GatherAsync(spec, plan, req, ct)).ConfigureAwait(false);
             await ctx.ReportAsync(new { stage = "gathered", items = gathered.Items.Count, gathered.Coverage.MessagesConsidered }).ConfigureAwait(false);
@@ -163,8 +159,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
             {
                 Question = req.Question, Restatement = (u.Restatement ?? req.Question).Trim(), AnswerType = type, Options = options.Distinct(StringComparer.OrdinalIgnoreCase).ToList(),
                 Subjects = subjects, AsOfMs = asOf, FromMs = from, TimeScope = u.TimeScope, Conditions = u.Conditions,
-                SensitiveCategory = SensitiveTraits.IsSensitive(u.SensitiveCategory ?? "") ? u.SensitiveCategory : null,
-                RestrictedAttribute = string.IsNullOrWhiteSpace(u.RestrictedAttribute) ? null : u.RestrictedAttribute, RoutineInference = u.RoutineInference,
                 AboutKlives = u.AboutKlives, NeedsWorldKnowledge = u.NeedsWorldKnowledge, Topic = u.Topic, Ambiguous = ambiguous, AsOfNote = note,
             };
         }
@@ -208,20 +202,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                     found.TryAdd(kit.Corpus.Canonical(p), Candidate(kit.Corpus.Canonical(p)));
             }
             return found.Values.Take(30).ToList();
-        }
-
-        // ── policy ───────────────────────────────────────────────────────────────
-
-        private string? Policy(InquirySpec spec, long now)
-        {
-            if (spec.SensitiveCategory != null && !SensitiveTraits.AllowsInference(spec.SensitiveCategory)) return "sensitive";
-            foreach (var s in spec.Subjects)
-            {
-                var band = kit.Context.Policy.BandOf(s.PersonId, now);
-                if (!MinorGuard.IsRestricted(band)) continue;
-                if (spec.RestrictedAttribute != null || spec.RoutineInference) return "minor:" + s.Label + ":" + band;
-            }
-            return null;
         }
 
         // ── plan ─────────────────────────────────────────────────────────────────
@@ -347,10 +327,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                     SubjectIds = kit.Corpus.PersonIdsOf(subject.PersonId), AtMs = spec.AsOfMs, Mode = spec.AsOfMs < kit.Context.Clock.NowMs - 86_400_000L ? KnowledgeMode.AsOfWorld : KnowledgeMode.Current,
                     EvidenceCutoffMs = spec.AsOfMs, Statuses = new[] { AssertionStatus.Accepted, AssertionStatus.Confirmed }, IncludeInferred = false, Limit = 400,
                 });
-                var band = kit.Context.Policy.BandOf(subject.PersonId, spec.AsOfMs);
                 foreach (var v in views)
                 {
-                    if (Attributes.IsBlockedFor(v.Record.Attribute, band) || Attributes.IsSensitive(v.Record.Attribute)) continue;
+                    // No minor or sensitive-trait filter: every accepted fact is evidence.
                     facts++;
                     var r = v.Record;
                     string validity = (r.ValidFromLatestMs is long vf ? " from ~" + Instant.Iso(vf)[..10] : "") + (r.ValidToLatestMs is long vt ? " until ~" + Instant.Iso(vt)[..10] : "");
@@ -639,32 +618,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
         private InquiryReportDto NeedsDisambiguation(TacticRunContext ctx, InquirySpec spec) => Empty(ctx, spec, InquiryVerdict.NeedsDisambiguation,
             spec.Ambiguous.Count > 0 ? "Several people match a name in the question: choose one and ask again." : "No person in the archive matches the question: name them or select them.") with
         { Disambiguation = spec.Ambiguous };
-
-        private InquiryReportDto Refused(TacticRunContext ctx, InquirySpec spec, string reason)
-        {
-            if (reason == "sensitive")
-            {
-                // The person's own explicit statement may be quoted with its date; nothing is inferred.
-                var quotes = new List<InquiryEvidenceDto>();
-                foreach (var s in spec.Subjects)
-                {
-                    var own = kit.Assertions.Query(new AssertionQuery
-                    {
-                        SubjectIds = kit.Corpus.PersonIdsOf(s.PersonId), AtMs = spec.AsOfMs, Attribute = spec.SensitiveCategory, Statuses = new[] { AssertionStatus.Accepted, AssertionStatus.Confirmed },
-                        IncludeInferred = false, Limit = 10,
-                    }).Where(v => v.Record.SourceKind == ClaimSource.SelfDisclosure);
-                    foreach (var v in own)
-                        foreach (var e in kit.Assertions.Evidence(v.Record.AssertionId).Take(3))
-                            quotes.Add(new InquiryEvidenceDto("Q" + (quotes.Count + 1).ToString(CultureInfo.InvariantCulture), "quote", e.MessageId, v.Record.AssertionId, s.PersonId,
-                                e.SentAtMs ?? v.Record.AssertedAtMs ?? 0, e.Quote ?? "", null, null, null, null, "self", "explicit statement"));
-                }
-                string note = SensitiveTraits.RefusalText + (quotes.Count > 0 ? " Their own explicit statement is quoted with its date." : "");
-                return Empty(ctx, spec, InquiryVerdict.Refused, note) with { EvidenceFor = quotes };
-            }
-            var parts = reason.Split(':');
-            return Empty(ctx, spec, InquiryVerdict.Refused,
-                $"{(parts.Length > 1 ? parts[1] : "This person")} is, or may be, under 18 ({(parts.Length > 2 ? parts[2] : "minor")}). Omniscience does not infer or show their real name, school, location, contacts, family or routines.");
-        }
 
         private InquiryReportDto Empty(TacticRunContext ctx, InquirySpec spec, InquiryVerdict verdict, string note) => new(
             InquiryId(ctx), ctx.RunId, spec.Question, spec.Restatement, spec.AnswerType, verdict, null, null, null, null, false, Array.Empty<ChoiceDto>(), Array.Empty<RankedPersonDto>(),

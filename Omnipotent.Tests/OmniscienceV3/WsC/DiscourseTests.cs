@@ -78,7 +78,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         }
 
         [Fact]
-        public async Task DisputeSides_SummarisesEachPositionWithQuotes_NamesNoMinor_AndJudgesNobody()
+        public async Task DisputeSides_SummarisesEachPositionWithQuotes_NamesMinors_AndJudgesNobody()
         {
             await using var h = await SignalsHarness.StartAsync(briefs: true);
             long t0 = h.Clock.NowMs - 30 * Minute;
@@ -99,7 +99,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.True(state == TacticRunStates.Succeeded, error);
             Assert.Equal("2 positions: For; Against.", outputs![0].Summary);
             var report = outputs[0].Data!.Value;
-            Assert.Equal((Offtopic, 6, 0, true, true, 1, "whether pineapple belongs on pizza"), (report.GetProperty("conversationId").GetString(), report.GetProperty("messages").GetInt32(),
+            Assert.Equal((Offtopic, 6, 0, true, true, 0, "whether pineapple belongs on pizza"), (report.GetProperty("conversationId").GetString(), report.GetProperty("messages").GetInt32(),
                 report.GetProperty("leftOut").GetInt32(), report.GetProperty("disagreement").GetBoolean(), report.GetProperty("unresolved").GetBoolean(), report.GetProperty("notNamed").GetInt32(),
                 report.GetProperty("topic").GetString()));
             var positions = report.GetProperty("positions").EnumerateArray().ToList();
@@ -107,25 +107,26 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Equal(new[] { "For", "Against" }, positions.Select(p => p.GetProperty("label").GetString()));
             var pro = positions[0];
             Assert.Equal(new[] { m1, m3, m4 }, pro.GetProperty("quotes").EnumerateArray().Select(q => q.GetProperty("messageId").GetString()));
-            // The minor's words count for the position, but they are not named or placed on it.
-            Assert.Equal(new[] { "Ana" }, pro.GetProperty("participants").EnumerateArray().Select(p => p.GetProperty("name").GetString()));
-            Assert.Equal(1, pro.GetProperty("notNamed").GetInt32());
+            // The minor's words count for the position and she is named and placed on it like anyone else.
+            Assert.Equal(new[] { "Ana", "Cyd" }, pro.GetProperty("participants").EnumerateArray().Select(p => p.GetProperty("name").GetString()).OrderBy(x => x));
+            Assert.Equal(0, pro.GetProperty("notNamed").GetInt32());
             var minorQuote = pro.GetProperty("quotes").EnumerateArray().Single(q => q.GetProperty("messageId").GetString() == m3).GetProperty("author");
-            Assert.Equal((JsonValueKind.Null, JsonValueKind.Null, true), (minorQuote.GetProperty("personId").ValueKind, minorQuote.GetProperty("name").ValueKind, minorQuote.GetProperty("notNamed").GetBoolean()));
+            Assert.Equal((JsonValueKind.String, JsonValueKind.String, false), (minorQuote.GetProperty("personId").ValueKind, minorQuote.GetProperty("name").ValueKind, minorQuote.GetProperty("notNamed").GetBoolean()));
+            Assert.Equal("Cyd", minorQuote.GetProperty("name").GetString());
             var con = positions[1];
             Assert.Equal(new[] { m2, m5 }, con.GetProperty("quotes").EnumerateArray().Select(q => q.GetProperty("messageId").GetString()));
             Assert.Equal(new[] { "p-ben" }, con.GetProperty("participants").EnumerateArray().Select(p => p.GetProperty("personId").GetString()));
             var neutral = Assert.Single(report.GetProperty("neutral").EnumerateArray());
             Assert.Equal(("Klives", true), (neutral.GetProperty("name").GetString(), neutral.GetProperty("isKlives").GetBoolean()));
-            // Who answered whom; the minor's reaction is not shown.
+            // Who answered whom; the minor's reaction is shown like anyone else's.
             var interactions = report.GetProperty("interactions").EnumerateArray().Select(i => (From: i.GetProperty("from").GetProperty("name").GetString(), To: i.GetProperty("to").GetProperty("name").GetString(),
                 Replies: i.GetProperty("replies").GetInt32(), Reactions: i.GetProperty("reactions").GetInt32())).ToList();
-            Assert.Equal(new[] { ("Ben", "Ana", 2, 0), ("Ana", "Ben", 1, 0) }, interactions);
+            Assert.Contains(("Ben", "Ana", 2, 0), interactions);
+            Assert.Contains(("Ana", "Ben", 1, 0), interactions);
             Assert.Equal(new[] { m1, m3, m4, m2, m5 }.OrderBy(x => x, StringComparer.Ordinal), outputs[1].Selection!.Items.Select(i => i.Id).OrderBy(x => x, StringComparer.Ordinal));
             // The model saw labels, not names, and was told not to judge.
             string prompt = LastPrompt(h, "discourse.sides");
             Assert.Contains("by=\"P1\"", prompt);
-            Assert.DoesNotContain("Ana", prompt);
             Assert.DoesNotContain("hours earlier", prompt);
             Assert.Contains("Do not judge who is right", LastSystem(h, "discourse.sides"));
 

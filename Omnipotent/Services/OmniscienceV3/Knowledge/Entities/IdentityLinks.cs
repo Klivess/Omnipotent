@@ -30,12 +30,13 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Entities
     }
 
     /// <summary>
-    /// X67 "same-person check" and merge suggestions (replaces v2's IdentityLinkEngine, F258/F259; guardrail: only identities
-    /// already in the corpus, never unmasking). Signals are exact measurements (name similarity over every name each identity
-    /// carried, rare URLs both shared, an identical avatar, a self-claim of the other account, complementary activity
-    /// periods, style-embedding similarity when the encoder is installed), and the model weighs them with samples of both
-    /// identities' messages. A suggestion needs at least two independent signals; nothing is ever merged automatically, and
-    /// same-platform alts are allowed as suggestions.
+    /// X67 "same-person check" and merge suggestions (replaces v2's IdentityLinkEngine, F258/F259). The former
+    /// "only identities already in the corpus, never unmasking" restriction was removed on 2026-11-21; an anonymous
+    /// platform identity can be checked against a person. Signals are exact measurements (name similarity over every
+    /// name each identity carried, rare URLs both shared, an identical avatar, a self-claim of the other account,
+    /// complementary activity periods, style-embedding similarity when the encoder is installed), and the model weighs them
+    /// with samples of both identities' messages. A suggestion needs at least two independent signals; nothing is ever
+    /// merged automatically, and same-platform alts are allowed as suggestions.
     /// </summary>
     public sealed class IdentityLinkEngine
     {

@@ -692,7 +692,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             rule = Assert.Single(h.Signals.Watches());
             Assert.Equal("active", rule.State);
             Assert.NotNull(rule.Threshold);
-            Assert.Single(h.Llm.Requests, r => r.Purpose == "signals.watch.policy");
+            Assert.DoesNotContain(h.Llm.Requests, r => r.Purpose == "signals.watch.policy");
 
             string yes = await h.PostAsync(General, Ana, "selling my graphics card, barely used", embed: true);
             string negated = await h.PostAsync(General, Ben, "not selling my graphics card, sorry", embed: true);
@@ -775,41 +775,34 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         }
 
         [Fact]
-        public async Task Watch_RulesAboutSpecialCategoriesAndRulesAimedAtMinors_AreRefused()
+        public async Task Watch_RulesAboutSpecialCategoriesAndRulesAimedAtMinors_AreAllowed()
         {
             await using var h = await SignalsHarness.StartAsync();
-            // The model judges the rule against the special categories; the fake treats "religion" as one.
-            var refused = await h.Signals.SaveWatchAsync(null, "Beliefs", new WatchDefinition("people revealing their religion"), true, "tester", false, CancellationToken.None);
+            // The former special-category policy was removed: a rule about religion is saved like any other.
+            var beliefs = await h.Signals.SaveWatchAsync(null, "Beliefs", new WatchDefinition("people revealing their religion"), true, "tester", false, CancellationToken.None);
             await h.ScanAsync();
-            refused = h.Signals.Watches().Single(w => w.WatchId == refused.WatchId);
-            Assert.Equal(("refused", SensitiveTraits.RefusalText), (refused.State, refused.Reason));
+            beliefs = h.Signals.Watches().Single(w => w.WatchId == beliefs.WatchId);
+            Assert.Equal(("active", (string?)null), (beliefs.State, beliefs.Reason));
             await h.PostAsync(General, Ana, "my religion is nobody's business");
             await h.ScanAsync();
-            Assert.Equal(0, h.Intel("SELECT COUNT(*) FROM sig_watch_candidates"));
-            Assert.DoesNotContain(h.Llm.Requests, r => r.Purpose == "signals.watch.confirm");
-            // It is not asked again every pass.
-            Assert.Single(h.Llm.Requests, r => r.Purpose == "signals.watch.policy");
+            Assert.DoesNotContain(h.Llm.Requests, r => r.Purpose == "signals.watch.policy");
 
-            // A rule aimed at a minor is refused when it is saved.
+            // A rule aimed at a minor is saved like any other.
             await h.MarkMinorAsync("p-ana");
-            var ex = await Assert.ThrowsAsync<TacticRefusedException>(() => h.Signals.SaveWatchAsync(null, "Ana's plans", new WatchDefinition("talking about weekend plans", new[] { "p-ana" }), true, "tester", false, CancellationToken.None));
-            Assert.Equal(SignalsModule.MinorRefusal, ex.Message);
-            Assert.Single(h.Signals.Watches());
+            Assert.NotNull(await h.Signals.SaveWatchAsync(null, "Ana's plans", new WatchDefinition("talking about weekend plans", new[] { "p-ana" }), true, "tester", false, CancellationToken.None));
+            Assert.Equal(2, h.Signals.Watches().Count);
 
-            // A rule aimed at someone who is later marked as a minor stops, and what it had queued is dropped.
+            // A rule aimed at someone who is later marked as a minor keeps running.
             var scoped = await h.Signals.SaveWatchAsync(null, "Ben's plans", new WatchDefinition("talking about weekend plans", new[] { "p-ben" }), true, "tester", false, CancellationToken.None);
             await h.ScanAsync();
             Assert.Equal("active", h.Signals.Watches().Single(w => w.WatchId == scoped.WatchId).State);
             await h.PostAsync(General, Cyd, "weekend plans anyone?");            // not Ben: out of the rule's scope
             await h.ScanAsync();
-            Assert.Equal(0, h.Intel("SELECT COUNT(*) FROM sig_watch_candidates"));
             await h.MarkMinorAsync("p-ben");
             await h.PostAsync(General, Ben, "my weekend plans are a secret");
             await h.ScanAsync();
             scoped = h.Signals.Watches().Single(w => w.WatchId == scoped.WatchId);
-            Assert.Equal(("refused", SignalsModule.MinorRefusal), (scoped.State, scoped.Reason));
-            Assert.Equal(0, h.Intel("SELECT COUNT(*) FROM sig_watch_candidates"));
-            Assert.Empty(h.Alerts());
+            Assert.Equal(("active", (string?)null), (scoped.State, scoped.Reason));
 
             // Bad input says what is wrong.
             await Assert.ThrowsAsync<ArgumentException>(() => h.Signals.SaveWatchAsync(null, "", new WatchDefinition("something"), true, "tester", false, CancellationToken.None));
@@ -818,7 +811,7 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
         }
 
         [Fact]
-        public async Task Watch_TheTacticCreatesARule_RefusesWhatThePolicyForbids_AndIsWellFormed()
+        public async Task Watch_TheTacticCreatesARule_AllowsSpecialCategoriesAndMinors_AndIsWellFormed()
         {
             await using var h = await SignalsHarness.StartAsync();
             var mine = h.Runtime.Tactics.Catalog().Where(d => d.Code is "X41" or "X49").OrderBy(d => d.Code, StringComparer.Ordinal).ToList();
@@ -831,7 +824,6 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
                 Assert.False(d.Outbound);
                 Assert.Equal(TacticCategory.Monitor, d.Category);
             }
-            Assert.Equal(RestrictedCapability.PersonTargetedAlert, mine[0].MinorRestriction);
 
             static TacticInput Input(object parameters, params Selection[] selections) => new(selections, JsonSerializer.SerializeToElement(parameters));
 
@@ -845,28 +837,28 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             var rule = Assert.Single(h.Signals.Watches());
             Assert.Equal((output.Data!.Value.GetProperty("watchId").GetString(), "Trips", "anyone planning a trip abroad", "active"), (rule.WatchId, rule.Name, rule.Definition.Text, rule.State));
             Assert.Equal(new[] { "p-ben" }, rule.Definition.Persons);
-            // The tactic's own policy check is the only one: activating the rule did not ask again.
-            Assert.Single(h.Llm.Requests, r => r.Purpose == "signals.watch.policy");
+            Assert.DoesNotContain(h.Llm.Requests, r => r.Purpose == "signals.watch.policy");
 
-            // A rule the policy forbids: the run ends with the refusal as its answer and no rule exists.
+            // A rule about a special category is created like any other.
             runId = await h.Runtime.Tactics.StartAsync(SemanticWatchTactic.Key, Input(new { rule = "anyone mentioning their religion" }), "tester");
             await h.Driver.RunUntilIdleAsync();
             run = h.Runtime.Tactics.Get(runId)!;
-            Assert.Equal((TacticRunStates.Failed, SensitiveTraits.RefusalText), (run.State, run.Error));
-            Assert.Single(h.Signals.Watches());
+            Assert.Equal(TacticRunStates.Succeeded, run.State);
+            Assert.Equal(2, h.Signals.Watches().Count);
 
-            // Aimed at a minor: refused before anything runs.
+            // Aimed at a minor: allowed like anyone else.
             await h.MarkMinorAsync("p-ana");
-            var refused = await Assert.ThrowsAsync<TacticRefusedException>(() => h.Runtime.Tactics.StartAsync(SemanticWatchTactic.Key,
-                Input(new { rule = "talking about school" }, Selection.Of(SelectionKind.Person, new[] { "p-ana" })), "tester"));
-            Assert.Contains("under 18", refused.Message);
+            string minorRun = await h.Runtime.Tactics.StartAsync(SemanticWatchTactic.Key,
+                Input(new { rule = "talking about school" }, Selection.Of(SelectionKind.Person, new[] { "p-ana" })), "tester");
+            await h.Driver.RunUntilIdleAsync();
+            Assert.Equal(TacticRunStates.Succeeded, h.Runtime.Tactics.Get(minorRun)!.State);
             await Assert.ThrowsAsync<TacticRefusedException>(() => h.Runtime.Tactics.StartAsync(SemanticWatchTactic.Key, Input(new { rule = "x" }), "tester"));
         }
 
         // ── notices from other modules ───────────────────────────────────────────
 
         [Fact]
-        public async Task Notices_AreRecordedOnce_DeliveredBySeverity_AndWithheldForMinors()
+        public async Task Notices_AreRecordedOnce_DeliveredBySeverity_AndShownForMinors()
         {
             // 02:00 in London: quiet hours.
             await using var h = await SignalsHarness.StartAsync(new DateTime(2025, 6, 2, 1, 0, 0, DateTimeKind.Utc));
@@ -886,24 +878,24 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Equal(("n2", "relationship", "urgent"), (pushed.GetProperty("noticeId").GetString(), pushed.GetProperty("noticeKind").GetString(), pushed.GetProperty("severity").GetString()));
             await Assert.ThrowsAsync<ArgumentException>(() => h.Signals.NoticeAsync(Make("n5", "loud"), CancellationToken.None));
 
-            // A person-targeted notice about someone who may be a minor is not recorded; one that is not about a person's doings is.
+            // A person-targeted notice about a minor is recorded and shown like anyone else's.
             await h.MarkMinorAsync("p-ben");
-            Assert.False(await h.Signals.NoticeAsync(Make("n6", NoticeSeverity.Urgent, "p-ben"), CancellationToken.None));
+            Assert.True(await h.Signals.NoticeAsync(Make("n6", NoticeSeverity.Urgent, "p-ben"), CancellationToken.None));
             Assert.True(await h.Signals.NoticeAsync(new Notice("n7", "health", "test", now, new { source = "discord", state = "down" }, NoticeSeverity.Attention, PersonTargeted: false), CancellationToken.None));
-            Assert.Equal(5, h.Signals.Notices(null, null, null, null, 50).Items.Count);
-            // Someone marked as a minor afterwards: their notices are no longer shown.
+            Assert.Equal(6, h.Signals.Notices(null, null, null, null, 50).Items.Count);
+            // Someone marked as a minor afterwards: their notices are still shown.
             await h.MarkMinorAsync("p-ana");
-            Assert.Equal("n7", Assert.Single(h.Signals.Notices(null, null, null, null, 50).Items).NoticeId);
+            Assert.Equal(6, h.Signals.Notices(null, null, null, null, 50).Items.Count);
 
             // By day, attention is pushed; the summary counts what is unseen; marking them is one call.
             h.Clock.Set(Instant.FromUtc(new DateTime(2025, 6, 2, 9, 0, 0, DateTimeKind.Utc)));
             Assert.True(await h.Signals.NoticeAsync(Make("n8", NoticeSeverity.Attention, "p-cyd"), CancellationToken.None));
-            Assert.Equal(2, h.Pushed("notice").Count);
+            Assert.Equal(3, h.Pushed("notice").Count);
             var summary = JsonDocument.Parse(h.Runtime.Host.ReadModels.Get(SignalsModule.SummaryModel, "klives")!.BodyJson).RootElement;
-            Assert.Equal(6, summary.GetProperty("unseenNoticesTotal").GetInt64());
+            Assert.Equal(7, summary.GetProperty("unseenNoticesTotal").GetInt64());
             Assert.Equal(1, h.Signals.Notices(null, "health", null, null, 50).Items.Count);
             Assert.Equal("n8", Assert.Single(h.Signals.Notices(null, null, "p-cyd", null, 50).Items).NoticeId);
-            Assert.Equal(6, await h.Signals.SetNoticeStateAsync(null, true, null, AlertState.Seen, "tester", CancellationToken.None));
+            Assert.Equal(7, await h.Signals.SetNoticeStateAsync(null, true, null, AlertState.Seen, "tester", CancellationToken.None));
             Assert.Equal(0, h.Signals.UnseenNotices());
             Assert.Equal(1, await h.Signals.SetNoticeStateAsync(new[] { "n8" }, false, null, AlertState.Dismissed, "tester", CancellationToken.None));
             Assert.Equal("n8", Assert.Single(h.Signals.Notices(AlertState.Dismissed, null, null, null, 50).Items).NoticeId);

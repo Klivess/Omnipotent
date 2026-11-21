@@ -139,7 +139,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
         }
 
         [Fact]
-        public async Task PicturesOfPeopleWithAnalysisOff_OrWhoMayBeMinors_AreNeverDescribed()
+        public async Task PicturesOfPeopleWithAnalysisOff_AreNotDescribed_ButMinorsAre()
         {
             string off = await AttachAsync("m1", Picture(2), "u-cy");
             string minor = await AttachAsync("m2", Picture(3), "u-dee");
@@ -152,9 +152,9 @@ namespace Omnipotent.Tests.OmniscienceV3.Ingest
             ReadModelStore.PolicyChanged();
 
             Assert.StartsWith("skipped: analysis is switched off", await module.CaptionAsync(off, Job(off)));
-            Assert.StartsWith("skipped: posted by someone who is or may be a minor", await module.CaptionAsync(minor, Job(minor)));
-            Assert.Empty(model.Requests);
-            Assert.Empty(Captions());
+            Assert.Equal("captioned", await module.CaptionAsync(minor, Job(minor)));
+            Assert.Single(model.Requests);
+            Assert.Single(Captions());
         }
 
         [Fact]

@@ -58,7 +58,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
             Outputs = new[] { TacticOutputKind.AlertRule, TacticOutputKind.Report },
             Lane = Lane.Cpu,
             RequiredPermission = "omniscience.alerts.manage",
-            MinorRestriction = RestrictedCapability.PersonTargetedAlert,
             TypicalDurationMs = 300,
         };
 

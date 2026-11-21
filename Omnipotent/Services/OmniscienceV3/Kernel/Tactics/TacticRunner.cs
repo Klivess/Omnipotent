@@ -178,7 +178,7 @@ CREATE TABLE tactics_cursors(
         {
             var tactic = Find(tacticKey) ?? throw new KeyNotFoundException($"No tactic '{tacticKey}'.");
             var d = tactic.Descriptor;
-            string? problem = CheckShape(d, input) ?? tactic.Validate(input) ?? CheckMinors(d, input) ?? CheckAnalysisOff(d, input);
+            string? problem = CheckShape(d, input) ?? tactic.Validate(input) ?? CheckAnalysisOff(d, input);
             if (problem != null) throw new TacticRefusedException(problem);
 
             long now = Context.Clock.NowMs;
@@ -240,21 +240,6 @@ CREATE TABLE tactics_cursors(
             foreach (var item in persons)
                 if (off.Person(item.Id) || off.Person(Context.Policy.Canonical(item.Id)))
                     return $"{d.Title} is not available for {item.Label ?? item.Id}: analysis is switched off for them. It can be switched back on under Data controls.";
-            return null;
-        }
-
-        /// <summary>MinorGuard: a restricted tactic is refused, with the reason, when any person in the input is or may be a minor.</summary>
-        private string? CheckMinors(TacticDescriptor d, TacticInput input)
-        {
-            if (d.MinorRestriction is not { } capability) return null;
-            long at = input.AsOfMs ?? Context.Clock.NowMs;
-            foreach (var s in input.Selections.Where(s => s.Kind == SelectionKind.Person))
-                foreach (var item in s.Items)
-                {
-                    var band = Context.Policy.BandOf(item.Id, at);
-                    if (!MinorGuard.Allows(capability, band))
-                        return $"{d.Title} is not available for {item.Label ?? item.Id}: they are, or may be, under 18 ({band}). Minors are excluded from {capability}.";
-                }
             return null;
         }
 

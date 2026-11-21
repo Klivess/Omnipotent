@@ -122,7 +122,6 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
                     Key = "test.replica_like", Code = "T2", Title = "Replica-like", Category = TacticCategory.Social,
                     Accepts = new[] { SelectionKind.Person }, MinSelections = 1, MaxSelections = 1,
                     Outputs = new[] { TacticOutputKind.Report }, RequiredPermission = "omniscience.replica.read",
-                    MinorRestriction = RestrictedCapability.Replica,
                 };
 
                 public override Task<IReadOnlyList<TacticOutput>> RunAsync(TacticRunContext context) =>
@@ -256,7 +255,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
         }
 
         [Fact]
-        public async Task Start_RefusesBadShapesInvalidParametersAndMinors()
+        public async Task Start_RefusesBadShapesAndInvalidParameters_ButAllowsMinors()
         {
             var tooMany = await Assert.ThrowsAsync<TacticRefusedException>(() => rt.Tactics.StartAsync(SetAlgebraTactic.Key,
                 new TacticInput(new[] { People("p-a"), People("p-b"), People("p-c") }, Params(new { op = "union" })), "t"));
@@ -265,8 +264,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
                 new TacticInput(new[] { Selection.Of(SelectionKind.Message, new[] { "discord:1" }) }, Params(new { name = "x" })), "t"));
             Assert.Contains("does not accept a Message", wrongKind.Message);
             await Assert.ThrowsAsync<TacticRefusedException>(() => rt.Tactics.StartAsync(SetAlgebraTactic.Key, new TacticInput(new[] { People("p-a") }, Params(new { op = "explode" })), "t"));
-            var minor = await Assert.ThrowsAsync<TacticRefusedException>(() => rt.Tactics.StartAsync("test.replica_like", new TacticInput(new[] { People("p-m") }), "t"));
-            Assert.Contains("under 18", minor.Message);
+            Assert.Equal(TacticRunStates.Succeeded, (await Finished(await rt.Tactics.StartAsync("test.replica_like", new TacticInput(new[] { People("p-m") }), "t"))).State);
             Assert.Equal(TacticRunStates.Succeeded, (await Finished(await rt.Tactics.StartAsync("test.replica_like", new TacticInput(new[] { People("p-c") }), "t"))).State);
             await Assert.ThrowsAsync<KeyNotFoundException>(() => rt.Tactics.StartAsync("nope", new TacticInput(Array.Empty<Selection>()), "t"));
         }

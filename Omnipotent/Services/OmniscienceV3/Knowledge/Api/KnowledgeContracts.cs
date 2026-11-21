@@ -70,7 +70,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
     public sealed record AgendaDto(long AsOfMs, string Zone, IReadOnlyList<PlanItemDto> Upcoming, IReadOnlyList<PlanItemDto> Overdue, IReadOnlyList<PlanItemDto> KlivesPromises);
 
     [ApiContract]
-    public sealed record KnowledgeFactsPageDto(string PersonId, string Mode, long AtMs, bool MinorRestricted, IReadOnlyList<KnowledgeFactDto> Items, string? NextCursor);
+    public sealed record KnowledgeFactsPageDto(string PersonId, string Mode, long AtMs, IReadOnlyList<KnowledgeFactDto> Items, string? NextCursor);
 
     /// <summary>A cited message in context: who said it, where, when, and the quoted words of the cited version.</summary>
     [ApiContract]
@@ -208,7 +208,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
     public sealed record KnowledgeProfileDto(
         string PersonId,
         long AsOfMs,
-        bool MinorRestricted,
         IReadOnlyList<KnowledgeCategoryDto> Categories,
         IReadOnlyList<KnowledgeFactDto> Inferences,
         int CoveredMessages,

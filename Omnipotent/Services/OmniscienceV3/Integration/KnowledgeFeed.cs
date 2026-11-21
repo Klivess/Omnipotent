@@ -61,7 +61,7 @@ namespace Omnipotent.Services.OmniscienceV3.Integration
             if (!kit.Corpus.PersonExists(personId)) return false;                                       // gone, or never known
             if (!string.Equals(kit.Corpus.Canonical(personId), personId, StringComparison.Ordinal)) return false; // merged: held under the person they joined
             if (kit.Corpus.AnalysisOff.Person(personId)) return false;
-            return !MinorGuard.IsRestricted(kit.Context.Policy.BandOf(personId, nowMs));
+            return true;
         }
 
         /// <summary>Whether a document a holder keeps may be shown now: the person it is about, and everyone else it names.</summary>
@@ -125,7 +125,7 @@ namespace Omnipotent.Services.OmniscienceV3.Integration
             {
                 profile = null; // a profile this build cannot read gives nothing to hold until it is rebuilt
             }
-            if (profile == null || profile.MinorRestricted) return documents;
+            if (profile == null) return documents;
             string name = kit.Corpus.DisplayName(person) ?? "Someone";
             foreach (var category in profile.Categories.Where(c => c.Category != Attributes.Sensitive))
             {
@@ -140,11 +140,11 @@ namespace Omnipotent.Services.OmniscienceV3.Integration
             return documents;
         }
 
-        /// <summary>A current stated fact, accepted or confirmed, about nothing sensitive, naming nobody who may not be held.</summary>
+        /// <summary>A current stated fact, accepted or confirmed, naming nobody who may not be held. No minor or
+        /// sensitive-trait filter applies.</summary>
         private bool Holdable(KnowledgeFactDto f, long now)
         {
             if (f.Status is not (AssertionStatus.Accepted or AssertionStatus.Confirmed)) return false;
-            if (f.Sensitivity != "normal" || Attributes.IsSensitive(f.Attribute)) return false;
             if ((f.ValidToLatestMs ?? f.ValidToEarliestMs) is long ended && ended <= now) return false;
             return f.ObjectPersonId == null || MayHold(kit.Corpus.Canonical(f.ObjectPersonId), now);
         }

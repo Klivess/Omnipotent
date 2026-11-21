@@ -72,7 +72,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                 new ScheduleTrigger("health", Every: TimeSpan.FromMinutes(10)),
             },
             DefaultLane = Lane.Cpu,
-            MinorRestricted = true,
             Settings = new[]
             {
                 new SettingDescriptor("monitors.freshness_hours", SettingTypes.Number, "12", "Messages sent or received longer ago than this raise nothing (they are history by the time Omniscience sees them).", 1, 168),

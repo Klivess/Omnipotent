@@ -23,11 +23,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
         [JsonPropertyName("scope_from")] public string? ScopeFrom { get; set; }
         [JsonPropertyName("scope_to")] public string? ScopeTo { get; set; }
         public List<string> Conditions { get; set; } = new();
-        [JsonPropertyName("sensitive_category")] public string? SensitiveCategory { get; set; }
-        [JsonPropertyName("restricted_attribute")] public string? RestrictedAttribute { get; set; }
         [JsonPropertyName("about_klives")] public bool AboutKlives { get; set; }
         [JsonPropertyName("needs_world_knowledge")] public bool NeedsWorldKnowledge { get; set; }
-        [JsonPropertyName("routine_inference")] public bool RoutineInference { get; set; }
         public string? Topic { get; set; }
     }
 
@@ -114,9 +111,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
         public long? FromMs { get; init; }
         public string? TimeScope { get; init; }
         public IReadOnlyList<string> Conditions { get; init; } = Array.Empty<string>();
-        public string? SensitiveCategory { get; init; }
-        public string? RestrictedAttribute { get; init; }
-        public bool RoutineInference { get; init; }
         public bool AboutKlives { get; init; }
         public bool NeedsWorldKnowledge { get; init; }
         public string? Topic { get; init; }

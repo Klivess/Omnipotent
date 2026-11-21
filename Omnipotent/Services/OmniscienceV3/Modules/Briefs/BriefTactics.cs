@@ -291,7 +291,6 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Briefs
             Outputs = new[] { TacticOutputKind.AlertRule },
             Lane = Kernel.Jobs.Lane.Cpu,
             RequiredPermission = "omniscience.alerts.manage",
-            MinorRestriction = RestrictedCapability.PersonTargetedAlert,
             TypicalDurationMs = 300,
         };
 

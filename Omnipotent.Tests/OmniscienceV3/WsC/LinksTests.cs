@@ -235,13 +235,13 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Throws<ArgumentException>(() => links.Track(null, null));
             Assert.Throws<ArgumentException>(() => links.Track("not an address", null));
 
-            // Someone who is or may be under 18: their shares are counted, they are not named, and their diet is not shown.
+            // Someone who is or may be under 18: their shares are counted and named like anyone else's.
             await h.MarkMinorAsync("p-ben");
             track = links.Track(Video, null);
-            Assert.Equal(new[] { ("", "not named", 1), ("p-ana", "Ana", 1) }, track.People.Select(p => (p.Key, p.Label!, p.Shares)));
-            Assert.Null(track.Items.Single(i => i.MessageId == b2).PersonId);
-            Assert.Contains("under 18", Assert.Throws<TacticRefusedException>(() => links.PersonLinks("p-ben")).Message);
-            Assert.Throws<TacticRefusedException>(() => links.Search(null, "p-ben", null, null, null, null, null));
+            Assert.Equal(new[] { ("p-ana", "Ana", 1), ("p-ben", "Ben", 1) }, track.People.Select(p => (p.Key, p.Label!, p.Shares)));
+            Assert.Equal("p-ben", track.Items.Single(i => i.MessageId == b2).PersonId);
+            Assert.NotNull(links.PersonLinks("p-ben"));
+            Assert.NotEmpty(links.Search(null, "p-ben", null, null, null, null, null).Items);
             Assert.Throws<KeyNotFoundException>(() => links.PersonLinks("p-nobody"));
         }
 

@@ -131,10 +131,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
     }
 
     /// <summary>
-    /// Combines age evidence into a band (plan Guardrails: stricter, never looser). The birth constraints intersect; when they
-    /// are inconsistent the largest consistent set (by probability) decides the main interval and the rest are flagged as
-    /// joke/misread candidates for review. For protection, any single unrejected statement that makes the person possibly
-    /// under 18 at the instant keeps the band at least LikelyMinor until Klives rejects it in review.
+    /// Combines age evidence into a band. The birth constraints intersect; when they are inconsistent the largest
+    /// consistent set (by probability) decides the main interval and the rest are flagged as joke/misread candidates for
+    /// review. Any single unrejected statement that makes the person possibly under 18 at the instant keeps the band at
+    /// least LikelyMinor until Klives rejects it in review. The band is informational only; it does not restrict anything.
     /// </summary>
     public static class AgeBands
     {
@@ -174,7 +174,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
             foreach (var r in inconsistent)
             {
                 var single = MinorGuard.Evaluate(r.Birth, false, atMs);
-                if (MinorGuard.IsRestricted(single)) band = Stricter(band, AgeBand.LikelyMinor);
+                if (single is AgeBand.Minor or AgeBand.LikelyMinor) band = Stricter(band, AgeBand.LikelyMinor);
             }
             return band;
         }
@@ -186,7 +186,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Policy
             _ => 0,
         };
 
-        /// <summary>The stricter of two bands; between two unrestricted bands, evidence of adulthood beats "unknown".</summary>
+        /// <summary>The stricter of two bands; between two bands that are not minor, evidence of adulthood beats "unknown".</summary>
         public static AgeBand Stricter(AgeBand a, AgeBand b)
         {
             int sa = Strictness(a), sb = Strictness(b);
