@@ -16,7 +16,7 @@ namespace Omnipotent.Services.KliveAgent
     ///
     /// Every user message goes through a Think â†’ Script â†’ Observe loop:
     ///   1. Build a rich system prompt: personality + repo map (task-personalised) + BM25 memories + tool catalogue.
-    ///   2. LLM responds with a planning statement and optional {{{ C# script }}} blocks.
+    ///   2. LLM responds with a planning statement and optional {{{ JavaScript }}} blocks.
     ///   3. Scripts are executed; structured observations are fed back.
     ///   4. Loop continues until the LLM produces a text-only response (the final answer).
     ///
@@ -28,7 +28,8 @@ namespace Omnipotent.Services.KliveAgent
     public class KliveAgentBrain
     {
         private readonly KliveAgent agentService;
-        private readonly KliveAgentScriptEngine scriptEngine;
+        /// <summary>Runs the model's scripts: JavaScript (Jint), which replaced the Roslyn C# host on 22 Nov 2026.</summary>
+        private readonly KliveAgentJsEngine jsEngine = new();
         private readonly KliveAgentMemory memory;
 
         private sealed record PromptToolDescriptor(string MethodName, string Description);
@@ -83,7 +84,7 @@ namespace Omnipotent.Services.KliveAgent
 
         private static readonly PromptToolDescriptor[] MemoryTools =
         [
-            new("SaveMemory", "Persist a durable fact about reality (about Klive, Omnipotent, or how a service really behaves). Tags must be a string array, e.g. new[] { \"klive\", \"identity\" }. Returns the saved memory id (string) — log it if the user asked you to confirm."),
+            new("SaveMemory", "Persist a durable fact about reality (about Klive, Omnipotent, or how a service really behaves). Tags are a string array, e.g. [\"klive\", \"identity\"]. Returns the saved memory id (string) — log it if the user asked you to confirm."),
             new("RecallMemories", "Search saved memories by free-text query (matches both content and tags as text)."),
             new("RecallMemoriesByTag", "Return memories whose Tags collection contains the given tag exactly (case-insensitive). Prefer over RecallMemories when filtering by a known tag."),
             new("DeleteMemory", "Forget a memory by its id (or short-id prefix shown in prompts). Use this to curate noise/duplicates/outdated beliefs."),
@@ -115,10 +116,9 @@ namespace Omnipotent.Services.KliveAgent
             new("SteerSteward", "Send a message to a Steward's Commander (steers a live wake or wakes it): SteerSteward(stewardID, message).")
         ];
 
-        public KliveAgentBrain(KliveAgent agentService, KliveAgentScriptEngine scriptEngine, KliveAgentMemory memory)
+        public KliveAgentBrain(KliveAgent agentService, KliveAgentMemory memory)
         {
             this.agentService = agentService;
-            this.scriptEngine = scriptEngine;
             this.memory = memory;
         }
 
@@ -209,7 +209,7 @@ namespace Omnipotent.Services.KliveAgent
 
             var sb = new StringBuilder();
 
-            sb.AppendLine(await personalityTask);
+            sb.AppendLine(KliveAgentPersonality.Resolve(await personalityTask));
             sb.AppendLine();
 
             bool compactPrompt = await compactPromptTask;
@@ -308,7 +308,7 @@ namespace Omnipotent.Services.KliveAgent
         // brace-delimiter like "{'"). These caused the real "Newline in constant / Invalid expression
         // term '{'" compile failures, so we strip them from both ends of an extracted block.
         private static readonly Regex FramingJunkLine = new(
-            @"^\s*(?:'''|""""""|`{3,}\s*(?:csharp|cs)?|'|""|`|-{3,}|\{'|'\}|\{\{\{|\}\}\})\s*$",
+            @"^\s*(?:'''|""""""|`{3,}\s*(?:csharp|cs|javascript|js)?|'|""|`|-{3,}|\{'|'\}|\{\{\{|\}\}\})\s*$",
             RegexOptions.Compiled);
 
         private static string StripCodeFraming(string code)
@@ -394,7 +394,9 @@ namespace Omnipotent.Services.KliveAgent
                     if (lineEnd > i)
                     {
                         var info = response.Substring(i + 3, lineEnd - (i + 3)).Trim().ToLowerInvariant();
-                        if (info is "" or "csharp" or "cs")
+                        // js is the language now; csharp/cs still run, so a stale habit gets the "this is C#" hint
+                        // instead of being silently treated as prose.
+                        if (info is "" or "js" or "javascript" or "csharp" or "cs")
                         {
                             int fenceStart = lineEnd + 1;
                             int close = response.IndexOf("```", fenceStart, StringComparison.Ordinal);
@@ -419,7 +421,7 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>Native tool names that are memory operations (dispatched straight to KliveAgentMemory,
-        /// NOT through the Roslyn script engine). Anything not in this set is treated as execute_csharp.</summary>
+        /// NOT through the Roslyn script engine). Anything not in this set is treated as execute_js.</summary>
         private static readonly HashSet<string> MemoryToolNames = new(StringComparer.Ordinal)
         {
             "recall_memories", "recall_memories_by_tag", "save_memory", "save_shortcut", "get_shortcuts", "delete_memory"
@@ -430,7 +432,7 @@ namespace Omnipotent.Services.KliveAgent
         private static readonly HashSet<string> NativeNonMemoryTools = new(StringComparer.Ordinal)
         {
             "grep", "find_files", "read_file", "list_directory", "get_global_path", "list_data_directory", "read_data_file",
-            "tool_speed", "tool_jobs", "start_background_tool",
+            "tool_speed", "tool_jobs", "start_background_tool", "run_powershell", "run_bash",
             "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
             "account_list", "account_register", "account_update",
             "klivemail_create_mailbox", "klivemail_list_messages", "klivemail_get_message", "klivemail_wait_for_email",
@@ -466,16 +468,16 @@ namespace Omnipotent.Services.KliveAgent
         private static bool IsWaitTool(string name) => name == "wait_for";
 
         /// <summary>True for native tools that are dispatched directly (outside Roslyn) — the code/file/path
-        /// tools plus memory tools plus computer-use tools plus wait_for. Anything else is routed to execute_csharp.</summary>
+        /// tools plus memory tools plus computer-use tools plus wait_for. Anything else is routed to execute_js.</summary>
         private static bool IsNonScriptTool(string name) => NativeNonMemoryTools.Contains(name) || MemoryToolNames.Contains(name) || ComputerUseToolNames.Contains(name) || IsWaitTool(name)
             // Service Surface tools are generated at startup, so no static set can list them. Claiming
             // them here is load-bearing: the caller's fallback treats any unrecognised name as
-            // execute_csharp and would compile the arguments JSON as C#.
+            // execute_js and would run the arguments JSON as a script.
             || KliveAgentServiceTools.IsHandled(name);
 
         /// <summary>Read-only native tools have no side effects and never touch the Roslyn session, so
         /// several of them in one turn can run concurrently (their I/O latency overlaps). Write tools
-        /// (save_*/delete_*) and execute_csharp are excluded — they run serially, in order.</summary>
+        /// (save_*/delete_*) and execute_js are excluded — they run serially, in order.</summary>
         /// <param name="argsJson">Needed for Service Surface tools: one generated tool covers several
         /// operations, so whether the call reads or writes is decided by its 'op', not by its name.</param>
         private static bool IsParallelSafeNativeTool(string name, string? argsJson = null) => name switch
@@ -524,7 +526,7 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>
-        /// The native tools exposed to the model: execute_csharp (arbitrary C# over the live service graph)
+        /// The native tools exposed to the model: execute_js (arbitrary JavaScript over the live service graph)
         /// plus first-class MEMORY tools so recall/save are a direct tool call, never a hand-written script.
         /// </summary>
         public static List<HFWrapper.HFTool> BuildToolDefinitions(bool includeComputerUse = false)
@@ -537,23 +539,25 @@ namespace Omnipotent.Services.KliveAgent
 
             var tools = new List<HFWrapper.HFTool>
             {
-                Tool("execute_csharp",
-                    "Execute a C# script IN-PROCESS INSIDE Omnipotent (Roslyn) — the script runs in the live " +
-                    "server's context, so it is equally good for general-purpose scripting (computation, parsing, " +
-                    "file/data work, HTTP) AND it can read, drive, and control ALL of Omnipotent: every live " +
-                    "service, its state, and its methods, via the ScriptGlobals API (GetService, GetTypeSchema, " +
-                    "GetObjectMembers, CallObjectMethod, Dyn, Log, SearchCode, ReadFile, GetRecentErrors, etc.). " +
-                    "Variables persist across calls within the same conversation. `await` any Task-returning call. " +
-                    "Use Log(...) to return observations. Pass RAW C# in the 'code' argument — do NOT wrap it " +
-                    "in {{{ }}} or markdown fences. NOTE: memory has its OWN dedicated tools (recall_memories, " +
-                    "save_memory, …) — use those, not execute_csharp, for anything memory-related.",
+                Tool("execute_js",
+                    "Run JavaScript IN-PROCESS INSIDE Omnipotent, against the live server: general-purpose scripting " +
+                    "(computation, parsing, data work) AND reading, driving and controlling ALL of Omnipotent: every live " +
+                    "service, its state and its methods. Every .NET object is fully dynamic: call its real member names " +
+                    "(the first letter's case does not matter), internal types included, with no casts. .NET lists take " +
+                    "for...of and JS array methods. Helpers are globals: Svc(name), GetService, ListServices, GetTypeSchema, " +
+                    "GetObjectMembers, GetObjectMember/CallObjectMethod (non-public members), Log, GetRecentErrors, " +
+                    "RunPowerShell, Delay(ms), and the rest of GetTypeSchema(\"ScriptGlobals\"). `await` works at the top " +
+                    "level and on any .NET Task. Top-level variables, functions and classes persist across calls in this " +
+                    "conversation (declaring a name again reassigns it). Log(...) returns observations, objects as JSON; the " +
+                    "last expression is shown as the result. Nothing is compiled. Pass RAW JavaScript in 'code', not wrapped " +
+                    "in {{{ }}} or fences. Memory has its OWN tools (recall_memories, save_memory, ...): use those.",
                     new { type = "object", properties = new {
-                        code = new { type = "string", description = "The raw C# script to compile and run." },
-                        timeoutSeconds = new { type = "integer", description = "Optional: seconds the script may RUN (default 30, max 300). Compiling is not counted. To wait for something to happen, use wait_for instead." }
+                        code = new { type = "string", description = "The raw JavaScript to run." },
+                        timeoutSeconds = new { type = "integer", description = "Optional: seconds the script may run (default 30, max 300). It is really stopped at that point. To wait for something to happen, use wait_for instead." }
                     }, required = new[] { "code" } }),
 
                 Tool("grep",
-                    "Search the codebase CONTENTS and return matching 'path:line: text' lines. Runs directly — no C#/compile step, so it cannot fail to compile. Use this for content search INSTEAD of calling SearchCode/SearchCodeRegex inside execute_csharp. 'pattern' is a regex by default; set fixedString=true for a literal substring. Scope with 'path' (a file or subfolder, e.g. \"Omnipotent/Services/KliveAgent\") and 'glob' (default *.cs). outputMode \"files\" lists only the files that match (fastest way to answer 'where is X used'), \"count\" counts. Skips bin/obj/node_modules and is bounded to 15 s.",
+                    "Search the codebase CONTENTS and return matching 'path:line: text' lines. Runs directly — no script needed. Use this for content search INSTEAD of calling SearchCode/SearchCodeRegex inside execute_js. 'pattern' is a regex by default; set fixedString=true for a literal substring. Scope with 'path' (a file or subfolder, e.g. \"Omnipotent/Services/KliveAgent\") and 'glob' (default *.cs). outputMode \"files\" lists only the files that match (fastest way to answer 'where is X used'), \"count\" counts. Skips bin/obj/node_modules and is bounded to 15 s.",
                     new { type = "object", properties = new {
                         pattern = new { type = "string", description = "Regex (or literal, if fixedString=true) to search for in file contents." },
                         path = new { type = "string", description = "Optional file or subfolder to scope the search (e.g. \"Omnipotent/Services\")." },
@@ -566,7 +570,7 @@ namespace Omnipotent.Services.KliveAgent
                     }, required = new[] { "pattern" } }),
 
                 Tool("find_files",
-                    "Find FILES in the codebase by NAME, newest first (like a glob). Runs directly — no compile step. \"*Routes*.cs\" matches file names at any depth; a pattern with a slash matches the path below 'path' (\"**/Talk/*.cs\"). Use this instead of FindFiles in execute_csharp, and instead of grep when you know the file name but not its folder.",
+                    "Find FILES in the codebase by NAME, newest first (like a glob). Runs directly — no compile step. \"*Routes*.cs\" matches file names at any depth; a pattern with a slash matches the path below 'path' (\"**/Talk/*.cs\"). Use this instead of FindFiles in execute_js, and instead of grep when you know the file name but not its folder.",
                     new { type = "object", properties = new {
                         pattern = new { type = "string", description = "Glob: * and ? within a name, ** across folders, {a,b} for alternatives." },
                         path = new { type = "string", description = "Optional subfolder to search (default: the whole codebase)." },
@@ -574,7 +578,7 @@ namespace Omnipotent.Services.KliveAgent
                     }, required = new[] { "pattern" } }),
 
                 Tool("read_file",
-                    "Read a SOURCE file from the codebase directly — no C#/compile step. Path is relative to the repo root (e.g. \"Omnipotent/Services/KliveAgent/KliveAgent.cs\"). NEVER send {\"path\":...} JSON as an execute_csharp script — that's THIS tool; call it. Use startLine/maxLines to page large files.",
+                    "Read a SOURCE file from the codebase directly — no script needed. Path is relative to the repo root (e.g. \"Omnipotent/Services/KliveAgent/KliveAgent.cs\"). NEVER send {\"path\":...} JSON as an execute_js script — that's THIS tool; call it. Use startLine/maxLines to page large files.",
                     new { type = "object", properties = new {
                         path = new { type = "string", description = "Repo-relative file path." },
                         startLine = new { type = "integer", description = "1-based start line (default 1)." },
@@ -582,7 +586,7 @@ namespace Omnipotent.Services.KliveAgent
                     }, required = new[] { "path" } }),
 
                 Tool("list_directory",
-                    "List files and folders in a CODEBASE directory (repo-relative, e.g. \"Omnipotent/Services\"). Runs directly — no compile step. For RUNTIME data directories (SavedData/...), use get_global_path then read in execute_csharp.",
+                    "List files and folders in a CODEBASE directory (repo-relative, e.g. \"Omnipotent/Services\"). Runs directly — no compile step. For RUNTIME data (SavedData/...), use list_data_directory and read_data_file.",
                     new { type = "object", properties = new {
                         path = new { type = "string", description = "Repo-relative directory (default: repo root)." }
                     }, required = Array.Empty<string>() }),
@@ -611,6 +615,22 @@ namespace Omnipotent.Services.KliveAgent
                         fromEnd = new { type = "boolean", description = "Return the LAST maxLines lines instead (newest entries of a journal/log)." }
                     }, required = new[] { "path" } }),
 
+                Tool("run_powershell",
+                    "Run PowerShell on the HOST machine Omnipotent runs on (pwsh, else Windows PowerShell; no profile, non-interactive) and get the exit code, output and errors back. No script needed: use it instead of RunPowerShell inside execute_js for docker, git, Windows services, processes, disk, network and log files. It runs with Omnipotent's own rights, and the whole process tree is killed at timeoutSeconds. A command that takes minutes: start it with start_background_tool and keep working.",
+                    new { type = "object", properties = new {
+                        script = new { type = "string", description = "The PowerShell to run (one command or several lines)." },
+                        timeoutSeconds = new { type = "integer", description = "Seconds before the process tree is killed (default 120, max 900)." },
+                        workingDirectory = new { type = "string", description = "Optional folder to run in." }
+                    }, required = new[] { "script" } }),
+
+                Tool("run_bash",
+                    "Run Bash on the HOST machine (WSL or Git Bash) and get the exit code, output and errors back. No compile step; same rights, timeout and process-tree kill as run_powershell. Use it for commands written for bash; prefer run_powershell for Windows itself.",
+                    new { type = "object", properties = new {
+                        script = new { type = "string", description = "The bash to run." },
+                        timeoutSeconds = new { type = "integer", description = "Seconds before the process tree is killed (default 120, max 900)." },
+                        workingDirectory = new { type = "string", description = "Optional folder to run in." }
+                    }, required = new[] { "script" } }),
+
                 Tool("tool_speed",
                     "How long each of your tools really takes on this server (typical, slow, worst, overruns, failures over its recent calls) and the fastest tool for each kind of job. Instant, no side effects. Check it when choosing between tools that could both do a job, or when a tool seems slow.",
                     new { type = "object", properties = new {
@@ -618,7 +638,7 @@ namespace Omnipotent.Services.KliveAgent
                     }, required = Array.Empty<string>() }),
 
                 Tool("start_background_tool",
-                    "Start a native or service tool call in the BACKGROUND and get a job id back at once, so a slow call (klivemail_wait_for_email, web_search with fetchTop, a long service operation) runs while you do other work. You are told when it finishes; tool_jobs collects the result. Not for computer_* tools, execute_csharp, wait_for or approval tools.",
+                    "Start a native or service tool call in the BACKGROUND and get a job id back at once, so a slow call (klivemail_wait_for_email, web_search with fetchTop, a long service operation) runs while you do other work. You are told when it finishes; tool_jobs collects the result. Not for computer_* tools, execute_js, wait_for or approval tools.",
                     new { type = "object", properties = new {
                         tool = new { type = "string", description = "The tool to run, e.g. \"klivemail_wait_for_email\"." },
                         arguments = new { type = "object", description = "That tool's arguments, exactly as you would pass them to it." }
@@ -801,15 +821,15 @@ namespace Omnipotent.Services.KliveAgent
                 Tool("wait_for",
                     "PAUSE until an external event happens, then continue — without ending your turn and without the 30s script limit. " +
                     "Use this whenever you must wait for someone/something else: a person to act (incl. in a GUI/game), a remote state to change, a file/email/build to appear. " +
-                    "Observe ONE of: watch:\"screen\" (wait until the SCREEN changes — the right choice for games/GUIs, e.g. an opponent's move; uses a perceptual diff so a ticking clock doesn't trigger it, tune with 'threshold'), 'url' (poll an HTTP GET), or 'check' (a short C# probe that Log()s the value to watch). If you give none, it watches the screen. " +
+                    "Observe ONE of: watch:\"screen\" (wait until the SCREEN changes — the right choice for games/GUIs, e.g. an opponent's move; uses a perceptual diff so a ticking clock doesn't trigger it, tune with 'threshold'), 'url' (poll an HTTP GET), or 'check' (a short JavaScript probe that Log()s the value to watch). If you give none, it watches the screen. " +
                     "Stop condition 'until' (url/check only): \"change\" (default), \"contains\" (returns when it contains 'target'), or \"true\". " +
                     "It blocks (heartbeating, no LLM cost while waiting) up to maxMinutes, polling every intervalSeconds, and ALWAYS returns — the moment the event fires, or with a 'no change yet, decide what to do' summary at maxMinutes, or early if a url/check probe keeps erroring (so a broken check never hangs). " +
-                    "For a SHORT settle right after your own action, computer_wait is simpler. NEVER hand-roll a long polling loop in execute_csharp — it gets killed at the per-script timeout.",
+                    "For a SHORT settle right after your own action, computer_wait is simpler. NEVER hand-roll a long polling loop in execute_js — it is stopped at the per-script timeout.",
                     new { type = "object", properties = new {
                         watch = new { type = "string", description = "\"screen\" to wait until the display changes (no url/check needed). Best for games/GUIs / waiting on another player." },
                         threshold = new { type = "number", description = "For watch:\"screen\": how big a change counts (mean 0..255 perceptual delta, default 2). Lower = more sensitive; raise if minor animation keeps tripping it." },
                         url = new { type = "string", description = "URL to poll with a GET (use this OR 'check' OR watch:\"screen\")." },
-                        check = new { type = "string", description = "A short C# probe that Log()s the value to watch. Fully general: services, files, DOM, etc." },
+                        check = new { type = "string", description = "A short JavaScript probe that Log()s the value to watch. Fully general: services, files, DOM, etc." },
                         until = new { type = "string", description = "\"change\" (default) | \"contains\" | \"true\" (url/check only)." },
                         target = new { type = "string", description = "Text to wait for when until=\"contains\"." },
                         intervalSeconds = new { type = "integer", description = "Poll cadence (default 5, min 2)." },
@@ -1024,6 +1044,19 @@ namespace Omnipotent.Services.KliveAgent
                     var text = await Task.Run(() => KliveAgentDataFiles.Read(path, startLine, maxLines, fromEnd));
                     return MaskForModel(globals, text);
                 }
+                case "run_powershell":
+                case "run_bash":
+                {
+                    var script = Str("script") ?? Str("command");
+                    if (string.IsNullOrWhiteSpace(script)) return "Error: 'script' is required.";
+                    int seconds = Math.Clamp(IntOr("timeoutSeconds", DefaultShellSeconds), 1, MaxShellSeconds);
+                    var workingDirectory = Str("workingDirectory") ?? Str("cwd");
+                    var timer = System.Diagnostics.Stopwatch.StartNew();
+                    var shell = toolName == "run_bash"
+                        ? await Data_Handling.HostShell.RunBashAsync(script, TimeSpan.FromSeconds(seconds), workingDirectory, globals.CancellationToken)
+                        : await Data_Handling.HostShell.RunPowerShellAsync(script, TimeSpan.FromSeconds(seconds), workingDirectory, globals.CancellationToken);
+                    return MaskForModel(globals, FormatShellResult(shell, seconds, timer.ElapsedMilliseconds));
+                }
                 case "tool_speed":
                     return globals.AgentService?.ToolSpeed?.Describe(Str("tool") ?? Str("filter"))
                         ?? "The tool-speed record is not loaded yet (KliveAgent is still starting).";
@@ -1165,6 +1198,40 @@ namespace Omnipotent.Services.KliveAgent
                 default:
                     return $"Unknown native tool '{toolName}'.";
             }
+        }
+
+        internal const int DefaultShellSeconds = 120;
+        internal const int MaxShellSeconds = 900;
+        private const int MaxShellOutputChars = 16_000;
+
+        /// <summary>
+        /// A host shell result as the model reads it. The first line carries the exit code AND the first thing
+        /// the command printed (or its first error), because a compacted run keeps only the first line of
+        /// each result. HostShell's own Format puts the status alone on line one, so it is not used here.
+        /// </summary>
+        internal static string FormatShellResult(Data_Handling.HostShell.ShellResult result, int timeoutSeconds, long elapsedMs)
+        {
+            static string? FirstLine(string text) =>
+                text.Split('\n').Select(l => l.TrimEnd('\r').Trim()).FirstOrDefault(l => l.Length > 0);
+            static string Clip(string line) => line.Length <= 200 ? line : line[..200] + "…";
+
+            string stdout = (result.Stdout ?? "").TrimEnd();
+            string stderr = (result.Stderr ?? "").TrimEnd();
+            string took = FormatElapsed(TimeSpan.FromMilliseconds(elapsedMs));
+            string status = result.TimedOut
+                ? $"timed out after {timeoutSeconds}s, process tree killed ({result.Interpreter})"
+                : $"exit {result.ExitCode} ({result.Interpreter}, {(elapsedMs < 1000 ? $"{elapsedMs}ms" : took)})";
+            string? headline = result.ExitCode == 0 && !result.TimedOut
+                ? FirstLine(stdout) ?? FirstLine(stderr)
+                : FirstLine(stderr) ?? FirstLine(stdout);
+
+            var sb = new StringBuilder();
+            sb.Append(status).Append(": ").AppendLine(headline == null ? "(no output)" : Clip(headline));
+            if (stdout.Length > 0 && (stdout.Contains('\n') || headline == null || Clip(FirstLine(stdout) ?? "") != Clip(headline)))
+                sb.AppendLine(stdout);
+            if (stderr.Length > 0) sb.AppendLine("stderr:").AppendLine(stderr);
+            string text = sb.ToString().TrimEnd();
+            return text.Length <= MaxShellOutputChars ? text : text[..MaxShellOutputChars] + $"\n[output cut at {MaxShellOutputChars} characters]";
         }
 
         /// <summary>Text read from files (code, runtime data) with any known secret value replaced, before the
@@ -1453,7 +1520,7 @@ namespace Omnipotent.Services.KliveAgent
         /// session, wait_for needs the progress channel, and the job tools would nest.</summary>
         private static readonly HashSet<string> NotInBackground = new(StringComparer.Ordinal)
         {
-            "execute_csharp", "wait_for", "start_background_tool", "tool_jobs", "task_ledger",
+            "execute_js", "execute_csharp", "wait_for", "start_background_tool", "tool_jobs", "task_ledger",
         };
 
         /// <summary>A background job is stopped if it is still running after this long.</summary>
@@ -1543,7 +1610,7 @@ namespace Omnipotent.Services.KliveAgent
                 ? "[auto-fixed before running, write it this way next time: " + string.Join("; ", repairs) + "]"
                 : null;
 
-        /// <summary>The optional timeoutSeconds of an execute_csharp call.</summary>
+        /// <summary>The optional timeoutSeconds of an execute_js call.</summary>
         internal static int? ExtractScriptTimeout(HFWrapper.HFToolCall toolCall)
         {
             var args = toolCall?.function?.arguments;
@@ -1596,7 +1663,7 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>
-        /// Implements the wait_for tool: poll an observable (an HTTP url, or a C# probe script) on an
+        /// Implements the wait_for tool: poll an observable (an HTTP url, or a JavaScript probe script) on an
         /// interval and return when it changes / contains text / is true, or when maxMinutes elapses.
         /// Heartbeats via <paramref name="heartbeat"/> (wired by the caller to ReportProgress so the stall
         /// watchdog sees a *waiting* run, not a hung one), honours the run cancellation token, and is NOT
@@ -1669,8 +1736,8 @@ namespace Omnipotent.Services.KliveAgent
             }
 
             // Probe via a DEDICATED throwaway script session so it can't pollute the agent's main session.
-            KliveAgentScriptEngine.ScriptExecutionSession? probe =
-                string.IsNullOrWhiteSpace(check) ? null : scriptEngine.CreateSession(new ScriptGlobals(agentService, ct));
+            KliveAgentJsSession? probe =
+                string.IsNullOrWhiteSpace(check) ? null : jsEngine.CreateSession(new ScriptGlobals(agentService, ct));
             using var http = string.IsNullOrWhiteSpace(url) ? null : new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(25) };
 
             async Task<string> Observe()
@@ -1930,14 +1997,9 @@ namespace Omnipotent.Services.KliveAgent
                 // The session is the conversation's, not the run's: a follow-up message within
                 // KliveAgent_KeepScriptSessionMinutes continues it, so the variables the last turn
                 // computed still exist and the turn does not start with a first compile.
-                var (scriptSession, sharedGlobals, scriptSessionKept) = scriptEngine.AcquireConversationSession(
+                var (scriptSession, sharedGlobals, scriptSessionKept) = jsEngine.AcquireConversationSession(
                     conversation.ConversationId,
                     () => new ScriptGlobals(agentService, cancellationToken) { ConversationId = conversation.ConversationId },
-                    new ScriptSessionOptions
-                    {
-                        CompileBudget = TimeSpan.FromSeconds(settings.ScriptCompileBudgetSeconds),
-                        AutoRepair = settings.ScriptAutoRepair,
-                    },
                     TimeSpan.FromMinutes(settings.KeepScriptSessionMinutes));
                 sharedGlobals.CancellationToken = cancellationToken;
                 sharedGlobals.ConversationId = conversation.ConversationId;
@@ -2661,7 +2723,7 @@ namespace Omnipotent.Services.KliveAgent
                                 // Memory / grep tool: dispatched straight to its API, not the script engine.
                                 segments.Add(new ResponseSegment { IsScript = false, ToolName = name, Content = tc.function?.arguments ?? string.Empty, ToolCallId = tc.id });
                             else
-                                segments.Add(new ResponseSegment { IsScript = true, ToolName = "execute_csharp", Content = ExtractCodeFromToolCall(tc), ToolCallId = tc.id, TimeoutSeconds = ExtractScriptTimeout(tc) });
+                                segments.Add(new ResponseSegment { IsScript = true, ToolName = "execute_js", Content = ExtractCodeFromToolCall(tc), ToolCallId = tc.id, TimeoutSeconds = ExtractScriptTimeout(tc) });
                         }
                     }
                     else
@@ -2776,15 +2838,15 @@ namespace Omnipotent.Services.KliveAgent
                             };
                         }
 
-                        // Guard: model sometimes emits C# code as plain text (unbalanced ``` fence,
+                        // Guard: model sometimes emits script code as plain text (unbalanced ``` fence,
                         // or naked tool calls like "ReadFile(...)") thinking it's a final answer.
                         // Re-prompt once to force a real final reply or a properly-fenced script.
                         if (!finalFormatRetryUsed && !stuckForceFinal && LooksLikeUnexecutedScript(finalText))
                         {
                             finalFormatRetryUsed = true;
-                            SendModelPrompt("[Format error] Your last reply was not a real final answer. Either it (a) contained C# code as plain text instead of actually running it, (b) was a stub like 'Let me get X' or 'I'll now Y' that promises to act but contains no answer, or (c) was an XML/JSON tool envelope. "
+                            SendModelPrompt("[Format error] Your last reply was not a real final answer. Either it (a) contained script code as plain text instead of actually running it, (b) was a stub like 'Let me get X' or 'I'll now Y' that promises to act but contains no answer, or (c) was an XML/JSON tool envelope. "
                                 + (useToolCalling
-                                    ? "Pick ONE: actually run the script by CALLING the execute_csharp tool, OR write the real text-only final answer with NO code, NO tool envelopes, NO 'Let me X'. "
+                                    ? "Pick ONE: actually run the script by CALLING the execute_js tool, OR write the real text-only final answer with NO code, NO tool envelopes, NO 'Let me X'. "
                                     : "Pick ONE: actually run the script wrapped in {{{ ... }}} so it executes, OR write the real text-only final answer with NO code, NO fences, NO tool names, NO 'Let me X'. ")
                                 + "Do not stall. Do not promise. Either act or answer.");
                             continue;
@@ -2933,7 +2995,7 @@ namespace Omnipotent.Services.KliveAgent
 
                     // #6 Parallel tool execution: read-only native tools in this turn are independent of each
                     // other (and of the turn's scripts), so kick them ALL off up front to overlap their I/O.
-                    // Their RESULTS are still consumed below in original segment order, and execute_csharp
+                    // Their RESULTS are still consumed below in original segment order, and execute_js
                     // scripts (which chain Roslyn session state) + write tools still run serially in order.
                     var prelaunchedTools = new Dictionary<ResponseSegment, Task<(bool ok, string output)>>();
                     foreach (var seg in segments)
@@ -3087,9 +3149,9 @@ namespace Omnipotent.Services.KliveAgent
                         var runBudget = segment.TimeoutSeconds is int asked
                             ? TimeSpan.FromSeconds(Math.Clamp(asked, 5, KliveAgentRunSettings.MaxScriptTimeoutSeconds))
                             : scriptTimeout;
-                        var result = await WithToolPulse(scriptSession.ExecuteAsync(segment.Content ?? string.Empty, runBudget), "running a C# script");
+                        var result = await WithToolPulse(scriptSession.ExecuteAsync(segment.Content ?? string.Empty, runBudget), "running a script");
                         performance.Add("script", result.ExecutionTimeMs);
-                        agentService.ToolSpeed?.Record("execute_csharp", null, result.ExecutionTimeMs,
+                        agentService.ToolSpeed?.Record("execute_js", null, result.ExecutionTimeMs,
                             result.Success ? ToolCallOutcome.Ok
                             : result.FailureKind is "timeout" or "compile-timeout" ? ToolCallOutcome.Overran
                             : ToolCallOutcome.Error);
@@ -3156,7 +3218,7 @@ namespace Omnipotent.Services.KliveAgent
                         // sees the result attached to the exact call it made.
                         if (useToolCalling && !string.IsNullOrEmpty(segment.ToolCallId))
                         {
-                            llm.AppendToolResult(llmSessionId, segment.ToolCallId, "execute_csharp", scriptObsText);
+                            llm.AppendToolResult(llmSessionId, segment.ToolCallId, segment.ToolName ?? "execute_js", scriptObsText);
                             anyToolResultsAppended = true;
                         }
                     }
@@ -3276,7 +3338,7 @@ namespace Omnipotent.Services.KliveAgent
                 try { agentService.Talk.GetListener(conversation.ConversationId)?.OnRunEnded(performance.Outcome == "completed"); }
                 catch { /* speech must never affect the run's outcome */ }
                 // The session's idle time counts from the end of the run, not its start.
-                try { scriptEngine.TouchConversationSession(conversation.ConversationId); } catch { }
+                try { jsEngine.TouchConversationSession(conversation.ConversationId); } catch { }
                 if (!background)
                 {
                     try { KliveLLM.KliveLLM.AIRouterReleaseInteractiveReserve(reserveOwner); } catch { }
@@ -3681,7 +3743,7 @@ namespace Omnipotent.Services.KliveAgent
         internal static string BuildCompactToolGuide(string userMessage, bool toolCallingMode)
         {
             if (!toolCallingMode) return BuildToolGuide(userMessage, false);
-            var sb = new StringBuilder("[ScriptGlobals — C# helpers]\n");
+            var sb = new StringBuilder("[Script helpers — globals in execute_js (JavaScript)]\n");
             sb.AppendLine("Core: " + string.Join(", ", StarterTools.Select(t => t.MethodName)));
             if (ShouldIncludeDiscoveryTools(userMessage))
                 sb.AppendLine("Codebase: " + string.Join(", ", DiscoveryTools.Select(t => t.MethodName)));
@@ -3689,7 +3751,7 @@ namespace Omnipotent.Services.KliveAgent
                 sb.AppendLine("Runtime: " + string.Join(", ", AdvancedRuntimeTools.Select(t => t.MethodName)));
             sb.AppendLine("Demiurge: " + string.Join(", ", DemiurgeTools.Select(t => t.MethodName)));
             sb.AppendLine("GetTypeSchema(\"ScriptGlobals\") lists exact signatures; GetMethodDocumentation(\"ScriptGlobals\", name) describes one helper.");
-            sb.AppendLine("Example: var svc = GetService(\"Name\"); Log(await CallObjectMethod(svc, \"Method\", args));");
+            sb.AppendLine("Example: const svc = Svc(\"Name\"); Log(await svc.SomeMethodAsync(args), svc.SomeProperty);");
             return sb.ToString();
         }
 
@@ -3708,10 +3770,10 @@ namespace Omnipotent.Services.KliveAgent
                 AppendToolNames(sb, "Runtime", AdvancedRuntimeTools);
 
             // Memory is ALWAYS surfaced (recall is meant to be a reflex every turn). In tool-calling mode
-            // it's a set of FIRST-CLASS native tools — call them directly, never via execute_csharp. In the
+            // it's a set of FIRST-CLASS native tools — call them directly, never via execute_js. In the
             // text-protocol fallback it's the ScriptGlobals C# methods.
             if (toolCallingMode)
-                sb.AppendLine("Memory (NATIVE TOOLS — call these directly as tool calls, NEVER via execute_csharp): "
+                sb.AppendLine("Memory (NATIVE TOOLS — call these directly as tool calls, NEVER via execute_js): "
                     + "recall_memories(query, maxResults?, since?, until?) — search memory (do this FIRST for non-code questions; since/until take \"7d\" or a UTC date for time-window recall); "
                     + "recall_memories_by_tag(tag); save_memory(content, tags?, importance?); "
                     + "save_shortcut(title, content, tags?); get_shortcuts(); delete_memory(id).");
@@ -3929,7 +3991,7 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>
-        /// Heuristic: does this "final answer" text actually look like it's secretly C# code
+        /// Heuristic: does this "final answer" text actually look like it's secretly script code
         /// (or a half-broken code fence) that the agent meant to execute but didn't wrap?
         /// We trip on: unbalanced ``` fence count, or several lines that look like tool
         /// calls / variable declarations / awaited Tasks.
@@ -4004,12 +4066,12 @@ namespace Omnipotent.Services.KliveAgent
         // routed back as a role:"tool" message keyed to this id. Null for text-protocol scripts.
         public string? ToolCallId { get; set; }
 
-        // The native tool that produced this segment: "execute_csharp" (then IsScript=true and Content is
-        // the C# code) or a memory tool name (then IsScript=false and Content is the raw JSON arguments).
+        // The native tool that produced this segment: "execute_js" (then IsScript=true and Content is
+        // the JavaScript code) or a memory tool name (then IsScript=false and Content is the raw JSON arguments).
         // Null for text-protocol prose/scripts.
         public string? ToolName { get; set; }
 
-        // execute_csharp's optional timeoutSeconds: how long this script asked to be allowed to run.
+        // execute_js's optional timeoutSeconds: how long this script asked to be allowed to run.
         public int? TimeoutSeconds { get; set; }
     }
 }

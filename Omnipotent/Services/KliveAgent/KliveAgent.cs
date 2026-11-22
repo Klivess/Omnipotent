@@ -57,7 +57,6 @@ namespace Omnipotent.Services.KliveAgent
         public KliveAgentRepoMap RepoMap { get; private set; }
 
         private KliveAgentBrain brain;
-        private KliveAgentScriptEngine scriptEngine;
         private readonly ConcurrentDictionary<string, AgentConversation> conversations = new(StringComparer.OrdinalIgnoreCase);
         private readonly ConcurrentDictionary<string, AgentPendingChatResponse> pendingApiResponses = new();
         private readonly ConcurrentDictionary<string, string> activeRunByConversation = new(StringComparer.OrdinalIgnoreCase);
@@ -355,14 +354,9 @@ namespace Omnipotent.Services.KliveAgent
                 await toolSpeed.LoadAsync();
                 ToolSpeed = toolSpeed;
 
-                // Initialize subsystems
-                SetInitProgress(15, "Starting the script engine…");
-                scriptEngine = new KliveAgentScriptEngine(this);
-                scriptEngine.Initialize();
-                // Pay Roslyn's cold-start now (overlapped with the rest of init below) so the user's first
-                // script doesn't eat the ~1s+ first-compile penalty. Fire-and-forget; safe if it fails.
-                _ = scriptEngine.WarmupAsync();
-
+                // Scripts are JavaScript (KliveAgentJsEngine, owned by the brain): nothing to compile, so
+                // there is no script host to build or warm up here any more. The Roslyn warm-up this replaced
+                // built ~80 MB of reference metadata at every start.
                 SetInitProgress(30, "Loading memory…");
                 Memory = new KliveAgentMemory(this);
                 await Memory.InitializeAsync();
@@ -383,7 +377,7 @@ namespace Omnipotent.Services.KliveAgent
                 }
 
                 SetInitProgress(45, "Restoring background tasks…");
-                BackgroundTasks = new KliveAgentBackgroundTasks(this, scriptEngine);
+                BackgroundTasks = new KliveAgentBackgroundTasks(this);
                 await BackgroundTasks.InitializeAsync();
                 if (Superseded()) return;
 
@@ -401,7 +395,7 @@ namespace Omnipotent.Services.KliveAgent
                 PublishServiceCapabilities();
 
                 SetInitProgress(88, "Preparing the agent brain…");
-                brain = new KliveAgentBrain(this, scriptEngine, Memory);
+                brain = new KliveAgentBrain(this, Memory);
 
                 // Set up Discord DM handler
                 DiscordDMHandler = HandleDiscordDM;

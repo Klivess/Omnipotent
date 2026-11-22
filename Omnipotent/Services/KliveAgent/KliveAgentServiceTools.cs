@@ -136,7 +136,7 @@ public sealed class KliveAgentServiceTools
     {
         if (!await IsEnabledAsync())
             return "Service tools are switched off (KliveAgent_ServiceToolsEnabled). Ask Klives to turn them "
-                 + "back on, or fall back to execute_csharp for this.";
+                 + "back on, or fall back to execute_js for this.";
 
         if (toolName == OmniToolCatalog.UniversalApiTool)
         {

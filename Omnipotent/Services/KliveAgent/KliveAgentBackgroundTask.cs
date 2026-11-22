@@ -8,14 +8,12 @@ namespace Omnipotent.Services.KliveAgent
     public class KliveAgentBackgroundTasks
     {
         private readonly KliveAgent agentService;
-        private readonly KliveAgentScriptEngine scriptEngine;
         private readonly ConcurrentDictionary<string, AgentBackgroundTaskInfo> tasks = new();
         private readonly ConcurrentDictionary<string, CancellationTokenSource> cancellationTokens = new();
 
-        public KliveAgentBackgroundTasks(KliveAgent agentService, KliveAgentScriptEngine scriptEngine)
+        public KliveAgentBackgroundTasks(KliveAgent agentService)
         {
             this.agentService = agentService;
-            this.scriptEngine = scriptEngine;
         }
 
         public async Task InitializeAsync()
@@ -79,7 +77,8 @@ namespace Omnipotent.Services.KliveAgent
                 try
                 {
                     var globals = new ScriptGlobals(agentService, cts.Token);
-                    var result = await scriptEngine.ExecuteScriptAsync(code, globals, TimeSpan.FromHours(24));
+                    // JavaScript, like every script KliveAgent writes (C# scripts were retired on 22 Nov 2026).
+                    var result = await KliveAgentJsEngine.RunOnceAsync(code, globals, TimeSpan.FromHours(24));
 
                     taskInfo.Status = result.Success ? AgentTaskStatus.Completed : AgentTaskStatus.Failed;
                     taskInfo.Result = guard.MaskText(result.Output)!;

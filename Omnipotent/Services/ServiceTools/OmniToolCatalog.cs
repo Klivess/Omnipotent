@@ -157,7 +157,7 @@ public static class OmniToolCatalog
                     name = UniversalServiceTool,
                     description =
                         "Reach ANY Omnipotent service directly, including ones with no dedicated tool. This is how you "
-                        + "read and drive the platform — prefer it over writing C# in execute_csharp.\n"
+                        + "read and drive the platform — prefer it over writing a script (execute_js / execute_csharp).\n"
                         + "• op=list — every service and what it does. Start here when unsure which service owns something.\n"
                         + "• op=describe — one service's operations with their exact arguments (requires: service). "
                         + "Call this before op=call on a service you have not used this turn; it costs one step and "
@@ -265,7 +265,7 @@ public static class OmniToolCatalog
         sb.AppendLine("[Service Surface]");
         sb.AppendLine("Omnipotent is one process running these services. You can read and drive all of them:");
         sb.AppendLine("dedicated tools where listed, otherwise omniservice (op=describe then op=call).");
-        sb.AppendLine("Do NOT reach for execute_csharp to call a service — that is the slow path and it is easy to get wrong.");
+        sb.AppendLine("Do NOT write a script (execute_js / execute_csharp) to call a service — that is the slow path and it is easy to get wrong.");
         sb.AppendLine();
 
         foreach (var service in registry.Services.OrderByDescending(s => s.Annotated).ThenBy(s => s.Key, StringComparer.Ordinal))

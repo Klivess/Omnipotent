@@ -128,21 +128,26 @@ namespace Omnipotent.Tests.KliveAgent
         [InlineData("Log(1);", null)]
         public void ScriptTimeout_IsReadFromTheToolCall(string arguments, int? expected)
         {
-            var call = new HFWrapper.HFToolCall { function = new HFWrapper.HFFunctionCall { name = "execute_csharp", arguments = arguments } };
+            var call = new HFWrapper.HFToolCall { function = new HFWrapper.HFFunctionCall { name = "execute_js", arguments = arguments } };
             Assert.Equal(expected, KliveAgentBrain.ExtractScriptTimeout(call));
         }
 
         [Fact]
-        public void ExecuteCSharp_OffersATimeout_AndThePromptStatesTheScriptRules()
+        public void ExecuteJs_OffersATimeout_AndThePromptStatesTheScriptRules()
         {
-            var tool = KliveAgentBrain.BuildToolDefinitions().First(t => t.function.name == "execute_csharp");
+            var names = KliveAgentBrain.BuildToolDefinitions().Select(t => t.function.name).ToList();
+            Assert.DoesNotContain("execute_csharp", names);
+            var tool = KliveAgentBrain.BuildToolDefinitions().First(t => t.function.name == "execute_js");
             string schema = Newtonsoft.Json.JsonConvert.SerializeObject(tool.function.parameters);
             Assert.Contains("timeoutSeconds", schema);
 
             string prompt = KliveAgentPromptPolicy.Build(nativeTools: true, computerUse: false);
-            Assert.Contains("Dyn(x).Member", prompt);
-            Assert.Contains("await Aw((Task<T>)x)", prompt);
-            Assert.Contains("`var x = ...;` not `using var x = ...;`", prompt);
+            Assert.Contains("Scripts are JavaScript", prompt);
+            Assert.Contains("`await` works at the top level", prompt);
+            Assert.DoesNotContain("execute_csharp", prompt);
+            Assert.DoesNotContain("Dyn(x)", prompt);
+            Assert.DoesNotContain("execute_csharp", KliveAgentPromptPolicy.BuildDetailed(true, true));
+            Assert.DoesNotContain("foreach (var", KliveAgentPromptPolicy.BuildDetailed(true, false));
         }
 
         [Fact]

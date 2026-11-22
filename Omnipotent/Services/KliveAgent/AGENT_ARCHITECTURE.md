@@ -8,20 +8,16 @@ tracked in the plan (persistence of actions, streaming, analytics, Discord gatin
 
 KliveAgent is **not** a code-rewriting coding agent for the Omnipotent source. It is Klives's
 personal assistant, **embedded inside Omnipotent, that operates and orchestrates the
-platform's live services at runtime**. It does this by writing C# scripts (delimited by
-`{{{ ... }}}`) that are compiled and executed in-process via Roslyn against the live service
-graph — reading state, calling service methods, pulling logs/errors, spawning background tasks,
-and saving durable memories.
-
-From its system prompt:
-
-> "You can access and control every service running on Omnipotent by writing C# scripts… When a
-> user just wants to chat, respond naturally without scripts."
+platform's live services at runtime**. It does this with native tools and, where no tool fits, by
+writing JavaScript (`execute_js`) that runs in-process (Jint) against the live service graph:
+reading state, calling service methods, pulling logs and errors, spawning background tasks and
+saving durable memories. Until 22 Nov 2026 those scripts were C#, compiled by Roslyn; see
+"Scripts are JavaScript" below for why that changed.
 
 Personality: sarcastic, witty, fiercely loyal to Klives; punchy answers, no walls of text.
 Access: gated to Klives (API routes require `KMPermissions.Klives`; Discord is owner-only).
 
-The key consequence: KliveAgent's "tools" are **arbitrary runtime C#**, not a fixed set of
+The key consequence: KliveAgent's "tools" are **arbitrary runtime scripts**, not only a fixed set of
 JSON-schema functions. That is a deliberately *more* powerful action surface — one composite
 script can do discovery + action + logging in a single step — at the cost of relying on text
 parsing rather than the provider's native structured tool-calling channel.
@@ -59,11 +55,11 @@ Implemented in [KliveAgentBrain.cs](KliveAgentBrain.cs) `ProcessMessageAsync`:
    + a task-personalised repo map (BM25, budgeted) + BM25-ranked memories + a conditionally-shown
    tool catalogue. `BuildUserPrompt` adds budget-selected conversation history + the new message.
 2. **Call the model** via KliveLLM (`QueryLLM`), which talks to Local/HuggingFace/OpenRouter.
-3. **Parse** the reply with `ParseLLMResponse` — extract `{{{ ... }}}` (or ```` ```csharp ````) blocks.
-4. **Execute** each script through the Roslyn `KliveAgentScriptEngine`; capture `[OK | ms] <output>`
-   or `[ERROR | ms] <failure>`, truncated to a token budget, into a `[Script Observations]` block.
-   A script that fails to compile is repaired first when the fault is mechanical (see "Scripts and
-   long unattended runs").
+3. **Parse** the reply: native tool calls (`execute_js` and the rest), or, in the text protocol,
+   `{{{ ... }}}` / ```` ```js ```` blocks via `ParseLLMResponse`.
+4. **Execute** each script in the conversation's JavaScript session (`KliveAgentJsEngine`); capture
+   `[OK | ms] <output>` or `[ERROR | ms] <failure>`, truncated to a token budget, into a
+   `[Script Observations]` block.
 5. **Observe & loop** — feed observations back as the next turn. Repeat.
 6. **Stop** when the model replies with no scripts (the final answer). Guardrails (as actually
    implemented): a 2-strike breaker on XML/JSON tool-envelope or empty no-op turns; adaptive
@@ -183,7 +179,57 @@ messaging Klives. What makes that work:
 - **Computer-use reliability (Oct 2026).** See the section after next.
 - **Scripts, restarts and compaction (Nov 2026).** See the next section.
 
+## Scripts are JavaScript (22 November 2026)
+
+`execute_csharp` is gone. KliveAgent's script tool is `execute_js`, run by Jint (a JavaScript
+interpreter written in .NET) inside the process, over the same helpers (`ScriptGlobals`). The
+text protocol's `{{{ }}}` blocks, `wait_for` check probes and `SpawnBackgroundTask` run JavaScript
+too. The Roslyn host (`KliveAgentScriptSession.cs`, repair, diagnostics) is no longer used by
+KliveAgent. Demiurge's Stewards still have their own `execute_csharp`.
+
+**Why.** Running a script was never the slow part; failing to run was. On 11 Nov 2026, 44% of live
+scripts failed, 224 of 380 at compile time, almost all where C#'s static types met Omnipotent's
+internals: a member called on an `object`, a cast to an internal type, a missing `await`, the script
+dialect's rules (`using var`, `await (Task<T>)x`). Each failure cost a model round trip. None of
+those exists in JavaScript.
+
+**How it behaves** (`KliveAgentJsEngine.cs`):
+- **Nothing to compile.** A script is parsed (Acornima) in about a millisecond. There is no cold first
+  compile and no Roslyn warm-up at start-up (that built ~80 MB of reference metadata).
+- **Every value is dynamic.** Jint binds members by reflection on the runtime type, so a service's
+  real member names work on whatever `GetService`/`Svc` returned, internal types included, and the first
+  letter's case does not matter. .NET lists take `for…of` and JS array methods; JS arrays pass to .NET
+  array parameters. `GetObjectMember`/`CallObjectMethod` still reach non-public members.
+- **Top-level `await`, and variables that last.** Jint allows top-level `await` only in modules, whose
+  variables die with them. So each script runs inside an async function, and its top-level
+  declarations are rewritten as assignments (`const s = await …` becomes `;(s = await …);`), which
+  set globals. Functions are copied to the global object; classes become assignments. Declaring a
+  name again just reassigns it, instead of failing with "already declared". The last expression is
+  returned and logged as `Result:`. Line numbers are preserved. A conversation's session is kept for
+  `KliveAgent_KeepScriptSessionMinutes`, as before.
+- **A real stop.** Each call gets Jint's `OperationDeadlineConstraint` for its budget, and a
+  cancellation for awaits on .NET tasks. A runaway loop or a hung await is ended at the timeout, and
+  the session is still usable. The Roslyn host could only abandon a timed-out script.
+- **Errors that say what to write.**
+  - A `SyntaxError` names its line and column.
+  - A wrong member name lists the nearest real ones.
+  - Code that looks like C# (memories, shortcuts and history from before the switch) gets a hint to
+    translate it.
+  - The helpers the C# prompt taught (`Dyn`, `Raw`, `Aw`) are identity functions, so a remembered
+    recipe needs little change.
+- **Same result shape.** Results are `AgentScriptResult`, so run history, script health, the tool-speed
+  record and the website are unchanged. Syntax errors count as `compile`; a timeout is `timeout`.
+- **Personality.** The saved default said "via C# scripts". OmniSettings saved that text on first read,
+  so `KliveAgentPersonality.Resolve` swaps the old default for the new one, and changes the phrase in an
+  edited personality.
+
+Tests: `KliveAgentJsEngineTests` (top-level await, internal types, persistence, kept-after-throw,
+wrong-member hints, syntax line, the C# hint, runaway loop, hung await, stop, Log formatting).
+
 ## Scripts and long unattended runs (November 2026)
+
+*This section describes the Roslyn C# host, which KliveAgent no longer uses (see above). The
+long-run plumbing (ledger, durable runs, tool deadlines, compaction) still applies.*
 
 Measured on the live server on 11 Nov 2026, before this work: 44% of scripts failed (380 of 865
 sampled; 224 of those never compiled, and four in ten of the compile failures were the same six

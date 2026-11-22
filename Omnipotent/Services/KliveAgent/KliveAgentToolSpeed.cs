@@ -45,7 +45,7 @@ public sealed record ToolSpeedEstimate(string Key, ToolSpeedTier Tier, bool Meas
 ///
 /// Why: a run is a chain of model calls and tool calls, and the tool half was never measured unless a
 /// call took a minute or more. The model picked tools on their descriptions alone, so a job grep does
-/// in 200 ms went to execute_csharp (a compile first), a page already fetched was fetched again, and an
+/// in 200 ms went to a C# script (a compile first), a page already fetched was fetched again, and an
 /// operation that hangs one call in five held the run for ten minutes each time it did.
 ///
 /// What it does with the record:
@@ -77,7 +77,7 @@ public sealed class KliveAgentToolSpeed
     internal const long HintAfterMs = 5_000;
 
     /// <summary>The pseudo-tool every dedicated Service Surface tool is also recorded under, so "use the
-    /// service's own tool" can be ranked against omniservice, omni_api and execute_csharp.</summary>
+    /// service's own tool" can be ranked against omniservice, omni_api and execute_js.</summary>
     internal const string ServiceToolsKey = "[service tools]";
 
     private readonly string? path;
@@ -155,8 +155,33 @@ public sealed class KliveAgentToolSpeed
                 return Normalize(StringArg(argsJson, "op") ?? StringArg(argsJson, "action"));
             case "computer_cdp":
                 return Normalize(StringArg(argsJson, "action") ?? StringArg(argsJson, "op"));
+            case "run_powershell":
+            case "run_bash":
+                return ShellCommandKey(StringArg(argsJson, "script") ?? StringArg(argsJson, "command"));
         }
         return KliveAgentServiceTools.IsHandled(tool) ? Normalize(KliveAgentBrain.ToolOperationOf(argsJson)) : null;
+    }
+
+    private static readonly Regex ShellCommandPattern = new(
+        @"^(?:\$[\w:]+\s*=\s*)?[&.\s]*(?:'(?<cmd>[^']+)'|""(?<cmd>[^""]+)""|(?<cmd>[^\s'""|;&(){}]+))", RegexOptions.Compiled);
+
+    /// <summary>
+    /// The command a shell script starts with ("docker", "git", "get-service"), so a shell tool's record
+    /// is kept per command: docker pull and Get-Date differ by minutes, and one record for both would
+    /// give every command the same patience. Comments, a leading variable assignment, the call operator
+    /// and a path are skipped.
+    /// </summary>
+    internal static string? ShellCommandKey(string? script)
+    {
+        if (string.IsNullOrWhiteSpace(script)) return null;
+        string? line = script.Split('\n').Select(l => l.Trim()).FirstOrDefault(l => l.Length > 0 && !l.StartsWith('#'));
+        if (line == null) return null;
+        var match = ShellCommandPattern.Match(line);
+        if (!match.Success) return null;
+        string command = match.Groups["cmd"].Value.Replace('\\', '/');
+        command = command[(command.LastIndexOf('/') + 1)..];
+        if (command.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) command = command[..^4];
+        return Normalize(command);
     }
 
     private static readonly Regex GuidPattern = new(@"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", RegexOptions.Compiled | RegexOptions.IgnoreCase);
@@ -257,6 +282,10 @@ public sealed class KliveAgentToolSpeed
     public TimeSpan PatienceFor(string tool, string? argsJson, int capSeconds, int floorSeconds)
     {
         if (capSeconds <= 0 || IsWaitingTool(tool)) return TimeSpan.Zero;
+        // A shell command given its own timeout is waited for that long: the model has said how long the
+        // command needs, and the shell kills its process tree at that time anyway.
+        if (tool is "run_powershell" or "run_bash" && IntArg(argsJson, "timeoutSeconds") is int asked && asked > 0)
+            return TimeSpan.FromSeconds(Math.Min(capSeconds, Math.Max(floorSeconds, asked + 10)));
         long basis = CleanSlowMs(tool, argsJson) ?? ExpectedSlowMs(ExpectedFor(tool, argsJson).Tier);
         long floorMs = Math.Max(1, floorSeconds) * 1000L;
         long ms = Math.Max(floorMs, basis * 4);
@@ -314,7 +343,9 @@ public sealed class KliveAgentToolSpeed
         ["web_search fetch"] = (ToolSpeedTier.Slow, 10_000),
         ["web_search snippets"] = (ToolSpeedTier.Fast, 1_500),
         ["search_knowledge noMessages"] = (ToolSpeedTier.Fast, 800),
-        ["execute_csharp"] = (ToolSpeedTier.Fast, 1_000),
+        ["execute_js"] = (ToolSpeedTier.Fast, 500),
+        ["run_powershell"] = (ToolSpeedTier.Fast, 900),
+        ["run_bash"] = (ToolSpeedTier.Fast, 700),
         ["omniservice"] = (ToolSpeedTier.Fast, 500),
         ["omni_api"] = (ToolSpeedTier.Fast, 800),
         [ServiceToolsKey] = (ToolSpeedTier.Fast, 400),
@@ -359,16 +390,18 @@ public sealed class KliveAgentToolSpeed
 
     internal static readonly ToolFamily[] Families =
     {
-        new("search code by content", new[] { "grep", "execute_csharp" }, "grep outputMode:\"files\" when you only need where"),
-        new("find files by name", new[] { "find_files", "list_directory", "execute_csharp" }),
-        new("read a source file", new[] { "read_file", "execute_csharp" }),
-        new("read runtime data (SavedData)", new[] { "read_data_file", "execute_csharp" }),
-        new("list runtime data", new[] { "list_data_directory", "execute_csharp" }),
+        new("search code by content", new[] { "grep", "execute_js" }, "grep outputMode:\"files\" when you only need where"),
+        new("find files by name", new[] { "find_files", "list_directory", "execute_js" }),
+        new("read a source file", new[] { "read_file", "execute_js" }),
+        new("read runtime data (SavedData)", new[] { "read_data_file", "execute_js" }),
+        new("list runtime data", new[] { "list_data_directory", "execute_js" }),
         new("recall facts about Klives or the past", new[] { "recall_memories", "recall_memories_by_tag", "search_knowledge" }),
         new("search history across systems", new[] { "search_knowledge noMessages", "search_knowledge" }),
         new("read a web page", new[] { "read_knowledge_doc", "web_fetch" }, "read_knowledge_doc only for a page already fetched or found by search"),
         new("get current facts from the web", new[] { "web_search snippets", "web_search fetch" }, "then web_fetch only the page you need"),
-        new("read or drive a live service", new[] { ServiceToolsKey, "omniservice", "omni_api", "execute_csharp" }, RankOnly: true),
+        new("read or drive a live service", new[] { ServiceToolsKey, "omniservice", "omni_api", "execute_js" }, RankOnly: true),
+        // Only the order: how long a shell takes is the command's doing, so no other tool is "faster".
+        new("run a command on the host", new[] { "run_powershell", "execute_js" }, "run_bash for bash/WSL", RankOnly: true),
         new("see what is on a web page", new[] { "computer_browser_inspect", "computer_cdp", "computer_screenshot", "computer_read_screen" }, ComputerOnly: true),
         new("act on a web page", new[] { "computer_browser_action", "computer_click_browser_control", "computer_click" }, ComputerOnly: true),
     };
@@ -431,8 +464,8 @@ public sealed class KliveAgentToolSpeed
             if (family.RankOnly || MemberIn(family, tool, argsJson) is not { } member) continue;
             foreach (var other in family.Tools)
             {
-                // execute_csharp can do almost anything, so it is never offered as the faster way.
-                if (other == member || other == "execute_csharp") continue;
+                // execute_js can do almost anything, so it is never offered as the faster way.
+                if (other == member || other == "execute_js") continue;
                 var estimate = EstimateMember(other);
                 if (estimate.Tier is ToolSpeedTier.Slow or ToolSpeedTier.HangProne or ToolSpeedTier.Waits) continue;
                 if (estimate.TypicalMs * 5 > thisCallMs) continue;
@@ -666,6 +699,8 @@ public sealed class KliveAgentToolSpeed
                 foreach (var s in snapshot.Series)
                 {
                     if (string.IsNullOrWhiteSpace(s.Key) || s.Ms == null || s.Outcomes == null || s.Ms.Count != s.Outcomes.Count) continue;
+                    // C# scripts were retired on 22 Nov 2026: their times describe a tool that no longer exists.
+                    if (s.Tool == "execute_csharp") continue;
                     if (s.Ms.Count > SamplesKept)
                     {
                         s.Ms.RemoveRange(0, s.Ms.Count - SamplesKept);

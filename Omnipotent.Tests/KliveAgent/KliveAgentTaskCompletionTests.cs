@@ -189,7 +189,7 @@ public sealed class KliveAgentTaskCompletionTests
     [InlineData("notify_klives", true)]
     [InlineData("recall_memories", false)]
     [InlineData("grep", false)]
-    [InlineData("execute_csharp", false)]
+    [InlineData("execute_js", false)]
     public void TaskTools_AreTheOnesThatActOnTheWorld(string tool, bool isTask) =>
         Assert.Equal(isTask, KliveAgentBrain.IsTaskTool(tool));
 

@@ -87,6 +87,59 @@ public sealed class KliveAgentToolSpeedTests
         Assert.Equal(expected, KliveAgentToolSpeed.OperationKey(tool, args));
     }
 
+    [Theory]
+    [InlineData("docker ps -a", "docker")]
+    [InlineData("  Get-Service KliveAPI | Select Status", "get-service")]
+    [InlineData("$r = Get-ChildItem C:\\Logs", "get-childitem")]
+    [InlineData("& 'C:\\Program Files\\Git\\bin\\git.exe' status", "git")]
+    [InlineData("# check first\n\ngit status", "git")]
+    [InlineData("/usr/bin/df -h", "df")]
+    [InlineData("   ", null)]
+    public void ShellTools_AreRecordedPerCommand(string script, string? expected)
+    {
+        Assert.Equal(expected, KliveAgentToolSpeed.ShellCommandKey(script));
+        Assert.Equal(expected, KliveAgentToolSpeed.OperationKey("run_powershell",
+            Newtonsoft.Json.JsonConvert.SerializeObject(new { script })));
+    }
+
+    [Fact]
+    public void ShellTools_AreWaitedForAsLongAsTheyWereGiven()
+    {
+        var speed = new KliveAgentToolSpeed();
+        Assert.Equal(TimeSpan.FromSeconds(310), speed.PatienceFor("run_powershell", "{\"script\":\"docker pull x\",\"timeoutSeconds\":300}", 600, 20));
+        Assert.Equal(TimeSpan.FromSeconds(600), speed.PatienceFor("run_bash", "{\"script\":\"make\",\"timeoutSeconds\":900}", 600, 20));
+        Assert.Equal(TimeSpan.FromSeconds(20), speed.PatienceFor("run_powershell", "{\"script\":\"Get-Date\"}", 600, 20)); // learned/expected
+    }
+
+    [Fact]
+    public void ShellResult_PutsTheExitCodeAndFirstOutputOnLineOne()
+    {
+        var ok = KliveAgentBrain.FormatShellResult(new Omnipotent.Data_Handling.HostShell.ShellResult(0, "CONTAINER ID   IMAGE\nabc123   nginx\n", "", false, "pwsh"), 120, 340);
+        Assert.StartsWith("exit 0 (pwsh, 340ms): CONTAINER ID   IMAGE", ok);
+        Assert.Contains("abc123   nginx", ok);
+
+        var failed = KliveAgentBrain.FormatShellResult(new Omnipotent.Data_Handling.HostShell.ShellResult(1, "", "docker: command not found\n", false, "bash"), 120, 50);
+        Assert.StartsWith("exit 1 (bash, 50ms): docker: command not found", failed);
+        Assert.Contains("stderr:", failed);
+
+        var timedOut = KliveAgentBrain.FormatShellResult(new Omnipotent.Data_Handling.HostShell.ShellResult(-1, "partial\n", "", true, "pwsh"), 30, 30_000);
+        Assert.StartsWith("timed out after 30s, process tree killed (pwsh): partial", timedOut);
+
+        var silent = KliveAgentBrain.FormatShellResult(new Omnipotent.Data_Handling.HostShell.ShellResult(0, "", "", false, "pwsh"), 120, 200);
+        Assert.Equal("exit 0 (pwsh, 200ms): (no output)", silent);
+    }
+
+    [Fact]
+    public async Task RunPowerShell_RunsWithoutAScript_AndCanRunInTheBackground()
+    {
+        var globals = new ScriptGlobals(null!);
+        string started = KliveAgentBrain.StartBackgroundTool(globals, "run_powershell", "{\"script\":\"Write-Output 'klive-shell-ok'\",\"timeoutSeconds\":60}");
+        Assert.StartsWith("Started run_powershell in the background as job-1", started);
+        string result = await globals.ToolJobs.ApplyAsync("{\"op\":\"wait\",\"id\":\"job-1\",\"waitSeconds\":90}", CancellationToken.None);
+        Assert.Contains("exit 0", result);
+        Assert.Contains("klive-shell-ok", result);
+    }
+
     [Fact]
     public void Normalize_FoldsIdsAndNumbers_SoTheRecordDoesNotGrowAKeyPerCall()
     {
@@ -204,7 +257,7 @@ public sealed class KliveAgentToolSpeedTests
     public void ScriptsAreNeverOfferedAsTheFasterWay()
     {
         var speed = new KliveAgentToolSpeed();
-        RecordMany(speed, "execute_csharp", null, 10, 20);
+        RecordMany(speed, "execute_js", null, 10, 20);
         Assert.Null(speed.SlowCallHint("read_file", null, 60_000));
     }
 
@@ -212,14 +265,14 @@ public sealed class KliveAgentToolSpeedTests
     public void PromptBlock_RanksEachGoalFastestFirst_AndNamesWhatIsSlowNow()
     {
         var speed = new KliveAgentToolSpeed();
-        RecordMany(speed, "execute_csharp", null, 1_400, 10);
+        RecordMany(speed, "execute_js", null, 1_400, 10);
         RecordMany(speed, "grep", null, 380, 10);
         RecordMany(speed, "web_fetch", null, 45_000, 10);
         RecordMany(speed, "web_fetch", null, 600_000, 3, ToolCallOutcome.Overran);
 
         string block = speed.BuildPromptBlock(computerUse: false);
         Assert.StartsWith("[Tool speed]", block);
-        Assert.Contains("- search code by content: grep 400ms → execute_csharp 1.4s", block);
+        Assert.Contains("- search code by content: grep 400ms → execute_js 1.4s", block);
         Assert.Contains("web_fetch", block);
         Assert.Contains("(hang-prone)", block);
         Assert.Contains("Slow right now: web_fetch", block);
@@ -232,7 +285,7 @@ public sealed class KliveAgentToolSpeedTests
     public void PromptBlock_WithNoRecord_StillGivesTheOrder()
     {
         string block = new KliveAgentToolSpeed().BuildPromptBlock(computerUse: false);
-        Assert.Contains("- read a source file: read_file → execute_csharp", block);
+        Assert.Contains("- read a source file: read_file → execute_js", block);
         Assert.DoesNotContain("Slow right now", block);
     }
 
@@ -416,6 +469,7 @@ public sealed class KliveAgentToolSpeedTests
     }
 
     [Theory]
+    [InlineData("execute_js")]
     [InlineData("execute_csharp")]
     [InlineData("wait_for")]
     [InlineData("computer_click")]
@@ -456,7 +510,7 @@ public sealed class KliveAgentToolSpeedTests
     public void NewTools_AreOffered()
     {
         var names = KliveAgentBrain.BuildToolDefinitions(includeComputerUse: false).Select(t => t.function.name).ToList();
-        foreach (var tool in new[] { "find_files", "read_data_file", "list_data_directory", "tool_speed", "tool_jobs", "start_background_tool", "grep" })
+        foreach (var tool in new[] { "find_files", "read_data_file", "list_data_directory", "tool_speed", "tool_jobs", "start_background_tool", "grep", "run_powershell", "run_bash" })
             Assert.Contains(tool, names);
         Assert.Equal(names.Count, names.Distinct().Count());
     }
