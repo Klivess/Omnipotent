@@ -122,10 +122,11 @@ Answer only with JSON that matches the schema.
         private static readonly IReadOnlyList<LlmOutputSchema> TwoReadings = new[] { ExtractSchema, AdjudicateSchema, CriticSchema };
 
         /// <summary>
-        /// Every schema a slice's questions answer with, in the order they are always sent. All of them go out with each
-        /// question (the one asked for is the one the model must call), so the reading and the critic that follows it
-        /// begin with the same bytes up to the end of the evidence. The adjudicator's schema repeats the whole claim
-        /// schema, so it is only carried when a second reading can call for it.
+        /// Every schema a slice's questions answer with, in the order they are always sent. They go out with each
+        /// question as one tool with a property per schema (the question says which to fill), so the reading and the
+        /// critic that follows it begin with the same bytes up to the end of the evidence whatever the provider does
+        /// with the tools it is sent. The adjudicator's schema repeats the whole claim schema, so it is only carried
+        /// when a second reading can call for it.
         /// </summary>
         public static IReadOnlyList<LlmOutputSchema> Schemas(bool secondReading) => secondReading ? TwoReadings : OneReading;
 

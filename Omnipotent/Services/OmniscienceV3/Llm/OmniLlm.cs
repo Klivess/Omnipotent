@@ -161,8 +161,8 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         /// <summary>Opens a "prefill once, ask many" session over a large stable prefix.</summary>
         /// <param name="reasoningEffort">How hard every question of the session is thought about ("off", "low", "medium",
         /// "high"); null leaves it to <see cref="Shape"/>.</param>
-        /// <param name="schemas">Every schema the session's questions answer with, in one fixed order: all of them are sent
-        /// with each question, so the tool definitions ahead of the prefix never change between two questions
+        /// <param name="schemas">Every schema the session's questions answer with, in one fixed order: they are sent with
+        /// each question as one tool, so the tool definition ahead of the prefix never changes between two questions
         /// (<see cref="LlmRequest.SchemaFamily"/>). Null for a session whose questions all use one schema.</param>
         public CacheShapedSession OpenSession(string moduleId, string purpose, string sessionKey, string systemPrompt, string stablePrefix,
             AIRouterWorkClass workClass, string? promptVersion = null, long? jobId = null, string? reasoningEffort = null,
@@ -184,7 +184,9 @@ namespace Omnipotent.Services.OmniscienceV3.Llm
         /// <summary>The text of everything a request sends: its turns, its system prompt and its tool definitions.</summary>
         internal static string PromptText(LlmRequest request) =>
             string.Concat(request.Turns.Select(t => t.Content)) + request.SystemPrompt
-            + string.Concat(KliveLLM.KliveLLM.GatewaySchemas(request).Select(s => s.Name + s.Description + s.Schema.ToString(Newtonsoft.Json.Formatting.None)));
+            + (KliveLLM.KliveLLM.GatewayTools(request) is { } set
+                ? string.Concat(set.Tools.Select(s => s.Name + s.Description + s.Schema.ToString(Newtonsoft.Json.Formatting.None))) + (set.Member == null ? "" : KliveLLM.KliveLLM.FamilyInstruction(set.Member))
+                : "");
 
         /// <summary>
         /// Omniscience's own prefix-cache hit rate over a window (cached / prompt tokens). Calls that carried images are

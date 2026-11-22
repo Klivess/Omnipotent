@@ -129,6 +129,18 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             // the plain hit rate of extraction cannot be 100% and is not what the lane is judged on.
             Assert.All(readings.Skip(1), r => Assert.True(r.CachedTokens >= 1_500, "a reading shared less than the rules and tools with the one before it"));
             Assert.True(PrefixCacheReplay.Share(replay.Calls) >= 0.60, $"all calls were {PrefixCacheReplay.Share(replay.Calls):P1} cached");
+
+            // The same run as it went out from 20 to 22 Nov 2026: each schema a tool of its own, all of them sent with
+            // every question, the question's own one forced. A provider that shows a forced call its one tool (AIRouter
+            // does) then reads a different tool block for the critic than for the reading before it, and the evidence
+            // behind it is prefilled again. Live that read 18% of re-sent tokens served, about 1,400 of a critic's 5,000.
+            var separate = PrefixCacheReplay.Of(h.Llm.Journal, PrefixCacheReplay.SeparateTools);
+            output.WriteLine("as sent from 20 to 22 Nov 2026 (a tool per schema, the call's own one forced):");
+            output.WriteLine(separate.Table(Kind));
+            var separateLater = separate.Calls.Where(c => c.Continuation).ToList();
+            long separateResent = separateLater.Sum(c => (long)c.ReusableTokens), separateServed = separateLater.Sum(c => (long)Math.Min(c.CachedTokens, c.ReusableTokens));
+            Assert.True(separateServed < 0.6 * separateResent, $"the old layout already served {separateServed:N0} of {separateResent:N0} re-sent tokens: the replay no longer shows what the provider did");
+            Assert.Contains(separateLater, c => c.CountsAsLostPrefix);
         }
     }
 }

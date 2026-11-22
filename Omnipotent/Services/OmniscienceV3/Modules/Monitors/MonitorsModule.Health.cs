@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Omnipotent.Services.OmniscienceV3.Kernel.Jobs;
 using Omnipotent.Services.OmniscienceV3.Kernel.Modules;
 using Omnipotent.Services.OmniscienceV3.Storage;
@@ -101,13 +102,13 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                     }, NoticeSeverity.Attention));
             }
 
-            // 4. Jobs that failed for good in the last day, per module.
+            // 4. Jobs that failed for good in the last day and whose work has not been done since, per module.
             using (var c = Context.Stores.Intel.OpenRead())
-                foreach (var (module, n, last) in c.Query(null, "SELECT module_id, COUNT(*), MAX(finished_at_ms) FROM jobs WHERE state='dead' AND finished_at_ms >= $d GROUP BY module_id",
-                             r => (r.GetString(0), r.GetInt32(1), r.GetInt64(2)), ("$d", now - Day)))
+                foreach (var group in DeadAndNotRedone(c, now - Day).GroupBy(d => d.Module, StringComparer.Ordinal))
                 {
-                    string? error = c.Scalar<string>(null, "SELECT error_message FROM jobs WHERE state='dead' AND module_id=$m ORDER BY finished_at_ms DESC LIMIT 1", ("$m", module));
-                    issues.Add(new Issue("jobs_dead|" + module, "jobs_dead", module, new { moduleId = module, jobs = n, lastMs = last, lastError = error is { Length: > 300 } e ? e[..300] : error }, NoticeSeverity.Attention));
+                    var latest = group.OrderByDescending(d => d.FinishedMs).ThenByDescending(d => d.JobId).First();
+                    issues.Add(new Issue("jobs_dead|" + group.Key, "jobs_dead", group.Key,
+                        new { moduleId = group.Key, jobs = group.Count(), lastMs = latest.FinishedMs, lastError = latest.Error is { Length: > 300 } e ? e[..300] : latest.Error }, NoticeSeverity.Attention));
                 }
 
             // 5. Work that is queued and going nowhere, from the job counters (a few dozen rows). Two days after launch the
@@ -202,6 +203,15 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
             using (var c = Context.Stores.Intel.OpenRead())
                 foreach (var (id, last, days) in c.Query(null, "SELECT source_id, last_ingest_ms, days_json FROM mon_sources", r => (r.GetString(0), r.GetInt64(1), r.GetString(2))))
                     tally[id] = (last, JsonSerializer.Deserialize<Dictionary<string, int>>(days) ?? new());
+            // What v2 hands over is counted where it is handed over: the tail reads v2's messages in the order v2 stored
+            // them and keeps its place, so how far that place moved is how many messages v2 brought, and when it last
+            // moved is when v2 last brought one. A message is credited to the best source that has it, and once
+            // KliveBot captures Discord itself that is KliveBot for nearly everything v2 also brings: counted by credit,
+            // v2 "fell silent" the day capture was switched on, with its tail completing every two minutes and
+            // importing what the bot cannot see (22 Nov 2026: "silent for 16.7 hours", ten messages imported that day).
+            var (legacyPlace, legacyAt) = LegacyHandOver();
+            bool legacyByPlace = legacyPlace > 0;
+            long legacySeen = legacyByPlace ? State("legacy_rowid") : 0;
             bool changed = false;
             for (int pass = 0; pass < 20; pass++)
             {
@@ -213,6 +223,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                 if (rows.Count == 0) break;
                 foreach (var (source, _, at) in rows)
                 {
+                    if (legacyByPlace && source == CorpusIds.LegacySourceId) continue;
                     var t = tally.TryGetValue(source, out var known) ? known : (Last: 0L, Days: new Dictionary<string, int>(StringComparer.Ordinal));
                     string day = Zones.LocalDate(at, zone).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
                     t.Days[day] = t.Days.GetValueOrDefault(day) + 1;
@@ -221,6 +232,21 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                 cursor = rows[^1].Seq;
                 changed = true;
                 if (rows.Count < 20000) break;
+            }
+            if (legacyByPlace)
+            {
+                var t = tally.TryGetValue(CorpusIds.LegacySourceId, out var known) ? known : (Last: 0L, Days: new Dictionary<string, int>(StringComparer.Ordinal));
+                // The first look only takes the place: everything before it was the migration, not a day's messages.
+                if (legacySeen > 0 && legacyPlace > legacySeen)
+                {
+                    string day = Zones.LocalDate(legacyAt, zone).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+                    t.Days[day] = (int)Math.Min(int.MaxValue, t.Days.GetValueOrDefault(day) + (legacyPlace - legacySeen));
+                }
+                if (legacyPlace != legacySeen || legacyAt > t.Last)
+                {
+                    tally[CorpusIds.LegacySourceId] = (Math.Max(t.Last, legacyAt), t.Days);
+                    changed = true;
+                }
             }
             if (!changed && State("ingest_seq") != 0) return;
             string oldest = Zones.LocalDate(now, zone).AddDays(-8).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
@@ -234,7 +260,44 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Monitors
                         ("$s", source), ("$l", last), ("$d", JsonSerializer.Serialize(kept)));
                 }
                 SetState(c, tx, "ingest_seq", Math.Max(final, 1));
+                if (legacyByPlace) SetState(c, tx, "legacy_rowid", legacyPlace);
             }, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>How far the tail of v2's messages has read (v2's own row number) and when it last read one; zeros
+        /// when it has never read any.</summary>
+        private (long Place, long AtMs) LegacyHandOver()
+        {
+            using var corpus = Context.Stores.Corpus.OpenRead();
+            return corpus.Query(null, "SELECT last_rowid, updated_at_ms FROM legacy_import_state WHERE table_name='messages'", r => (r.GetInt64(0), r.GetInt64(1))).FirstOrDefault();
+        }
+
+        /// <summary>How many later jobs of a kind are looked at for one that did a dead job's work again.</summary>
+        private const int RedoneLookAhead = 200;
+
+        /// <summary>
+        /// The jobs that failed for good since <paramref name="sinceMs"/> and whose work has not been done since. A job
+        /// of a recurring kind (a sweep, a sample, a nightly build) carries the same key every time it is queued: when a
+        /// later one with that key has succeeded, the work the dead one stood for is done, and "failed for good" is no
+        /// longer true of it. It used to be told for a day all the same (22 Nov 2026: the classifier's sampling job,
+        /// dead at 07:10, done again five times by the afternoon and still a problem on the Health page).
+        /// </summary>
+        private static List<(string Module, long JobId, long FinishedMs, string? Error)> DeadAndNotRedone(SqliteConnection intel, long sinceMs)
+        {
+            var dead = intel.Query(null, "SELECT job_id, module_id, kind, dedupe_key, finished_at_ms, error_message FROM jobs WHERE state='dead' AND finished_at_ms >= $d ORDER BY job_id",
+                r => (Id: r.GetInt64(0), Module: r.GetString(1), Kind: r.GetString(2), Key: r.GetStringOrNull(3), Finished: r.GetInt64(4), Error: r.GetStringOrNull(5)), ("$d", sinceMs));
+            var open = new List<(string, long, long, string?)>();
+            foreach (var d in dead)
+            {
+                // Later jobs of the same kind, in the order they were queued, through the index that holds exactly that;
+                // a bounded look, so a kind with a job per attachment costs no more than a recurring one.
+                bool redone = d.Key != null && intel.Scalar<long?>(null, """
+                    SELECT 1 FROM (SELECT state, dedupe_key, finished_at_ms FROM jobs WHERE module_id=$m AND kind=$k AND job_id > $id ORDER BY job_id LIMIT $n)
+                    WHERE state='succeeded' AND dedupe_key=$key AND finished_at_ms >= $f LIMIT 1
+                    """, ("$m", d.Module), ("$k", d.Kind), ("$id", d.Id), ("$n", RedoneLookAhead), ("$key", d.Key), ("$f", d.Finished)) != null;
+                if (!redone) open.Add((d.Module, d.Id, d.Finished, d.Error));
+            }
+            return open;
         }
 
         public HealthListDto Health()

@@ -157,6 +157,86 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.NotEmpty(first);
         }
 
+        /// <summary>
+        /// 22 Nov 2026: every inquiry on the server was stopped in its gather stage after an hour, three attempts each. A
+        /// gather searches three scopes for each facet in turn (the subject's own messages, their conversations, what they
+        /// reacted to), and the retriever kept the vector candidates of the last scope only: each search read thousands of
+        /// rows and vectors again, because the search before it had been of another scope.
+        /// </summary>
+        [Fact]
+        public async Task ScopesSearchedInTurn_AreEachReadOnce_HoweverOftenTheSearchGoesRoundThem()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            var (cats, tabby, train) = await AnaAsync(h);
+            var encoder = new FakeEncoder();
+            h.Kit.Encoder = encoder;
+            await h.Context.Vectors!.UpsertAsync(VectorSpaces.Message, encoder.ModelVersion, new[]
+            {
+                new VectorItem(cats, FakeEncoder.Embed("my cat knocked the plant over again"), 1),
+                new VectorItem(tabby, FakeEncoder.Embed("cat"), 1),
+                new VectorItem(train, FakeEncoder.Embed("train was late again"), 1),
+            });
+            var own = AnasOwn();
+            var theirs = new RetrievalScope { ConversationIds = new[] { "discord:c-ana" }, ToMs = Now, Limit = 5 };
+            var reacted = new RetrievalScope { MessageIds = new[] { cats, train }, ToMs = Now, Limit = 5 };
+
+            // Eight facets, as an inquiry plans at most.
+            for (int facet = 0; facet < 8; facet++)
+            {
+                var (mine, _) = await h.Kit.Retriever.SearchAsync(new[] { "cat" }, own, CancellationToken.None);
+                // A counter-evidence search is the same scope with another limit.
+                await h.Kit.Retriever.SearchAsync(new[] { "dog" }, own with { Limit = 8 }, CancellationToken.None);
+                var (around, covTheirs) = await h.Kit.Retriever.SearchAsync(new[] { "cat" }, theirs, CancellationToken.None);
+                var (liked, covReacted) = await h.Kit.Retriever.SearchAsync(new[] { "cat" }, reacted, CancellationToken.None);
+                Assert.Contains(mine, r => r.MessageId == tabby && r.VectorRank == 1);
+                Assert.Contains(around, r => r.MessageId == tabby && r.VectorRank == 1);
+                Assert.Equal((3, 2), (covTheirs.Candidates, covReacted.Candidates));
+                Assert.DoesNotContain(liked, r => r.MessageId == tabby);
+            }
+
+            // Thirty-two searches, three reads (twenty-four before).
+            Assert.Equal(3, h.Kit.Retriever.CandidateLoads);
+        }
+
+        [Fact]
+        public async Task TheNewestOfAScope_AreTakenFromEachAccountOrConversationInTurn_AndNoneIsLeftOut()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            var corpus = new CorpusBuilder(h.Stores);
+            await corpus.PersonAsync("p-ana", "Ana");
+            await corpus.PersonAsync("p-ben", "Ben");
+            await corpus.ConversationAsync("discord:c-one", "dm", "p-ana");
+            await corpus.ConversationAsync("discord:c-two", "dm", "p-ben");
+            var encoder = new FakeEncoder();
+            h.Kit.Encoder = encoder;
+            // Two conversations, written to in turn; the newest four are two of each.
+            var ids = new List<(string Id, long At)>();
+            for (int i = 0; i < 6; i++)
+            {
+                long at = Now - (6 - i) * 60_000L;
+                ids.Add((await corpus.MessageAsync(i % 2 == 0 ? "p-ana" : "p-ben", i % 2 == 0 ? "discord:c-one" : "discord:c-two", at, $"note number {i} about the garden"), at));
+            }
+            await h.Context.Vectors!.UpsertAsync(VectorSpaces.Message, encoder.ModelVersion, ids.Select(x => new VectorItem(x.Id, FakeEncoder.Embed("garden"), 1)).ToList());
+
+            var scope = new RetrievalScope { ConversationIds = new[] { "discord:c-one", "discord:c-two" }, ToMs = Now, Limit = 10, VectorCandidates = 4 };
+            var (results, coverage) = await h.Kit.Retriever.SearchAsync(new[] { "zebra" }, scope, CancellationToken.None);
+            Assert.Equal(4, coverage.Candidates);
+            Assert.Equal(ids.OrderByDescending(x => x.At).Take(4).Select(x => x.Id).OrderBy(x => x), results.Select(r => r.MessageId).OrderBy(x => x));
+            // Nothing after the scope's period is a candidate.
+            var (early, _) = await h.Kit.Retriever.SearchAsync(new[] { "zebra" }, scope with { ToMs = ids[2].At }, CancellationToken.None);
+            Assert.Equal(ids.Take(3).Select(x => x.Id).OrderBy(x => x), early.Select(r => r.MessageId).OrderBy(x => x));
+
+            // Each account's or conversation's newest rows come off the index in order: no row is read and nothing is sorted.
+            using var c = h.Stores.Corpus.OpenRead();
+            foreach (string column in new[] { "author_identity_id", "conversation_id" })
+            {
+                var plan = c.Query(null, "EXPLAIN QUERY PLAN " + HybridRetriever.NewestOfOneStatement(column, new RetrievalScope { FromMs = 0, ToMs = Now }), r => r.GetString(3),
+                    ("$k", "a"), ("$f", 0L), ("$t", Now), ("$l", 10));
+                Assert.All(plan, p => Assert.Contains("COVERING INDEX", p));
+                Assert.DoesNotContain(plan, p => p.Contains("TEMP B-TREE"));
+            }
+        }
+
         [Fact]
         public void FtsQuery_SplitsWordsWhereTheTokenizerDoes_AndLeavesOutWordsThatAreTooCommon()
         {

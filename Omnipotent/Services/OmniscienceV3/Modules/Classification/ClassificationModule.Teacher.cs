@@ -28,10 +28,16 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
         /// priority order: tracked people 35%, Klives's DMs 25%, watch tier 15%, everyone else 25% (shares of an empty tier
         /// pass to the next). Candidates are drawn by seeded random probes into the corpus indexes, never by a scan;
         /// they must be embedded (training needs the vector), labelable and authored, and duplicates of a queued text are skipped.
+        /// <para>Every batch of probes is queued as soon as it is drawn and reported, and the job ends when its time is
+        /// up: the next one, ten minutes later, carries on from what is queued. A probe is a handful of cold reads, and
+        /// on the server's drive a thousand picks took 40 to 68 minutes, kept in memory until the end and reported
+        /// nowhere. One such run was taken for stuck at two hours and stopped five times over, each time with everything
+        /// it had drawn (22 Nov 2026), and while it ran it held one of the two workers that take long work.</para>
         /// </summary>
         private async Task<string?> TeacherSampleAsync(JobContext job)
         {
             var ct = job.Cancellation;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
             int target = Setting(TeacherTargetSetting, 6000);
             long have;
             HashSet<string> queuedHashes;
@@ -44,7 +50,9 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
             int need = (int)Math.Min(1_000, target - have);
             if (need <= 0 || Context.Encoder == null || Context.Vectors == null) return JsonSerializer.Serialize(new { have, target, added = 0 });
 
-            var rng = new Random(unchecked((int)(Context.Clock.NowMs / 3_600_000)) ^ 0x5eed);
+            // Seeded by the job: seeded by the hour, the several jobs of one hour each began with the probes of the one
+            // before, and found what it had already queued.
+            var rng = new Random(unchecked((int)(Context.Clock.NowMs / 3_600_000) * 31 + (int)job.Job.JobId * 16777619) ^ 0x5eed);
             List<string> trackedIds, watchIds, klivesDms;
             long maxRowId;
             using (var op = Context.Stores.Operator.OpenRead())
@@ -69,9 +77,10 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                 ("watch", 0.15, 200, () => ProbeBy(probeConn, "author_identity_id", watchIds, rng)),
                 ("other", 0.25, 100, () => ProbeRowId(probeConn, maxRowId, rng)),
             };
-            var picked = new List<(string Id, string Hash, int Priority, string Tier)>();
+            var byTier = new Dictionary<string, int>(StringComparer.Ordinal);
             var pickedIds = new HashSet<string>(StringComparer.Ordinal);
-            int carry = 0;
+            int carry = 0, added = 0, batches = 0;
+            bool outOfTime = false;
             foreach (var (name, share, priority, probe) in tiers)
             {
                 int quota = (int)Math.Round(need * share) + carry;
@@ -79,11 +88,16 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                 while (got < quota && attempts < Math.Max(4, quota / 4))
                 {
                     ct.ThrowIfCancellationRequested();
+                    // Looked at before every batch but the job's first: a job always draws one (a tier with nobody in it
+                    // draws nothing and does not count as that one).
+                    if (batches > 0 && sw.Elapsed >= TeacherSampleBudget) { outOfTime = true; break; }
                     attempts++;
-                    var batch = Enumerable.Range(0, 64).Select(_ => probe()).OfType<string>().Distinct().ToList();
+                    var batch = Enumerable.Range(0, TeacherSampleProbes).Select(_ => probe()).OfType<string>().Distinct().ToList();
                     if (batch.Count == 0) break;
+                    batches++;
                     var rows = LoadMessages(probeConn, batch);
                     var embedded = Vectors.Get(VectorSpaces.Message, Encoder.ModelVersion, rows.Select(r => r.MessageId).ToList());
+                    var picked = new List<(string Id, string Hash)>();
                     foreach (var m in rows.OrderBy(r => r.MessageId, StringComparer.Ordinal))
                     {
                         if (got >= quota) break;
@@ -97,23 +111,36 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Classification
                             if (shortTaken > quota * 0.4 && rng.NextDouble() < 0.5) continue;
                             shortTaken++;
                         }
-                        picked.Add((m.MessageId, hash, priority, name));
+                        picked.Add((m.MessageId, hash));
                         pickedIds.Add(m.MessageId);
                         got++;
                     }
+                    if (picked.Count > 0)
+                    {
+                        long now = Context.Clock.NowMs;
+                        await Context.Stores.Intel.WriteAsync((c, tx) =>
+                        {
+                            using var put = new PreparedStatement(c, tx, """
+                                INSERT OR IGNORE INTO classify_teacher_queue(message_id, reason, priority, attempts, state, enqueued_at_ms, text_hash) VALUES($m,$r,$p,0,'queued',$t,$h)
+                                """, "$m", "$r", "$p", "$t", "$h");
+                            foreach (var p in picked) put.Run(p.Id, TeacherReasons.Sample, priority, now, p.Hash);
+                        }, ct).ConfigureAwait(false);
+                        added += picked.Count;
+                        byTier[name] = byTier.GetValueOrDefault(name) + picked.Count;
+                    }
+                    await job.ReportProgressAsync(new { have = have + added, target, added, tier = name }).ConfigureAwait(false);
                 }
+                if (outOfTime) break;
                 carry = Math.Max(0, quota - got);
             }
-            long now = Context.Clock.NowMs;
-            await Context.Stores.Intel.WriteAsync((c, tx) =>
-            {
-                using var put = new PreparedStatement(c, tx, """
-                    INSERT OR IGNORE INTO classify_teacher_queue(message_id, reason, priority, attempts, state, enqueued_at_ms, text_hash) VALUES($m,$r,$p,0,'queued',$t,$h)
-                    """, "$m", "$r", "$p", "$t", "$h");
-                foreach (var p in picked) put.Run(p.Id, TeacherReasons.Sample, p.Priority, now, p.Hash);
-            }, ct).ConfigureAwait(false);
-            return JsonSerializer.Serialize(new { have, target, added = picked.Count, byTier = picked.GroupBy(p => p.Tier).ToDictionary(g => g.Key, g => g.Count()) });
+            return JsonSerializer.Serialize(new { have, target, added, byTier, more = outOfTime });
         }
+
+        /// <summary>How long one sampling job draws before it ends and leaves the rest to the next.</summary>
+        internal static TimeSpan TeacherSampleBudget { get; set; } = TimeSpan.FromMinutes(4);
+
+        /// <summary>How many random probes one batch of a sampling job makes.</summary>
+        internal static int TeacherSampleProbes { get; set; } = 64;
 
         /// <summary>A random message of a random key (author or conversation) through its time index.</summary>
         private static string? ProbeBy(Microsoft.Data.Sqlite.SqliteConnection corpus, string column, IReadOnlyList<string> keys, Random rng)

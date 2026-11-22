@@ -128,25 +128,83 @@ public class GatewayContinuationTests
         Assert.Equal(2, Session(llm).structuredMessages.Count);
     }
 
-    [Fact]
-    public void EveryCallOfAFamily_GoesOutWithTheSameToolDefinitions_InTheSameOrder()
-    {
-        var claims = new LlmOutputSchema("emit_claims", "claims", new Newtonsoft.Json.Linq.JObject());
-        var verdicts = new LlmOutputSchema("emit_verdicts", "verdicts", new Newtonsoft.Json.Linq.JObject());
-        var family = new[] { claims, verdicts };
-        LlmRequest Ask(LlmOutputSchema? schema, IReadOnlyList<LlmOutputSchema>? schemas) => new()
-        {
-            Purpose = "test", SessionKey = Id, Turns = new[] { new LlmTurn("user", "q") }, OutputSchema = schema, SchemaFamily = schemas,
-        };
+    // Seen live on 22 Nov 2026: with every schema of the family sent as a tool of its own and the call's own one forced,
+    // the critic was still served the system prompt and no more (about 1,400 of 5,000 tokens; 18% of everything sent a
+    // second time). The provider shows a call that must use one tool that tool alone, so the two calls' tool blocks
+    // differed after all. A family now goes out as one tool, and every call of it is made to call that one.
 
-        Assert.Equal(new[] { "emit_claims", "emit_verdicts" }, Llm.GatewaySchemas(Ask(claims, family)).Select(s => s.Name).ToArray());
-        Assert.Equal(new[] { "emit_claims", "emit_verdicts" }, Llm.GatewaySchemas(Ask(verdicts, family)).Select(s => s.Name).ToArray());
-        // Without a family a call sends its own schema alone, as every caller did before.
-        Assert.Equal(new[] { "emit_verdicts" }, Llm.GatewaySchemas(Ask(verdicts, null)).Select(s => s.Name).ToArray());
-        // A schema its family forgot still reaches the model (after the family's).
+    private static readonly LlmOutputSchema Claims = new("emit_claims", "The claims.",
+        Newtonsoft.Json.Linq.JObject.Parse("""{"type":"object","required":["claims"],"properties":{"claims":{"type":"array"}}}"""));
+    private static readonly LlmOutputSchema Verdicts = new("emit_verdicts", "The verdicts.",
+        Newtonsoft.Json.Linq.JObject.Parse("""{"type":"object","required":["verdicts"],"properties":{"verdicts":{"type":"array"}}}"""));
+
+    private static LlmRequest Ask(LlmOutputSchema? schema, IReadOnlyList<LlmOutputSchema>? schemas) => new()
+    {
+        Purpose = "test", SessionKey = Id, Turns = new[] { new LlmTurn("user", "q") }, OutputSchema = schema, SchemaFamily = schemas,
+    };
+
+    private static string[] Members(Llm.GatewayToolSet set) =>
+        ((Newtonsoft.Json.Linq.JObject)set.Tools.Single().Schema["properties"]!).Properties().Select(p => p.Name).ToArray();
+
+    [Fact]
+    public void EveryCallOfAFamily_GoesOutWithOneAndTheSameTool_AndIsMadeToCallIt()
+    {
+        var family = new[] { Claims, Verdicts };
+        var reading = Llm.GatewayTools(Ask(Claims, family))!;
+        var critic = Llm.GatewayTools(Ask(Verdicts, family))!;
+
+        // One tool, the same object and so the same bytes, forced by the same name: whatever a provider does with the
+        // tools of a forced call, it does the same to both.
+        Assert.Same(reading.Tools.Single(), critic.Tools.Single());
+        Assert.Equal(Llm.FamilyToolName, reading.Forced);
+        Assert.Equal(reading.Forced, critic.Forced);
+        Assert.Equal(new[] { "emit_claims", "emit_verdicts" }, Members(reading));
+        // What differs is said at the end of the question.
+        Assert.Equal("emit_claims", reading.Member);
+        Assert.Equal("emit_verdicts", critic.Member);
+        Assert.Contains("\"emit_verdicts\"", Llm.FamilyInstruction(critic.Member!));
+        // Each schema is carried whole, and the family's own objects are not touched by it.
+        Assert.Equal("array", (string?)reading.Tools[0].Schema.SelectToken("properties.emit_claims.properties.claims.type"));
+        Assert.Equal("The verdicts.", (string?)reading.Tools[0].Schema.SelectToken("properties.emit_verdicts.description"));
+        Assert.Null(Verdicts.Schema["description"]);
+    }
+
+    [Fact]
+    public void ACallWithoutAFamily_SendsItsOwnSchemaAlone_AsBefore()
+    {
+        var alone = Llm.GatewayTools(Ask(Verdicts, null))!;
+        Assert.Same(Verdicts, alone.Tools.Single());
+        Assert.Equal("emit_verdicts", alone.Forced);
+        Assert.Null(alone.Member);
+        // A family of one is that schema.
+        var one = Llm.GatewayTools(Ask(Verdicts, new[] { Verdicts }))!;
+        Assert.Same(Verdicts, one.Tools.Single());
+        Assert.Null(one.Member);
+        // A schema its family forgot still reaches the model, in a tool that carries it too.
         var other = new LlmOutputSchema("emit_other", "other", new Newtonsoft.Json.Linq.JObject());
-        Assert.Equal(new[] { "emit_claims", "emit_verdicts", "emit_other" }, Llm.GatewaySchemas(Ask(other, family)).Select(s => s.Name).ToArray());
+        var forgotten = Llm.GatewayTools(Ask(other, new[] { Claims, Verdicts }))!;
+        Assert.Equal(new[] { "emit_claims", "emit_verdicts", "emit_other" }, Members(forgotten));
+        Assert.Equal("emit_other", forgotten.Member);
         // A plain-text call has no tools at all: an empty or unforced tool list would let the model call one.
-        Assert.Empty(Llm.GatewaySchemas(Ask(null, family)));
+        Assert.Null(Llm.GatewayTools(Ask(null, new[] { Claims, Verdicts })));
+    }
+
+    [Fact]
+    public void AFamilyCallsAnswer_IsTheObjectUnderItsOwnProperty_ExactlyAsTheModelWroteIt()
+    {
+        // Taken out as written: no number or date in it is read and written again.
+        Assert.Equal("""{"claims":[{"when":"2024-03-05T14:30","p":0.90}]}""",
+            Llm.FamilyAnswer("""{"emit_claims":{"claims":[{"when":"2024-03-05T14:30","p":0.90}]}}""", Claims));
+        // The object without its property around it is the answer too.
+        Assert.Equal("""{"verdicts":[]}""", Llm.FamilyAnswer("""{"verdicts":[]}""", Verdicts));
+        // Handed over as a string of JSON.
+        Assert.Equal("""{"verdicts":[]}""", Llm.FamilyAnswer("""{"emit_verdicts":"{\"verdicts\":[]}"}""", Verdicts));
+        // Another member filled, or nothing: no answer to this question (the caller asks once more).
+        Assert.Null(Llm.FamilyAnswer("""{"emit_claims":{"claims":[]}}""", Verdicts));
+        Assert.Null(Llm.FamilyAnswer("{}", Verdicts));
+        Assert.Null(Llm.FamilyAnswer("""{"emit_verdicts":null}""", Verdicts));
+        // Cut off at the ceiling: left as it is, for the caller's reading of a cut-off answer.
+        Assert.Equal("""{"emit_verdicts":{"verdicts":[{"id":"f1" """, Llm.FamilyAnswer("""{"emit_verdicts":{"verdicts":[{"id":"f1" """, Verdicts));
+        Assert.Null(Llm.FamilyAnswer(null, Verdicts));
     }
 }

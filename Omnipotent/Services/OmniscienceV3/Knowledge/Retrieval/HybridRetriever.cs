@@ -197,10 +197,18 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
         /// <summary>The matches of a full-text query, best first, read from the full-text index alone.</summary>
         internal const string RankedMatches = "SELECT rowid FROM messages_fts WHERE messages_fts MATCH $q ORDER BY rank";
 
-        private const long ScopeTtlMs = 5 * 60_000;
+        private const long ScopeTtlMs = 15 * 60_000;
         private readonly ConcurrentDictionary<string, (RowSet Rows, bool PeriodApplied, long AtTick)> scopeRows = new(StringComparer.Ordinal);
         private sealed record KeptVectors(string Key, List<string> Ids, List<float[]> Vectors, long AtTick);
-        private volatile KeptVectors? vectorCandidates;
+        /// <summary>The vector candidates of the scopes searched lately. An inquiry goes round three scopes for every facet
+        /// (the subject's own messages, their conversations, what they reacted to); with room for one, each search read its
+        /// thousands of rows and vectors again, because the search before it had been of another scope.</summary>
+        private readonly ConcurrentDictionary<string, KeptVectors> vectorCandidates = new(StringComparer.Ordinal);
+        /// <summary>How many scopes' candidates are kept, and how many vectors in all (a vector is its dimensions × 4 bytes).</summary>
+        internal const int KeptScopes = 6, KeptVectorLimit = 40_000;
+        /// <summary>How many times candidate vectors were read from the stores (not served from what is kept).</summary>
+        internal int CandidateLoads => Volatile.Read(ref candidateLoads);
+        private int candidateLoads;
 
         /// <summary>
         /// The best matches of a full-text query within a scope, reading a message's row only for the few that are returned.
@@ -353,7 +361,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             if (scope.AuthorIdentityIds == null && scope.ConversationIds == null && scope.MessageIds == null) return (new List<string>(), new List<float[]>()); // never scan the whole corpus per query
             string key = scope.Signature() + "|" + scope.VectorCandidates + "|" + enc.ModelVersion;
             long now = Environment.TickCount64;
-            if (vectorCandidates is { } kept && kept.Key == key && now - kept.AtTick < ScopeTtlMs) return (kept.Ids, kept.Vectors);
+            if (vectorCandidates.TryGetValue(key, out var kept) && now - kept.AtTick < ScopeTtlMs) return (kept.Ids, kept.Vectors);
+            Interlocked.Increment(ref candidateLoads);
 
             var ids = new List<string>();
             using (var c = stores.Corpus.OpenRead())
@@ -367,6 +376,24 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
                 AddIn(where, args, "m.message_id", "$mi", scope.MessageIds);
                 if (scope.MessageIds != null)
                     ids = c.Query(null, $"SELECT m.message_id FROM messages m WHERE {string.Join(" AND ", where)} ORDER BY m.sent_at_ms DESC LIMIT $l", r => r.GetString(0), args.ToArray());
+                else if (scope.AuthorIdentityIds == null || scope.ConversationIds == null)
+                {
+                    // One list of accounts, or one of conversations: the newest of each come straight off the end of its
+                    // run in the index, and the newest of them all are picked from those. Asked for in one statement
+                    // ("in any of these sixty conversations, newest first"), every index entry of all sixty was read and
+                    // sorted to find a few thousand.
+                    bool byAuthor = scope.AuthorIdentityIds != null;
+                    var newest = new List<(long Row, long At)>();
+                    foreach (var one in (byAuthor ? scope.AuthorIdentityIds! : scope.ConversationIds!).Take(200))
+                    {
+                        var own = new List<(string, object?)> { ("$k", one), ("$l", scope.VectorCandidates) };
+                        if (scope.FromMs is long from) own.Add(("$f", from));
+                        if (scope.ToMs is long to) own.Add(("$t", to));
+                        newest.AddRange(c.Query(null, NewestOfOneStatement(byAuthor ? "author_identity_id" : "conversation_id", scope), r => (r.GetInt64(0), r.GetInt64(1)), own.ToArray()));
+                    }
+                    foreach (var chunk in newest.OrderByDescending(n => n.At).ThenByDescending(n => n.Row).Take(scope.VectorCandidates).Select(n => n.Row).Chunk(500))
+                        ids.AddRange(c.Query(null, $"SELECT message_id FROM messages WHERE rowid IN ({string.Join(",", chunk)})", r => r.GetString(0)));
+                }
                 else
                 {
                     // Which rows are the newest is settled in the index (it holds the time and the row number), and only
@@ -394,9 +421,22 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Retrieval
             }
             var keptIds = ids.Where(vectors.ContainsKey).ToList();
             var keptVectors = keptIds.Select(id => vectors[id]).ToList();
-            vectorCandidates = new KeptVectors(key, keptIds, keptVectors, now);
+            vectorCandidates[key] = new KeptVectors(key, keptIds, keptVectors, now);
+            // The oldest go first, until what is kept is within both limits (the scope just read always stays).
+            foreach (var old in vectorCandidates.Values.OrderBy(k => k.AtTick).ToList())
+            {
+                bool stale = now - old.AtTick >= ScopeTtlMs;
+                if (!stale && vectorCandidates.Count <= KeptScopes && vectorCandidates.Values.Sum(k => (long)k.Vectors.Count) <= KeptVectorLimit) break;
+                if (old.Key != key) vectorCandidates.TryRemove(old.Key, out _);
+            }
             return (keptIds, keptVectors);
         }
+
+        /// <summary>The statement that reads the newest rows of one account or one conversation within the scope's period,
+        /// newest first, from the index alone: the entries are met in that order, so nothing is sorted and no row is read.</summary>
+        internal static string NewestOfOneStatement(string column, RetrievalScope scope) =>
+            $"SELECT rowid, sent_at_ms FROM messages INDEXED BY {(column == "author_identity_id" ? "ix_messages_author_time" : "ix_messages_conv_time")} WHERE {column}=$k"
+            + (scope.FromMs != null ? " AND sent_at_ms >= $f" : "") + (scope.ToMs != null ? " AND sent_at_ms <= $t" : "") + " ORDER BY sent_at_ms DESC LIMIT $l";
 
         /// <summary>Decodes a stored vector (contract: vectors.db quant "i8" = int8 × scale, "f32" = little-endian floats).</summary>
         public static float[]? Decode(int dims, string quant, double scale, byte[] blob)

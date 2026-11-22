@@ -74,7 +74,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                 return await ctx.StageAsync("persist", ct => PersistAsync(ctx, req, spec, NeedsDisambiguation(ctx, spec), ct)).ConfigureAwait(false);
 
             var plan = await ctx.StageAsync("plan", ct => PlanAsync(ctx, req, spec, ct)).ConfigureAwait(false);
-            var gathered = await ctx.StageAsync("gather", ct => GatherAsync(spec, plan, req, ct)).ConfigureAwait(false);
+            var gathered = await ctx.StageAsync("gather", ct => GatherAsync(ctx, spec, plan, req, ct)).ConfigureAwait(false);
             await ctx.ReportAsync(new { stage = "gathered", items = gathered.Items.Count, gathered.Coverage.MessagesConsidered }).ConfigureAwait(false);
             var passes = await ctx.StageAsync("reason", ct => ReasonAsync(ctx, req, spec, gathered, ct)).ConfigureAwait(false);
             var verified = await ctx.StageAsync("verify", ct => VerifyAsync(ctx, req, spec, gathered, passes, ct)).ConfigureAwait(false);
@@ -238,9 +238,23 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
 
         // ── gather ───────────────────────────────────────────────────────────────
 
-        private async Task<GatherResult> GatherAsync(InquirySpec spec, InquiryPlan plan, InquiryRequest req, CancellationToken ct)
+        /// <summary>How many of a scope's newest messages a gather's vector pass compares against: the subject's own, and
+        /// those of the conversations they are in. Each is a row read from the archive, on a drive where a cold read
+        /// takes 25 to 150 ms, and full-text search covers the whole scope whatever these are.</summary>
+        internal const int OwnVectorCandidates = 4_000, TheirVectorCandidates = 3_000;
+
+        /// <summary>
+        /// Finds the evidence. Every search is reported as it ends, with what has been found so far. The stage used to
+        /// say "running" once and nothing more until it was done, and a stage that says nothing for an hour is stopped
+        /// as stuck: on the server every run was, three attempts each, with up to thirty-two searches still to go
+        /// (22 Nov 2026).
+        /// </summary>
+        private async Task<GatherResult> GatherAsync(TacticRunContext ctx, InquirySpec spec, InquiryPlan plan, InquiryRequest req, CancellationToken ct)
         {
+            int searches = 0, facetsDone = 0, facetsInAll = spec.Subjects.Count * plan.Facets.Count;
             var candidates = new Dictionary<string, (double Score, string Facet, string Reliability, bool Counter, string? Subject)>(StringComparer.Ordinal);
+            Task Tell(string subject, string? facet, string doing) =>
+                ctx.ReportAsync(new { stage = "gather", status = "running", subject, facet, doing, facets = facetsDone, of = facetsInAll, searches, found = candidates.Count });
             var notes = new List<string>();
             int considered = 0;
             bool vectors = false;
@@ -256,6 +270,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
             }
             foreach (var subject in spec.Subjects)
             {
+                await Tell(subject.Label, null, "finding where they talk and what they reacted to").ConfigureAwait(false);
                 var identities = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(subject.PersonId)).Select(i => i.IdentityId).ToList();
                 // The sixty conversations they have lately been most active in (from their newest messages, a bounded read).
                 var conversations = kit.Corpus.ConversationsOf(identities, newest: 5_000).Take(60).Select(c => c.ConversationId).ToList();
@@ -264,32 +279,45 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                     reacted = c.QueryIn(null, "SELECT message_id, added_at_ms FROM reactions WHERE identity_id IN ({keys}) ORDER BY added_at_ms DESC LIMIT 2000",
                             identities, r => (Id: r.GetString(0), At: r.GetInt64OrNull(1)))
                         .Where(x => x.At == null || x.At <= spec.AsOfMs).Select(x => x.Id).Distinct(StringComparer.Ordinal).Take(800).ToList();
+                // The three scopes every facet is searched in. One object each for the whole subject, so the retriever
+                // reads a scope's rows and vectors once and every later facet finds them kept.
+                var own = new RetrievalScope { AuthorIdentityIds = identities, FromMs = spec.FromMs, ToMs = spec.AsOfMs, Limit = 14, VectorCandidates = OwnVectorCandidates };
+                var theirs = new RetrievalScope { ConversationIds = conversations, FromMs = spec.FromMs, ToMs = spec.AsOfMs, Limit = 10, VectorCandidates = TheirVectorCandidates };
+                var liking = new RetrievalScope { MessageIds = reacted, ToMs = spec.AsOfMs, Limit = 6 };
                 foreach (var facet in plan.Facets)
                 {
                     ct.ThrowIfCancellationRequested();
-                    var own = new RetrievalScope { AuthorIdentityIds = identities, FromMs = spec.FromMs, ToMs = spec.AsOfMs, Limit = 14 };
+                    await Tell(subject.Label, facet.Name, "searching their own messages").ConfigureAwait(false);
                     var (selfHits, cov) = await kit.Retriever.SearchAsync(facet.Queries, own, ct).ConfigureAwait(false);
+                    searches++;
                     vectors |= cov.Vectors;
                     if (cov.Note != null && !notes.Contains(cov.Note)) notes.Add(cov.Note);
                     Add(selfHits, facet.Name, "self", false, subject.PersonId, 1.0);
                     if (facet.CounterQueries.Count > 0)
                     {
+                        await Tell(subject.Label, facet.Name, "searching their own messages for the opposite").ConfigureAwait(false);
                         var (counter, _) = await kit.Retriever.SearchAsync(facet.CounterQueries, own with { Limit = 8 }, ct).ConfigureAwait(false);
+                        searches++;
                         Add(counter, facet.Name, "self", true, subject.PersonId, 0.95);
                     }
                     if (conversations.Count > 0)
                     {
-                        var theirs = new RetrievalScope { ConversationIds = conversations, FromMs = spec.FromMs, ToMs = spec.AsOfMs, Limit = 10 };
+                        await Tell(subject.Label, facet.Name, "searching the conversations they are in").ConfigureAwait(false);
                         var (others, _) = await kit.Retriever.SearchAsync(facet.Queries, theirs, ct).ConfigureAwait(false);
+                        searches++;
                         Add(others, facet.Name, "third_party", false, subject.PersonId, 0.6);
                     }
                     if (reacted.Count > 0)
                     {
-                        var (liked, _) = await kit.Retriever.SearchAsync(facet.Queries, new RetrievalScope { MessageIds = reacted, ToMs = spec.AsOfMs, Limit = 6 }, ct).ConfigureAwait(false);
+                        await Tell(subject.Label, facet.Name, "searching what they reacted to").ConfigureAwait(false);
+                        var (liked, _) = await kit.Retriever.SearchAsync(facet.Queries, liking, ct).ConfigureAwait(false);
+                        searches++;
                         Add(liked, facet.Name, "behaviour", false, subject.PersonId, 0.8);
                     }
+                    facetsDone++;
                 }
             }
+            await Tell(string.Join(", ", spec.Subjects.Select(s => s.Label)), null, "reading what was found").ConfigureAwait(false);
             var messages = kit.Corpus.Messages(candidates.Keys.ToList()).ToDictionary(m => m.MessageId, StringComparer.Ordinal);
             considered = messages.Count;
             var subjectsIdentityPerson = spec.Subjects.ToDictionary(s => s.PersonId, s => s.Label, StringComparer.Ordinal);

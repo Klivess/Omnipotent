@@ -223,6 +223,55 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             Assert.Contains(model.Dossiers[0].Values, line => line.Contains("I speak Portuguese"));
         }
 
+        /// <summary>
+        /// 22 Nov 2026 on the server: every inquiry was stopped in its gather stage, "made no progress for 60 min", three
+        /// attempts each. The stage said "running" once and nothing more while it made up to thirty-two searches, and each
+        /// search read the vectors of its scope again because the search before it had been of another scope.
+        /// </summary>
+        [Fact]
+        public async Task TheGatherStage_SaysWhatItIsDoingAtEverySearch_AndReadsEachScopesVectorsOnce()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            await PlantedFactCorpus.WriteAsync(h.Stores, Now);
+            var encoder = new FakeEncoder();
+            h.Kit.Encoder = encoder;
+            List<(string Id, string Text)> messages;
+            using (var c = h.Stores.Corpus.OpenRead())
+                messages = c.Query(null, "SELECT message_id, content FROM messages WHERE content IS NOT NULL", r => (r.GetString(0), r.GetString(1)));
+            await h.Context.Vectors!.UpsertAsync(VectorSpaces.Message, encoder.ModelVersion, messages.Select(m => new VectorItem(m.Id, FakeEncoder.Embed(m.Text), 1)).ToList());
+            // Five facets, each with counter-evidence to look for.
+            var model = new ScriptedInquirer
+            {
+                Plan = new
+                {
+                    facets = new[] { "pets", "home", "habits", "purchases", "plans" }.Select(name => new { name, kind = "direct", queries = new[] { "cat", name }, counter_queries = new[] { "dog", "allergic" } }).ToArray(),
+                    base_rate = new { probability = 0.3, rationale = "Roughly a third of households keep a cat." },
+                },
+            };
+            model.Wire(h.Llm);
+
+            var (run, report, _) = await RunAsync(h, "x01.ask_yes_no", Ask("Ava's obviously a crazy cat lady, right?"));
+
+            Assert.True(report!.Coverage.VectorSearch);
+            List<JsonElement> said;
+            using (var c = h.Stores.Intel.OpenRead())
+                said = c.Query(null, "SELECT payload_json FROM stream_events WHERE topic='tactic.progress' ORDER BY event_id", r => JsonDocument.Parse(r.GetString(0)).RootElement)
+                    .Where(e => e.GetProperty("runId").GetString() == run.RunId).Select(e => e.GetProperty("detail"))
+                    .Where(d => d.TryGetProperty("stage", out var stage) && stage.GetString() == "gather" && d.TryGetProperty("doing", out _)).ToList();
+            // Before the first search, at each search (their own words, the opposite, their conversations: three or four
+            // a facet), and once more when the searching is done.
+            var searches = said.Where(d => d.GetProperty("facet").ValueKind == JsonValueKind.String).ToList();
+            Assert.True(searches.Count >= 15, $"the gather stage reported {searches.Count} searches of five facets");
+            Assert.Equal(new[] { "habits", "home", "pets", "plans", "purchases" }, searches.Select(d => d.GetProperty("facet").GetString()).Distinct().OrderBy(f => f, StringComparer.Ordinal));
+            Assert.Contains(searches, d => d.GetProperty("doing").GetString() == "searching their own messages for the opposite");
+            Assert.All(said, d => Assert.Equal(5, d.GetProperty("of").GetInt32()));
+            var last = said[^1];
+            Assert.Equal((5, searches.Count), (last.GetProperty("facets").GetInt32(), last.GetProperty("searches").GetInt32()));
+            Assert.True(last.GetProperty("found").GetInt32() > 0);
+            // One read of each scope's vectors for all five facets (it was one for every search but the counter-evidence one).
+            Assert.InRange(h.Kit.Retriever.CandidateLoads, 1, 3);
+        }
+
         [Fact]
         public async Task Citations_ThatDoNotExistOrDoNotSupportThePoint_AreRemoved_AndPassesLeftWithNoneAreDropped()
         {

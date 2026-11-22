@@ -41,9 +41,10 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
 
         public List<Sent> Calls { get; } = new();
 
-        public static PrefixCacheReplay Of(IEnumerable<FakeLlm.JournalEntry> journal)
+        public static PrefixCacheReplay Of(IEnumerable<FakeLlm.JournalEntry> journal,
+            Func<LlmRequest, (IReadOnlyList<LlmOutputSchema> Sent, string? Forced, string? Member)>? toolLayout = null)
         {
-            var replay = new PrefixCacheReplay();
+            var replay = toolLayout == null ? new PrefixCacheReplay() : new PrefixCacheReplay { ToolLayout = toolLayout };
             foreach (var entry in journal)
             {
                 if (entry.Request == null) replay.sessions.Remove(entry.SessionKey);
@@ -67,8 +68,15 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             }
             foreach (var turn in request.Turns) session!.Messages.Add((turn.Role, turn.Content));
 
-            // The tool definitions exactly as the gateway sends them: the call's family, or its own schema alone.
-            string image = Render(session!.System, Omnipotent.Services.KliveLLM.KliveLLM.GatewaySchemas(request), session.Messages);
+            // The tool definitions as the provider shows them to the model: of what the gateway sends, the one the call is
+            // made to use, and no other. (Until 22 Nov 2026 this replay showed every tool that was sent. AIRouter does
+            // not: live, a forced call's prompt was short by exactly the tools it was not forced to use, so a reading
+            // and its critic, sent with the same two tools and each forced to its own, matched no further than the
+            // system prompt, while this replay scored them 92% cached.)
+            var tools = Tools(request);
+            // What the gateway adds to the question travels in the turn.
+            if (tools.Member != null) session!.Messages[^1] = (session.Messages[^1].Role, session.Messages[^1].Content + Omnipotent.Services.KliveLLM.KliveLLM.FamilyInstruction(tools.Member));
+            string image = Render(session!.System, tools.Shown, session.Messages);
             int cached = 0;
             foreach (string earlier in seen) cached = Math.Max(cached, CommonPrefix(earlier, image));
             seen.Add(image);
@@ -88,6 +96,24 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             }
             else session.Unanswered = true;
             if (!request.KeepSession) sessions.Remove(request.SessionKey);
+        }
+
+        /// <summary>How a request's tools reach the model. The gateway's own way by default; a test may put another in
+        /// its place to replay a layout that is no longer sent.</summary>
+        public Func<LlmRequest, (IReadOnlyList<LlmOutputSchema> Sent, string? Forced, string? Member)> ToolLayout { get; init; } = request =>
+            Omnipotent.Services.KliveLLM.KliveLLM.GatewayTools(request) is { } set ? (set.Tools, set.Forced, set.Member) : (Array.Empty<LlmOutputSchema>(), null, null);
+
+        /// <summary>The layout of 20 to 22 Nov 2026: every schema of the family as a tool of its own, the call's own one forced.</summary>
+        public static (IReadOnlyList<LlmOutputSchema> Sent, string? Forced, string? Member) SeparateTools(LlmRequest request)
+        {
+            if (request.OutputSchema is not { } wanted) return (Array.Empty<LlmOutputSchema>(), null, null);
+            return (request.SchemaFamily is { Count: > 0 } family ? family : new[] { wanted }, wanted.Name, null);
+        }
+
+        private (IReadOnlyList<LlmOutputSchema> Shown, string? Member) Tools(LlmRequest request)
+        {
+            var (sent, forced, member) = ToolLayout(request);
+            return (forced == null ? sent : sent.Where(t => t.Name == forced).ToList(), member);
         }
 
         private static string Render(string system, IReadOnlyList<LlmOutputSchema> tools, IReadOnlyList<(string Role, string Content)> messages)

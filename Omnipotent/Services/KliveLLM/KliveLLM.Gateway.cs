@@ -48,12 +48,12 @@ public sealed record LlmRequest
     public Action<string>? OnToken { get; init; }
     public bool KeepSession { get; init; }
     /// <summary>
-    /// Every schema the calls of one prompt family answer with, in one fixed order. All of them go out as tool
-    /// definitions on every structured call of the family, and <see cref="OutputSchema"/> names the one this call
-    /// must answer with. A provider lays the tool definitions out ahead of the conversation, so a call that sent only
-    /// its own schema shared nothing with the call before it past the system prompt: Omniscience's critic, asked with
-    /// another schema than the reading before it, had the whole evidence prefilled a second time. Null: the call's own
-    /// schema alone.
+    /// Every schema the calls of one prompt family answer with, in one fixed order. They go out as one tool
+    /// definition, the same on every structured call of the family, with a property per schema, and
+    /// <see cref="OutputSchema"/> names the one this call must answer with (<see cref="KliveLLM.GatewayTools"/>). A
+    /// provider lays the tool definitions out ahead of the conversation, so a call whose tools differ from the call
+    /// before it shares nothing with it past the system prompt: Omniscience's critic, asked with another schema than
+    /// the reading before it, had the whole evidence prefilled a second time. Null: the call's own schema alone.
     /// </summary>
     public IReadOnlyList<LlmOutputSchema>? SchemaFamily { get; init; }
     /// <summary>
@@ -255,18 +255,19 @@ public partial class KliveLLM
         string provider = "", model = request.Model ?? "";
         try
         {
-            AppendGatewayTurns(sid, request);
+            var toolSet = GatewayTools(request);
+            AppendGatewayTurns(sid, toolSet?.Member == null ? request : request with { Turns = WithFamilyInstruction(request.Turns, toolSet.Member) });
 
             var tools = new List<HFWrapper.HFTool>();
             object? toolChoice = null;
-            if (request.OutputSchema is { } schema)
+            if (toolSet != null)
             {
-                foreach (var tool in GatewaySchemas(request))
+                foreach (var tool in toolSet.Tools)
                     tools.Add(new HFWrapper.HFTool
                     {
                         function = new HFWrapper.HFFunctionDefinition { name = tool.Name, description = tool.Description, parameters = tool.Schema },
                     });
-                toolChoice = new { type = "function", function = new { name = schema.Name } };
+                toolChoice = new { type = "function", function = new { name = toolSet.Forced } };
             }
 
             // Without a schema there are no tools, and the key is left out: OpenAI-compatible APIs reject an empty
@@ -299,11 +300,12 @@ public partial class KliveLLM
                     AppendToolResult(sid, call.id, call.function?.name ?? "result", "{\"recorded\":true}", preservePromptPrefix: true);
 
             string? structured = null;
-            if (request.OutputSchema is { } s)
+            if (request.OutputSchema is { } s && toolSet != null)
             {
-                var call = resp.ToolCalls?.FirstOrDefault(c => c?.function?.name == s.Name);
+                var call = resp.ToolCalls?.FirstOrDefault(c => c?.function?.name == toolSet.Forced);
                 structured = call?.function?.arguments;
                 if (string.IsNullOrWhiteSpace(structured)) structured = ExtractJsonObject(resp.Response);
+                if (toolSet.Member != null) structured = FamilyAnswer(structured, s);
                 if (string.IsNullOrWhiteSpace(structured))
                     return Fail(LooksLikeRefusal(resp.Response) ? LlmErrorKind.Refused : LlmErrorKind.NoStructuredOutput,
                         "The model did not return the requested structured output.", resp, sw.ElapsedMilliseconds);
@@ -353,17 +355,103 @@ public partial class KliveLLM
         }
     }
 
+    /// <summary>The tool definitions a structured request goes out with, the one the model is made to call, and, when
+    /// that one is a family's shared tool, the property of it this call's answer goes in.</summary>
+    internal sealed record GatewayToolSet(IReadOnlyList<LlmOutputSchema> Tools, string Forced, string? Member);
+
+    /// <summary>The name of the one tool every call of a schema family is made to call. Not a name any schema of a
+    /// family carries (the inquiry's own answer schema is "emit_answer").</summary>
+    internal const string FamilyToolName = "record_answer";
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<IReadOnlyList<LlmOutputSchema>, LlmOutputSchema> familyTools = new();
+
     /// <summary>
-    /// The tool definitions a structured request goes out with, in the order they are sent: its family's, the same
-    /// list on every call of the family, or its own schema alone. A schema the family does not list is sent after it
-    /// (the call still works; its tool block is then its own, and so is everything the provider reads behind it).
+    /// What a structured request goes out with. A call without a family sends its own schema as the only tool and is
+    /// made to call it, as every caller did before. The calls of a family all send one and the same tool
+    /// (<see cref="FamilyTool"/>) and are all made to call it; which of its properties to fill is said at the end of
+    /// the question.
+    /// <para>From 20 to 22 Nov 2026 a family's schemas went out as separate tools, all of them on every call, with the
+    /// call's own one forced. That is only the same bytes on every call if the provider shows the model every tool it
+    /// is sent. AIRouter shows a call that must use one tool that tool alone: the critic's prompt came back counted
+    /// about 1,100 tokens smaller than the reading's over the same evidence (the size of the claims schema), and of
+    /// its 5,000 tokens some 1,400 were served from cache, the system prompt and no more. Of everything Omniscience
+    /// sent a second time, 18% came from cache. One tool, forced by one name, leaves a provider nothing to choose
+    /// between.</para>
     /// </summary>
-    internal static IReadOnlyList<LlmOutputSchema> GatewaySchemas(LlmRequest request)
+    internal static GatewayToolSet? GatewayTools(LlmRequest request)
     {
-        if (request.OutputSchema is not { } wanted) return Array.Empty<LlmOutputSchema>();
+        if (request.OutputSchema is not { } wanted) return null;
         var family = request.SchemaFamily;
-        if (family == null || family.Count == 0) return new[] { wanted };
-        return family.Any(s => string.Equals(s.Name, wanted.Name, StringComparison.Ordinal)) ? family : family.Append(wanted).ToList();
+        if (family == null || family.Count == 0) return new GatewayToolSet(new[] { wanted }, wanted.Name, null);
+        // A schema its family forgot still reaches the model: the tool is then this call's own, and so is everything
+        // the provider reads behind it.
+        if (!family.Any(s => string.Equals(s.Name, wanted.Name, StringComparison.Ordinal)))
+            return new GatewayToolSet(new[] { FamilyTool(family.Append(wanted).ToList()) }, FamilyToolName, wanted.Name);
+        if (family.Count == 1) return new GatewayToolSet(new[] { wanted }, wanted.Name, null);
+        return new GatewayToolSet(new[] { familyTools.GetValue(family, FamilyTool) }, FamilyToolName, wanted.Name);
+    }
+
+    /// <summary>One tool for a whole family: an object with a property per schema, named after it, in the family's order.</summary>
+    internal static LlmOutputSchema FamilyTool(IReadOnlyList<LlmOutputSchema> family)
+    {
+        var properties = new JObject();
+        foreach (var schema in family)
+        {
+            var member = (JObject)schema.Schema.DeepClone();
+            if (member["description"] == null && !string.IsNullOrWhiteSpace(schema.Description)) member["description"] = schema.Description;
+            properties[schema.Name] = member;
+        }
+        return new LlmOutputSchema(FamilyToolName, "Records the answer to the question that was asked. Fill in exactly one property, the one the question names, and leave the others out.",
+            new JObject { ["type"] = "object", ["properties"] = properties });
+    }
+
+    /// <summary>What the end of a family call's question says about where its answer goes.</summary>
+    internal static string FamilyInstruction(string member) =>
+        "\n\nGive your answer by calling " + FamilyToolName + " with only its \"" + member + "\" property filled in.";
+
+    /// <summary>The turns with the family instruction at the end of the last one: behind the question, so nothing ahead of
+    /// it moves.</summary>
+    private static IReadOnlyList<LlmTurn> WithFamilyInstruction(IReadOnlyList<LlmTurn> turns, string member)
+    {
+        var copy = new List<LlmTurn>(turns);
+        copy[^1] = copy[^1] with { Content = copy[^1].Content + FamilyInstruction(member) };
+        return copy;
+    }
+
+    /// <summary>
+    /// A family call's own answer, taken out of the shared tool's arguments: the object under the property named after
+    /// its schema. A model that answered with that object alone, without the property around it, is taken at its word.
+    /// Null when the arguments hold neither (another member was filled, or nothing): the call has no structured
+    /// answer. Arguments that are not whole JSON (cut off at the ceiling) are returned as they are, for the caller's
+    /// own reading of a cut-off answer.
+    /// </summary>
+    internal static string? FamilyAnswer(string? arguments, LlmOutputSchema wanted)
+    {
+        if (string.IsNullOrWhiteSpace(arguments)) return arguments;
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(arguments, new System.Text.Json.JsonDocumentOptions
+            {
+                AllowTrailingCommas = true, CommentHandling = System.Text.Json.JsonCommentHandling.Skip,
+            });
+            var root = doc.RootElement;
+            if (root.ValueKind != System.Text.Json.JsonValueKind.Object) return arguments;
+            if (root.TryGetProperty(wanted.Name, out var member))
+            {
+                if (member.ValueKind == System.Text.Json.JsonValueKind.Object) return member.GetRawText();
+                // Some models hand an object over as a string of JSON.
+                if (member.ValueKind == System.Text.Json.JsonValueKind.String && member.GetString() is { } text && text.TrimStart().StartsWith('{')) return text;
+                return null;
+            }
+            if (wanted.Schema["properties"] is JObject own)
+                foreach (var property in root.EnumerateObject())
+                    if (own[property.Name] != null) return arguments;
+            return null;
+        }
+        catch (System.Text.Json.JsonException)
+        {
+            return arguments;
+        }
     }
 
     /// <summary>

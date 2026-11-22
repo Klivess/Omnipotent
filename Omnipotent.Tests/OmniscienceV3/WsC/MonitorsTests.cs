@@ -6,6 +6,7 @@ using Omnipotent.Services.OmniscienceV3.Modules.Monitors;
 using Omnipotent.Services.OmniscienceV3.Modules.Signalling;
 using Omnipotent.Services.OmniscienceV3.Storage;
 using Omnipotent.Services.OmniscienceV3.Storage.Sqlite;
+using Omnipotent.Services.OmniscienceV3.Temporal;
 
 namespace Omnipotent.Tests.OmniscienceV3.WsC
 {
@@ -399,6 +400,102 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             Assert.Equal(5, off[1].Data!.Value.GetProperty("extra").GetProperty("open").GetArrayLength());
             await RunAsync(h, minutes: 11);
             Assert.Equal("switched off", h.Driver.LastResult(MonitorsModule.HealthKind)!.Value.GetProperty("skipped").GetString());
+        }
+
+        /// <summary>
+        /// 22 Nov 2026: "Omniscience v2 migration has been silent for 16.7 hours; it usually brings 130.3 messages a day",
+        /// with v2's tail completing every two minutes. A message is credited to the best source that has it, and since
+        /// KliveBot captures Discord itself that is KliveBot for nearly everything v2 also brings. What v2 brings is now
+        /// read off the tail's own place in v2's messages.
+        /// </summary>
+        [Fact]
+        public async Task DataHealth_V2IsSilentOnlyWhenItsTailHandsNothingOver_WhoeverIsCreditedWithTheMessages()
+        {
+            await using var h = await SignalsHarness.StartAsync(monitors: true);
+            await RunAsync(h);
+            long start = h.Clock.NowMs;
+            string Day0(long at) => Zones.LocalDate(at, h.Runtime.Host.Settings.KlivesZone).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+            // v2 brought 130 messages a day for a week (as the check knew it), and its tail last read one 17 hours ago.
+            var week = Enumerable.Range(1, 7).ToDictionary(d => Day0(start - d * Day), _ => 130);
+            await h.Runtime.Stores.Corpus.WriteAsync((c, tx) =>
+            {
+                c.Exec(tx, "INSERT OR REPLACE INTO sources(source_id, platform, kind, label, status, rank, created_at_ms, updated_at_ms) VALUES($s,'omniscience','legacy','Omniscience v2 migration','active',0,$n,$n)",
+                    ("$s", CorpusIds.LegacySourceId), ("$n", start));
+                c.Exec(tx, "INSERT OR REPLACE INTO legacy_import_state(table_name, last_rowid, rows_imported, rows_quarantined, updated_at_ms) VALUES('messages',5000,5000,0,$t)", ("$t", start - 17 * Hour));
+            });
+            await h.Runtime.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "INSERT OR REPLACE INTO mon_sources(source_id, last_ingest_ms, days_json) VALUES($s,$l,$d)",
+                ("$s", CorpusIds.LegacySourceId), ("$l", start - 17 * Hour), ("$d", JsonSerializer.Serialize(week))));
+
+            // Nothing handed over for 17 hours: that is a silent source, and is said.
+            await RunAsync(h, minutes: 11);
+            var silent = h.Monitors!.Health().Open.Single(i => i.Kind == "source_stalled");
+            Assert.Equal(CorpusIds.LegacySourceId, silent.Subject);
+            Assert.Equal(130.0, silent.Detail.GetProperty("usualPerDay").GetDouble());
+
+            // The tail reads forty more of v2's messages. Every one of them is already here from the bot, so none is
+            // credited to v2 (no message row says "legacy:v2"): v2 is bringing messages all the same.
+            await h.PostAsync(General, Ana, "captured by the bot first", source: SourceKinds.Backfill);
+            long handed = h.Clock.NowMs;
+            await h.Runtime.Stores.Corpus.WriteAsync((c, tx) => c.Exec(tx, "UPDATE legacy_import_state SET last_rowid=5040, updated_at_ms=$t WHERE table_name='messages'", ("$t", handed)));
+            await RunAsync(h, minutes: 11);
+            Assert.DoesNotContain(h.Monitors.Health().Open, i => i.Kind == "source_stalled");
+            using (var c = h.Runtime.Stores.Intel.OpenRead())
+            {
+                var (last, days) = c.Query(null, "SELECT last_ingest_ms, days_json FROM mon_sources WHERE source_id=$s", r => (r.GetInt64(0), r.GetString(1)), ("$s", CorpusIds.LegacySourceId)).Single();
+                Assert.Equal(handed, last);
+                // Counted once, as what was handed over: the migration before the first look is not a day's messages.
+                Assert.Equal(40, JsonSerializer.Deserialize<Dictionary<string, int>>(days)![Day0(handed)]);
+            }
+
+            // The tail goes on completing but v2 has nothing new for it: after twelve hours that is said again, though
+            // the bot's messages keep arriving.
+            await h.PostAsync(General, Ana, "the bot is still capturing", source: SourceKinds.Backfill);
+            await RunAsync(h, minutes: 13 * 60);
+            Assert.Equal(CorpusIds.LegacySourceId, h.Monitors.Health().Open.Single(i => i.Kind == "source_stalled").Subject);
+        }
+
+        /// <summary>
+        /// 22 Nov 2026: "1 classify job failed for good in the last day" stood on the Health page all afternoon. The job was
+        /// the classifier's sampling job, which is queued again every ten minutes under the same key, and five later ones
+        /// had succeeded by then.
+        /// </summary>
+        [Fact]
+        public async Task DataHealth_ADeadJobWhoseWorkWasDoneAgainSince_IsNotAProblem()
+        {
+            await using var h = await SignalsHarness.StartAsync(monitors: true);
+            await RunAsync(h);
+            long now = h.Clock.NowMs;
+            await h.Runtime.Stores.Intel.WriteAsync((c, tx) =>
+            {
+                void Job(string module, string kind, string? key, string state, long finished, string? error = null) => c.Exec(tx, """
+                    INSERT INTO jobs(module_id, kind, dedupe_key, priority, lane, state, attempts, max_attempts, not_before_ms, error_class, error_message, created_at_ms, finished_at_ms)
+                    VALUES($m,$k,$d,1,'Cpu',$s,3,3,0,$ec,$e,$f,$f)
+                    """, ("$m", module), ("$k", kind), ("$d", key), ("$s", state), ("$ec", error == null ? null : "Transient"), ("$e", error), ("$f", finished));
+                // Recurring work that died and was then done: no longer a problem.
+                Job("classify", "teacher-sample", "classify|teacher-sample|stream|teacher", "dead", now - 6 * Hour, "Made no progress for 120 min; stopped.");
+                Job("classify", "teacher-sample", "classify|teacher-sample|stream|teacher", "succeeded", now - 5 * Hour);
+                // Recurring work that died and has not been done since (it succeeded before, and the one after was called off): still one.
+                Job("rollups", "drain", "rollups|drain|stream|cells", "succeeded", now - 9 * Hour);
+                Job("rollups", "drain", "rollups|drain|stream|cells", "dead", now - 4 * Hour, "disk I/O error");
+                Job("rollups", "drain", "rollups|drain|stream|cells", "cancelled", now - Hour);
+                // A run of its own (Klives's question): nothing else carries its key.
+                Job("core.tactics", "run", "core.tactics|run|tactic_run|r1", "dead", now - 3 * Hour, "Made no progress for 60 min; stopped.");
+                Job("core.tactics", "run", "core.tactics|run|tactic_run|r2", "succeeded", now - 2 * Hour);
+                // No key at all: it is counted, as before.
+                Job("links", "unfurl", null, "dead", now - 2 * Hour, "HttpRequestException: 503");
+                Job("links", "unfurl", null, "succeeded", now - Hour);
+            });
+            await RunAsync(h, minutes: 11);
+
+            var dead = h.Monitors!.Health().Open.Where(i => i.Kind == "jobs_dead").ToDictionary(i => i.Subject!, i => i.Detail);
+            Assert.Equal(new[] { "core.tactics", "links", "rollups" }, dead.Keys.OrderBy(k => k, StringComparer.Ordinal));
+            Assert.Equal((1, "disk I/O error"), (dead["rollups"].GetProperty("jobs").GetInt32(), dead["rollups"].GetProperty("lastError").GetString()));
+
+            // The rollup's next run succeeds: its problem closes at the next check.
+            await h.Runtime.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "UPDATE jobs SET state='succeeded', finished_at_ms=$n WHERE module_id='rollups' AND state='cancelled'", ("$n", h.Clock.NowMs)));
+            await RunAsync(h, minutes: 11);
+            Assert.DoesNotContain(h.Monitors.Health().Open, i => i.Kind == "jobs_dead" && i.Subject == "rollups");
+            Assert.Contains(h.Monitors.Health().Resolved, i => i.Kind == "jobs_dead" && i.Subject == "rollups");
         }
 
         /// <summary>
