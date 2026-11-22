@@ -93,9 +93,40 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
     [ApiContract]
     public sealed record KnowledgeJobStartedDto(long JobId, string? Detail = null);
 
+    /// <summary>One item waiting for Klives's decision. <c>DetailJson</c> is what the module stored (it carries ids);
+    /// <c>Context</c> is the same named, and is what a page shows.</summary>
     [ApiContract]
     public sealed record KnowledgeReviewItemDto(string ItemId, string Kind, string? SubjectId, string Title, string? DetailJson, double Priority, string State, long CreatedAtMs,
-        long UpdatedAtMs, long? ResolvedAtMs, string? Resolution, string? Actor);
+        long UpdatedAtMs, long? ResolvedAtMs, string? Resolution, string? Actor, ReviewContextDto? Context = null);
+
+    /// <summary>
+    /// What a review item points at, named, so a page shows people, places and what was said instead of the ids its detail
+    /// carries. <c>People</c> names everyone it mentions (the subject included); <c>Messages</c> are the messages it rests on,
+    /// in context. The rest is set for the kinds with a decision of their own: <c>Alias</c> (alias), <c>Fact</c> (contradiction,
+    /// flapping, unproven, possible_change, rejected_resurfaced), <c>Age</c> (age_conflict), <c>Link</c> (identity_link).
+    /// </summary>
+    [ApiContract]
+    public sealed record ReviewContextDto(IReadOnlyDictionary<string, string> People, IReadOnlyList<EvidenceContextDto> Messages, ReviewAliasDto? Alias = null, ReviewFactDto? Fact = null,
+        IReadOnlyList<AgeStatementDto>? Age = null, ReviewLinkDto? Link = null);
+
+    /// <summary>A name people use for someone, as it stands now: where it is used (<c>PlaceName</c>: the server or chat by name;
+    /// <c>PlaceKind</c>: server, group or dm) and how often, by how many people.</summary>
+    [ApiContract]
+    public sealed record ReviewAliasDto(string AliasId, string Alias, string NameKind, string Status, string ScopeKind, string? ScopeId, string? PlaceName, string? PlaceKind,
+        int Usages, int Speakers, int SelfClaims, bool CommonWord, long FirstSeenMs, long LastSeenMs);
+
+    /// <summary>The fact a review item is about, as it stands now (<c>AssertionId</c> opens it with its evidence), and every value in question.</summary>
+    [ApiContract]
+    public sealed record ReviewFactDto(string Attribute, string AttributeTitle, string? AssertionId, string? Value, string? Status, string? ObjectPersonId, IReadOnlyList<string> Values);
+
+    /// <summary>An account by what it is called: the platform, the name it shows now, its handle when that differs, and whose it is.</summary>
+    [ApiContract]
+    public sealed record ReviewAccountDto(string Platform, string? Name, string? Handle, string PersonId);
+
+    /// <summary>Two accounts that may be one person, and where the suggestion stands.</summary>
+    [ApiContract]
+    public sealed record ReviewLinkDto(string LinkId, string Verdict, ReviewAccountDto A, ReviewAccountDto B, double Probability, int IndependentSignals, IReadOnlyList<LinkSignalDto> Signals,
+        long? MergeId);
 
     [ApiContract]
     public sealed record KnowledgeReviewPageDto(long AsOfMs, IReadOnlyList<KnowledgeReviewItemDto> Items, string? NextCursor);
@@ -147,9 +178,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
     [ApiContract]
     public sealed record LinkSignalDto(string Kind, double Strength, string Detail);
 
+    /// <summary>Two accounts that may be one person. <c>AccountA</c>/<c>AccountB</c> say what the accounts are called (the
+    /// identity ids are for requests, never for reading).</summary>
     [ApiContract]
     public sealed record IdentityLinkDto(string LinkId, string IdentityA, string IdentityB, string PersonA, string PersonB, IReadOnlyList<LinkSignalDto> Signals, int IndependentSignals,
-        double Probability, string Verdict, string? JudgeJson, long CreatedAtMs, long UpdatedAtMs, long? DecidedAtMs, long? MergeId);
+        double Probability, string Verdict, string? JudgeJson, long CreatedAtMs, long UpdatedAtMs, long? DecidedAtMs, long? MergeId, ReviewAccountDto? AccountA = null,
+        ReviewAccountDto? AccountB = null);
 
     [ApiContract]
     public sealed record IdentityLinkPageDto(IReadOnlyList<IdentityLinkDto> Items, string? NextCursor);
@@ -174,7 +208,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
     public sealed record UnmergeRequest(long MergeId);
 
     [ApiContract]
-    public sealed record MergeRowDto(long MergeId, string FromPersonId, string IntoPersonId, long MergedAtMs, string Actor, string? Reason, long? UndoneAtMs);
+    /// <summary>One merge of two people. <c>FromName</c>/<c>IntoName</c> are each person's own name (a person merged into
+    /// another is otherwise known by the name of the one it joined, so both sides would read the same).</summary>
+    public sealed record MergeRowDto(long MergeId, string FromPersonId, string IntoPersonId, long MergedAtMs, string Actor, string? Reason, long? UndoneAtMs, string? FromName = null,
+        string? IntoName = null);
 
     [ApiContract]
     public sealed record PlanPageDto(IReadOnlyList<PlanItemDto> Items, string? NextCursor);

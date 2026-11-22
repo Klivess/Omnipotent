@@ -133,8 +133,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                 try
                 {
                     var (items, next) = review.Page(q.Str("state", 16) ?? ReviewStates.Open, q.Str("kind", 32), person, (q.Str("sort", 16) ?? "priority") == "age", q.Str("cursor", 256), q.Int("limit", 100, 1, 500));
-                    return ApiResponses.OkAsync(req, new KnowledgeReviewPageDto(Rt.Clock.NowMs, items.Select(i => new KnowledgeReviewItemDto(i.ItemId, i.Kind, i.SubjectId, i.Title, i.DetailJson,
-                        i.Priority, i.State, i.CreatedAtMs, i.UpdatedAtMs, i.ResolvedAtMs, i.Resolution, i.Actor)).ToList(), next));
+                    // Each item with what it points at named (people, places, the words said, the thing to decide): its detail carries ids.
+                    return ApiResponses.OkAsync(req, new KnowledgeReviewPageDto(Rt.Clock.NowMs, new ReviewContexts(Kit, Rt.Stores).Dtos(items), next));
                 }
                 catch (ArgumentException ex) { throw ApiException.BadRequest(ex.Message); }
             }, ct).ConfigureAwait(false);
@@ -266,7 +266,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                 try
                 {
                     var (items, next) = Module<IdentityModule>().Page(q.Str("verdict", 16) ?? "suggested", q.Str("person", 256), q.Str("cursor", 128), q.Int("limit", 50, 1, 500));
-                    return ApiResponses.OkAsync(req, new IdentityLinkPageDto(items.Select(ToDto).ToList(), next));
+                    var accounts = new ReviewContexts(Kit, Rt.Stores).Accounts(items.SelectMany(l => new[] { l.IdentityA, l.IdentityB }).ToList());
+                    return ApiResponses.OkAsync(req, new IdentityLinkPageDto(items.Select(l => ToDto(l, accounts)).ToList(), next));
                 }
                 catch (ArgumentException ex) { throw ApiException.BadRequest(ex.Message); }
             }, ct).ConfigureAwait(false);
@@ -280,7 +281,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                 try
                 {
                     var (link, merge) = await Module<IdentityModule>().DecideAsync(body.LinkId, body.Accept, ApiBody.Actor(req), body.Note, host.Stopping).ConfigureAwait(false);
-                    await ApiResponses.OkAsync(req, new IdentityLinkDecisionDto(ToDto(link), merge == null ? null : new MergeResultDto(merge.MergeId, merge.Survivor, merge.Absorbed, merge.Changed, merge.Reason))).ConfigureAwait(false);
+                    var accounts = new ReviewContexts(Kit, Rt.Stores).Accounts(new[] { link.IdentityA, link.IdentityB });
+                    await ApiResponses.OkAsync(req, new IdentityLinkDecisionDto(ToDto(link, accounts), merge == null ? null : new MergeResultDto(merge.MergeId, merge.Survivor, merge.Absorbed, merge.Changed, merge.Reason))).ConfigureAwait(false);
                 }
                 catch (InvalidOperationException ex) { throw ApiException.Conflict(ex.Message); }
             }, ct).ConfigureAwait(false);
@@ -314,8 +316,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
             }, ct).ConfigureAwait(false);
 
             await Get("persons/merges", OmnisciencePerms.PersonsRead, req =>
-                ApiResponses.OkAsync(req, new PersonMerges(Rt.Stores, Rt.Clock, Kit.Corpus).History(ApiQuery.Of(req).Required("person", 256))
-                    .Select(m => new MergeRowDto(m.MergeId, m.FromPersonId, m.IntoPersonId, m.MergedAtMs, m.Actor, m.Reason, m.UndoneAtMs)).ToList()), ct).ConfigureAwait(false);
+            {
+                var history = new PersonMerges(Rt.Stores, Rt.Clock, Kit.Corpus).History(ApiQuery.Of(req).Required("person", 256));
+                var own = new ReviewContexts(Kit, Rt.Stores).OwnNames(history.SelectMany(m => new[] { m.FromPersonId, m.IntoPersonId }).ToList());
+                return ApiResponses.OkAsync(req, history.Select(m => new MergeRowDto(m.MergeId, m.FromPersonId, m.IntoPersonId, m.MergedAtMs, m.Actor, m.Reason, m.UndoneAtMs,
+                    own.GetValueOrDefault(m.FromPersonId), own.GetValueOrDefault(m.IntoPersonId))).ToList());
+            }, ct).ConfigureAwait(false);
 
             // ── timeline, plans, agenda ─────────────────────────────────────────
             await Get("timeline", OmnisciencePerms.PersonsRead, req => ServeReadModel(req, TimelineModule.ReadModel, Kit.Corpus.Canonical(ApiQuery.Of(req).Required("person", 256))), ct).ConfigureAwait(false);
@@ -445,20 +451,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
             ",\"schemaVersion\":" + row.SchemaVersion.ToString(CultureInfo.InvariantCulture) + ",\"asOfMs\":" + row.AsOfMs.ToString(CultureInfo.InvariantCulture) +
             ",\"sourceSeq\":" + row.SourceSeq.ToString(CultureInfo.InvariantCulture) + ",\"computedAtMs\":" + row.ComputedAtMs.ToString(CultureInfo.InvariantCulture) + ",\"body\":" + row.BodyJson + "}";
 
-        private IReadOnlyList<EvidenceContextDto> Context(KnowledgeKit kit, IReadOnlyList<EvidenceRef> evidence)
-        {
-            var messages = kit.Corpus.Messages(evidence.Select(e => e.MessageId).Distinct().ToList()).ToDictionary(m => m.MessageId, StringComparer.Ordinal);
-            var conversations = kit.Corpus.Conversations(messages.Values.Select(m => m.ConversationId).Distinct().ToList());
-            return evidence.Select(e =>
-            {
-                messages.TryGetValue(e.MessageId, out var m);
-                var conv = m != null && conversations.TryGetValue(m.ConversationId, out var cv) ? cv : null;
-                string? text = m == null ? null : kit.Corpus.VersionText(e.MessageId, e.MessageVersion) ?? m.Content;
-                return new EvidenceContextDto(e.MessageId, e.MessageVersion, e.Role, e.Quote, e.Weight, e.SentAtMs ?? m?.SentAtMs, m?.AuthorPersonId,
-                    m?.AuthorPersonId == null ? null : kit.Corpus.DisplayName(m.AuthorPersonId), m?.ConversationId, conv?.Kind, conv?.Title, m?.GuildId, conv?.GuildName, m?.Platform,
-                    m?.DeletedAtMs != null, m?.EditedAtMs != null, text == null ? null : Evidence.EvidenceRenderer.Truncate(text, 2_000));
-            }).ToList();
-        }
+        private IReadOnlyList<EvidenceContextDto> Context(KnowledgeKit kit, IReadOnlyList<EvidenceRef> evidence) =>
+            EvidenceContexts.List(kit, evidence, new ReviewContexts(kit, Rt.Stores).Names);
 
         private IReadOnlyList<AgeEvidenceRow> AllAgeEvidence(string person)
         {
@@ -582,8 +576,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
                 });
         }
 
-        private static IdentityLinkDto ToDto(IdentityLinkRow l) => new(l.LinkId, l.IdentityA, l.IdentityB, l.PersonA, l.PersonB,
-            l.Signals.Select(s => new LinkSignalDto(s.Kind, s.Strength, s.Detail)).ToList(), l.IndependentSignals, l.Probability, l.Verdict, l.JudgeJson, l.CreatedAtMs, l.UpdatedAtMs, l.DecidedAtMs, l.MergeId);
+        private static IdentityLinkDto ToDto(IdentityLinkRow l, IReadOnlyDictionary<string, ReviewAccountDto> accounts) => new(l.LinkId, l.IdentityA, l.IdentityB, l.PersonA, l.PersonB,
+            l.Signals.Select(s => new LinkSignalDto(s.Kind, s.Strength, s.Detail)).ToList(), l.IndependentSignals, l.Probability, l.Verdict, l.JudgeJson, l.CreatedAtMs, l.UpdatedAtMs, l.DecidedAtMs, l.MergeId,
+            accounts.GetValueOrDefault(l.IdentityA), accounts.GetValueOrDefault(l.IdentityB));
 
         private Task Get(string path, PermissionDef permission, Func<UserRequest, Task> handler, CancellationToken ct) =>
             registrar.RouteAsync(P + path, HttpMethod.Get, permission, handler, RouteRegistrar.DefaultMaxBodyBytes, ct);
