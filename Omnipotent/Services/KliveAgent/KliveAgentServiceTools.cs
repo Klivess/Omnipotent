@@ -91,6 +91,32 @@ public sealed class KliveAgentServiceTools
         return resolved is { Mutating: false };
     }
 
+    /// <summary>
+    /// Whether a call may stop to wait for Klives' approval: an irreversible (Destructive) operation goes
+    /// through the approval gate inside the call. Such a call is given the full tool deadline rather than
+    /// the time its operation usually takes, because the wait is Klives, not the tool. An operation that
+    /// cannot be resolved from the arguments counts as one that may.
+    /// </summary>
+    public static bool MayAwaitApproval(string? toolName, string? argumentsJson)
+    {
+        if (string.IsNullOrEmpty(toolName) || !IsHandled(toolName)) return false;
+        if (toolName == OmniToolCatalog.UniversalApiTool) return false;   // routes have no approval gate
+
+        if (toolName == OmniToolCatalog.UniversalServiceTool)
+        {
+            if (!string.Equals(ReadString(argumentsJson, "op"), "call", StringComparison.OrdinalIgnoreCase)) return false;
+            var operation = OmniToolRegistry.Shared.FindOnService(
+                ReadString(argumentsJson, "service") ?? "", ReadString(argumentsJson, "method") ?? "");
+            return operation is null or { Destructive: true };
+        }
+
+        var tool = OmniToolRegistry.Shared.GetTool(toolName);
+        if (tool == null) return false;
+        var opName = ReadString(argumentsJson, "op");
+        var resolved = tool.Operations.FirstOrDefault(o => string.Equals(o.Op, opName, StringComparison.OrdinalIgnoreCase));
+        return resolved?.Destructive ?? tool.Operations.Any(o => o.Destructive);
+    }
+
     private static string? ReadString(string? json, string property)
     {
         if (string.IsNullOrWhiteSpace(json)) return null;

@@ -249,6 +249,18 @@ namespace Omnipotent.Services.KliveAgent
 
             sb.Append(compactPrompt ? BuildCompactToolGuide(userMessage, toolCallingMode) : BuildToolGuide(userMessage, toolCallingMode));
 
+            // Which tool to use first for each job, from what calls have taken on this server. Below the
+            // breakpoint because the measurements move; built from memory, so it costs nothing to add.
+            if (toolCallingMode && agentService.ToolSpeed is { } toolSpeed)
+            {
+                try
+                {
+                    sb.AppendLine();
+                    sb.Append(toolSpeed.BuildPromptBlock(computerUseEnabled));
+                }
+                catch { /* best-effort: a missing ranking must never break the prompt build */ }
+            }
+
             if (!string.IsNullOrWhiteSpace(repoMap))
             {
                 sb.AppendLine();
@@ -417,7 +429,9 @@ namespace Omnipotent.Services.KliveAgent
         /// Combined with MemoryToolNames in IsNonScriptTool.</summary>
         private static readonly HashSet<string> NativeNonMemoryTools = new(StringComparer.Ordinal)
         {
-            "grep", "read_file", "list_directory", "get_global_path", "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
+            "grep", "find_files", "read_file", "list_directory", "get_global_path", "list_data_directory", "read_data_file",
+            "tool_speed", "tool_jobs", "start_background_tool",
+            "search_knowledge", "read_knowledge_doc", "web_search", "web_fetch",
             "account_list", "account_register", "account_update",
             "klivemail_create_mailbox", "klivemail_list_messages", "klivemail_get_message", "klivemail_wait_for_email",
             "notify_klives", "task_ledger",
@@ -466,7 +480,10 @@ namespace Omnipotent.Services.KliveAgent
         /// operations, so whether the call reads or writes is decided by its 'op', not by its name.</param>
         private static bool IsParallelSafeNativeTool(string name, string? argsJson = null) => name switch
         {
-            "grep" or "read_file" or "list_directory" or "get_global_path"
+            // tool_jobs only reads unless it cancels.
+            "tool_jobs" => !string.Equals(KliveAgentToolSpeed.OperationKey(name, argsJson), "cancel", StringComparison.Ordinal),
+            "grep" or "find_files" or "read_file" or "list_directory" or "get_global_path"
+                or "list_data_directory" or "read_data_file" or "tool_speed"
                 or "recall_memories" or "recall_memories_by_tag" or "get_shortcuts"
                 or "search_knowledge" or "read_knowledge_doc" or "web_search" or "web_fetch"
                 or "account_list" or "list_scheduled_tasks"
@@ -536,12 +553,24 @@ namespace Omnipotent.Services.KliveAgent
                     }, required = new[] { "code" } }),
 
                 Tool("grep",
-                    "Search the codebase CONTENTS and return matching 'path:line' lines. Runs directly — no C#/compile step, so it cannot fail to compile. Use this for content search INSTEAD of calling SearchCode/SearchCodeRegex inside execute_csharp. 'pattern' is a regex (ripgrep-style) by default; set fixedString=true for a literal substring. Scope with 'path' (a file or subfolder, e.g. \"Omnipotent/Services/KliveAgent\").",
+                    "Search the codebase CONTENTS and return matching 'path:line: text' lines. Runs directly — no C#/compile step, so it cannot fail to compile. Use this for content search INSTEAD of calling SearchCode/SearchCodeRegex inside execute_csharp. 'pattern' is a regex by default; set fixedString=true for a literal substring. Scope with 'path' (a file or subfolder, e.g. \"Omnipotent/Services/KliveAgent\") and 'glob' (default *.cs). outputMode \"files\" lists only the files that match (fastest way to answer 'where is X used'), \"count\" counts. Skips bin/obj/node_modules and is bounded to 15 s.",
                     new { type = "object", properties = new {
                         pattern = new { type = "string", description = "Regex (or literal, if fixedString=true) to search for in file contents." },
                         path = new { type = "string", description = "Optional file or subfolder to scope the search (e.g. \"Omnipotent/Services\")." },
-                        maxResults = new { type = "integer", description = "Max matches to return (default 30)." },
+                        glob = new { type = "string", description = "Optional file filter, default \"*.cs\". e.g. \"*.{ts,vue}\", \"*.md\", \"**/Talk/*.cs\"; \"*\" searches every source file type." },
+                        outputMode = new { type = "string", description = "\"content\" (default: matching lines), \"files\" (matching files with a count each), or \"count\"." },
+                        context = new { type = "integer", description = "Lines of context around each match, 0-5 (default 0). Saves a read_file when you need the surrounding code." },
+                        ignoreCase = new { type = "boolean", description = "Case-insensitive match (default false; true when fixedString is set)." },
+                        maxResults = new { type = "integer", description = "Max matching lines (content) or files (files) to return (default 30)." },
                         fixedString = new { type = "boolean", description = "Treat pattern as a literal substring instead of regex (default false)." }
+                    }, required = new[] { "pattern" } }),
+
+                Tool("find_files",
+                    "Find FILES in the codebase by NAME, newest first (like a glob). Runs directly — no compile step. \"*Routes*.cs\" matches file names at any depth; a pattern with a slash matches the path below 'path' (\"**/Talk/*.cs\"). Use this instead of FindFiles in execute_csharp, and instead of grep when you know the file name but not its folder.",
+                    new { type = "object", properties = new {
+                        pattern = new { type = "string", description = "Glob: * and ? within a name, ** across folders, {a,b} for alternatives." },
+                        path = new { type = "string", description = "Optional subfolder to search (default: the whole codebase)." },
+                        maxResults = new { type = "integer", description = "Max files to return (default 50, max 200)." }
                     }, required = new[] { "pattern" } }),
 
                 Tool("read_file",
@@ -563,6 +592,45 @@ namespace Omnipotent.Services.KliveAgent
                     new { type = "object", properties = new {
                         key = new { type = "string", description = "A GlobalPaths field name." }
                     }, required = new[] { "key" } }),
+
+                Tool("list_data_directory",
+                    "List Omnipotent's RUNTIME data (SavedData, state files, journals, logs) newest first, with sizes and times — no script needed. 'path' starts with a GlobalPaths key (\"KliveAgentDirectory\", \"MemeScraperReelsDataDirectory/2026-11\") or is relative to the app folder (\"SavedData/KliveAgent\"). For source code use list_directory.",
+                    new { type = "object", properties = new {
+                        path = new { type = "string", description = "GlobalPaths key (optionally followed by /subfolder) or a path under the app folder. Default: SavedData." },
+                        pattern = new { type = "string", description = "Optional name filter, e.g. \"*.json\"." },
+                        recursive = new { type = "boolean", description = "Include subfolders (default false)." },
+                        maxResults = new { type = "integer", description = "Max entries to show (default 100, max 500)." }
+                    }, required = Array.Empty<string>() }),
+
+                Tool("read_data_file",
+                    "Read a RUNTIME data file (a state .json, a .jsonl journal, a log) directly — no script, no compile. Same paths as list_data_directory. fromEnd:true gives the newest lines of a journal or log without reading the whole file. Files holding credentials (settings, the account registry, vaults, keys, tokens) are refused. For source code use read_file.",
+                    new { type = "object", properties = new {
+                        path = new { type = "string", description = "GlobalPaths key + /file, or a path under the app folder, e.g. \"KliveAgentDirectory/KliveAgentStats.json\"." },
+                        startLine = new { type = "integer", description = "1-based first line (default 1)." },
+                        maxLines = new { type = "integer", description = "Max lines (default 200, max 1000)." },
+                        fromEnd = new { type = "boolean", description = "Return the LAST maxLines lines instead (newest entries of a journal/log)." }
+                    }, required = new[] { "path" } }),
+
+                Tool("tool_speed",
+                    "How long each of your tools really takes on this server (typical, slow, worst, overruns, failures over its recent calls) and the fastest tool for each kind of job. Instant, no side effects. Check it when choosing between tools that could both do a job, or when a tool seems slow.",
+                    new { type = "object", properties = new {
+                        tool = new { type = "string", description = "Optional: only tools or operations whose name contains this." }
+                    }, required = Array.Empty<string>() }),
+
+                Tool("start_background_tool",
+                    "Start a native or service tool call in the BACKGROUND and get a job id back at once, so a slow call (klivemail_wait_for_email, web_search with fetchTop, a long service operation) runs while you do other work. You are told when it finishes; tool_jobs collects the result. Not for computer_* tools, execute_csharp, wait_for or approval tools.",
+                    new { type = "object", properties = new {
+                        tool = new { type = "string", description = "The tool to run, e.g. \"klivemail_wait_for_email\"." },
+                        arguments = new { type = "object", description = "That tool's arguments, exactly as you would pass them to it." }
+                    }, required = new[] { "tool" } }),
+
+                Tool("tool_jobs",
+                    "Background tool calls in this conversation: the ones you started with start_background_tool and the ones that ran far past their usual time and were moved to the background so you were not stuck waiting. op=list (default), result (id), wait (id, or none for the first to finish; waitSeconds default 60, max 300), cancel (id).",
+                    new { type = "object", properties = new {
+                        op = new { type = "string", description = "list | result | wait | cancel" },
+                        id = new { type = "string", description = "The job id, e.g. \"job-2\"." },
+                        waitSeconds = new { type = "integer", description = "For wait: how long to block at most (default 60, max 300)." }
+                    }, required = Array.Empty<string>() }),
 
                 Tool("recall_memories",
                     "Search your long-term memory for facts about Klive, his preferences/people/projects/history, " +
@@ -891,11 +959,56 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     var pattern = Str("pattern");
                     if (string.IsNullOrWhiteSpace(pattern)) return "Error: 'pattern' is required.";
-                    var path = Str("path") ?? string.Empty;
-                    var maxResults = IntOr("maxResults", 30);
-                    return BoolOr("fixedString", false)
-                        ? globals.SearchCode(pattern, path, maxResults)
-                        : globals.SearchCodeRegex(pattern, path, maxResults);
+                    bool fixedString = BoolOr("fixedString", false);
+                    var options = new KliveAgentCodeSearch.GrepOptions(pattern, Str("path"), Str("glob"),
+                        Str("outputMode") ?? Str("output_mode") ?? "content", IntOr("context", 0),
+                        // A literal search always ignored case (it was SearchCode); a regex never did.
+                        BoolOr("ignoreCase", fixedString), fixedString, IntOr("maxResults", 30));
+                    var found = await Task.Run(() => KliveAgentCodeSearch.Grep(ScriptGlobals.CodebaseRootPath, options,
+                        KliveAgentCodeSearch.DefaultBudget, globals.CancellationToken));
+                    return MaskForModel(globals, found);
+                }
+                case "find_files":
+                {
+                    var pattern = Str("pattern") ?? Str("glob");
+                    var path = Str("path");
+                    int maxResults = IntOr("maxResults", 50);
+                    return await Task.Run(() => KliveAgentCodeSearch.FindFiles(ScriptGlobals.CodebaseRootPath, pattern ?? "", path,
+                        maxResults, KliveAgentCodeSearch.DefaultBudget, globals.CancellationToken));
+                }
+                case "list_data_directory":
+                {
+                    var path = Str("path") ?? Str("key");
+                    var pattern = Str("pattern");
+                    bool recursive = BoolOr("recursive", false);
+                    int maxResults = IntOr("maxResults", 100);
+                    return await Task.Run(() => KliveAgentDataFiles.List(path, pattern, recursive, maxResults, ct: globals.CancellationToken));
+                }
+                case "read_data_file":
+                {
+                    var path = Str("path") ?? Str("key");
+                    if (string.IsNullOrWhiteSpace(path)) return "Error: 'path' is required (a GlobalPaths key + /file, or a path under the app folder).";
+                    int startLine = IntOr("startLine", 1), maxLines = IntOr("maxLines", KliveAgentDataFiles.DefaultLines);
+                    bool fromEnd = BoolOr("fromEnd", false);
+                    var text = await Task.Run(() => KliveAgentDataFiles.Read(path, startLine, maxLines, fromEnd));
+                    return MaskForModel(globals, text);
+                }
+                case "tool_speed":
+                    return globals.AgentService?.ToolSpeed?.Describe(Str("tool") ?? Str("filter"))
+                        ?? "The tool-speed record is not loaded yet (KliveAgent is still starting).";
+                case "tool_jobs":
+                    return await globals.ToolJobs.ApplyAsync(argsJson, globals.CancellationToken);
+                case "start_background_tool":
+                {
+                    string? inner = null;
+                    if (hasArgs && root.TryGetProperty("arguments", out var a))
+                        inner = a.ValueKind switch
+                        {
+                            System.Text.Json.JsonValueKind.Object => a.GetRawText(),
+                            System.Text.Json.JsonValueKind.String => a.GetString(),
+                            _ => null,
+                        };
+                    return StartBackgroundTool(globals, Str("tool") ?? Str("name"), inner);
                 }
                 case "read_file":
                 {
@@ -1021,6 +1134,14 @@ namespace Omnipotent.Services.KliveAgent
                 default:
                     return $"Unknown native tool '{toolName}'.";
             }
+        }
+
+        /// <summary>Text read from files (code, runtime data) with any known secret value replaced, before the
+        /// model sees it. Files can hold what the vault holds; the model only ever handles references.</summary>
+        private static string MaskForModel(ScriptGlobals globals, string text)
+        {
+            try { return globals.AgentService?.SecretGuard.MaskText(text) ?? text; }
+            catch { return text; }
         }
 
         private static string FormatMemoriesResult(List<AgentMemoryEntry> memories)
@@ -1236,6 +1357,108 @@ namespace Omnipotent.Services.KliveAgent
                 _ = work.ContinueWith(t => _ = t.Exception, TaskContinuationOptions.OnlyOnFaulted);
                 return (false, $"{toolName} was stopped.");
             }
+        }
+
+        /// <summary>How a wait for a tool call ended.</summary>
+        internal enum ToolWait { Finished, Overran, Stopped }
+
+        /// <summary>Waits for a tool call at most <paramref name="patience"/> (zero: until it finishes or the
+        /// run is stopped). Unlike <see cref="WithToolDeadlineAsync"/> it leaves the call alone, so a call
+        /// that overruns can be handed to the background with its result still to come.</summary>
+        internal static async Task<ToolWait> AwaitToolAsync(Task work, TimeSpan patience, CancellationToken stop)
+        {
+            try
+            {
+                if (patience <= TimeSpan.Zero) await work.WaitAsync(stop);
+                else await work.WaitAsync(patience, stop);
+                return ToolWait.Finished;
+            }
+            catch (TimeoutException)
+            {
+                return ToolWait.Overran;
+            }
+            catch (OperationCanceledException) when (stop.IsCancellationRequested)
+            {
+                return ToolWait.Stopped;
+            }
+            catch
+            {
+                // The call itself failed: the caller reads that from the task.
+                return ToolWait.Finished;
+            }
+        }
+
+        /// <summary>What the model is told when a call outlived its patience. Starts with the finding, since
+        /// the first line is what survives compaction.</summary>
+        internal static string MovedToBackgroundText(string tool, string jobId, TimeSpan waited, ToolSpeedEstimate? usual) =>
+            $"{tool} was still running after {FormatElapsed(waited)}"
+            + (usual is { Measured: true } u ? $" (it usually takes {KliveAgentToolSpeed.FormatMs(u.TypicalMs)})" : "")
+            + $", so this step stopped waiting and moved it to the background as {jobId}. It is still running: you will be told when it finishes, "
+            + $"and tool_jobs (op:\"result\" or \"wait\", id:\"{jobId}\") collects it. Do not call it again meanwhile; carry on with other work, "
+            + "or use a faster tool for the same job.";
+
+        /// <summary>Records a call that was moved to the background once it ends, as an overrun with its real
+        /// duration, or at the deadline if it never ends: the hangs are what the record must not miss.</summary>
+        private async Task RecordMovedToolCallAsync(Task<(bool ok, string output)> work, string name, string? content,
+            System.Diagnostics.Stopwatch timer, int deadlineSeconds)
+        {
+            try
+            {
+                var cap = TimeSpan.FromSeconds(deadlineSeconds > 0 ? deadlineSeconds : 3600);
+                var remaining = cap - timer.Elapsed;
+                bool finished = remaining > TimeSpan.Zero && await Task.WhenAny(work, Task.Delay(remaining)) == work;
+                long ms = finished ? timer.ElapsedMilliseconds : (long)cap.TotalMilliseconds;
+                agentService.ToolSpeed?.Record(name, content, ms, ToolCallOutcome.Overran);
+                if (ms >= SlowToolMs)
+                    agentService.Stats?.RecordSlowTool(name, ToolOperationOf(content), ms, timedOut: !finished);
+            }
+            catch
+            {
+                // Bookkeeping only.
+            }
+        }
+
+        /// <summary>Tools that never run as a background job: scripts share the conversation's Roslyn
+        /// session, wait_for needs the progress channel, and the job tools would nest.</summary>
+        private static readonly HashSet<string> NotInBackground = new(StringComparer.Ordinal)
+        {
+            "execute_csharp", "wait_for", "start_background_tool", "tool_jobs", "task_ledger",
+        };
+
+        /// <summary>A background job is stopped if it is still running after this long.</summary>
+        internal static readonly TimeSpan BackgroundJobCeiling = TimeSpan.FromMinutes(30);
+
+        /// <summary>The start_background_tool tool: runs a native or service tool as a job of this
+        /// conversation, with its own cancellation, and answers at once with the job id.</summary>
+        internal static string StartBackgroundTool(ScriptGlobals globals, string? tool, string? innerArgs)
+        {
+            if (string.IsNullOrWhiteSpace(tool))
+                return "Error: 'tool' is required, e.g. {\"tool\":\"klivemail_wait_for_email\",\"arguments\":{\"mailbox\":\"x@klive.dev\"}}.";
+            tool = tool.Trim();
+            if (IsComputerTool(tool) || NotInBackground.Contains(tool))
+                return $"{tool} cannot run in the background (computer, script, wait and job tools run in order in the step). Call it directly.";
+            if (!IsNonScriptTool(tool))
+                return $"Unknown tool '{tool}'. start_background_tool runs one of your native or service tools by name.";
+            if (globals.ToolJobs.RunningCount >= KliveAgentToolJobs.MaxRunning)
+                return $"{KliveAgentToolJobs.MaxRunning} background jobs are already running. Collect or cancel one first (tool_jobs op:\"list\").";
+
+            var agent = globals.AgentService;
+            var cancel = CancellationTokenSource.CreateLinkedTokenSource(globals.CancellationToken);
+            if (!KliveAgentToolSpeed.IsWaitingTool(tool)) cancel.CancelAfter(BackgroundJobCeiling);
+            var jobGlobals = new ScriptGlobals(agent, cancel.Token) { ConversationId = globals.ConversationId, RunLedger = globals.RunLedger };
+            var timer = System.Diagnostics.Stopwatch.StartNew();
+            var work = Task.Run(() => RunNativeToolAsync(jobGlobals, tool, innerArgs));
+            var job = globals.ToolJobs.Add(tool, innerArgs, work, DateTime.UtcNow, moved: false, cancel);
+            _ = work.ContinueWith(t =>
+            {
+                if (t.Status == TaskStatus.RanToCompletion && !cancel.IsCancellationRequested)
+                    agent?.ToolSpeed?.Record(tool, innerArgs, timer.ElapsedMilliseconds, t.Result.ok ? ToolCallOutcome.Ok : ToolCallOutcome.Error);
+            }, TaskScheduler.Default);
+
+            var usual = agent?.ToolSpeed?.Estimate(tool, innerArgs);
+            return $"Started {tool} in the background as {job.Id}"
+                + (usual is { Measured: true } u ? $" (it usually takes {KliveAgentToolSpeed.FormatMs(u.TypicalMs)})" : "")
+                + $". Keep working: you will be told when it finishes, and tool_jobs (op:\"result\" or \"wait\", id:\"{job.Id}\") collects it.";
         }
 
         /// <summary>The 'op' (or method/path) of a tool call, so a slow call names its operation, not only its tool.</summary>
@@ -1693,6 +1916,13 @@ namespace Omnipotent.Services.KliveAgent
                 bool ledgerDue = false;
                 bool ledgerNudged = false;
 
+                // Tool speed, per run: a hang-prone tool is turned down at most once per operation (calling
+                // it again runs it), and a slow result names the faster tool at most once per tool.
+                var speedGated = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+                var speedHinted = new System.Collections.Concurrent.ConcurrentDictionary<string, byte>(StringComparer.Ordinal);
+                var runStartedUtc = DateTime.UtcNow;
+                int backgroundJobNudges = 0;
+
                 // Per-script hard timeout for the RUN (compiling has its own budget). A script that
                 // overruns it is abandoned so the agent never hangs; a script can ask for more with
                 // timeoutSeconds, up to KliveAgentRunSettings.MaxScriptTimeoutSeconds.
@@ -2145,16 +2375,73 @@ namespace Omnipotent.Services.KliveAgent
                     var speculativeTasks = new System.Collections.Concurrent.ConcurrentDictionary<string, Task<(bool ok, string output)>>();
                     async Task<(bool ok, string output)> RunNativeToolMeasuredAsync(string name, string? content)
                     {
+                        var speed = agentService.ToolSpeed;
+
+                        // A tool the record says hangs, when a much faster tool does the same job: say so
+                        // instead of running it, once. The model may know better, so a second call runs.
+                        if (settings.ToolSpeedGate && speed?.GateAdvice(name, content) is { } advice
+                            && speedGated.TryAdd(name + " " + KliveAgentToolSpeed.OperationKey(name, content), 0))
+                            return (false, advice);
+
                         var toolTimer = System.Diagnostics.Stopwatch.StartNew();
+                        var startedUtc = DateTime.UtcNow;
                         (bool ok, string output) outcome;
+                        bool moved = false, stopped = false;
+                        // An irreversible operation waits for Klives' approval inside the call, so its time
+                        // is his, not the tool's: it gets the whole deadline and stays out of the record.
+                        bool awaitsApproval = KliveAgentServiceTools.MayAwaitApproval(name, content);
                         using (performance.Measure("nativeTool"))
-                            outcome = await WithToolDeadlineAsync(RunNativeToolAsync(sharedGlobals, name, content), name,
-                                ToolDeadlineFor(name, settings.NativeToolDeadlineSeconds), cancellationToken);
-                        // Which operation was slow, on disk: two live calls ran 2 h and 3 h 16 min and nothing
-                        // recorded which they were (the tool audit only lives as long as the process).
-                        if (toolTimer.ElapsedMilliseconds >= SlowToolMs)
-                            agentService.Stats?.RecordSlowTool(name, ToolOperationOf(content), toolTimer.ElapsedMilliseconds,
-                                timedOut: !outcome.ok && outcome.output.Contains(ToolDeadlineMarker, StringComparison.Ordinal));
+                        {
+                            if (settings.AdaptiveToolPatience && speed != null)
+                            {
+                                // Wait as long as this operation's own good calls need, not ten minutes for
+                                // everything. A call that outlives that keeps running as a background job
+                                // and its result is kept, where the plain deadline threw it away.
+                                var work = RunNativeToolAsync(sharedGlobals, name, content);
+                                var patience = awaitsApproval
+                                    ? ToolDeadlineFor(name, settings.NativeToolDeadlineSeconds)
+                                    : speed.PatienceFor(name, content, settings.NativeToolDeadlineSeconds, settings.ToolPatienceFloorSeconds);
+                                switch (await AwaitToolAsync(work, patience, cancellationToken))
+                                {
+                                    case ToolWait.Finished:
+                                        outcome = await work;
+                                        break;
+                                    case ToolWait.Stopped:
+                                        outcome = (false, $"{name} was stopped.");
+                                        stopped = true;
+                                        break;
+                                    default:
+                                        var job = sharedGlobals.ToolJobs.Add(name, content, work, startedUtc, moved: true);
+                                        outcome = (false, MovedToBackgroundText(name, job.Id, toolTimer.Elapsed, speed.Estimate(name, content)));
+                                        moved = true;
+                                        if (!awaitsApproval)
+                                            _ = RecordMovedToolCallAsync(work, name, content, toolTimer, settings.NativeToolDeadlineSeconds);
+                                        break;
+                                }
+                            }
+                            else
+                            {
+                                outcome = await WithToolDeadlineAsync(RunNativeToolAsync(sharedGlobals, name, content), name,
+                                    ToolDeadlineFor(name, settings.NativeToolDeadlineSeconds), cancellationToken);
+                            }
+                        }
+
+                        long elapsedMs = toolTimer.ElapsedMilliseconds;
+                        if (!moved && !stopped)
+                        {
+                            bool deadlineHit = !outcome.ok && outcome.output.Contains(ToolDeadlineMarker, StringComparison.Ordinal);
+                            if (!awaitsApproval)
+                                speed?.Record(name, content, elapsedMs,
+                                    deadlineHit ? ToolCallOutcome.Overran : outcome.ok ? ToolCallOutcome.Ok : ToolCallOutcome.Error);
+                            // Which operation was slow, on disk: two live calls ran 2 h and 3 h 16 min and nothing
+                            // recorded which they were (the tool audit only lives as long as the process).
+                            if (elapsedMs >= SlowToolMs)
+                                agentService.Stats?.RecordSlowTool(name, ToolOperationOf(content), elapsedMs, timedOut: deadlineHit);
+                        }
+
+                        // A slow answer names the faster tool for the same job, once per tool per run.
+                        if (outcome.ok && speed?.SlowCallHint(name, content, elapsedMs) is { } hint && speedHinted.TryAdd(name, 0))
+                            outcome = (true, outcome.output + "\n" + hint);
                         return outcome;
                     }
                     void OnToolCallComplete(HFWrapper.HFToolCall tc)
@@ -2519,6 +2806,39 @@ namespace Omnipotent.Services.KliveAgent
                             continue;
                         }
 
+                        // A final answer while background jobs this run started are still out, or finished
+                        // unread: the answer may be missing what they found. Once per run.
+                        if (useToolCalling && !stuckForceFinal && !budgetForceFinal && backgroundJobNudges < 1)
+                        {
+                            var stillRunning = sharedGlobals.ToolJobs.RunningSince(runStartedUtc);
+                            var unread = sharedGlobals.ToolJobs.TakeNotices();
+                            if (stillRunning.Count > 0 || unread.Count > 0)
+                            {
+                                backgroundJobNudges++;
+                                lock (progressGate)
+                                {
+                                    if (progressText.Length > 0) progressText.AppendLine().AppendLine();
+                                    progressText.Append(finalText);
+                                }
+                                ReportProgress("running", "checking on background jobs before answering", new AgentActivityEvent
+                                {
+                                    Iteration = iteration + 1,
+                                    Kind = "think",
+                                    Text = "asked to account for background jobs before the final answer"
+                                });
+                                var note = new StringBuilder("[Background jobs] ");
+                                if (stillRunning.Count > 0)
+                                    note.Append("Still running from this run: ")
+                                        .Append(string.Join(", ", stillRunning.Select(j => $"{j.Id} ({j.Tool}, {FormatElapsed(j.Elapsed)} so far)")))
+                                        .Append(". If your answer depends on one, tool_jobs op:\"wait\" for it now. ");
+                                if (unread.Count > 0)
+                                    note.Append("Finished but not read yet:\n").Append(string.Join("\n", unread)).Append('\n');
+                                note.Append("If none of this changes your answer, give it again, and say what is still running.");
+                                SendModelPrompt(note.ToString());
+                                continue;
+                            }
+                        }
+
                         // Atomically close the steering inbox immediately before the actual return. If
                         // guidance raced with this answer, apply it and give the model another turn.
                         bool finalRetryForSteering = false;
@@ -2615,6 +2935,7 @@ namespace Omnipotent.Services.KliveAgent
                             {
                                 ComputerToolResult cr;
                                 int actingIteration = iteration + 1;
+                                var computerTimer = System.Diagnostics.Stopwatch.StartNew();
                                 using (performance.Measure("computerTool"))
                                     cr = await WithToolPulse(agentService.Computer.ExecuteAsync(computerTarget, segment.ToolName,
                                         segment.Content, conversation.ConversationId, cancellationToken, hcp =>
@@ -2623,6 +2944,10 @@ namespace Omnipotent.Services.KliveAgent
                                                 : new AgentActivityEvent { Iteration = actingIteration, Kind = hcp.Activity.Kind, Text = hcp.Activity.Text };
                                             ReportProgress("running", hcp.Note, act, frame: hcp.AnnotatedFrameJpeg, approval: hcp.Approval);
                                         }), $"running {segment.ToolName}");
+                                // Computer tools are timed for the ranking (structured page state against a
+                                // screenshot) but never cut short or moved: they act on the desktop in order.
+                                agentService.ToolSpeed?.Record(segment.ToolName, segment.Content, computerTimer.ElapsedMilliseconds,
+                                    cr.Success ? ToolCallOutcome.Ok : ToolCallOutcome.Error);
                                 if (computerTarget == KliveAgentComputerTarget.Container)
                                     computerContainerId = agentService.Computer.DesktopContainerID ?? computerContainerId;
                                 // A takeover that timed out or was declined means Klives is not at hand,
@@ -2731,6 +3056,10 @@ namespace Omnipotent.Services.KliveAgent
                             : scriptTimeout;
                         var result = await WithToolPulse(scriptSession.ExecuteAsync(segment.Content ?? string.Empty, runBudget), "running a C# script");
                         performance.Add("script", result.ExecutionTimeMs);
+                        agentService.ToolSpeed?.Record("execute_csharp", null, result.ExecutionTimeMs,
+                            result.Success ? ToolCallOutcome.Ok
+                            : result.FailureKind is "timeout" or "compile-timeout" ? ToolCallOutcome.Overran
+                            : ToolCallOutcome.Error);
                         // Compile and run apart: one "script" figure hid a 4.5 s first compile behind 132 ms later ones.
                         if (result.CompileMs is long compileMs)
                             performance.Add(result.ColdStart ? "script.coldCompile" : "script.compile", compileMs);
@@ -2870,6 +3199,11 @@ namespace Omnipotent.Services.KliveAgent
                         guidance += "\n\n[Ledger] This task is running long. Record your plan with task_ledger (op=set_plan), mark steps done as you go, "
                             + "and note the facts you had to find out: those notes are kept when earlier steps are summarised and when the server restarts.";
                     }
+
+                    // Background jobs that finished since the last step, each with what it found.
+                    var jobNotices = sharedGlobals.ToolJobs.TakeNotices();
+                    if (jobNotices.Count > 0)
+                        guidance += "\n\n" + string.Join("\n", jobNotices);
 
                     if (useToolCalling && anyToolResultsAppended)
                         SendModelPrompt(guidance);

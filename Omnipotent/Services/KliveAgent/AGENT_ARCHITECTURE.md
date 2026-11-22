@@ -291,6 +291,70 @@ later one; three Alpha Lab runs were cut by a restart and never answered; a run 
 - **A richer compaction digest inside KliveLLM.** The headline-first result gets the same effect from
   KliveAgent's side and leaves the digest Demiurge depends on byte-identical.
 
+## Tool speed: the fastest tool for the job (November 2026)
+
+A run's wall clock is model calls plus tool calls, and until now only tool calls of a minute or more
+were recorded. The model chose tools by their descriptions alone: a job `grep` does in a fraction of a
+second went to `execute_csharp` (a compile first), a page already indexed was fetched again, and an
+operation that hangs one call in five held the run for the whole ten-minute deadline each time it did.
+
+- **The record** (`KliveAgentToolSpeed`, `SavedData/KliveAgent/ToolSpeed.json`). Every native, service,
+  computer and script call is timed with its outcome (ok, error, overran). Each tool keeps its last 64
+  calls, and so does each operation where the operation changes the time: a service tool's `op`,
+  `omni_api`'s method and path (ids and numbers folded), `web_search` with or without `fetchTop`,
+  `search_knowledge` with or without messages. Every dedicated service tool also counts toward
+  `[service tools]`. Durations only: no arguments, results or content. Eight calls make a measurement
+  trusted. Until then a built-in expectation per tool stands in.
+- **Tiers.** Instant (median under 300 ms), fast (under 2 s), moderate (under 10 s), slow, and
+  hang-prone: one call in ten over two minutes, or two or more overruns making up a tenth of the calls.
+  Tools that wait on purpose (`wait_for`, `klivemail_wait_for_email`, `tool_jobs`, `request_human`, the
+  approval tools) are their own tier and are never ranked or cut short.
+- **Families.** `KliveAgentToolSpeed.Families` lists, for each goal, the tools that can reach it. Goals
+  include searching code, finding files, reading source, reading or listing runtime data, recall,
+  cross-system history, reading a page, web facts, live services, and seeing or acting on a page.
+  `execute_csharp` is in many families but is never offered as the faster choice. The live-service family
+  only sets the order: a service's own tool, `omniservice` and `omni_api` reach the same method, so
+  when that method is slow no route is faster.
+- **Steering the model.**
+  - `SpeedRule` sits in the cached operating rules.
+  - The `[Tool speed]` block below the cache breakpoint ranks each goal's tools fastest first, with
+    measured typical times rounded to a few steps so the block rarely changes. It names what is slow
+    right now.
+  - A slow result (5 s or more) gets one `[speed]` line naming the faster tool for the same job, once per
+    tool per run.
+  - The tool definitions carry nothing measured, so the tools array stays byte-stable for the prefix cache.
+- **Patience instead of one deadline** (`KliveAgent_AdaptiveToolPatience`, default on).
+  - A call is waited for four times what nine in ten of its operation's good calls take. That wait is at
+    least `KliveAgent_ToolPatienceFloorSeconds` (20) and at most `KliveAgent_NativeToolDeadlineSeconds`
+    (600). Overruns are left out of that basis, so the hangs cannot set it.
+  - A call still running after its patience is moved to a background job, so its result is kept. The
+    plain deadline threw it away. The model is told on the result's first line.
+  - An irreversible service operation waits for Klives' approval inside the call
+    (`KliveAgentServiceTools.MayAwaitApproval`). It keeps the whole deadline and stays out of the record.
+  - Computer tools are timed but never cut short or moved: they act on the desktop in order.
+- **The gate** (`KliveAgent_ToolSpeedGate`, default on). A call to a measured hang-prone tool, when a tool
+  at least five times faster does the same job, is answered once per run per operation with
+  `[NOT RUN | slow tool]` and the alternative. Calling it again runs it, because the model may know the
+  faster tool cannot do this particular job.
+- **Background jobs** (`KliveAgentToolJobs`, on the conversation's `ScriptGlobals`, not persisted).
+  - `start_background_tool` starts a native or service tool as a job with its own cancellation (30-minute
+    ceiling unless the tool waits on purpose), for example waiting for an email while doing other work.
+  - `tool_jobs` lists jobs, reads a result, waits for one job (or the first to finish) and cancels.
+  - Finished jobs are announced once in the next step's guidance, with the first line of what they found.
+  - A final answer while this run's jobs are still out, or finished unread, is sent back once.
+  - Not for computer tools, scripts, `wait_for`, `task_ledger` or the job tools themselves.
+- **New and faster tools.**
+  - `grep` is now `KliveAgentCodeSearch`: `outputMode` files or count, `context` lines, `glob` for other
+    file types, and `ignoreCase`. It skips bin, obj, node_modules and the .claude worktrees, gives each
+    regex match 250 ms and each search 15 s, and runs off the caller's thread.
+  - `find_files` searches file names by glob, newest first.
+  - `read_data_file` (a window, or `fromEnd` for the newest lines of a journal) and `list_data_directory`
+    reach runtime data under the app folder by GlobalPaths key, with no script. Files holding credentials
+    (settings, the account registry, vaults, keys, tokens, certificates) are listed but never read.
+    Everything read passes through the secret guard.
+  - `tool_speed` shows the record and the ranking.
+- **Measured:** `GET /kliveagent/stats/tools` (the record per tool and operation, and the ranking per goal).
+
 ## Computer-use reliability (October 2026)
 
 KliveAgent's own report (`computer-use-report.pdf`, 8 Oct 2026) found structured browser tools ~85%

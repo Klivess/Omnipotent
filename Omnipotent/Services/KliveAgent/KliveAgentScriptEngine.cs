@@ -41,6 +41,10 @@ namespace Omnipotent.Services.KliveAgent
         /// the task_ledger tool reads and writes.</summary>
         internal AgentRunLedger? RunLedger { get; set; }
 
+        /// <summary>This conversation's background tool calls (start_background_tool, and calls the brain
+        /// stopped waiting for), which the tool_jobs tool reads. Lives as long as the kept script session.</summary>
+        internal KliveAgentToolJobs ToolJobs { get; } = new();
+
         /// <summary>The owning agent. Internal so the brain's static tool dispatch can reach per-agent
         /// state (the Service Surface bridge) without threading it through every call.</summary>
         internal KliveAgent AgentService => agentService;
@@ -1364,6 +1368,10 @@ namespace Omnipotent.Services.KliveAgent
         // ── Codebase Reading ──
 
         private static readonly string CodebaseRoot = ResolveCodebaseRoot();
+
+        /// <summary>The source tree the codebase tools read (native grep and find_files search it too).</summary>
+        internal static string CodebaseRootPath => CodebaseRoot;
+
         private static readonly HashSet<string> AllowedExtensions = new(StringComparer.OrdinalIgnoreCase)
         {
             ".cs", ".csproj", ".sln", ".json", ".xml", ".config", ".txt", ".md",
@@ -1372,7 +1380,7 @@ namespace Omnipotent.Services.KliveAgent
             ".ts", ".tsx", ".jsx", ".html", ".css", ".scss", ".sql", ".toml",
             ".ini", ".env", ".gitignore", ".editorconfig"
         };
-        private static bool IsAllowedSourceFile(string path)
+        internal static bool IsAllowedSourceFile(string path)
         {
             string name = Path.GetFileName(path);
             return AllowedExtensions.Contains(Path.GetExtension(path))
@@ -1459,6 +1467,11 @@ namespace Omnipotent.Services.KliveAgent
                 keys[p.Name] = () => p.GetValue(null) as string;
             return keys;
         }
+
+        /// <summary>A GlobalPaths key's path (relative to the app folder), or null when no key has that
+        /// name. Used by the native data-file tools.</summary>
+        internal static string? ResolveGlobalPathKey(string key) =>
+            string.IsNullOrWhiteSpace(key) ? null : FindGlobalPath(GlobalPathKeys(), key);
 
         /// <summary>Exact, then case-insensitive. Keys from before Projects became Demiurge
         /// ("ProjectsVolumesDirectory") still resolve, so remembered scripts keep working.</summary>

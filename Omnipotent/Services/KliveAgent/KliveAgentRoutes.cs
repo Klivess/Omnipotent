@@ -994,6 +994,21 @@ namespace Omnipotent.Services.KliveAgent
                 await req.ReturnResponse(JsonConvert.SerializeObject(service.Stats.BuildScriptHealth(days)));
             }, HttpMethod.Get, KliveAgentPerms.StatusView);
 
+            // Tool speed: what each tool and operation really takes here, and the ranking per goal that the
+            // [Tool speed] prompt block is built from. Durations only, never arguments or results.
+            await CreateDurableRoute("/kliveagent/stats/tools", async req =>
+            {
+                KliveAPI.Caching.CacheDeps.MarkUncacheable("live tool-speed statistics");
+                var speed = service.ToolSpeed;
+                await req.ReturnResponse(speed == null
+                    ? JsonConvert.SerializeObject(new { ready = false })
+                    : JsonConvert.SerializeObject(speed.BuildReport(), new JsonSerializerSettings
+                    {
+                        ContractResolver = new Newtonsoft.Json.Serialization.CamelCasePropertyNamesContractResolver(),
+                        Converters = { new Newtonsoft.Json.Converters.StringEnumConverter() },
+                    }));
+            }, HttpMethod.Get, KliveAgentPerms.StatusView);
+
             await CreateRoute("/kliveagent/stats/summary", async (req) =>
             {
                 try

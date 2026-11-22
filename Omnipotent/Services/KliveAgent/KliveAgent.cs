@@ -28,6 +28,10 @@ namespace Omnipotent.Services.KliveAgent
         /// KliveAgentServiceTools.</summary>
         public KliveAgentServiceTools ServiceTools { get; private set; }
         public KliveAgentStats Stats { get; private set; } = null!;
+
+        /// <summary>How long each tool really takes here, and which tool to use first for a job. See
+        /// KliveAgentToolSpeed. Null until start-up has loaded it.</summary>
+        public KliveAgentToolSpeed? ToolSpeed { get; private set; }
         private KliveAgentAttachments? attachments;
         public KliveAgentAttachments Attachments => attachments ??= new KliveAgentAttachments();
         private KliveAgentPromptCache? promptCache;
@@ -330,6 +334,11 @@ namespace Omnipotent.Services.KliveAgent
                 };
                 await Stats.InitializeAsync();
                 if (Superseded()) return;
+
+                var toolSpeed = new KliveAgentToolSpeed(Path.Combine(
+                    OmniPaths.GetPath(OmniPaths.GlobalPaths.KliveAgentDirectory), "ToolSpeed.json"));
+                await toolSpeed.LoadAsync();
+                ToolSpeed = toolSpeed;
 
                 // Initialize subsystems
                 SetInitProgress(15, "Starting the script engine…");

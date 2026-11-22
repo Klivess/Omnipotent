@@ -245,7 +245,7 @@ namespace Omnipotent.Services.KliveAgent
         // .claude holds a coding session's worktrees, each a whole second copy of the repository: with
         // seven of them on the development machine every class was indexed eight times. Names are matched
         // below the root only, so a session whose root is itself a worktree still indexes its own files.
-        private static readonly HashSet<string> IgnoredSourceDirectories = new(StringComparer.OrdinalIgnoreCase)
+        internal static readonly HashSet<string> IgnoredSourceDirectories = new(StringComparer.OrdinalIgnoreCase)
         { "bin", "obj", "node_modules", ".git", ".vs", ".nuxt", ".output", ".idea", "serverBuild", "SavedData", ".claude" };
 
         internal static IEnumerable<string> EnumerateSourceFiles(string root, CancellationToken cancellationToken = default)

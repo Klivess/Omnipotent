@@ -38,6 +38,19 @@ internal sealed record KliveAgentRunSettings(
     /// Two live calls ran 2 h and 3 h 16 min with nothing bounding them. 0 turns the limit off.</summary>
     public int NativeToolDeadlineSeconds { get; init; } = 600;
 
+    /// <summary>Wait for each native or service tool call as long as that operation's own record says it
+    /// needs (four times what nine in ten of its good calls take, at least <see cref="ToolPatienceFloorSeconds"/>,
+    /// at most <see cref="NativeToolDeadlineSeconds"/>), and move a call that outlives it to a background
+    /// job instead of throwing it away. Off: every call waits for the full deadline, as before.</summary>
+    public bool AdaptiveToolPatience { get; init; } = true;
+
+    /// <summary>The shortest patience any tool call gets.</summary>
+    public int ToolPatienceFloorSeconds { get; init; } = 20;
+
+    /// <summary>Turn down, once per run, a call to a tool the record says is hang-prone when a much faster
+    /// tool does the same job (calling it again runs it).</summary>
+    public bool ToolSpeedGate { get; init; } = true;
+
     internal const string ThinkingBySteps = "steps";
     internal const string ThinkingByErrors = "errors";
     internal static readonly string[] ThinkingEscalationModes = { ThinkingBySteps, ThinkingByErrors };
@@ -74,8 +87,12 @@ internal sealed record KliveAgentRunSettings(
         var keepSession = agent.GetIntOmniSetting("KliveAgent_KeepScriptSessionMinutes", 20);
         var toolDeadline = agent.GetIntOmniSetting("KliveAgent_NativeToolDeadlineSeconds", 600);
         var thinking = agent.GetDropdownOmniSetting("KliveAgent_ThinkingEscalationMode", ThinkingBySteps, ThinkingEscalationModes);
+        var adaptivePatience = agent.GetBoolOmniSetting("KliveAgent_AdaptiveToolPatience", true);
+        var patienceFloor = agent.GetIntOmniSetting("KliveAgent_ToolPatienceFloorSeconds", 20);
+        var speedGate = agent.GetBoolOmniSetting("KliveAgent_ToolSpeedGate", true);
         await Task.WhenAll(stream, computer, screenshots, scriptTimeout, fast, reasoning, tokens, minutes, retries,
-            frames, idle, target, vision, compileBudget, autoRepair, keepSession, toolDeadline, thinking);
+            frames, idle, target, vision, compileBudget, autoRepair, keepSession, toolDeadline, thinking,
+            adaptivePatience, patienceFloor, speedGate);
         return new(await stream, await computer, Math.Max(1, await screenshots), Math.Max(1, await scriptTimeout),
             await fast ?? "", await reasoning ?? "", Math.Max(0, await tokens), Math.Max(0, await minutes),
             Math.Clamp(await retries, 0, 20), Math.Max(1, await frames), Math.Clamp(await idle, 30, 1800),
@@ -85,6 +102,9 @@ internal sealed record KliveAgentRunSettings(
             ScriptAutoRepair = await autoRepair,
             KeepScriptSessionMinutes = Math.Clamp(await keepSession, 0, 240),
             NativeToolDeadlineSeconds = Math.Clamp(await toolDeadline, 0, 86_400),
+            AdaptiveToolPatience = await adaptivePatience,
+            ToolPatienceFloorSeconds = Math.Clamp(await patienceFloor, 5, 600),
+            ToolSpeedGate = await speedGate,
             ThinkingEscalation = string.Equals((await thinking)?.Trim(), ThinkingByErrors, StringComparison.OrdinalIgnoreCase)
                 ? ThinkingByErrors : ThinkingBySteps,
         };
