@@ -1036,15 +1036,14 @@ namespace Omnipotent.Services.KliveLLM
             int? status = null;
             if (completion)
             {
-                // One real request with a one-token answer: proves the key, the model and the route end to end.
+                // One real request with a short answer: proves the key, the model and the route end to end.
                 var caller = new LlmCaller("KliveLLM", "router-test", router.Id, "Router test from the KliveLLM page");
                 using var call = llm.BeginCall(caller, "chat", null, AIRouterWorkClass.Interactive, stream: false);
                 try
                 {
                     string chosen = string.IsNullOrWhiteSpace(model) ? config.Model : model.Trim();
                     call.Trace.SetRoute(router.Id, router.Name, chosen, LlmCosting.BillingName(router.Billing));
-                    var payload = new HFWrapper.HFLLMInferenceRequest { model = chosen, stream = false, max_tokens = 1 };
-                    payload.BuildMessagesFromList(new List<HFWrapper.HFMessage> { new() { role = "user", content = "Reply with one word: ok" } });
+                    var payload = RouterTestPayload(config, chosen);
                     var response = await llm.SendPayloadWithRetryAsync(config, payload, CancellationToken.None, workClass: AIRouterWorkClass.Interactive);
                     call.Succeed(response);
                     reply = new
@@ -1065,15 +1064,10 @@ namespace Omnipotent.Services.KliveLLM
             }
             else
             {
-                string url = router.Kind == "openrouter" ? "https://openrouter.ai/api/v1/key"
-                    : config.ChatCompletionsEndpoint.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase)
-                        ? config.ChatCompletionsEndpoint[..^"/chat/completions".Length] + "/models"
-                        : config.ChatCompletionsEndpoint.TrimEnd('/') + "/models";
                 try
                 {
                     using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
-                    using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                    request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", config.ApiKey);
+                    using var request = KliveLLM.BuildProbeRequest(router, config);
                     using var response = await http.SendAsync(request);
                     status = (int)response.StatusCode;
                     string body = await response.Content.ReadAsStringAsync();
@@ -1090,6 +1084,30 @@ namespace Omnipotent.Services.KliveLLM
             timer.Stop();
             llm.Ledger?.Health.NoteProbe(router.Id, error == null, timer.Elapsed.TotalMilliseconds, error);
             return new { ok = error == null, stage = completion ? "completion" : "reachability", ms = timer.ElapsedMilliseconds, status, error, reply };
+        }
+
+        /// <summary>Output budget of the Test-a-reply request, reasoning included.</summary>
+        internal const int RouterTestMaxTokens = 256;
+
+        /// <summary>
+        /// The Test-a-reply request: "Reply with one word: ok", with reasoning switched off where the
+        /// router can switch it off. It used to allow one token, which a reasoning model spends on
+        /// thinking before it writes anything. OpenAI then refuses the whole request (HTTP 400, "max_tokens
+        /// or model output limit was reached") rather than returning a cut-off answer, so the OpenAI router
+        /// (gpt-6-luna) could never pass. A model that cannot stop reasoning (DeepSeek on AIRouter) still
+        /// fits a short answer in the budget.
+        /// </summary>
+        internal static HFWrapper.HFLLMInferenceRequest RouterTestPayload(KliveLLM.RemoteLLMProviderConfiguration config, string model)
+        {
+            var payload = new HFWrapper.HFLLMInferenceRequest { model = model, stream = false, max_tokens = RouterTestMaxTokens };
+            payload.reasoning_effort = config.Provider switch
+            {
+                KliveLLM.LLMProvider.OpenAI => KliveLLM.OpenAIReasoningEffort(model, "off", hasTools: false),
+                KliveLLM.LLMProvider.AIRouter => KliveLLM.AIRouterReasoningEffort(model, "off"),
+                _ => null,
+            };
+            payload.BuildMessagesFromList(new List<HFWrapper.HFMessage> { new() { role = "user", content = "Reply with one word: ok" } });
+            return payload;
         }
 
         // ── exports ──

@@ -83,6 +83,59 @@ public sealed class OpenAIProviderTests
         Assert.DoesNotContain("max_completion_tokens", Newtonsoft.Json.JsonConvert.SerializeObject(other));
     }
 
+    // ── The KliveLLM page's router tests ──
+
+    [Fact]
+    public void TestAReply_LeavesRoomToAnswer_WithReasoningOffWhereTheRouterCanTurnItOff()
+    {
+        // OpenAI refuses the whole request when a reasoning model runs out of budget, so one token never passed.
+        var openai = new LlmService.RemoteLLMProviderConfiguration(LlmService.LLMProvider.OpenAI, "OpenAI", "https://api.openai.com/v1/chat/completions", "k", "gpt-6-luna");
+        var payload = KliveLLMRoutes.RouterTestPayload(openai, "gpt-6-luna");
+        Assert.Equal("none", payload.reasoning_effort);
+        LlmService.ApplyOpenAIWireRules(ref payload, openai);
+        Assert.Equal(KliveLLMRoutes.RouterTestMaxTokens, payload.max_completion_tokens);
+        Assert.True(KliveLLMRoutes.RouterTestMaxTokens >= 64);
+
+        var airouter = new LlmService.RemoteLLMProviderConfiguration(LlmService.LLMProvider.AIRouter, "AIRouter", "https://api.airouter.ch/v1/chat/completions", "k", "Qwen3.8");
+        Assert.Equal("none", KliveLLMRoutes.RouterTestPayload(airouter, "Qwen3.8").reasoning_effort);
+
+        // Added routers (Anthropic's OpenAI-compatible endpoint among them) get no field they might refuse.
+        var anthropic = new LlmService.RemoteLLMProviderConfiguration(LlmService.LLMProvider.CustomOpenAI, "Anthropic", "https://api.anthropic.com/v1/chat/completions", "k", "claude-haiku-5-5");
+        var added = KliveLLMRoutes.RouterTestPayload(anthropic, "claude-haiku-5-5");
+        Assert.Null(added.reasoning_effort);
+        Assert.Equal(KliveLLMRoutes.RouterTestMaxTokens, added.max_tokens);
+        Assert.DoesNotContain("reasoning_effort", Newtonsoft.Json.JsonConvert.SerializeObject(added));
+    }
+
+    [Fact]
+    public void Probe_OfAnthropic_SendsItsOwnKeyAndVersionHeaders()
+    {
+        var router = new LlmRouterDefinition { Id = "anthropic", Name = "Anthropic", Kind = "openai", BaseUrl = "https://api.anthropic.com/v1" };
+        var config = new LlmService.RemoteLLMProviderConfiguration(LlmService.LLMProvider.CustomOpenAI, "Anthropic", "https://api.anthropic.com/v1/chat/completions", "sk-ant-test", "claude-haiku-5-5");
+        using var request = LlmService.BuildProbeRequest(router, config);
+        Assert.Equal(HttpMethod.Get, request.Method);
+        Assert.Equal("https://api.anthropic.com/v1/models?limit=1000", request.RequestUri!.ToString());
+        Assert.Equal("sk-ant-test", request.Headers.GetValues("x-api-key").Single());
+        Assert.Equal(LlmService.AnthropicApiVersion, request.Headers.GetValues("anthropic-version").Single());
+        Assert.Null(request.Headers.Authorization);
+    }
+
+    [Theory]
+    [InlineData("openai", "https://api.openai.com/v1/chat/completions", "https://api.openai.com/v1/models")]
+    [InlineData("airouter", "https://api.airouter.ch/v1/chat/completions", "https://api.airouter.ch/v1/models")]
+    [InlineData("openai", "https://example.com/v1", "https://example.com/v1/models")]
+    [InlineData("openrouter", "https://openrouter.ai/api/v1/chat/completions", "https://openrouter.ai/api/v1/key")]
+    public void Probe_OfOtherRouters_IsABearerGet(string kind, string endpoint, string expectedUrl)
+    {
+        var router = new LlmRouterDefinition { Id = kind, Name = kind, Kind = kind };
+        var config = new LlmService.RemoteLLMProviderConfiguration(LlmService.LLMProvider.CustomOpenAI, kind, endpoint, "k", "m");
+        using var request = LlmService.BuildProbeRequest(router, config);
+        Assert.Equal(expectedUrl, request.RequestUri!.ToString());
+        Assert.Equal("Bearer k", request.Headers.Authorization?.ToString());
+        Assert.False(request.Headers.Contains("anthropic-version"));
+        Assert.False(LlmService.IsAnthropicEndpoint(endpoint));
+    }
+
     [Fact]
     public void OpenAIPrices_FallBackToOpenRoutersListing()
     {

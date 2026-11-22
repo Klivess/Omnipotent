@@ -170,18 +170,10 @@ public partial class KliveLLM
             catch { continue; } // no key: nothing to probe
             if (config == null) continue;
 
-            string url = router.Kind switch
-            {
-                "openrouter" => "https://openrouter.ai/api/v1/key",
-                _ => config.ChatCompletionsEndpoint.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase)
-                    ? config.ChatCompletionsEndpoint[..^"/chat/completions".Length] + "/models"
-                    : config.ChatCompletionsEndpoint.TrimEnd('/') + "/models",
-            };
             var timer = System.Diagnostics.Stopwatch.StartNew();
             try
             {
-                using var request = new HttpRequestMessage(HttpMethod.Get, url);
-                request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.ApiKey);
+                using var request = BuildProbeRequest(router, config);
                 using var response = await probeHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, ct);
                 // Never read an unbounded body: the model lists of some routers are large.
                 string body = await ReadCappedAsync(response, 2 * 1024 * 1024, ct);
@@ -221,6 +213,46 @@ public partial class KliveLLM
             }
         }
     }
+
+    /// <summary>Anthropic's API version header, required on its own endpoints (the model list among them).</summary>
+    internal const string AnthropicApiVersion = "2023-06-01";
+
+    /// <summary>
+    /// The light request that shows a router is reachable with its key, shared by the minute probe and
+    /// the page's Test button: OpenRouter's key endpoint, otherwise the model list beside the chat
+    /// endpoint. Anthropic's chat endpoint is OpenAI-compatible and takes a Bearer key, but its model
+    /// list is Anthropic's own API, which refuses a request without x-api-key and anthropic-version
+    /// (HTTP 400). Before this, every quiet minute counted Anthropic as down. It also returns 20 models
+    /// unless asked for more.
+    /// </summary>
+    internal static HttpRequestMessage BuildProbeRequest(LlmRouterDefinition router, RemoteLLMProviderConfiguration config)
+    {
+        if (router.Kind == "openrouter")
+        {
+            var keyRequest = new HttpRequestMessage(HttpMethod.Get, "https://openrouter.ai/api/v1/key");
+            keyRequest.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.ApiKey);
+            return keyRequest;
+        }
+        string endpoint = config.ChatCompletionsEndpoint;
+        string url = endpoint.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase)
+            ? endpoint[..^"/chat/completions".Length] + "/models"
+            : endpoint.TrimEnd('/') + "/models";
+        if (IsAnthropicEndpoint(endpoint))
+        {
+            var anthropic = new HttpRequestMessage(HttpMethod.Get, url + "?limit=1000");
+            anthropic.Headers.Add("x-api-key", config.ApiKey);
+            anthropic.Headers.Add("anthropic-version", AnthropicApiVersion);
+            return anthropic;
+        }
+        var request = new HttpRequestMessage(HttpMethod.Get, url);
+        request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", config.ApiKey);
+        return request;
+    }
+
+    /// <summary>Whether <paramref name="endpoint"/> is Anthropic's own API (api.anthropic.com).</summary>
+    internal static bool IsAnthropicEndpoint(string? endpoint) =>
+        Uri.TryCreate(endpoint, UriKind.Absolute, out var uri)
+        && uri.Host.Equals("api.anthropic.com", StringComparison.OrdinalIgnoreCase);
 
     private static async Task<string> ReadCappedAsync(HttpResponseMessage response, int maxBytes, CancellationToken ct)
     {

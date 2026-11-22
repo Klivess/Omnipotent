@@ -539,19 +539,20 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
                 lastCheckpointMs = now;
                 CheckpointStores();
             }
-            if (now - lastPruneMs >= (long)TimeSpan.FromHours(6).TotalMilliseconds)
+            if (now - lastPruneMs >= (long)PruneEvery.TotalMilliseconds)
             {
                 lastPruneMs = now;
                 await Events.PruneAsync(options.StreamRetention, ct).ConfigureAwait(false);
-                await stores.Intel.WriteAsync((c, tx) =>
-                {
-                    c.Exec(tx, "DELETE FROM jobs WHERE state IN ('succeeded','cancelled') AND finished_at_ms < $cut",
-                        ("$cut", now - (long)options.SucceededJobRetention.TotalMilliseconds));
-                    c.Exec(tx, "DELETE FROM jobs WHERE state='dead' AND finished_at_ms < $cut",
-                        ("$cut", now - (long)options.DeadJobRetention.TotalMilliseconds));
-                }, ct).ConfigureAwait(false);
+                // A few hundred of the oldest finished jobs at a time, never a statement over all of them: see
+                // JobQueue.PruneFinishedAsync for the twenty minutes that cost every lane after each start.
+                var pruned = await Jobs.PruneFinishedAsync(options.SucceededJobRetention, options.DeadJobRetention, ct).ConfigureAwait(false);
+                // More than one round's worth is old enough: the next round carries on instead of waiting ten minutes.
+                if (pruned.More) lastPruneMs = 0;
             }
         }
+
+        /// <summary>How often finished jobs and stream events past their retention are removed.</summary>
+        internal static TimeSpan PruneEvery { get; set; } = TimeSpan.FromMinutes(10);
 
         public const string LeftBehindProblem = "handlers_left_behind";
         private string leftBehindReported = "";

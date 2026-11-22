@@ -20,6 +20,8 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
         private interface IWriteOp
         {
             CancellationToken Token { get; }
+            /// <summary>Who asked for the write ("ModuleHost.RunMaintenanceOnceAsync"), for the line a slow one leaves.</summary>
+            string Origin { get; }
             void Execute(SqliteConnection conn, SqliteTransaction tx);
             void Complete();
             void Fail(Exception ex);
@@ -30,15 +32,19 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
         {
             private readonly Func<SqliteConnection, SqliteTransaction, T> work;
             private readonly TaskCompletionSource<T> tcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            private readonly string caller, file;
             private T? result;
 
-            public WriteOp(Func<SqliteConnection, SqliteTransaction, T> work, CancellationToken token)
+            public WriteOp(Func<SqliteConnection, SqliteTransaction, T> work, CancellationToken token, string caller, string file)
             {
                 this.work = work;
                 Token = token;
+                this.caller = caller;
+                this.file = file;
             }
 
             public CancellationToken Token { get; }
+            public string Origin => (file.Length == 0 ? "" : System.IO.Path.GetFileNameWithoutExtension(file) + ".") + (caller.Length == 0 ? "?" : caller);
             public Task<T> Task => tcs.Task;
             public void Execute(SqliteConnection conn, SqliteTransaction tx) => result = work(conn, tx);
             public void Complete() => tcs.TrySetResult(result!);
@@ -49,15 +55,26 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
         private readonly Channel<IWriteOp> channel = Channel.CreateUnbounded<IWriteOp>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
         private readonly SqliteConnection conn;
         private readonly int maxBatch;
+        private readonly Action<string, TimeSpan, long>? onSlow;
         private readonly Task loop;
         private long pending;
         private long committedBatches;
         private long lastCommitMicros;
 
-        public WriterQueue(SqliteConnection openWriteConnection, int maxBatch = 256)
+        /// <summary>
+        /// One write that takes this long has kept every other write of its file waiting for as long, and is told to
+        /// <c>onSlow</c> when it ends. A file has one writer: on the server a clean-up statement held intel.db's for
+        /// twenty minutes after every start, and all that showed was that no job finished (22 Nov 2026).
+        /// </summary>
+        internal static TimeSpan SlowOperation { get; set; } = TimeSpan.FromSeconds(5);
+
+        /// <param name="onSlow">Told (who asked, how long it took, how many writes were waiting) when one write took
+        /// <see cref="SlowOperation"/> or longer.</param>
+        public WriterQueue(SqliteConnection openWriteConnection, int maxBatch = 256, Action<string, TimeSpan, long>? onSlow = null)
         {
             conn = openWriteConnection;
             this.maxBatch = Math.Max(1, maxBatch);
+            this.onSlow = onSlow;
             // Owned long-running loop, awaited in DisposeAsync: not fire-and-forget.
             loop = Task.Factory.StartNew(RunAsync, CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap();
         }
@@ -66,10 +83,10 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
         public long CommittedBatches => Interlocked.Read(ref committedBatches);
         public TimeSpan LastCommitDuration => TimeSpan.FromTicks(Interlocked.Read(ref lastCommitMicros) * 10);
 
-        public Task<T> Enqueue<T>(Func<SqliteConnection, SqliteTransaction, T> work, CancellationToken token)
+        public Task<T> Enqueue<T>(Func<SqliteConnection, SqliteTransaction, T> work, CancellationToken token, string caller = "", string file = "")
         {
             ArgumentNullException.ThrowIfNull(work);
-            var op = new WriteOp<T>(work, token);
+            var op = new WriteOp<T>(work, token, caller, file);
             Interlocked.Increment(ref pending);
             if (!channel.Writer.TryWrite(op))
             {
@@ -95,10 +112,12 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
                 try
                 {
                     tx = conn.BeginTransaction();
-                    foreach (var op in batch)
+                    for (int i = 0; i < batch.Count; i++)
                     {
+                        var op = batch[i];
                         if (op.Token.IsCancellationRequested) { op.Cancel(); continue; }
                         conn.Exec(tx, "SAVEPOINT op");
+                        long began = Stopwatch.GetTimestamp();
                         try
                         {
                             op.Execute(conn, tx);
@@ -111,6 +130,9 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
                             conn.Exec(tx, "RELEASE op");
                             op.Fail(ex);
                         }
+                        var took = Stopwatch.GetElapsedTime(began);
+                        // Waiting behind it: the rest of this batch, and whatever was queued while it ran.
+                        if (onSlow != null && took >= SlowOperation) ReportSlow(op.Origin, took, Interlocked.Read(ref pending) - 1 - i);
                     }
                     tx.Commit();
                     foreach (var op in succeeded) op.Complete();
@@ -131,6 +153,20 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
                     Interlocked.Increment(ref committedBatches);
                     Interlocked.Exchange(ref lastCommitMicros, (long)(sw.Elapsed.TotalMilliseconds * 1000));
                 }
+            }
+        }
+
+        /// <summary>Tells whoever listens about a slow write. Nothing the listener does may stop the writer.</summary>
+        private void ReportSlow(string origin, TimeSpan took, long waiting)
+        {
+            try
+            {
+                onSlow!(origin, took, Math.Max(0, waiting));
+            }
+            catch (Exception)
+            {
+                // A log that could not be written is not a reason to fail the writes that follow.
+                return;
             }
         }
 

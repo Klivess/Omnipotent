@@ -44,15 +44,24 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         public Task CommitAsync(SliceCommit commit, string promptVersion, string? model, CancellationToken ct)
         {
             long now = clock.NowMs;
+            // Which of the anchors were read before is looked up before the write, on a read connection: a lookup made
+            // inside it is a page read from the drive while the store's one writer is held. One job reads a person at a
+            // time, so nothing else covers these messages for them in between.
+            var anchorIds = commit.Anchors.Select(a => a.MessageId).Distinct(StringComparer.Ordinal).ToList();
+            int newlyCovered = anchorIds.Count;
+            if (anchorIds.Count > 0)
+            {
+                using var read = stores.Intel.OpenRead();
+                newlyCovered -= read.QueryIn(null, "SELECT message_id FROM kn_coverage WHERE message_id IN ({keys}) AND person_id=$p", anchorIds, r => r.GetString(0), 500,
+                    ("$p", commit.CoveragePersonId)).Distinct(StringComparer.Ordinal).Count();
+            }
             return stores.Intel.WriteAsync((c, tx) =>
             {
                 foreach (var v in commit.Verified) InsertVerified(c, tx, v, commit.SourceSeq, now);
                 foreach (var r in commit.Rejected) InsertRejected(c, tx, r, commit.RunId, promptVersion, model, commit.SourceSeq, now);
                 foreach (var a in commit.AgeEvidence) UpsertAge(c, tx, a, commit.SourceSeq, now);
-                int newlyCovered = 0;
                 foreach (var (messageId, version) in commit.Anchors)
                 {
-                    if (c.Scalar<long?>(tx, "SELECT 1 FROM kn_coverage WHERE person_id=$p AND message_id=$m", ("$p", commit.CoveragePersonId), ("$m", messageId)) == null) newlyCovered++;
                     c.Exec(tx, """
                         INSERT INTO kn_coverage(person_id, message_id, message_version, prompt_version, run_id, outcome, covered_at_ms) VALUES($p,$m,$v,$pv,$r,$o,$t)
                         ON CONFLICT(person_id, message_id) DO UPDATE SET message_version=excluded.message_version, prompt_version=excluded.prompt_version,

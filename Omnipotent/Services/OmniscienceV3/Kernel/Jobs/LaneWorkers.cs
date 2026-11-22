@@ -74,7 +74,10 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         public int Express { get; init; }
 
         /// <summary>A kind whose runs have lately taken longer than this is not taken by an express worker.</summary>
-        public TimeSpan ExpressLimit { get; init; } = TimeSpan.FromSeconds(30);
+        /// <remarks>Two minutes: the health check runs for 37 to 119 s on the server and the copy of v2's messages for 5 to
+        /// 66 s, and those are the two whose lateness is seen at once (notices hours old, no new messages). At thirty
+        /// seconds both counted as long and waited with the mirror and the drains for an ordinary worker.</remarks>
+        public TimeSpan ExpressLimit { get; init; } = TimeSpan.FromMinutes(2);
 
         /// <summary>
         /// How many workers of the lane a module that is working through a backlog (<see cref="JobQueue.BacklogJobs"/>)
@@ -144,9 +147,11 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         }
 
         /// <summary>How long the runs of each kind of job have lately taken (a moving average, in milliseconds), learned as
-        /// they run. A kind nobody has seen yet counts as short. What decides an express worker's choice is written down
-        /// (<see cref="SavePaceAsync"/>) and read back at the next start: without that, an express worker took every long
-        /// kind once more after each restart, and the server is restarted with every deploy.</summary>
+        /// they run, written down (<see cref="SavePaceAsync"/>) and read back at the next start. An express worker takes
+        /// only kinds that are known here to be short: on the first start with express workers both took a kind nobody
+        /// had measured yet (a Discord pull, a replica readiness count) and were held by it like any other worker, and
+        /// the server is restarted with every deploy (22 Nov 2026). A kind nobody has seen is run once by an ordinary
+        /// worker first.</summary>
         private readonly System.Collections.Concurrent.ConcurrentDictionary<(string Module, string Kind), double> typicalMs = new();
 
         /// <summary>What of <see cref="typicalMs"/> the queue's store holds.</summary>
@@ -171,8 +176,9 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
 
         /// <summary>
         /// Writes down how long <paramref name="job"/>'s kind takes when that changes what an express worker of
-        /// <paramref name="lane"/> does with it: the kind has become long, has stopped being long, or is long and has
-        /// doubled or halved. A short kind that stays short is never written.
+        /// <paramref name="lane"/> does with it: the kind has been measured for the first time, has become long, has
+        /// stopped being long, or is long and has doubled or halved. A short kind is written once and not again while
+        /// it stays short.
         /// </summary>
         private async Task SavePaceAsync(JobRecord job, LaneOptions lane)
         {
@@ -185,7 +191,6 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                 bool wasLong = saved >= limit;
                 if (wasLong == isLong && !(isLong && (now >= saved * 2 || now <= saved / 2))) return;
             }
-            else if (!isLong) return;
             savedMs[key] = now;
             try
             {
@@ -199,11 +204,18 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             }
         }
 
-        /// <summary>The kinds an express worker of <paramref name="lane"/> leaves to the ordinary workers.</summary>
+        /// <summary>The kinds whose runs have lately taken <paramref name="lane"/>'s express limit or longer.</summary>
         public IReadOnlyCollection<(string Module, string Kind)> LongKinds(LaneOptions lane)
         {
             double limit = lane.ExpressLimit.TotalMilliseconds;
             return typicalMs.Where(kv => kv.Value >= limit).Select(kv => kv.Key).ToList();
+        }
+
+        /// <summary>The kinds an express worker of <paramref name="lane"/> takes: those that have been measured and run short.</summary>
+        public IReadOnlyCollection<(string Module, string Kind)> ShortKinds(LaneOptions lane)
+        {
+            double limit = lane.ExpressLimit.TotalMilliseconds;
+            return typicalMs.Where(kv => kv.Value < limit).Select(kv => kv.Key).ToList();
         }
 
         /// <summary>A run of <paramref name="job"/>'s kind ended after <paramref name="elapsed"/>: each new run counts as much
@@ -228,7 +240,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                     // An express worker may hold one job of a module beside those its ordinary workers hold, so a module's
                     // minute-by-minute work is not kept waiting by that module's own long job.
                     job = express
-                        ? await queue.LeaseNextAsync(lane.Lane, owner, lane.LeaseDuration, token, lane.ModuleLimit + lane.Express, lane.MaxPerBacklog, LongKinds(lane)).ConfigureAwait(false)
+                        ? await queue.LeaseNextAsync(lane.Lane, owner, lane.LeaseDuration, token, lane.ModuleLimit + lane.Express, lane.MaxPerBacklog, only: ShortKinds(lane)).ConfigureAwait(false)
                         : await queue.LeaseNextAsync(lane.Lane, owner, lane.LeaseDuration, token, lane.ModuleLimit, lane.MaxPerBacklog).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }

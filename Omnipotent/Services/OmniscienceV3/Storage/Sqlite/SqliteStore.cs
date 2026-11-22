@@ -62,9 +62,13 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
                 " PRAGMA cache_size=-65536; PRAGMA mmap_size=268435456; PRAGMA wal_autocheckpoint=2000;" +
                 " PRAGMA journal_size_limit=134217728;");
             writerConnection = conn;
-            writer = new WriterQueue(conn);
+            writer = new WriterQueue(conn, onSlow: (origin, took, waiting) => SlowWriteLog?.Invoke(
+                $"[OmniscienceV3] {Name}.db: one write ({origin}) held the writer for {took.TotalSeconds:0} s; {waiting} other write(s) waited behind it."));
             await ApplyMigrationsAsync(migrations, ct).ConfigureAwait(false);
         }
+
+        /// <summary>Where a write that held this file's one writer for long is reported (see <see cref="WriterQueue.SlowOperation"/>).</summary>
+        public Action<string>? SlowWriteLog { get; set; }
 
         /// <summary>Applies module migrations through the writer (safe while the store is live).</summary>
         public Task<int> ApplyMigrationsAsync(IEnumerable<Migration> migrations, CancellationToken ct = default)
@@ -101,14 +105,18 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
             }
         }
 
-        public Task<T> WriteAsync<T>(Func<SqliteConnection, SqliteTransaction, T> work, CancellationToken ct = default)
+        /// <param name="caller">Filled in by the compiler: who asked, for the line a slow write leaves.</param>
+        /// <param name="file">Filled in by the compiler.</param>
+        public Task<T> WriteAsync<T>(Func<SqliteConnection, SqliteTransaction, T> work, CancellationToken ct = default,
+            [System.Runtime.CompilerServices.CallerMemberName] string caller = "", [System.Runtime.CompilerServices.CallerFilePath] string file = "")
         {
             EnsureLive();
-            return writer!.Enqueue(work, ct);
+            return writer!.Enqueue(work, ct, caller, file);
         }
 
-        public Task WriteAsync(Action<SqliteConnection, SqliteTransaction> work, CancellationToken ct = default) =>
-            WriteAsync<bool>((c, tx) => { work(c, tx); return true; }, ct);
+        public Task WriteAsync(Action<SqliteConnection, SqliteTransaction> work, CancellationToken ct = default,
+            [System.Runtime.CompilerServices.CallerMemberName] string caller = "", [System.Runtime.CompilerServices.CallerFilePath] string file = "") =>
+            WriteAsync<bool>((c, tx) => { work(c, tx); return true; }, ct, caller, file);
 
         public StoreHealth GetHealth()
         {

@@ -75,6 +75,8 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
             var intel = new SqliteStore("intel", paths.Intel, clock);
             var op = new SqliteStore("operator", paths.Operator, clock);
             var vectors = new SqliteStore("vectors", paths.Vectors, clock);
+            // A write that holds a store's one writer for seconds is said in the log, with who asked for it.
+            foreach (var store in new[] { corpus, intel, op, vectors }) store.SlowWriteLog = log;
             var opened = new List<SqliteStore>();
             var step = System.Diagnostics.Stopwatch.StartNew();
             async Task OpenOneAsync(SqliteStore store, IReadOnlyList<Migration> migrations)

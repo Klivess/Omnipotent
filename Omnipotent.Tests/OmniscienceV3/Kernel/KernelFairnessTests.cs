@@ -191,6 +191,32 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
         }
 
         [Fact]
+        public async Task AWorkerWithAListOfKinds_TakesOnlyThose_NeverFromABacklog_AndAsksNothingWhenItsListIsEmpty()
+        {
+            long mirror = await queue.EnqueueAsync(Req("explore", "mirror", priority: 100));
+            long engine = await queue.EnqueueAsync(Req("explore", "engine", priority: 60));
+            long scan = await queue.EnqueueAsync(Req("monitors", "scan", priority: 50));
+            long health = await queue.EnqueueAsync(Req("monitors", "health", priority: 150));
+            await BacklogAsync("media.store", JobQueue.BacklogJobs + 10, priority: 110);
+
+            // Nothing is known to be short yet: there is nothing to take, and the store is not asked.
+            long batches = stores.Intel.GetHealth().CommittedBatches;
+            Assert.Null(await queue.LeaseNextAsync(Lane.Cpu, "express", TimeSpan.FromMinutes(1), only: Array.Empty<(string, string)>()));
+            Assert.Equal(batches, stores.Intel.GetHealth().CommittedBatches);
+
+            var knownShort = new[] { ("monitors", "scan"), ("explore", "engine"), ("media.store", "bulk"), ("signals", "scan") };
+            var taken = new List<long>();
+            while (await queue.LeaseNextAsync(Lane.Cpu, "express", TimeSpan.FromMinutes(1), only: knownShort) is { } job) taken.Add(job.JobId);
+
+            // The two kinds on its list that are waiting, in priority order. Not the mirror or the health check (not on the
+            // list, though both rank higher), and nothing of the backlog although its kind is on the list.
+            Assert.Equal(new[] { engine, scan }, taken.ToArray());
+            Assert.Equal(new[] { JobStates.Queued, JobStates.Queued }, new[] { queue.Get(mirror)!.State, queue.Get(health)!.State });
+            // An ordinary worker takes what was left, the highest first.
+            Assert.Equal(health, (await queue.LeaseNextAsync(Lane.Cpu, "w", TimeSpan.FromMinutes(1)))!.JobId);
+        }
+
+        [Fact]
         public async Task WithinAModule_PriorityThenAgeStillDecide()
         {
             long low = await queue.EnqueueAsync(Req("m", "low", priority: 10));
@@ -274,24 +300,30 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
             w.Start();
             try
             {
-                // One run teaches the lane what kind of job this is (a kind nobody has seen yet counts as short).
+                // One run of each kind teaches the lane what it is. Until a kind has been measured only the ordinary worker
+                // takes it: the express worker's first jobs on the server were two kinds nobody had measured, both long.
                 long first = await queue.EnqueueAsync(Req("explore", "mirror"));
-                await WaitUntil(() => queue.Get(first)!.State == JobStates.Succeeded);
+                long firstScan = await queue.EnqueueAsync(Req("monitors", "scan", priority: 10));
+                await WaitUntil(() => queue.Get(first)!.State == JobStates.Succeeded && queue.Get(firstScan)!.State == JobStates.Succeeded);
                 Assert.Contains(("explore", "mirror"), w.LongKinds(lane));
+                await WaitUntil(() => w.ShortKinds(lane).Contains(("monitors", "scan")));
 
                 long held = await queue.EnqueueAsync(Req("explore", "mirror") with { SubjectId = "block", SubjectKind = "test" });
                 await WaitUntil(() => queue.Get(held)!.State == JobStates.Leased);
                 long waiting = await queue.EnqueueAsync(Req("explore", "mirror") with { SubjectId = "block", SubjectKind = "test" });
+                long unseen = await queue.EnqueueAsync(Req("insights", "never-run-before", priority: 300));
                 long scan = await queue.EnqueueAsync(Req("monitors", "scan", priority: 10));
 
-                // The scan runs although the lane's only ordinary worker is inside a long job and another long job stands
-                // ahead of it at a higher priority; that second long job waits for the ordinary worker.
+                // The scan runs although the lane's only ordinary worker is inside a long job and two jobs stand ahead of it
+                // at higher priorities: another long one, and one of a kind nobody has measured. Both wait for the ordinary worker.
                 await WaitUntil(() => queue.Get(scan)!.State == JobStates.Succeeded);
                 Assert.Equal(JobStates.Leased, queue.Get(held)!.State);
                 Assert.Equal(JobStates.Queued, queue.Get(waiting)!.State);
+                Assert.Equal(JobStates.Queued, queue.Get(unseen)!.State);
 
                 release.Set();
-                await WaitUntil(() => queue.Get(held)!.State == JobStates.Succeeded && queue.Get(waiting)!.State == JobStates.Succeeded);
+                await WaitUntil(() => queue.Get(held)!.State == JobStates.Succeeded && queue.Get(waiting)!.State == JobStates.Succeeded && queue.Get(unseen)!.State == JobStates.Succeeded);
+                await WaitUntil(() => w.ShortKinds(lane).Contains(("insights", "never-run-before"))); // measured now: the express worker's from here on
             }
             finally
             {
@@ -329,12 +361,12 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
                 long backup = await queue.EnqueueAsync(Req("test.archive", "backup"));
                 long sync = await queue.EnqueueAsync(Req("ingest.legacy", "sync"));
                 await WaitUntil(() => queue.Get(backup)!.State == JobStates.Succeeded && queue.Get(sync)!.State == JobStates.Succeeded);
-                await WaitUntil(() => Learned().Length == 1);
+                await WaitUntil(() => Learned().Length == 2);
             }
-            // Only what changes an express worker's choice is written down: the long kind, not the short one.
-            var kept = Assert.Single(Learned());
-            Assert.Equal(("test.archive", "backup"), (kept.Module, kept.Kind));
-            Assert.True(kept.TypicalMs >= 150, $"{kept.TypicalMs} ms");
+            // Both are written down: the long kind is what an express worker leaves alone, the short one what it may take.
+            var kept = Learned().ToDictionary(p => p.Module + "/" + p.Kind, p => p.TypicalMs, StringComparer.Ordinal);
+            Assert.True(kept["test.archive/backup"] >= 150, $"{kept["test.archive/backup"]} ms");
+            Assert.True(kept["ingest.legacy/sync"] < 150, $"{kept["ingest.legacy/sync"]} ms");
 
             // The next process, with work already waiting when it starts: two long jobs ahead of a short one.
             var release = new ManualResetEventSlim(false);
@@ -357,6 +389,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
                 // Before any job has run here: what the last process learned, and what the store began with.
                 Assert.Contains(("test.archive", "backup"), next.LongKinds(lane));
                 Assert.Contains(("explore", "mirror"), next.LongKinds(lane));
+                Assert.Contains(("ingest.legacy", "sync"), next.ShortKinds(lane));
                 await WaitUntil(() => queue.Get(tail)!.State == JobStates.Succeeded);
                 await WaitUntil(() => new[] { b1, b2 }.Count(id => queue.Get(id)!.State == JobStates.Leased) == 1);
                 // The express worker did not take the second long job: it is waiting for the ordinary worker.

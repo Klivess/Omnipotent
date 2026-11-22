@@ -521,15 +521,35 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         /// version is read again through the evidence queue like any other change). On the server 2,795 of them stood ahead
         /// of fourteen people's readings; new ones are planned outside the model lane. Returns how many were closed.
         /// </summary>
-        private Task<int> CloseIdleReverificationsAsync(CancellationToken ct) => Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, """
-            UPDATE jobs SET state='cancelled', finished_at_ms=$now, error_message='Closed: no claim rests on this message, so there was nothing to re-verify.'
-            WHERE job_id IN (
-                SELECT j.job_id FROM jobs j INDEXED BY ix_jobs_module_state
-                WHERE j.module_id=$m AND j.state='queued' AND j.kind=$k AND j.lane='LlmBackground'
-                  AND NOT EXISTS (SELECT 1 FROM kn_claim_messages cm WHERE cm.message_id = j.subject_id)
-                  AND NOT EXISTS (SELECT 1 FROM kn_age_evidence a WHERE a.message_id = j.subject_id)
-                LIMIT 5000)
-            """, ("$now", Context.Clock.NowMs), ("$m", Id), ("$k", ReverifyKind)), ct);
+        private async Task<int> CloseIdleReverificationsAsync(CancellationToken ct)
+        {
+            // Which of them have nothing to do is found on a read connection. Found inside the write, every row read from
+            // the drive was read while the store's one writer was held, and every lease and heartbeat waited for it.
+            List<long> idle;
+            using (var c = Context.Stores.Intel.OpenRead())
+                idle = c.Query(null, """
+                    SELECT j.job_id FROM jobs j INDEXED BY ix_jobs_module_state
+                    WHERE j.module_id=$m AND j.state='queued' AND j.kind=$k AND j.lane='LlmBackground'
+                      AND NOT EXISTS (SELECT 1 FROM kn_claim_messages cm WHERE cm.message_id = j.subject_id)
+                      AND NOT EXISTS (SELECT 1 FROM kn_age_evidence a WHERE a.message_id = j.subject_id)
+                    LIMIT $n
+                    """, r => r.GetInt64(0), ("$m", Id), ("$k", ReverifyKind), ("$n", CloseReverificationsPerSweep));
+            int closed = 0;
+            long now = Context.Clock.NowMs;
+            foreach (var chunk in idle.Chunk(200))
+            {
+                string ids = string.Join(",", chunk.Select(id => id.ToString(CultureInfo.InvariantCulture)));
+                // Still queued is asked again where the rows change: a worker may have taken one since the look.
+                closed += await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, $"""
+                    UPDATE jobs SET state='cancelled', finished_at_ms=$now, error_message='Closed: no claim rests on this message, so there was nothing to re-verify.'
+                    WHERE job_id IN ({ids}) AND state='queued'
+                    """, ("$now", now)), ct).ConfigureAwait(false);
+            }
+            return closed;
+        }
+
+        /// <summary>How many idle re-verifications one sweep closes: a sweep comes every minute and must stay short.</summary>
+        internal static int CloseReverificationsPerSweep { get; set; } = 600;
 
         private int ClaimVersion(string claimId, string messageId)
         {

@@ -108,25 +108,32 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         /// <para><paramref name="maxPerModule"/> is how many jobs one module may hold leased in this lane at once, so a
         /// module whose jobs are slow or stuck cannot occupy every worker; <paramref name="maxPerBacklog"/> is the same
         /// limit for a module that is working through a backlog. <paramref name="exclude"/> names kinds this worker does
-        /// not take (see <see cref="LaneOptions.Express"/>).</para>
+        /// not take; <paramref name="only"/> names the only kinds it takes (see <see cref="LaneOptions.Express"/>), and
+        /// such a worker passes over the backlogs.</para>
         /// </summary>
         public Task<JobRecord?> LeaseNextAsync(Lane lane, string owner, TimeSpan leaseDuration, CancellationToken ct = default, int maxPerModule = int.MaxValue,
-            int maxPerBacklog = int.MaxValue, IReadOnlyCollection<(string Module, string Kind)>? exclude = null) =>
-            intel.WriteAsync<JobRecord?>((c, tx) =>
+            int maxPerBacklog = int.MaxValue, IReadOnlyCollection<(string Module, string Kind)>? exclude = null, IReadOnlyCollection<(string Module, string Kind)>? only = null)
+        {
+            // A worker that takes nothing has nothing to ask the store's one writer for.
+            if (only is { Count: 0 }) return Task.FromResult<JobRecord?>(null);
+            return intel.WriteAsync<JobRecord?>((c, tx) =>
             {
                 long now = clock.NowMs;
                 string laneName = lane.ToString();
+                static Dictionary<string, List<string>> ByModule(IReadOnlyCollection<(string Module, string Kind)> kinds) =>
+                    kinds.GroupBy(e => e.Module, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.Select(e => e.Kind).Distinct(StringComparer.Ordinal).ToList(), StringComparer.Ordinal);
+                var excluded = exclude is { Count: > 0 } ? ByModule(exclude) : null;
+                var allowed = only != null ? ByModule(only) : null;
                 // job_counts is kept by triggers: a few rows per module, read in place of a scan of the queue.
                 var modules = c.Query(tx, """
                     SELECT module_id, SUM(CASE WHEN state='queued' THEN n ELSE 0 END), SUM(CASE WHEN state='leased' THEN n ELSE 0 END)
                     FROM job_counts WHERE lane=$l AND state IN ('queued','leased') GROUP BY module_id ORDER BY module_id
                     """, r => (Module: r.GetString(0), Queued: r.GetInt64(1), Leased: r.GetInt64(2)), ("$l", laneName))
-                    .Where(m => m.Queued > 0 && m.Leased < (m.Queued > BacklogJobs ? Math.Min(maxPerModule, maxPerBacklog) : maxPerModule)).ToList();
+                    .Where(m => m.Queued > 0 && m.Leased < (m.Queued > BacklogJobs ? Math.Min(maxPerModule, maxPerBacklog) : maxPerModule))
+                    // A worker with a list of kinds looks only at the modules those belong to, and never at a backlog:
+                    // finding one kind among a backlog's rows would mean walking them.
+                    .Where(m => allowed == null || (allowed.ContainsKey(m.Module) && m.Queued <= BacklogJobs)).ToList();
                 if (modules.Count == 0) return null;
-
-                var excluded = exclude is { Count: > 0 }
-                    ? exclude.GroupBy(e => e.Module, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.Select(e => e.Kind).Distinct(StringComparer.Ordinal).ToList(), StringComparer.Ordinal)
-                    : null;
 
                 // A module's best ready job at each priority it has queued, highest first: one index seek per level.
                 // Kinds the worker does not take are left out (the kind is on the row, so a level made only of those is
@@ -139,6 +146,11 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                     {
                         for (int i = 0; i < kinds.Count; i++) args.Add(("$x" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), kinds[i]));
                         notKinds = " AND kind NOT IN (" + string.Join(",", kinds.Select((_, i) => "$x" + i.ToString(System.Globalization.CultureInfo.InvariantCulture))) + ")";
+                    }
+                    if (allowed != null && allowed.TryGetValue(module, out var taken))
+                    {
+                        for (int i = 0; i < taken.Count; i++) args.Add(("$y" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), taken[i]));
+                        notKinds += " AND kind IN (" + string.Join(",", taken.Select((_, i) => "$y" + i.ToString(System.Globalization.CultureInfo.InvariantCulture))) + ")";
                     }
                     int? below = null;
                     for (int level = 0; level < levels; level++)
@@ -203,6 +215,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                     """, ("$o", owner), ("$exp", now + (long)leaseDuration.TotalMilliseconds), ("$now", now), ("$id", job.JobId));
                 return Read(c, tx, job.JobId);
             }, ct);
+        }
 
         /// <summary>Extends the lease (and optionally records progress). False when the lease was lost.</summary>
         public Task<bool> HeartbeatAsync(long jobId, string owner, TimeSpan leaseDuration, string? progressJson = null, CancellationToken ct = default) =>
@@ -387,6 +400,61 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                 UPDATE jobs SET priority = priority + 1
                 WHERE state='queued' AND created_at_ms < $cut AND priority < $cap
                 """, ("$cut", clock.NowMs - (long)olderThan.TotalMilliseconds), ("$cap", cap)), ct);
+
+        /// <summary>How many finished jobs one look of <see cref="PruneFinishedAsync"/> reads.</summary>
+        internal static int PruneBatch { get; set; } = 500;
+
+        /// <summary>How many such looks one call makes per state at most.</summary>
+        internal static int PruneBatches { get; set; } = 8;
+
+        /// <summary>Rows <see cref="PruneFinishedAsync"/> has read since the process started (what it costs).</summary>
+        internal static long PruneLooked;
+
+        /// <summary>The oldest finished jobs of one state, in job order, read from the (state, job) index.</summary>
+        internal const string PruneLookSql =
+            "SELECT job_id, finished_at_ms FROM jobs INDEXED BY ix_jobs_state WHERE state=$s AND job_id > $after ORDER BY job_id LIMIT $n";
+
+        /// <summary>
+        /// Removes finished jobs that are past their retention: the oldest first, a few hundred at a time, each delete a
+        /// short write of its own. Returns how many were removed, and whether there may be more.
+        /// <para>This used to be two statements, <c>DELETE FROM jobs WHERE state IN (…) AND finished_at_ms &lt; cut</c>, run
+        /// at every start and every six hours. No index holds the finish time, so each read every finished job's row
+        /// (some 400,000 on the server, scattered over a gigabyte) inside the queue's one writer: for about twenty
+        /// minutes after every start no job could be leased, completed or heartbeated on any lane, 27 writes stood
+        /// waiting, and nothing was old enough to delete (22 Nov 2026).</para>
+        /// <para>Jobs finish roughly in the order they were made, so the oldest job ids are looked at first, on a read
+        /// connection, and the look stops at the first batch that holds nothing old enough. A job made long ago that
+        /// finished lately can hide older-finished ones behind it for a while; they go once it is old enough itself.</para>
+        /// </summary>
+        public async Task<(int Removed, bool More)> PruneFinishedAsync(TimeSpan succeededRetention, TimeSpan deadRetention, CancellationToken ct = default)
+        {
+            long now = clock.NowMs;
+            int removed = 0;
+            bool more = false;
+            foreach (var (state, retention) in new[] { (JobStates.Succeeded, succeededRetention), (JobStates.Cancelled, succeededRetention), (JobStates.Dead, deadRetention) })
+            {
+                long cut = now - (long)retention.TotalMilliseconds, after = 0;
+                for (int batch = 0; batch < PruneBatches; batch++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    List<(long JobId, long? FinishedAtMs)> oldest;
+                    using (var c = intel.OpenRead())
+                        oldest = c.Query(null, PruneLookSql, r => (r.GetInt64(0), r.GetInt64OrNull(1)), ("$s", state), ("$after", after), ("$n", PruneBatch));
+                    Interlocked.Add(ref PruneLooked, oldest.Count);
+                    if (oldest.Count == 0) break;
+                    var expired = oldest.Where(j => j.FinishedAtMs is long finished && finished < cut).Select(j => j.JobId).ToList();
+                    if (expired.Count == 0) break; // the oldest are within their time: so, nearly always, is everything after them
+                    string ids = string.Join(",", expired.Select(id => id.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+                    // The state and the time are asked again where the rows are deleted: a dead job may have been retried since the look.
+                    removed += await intel.WriteAsync((c, tx) => c.Exec(tx, $"DELETE FROM jobs WHERE job_id IN ({ids}) AND state=$s AND finished_at_ms < $cut", ("$s", state), ("$cut", cut)), ct)
+                        .ConfigureAwait(false);
+                    after = oldest[^1].JobId;
+                    if (oldest.Count < PruneBatch) break;
+                    if (batch == PruneBatches - 1) more = true;
+                }
+            }
+            return (removed, more);
+        }
 
         public JobRecord? Get(long jobId)
         {
