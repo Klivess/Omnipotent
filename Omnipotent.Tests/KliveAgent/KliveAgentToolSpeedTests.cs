@@ -461,6 +461,44 @@ public sealed class KliveAgentToolSpeedTests
         Assert.Equal(names.Count, names.Distinct().Count());
     }
 
+    /// <summary>Anthropic refuses the whole request when two tools share a name. computer_mouse_move_relative
+    /// was offered twice in host mode from July to November and failed every run there at step 1.</summary>
+    [Theory]
+    [InlineData("host", true)]
+    [InlineData("container", true)]
+    [InlineData("container", false)]
+    [InlineData("none", true)]
+    public void EveryComputerMode_OffersEachToolNameOnce_ServiceToolsIncluded(string target, bool vision)
+    {
+        var tools = KliveAgentBrain.BuildToolDefinitions(includeComputerUse: target == "host");
+        if (target == "container") tools.AddRange(KliveAgentComputer.BuildContainerToolDefinitions(vision));
+        tools.AddRange(Omnipotent.Services.ServiceTools.OmniToolCatalog.BuildServiceTools(
+            Omnipotent.Services.ServiceTools.OmniToolRegistry.Shared, Array.Empty<string>(), offerAll: true));
+        tools.AddRange(Omnipotent.Services.ServiceTools.OmniToolCatalog.BuildUniversalTools(includeApi: true));
+
+        var repeated = tools.GroupBy(t => t.function.name).Where(g => g.Count() > 1).Select(g => g.Key).ToList();
+        Assert.Empty(repeated);
+    }
+
+    [Fact]
+    public void DistinctToolNames_KeepsTheFirst_AndSaysWhatItDropped()
+    {
+        static Omnipotent.Services.KliveLLM.HFWrapper.HFTool Tool(string name, string description) => new()
+        {
+            type = "function",
+            function = new Omnipotent.Services.KliveLLM.HFWrapper.HFFunctionDefinition { name = name, description = description, parameters = new { } },
+        };
+        var tools = new List<Omnipotent.Services.KliveLLM.HFWrapper.HFTool> { Tool("a", "first"), Tool("b", "b"), Tool("a", "second") };
+        IReadOnlyList<string>? dropped = null;
+        var kept = KliveAgentBrain.DistinctToolNames(tools, names => dropped = names);
+        Assert.Equal(new[] { "a", "b" }, kept.Select(t => t.function.name));
+        Assert.Equal("first", kept[0].function.description);
+        Assert.Equal(new[] { "a" }, dropped);
+
+        var clean = new List<Omnipotent.Services.KliveLLM.HFWrapper.HFTool> { Tool("x", "x") };
+        Assert.Same(clean, KliveAgentBrain.DistinctToolNames(clean, _ => throw new InvalidOperationException("nothing was dropped")));
+    }
+
     [Fact]
     public void SpeedRule_IsInTheCachedPolicy_ForNativeToolsOnly()
     {

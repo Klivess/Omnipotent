@@ -824,6 +824,35 @@ namespace Omnipotent.Services.KliveAgent
         }
 
         /// <summary>
+        /// The offered tools with each name once, the first definition kept. Providers that check (Anthropic)
+        /// refuse the whole request when two tools share a name: one stray duplicate in the host computer tools
+        /// failed every run there at step 1. The order is otherwise unchanged, so the array stays byte-stable.
+        /// </summary>
+        internal static List<HFWrapper.HFTool> DistinctToolNames(List<HFWrapper.HFTool> tools, Action<IReadOnlyList<string>>? onDropped = null)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var kept = new List<HFWrapper.HFTool>(tools.Count);
+            List<string>? dropped = null;
+            foreach (var tool in tools)
+            {
+                string? name = tool?.function?.name;
+                if (string.IsNullOrEmpty(name) || seen.Add(name)) { if (tool != null) kept.Add(tool); continue; }
+                (dropped ??= new List<string>()).Add(name);
+            }
+            if (dropped != null) onDropped?.Invoke(dropped);
+            return dropped == null ? tools : kept;
+        }
+
+        private static int droppedToolsReported;
+
+        /// <summary>Says once per process which names were offered twice, so the source gets fixed.</summary>
+        private void ReportDroppedTools(IReadOnlyList<string> names)
+        {
+            if (System.Threading.Interlocked.Exchange(ref droppedToolsReported, 1) != 0) return;
+            _ = agentService.ServiceLog($"[KliveAgent] Tools offered twice, sent once: {string.Join(", ", names.Distinct())}. Fix the duplicate at its source.", false);
+        }
+
+        /// <summary>
         /// Computer-use ("host control") tools: drive the real Windows desktop (mouse/keyboard/screen) and
         /// the browser. Each returns a text observation; perception tools also return a screenshot fed to
         /// the vision model. Coordinates are in the pixel space of the most recent screenshot. Irreversible
@@ -852,7 +881,9 @@ namespace Omnipotent.Services.KliveAgent
             tools.Add(Tool("computer_window_state",
                 "Report the active window (title/pos/size), the virtual-screen size, and whether OS-level control is available.", Obj(new { })));
             tools.Add(Tool("computer_read_screen", "List visible window titles/sizes. For content, use computer_screenshot or computer_find_text.", Obj(new { })));
-            tools.Add(Tool("computer_mouse_move_relative", "Move the mouse by a raw relative delta for games that ignore absolute pointer movement.", Obj(new { dx = intType, dy = intType, steps = intType }, "dx", "dy")));
+            // computer_mouse_move_relative comes from VisualComputerToolCatalog (SupportsRelativeMouse above).
+            // A second copy here went unnoticed until a run reached Anthropic, which refuses the whole
+            // request when two tools share a name.
 
             /*tools.Add(Tool("computer_screenshot",
                 "Capture the screen as an image you can SEE (fed to your vision). Returns the pixel size; coordinates you give to computer_click/move/etc. are in THIS image's pixel space. ALWAYS screenshot before clicking blind.",
@@ -1886,6 +1917,8 @@ namespace Omnipotent.Services.KliveAgent
                 {
                     toolDefinitions.AddRange(await serviceToolsTask);
                 }
+                if (!continueTalk && toolDefinitions != null)
+                    toolDefinitions = DistinctToolNames(toolDefinitions, ReportDroppedTools);
 
                 if (!continueTalk) llm.ResetSession(llmSessionId);
 
@@ -3508,6 +3541,7 @@ namespace Omnipotent.Services.KliveAgent
                 try { tools.AddRange(await agentService.ServiceTools.BuildToolDefinitionsAsync()); }
                 catch (Exception ex) { await agentService.ServiceLogError(ex, "Talk warm-up: service tools unavailable."); }
             }
+            tools = DistinctToolNames(tools, ReportDroppedTools);
             string seed = BuildUserPrompt(conversation, seedText, "Klives", seedOnly: true);
             cancellationToken.ThrowIfCancellationRequested();
 
