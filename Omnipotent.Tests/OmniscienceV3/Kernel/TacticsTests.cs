@@ -243,6 +243,13 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
             var run = await Finished(runId);
             Assert.Equal(TacticRunStates.Succeeded, run.State);
             var outputs = JsonSerializer.Deserialize<List<TacticOutput>>(run.OutputsJson!, KernelJson.Options)!;
+            // A run somebody started is worked in the lane of things a person is waiting for, though its tactic names the
+            // CPU lane: there a tactic of a second stood in line behind every module's background work. A step of a
+            // playbook, which nobody watches, stays in its tactic's own lane.
+            var descriptor = rt.Tactics.Find(SetAlgebraTactic.Key)!.Descriptor;
+            Assert.Equal(Lane.Cpu, descriptor.Lane);
+            Assert.Equal(Lane.LlmInteractive, rt.Host.Jobs.Get(run.JobId!.Value)!.Lane);
+            Assert.Equal(Lane.Cpu, TacticRunner.LaneOf(descriptor, fromPlaybook: true));
             var cohort = outputs.Single().Selection!;
             Assert.Equal(new[] { "p-a", "p-c" }, cohort.Items.Select(i => i.Id).OrderBy(x => x));
 

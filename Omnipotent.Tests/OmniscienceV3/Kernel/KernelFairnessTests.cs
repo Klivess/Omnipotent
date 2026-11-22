@@ -263,7 +263,10 @@ namespace Omnipotent.Tests.OmniscienceV3.Kernel
             Assert.All(lanes, l => Assert.True(l.StallAfter > TimeSpan.Zero));
             Assert.Equal(1, lanes.Single(l => l.Lane == Lane.Cpu).ModuleLimit);
             Assert.Equal(3, lanes.Single(l => l.Lane == Lane.Io).ModuleLimit);
-            Assert.Equal(2, lanes.Single(l => l.Lane == Lane.LlmInteractive).ModuleLimit);
+            // What Klives started and watches: four workers, of which one module may hold three. With two, which one module
+            // could hold both of, two inquiries that went wrong held them for an hour each and the runs asked for meanwhile
+            // waited 55 and 92 minutes to begin (22 Nov 2026).
+            Assert.Equal((4, 3), (lanes.Single(l => l.Lane == Lane.LlmInteractive).Concurrency, lanes.Single(l => l.Lane == Lane.LlmInteractive).ModuleLimit));
             Assert.Equal(TimeSpan.Zero, new KernelOptions().PriorityAgeAfter); // no rewrite of every queued row every ten minutes
             // The two lanes that mix jobs of a second with jobs of an hour keep a worker for the short ones, beside the others.
             Assert.Equal(1, lanes.Single(l => l.Lane == Lane.Cpu).Express);

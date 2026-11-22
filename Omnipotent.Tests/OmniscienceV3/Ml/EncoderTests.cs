@@ -50,6 +50,35 @@ namespace Omnipotent.Tests.OmniscienceV3.Ml
             Assert.Contains("👍🏽", words); // one grapheme: the skin tone stays with its emoji
         }
 
+        /// <summary>
+        /// 22 Nov 2026: an inquiry's searches each encode the five to eight wordings of a facet. More than four texts counted
+        /// as the backlog, so each search could wait fifteen seconds for the host to be idle, on a host that never is.
+        /// </summary>
+        [Fact]
+        public async Task WhatSomebodyIsWaitingFor_IsEncodedWithoutWaitingForTheHost_HoweverManyTextsItHolds()
+        {
+            // A handful of texts never waits; a batch does, from a background job and from no job at all.
+            Assert.False(E5TextEncoder.WaitsForTheHost(E5TextEncoder.InteractiveTexts));
+            Assert.True(E5TextEncoder.WaitsForTheHost(8));
+            using var job = new CancellationTokenSource();
+            bool background = await Task.Run(() =>
+            {
+                Omnipotent.Services.OmniscienceV3.Storage.Sqlite.AmbientCancellation.Set(job.Token);
+                return E5TextEncoder.WaitsForTheHost(8);
+            });
+            Assert.True(background);
+            // A job of the interactive lane (LaneWorkers marks it so) does not, and nor does what it goes on to await.
+            bool watched = await Task.Run(async () =>
+            {
+                Omnipotent.Services.OmniscienceV3.Storage.Sqlite.AmbientCancellation.Set(job.Token, foreground: true);
+                await Task.Yield();
+                return E5TextEncoder.WaitsForTheHost(8);
+            });
+            Assert.False(watched);
+            // The mark stays with the flow it was set in.
+            Assert.True(E5TextEncoder.WaitsForTheHost(8));
+        }
+
         [Fact]
         public async Task CpuThrottle_PausesWhileBusyButNeverForever()
         {

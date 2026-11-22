@@ -30,8 +30,13 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             new LaneOptions(Lane.Cpu, Math.Clamp(processors / 2, 2, 4), TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2), StallAfter: TimeSpan.FromHours(2)) { Express = 1 },
             new LaneOptions(Lane.Io, 4, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2), StallAfter: TimeSpan.FromMinutes(30)) { Express = 1 },
             new LaneOptions(Lane.LlmBackground, 1, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(5), StallAfter: TimeSpan.FromMinutes(60)),
-            // Klives started these himself and watches them: two of the same kind may run side by side.
-            new LaneOptions(Lane.LlmInteractive, 2, TimeSpan.FromMinutes(5), TimeSpan.FromMilliseconds(500), StallAfter: TimeSpan.FromMinutes(60), MaxPerModule: 2),
+            // Klives started these himself and watches them, so several of one module may run side by side. With two
+            // workers that one module could hold both, two inquiries that went wrong held them for an hour each, and the
+            // runs asked for meanwhile waited 55 and 92 minutes to begin (22 Nov 2026). Four, of which one module may
+            // hold three: these jobs wait on the model or the drive far more than they compute, every tactic a person
+            // starts is worked here (TacticRunner.LaneOf), and a reply in a replica chat or a digest asked for now always
+            // finds the fourth.
+            new LaneOptions(Lane.LlmInteractive, 4, TimeSpan.FromMinutes(5), TimeSpan.FromMilliseconds(500), StallAfter: TimeSpan.FromMinutes(60), MaxPerModule: 3),
             new LaneOptions(Lane.Coordinator, 4, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(1), StallAfter: TimeSpan.FromHours(24)),
         };
         public TimeSpan LoopInterval { get; init; } = TimeSpan.FromSeconds(1);

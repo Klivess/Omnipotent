@@ -258,18 +258,62 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
                 said = c.Query(null, "SELECT payload_json FROM stream_events WHERE topic='tactic.progress' ORDER BY event_id", r => JsonDocument.Parse(r.GetString(0)).RootElement)
                     .Where(e => e.GetProperty("runId").GetString() == run.RunId).Select(e => e.GetProperty("detail"))
                     .Where(d => d.TryGetProperty("stage", out var stage) && stage.GetString() == "gather" && d.TryGetProperty("doing", out _)).ToList();
-            // Before the first search, at each search (their own words, the opposite, their conversations: three or four
-            // a facet), and once more when the searching is done.
-            var searches = said.Where(d => d.GetProperty("facet").ValueKind == JsonValueKind.String).ToList();
-            Assert.True(searches.Count >= 15, $"the gather stage reported {searches.Count} searches of five facets");
-            Assert.Equal(new[] { "habits", "home", "pets", "plans", "purchases" }, searches.Select(d => d.GetProperty("facet").GetString()).Distinct().OrderBy(f => f, StringComparer.Ordinal));
-            Assert.Contains(searches, d => d.GetProperty("doing").GetString() == "searching their own messages for the opposite");
+            // Before the first search, twice a facet (her own words, her conversations and what she reacted to in one
+            // search, then her own words for the opposite), and once more when the searching is done.
+            var told = said.Where(d => d.GetProperty("facet").ValueKind == JsonValueKind.String).ToList();
+            Assert.Equal(10, told.Count);
+            Assert.Equal(new[] { "habits", "home", "pets", "plans", "purchases" }, told.Select(d => d.GetProperty("facet").GetString()).Distinct().OrderBy(f => f, StringComparer.Ordinal));
+            Assert.Equal(5, told.Count(d => d.GetProperty("doing").GetString() == "searching their own messages for the opposite"));
+            Assert.Equal(5, told.Count(d => d.GetProperty("doing").GetString()!.StartsWith("searching their own messages, the conversations they are in", StringComparison.Ordinal)));
             Assert.All(said, d => Assert.Equal(5, d.GetProperty("of").GetInt32()));
             var last = said[^1];
-            Assert.Equal((5, searches.Count), (last.GetProperty("facets").GetInt32(), last.GetProperty("searches").GetInt32()));
+            // Every scope searched is counted: three or four a facet (her own, the opposite, her conversations, what she reacted to).
+            Assert.Equal(5, last.GetProperty("facets").GetInt32());
+            Assert.InRange(last.GetProperty("searches").GetInt32(), 15, 20);
             Assert.True(last.GetProperty("found").GetInt32() > 0);
-            // One read of each scope's vectors for all five facets (it was one for every search but the counter-evidence one).
+            Assert.DoesNotContain(report.Coverage.Notes, n => n.Contains("time allowed", StringComparison.Ordinal) || n.Contains("not searched", StringComparison.Ordinal));
+            // One read of each scope's vectors for all five facets (it was one for every search but the counter-evidence one),
+            // one encoding of each facet's questions and of the opposite's (one for every search), and each word of the plan
+            // read from the full-text index once: "cat", the five facet names, "dog" and "allergic", with their plain plurals.
             Assert.InRange(h.Kit.Retriever.CandidateLoads, 1, 3);
+            Assert.InRange(h.Kit.Retriever.QueryEncodings, 1, 6);
+            Assert.InRange(h.Kit.Retriever.TermReads, 8, 16);
+        }
+
+        /// <summary>
+        /// 22 Nov 2026 on the server: the inquiries that did finish took four to five hours, nearly all of it looking for
+        /// evidence on a drive where what is not in memory takes a tenth of a second a page. The stage has a budget now.
+        /// With none at all it still searches its first facet, and the answer says what was not searched.
+        /// </summary>
+        [Fact]
+        public async Task WithNoTimeToLookForEvidence_AnInquirySearchesItsFirstFacet_Answers_AndSaysWhatWasNotSearched()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            await PlantedFactCorpus.WriteAsync(h.Stores, Now);
+            await h.Context.Settings.SetAsync(InquiryModule.GatherSecondsSetting, 0, "test");
+            var model = new ScriptedInquirer
+            {
+                Plan = new
+                {
+                    facets = new[] { "pets", "home", "habits" }.Select(name => new { name, kind = "direct", queries = new[] { "cat", name }, counter_queries = new[] { "dog", "allergic" } }).ToArray(),
+                    base_rate = new { probability = 0.3, rationale = "Roughly a third of households keep a cat." },
+                },
+            };
+            model.Wire(h.Llm);
+
+            var (run, report, _) = await RunAsync(h, "x01.ask_yes_no", Ask("Ava's obviously a crazy cat lady, right?"));
+
+            Assert.Equal(TacticRunStates.Succeeded, run.State);
+            // Her own words about the cat were found by the first wording of the first facet, and are what the answer cites.
+            Assert.NotEmpty(report!.EvidenceFor);
+            Assert.True(report.Coverage.ItemsInDossier > 0);
+            Assert.Contains(report.Coverage.Notes, n => n.Contains("given 0 s", StringComparison.Ordinal) && n.Contains("2 of the 3 facets planned were not searched", StringComparison.Ordinal));
+            List<JsonElement> told;
+            using (var c = h.Stores.Intel.OpenRead())
+                told = c.Query(null, "SELECT payload_json FROM stream_events WHERE topic='tactic.progress' ORDER BY event_id", r => JsonDocument.Parse(r.GetString(0)).RootElement)
+                    .Where(e => e.GetProperty("runId").GetString() == run.RunId).Select(e => e.GetProperty("detail"))
+                    .Where(d => d.TryGetProperty("stage", out var stage) && stage.GetString() == "gather" && d.TryGetProperty("doing", out _) && d.GetProperty("facet").ValueKind == JsonValueKind.String).ToList();
+            Assert.Equal(new[] { "pets" }, told.Select(d => d.GetProperty("facet").GetString()).Distinct().ToArray());
         }
 
         [Fact]

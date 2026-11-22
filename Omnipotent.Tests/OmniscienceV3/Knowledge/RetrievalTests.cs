@@ -72,26 +72,191 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
         }
 
         [Fact]
-        public async Task FullText_ReadsNoMessageRow_ToRankAMatchOrToTellWhetherItIsInScope()
+        public async Task FullText_ReadsNoMessageRow_ToFindAWordsMatchesOrToTellWhetherTheyAreInScope()
         {
             await using var h = await KnowledgeHarness.StartAsync(Now);
             using var c = h.Stores.Corpus.OpenRead();
 
-            // The matches, best first, come from the full-text index alone: the messages table is not in the plan at all.
-            // (The statement before this one joined every match to its row before sorting; on the server that was over a
-            // million row reads for one query, and two tactic runs died in it, 20 Nov 2026.)
-            var ranked = c.Query(null, "EXPLAIN QUERY PLAN " + HybridRetriever.RankedMatches, r => r.GetString(3), ("$q", "\"cat\" OR \"cats\""));
-            Assert.Contains(ranked, p => p.Contains("messages_fts"));
-            Assert.DoesNotContain(ranked, p => p.Contains("ix_messages") || p.Contains(" messages ") || p.EndsWith(" messages") || p.Contains(" m "));
+            // A word's matches come from the full-text index alone: the messages table is not in the plan at all. (The
+            // first statement joined every match to its row before sorting; on the server that was over a million row
+            // reads for one query, and two tactic runs died in it, 20 Nov 2026.)
+            var matches = c.Query(null, "EXPLAIN QUERY PLAN " + HybridRetriever.TermMatches, r => r.GetString(3), ("$q", "\"cat\""), ("$l", 10L));
+            Assert.Contains(matches, p => p.Contains("messages_fts"));
+            Assert.DoesNotContain(matches, p => p.Contains("ix_messages") || p.Contains(" messages ") || p.EndsWith(" messages") || p.Contains(" m "));
+            // Nor are they asked for best first. To put its matches in order the index scores every one of them in the
+            // archive, and a score needs the message's length: a lookup in a table of its own for each match, which was
+            // where an inquiry's hour went (22 Nov 2026). The matches are ranked in memory, those in scope only.
+            Assert.DoesNotContain("ORDER BY", HybridRetriever.TermMatches, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain("rank", HybridRetriever.TermMatches, StringComparison.OrdinalIgnoreCase);
 
-            // Which rows a scope holds comes from an index that has everything asked of it: again no row is read.
+            // Which rows a scope holds comes from an index that has everything asked of it, in the order asked: again no
+            // row is read, and nothing is sorted.
             var scope = new RetrievalScope { FromMs = 0, ToMs = Now };
             foreach (string column in new[] { "author_identity_id", "conversation_id" })
             {
-                var plan = c.Query(null, "EXPLAIN QUERY PLAN " + HybridRetriever.ScopeRowsStatement(column, "$k0,$k1", scope), r => r.GetString(3),
-                    ("$k0", "a"), ("$k1", "b"), ("$f", 0L), ("$t", Now));
+                var plan = c.Query(null, "EXPLAIN QUERY PLAN " + HybridRetriever.NewestOfOneStatement(column, scope), r => r.GetString(3),
+                    ("$k", "a"), ("$f", 0L), ("$t", Now), ("$l", 5_000));
                 Assert.All(plan, p => Assert.Contains("COVERING INDEX", p));
+                Assert.DoesNotContain(plan, p => p.Contains("TEMP B-TREE"));
             }
+        }
+
+        /// <summary>
+        /// 22 Nov 2026: the runs that did finish on the server took four to five hours, most of it in the gather stage. A
+        /// facet's questions were asked of three scopes one after the other, and each time every question was run against
+        /// the whole full-text index and its text encoded again.
+        /// </summary>
+        [Fact]
+        public async Task ScopesAskedTheSameQuestionsTogether_ReadEachWordOnce_AndEncodeTheQuestionsOnce()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            var (cats, tabby, train) = await AnaAsync(h);
+            var encoder = new FakeEncoder();
+            h.Kit.Encoder = encoder;
+            await h.Context.Vectors!.UpsertAsync(VectorSpaces.Message, encoder.ModelVersion, new[]
+            {
+                new VectorItem(cats, FakeEncoder.Embed("my cat knocked the plant over again"), 1),
+                new VectorItem(tabby, FakeEncoder.Embed("cat"), 1),
+                new VectorItem(train, FakeEncoder.Embed("train was late again"), 1),
+            });
+            var own = AnasOwn();
+            var theirs = new RetrievalScope { ConversationIds = new[] { "discord:c-ana" }, ToMs = Now, Limit = 5 };
+            var reacted = new RetrievalScope { MessageIds = new[] { cats, train }, ToMs = Now, Limit = 5 };
+            var retriever = h.Kit.Retriever;
+
+            // Each scope asked on its own gives what the three give when asked together.
+            var apart = new List<IReadOnlyList<RetrievedMessage>>();
+            foreach (var scope in new[] { own, theirs, reacted })
+                apart.Add((await new HybridRetriever(h.Stores, h.Kit.Corpus, () => encoder).SearchAsync(new[] { "cat", "the plant" }, scope, CancellationToken.None)).Results);
+
+            // Eight facets, as an inquiry plans at most, each with two wordings.
+            for (int facet = 0; facet < 8; facet++)
+            {
+                var together = await retriever.SearchScopesAsync(new[] { "cat", "the plant" }, new[] { own, theirs, reacted }, CancellationToken.None);
+                Assert.Equal(3, together.Count);
+                for (int s = 0; s < 3; s++)
+                    Assert.Equal(apart[s].Select(r => (r.MessageId, r.FtsRank, r.VectorRank)), together[s].Results.Select(r => (r.MessageId, r.FtsRank, r.VectorRank)));
+                Assert.Contains(together[0].Results, r => r.MessageId == tabby && r.VectorRank == 1 && r.FtsRank == null);
+                Assert.Contains(together[1].Results, r => r.MessageId == cats && r.FtsRank == 1);
+                Assert.DoesNotContain(together[2].Results, r => r.MessageId == tabby);
+                Assert.Equal((3, 3, 2), (together[0].Coverage.Candidates, together[1].Coverage.Candidates, together[2].Coverage.Candidates));
+            }
+
+            // Twenty-four scope searches of two questions each. The words "cat", "cats", "the", "plant" (and their plain
+            // plurals) were each read from the full-text index once, the two questions encoded in one go, and each
+            // scope's vectors read once.
+            Assert.InRange(retriever.TermReads, 4, 6);
+            Assert.Equal(1, retriever.QueryEncodings);
+            Assert.Equal(3, retriever.CandidateLoads);
+        }
+
+        [Fact]
+        public async Task AMatchHoldingMoreOfTheQuestionsWords_StandsAboveOneHoldingFewer_AndTheRarerWordCountsForMore()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            var corpus = new CorpusBuilder(h.Stores);
+            await corpus.PersonAsync("p-ana", "Ana");
+            await corpus.ConversationAsync("discord:c-ana", "dm", "p-ana");
+            string older = await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 9_000_000, "chess tonight");
+            string both = await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 8_000_000, "I really dislike chess, far too slow for me");
+            string newer = await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 7_000_000, "chess club was fun");
+            string rare = await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 6_000_000, "I dislike mondays");
+            await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 5_000_000, "train was late again");
+            var retriever = new HybridRetriever(h.Stores, h.Kit.Corpus, () => null);
+
+            var (hits, _) = await retriever.SearchAsync(new[] { "dislike chess" }, AnasOwn(10), CancellationToken.None);
+
+            // Both words; then the word fewer messages hold ("dislike", two of them, against three for "chess"); then the
+            // commoner word, the newer message first.
+            Assert.Equal(new[] { both, rare, newer, older }, hits.Select(x => x.MessageId).ToArray());
+            Assert.Equal(new int?[] { 1, 2, 3, 4 }, hits.Select(x => x.FtsRank).ToArray());
+        }
+
+        [Fact]
+        public async Task AScopesRows_AreListedNewestFirstAFewAtATime_AndAllOfThemAreSearched()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            var corpus = new CorpusBuilder(h.Stores);
+            await corpus.PersonAsync("p-ana", "Ana");
+            await corpus.PersonAsync("p-ben", "Ben");
+            await corpus.ConversationAsync("discord:c-one", "dm", "p-ana");
+            await corpus.ConversationAsync("discord:c-two", "dm", "p-ben");
+            var ids = new List<string>();
+            for (int i = 0; i < 12; i++)
+                ids.Add(await corpus.MessageAsync(i % 3 == 0 ? "p-ben" : "p-ana", i % 3 == 0 ? "discord:c-two" : "discord:c-one", Now - (20 - i) * 60_000L, $"garden note {i}"));
+            // Two rows of each conversation at first, then the rest of each: eight and four in all.
+            var retriever = new HybridRetriever(h.Stores, h.Kit.Corpus, () => null) { FirstPassRows = 2 };
+            var scope = new RetrievalScope { ConversationIds = new[] { "discord:c-one", "discord:c-two" }, ToMs = Now, Limit = 20 };
+
+            var (hits, coverage) = await retriever.SearchAsync(new[] { "garden" }, scope, CancellationToken.None);
+
+            Assert.Equal(ids.OrderBy(x => x), hits.Select(x => x.MessageId).OrderBy(x => x));
+            Assert.DoesNotContain("time allowed", coverage.Note ?? "");
+            // One word in every message: equals, so the newest first.
+            Assert.Equal(Enumerable.Reverse(ids), hits.Select(x => x.MessageId));
+        }
+
+        /// <summary>
+        /// A word's matches are kept between searches, and a standing question is asked of the messages of the last
+        /// minutes: what is kept has to hold the messages that came after it was read.
+        /// </summary>
+        [Fact]
+        public async Task AWordsKeptMatches_HoldTheMessagesThatArrivedSinceTheyWereRead()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            var corpus = new CorpusBuilder(h.Stores);
+            await corpus.PersonAsync("p-ana", "Ana");
+            await corpus.ConversationAsync("discord:c-ana", "dm", "p-ana");
+            string cats = await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 3_600_000, "my cat knocked the plant over again");
+            await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 2_000_000, "train was late again");
+            var retriever = new HybridRetriever(h.Stores, h.Kit.Corpus, () => null);
+            var (before, _) = await retriever.SearchAsync(new[] { "cat" }, AnasOwn() with { ToMs = null }, CancellationToken.None);
+            Assert.Equal(new[] { cats }, before.Select(r => r.MessageId).ToArray());
+            int reads = retriever.TermReads;
+
+            string arrived = await corpus.MessageAsync("p-ana", "discord:c-ana", Now - 1_000, "the cat is on the keyboard");
+            var (among, _) = await retriever.SearchAsync(new[] { "cat" }, new RetrievalScope { MessageIds = new[] { arrived }, Limit = 3 }, CancellationToken.None);
+
+            Assert.Equal(new[] { arrived }, among.Select(r => r.MessageId).ToArray());
+            // Only what arrived was looked up: the word was not read from the start again.
+            Assert.Equal(reads, retriever.TermReads);
+        }
+
+        /// <summary>
+        /// A search that has run out of time ends with what it has and says what it left out. With no time at all it still
+        /// takes one step of everything: the first account or conversation of the scope, the first wording of the question.
+        /// </summary>
+        [Fact]
+        public async Task WithNoTimeLeft_ASearchStillLooksAtTheFirstOfItsScope_AndSaysWhatItLeftOut()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            var corpus = new CorpusBuilder(h.Stores);
+            await corpus.PersonAsync("p-ana", "Ana");
+            await corpus.PersonAsync("p-ben", "Ben");
+            await corpus.ConversationAsync("discord:c-one", "dm", "p-ana");
+            await corpus.ConversationAsync("discord:c-two", "dm", "p-ben");
+            string one = await corpus.MessageAsync("p-ana", "discord:c-one", Now - 3_000_000, "the cat is asleep");
+            string two = await corpus.MessageAsync("p-ben", "discord:c-two", Now - 2_000_000, "my cat ignores me");
+            string plant = await corpus.MessageAsync("p-ana", "discord:c-one", Now - 1_000_000, "watered the plant");
+            var encoder = new FakeEncoder();
+            await h.Context.Vectors!.UpsertAsync(VectorSpaces.Message, encoder.ModelVersion, new[] { new VectorItem(one, FakeEncoder.Embed("cat"), 1), new VectorItem(two, FakeEncoder.Embed("cat"), 1) });
+            var retriever = new HybridRetriever(h.Stores, h.Kit.Corpus, () => encoder);
+            var scope = new RetrievalScope { ConversationIds = new[] { "discord:c-one", "discord:c-two" }, ToMs = Now, Limit = 10 };
+
+            var spent = (await retriever.SearchScopesAsync(new[] { "cat", "plant" }, new[] { scope }, CancellationToken.None, new RetrievalBudget(TimeSpan.Zero)))[0];
+
+            // The first conversation and the first wording, by full text.
+            Assert.Equal(new[] { one }, spent.Results.Select(r => r.MessageId).ToArray());
+            Assert.False(spent.Coverage.Vectors);
+            Assert.Contains("only the newest of them were searched", spent.Coverage.Note);
+            Assert.Contains("before every wording of the search had been tried", spent.Coverage.Note);
+            Assert.Contains("message vectors were read", spent.Coverage.Note);
+
+            // What a search could not finish is not kept as if it were the scope: the next one, given time, reads it all.
+            var whole = (await retriever.SearchScopesAsync(new[] { "cat", "plant" }, new[] { scope }, CancellationToken.None, new RetrievalBudget(TimeSpan.FromMinutes(5))))[0];
+            Assert.Equal(new[] { one, two, plant }.OrderBy(x => x), whole.Results.Select(r => r.MessageId).OrderBy(x => x));
+            Assert.True(whole.Coverage.Vectors);
+            Assert.Null(whole.Coverage.Note);
         }
 
         [Theory]
@@ -196,6 +361,8 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
 
             // Thirty-two searches, three reads (twenty-four before).
             Assert.Equal(3, h.Kit.Retriever.CandidateLoads);
+            // And the two questions were each encoded once, where every search encoded its own again.
+            Assert.Equal(2, h.Kit.Retriever.QueryEncodings);
         }
 
         [Fact]

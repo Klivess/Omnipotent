@@ -47,6 +47,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
         public const string StandingIntervalSetting = Id + ".standing_min_interval_hours";
         public const string StandingBudgetSetting = Id + ".standing_daily_budget";
         public const string FreshnessSetting = Id + ".live_freshness_hours";
+        public const string GatherSecondsSetting = Id + ".gather_seconds";
+        /// <summary>How long an inquiry looks for evidence unless told otherwise. Long enough for every facet when the
+        /// archive's pages are in memory (seconds), short enough that an answer is minutes away when they are not.</summary>
+        public const int DefaultGatherSeconds = 90;
 
         private KnowledgeKit kit = null!;
 
@@ -71,6 +75,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                 new SettingDescriptor(StandingIntervalSetting, SettingTypes.Number, "6", "Minimum hours between re-evaluations of one standing question.", 0.25, 720),
                 new SettingDescriptor(StandingBudgetSetting, SettingTypes.Int, "24", "Standing-question re-evaluations allowed per day (Klives's zone).", 0, 1_000),
                 new SettingDescriptor(FreshnessSetting, SettingTypes.Number, "24", "Only live messages younger than this many hours can trigger a standing question.", 1, 720),
+                new SettingDescriptor(GatherSecondsSetting, SettingTypes.Int, "90", "Seconds an inquiry may spend finding evidence before it reasons with what it has found. When the time runs out the answer says what was not searched; asking again finds more, because what the first search read is then in memory.", 0, 3_600),
             },
         };
 

@@ -199,18 +199,29 @@ CREATE TABLE tactics_cursors(
                 using var subject = new PreparedStatement(c, tx, "INSERT OR IGNORE INTO tactic_run_subjects(run_id, subject_kind, subject_id) VALUES($r,$k,$i)", "$r", "$k", "$i");
                 foreach (var (kind, id) in subjects) subject.Run(runId, kind, id);
             }, ct).ConfigureAwait(false);
-            await EnqueueRunJobAsync(runId, d, ct).ConfigureAwait(false);
+            await EnqueueRunJobAsync(runId, d, playbookRunId != null, ct).ConfigureAwait(false);
             await PublishAsync(Topics.TacticProgress, runId, d.Key, new { state = TacticRunStates.Queued }, ct).ConfigureAwait(false);
             return runId;
         }
 
-        private async Task EnqueueRunJobAsync(string runId, TacticDescriptor d, CancellationToken ct)
+        /// <summary>
+        /// The lane a run is worked in. A run somebody started is worked in the lane of things a person is waiting for,
+        /// whatever lane its tactic names; a step of a playbook, which nobody watches, in its tactic's own.
+        /// <para>Most tactics name the CPU lane: a filter, a set operation, a count, done in a second. That lane has two
+        /// workers for the background work of every module, each taken for four or five minutes at a time, and a job in it
+        /// waits its turn among everything queued before it. Its third worker, kept for short jobs, does not take a tactic
+        /// either: every run is the one kind of job, and an inquiry of that kind takes minutes. So a tactic of a second
+        /// stood in the queue for as long as the lane was behind.</para>
+        /// </summary>
+        internal static Lane LaneOf(TacticDescriptor d, bool fromPlaybook) => fromPlaybook ? d.Lane : Lane.LlmInteractive;
+
+        private async Task EnqueueRunJobAsync(string runId, TacticDescriptor d, bool fromPlaybook, CancellationToken ct)
         {
             long jobId = await Context.Jobs.EnqueueAsync(new JobRequest
             {
                 ModuleId = ModuleId, Kind = RunKind, SubjectKind = "tactic_run", SubjectId = runId,
                 DedupeKey = JobRequest.KeyFor(ModuleId, RunKind, "tactic_run", runId),
-                Lane = d.Lane, Priority = 200, MaxAttempts = 3, RunId = runId,
+                Lane = LaneOf(d, fromPlaybook), Priority = 200, MaxAttempts = 3, RunId = runId,
             }, ct).ConfigureAwait(false);
             await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "UPDATE tactic_runs SET job_id=$j WHERE run_id=$r", ("$j", jobId), ("$r", runId)), ct).ConfigureAwait(false);
         }
@@ -403,7 +414,7 @@ CREATE TABLE tactics_cursors(
             if (run.State != TacticRunStates.Paused) return false;
             var tactic = Find(run.TacticKey) ?? throw new TacticRefusedException($"The tactic '{run.TacticKey}' is no longer installed.");
             await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, "UPDATE tactic_runs SET state='queued' WHERE run_id=$r AND state='paused'", ("$r", runId)), ct).ConfigureAwait(false);
-            await EnqueueRunJobAsync(runId, tactic.Descriptor, ct).ConfigureAwait(false);
+            await EnqueueRunJobAsync(runId, tactic.Descriptor, run.PlaybookRunId != null, ct).ConfigureAwait(false);
             await PublishAsync(Topics.TacticProgress, runId, run.TacticKey, new { state = TacticRunStates.Queued, resumed = true }, ct).ConfigureAwait(false);
             return true;
         }

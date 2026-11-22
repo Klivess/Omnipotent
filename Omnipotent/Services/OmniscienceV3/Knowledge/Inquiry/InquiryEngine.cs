@@ -243,15 +243,95 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
         /// takes 25 to 150 ms, and full-text search covers the whole scope whatever these are.</summary>
         internal const int OwnVectorCandidates = 4_000, TheirVectorCandidates = 3_000;
 
+        /// <summary>How many of a subject's newest messages say which conversations they are lately active in. Which
+        /// conversation a message is in is on its row, so each is a read of the archive; it was five thousand, read before
+        /// the first search had begun.</summary>
+        internal const int ActiveConversationsFrom = 800;
+
+        /// <summary>The share of an inquiry's search time that may go on finding where its subjects talk and what they reacted
+        /// to, before the first search. Both are read a page at a time, newest first, and each takes its first page
+        /// whatever the clock says.</summary>
+        internal const double PreparationShare = 0.2;
+
         /// <summary>
-        /// Finds the evidence. Every search is reported as it ends, with what has been found so far. The stage used to
-        /// say "running" once and nothing more until it was done, and a stage that says nothing for an hour is stopped
-        /// as stuck: on the server every run was, three attempts each, with up to thirty-two searches still to go
-        /// (22 Nov 2026).
+        /// The conversations the identities have lately been most active in, at most sixty, the busiest first: counted over
+        /// their newest messages, <see cref="ActiveConversationsFrom"/> of each at most. Which conversation a message is in
+        /// is on its row, so every message counted is a read of the archive: they are read a hundred at a time, newest
+        /// first, and the counting stops when the stage's time for preparing is used up. Read in one statement, as they
+        /// were, they could take all the time the stage has before its first search (a cold row is 25 to 150 ms).
+        /// </summary>
+        private List<string> ActiveConversations(IReadOnlyList<string> identities, long asOfMs, RetrievalBudget budget)
+        {
+            const int Page = 100;
+            var counts = new Dictionary<string, int>(StringComparer.Ordinal);
+            using var c = kit.Context.Stores.Corpus.OpenRead();
+            foreach (var identity in identities)
+            {
+                long before = asOfMs == long.MaxValue ? long.MaxValue : asOfMs + 1;
+                for (int taken = 0; taken < ActiveConversationsFrom;)
+                {
+                    var page = c.Query(null, "SELECT conversation_id, sent_at_ms FROM messages INDEXED BY ix_messages_author_time WHERE author_identity_id=$a AND sent_at_ms < $b ORDER BY sent_at_ms DESC LIMIT $l",
+                        r => (Conversation: r.GetString(0), At: r.GetInt64(1)), ("$a", identity), ("$b", before), ("$l", Page));
+                    foreach (var (conversation, at) in page)
+                    {
+                        counts[conversation] = counts.GetValueOrDefault(conversation) + 1;
+                        before = Math.Min(before, at);
+                    }
+                    taken += page.Count;
+                    if (page.Count < Page || budget.Elapsed >= budget.Total * PreparationShare) break;
+                }
+            }
+            return counts.OrderByDescending(kv => kv.Value).ThenBy(kv => kv.Key, StringComparer.Ordinal).Take(60).Select(kv => kv.Key).ToList();
+        }
+
+        /// <summary>
+        /// The messages the identities most lately reacted to, at most eight hundred. A reaction's message is on its row:
+        /// the newest come off the index in order, two hundred at a time for each account, and the reading stops at eight
+        /// hundred or when the stage's time for preparing is used up. Asked of all accounts in one statement, as it was,
+        /// every reaction any of them ever made was read and sorted to keep two thousand.
+        /// </summary>
+        private List<string> ReactedTo(IReadOnlyList<string> identities, long asOfMs, RetrievalBudget budget)
+        {
+            const int Page = 200, Wanted = 800;
+            var reactions = new List<(string Id, long? At)>();
+            using var c = kit.Context.Stores.Corpus.OpenRead();
+            foreach (var identity in identities)
+            {
+                long before = asOfMs == long.MaxValue ? long.MaxValue : asOfMs + 1;
+                for (int taken = 0; taken < Wanted;)
+                {
+                    var page = c.Query(null, "SELECT message_id, added_at_ms FROM reactions WHERE identity_id=$i AND added_at_ms < $b ORDER BY added_at_ms DESC LIMIT $l",
+                        r => (Id: r.GetString(0), At: r.GetInt64OrNull(1)), ("$i", identity), ("$b", before), ("$l", Page));
+                    reactions.AddRange(page);
+                    foreach (var (_, at) in page) before = Math.Min(before, at ?? before);
+                    taken += page.Count;
+                    if (page.Count < Page || budget.Elapsed >= budget.Total * PreparationShare) break;
+                }
+                // Reactions whose time is not known (an import that carried none) count as old: they fill what room is left.
+                if (reactions.Count < Wanted)
+                    reactions.AddRange(c.Query(null, "SELECT message_id, added_at_ms FROM reactions WHERE identity_id=$i AND added_at_ms IS NULL LIMIT $l",
+                        r => (Id: r.GetString(0), At: r.GetInt64OrNull(1)), ("$i", identity), ("$l", Wanted - reactions.Count)));
+            }
+            return reactions.OrderByDescending(x => x.At ?? long.MinValue).Select(x => x.Id).Distinct(StringComparer.Ordinal).Take(Wanted).ToList();
+        }
+
+        /// <summary>
+        /// Finds the evidence, within the time an inquiry is given for it (<see cref="InquiryModule.GatherSecondsSetting"/>).
+        /// <para>For every facet the subject's own messages, the conversations they are in and what they reacted to are
+        /// searched together, then their own messages again for the opposite. Each search is reported as it begins, with
+        /// what has been found so far: the stage used to say "running" once and nothing more, and a stage that says
+        /// nothing for an hour is stopped as stuck (on the server every run was, three attempts each, 22 Nov 2026).</para>
+        /// <para>What a search costs depends on how much of the archive is in memory, and on the server that ran from
+        /// seconds to over an hour for the same question. So the stage has a budget: the first facet is always searched,
+        /// the others while there is time, the first of the plan first; when the time is up the inquiry reasons with what
+        /// was found and its coverage says what was not searched. The pages a search read stay in memory, so the same
+        /// question asked again finds more.</para>
         /// </summary>
         private async Task<GatherResult> GatherAsync(TacticRunContext ctx, InquirySpec spec, InquiryPlan plan, InquiryRequest req, CancellationToken ct)
         {
-            int searches = 0, facetsDone = 0, facetsInAll = spec.Subjects.Count * plan.Facets.Count;
+            int seconds = Math.Clamp(kit.Context.Settings.Get(InquiryModule.GatherSecondsSetting, InquiryModule.DefaultGatherSeconds), 0, 3_600);
+            var budget = new RetrievalBudget(TimeSpan.FromSeconds(seconds));
+            int searches = 0, facetsDone = 0, facetsInAll = spec.Subjects.Count * plan.Facets.Count, facetsLeftOut = 0;
             var candidates = new Dictionary<string, (double Score, string Facet, string Reliability, bool Counter, string? Subject)>(StringComparer.Ordinal);
             Task Tell(string subject, string? facet, string doing) =>
                 ctx.ReportAsync(new { stage = "gather", status = "running", subject, facet, doing, facets = facetsDone, of = facetsInAll, searches, found = candidates.Count });
@@ -268,55 +348,68 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
                     if (!candidates.TryGetValue(r.MessageId, out var e) || e.Score < score) candidates[r.MessageId] = (score, facet, reliability, counter, subject);
                 }
             }
+            void Note(RetrievalCoverage coverage)
+            {
+                vectors |= coverage.Vectors;
+                if (coverage.Note != null && !notes.Contains(coverage.Note)) notes.Add(coverage.Note);
+            }
+            // Where each subject talks and what they reacted to, before any searching.
+            var places = new List<(InquirySubjectRef Subject, RetrievalScope Own, List<(RetrievalScope Scope, string Reliability, double Weight)> Scopes, string Doing)>();
             foreach (var subject in spec.Subjects)
             {
                 await Tell(subject.Label, null, "finding where they talk and what they reacted to").ConfigureAwait(false);
                 var identities = kit.Corpus.IdentitiesOf(kit.Corpus.PersonIdsOf(subject.PersonId)).Select(i => i.IdentityId).ToList();
-                // The sixty conversations they have lately been most active in (from their newest messages, a bounded read).
-                var conversations = kit.Corpus.ConversationsOf(identities, newest: 5_000).Take(60).Select(c => c.ConversationId).ToList();
-                List<string> reacted;
-                using (var c = kit.Context.Stores.Corpus.OpenRead())
-                    reacted = c.QueryIn(null, "SELECT message_id, added_at_ms FROM reactions WHERE identity_id IN ({keys}) ORDER BY added_at_ms DESC LIMIT 2000",
-                            identities, r => (Id: r.GetString(0), At: r.GetInt64OrNull(1)))
-                        .Where(x => x.At == null || x.At <= spec.AsOfMs).Select(x => x.Id).Distinct(StringComparer.Ordinal).Take(800).ToList();
+                // The sixty conversations they have lately been most active in, and what they lately reacted to.
+                var conversations = ActiveConversations(identities, spec.AsOfMs, budget);
+                var reacted = ReactedTo(identities, spec.AsOfMs, budget);
                 // The three scopes every facet is searched in. One object each for the whole subject, so the retriever
                 // reads a scope's rows and vectors once and every later facet finds them kept.
                 var own = new RetrievalScope { AuthorIdentityIds = identities, FromMs = spec.FromMs, ToMs = spec.AsOfMs, Limit = 14, VectorCandidates = OwnVectorCandidates };
                 var theirs = new RetrievalScope { ConversationIds = conversations, FromMs = spec.FromMs, ToMs = spec.AsOfMs, Limit = 10, VectorCandidates = TheirVectorCandidates };
                 var liking = new RetrievalScope { MessageIds = reacted, ToMs = spec.AsOfMs, Limit = 6 };
-                foreach (var facet in plan.Facets)
+                var scopes = new List<(RetrievalScope Scope, string Reliability, double Weight)> { (own, "self", 1.0) };
+                if (conversations.Count > 0) scopes.Add((theirs, "third_party", 0.6));
+                if (reacted.Count > 0) scopes.Add((liking, "behaviour", 0.8));
+                places.Add((subject, own, scopes, "searching their own messages" + (conversations.Count > 0 ? ", the conversations they are in" : "") + (reacted.Count > 0 ? " and what they reacted to" : "")));
+            }
+            // Facet by facet across the subjects, not subject by subject: when the time runs out, every subject has been
+            // asked the same facets (a ranking of eight people must not rest on all the evidence about the first and none
+            // about the last). The first facet is searched for everyone whatever the clock says, so an inquiry never
+            // reasons over nothing because finding where its subjects talk took all the time there was.
+            bool firstFacet = true;
+            foreach (var facet in plan.Facets)
+            {
+                foreach (var (subject, own, scopes, doing) in places)
                 {
                     ct.ThrowIfCancellationRequested();
-                    await Tell(subject.Label, facet.Name, "searching their own messages").ConfigureAwait(false);
-                    var (selfHits, cov) = await kit.Retriever.SearchAsync(facet.Queries, own, ct).ConfigureAwait(false);
-                    searches++;
-                    vectors |= cov.Vectors;
-                    if (cov.Note != null && !notes.Contains(cov.Note)) notes.Add(cov.Note);
-                    Add(selfHits, facet.Name, "self", false, subject.PersonId, 1.0);
-                    if (facet.CounterQueries.Count > 0)
+                    if (!firstFacet && budget.Spent)
+                    {
+                        facetsLeftOut++;
+                        continue;
+                    }
+                    await Tell(subject.Label, facet.Name, doing).ConfigureAwait(false);
+                    // One pass over the full-text index and one encoding of the questions for all the scopes.
+                    var found = await kit.Retriever.SearchScopesAsync(facet.Queries, scopes.Select(s => s.Scope).ToList(), ct, budget).ConfigureAwait(false);
+                    for (int i = 0; i < scopes.Count; i++)
+                    {
+                        searches++;
+                        Note(found[i].Coverage);
+                        Add(found[i].Results, facet.Name, scopes[i].Reliability, false, subject.PersonId, scopes[i].Weight);
+                    }
+                    if (facet.CounterQueries.Count > 0 && !budget.Spent)
                     {
                         await Tell(subject.Label, facet.Name, "searching their own messages for the opposite").ConfigureAwait(false);
-                        var (counter, _) = await kit.Retriever.SearchAsync(facet.CounterQueries, own with { Limit = 8 }, ct).ConfigureAwait(false);
+                        var (counter, covered) = (await kit.Retriever.SearchScopesAsync(facet.CounterQueries, new[] { own with { Limit = 8 } }, ct, budget).ConfigureAwait(false))[0];
                         searches++;
+                        Note(covered);
                         Add(counter, facet.Name, "self", true, subject.PersonId, 0.95);
-                    }
-                    if (conversations.Count > 0)
-                    {
-                        await Tell(subject.Label, facet.Name, "searching the conversations they are in").ConfigureAwait(false);
-                        var (others, _) = await kit.Retriever.SearchAsync(facet.Queries, theirs, ct).ConfigureAwait(false);
-                        searches++;
-                        Add(others, facet.Name, "third_party", false, subject.PersonId, 0.6);
-                    }
-                    if (reacted.Count > 0)
-                    {
-                        await Tell(subject.Label, facet.Name, "searching what they reacted to").ConfigureAwait(false);
-                        var (liked, _) = await kit.Retriever.SearchAsync(facet.Queries, liking, ct).ConfigureAwait(false);
-                        searches++;
-                        Add(liked, facet.Name, "behaviour", false, subject.PersonId, 0.8);
                     }
                     facetsDone++;
                 }
+                firstFacet = false;
             }
+            if (facetsLeftOut > 0)
+                notes.Add($"The search for evidence was given {seconds} s and stopped there: {facetsLeftOut} of the {facetsInAll} facets planned {(facetsLeftOut == 1 ? "was" : "were")} not searched. Asked again, the same question finds more, because what this search read is still in memory.");
             await Tell(string.Join(", ", spec.Subjects.Select(s => s.Label)), null, "reading what was found").ConfigureAwait(false);
             var messages = kit.Corpus.Messages(candidates.Keys.ToList()).ToDictionary(m => m.MessageId, StringComparer.Ordinal);
             considered = messages.Count;

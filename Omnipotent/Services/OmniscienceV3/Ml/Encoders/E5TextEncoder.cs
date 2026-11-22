@@ -101,7 +101,7 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
             // A handful of texts is someone's question (a search, a watch rule, a concept), not the backlog: it does not
             // wait for the host to be idle. Waiting did: a search asked while the server was busy sat in the throttle for
             // up to a minute before its one line of text was encoded.
-            bool bulk = inputs.Count > InteractiveTexts;
+            bool bulk = WaitsForTheHost(inputs.Count);
 
             // 1. Windows: every text becomes one or more token windows, each remembered with its owner and weight.
             var all = new List<Window>(inputs.Count);
@@ -150,6 +150,15 @@ namespace Omnipotent.Services.OmniscienceV3.Ml.Encoders
         /// <summary>Runs order[start..start+count) as one batch, halving it on allocation failure down to single rows.</summary>
         /// <summary>Requests of at most this many texts are answered without the host-load throttle.</summary>
         public const int InteractiveTexts = 4;
+
+        /// <summary>
+        /// Whether a request to encode <paramref name="texts"/> texts gives way to a busy host first. Not a handful of texts
+        /// (see <see cref="InteractiveTexts"/>), and nothing asked from the lane of work somebody started and is watching,
+        /// however many texts it holds: a facet of an inquiry is five to eight wordings of one question, which counted as
+        /// the backlog, and each of an inquiry's thirty-two searches could wait fifteen seconds for a host that is busy all
+        /// day (22 Nov 2026).
+        /// </summary>
+        internal static bool WaitsForTheHost(int texts) => texts > InteractiveTexts && Storage.Sqlite.AmbientCancellation.Pace is not { Foreground: true };
 
         private async Task RunWithSplitsAsync(List<Window> all, int[] order, int start, int count, float[][] pooled, bool bulk, CancellationToken ct)
         {
