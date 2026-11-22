@@ -328,7 +328,26 @@ CREATE TABLE kn_evidence_cursor(
 CREATE INDEX ix_kn_coverage_message ON kn_coverage(message_id);
 CREATE INDEX ix_kn_age_message ON kn_age_evidence(message_id);
 """),
+            // Until 22 Nov 2026 a fact whose messages named no time was stored as holding from zero to zero, which is
+            // 1 January 1970: every such event, plan and promise, and every such fixed fact (Consolidator.FirstStated has
+            // the cause). No real fact holds from that exact millisecond, so the rows are put right where they stand:
+            // no date, and an event's place in time is its first evidence, as it would have been. The people whose
+            // facts were touched are marked for their views (profile, timeline, plans) to be built again; the mark is
+            // made first, while the rows can still be told apart.
+            new Migration(DeductionModule, 3, "facts dated 1 January 1970 for want of a date: no date, and their people's views rebuilt", $"""
+INSERT OR IGNORE INTO module_dirty(module_id, subject_kind, subject_id, dirty_since_seq, dirty_at_ms)
+SELECT '{DeductionModule}', '{ViewsDirtyKind}', subject_id, 0, CAST(strftime('%s','now') AS INTEGER) * 1000
+FROM assertions WHERE subject_kind='person' AND valid_from_earliest_ms=0 AND valid_from_latest_ms=0 GROUP BY subject_id;
+
+UPDATE assertions SET valid_from_earliest_ms=NULL, valid_from_latest_ms=NULL WHERE valid_from_earliest_ms=0 AND valid_from_latest_ms=0;
+UPDATE kn_assertion_dims SET valid_from_ms=NULL WHERE valid_from_ms=0;
+UPDATE kn_assertion_dims SET occurred_at_ms=COALESCE(first_evidence_at_ms, recorded_at_ms) WHERE occurred_at_ms=0;
+"""),
         };
+
+        /// <summary>The dirty kind that asks for a person's views to be built again from the facts as they are stored
+        /// (<see cref="Deduction.DeductionModule.ViewsKind"/>).</summary>
+        public const string ViewsDirtyKind = "views";
 
         public static IReadOnlyList<Migration> Identity { get; } = new[]
         {
@@ -440,6 +459,22 @@ CREATE TABLE kn_reminders(
 );
 CREATE INDEX ix_kn_reminders_due ON kn_reminders(state, fire_at_ms);
 CREATE INDEX ix_kn_reminders_plan ON kn_reminders(plan_id);
+"""),
+            // said_at_ms: when the plan was first said (its earliest evidence, read from the fact's own row: this module
+            // depends on the deduction module, whose tables are there before these statements run). Most plans in chat
+            // name no date ("let's play", "I'll send it"); when they were said is then the one time there is to show
+            // and to sort them by.
+            // The second part undoes what the store's 1970 dates (deduction migration 3) left here: a plan "scheduled"
+            // for 1 January 1970 has no date, was never past or overdue on that account, and has no reminder to fire.
+            new Migration(PlansModule, 2, "when a plan was said; plans dated 1 January 1970 have no date", """
+ALTER TABLE kn_plans ADD COLUMN said_at_ms INTEGER;
+UPDATE kn_plans SET said_at_ms=(SELECT d.first_evidence_at_ms FROM kn_assertion_dims d WHERE d.assertion_id=kn_plans.assertion_id);
+UPDATE kn_plans SET scheduled_earliest_ms=NULL, scheduled_latest_ms=NULL,
+    status=CASE WHEN status IN ('past','overdue','due','upcoming') THEN 'undated' ELSE status END
+WHERE scheduled_earliest_ms=0 AND scheduled_latest_ms=0;
+UPDATE kn_reminders SET state='cancelled' WHERE occurrence_ms=0 AND state='pending';
+DROP INDEX ix_kn_plans_time;
+CREATE INDEX ix_kn_plans_time ON kn_plans(COALESCE(scheduled_earliest_ms, said_at_ms, 0), plan_id);
 """),
         };
 

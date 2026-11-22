@@ -526,6 +526,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
             return (page, page[^1].StartedAtMs.ToString(CultureInfo.InvariantCulture) + "|" + page[^1].RunId);
         }
 
+        /// <summary>Where a plan stands in the list: when it is for, or, when it names no date, when it was said (the
+        /// expression ix_kn_plans_time is built on). Plans without a date used to be listed first, in no order at all.</summary>
+        internal const string PlanOrder = "COALESCE(scheduled_earliest_ms, said_at_ms, 0)";
+
         private (IReadOnlyList<PlanItemDto>, string?) PlansPage(string? person, string? status, string? kind, bool klivesOnly, string? cursor, int limit)
         {
             var where = new List<string> { "status <> 'cancelled' OR $s = 'cancelled'" };
@@ -538,7 +542,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
             {
                 int bar = cursor.IndexOf('|');
                 if (bar <= 0 || !long.TryParse(cursor[..bar], NumberStyles.Integer, CultureInfo.InvariantCulture, out long at)) throw ApiException.BadRequest("Malformed cursor.");
-                where.Add("(COALESCE(scheduled_earliest_ms, 0) > $ca OR (COALESCE(scheduled_earliest_ms, 0) = $ca AND plan_id > $ci))");
+                where.Add($"({PlanOrder} > $ca OR ({PlanOrder} = $ca AND plan_id > $ci))");
                 args.Add(("$ca", at));
                 args.Add(("$ci", cursor[(bar + 1)..]));
             }
@@ -546,7 +550,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
             var plans = Module<PlansModule>();
             List<(string Id, string Owner, long? Earliest)> rows;
             using (var c = Rt.Stores.Intel.OpenRead())
-                rows = c.Query(null, $"SELECT plan_id, owner_person_id, scheduled_earliest_ms FROM kn_plans WHERE {string.Join(" AND ", where.Select(w => "(" + w + ")"))} ORDER BY COALESCE(scheduled_earliest_ms, 0), plan_id LIMIT $l",
+                rows = c.Query(null, $"SELECT plan_id, owner_person_id, {PlanOrder} FROM kn_plans WHERE {string.Join(" AND ", where.Select(w => "(" + w + ")"))} ORDER BY {PlanOrder}, plan_id LIMIT $l",
                     r => (r.GetString(0), r.GetString(1), r.GetInt64OrNull(2)), args.ToArray());
             long now = Rt.Clock.NowMs;
             var built = rows.Select(r => r.Owner).Distinct().SelectMany(o => plans.Build(o, now)).ToDictionary(p => p.PlanId, StringComparer.Ordinal);

@@ -201,7 +201,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 foreach (var g in group.Where(c => c.Plan?.StatusChange == null).GroupBy(c => ValueKey(c) + "|" + c.Polarity + "|" + NaturalKeys.Quarter(EventTime(c)), StringComparer.Ordinal))
                 {
                     var ep = NewEpisode(def, g.ToList());
-                    ep.Occurred = Intersect(g.Select(c => c.Occurred).OfType<TimeInterval>()) ?? g.Select(c => c.Occurred).OfType<TimeInterval>().FirstOrDefault();
+                    ep.Occurred = Intersect(g.Select(c => c.Occurred).OfType<TimeInterval>()) ?? FirstStated(g.Select(c => c.Occurred));
                     ep.EpisodeLabel = NaturalKeys.Quarter(EventTime(g.First()));
                     result.Add(ep);
                 }
@@ -227,7 +227,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 foreach (var g in group.GroupBy(c => ValueKey(c) + "|" + c.Polarity, StringComparer.Ordinal))
                 {
                     var ep = NewEpisode(def, g.ToList());
-                    ep.ValidFrom = ep.Claims.Select(c => c.ValidFrom).OfType<TimeInterval>().FirstOrDefault();
+                    ep.ValidFrom = FirstStated(ep.Claims.Select(c => c.ValidFrom));
                     result.Add(ep);
                 }
                 var affirmed = result.Where(e => e.Polarity == Polarity.Affirmed).ToList();
@@ -253,6 +253,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             }
             return result;
         }
+
+        /// <summary>
+        /// The first interval a claim states, or none when no claim states one. An interval is a value: asked for "the first
+        /// or the default" of the stated ones alone, an empty list answers with the interval from zero to zero, which is
+        /// midnight on 1 January 1970 and not "nothing". Every event, plan and promise whose messages named no time, and
+        /// every fixed fact (a name, a birth year) no claim dated, was stored as holding since 1970 (22 Nov 2026: 56 of
+        /// 59 plans "1970-01-01 · 20779 d ago", status past).
+        /// </summary>
+        internal static TimeInterval? FirstStated(IEnumerable<TimeInterval?> intervals) => intervals.FirstOrDefault(i => i != null);
 
         private static long EventTime(VerifiedClaim c) => c.Occurred is { } o && !o.IsUnknown
             ? (o.EarliestMs == long.MinValue ? o.LatestMs : o.LatestMs == long.MaxValue ? o.EarliestMs : o.MidpointMs)

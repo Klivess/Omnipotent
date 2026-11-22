@@ -34,6 +34,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         /// <summary>Consolidate, then rebuild everything projected from the person's facts whether or not the consolidation
         /// changed anything: a forget run has already removed rows from under them, so the consolidation itself sees no change.</summary>
         public const string ReprojectKind = "reproject";
+        /// <summary>A person's profile, timeline and plans built again from the store as it stands (no reading, no consolidation).</summary>
+        public const string ViewsKind = "views";
         public const string DetectiveKind = "detective";
         public const string HypothesesKind = "hypotheses";
         public const string ReverifyKind = "reverify";
@@ -205,6 +207,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                     case "reproject":
                         jobs.Add(Job(ReprojectKind, "person", kit.Corpus.Canonical(d.Id), 170));
                         break;
+                    case KnowledgeSchema.ViewsDirtyKind:
+                        // Nothing is read or consolidated, so no model is asked: it does not stand in the model lane.
+                        jobs.Add(Job(ViewsKind, "person", kit.Corpus.Canonical(d.Id), 90, lane: Lane.Cpu));
+                        break;
                     case "merge":
                     {
                         string canonical = kit.Corpus.Canonical(d.Id);
@@ -235,6 +241,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             ExtractKind => await ExtractAsync(job).ConfigureAwait(false),
             ConsolidateKind => await ConsolidateJobAsync(job).ConfigureAwait(false),
             ReprojectKind => await ReprojectJobAsync(job).ConfigureAwait(false),
+            ViewsKind => await ViewsJobAsync(job).ConfigureAwait(false),
             DetectiveKind => await DetectiveAsync(job).ConfigureAwait(false),
             HypothesesKind => await HypothesesAsync(job).ConfigureAwait(false),
             ReverifyKind => await ReverifyAsync(job).ConfigureAwait(false),
@@ -421,6 +428,36 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             return Result(new { person, result.Claims, result.Reconcile.Inserted, result.Reconcile.Superseded, result.Reconcile.Retracted, reprojected = true });
         }
 
+        /// <summary>
+        /// Builds a person's views again from the facts as they are stored: the profile here, the timeline and the plans as
+        /// jobs of their own. For when the stored facts were put right where they stand (a repair), not learned anew: no
+        /// claim is read and nothing is consolidated, so the job asks no model and need not wait in the model lane, where
+        /// a full re-projection of a hundred people would stand behind days of reading.
+        /// </summary>
+        private async Task<string?> ViewsJobAsync(JobContext job)
+        {
+            string person = kit.Corpus.Canonical(Subject(job));
+            if (!kit.Corpus.PersonExists(person)) return Result(new { person, outcome = "unknown_person" });
+            await WriteProfileAsync(person, kit.Corpus.MaxSeq(), job.Cancellation).ConfigureAwait(false);
+            await QueueProjectionsAsync(person, job.Cancellation).ConfigureAwait(false);
+            return Result(new { person, rebuilt = new[] { "profile", "timeline", "plans" } });
+        }
+
+        /// <summary>Queues the timeline and the plans of a person to be projected again from the store.</summary>
+        private async Task QueueProjectionsAsync(string person, CancellationToken ct)
+        {
+            await Context.Jobs.EnqueueAsync(new JobRequest
+            {
+                ModuleId = KnowledgeSchema.TimelineModule, Kind = "project", SubjectKind = "person", SubjectId = person, Lane = Lane.Cpu, Priority = 90,
+                DedupeKey = JobRequest.KeyFor(KnowledgeSchema.TimelineModule, "project", "person", person),
+            }, ct).ConfigureAwait(false);
+            await Context.Jobs.EnqueueAsync(new JobRequest
+            {
+                ModuleId = KnowledgeSchema.PlansModule, Kind = "project", SubjectKind = "person", SubjectId = person, Lane = Lane.Cpu, Priority = 90,
+                DedupeKey = JobRequest.KeyFor(KnowledgeSchema.PlansModule, "project", "person", person),
+            }, ct).ConfigureAwait(false);
+        }
+
         /// <param name="jobId">The job the work is audited against; none for a tactic run (X17).</param>
         /// <param name="projectAlways">Queue the timeline and plans projections even when the consolidation changed nothing.</param>
         internal async Task<ConsolidationResult> ConsolidateAndProjectAsync(string person, long? jobId, long seq, CancellationToken ct, bool projectAlways = false)
@@ -434,16 +471,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             await FlagAgeConflictsAsync(person, seq, ct).ConfigureAwait(false);
             if (result.Reconcile.Changed || projectAlways)
             {
-                await Context.Jobs.EnqueueAsync(new JobRequest
-                {
-                    ModuleId = KnowledgeSchema.TimelineModule, Kind = "project", SubjectKind = "person", SubjectId = person, Lane = Lane.Cpu, Priority = 90,
-                    DedupeKey = JobRequest.KeyFor(KnowledgeSchema.TimelineModule, "project", "person", person),
-                }, ct).ConfigureAwait(false);
-                await Context.Jobs.EnqueueAsync(new JobRequest
-                {
-                    ModuleId = KnowledgeSchema.PlansModule, Kind = "project", SubjectKind = "person", SubjectId = person, Lane = Lane.Cpu, Priority = 90,
-                    DedupeKey = JobRequest.KeyFor(KnowledgeSchema.PlansModule, "project", "person", person),
-                }, ct).ConfigureAwait(false);
+                await QueueProjectionsAsync(person, ct).ConfigureAwait(false);
                 if (result.Reconcile.Changed && DetectiveDue(person))
                     await Context.Jobs.EnqueueAsync(Job(DetectiveKind, "person", person, 60), ct).ConfigureAwait(false);
             }

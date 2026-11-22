@@ -27,7 +27,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
     public sealed record PlanRecord(
         string PlanId, string Kind, string? Subtype, string OwnerPersonId, string? CounterpartyPersonId, bool InvolvesKlives, bool KlivesPromised, string Title,
         TimeInterval? Scheduled, string? LocalZone, bool AllDay, string Firmness, bool Cancelled, bool Done, bool Rescheduled, string? Recurrence, int? Month, int? Day,
-        int? Year, string AssertionId, string NaturalKey, IReadOnlyList<EvidenceRef> Evidence, string? ConversationId, string? GuildId, string? Platform);
+        int? Year, string AssertionId, string NaturalKey, IReadOnlyList<EvidenceRef> Evidence, string? ConversationId, string? GuildId, string? Platform,
+        long? SaidAtMs = null);
 
     /// <summary>
     /// <c>knowledge.plans</c> — Plans, Promises &amp; Dates (N8): commitments ("I'll send it tomorrow"), shared plans ("let's play
@@ -162,9 +163,12 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
                 bool allDay = kind == "birthday" || scheduled is not { } s || s.WidthMs > 3 * 3_600_000L;
                 var dims = Dims(r.AssertionId);
                 string title = kind == "birthday" ? $"{kit.Corpus.DisplayName(person) ?? "Someone"}'s birthday" : (r.ValueText ?? r.Value.Text);
+                var evidence = kit.Assertions.Evidence(r.AssertionId);
+                // When it was first said. Most plans in chat name no date, and this is then the one time they have.
+                long? saidAt = evidence.Min(e => e.SentAtMs) ?? r.FirstEvidenceAtMs ?? r.AssertedAtMs;
                 result.Add(new PlanRecord(NaturalKeys.Id("pl", r.NaturalKey, 20), kind, subtype, owner, counterparty, involvesKlives, klivesPromised, title, scheduled,
                     dims.Zone, allDay, firmness, cancelled, done, rescheduled, kind == "birthday" ? "yearly" : null, month, day, year, r.AssertionId, r.NaturalKey,
-                    kit.Assertions.Evidence(r.AssertionId), dims.Conversation, dims.Guild, dims.Platform));
+                    evidence, dims.Conversation, dims.Guild, dims.Platform, saidAt));
             }
             return result;
         }
@@ -249,16 +253,16 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
                     c.Exec(tx, """
                         INSERT INTO kn_plans(plan_id, kind, subtype, owner_person_id, counterparty_person_id, involves_klives, klives_promised, title, scheduled_earliest_ms,
                             scheduled_latest_ms, local_zone, all_day, firmness, status, recurrence, month, day, year, assertion_id, natural_key, evidence_json, conversation_id,
-                            guild_id, platform, created_at_ms, updated_at_ms, source_seq)
-                        VALUES($id,$k,$st,$o,$cp,$ik,$kp,$t,$se,$sl,$z,$ad,$f,$status,$rec,$mo,$d,$y,$a,$key,$ev,$conv,$g,$pl,$n,$n,$seq)
+                            guild_id, platform, created_at_ms, updated_at_ms, source_seq, said_at_ms)
+                        VALUES($id,$k,$st,$o,$cp,$ik,$kp,$t,$se,$sl,$z,$ad,$f,$status,$rec,$mo,$d,$y,$a,$key,$ev,$conv,$g,$pl,$n,$n,$seq,$said)
                         ON CONFLICT(plan_id) DO UPDATE SET kind=excluded.kind, subtype=excluded.subtype, owner_person_id=excluded.owner_person_id,
                             counterparty_person_id=excluded.counterparty_person_id, involves_klives=excluded.involves_klives, klives_promised=excluded.klives_promised,
                             title=excluded.title, scheduled_earliest_ms=excluded.scheduled_earliest_ms, scheduled_latest_ms=excluded.scheduled_latest_ms,
                             local_zone=excluded.local_zone, all_day=excluded.all_day, firmness=excluded.firmness, status=excluded.status, recurrence=excluded.recurrence,
                             month=excluded.month, day=excluded.day, year=excluded.year, assertion_id=excluded.assertion_id, evidence_json=excluded.evidence_json,
                             conversation_id=excluded.conversation_id, guild_id=excluded.guild_id, platform=excluded.platform,
-                            updated_at_ms=excluded.updated_at_ms, source_seq=excluded.source_seq
-                        """, ("$id", p.PlanId), ("$k", p.Kind), ("$st", p.Subtype), ("$o", p.OwnerPersonId), ("$cp", p.CounterpartyPersonId), ("$ik", p.InvolvesKlives ? 1 : 0),
+                            updated_at_ms=excluded.updated_at_ms, source_seq=excluded.source_seq, said_at_ms=excluded.said_at_ms
+                        """, ("$said", p.SaidAtMs), ("$id", p.PlanId), ("$k", p.Kind), ("$st", p.Subtype), ("$o", p.OwnerPersonId), ("$cp", p.CounterpartyPersonId), ("$ik", p.InvolvesKlives ? 1 : 0),
                         ("$kp", p.KlivesPromised ? 1 : 0), ("$t", p.Title), ("$se", Bound(p.Scheduled?.EarliestMs)), ("$sl", Bound(p.Scheduled?.LatestMs)), ("$z", p.LocalZone),
                         ("$ad", p.AllDay ? 1 : 0), ("$f", p.Firmness), ("$status", status), ("$rec", p.Recurrence), ("$mo", p.Month), ("$d", p.Day), ("$y", p.Year),
                         ("$a", p.AssertionId), ("$key", p.NaturalKey), ("$ev", JsonSerializer.Serialize(p.Evidence.Take(20), KernelJson.Options)), ("$conv", p.ConversationId),
@@ -367,6 +371,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Plans
 
         public PlanItemDto ToDto(PlanRecord p, long now) => new(p.PlanId, p.Kind, p.Subtype, p.OwnerPersonId, p.CounterpartyPersonId, p.InvolvesKlives, p.KlivesPromised,
             p.Title, Bound(p.Scheduled?.EarliestMs), Bound(p.Scheduled?.LatestMs), NextOccurrence(p, now), p.LocalZone, p.AllDay, p.Firmness, StatusAt(p, now), p.Recurrence,
-            p.Evidence.Count, p.Evidence.Select(e => e.MessageId).Take(5).ToList(), p.ConversationId);
+            p.Evidence.Count, p.Evidence.Select(e => e.MessageId).Take(5).ToList(), p.ConversationId, p.SaidAtMs);
     }
 }

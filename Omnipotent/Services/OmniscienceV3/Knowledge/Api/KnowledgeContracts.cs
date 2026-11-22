@@ -63,7 +63,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Api
         string? Recurrence,
         int EvidenceCount,
         IReadOnlyList<string> EvidenceMessageIds,
-        string? ConversationId);
+        string? ConversationId,
+        // When it was first said (its earliest evidence): what a plan that names no date is shown and sorted by.
+        long? SaidAtMs = null);
 
     /// <summary>The <c>knowledge.agenda</c> read model: what is coming up in Klives's zone, overdue promises, and his own promises.</summary>
     [ApiContract]
