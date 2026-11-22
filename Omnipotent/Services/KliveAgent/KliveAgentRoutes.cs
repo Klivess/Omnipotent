@@ -42,10 +42,14 @@ namespace Omnipotent.Services.KliveAgent
         // ── Talk mode (spoken conversation) ──
 
         /// <summary>
-        /// /kliveagent/talk — one WebSocket per spoken conversation. Registered on the typed KliveAPI rather
-        /// than through reflection (which fails silently and partially). KliveAPI resolves the
-        /// ?authorization= credential and enforces chat.use before upgrading; the handler checks it again
-        /// against the profile it was handed.
+        /// /kliveagent/voice — one WebSocket per spoken conversation (talk mode on OpenAI's GPT-Live: the
+        /// browser's WebRTC offer goes up it, the answer and KliveAgent's progress come down). Registered on
+        /// the typed KliveAPI rather than through reflection (which fails silently and partially). KliveAPI
+        /// resolves the ?authorization= credential and enforces chat.use before upgrading; the handler
+        /// checks it again against the profile it was handed.
+        ///
+        /// /kliveagent/talk was the AIRouter Whisper/Kokoro protocol. It stays registered only to tell a page
+        /// still running the old build to reload, with a close code that page stops on rather than retries.
         /// </summary>
         private async Task RegisterTalkRouteAsync()
         {
@@ -65,14 +69,24 @@ namespace Omnipotent.Services.KliveAgent
                     await Task.Delay(250);
                 }
 
-                await api.CreateWebSocketRoute("/kliveagent/talk", async (context, socket, query, user) =>
+                await api.CreateWebSocketRoute("/kliveagent/voice", async (context, socket, query, user) =>
                 {
                     if (user == null || !AccessEvaluator.Can(user, KliveAgentPerms.ChatUse))
                     {
                         try { await socket.CloseAsync((System.Net.WebSockets.WebSocketCloseStatus)4003, "Unauthorized", CancellationToken.None); } catch { }
                         return;
                     }
-                    await service.RunTalkSessionAsync(socket, query);
+                    await service.RunVoiceSessionAsync(socket, query);
+                }, KliveAgentPerms.ChatUse);
+
+                await api.CreateWebSocketRoute("/kliveagent/talk", async (context, socket, query, user) =>
+                {
+                    try
+                    {
+                        await socket.CloseAsync((System.Net.WebSockets.WebSocketCloseStatus)4403,
+                            "Talk mode now runs on GPT-Live: reload the page.", CancellationToken.None);
+                    }
+                    catch { }
                 }, KliveAgentPerms.ChatUse);
             }
             catch (Exception ex)

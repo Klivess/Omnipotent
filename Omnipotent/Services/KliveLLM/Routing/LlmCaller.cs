@@ -71,6 +71,7 @@ namespace Omnipotent.Services.KliveLLM
             public static readonly LlmCaller KliveAgentChat = new("KliveAgent", "chat");
             public static readonly LlmCaller KliveAgentTalk = new("KliveAgent", "talk");
             public static readonly LlmCaller KliveAgentSpeech = new("KliveAgent", "speech");
+            public static readonly LlmCaller KliveAgentVoice = new("KliveAgent", "voice");
             public static readonly LlmCaller DemiurgeCommander = new("Demiurge", "commander");
             public static readonly LlmCaller DemiurgeSubAgent = new("Demiurge", "subagent");
             public static readonly LlmCaller DemiurgeFrontDesk = new("Demiurge", "frontdesk");
@@ -116,9 +117,11 @@ namespace Omnipotent.Services.KliveLLM
         {
             new("KliveAgent", "chat", "Chat", "Conversations with KliveAgent, including its tool and computer-use loop.",
                 AIRouterWorkClass.Interactive, ModelSource: "KliveAgent_FastModel and KliveAgent_ReasoningModel", ModelSourceLink: "/administration/omnisettings"),
-            new("KliveAgent", "talk", "Talk mode", "Spoken conversations: one pinned model on an append-only session.",
+            new("KliveAgent", "talk", "Talk mode", "The agent behind a spoken conversation: one pinned model on an append-only session.",
                 AIRouterWorkClass.Interactive, NeedsToolCalling: true, ModelSource: "KliveAgent_TalkModel", ModelSourceLink: "/administration/omnisettings"),
-            new("KliveAgent", "speech", "Speech", "Speech to text and text to speech for talk mode.",
+            new("KliveAgent", "voice", "Voice", "GPT-Live, the voice Klives talks to: OpenAI sessions billed by the minute.",
+                AIRouterWorkClass.Interactive, FixedRouter: LlmRouterIds.OpenAI, ModelSource: "KliveAgent_LiveModel", ModelSourceLink: "/administration/omnisettings"),
+            new("KliveAgent", "speech", "Speech", "AIRouter speech to text and text to speech (no longer used by talk mode).",
                 AIRouterWorkClass.Audio, FixedRouter: "airouter"),
 
             new("Demiurge", "commander", "Commander", "Each Steward's Commander wake loop.",

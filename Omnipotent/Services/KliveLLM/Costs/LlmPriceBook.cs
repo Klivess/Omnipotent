@@ -86,6 +86,9 @@ namespace Omnipotent.Services.KliveLLM
                 if (router != null && entries.TryGetValue(Key(router, m), out var own) && own.HasPrice) return own;
                 if (entries.TryGetValue(Key("*", m), out var any) && any.HasPrice) return any;
                 if (entries.TryGetValue(Key(LlmRouterIds.OpenRouter, m), out var catalogue) && catalogue.HasPrice) return catalogue;
+                // OpenAI's own router names a model bare ("gpt-6-luna"); OpenRouter lists it as "openai/gpt-6-luna".
+                if (string.Equals(router, LlmRouterIds.OpenAI, StringComparison.OrdinalIgnoreCase) && !m.Contains('/')
+                    && entries.TryGetValue(Key(LlmRouterIds.OpenRouter, "openai/" + m), out var openAiListed) && openAiListed.HasPrice) return openAiListed;
                 // OpenRouter answers with a dated variant of the slug it was sent ("…-20250514").
                 int dash = m.LastIndexOf('-');
                 if (dash > 0 && m.Length - dash == 9 && m[(dash + 1)..].All(char.IsDigit)

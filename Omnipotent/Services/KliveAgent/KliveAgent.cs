@@ -161,10 +161,10 @@ namespace Omnipotent.Services.KliveAgent
         // ── Talk mode ──
 
         /// <summary>
-        /// Serves one talk-mode WebSocket for as long as it stays open. Authorization has already been
-        /// checked by the route; this validates the conversation and starts the session.
+        /// Serves one voice WebSocket (talk mode on GPT-Live) for as long as it stays open. Authorization
+        /// has already been checked by the route; this validates the conversation and starts the session.
         /// </summary>
-        internal async Task RunTalkSessionAsync(WebSocket socket, NameValueCollection query)
+        internal async Task RunVoiceSessionAsync(WebSocket socket, NameValueCollection query)
         {
             async Task Refuse(int code, string reason)
             {
@@ -181,12 +181,27 @@ namespace Omnipotent.Services.KliveAgent
             if (llm == null) { await Refuse(4503, "KliveLLM is not running."); return; }
 
             if (conversations.TryGetValue(conversationId, out var canonical)) conversationId = canonical.ConversationId;
-            double? speed = double.TryParse(query["speed"], NumberStyles.Float, CultureInfo.InvariantCulture, out double s) ? s : null;
-            var session = new KliveAgentTalkSession(new KliveAgentTalkBackend(this), new KliveLLMTalkAudio(llm), socket,
-                conversationId, settings, query["voice"], speed, query["format"]);
+            var session = new KliveAgentVoiceSession(new KliveAgentTalkBackend(this), new KliveLLMTalkVoice(llm), socket,
+                conversationId, settings);
             await session.RunAsync();
 
             static string Clip(string text, int max) => text.Length <= max ? text : text[..max];
+        }
+
+        /// <summary>The conversation's finished messages, oldest first (at most <paramref name="max"/>), for
+        /// a voice session to start with. Empty for a conversation nobody has written to yet.</summary>
+        internal IReadOnlyList<(bool User, string Text)> RecentTalkHistory(string conversationId, int max)
+        {
+            if (max <= 0 || !conversations.TryGetValue(conversationId, out var conversation)) return Array.Empty<(bool, string)>();
+            lock (conversation.SyncRoot)
+            {
+                return (conversation.Messages ?? new List<AgentMessage>())
+                    .Where(m => !string.Equals(m.DeliveryStatus, "running", StringComparison.OrdinalIgnoreCase)
+                        && !string.IsNullOrWhiteSpace(m.Content))
+                    .TakeLast(max)
+                    .Select(m => (m.Role == AgentMessageRole.User, m.Content))
+                    .ToList();
+            }
         }
 
         /// <summary>

@@ -28,7 +28,7 @@ internal static class KliveAgentPromptPolicy
     /// between them never costs a re-prefill.
     /// </summary>
     internal const string SpokenTurnsRule =
-        "Turns marked [Spoken] reach you by voice and your reply is read aloud. Answer those like a person on a call: one to three short sentences in plain words, with no markdown, lists, tables, code, URLs, IDs or file paths in what you say. Anything Klives should see rather than hear goes in a ```screen block, which is shown and never spoken. Before a tool call, say one short clause of what you are doing (\"Checking the trader.\") and then call it; that clause is the one exception to the no-filler rule. A turn marked [Interrupted] means he cut your last reply off and did not hear the rest: answer what he says now.";
+        "Turns marked [Spoken] come from a live voice call: a voice model talks with Klives and hands you what he asks, and whatever you write outside ```screen blocks is passed back to that voice, which says it in its own words. Answer those like a person on a call: one to three short sentences in plain words, with no markdown, lists, tables, code, URLs, IDs or file paths in what you say. Anything Klives should see rather than hear goes in a ```screen block, which is shown and never spoken. The voice has already acknowledged him, so do not open with filler; before a tool call that will take a moment, one short clause of what you are doing (\"Checking the trader.\") is the exception. An [On the call, before this] note is what he and the voice said since your last answer: use it to understand what he means now.";
 
     /// <summary>
     /// The rules of the script host, each one a mistake live scripts kept making (11 Nov 2026: 44% of

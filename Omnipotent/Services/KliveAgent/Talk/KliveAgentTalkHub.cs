@@ -63,7 +63,7 @@ internal sealed class TalkEpoch
 /// <summary>Which talk session, if any, is attached to each conversation, and the warm epoch behind it.</summary>
 public sealed class KliveAgentTalkHub
 {
-    private readonly ConcurrentDictionary<string, KliveAgentTalkSession> sessions = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<string, KliveAgentVoiceSession> sessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly ConcurrentDictionary<string, TalkEpoch> epochs = new(StringComparer.OrdinalIgnoreCase);
 
     internal ITalkListener? GetListener(string? conversationId) =>
@@ -75,9 +75,9 @@ public sealed class KliveAgentTalkHub
     public int AttachedCount => sessions.Count;
 
     /// <summary>Attaches a session; returns the one it replaced (a second tab takes the conversation over).</summary>
-    internal KliveAgentTalkSession? Attach(string conversationId, KliveAgentTalkSession session)
+    internal KliveAgentVoiceSession? Attach(string conversationId, KliveAgentVoiceSession session)
     {
-        KliveAgentTalkSession? previous = null;
+        KliveAgentVoiceSession? previous = null;
         sessions.AddOrUpdate(conversationId, session, (_, existing) =>
         {
             previous = ReferenceEquals(existing, session) ? null : existing;
@@ -86,9 +86,9 @@ public sealed class KliveAgentTalkHub
         return previous;
     }
 
-    internal void Detach(string conversationId, KliveAgentTalkSession session) =>
-        ((ICollection<KeyValuePair<string, KliveAgentTalkSession>>)sessions)
-            .Remove(new KeyValuePair<string, KliveAgentTalkSession>(conversationId, session));
+    internal void Detach(string conversationId, KliveAgentVoiceSession session) =>
+        ((ICollection<KeyValuePair<string, KliveAgentVoiceSession>>)sessions)
+            .Remove(new KeyValuePair<string, KliveAgentVoiceSession>(conversationId, session));
 
     internal TalkEpoch? GetEpoch(string conversationId) => epochs.TryGetValue(conversationId, out var epoch) ? epoch : null;
 

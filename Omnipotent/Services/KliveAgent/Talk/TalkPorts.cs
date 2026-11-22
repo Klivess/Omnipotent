@@ -1,3 +1,4 @@
+using Newtonsoft.Json.Linq;
 using Omnipotent.Services.KliveAgent.Models;
 using Omnipotent.Services.KliveLLM;
 
@@ -6,7 +7,7 @@ namespace Omnipotent.Services.KliveAgent.Talk;
 /// <summary>The receipt for a spoken turn handed to the agent.</summary>
 internal sealed record TalkTurnReceipt(string? RequestId, bool Steering, bool Accepted, string? Error);
 
-/// <summary>What a talk session needs from KliveAgent. Lets the session be exercised without a live agent.</summary>
+/// <summary>What a voice session needs from KliveAgent. Lets the session be exercised without a live agent.</summary>
 internal interface ITalkBackend
 {
     KliveAgentTalkHub Hub { get; }
@@ -15,22 +16,28 @@ internal interface ITalkBackend
     IReadOnlyList<AgentSteeringMessage>? GetSteering(string requestId);
     Task EnsureWarmAsync(string conversationId, ITalkListener listener, CancellationToken cancellationToken);
     Task<string?> PrepareContextAsync(string text);
+    /// <summary>The conversation's messages, oldest first, for the voice to start with.</summary>
+    IReadOnlyList<(bool User, string Text)> RecentHistory(string conversationId, int max);
     void RecordStage(string stage, long ms);
     void LogError(Exception ex, string message);
 }
 
-/// <summary>What a talk session needs from KliveLLM: speech in, speech out, and the slot reserve.</summary>
-internal interface ITalkAudio
+/// <summary>What a voice session needs from KliveLLM: GPT-Live on the OpenAI key, the AIRouter slot
+/// reserve for the agent behind it, and the ledger.</summary>
+internal interface ITalkVoice
 {
-    Task<AIRouterTranscript> TranscribeAsync(byte[] wav, string? language, string? prompt, CancellationToken cancellationToken);
-    Task<(byte[] Audio, string Format)> SynthesizeAsync(string text, string voice, double speed, string format, CancellationToken cancellationToken);
-    Task<IReadOnlyList<AIRouterVoice>> ListVoicesAsync(CancellationToken cancellationToken);
+    /// <summary>Null when GPT-Live can be used; otherwise why not (the OpenAI router is switched off).</summary>
+    string? Unavailable { get; }
+    Task<OpenAILiveCreated> CreateSessionAsync(JObject session, string offerSdp, CancellationToken cancellationToken);
+    Task<IOpenAILiveSideband> AttachAsync(string sessionId, CancellationToken cancellationToken);
     Task WarmAsync(CancellationToken cancellationToken);
     void EngageReserve(string ownerId, TimeSpan ttl);
     void ReleaseReserve(string ownerId);
+    void RecordSession(string sessionId, string model, DateTimeOffset started, DateTimeOffset ended,
+        OpenAILiveUsage? usage, bool usageFinal, double activePerMinute, double standbyPerMinute, string outcome, string? error);
 }
 
-/// <summary>The live KliveAgent behind a talk session.</summary>
+/// <summary>The live KliveAgent behind a voice session.</summary>
 internal sealed class KliveAgentTalkBackend : ITalkBackend
 {
     private readonly KliveAgent agent;
@@ -57,6 +64,9 @@ internal sealed class KliveAgentTalkBackend : ITalkBackend
 
     public Task<string?> PrepareContextAsync(string text) => agent.PrepareTalkTurnContextAsync(text);
 
+    public IReadOnlyList<(bool User, string Text)> RecentHistory(string conversationId, int max) =>
+        agent.RecentTalkHistory(conversationId, max);
+
     public void RecordStage(string stage, long ms)
     {
         try { agent.Stats?.RecordStageSample(stage, ms); } catch { }
@@ -65,30 +75,30 @@ internal sealed class KliveAgentTalkBackend : ITalkBackend
     public void LogError(Exception ex, string message) => _ = agent.ServiceLogError(ex, message, false);
 }
 
-/// <summary>AIRouter speech plus the KliveLLM slot reserve and connection warm-up.</summary>
-internal sealed class KliveLLMTalkAudio : ITalkAudio
+/// <summary>GPT-Live through KliveLLM's OpenAI router, plus the AIRouter slot reserve and connection warm-up
+/// for the agent that answers.</summary>
+internal sealed class KliveLLMTalkVoice : ITalkVoice
 {
     private readonly KliveLLM.KliveLLM llm;
 
-    internal KliveLLMTalkAudio(KliveLLM.KliveLLM llm) => this.llm = llm;
+    internal KliveLLMTalkVoice(KliveLLM.KliveLLM llm) => this.llm = llm;
 
-    public Task<AIRouterTranscript> TranscribeAsync(byte[] wav, string? language, string? prompt, CancellationToken cancellationToken) =>
-        llm.Audio.TranscribeAsync(wav, "speech.wav", "audio/wav", language, prompt, cancellationToken);
+    public string? Unavailable => llm.OpenAIEnabled ? null : "The OpenAI router is switched off on the KliveLLM page.";
 
-    public Task<(byte[] Audio, string Format)> SynthesizeAsync(string text, string voice, double speed, string format,
-        CancellationToken cancellationToken) =>
-        llm.Audio.SynthesizeAsync(text, voice, speed, format, cancellationToken);
+    public Task<OpenAILiveCreated> CreateSessionAsync(JObject session, string offerSdp, CancellationToken cancellationToken) =>
+        llm.OpenAILive.CreateWebRtcSessionAsync(session, offerSdp, cancellationToken);
 
-    public Task<IReadOnlyList<AIRouterVoice>> ListVoicesAsync(CancellationToken cancellationToken) =>
-        llm.Audio.ListVoicesAsync(cancellationToken);
+    public async Task<IOpenAILiveSideband> AttachAsync(string sessionId, CancellationToken cancellationToken) =>
+        await llm.OpenAILive.AttachAsync(sessionId, cancellationToken);
 
-    public async Task WarmAsync(CancellationToken cancellationToken)
-    {
-        _ = llm.WarmUpConnectionAsync(cancellationToken);
-        await llm.Audio.WarmAsync(cancellationToken);
-    }
+    public Task WarmAsync(CancellationToken cancellationToken) =>
+        llm.WarmUpConnectionAsync(cancellationToken, LlmConsumerCatalog.Callers.KliveAgentTalk);
 
     public void EngageReserve(string ownerId, TimeSpan ttl) => llm.EngageInteractiveReserve(ownerId, ttl);
 
     public void ReleaseReserve(string ownerId) => llm.ReleaseInteractiveReserve(ownerId);
+
+    public void RecordSession(string sessionId, string model, DateTimeOffset started, DateTimeOffset ended,
+        OpenAILiveUsage? usage, bool usageFinal, double activePerMinute, double standbyPerMinute, string outcome, string? error) =>
+        llm.RecordLiveSession(sessionId, model, started, ended, usage, usageFinal, activePerMinute, standbyPerMinute, outcome, error);
 }

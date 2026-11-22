@@ -462,63 +462,75 @@ search (no API keys).
 ## Talk mode (spoken conversation)
 
 Talk mode is the spoken alternative to typing on the KliveAgent page. Klives speaks, KliveAgent answers out
-loud, and the conversation is the same one the typed chat uses. Speech-to-text is AIRouter's
-`whisper-large-v3-turbo` (`/v1/audio/transcriptions`); text-to-speech is AIRouter's `kokoro`
-(`/v1/audio/speech`, default voice `bm_george`).
+loud, and the conversation is the same one the typed chat uses. Since Nov 2026 the voice is OpenAI's
+**GPT-Live** (model `KliveAgent_LiveModel`, default `gpt-live-1.1`; any GPT-Live model id works), a
+full-duplex voice model that listens while it speaks and hands reasoning and tool use to a backend agent.
+KliveAgent is that backend. The AIRouter Whisper/Kokoro talk mode it replaced is gone (AIRouter's audio
+client stays for Omniscience's media transcription).
 
-**Transport.** One WebSocket per conversation: `/kliveagent/talk?conversationId=…` (typed
-`KliveAPI.CreateWebSocketRoute`, `kliveagent.chat.use`, re-checked in the handler). JSON text frames carry
-control messages. Binary frames carry audio:
-- `0x02 [u16 utt] [PCM16 16 kHz]` from the browser.
-- `0x01 [u16 turn] [u16 seq] [segment]` and `0x03 [u16 index] [filler]` from the server.
+**Three connections:**
+- Browser ⇄ OpenAI, WebRTC: the microphone goes up, the voice comes down, and GPT-Live's events (transcripts,
+  standby) arrive on the `oai-events` data channel. The server never touches audio. The browser may only
+  mute, unmute and hang up on that channel (`client.data_channel.allowed_client_events`).
+- Browser ⇄ KliveAgent, `/kliveagent/voice?conversationId=…` (typed `KliveAPI.CreateWebSocketRoute`,
+  `kliveagent.chat.use`): the page sends its SDP offer; the server creates the session with
+  `POST {OpenAIBaseURL}/live/sessions` (key, instructions and history stay on the server) and returns OpenAI's
+  answer. The socket then carries `delegation`, `heard`, `turn` (the same shape the typed chat follows),
+  `said`, `state`, `tool`, `usage`, `standby` and `closed`. A second tab for the same conversation takes it
+  over. `/kliveagent/talk` (the old protocol) only tells an old page to reload (close 4403).
+- KliveAgent ⇄ OpenAI, the sideband `wss://…/live/sessions/{id}/attach`: every transcript and delegation
+  event, and the commands that steer the voice.
 
-A second tab for the same conversation takes it over.
-
-**Where the latency goes, and what removes it:**
+**A request, end to end.** GPT-Live decides a reply needs the backend and raises a client delegation
+(`session.delegation.created`, which carries no text, only `offset_ms`). `LiveTranscript` takes every word
+Klives began saying up to that moment that no earlier delegation took (it waits up to 1.2 s for the last
+words' transcript). Anything said on the call in between (a clarifying question and its answer) goes along as
+an `[On the call, before this]` turn note. The words are queued to KliveAgent as a spoken turn (steering if a
+run is active). As the reply streams, `SpeechSegmenter` cuts it into speakable pieces (code, `screen` blocks,
+scripts, URLs and IDs never reach the voice); the first piece goes as soon as it exists, later ones every
+250 ms, as `session.commentary.append` under the delegation's id, which GPT-Live says in its own words. Tool
+activity goes as silent `session.thinking.append` context, so "what are you doing?" has an answer. A run
+quiet for `KliveAgent_LiveProgressSeconds` (default 10) gets a spoken "still working on it". When the run
+ends, a thinking note says it is finished (client delegations have no completion event).
 
 | Stage | Mechanism |
 |---|---|
-| Detecting the end of speech | The browser runs Silero VAD (`@ricky0123/vad-web`, assets self-hosted under `/talk/`, loudness fallback) and its own endpointer (`scripts/talk/endpointer.ts`). The server's provisional transcript says whether the sentence sounded finished, so the commit comes after 450 ms of silence when it did, 1100 ms when it trails off, 750 ms otherwise. Hold-to-talk commits on release. |
-| Upload | Audio streams while Klives speaks; nothing is uploaded after he stops. |
-| Transcription | Starts at the first ~250 ms pause. On commit it is reused when no speech followed the pause (`talk.sttReused`). |
-| Prompt context | Memory and knowledge for the turn are fetched during that same pause (`PrepareTalkTurnContextAsync`). |
-| Prefill | A spoken conversation keeps ONE append-only tool session (`TalkEpoch`): the run does not `ResetSession` at the end, and the next turn appends `[Spoken] …` plus only new context lines. It rebuilds when the compatibility key (computer target, vision, model) changes, the session has been idle past the measured prefix lifetime, it exceeds `KliveAgent_TalkSessionMaxTokens`, or a tool exchange is unfinished. Opening talk mode seeds the session and sends it once with `max_tokens: 1` (`WarmToolSessionPrefixAsync`), so the first question pays only for its own words. |
-| Model slot | While talking, one of AIRouter's three slots is held back from background work (`EngageInteractiveReserve`, TTL `KliveAgent_TalkReserveIdleMinutes`). Live work (Interactive, and the new `Audio` class) may use all three; nothing in flight is pre-empted; the warm-cohort size is computed on the reduced count. |
-| Reasoning | Spoken turns are pinned to `KliveAgent_TalkThinking` (default low) on one model (`KliveAgent_TalkModel`). KliveLLM now sends AIRouter `reasoning_effort` for callers that opt in (`honourThinkingOnAIRouter`): Qwen off/low/medium/high → none/low/medium/xhigh; DeepSeek → high/xhigh. KliveAgent opts in for typing too, so its adaptive levels finally take effect there. |
-| First audio | `SpeechSegmenter` cuts the streamed reply into speakable segments. The first is cut at the first clause with at least 4 words (or 12 words); later ones are whole sentences. At most 2 are synthesised at once, and never far ahead of playback. |
-| Tools | The model says one short clause before a tool call (the `[Spoken turns]` rule in the stable prompt skeleton). That clause is spoken while the tool runs. A cached filler covers a tool that runs past 1.2 s with nothing said. |
+| Turn-taking, barge-in, acknowledgement | GPT-Live itself. It says a short acknowledgement after `KliveAgent_LiveAckDelayMs` (default 500 ms) unless KliveAgent's first words arrive sooner. |
+| Prompt context | Memory and knowledge are fetched as soon as Klives pauses (`PrepareTalkTurnContextAsync`), before GPT-Live delegates. |
+| Prefill | Unchanged: one append-only tool session per spoken conversation (`TalkEpoch`), warmed when talk opens and when he starts speaking after a while, rebuilt when its compatibility key changes, it goes idle past the prefix lifetime, exceeds `KliveAgent_TalkSessionMaxTokens`, or a tool exchange is unfinished. |
+| Model slot | Unchanged: one AIRouter slot held back from background work while talking (`KliveAgent_TalkReserveSlot`). |
+| Reasoning | Unchanged: spoken turns pinned to `KliveAgent_TalkThinking` (default low) on `KliveAgent_TalkModel`. |
 
-**What is never spoken.** Fenced blocks (including ```` ```screen ```` blocks, meant to be seen), `{{{ }}}`
-scripts, tables, URLs, long hex IDs and paths. Markdown is stripped, CamelCase names are split, and the
-`KliveAgent_TalkPronunciations` lexicon is applied (`Written=Spoken; …`).
+**Session settings.** Voice `KliveAgent_LiveVoice` (a built-in such as `marin`, or a custom voice id; fixed per
+session, so a new voice is a new call). Standby after `KliveAgent_LiveIdleSeconds` of silence (default 20;
+0 = never; billed lower, woken by speech). The last `KliveAgent_LiveHistoryMessages` messages (default 20) seed
+the voice. `KliveAgent_LiveExtraInstructions` is appended to the built-in instructions (`LiveInstructions`:
+role, style, backchannel, interruption and delegation policies, as OpenAI's prompting guide lays out; for the
+first model, `gpt-live-1`, the delegation wording becomes `<|SpawnThinking|>`). `KliveAgent_TalkVocabulary`
+gives it names to expect; `KliveAgent_TalkPronunciations` respells what KliveAgent hands it.
 
-**Turn-taking extras:**
-- **Barge-in.** Speech while the reply plays fades it out in about 30 ms. The browser reports what was
-  heard; the rest of that run stays silent, and the next turn carries `[Interrupted] … he only heard: "…"`.
-  If Klives' words became steering, the run's next model call is a new spoken turn.
-- **Local commands.** "Stop" / "never mind" cancel the run with no model call. "Say that again" replays the
-  last reply from the speech cache.
-- **Whisper hygiene.** Phantom "Thank you." transcripts on short or quiet clips are dropped. The Whisper
-  prompt is `KliveAgent_TalkVocabulary` plus the last sentence spoken.
+**Local commands.** A delegated "stop" / "never mind" cancels the run without a new agent turn; "say that
+again" hands the last reply back. The stop button and Escape send `hush`: GPT-Live gets an instruction to stop
+talking, and the rest of that reply stays unsaid.
+
+**OpenAI as a provider.** The KliveLLM router `openai` (key `OpenAILLMToken`, base `OpenAIBaseURL`, default
+chat model `OpenAIModelID`) serves both chat completions and GPT-Live; switching it off on the KliveLLM page
+turns the voice off. Each voice session is one ledger row on KliveAgent's `voice` lane, costed from GPT-Live's
+own usage at `KliveAgent_LiveActivePerMinuteUsd` / `KliveAgent_LiveStandbyPerMinuteUsd` (0.05 / 0.02).
 
 **Code:**
 - Server:
-  - `Services/KliveAgent/Talk/` — session, segmenter, wire format, text rules, speech cache, hub/epoch, ports.
-  - `Services/KliveLLM/AIRouterAudio.cs` — the audio client. It learns which optional fields AIRouter
-    refuses; a 429 penalises the shared queue.
-  - `KliveLLM.Live.cs` — reserve, warm-up, session accessors.
+  - `Services/KliveAgent/Talk/` — `KliveAgentVoiceSession` (the session), `LiveTranscript`, `LiveInstructions`,
+    `SpeechSegmenter`, `TalkText` (commands), `KliveAgentTalkHub` (attachment + epoch), `TalkPorts`.
+  - `Services/KliveLLM/OpenAILive.cs` — the GPT-Live client and sideband; `KliveLLM.OpenAI.cs` — key, client,
+    ledger record.
 - Website:
-  - `composables/useTalkMode.ts`, `components/KliveAgent/TalkBar.vue`.
-  - `scripts/talk/` — endpointer, player, detector, prefs. `scripts/copy-talk-assets.mjs` runs on install.
-- Telemetry stages (Analytics → performance): `talk.endpoint`, `talk.stt`, `talk.sttReused`,
-  `talk.firstSegment`, `talk.tts`, `talk.firstAudio`, `talk.continued` / `talk.rebuilt`,
-  `talk.context(Prepared)`.
+  - `composables/useTalkMode.ts` (WebRTC + the voice socket), `components/KliveAgent/TalkBar.vue`,
+    `scripts/talk/prefs.ts`.
+- Telemetry stages (Analytics → performance): `talk.liveCreate`, `talk.liveAttach`, `talk.delegationSettle`,
+  `talk.firstWords` (delegation → KliveAgent's first words to the voice), `talk.firstAudio` (end of his words →
+  the voice answering), `talk.continued` / `talk.rebuilt`, `talk.context(Prepared)`.
 
-**Unverified until the first live run.** Run `AIRouterAudioLiveProbe` with `OMNI_LIVE_AIROUTER=1
-AIROUTER_API_KEY=…` to confirm:
-- which formats and fields AIRouter accepts;
-- the real TTS/STT latencies;
-- whether `stream:true` streams.
-
-Whether audio counts toward the 3-parallel limit is unknown. `AIRouterAudioCountsTowardParallel` defaults
-to true (safe); measure only with the fleet paused.
+**Unverified until the first live call** (no OpenAI key was available when this was built): the exact moment
+`offset_ms` marks relative to transcript timestamps, whether `session.commentary.append` with a null delegation
+id is accepted (used for runs started by typing while on a call), and the sideband's audio reflection volume.

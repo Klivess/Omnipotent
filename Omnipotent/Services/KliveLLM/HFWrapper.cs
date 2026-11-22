@@ -269,6 +269,12 @@ namespace Omnipotent.Services.KliveLLM
             [JsonProperty("max_tokens", NullValueHandling = NullValueHandling.Ignore)]
             public int? max_tokens;
 
+            // OpenAI's name for the same cap; its current models refuse max_tokens. Only ever set for
+            // the OpenAI provider (KliveLLM.ApplyOpenAIWireRules moves the value across just before
+            // sending), so every other request serializes exactly as before.
+            [JsonProperty("max_completion_tokens", NullValueHandling = NullValueHandling.Ignore)]
+            public int? max_completion_tokens;
+
             [JsonProperty("service_tier", NullValueHandling = NullValueHandling.Ignore)]
             public string service_tier;
 

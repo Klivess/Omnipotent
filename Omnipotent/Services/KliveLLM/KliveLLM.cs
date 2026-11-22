@@ -165,7 +165,17 @@ namespace Omnipotent.Services.KliveLLM
         private const string AIRouterEndpoint = "https://api.airouter.ch/v1";
         private const string DefaultAIRouterModel = "Qwen3.8";
 
-        private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter", CustomOpenAIProviderOption, AIRouterProviderOption };
+        // OpenAI's own API. Its own provider rather than the generic custom endpoint because OpenAI's
+        // current models are strict where the generic endpoint is not: they take max_completion_tokens
+        // (max_tokens is deprecated), and over Chat Completions they only call functions with
+        // reasoning_effort "none" — see ApplyOpenAIWireRules and ApplyThinkingPreference. The same key
+        // (OpenAILLMToken) opens GPT-Live, KliveAgent's voice (OpenAILiveClient). The base URL is a
+        // setting so a proxy or a regional endpoint can stand in for api.openai.com.
+        internal const string OpenAIProviderOption = "OpenAI";
+        internal const string DefaultOpenAIBaseUrl = "https://api.openai.com/v1";
+        private const string DefaultOpenAIModel = "gpt-6-luna";
+
+        private static readonly string[] ProviderOptions = new[] { "Local", "HuggingFace", "OpenRouter", CustomOpenAIProviderOption, AIRouterProviderOption, OpenAIProviderOption };
         private static readonly string[] OpenRouterServiceTierOptions = new[] { "default", "flex", "priority" };
         private static readonly string[] ThinkingTypeOptions = new[] { "Off", "Low", "Medium", "High" };
 
@@ -204,6 +214,7 @@ namespace Omnipotent.Services.KliveLLM
             OpenRouter,
             CustomOpenAI,
             AIRouter,
+            OpenAI,
         }
 
         /// <summary>
@@ -423,6 +434,11 @@ namespace Omnipotent.Services.KliveLLM
                 return LLMProvider.AIRouter;
             }
 
+            if (string.Equals(configuredProvider, OpenAIProviderOption, StringComparison.OrdinalIgnoreCase))
+            {
+                return LLMProvider.OpenAI;
+            }
+
             return LLMProvider.HuggingFace;
         }
 
@@ -527,6 +543,9 @@ namespace Omnipotent.Services.KliveLLM
             await GetStringOmniSetting("AIRouterLLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
             await GetStringOmniSetting("AIRouterModelID", DefaultAIRouterModel, false, false);
             await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, false);
+            await GetStringOmniSetting("OpenAILLMToken", defaultValue: null, sensitive: true, askKlivesForFulfillment: false);
+            await GetStringOmniSetting("OpenAIBaseURL", DefaultOpenAIBaseUrl, false, false);
+            await GetStringOmniSetting("OpenAIModelID", DefaultOpenAIModel, false, false);
             await GetDropdownOmniSetting("OpenRouterServiceTier", "default", OpenRouterServiceTierOptions, false, false);
             await GetDropdownOmniSetting("ThinkingType", "Medium", ThinkingTypeOptions, false, false);
 
@@ -788,6 +807,7 @@ namespace Omnipotent.Services.KliveLLM
                 LlmRouterIds.OpenRouterFree => await GetStringOmniSetting("FreeOpenRouterModelID", DefaultFreeOpenRouterModel, false, true),
                 LlmRouterIds.Custom => await GetStringOmniSetting("CustomOpenAIModelID", DefaultCustomOpenAIModel, false, true),
                 LlmRouterIds.AIRouter => await GetStringOmniSetting("AIRouterModelID", DefaultAIRouterModel, false, true),
+                LlmRouterIds.OpenAI => await GetStringOmniSetting("OpenAIModelID", DefaultOpenAIModel, false, true),
                 LlmRouterIds.HuggingFace => await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true),
                 LlmRouterIds.Local => "local",
                 _ => router.DefaultModel ?? "",
@@ -2728,6 +2748,13 @@ namespace Omnipotent.Services.KliveLLM
         /// silently change the reasoning of every fleet caller that happens to pass a level.</summary>
         private void ApplyThinkingPreference(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider, string? thinkingOverride = null, bool honourThinkingOnAIRouter = false)
         {
+            if (remoteProvider.Provider == LLMProvider.OpenAI)
+            {
+                payload.reasoning_effort = OpenAIReasoningEffort(payload.model ?? remoteProvider.Model,
+                    ResolveThinkingLevel(thinkingOverride, remoteProvider.ThinkingCeiling),
+                    hasTools: payload.tools is { Count: > 0 });
+                return;
+            }
             if (remoteProvider.Provider == LLMProvider.AIRouter)
             {
                 // A lane with its own reasoning ceiling has opted in, whatever the caller said.
@@ -2766,6 +2793,45 @@ namespace Omnipotent.Services.KliveLLM
             if (id.StartsWith("deepseek", StringComparison.Ordinal))
                 return canonical == "high" ? "xhigh" : "high";
             return null;
+        }
+
+        /// <summary>
+        /// The <c>reasoning_effort</c> to send OpenAI for <paramref name="model"/>, or null to send none.
+        /// Only OpenAI's reasoning families (gpt-5 and later, the o-series) take the field; older models
+        /// reject it, so they get nothing. Over Chat Completions OpenAI calls functions only at effort
+        /// "none" (its gpt-6-luna model page, Nov 2026), so a request that carries tools asks for "none"
+        /// whatever the caller's level — otherwise every KliveAgent tool turn routed here would be
+        /// refused. Without tools the canonical level maps straight across (off → none).
+        /// </summary>
+        internal static string? OpenAIReasoningEffort(string? model, string? level, bool hasTools)
+        {
+            string id = (model ?? string.Empty).Trim().ToLowerInvariant();
+            int slash = id.LastIndexOf('/');
+            if (slash >= 0) id = id[(slash + 1)..];
+            bool reasoningFamily = id.StartsWith("o1", StringComparison.Ordinal) || id.StartsWith("o3", StringComparison.Ordinal)
+                || id.StartsWith("o4", StringComparison.Ordinal)
+                || (id.StartsWith("gpt-", StringComparison.Ordinal) && id.Length > 4 && char.IsDigit(id[4]) && id[4] >= '5');
+            if (!reasoningFamily) return null;
+            if (hasTools) return "none";
+            return (level ?? string.Empty).Trim().ToLowerInvariant() switch
+            {
+                "off" => "none",
+                "low" => "low",
+                "medium" => "medium",
+                "high" => "high",
+                _ => null,
+            };
+        }
+
+        /// <summary>
+        /// OpenAI's current models refuse <c>max_tokens</c> in favour of <c>max_completion_tokens</c>.
+        /// Every other provider keeps the field it has always been sent, byte for byte.
+        /// </summary>
+        internal static void ApplyOpenAIWireRules(ref HFWrapper.HFLLMInferenceRequest payload, RemoteLLMProviderConfiguration remoteProvider)
+        {
+            if (remoteProvider.Provider != LLMProvider.OpenAI || payload.max_tokens is not { } cap) return;
+            payload.max_completion_tokens = cap;
+            payload.max_tokens = null;
         }
 
         // Chooses the transport: when a token sink is supplied we stream (stream=true + SSE) so the UI
@@ -2852,6 +2918,7 @@ namespace Omnipotent.Services.KliveLLM
         {
             payload.stream = true;
             payload.stream_options = new { include_usage = true };
+            ApplyOpenAIWireRules(ref payload, remoteProvider);
             string payloadJson = JsonConvert.SerializeObject(payload);
             var trace = CurrentTrace;
             if (trace is { CaptureContent: true }) trace.CapturedRequest = payloadJson;
@@ -3159,6 +3226,7 @@ namespace Omnipotent.Services.KliveLLM
         {
             // Serialize once; HttpRequestMessage/StringContent can only be sent once, so build a
             // fresh request per attempt from this cached body.
+            ApplyOpenAIWireRules(ref payload, remoteProvider);
             string payloadJson = JsonConvert.SerializeObject(payload);
             var trace = CurrentTrace;
             if (trace is { CaptureContent: true }) trace.CapturedRequest = payloadJson;

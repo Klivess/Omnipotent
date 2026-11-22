@@ -1,12 +1,10 @@
-using System.Buffers.Binary;
 using Omnipotent.Services.KliveAgent.Talk;
-using Omnipotent.Services.KliveLLM;
 
 namespace Omnipotent.Tests.KliveAgent;
 
 /// <summary>
-/// The text side of talk mode: what gets said (and when it is safe to say it), how turn-taking is
-/// judged from a provisional transcript, and the audio framing the browser and server share.
+/// The text side of talk mode: what of KliveAgent's reply is handed to the voice (and when it is safe
+/// to hand it over), and which short requests the voice session handles itself.
 /// </summary>
 public sealed class KliveAgentTalkTextTests
 {
@@ -137,21 +135,7 @@ public sealed class KliveAgentTalkTextTests
         Assert.Equal("Klivesy stays", SpeechSegmenter.ToSpeech("Klivesy stays", lexicon));
     }
 
-    // ── Turn-taking ──
-
-    [Theory]
-    [InlineData("Restart the trader.", "complete")]
-    [InlineData("What's the status?", "complete")]
-    [InlineData("yes", "complete")]
-    [InlineData("Restart the trader and.", "incomplete")]
-    [InlineData("Check the logs, um", "incomplete")]
-    [InlineData("I want you to check the", "incomplete")]
-    [InlineData("so...", "incomplete")]
-    [InlineData("", "incomplete")]
-    public void EndpointHint_ReadsWhetherTheSentenceSoundedFinished(string transcript, string hint)
-    {
-        Assert.Equal(hint, TalkText.EndpointHint(transcript));
-    }
+    // ── Local commands ──
 
     [Theory]
     [InlineData("Stop.", "Stop")]
@@ -164,72 +148,5 @@ public sealed class KliveAgentTalkTextTests
     public void LocalCommands_MatchOnlyWholeUtterances(string transcript, string command)
     {
         Assert.Equal(command, TalkText.MatchCommand(transcript).ToString());
-    }
-
-    [Fact]
-    public void Phantoms_OnShortOrQuietClips_AreRecognised_ButRealAnswersAreNot()
-    {
-        var thanks = new AIRouterTranscript("Thank you.", "en", 0.8, 0, 0, false);
-        Assert.True(TalkText.LooksLikePhantom(thanks, audioMs: 700, rms: 0.05));
-        Assert.False(TalkText.LooksLikePhantom(thanks, audioMs: 2500, rms: 0.08));
-        Assert.True(TalkText.LooksLikePhantom(new AIRouterTranscript(" ... ", null, 0, 0, 0, false), 1000, 0.1));
-        Assert.True(TalkText.LooksLikePhantom(new AIRouterTranscript("Restart it", "en", 1, 0.9, -1.2, true), 1000, 0.1));
-        Assert.False(TalkText.LooksLikePhantom(new AIRouterTranscript("Okay.", "en", 0.5, 0.1, -0.2, true), 500, 0.05));
-        Assert.False(TalkText.LooksLikePhantom(new AIRouterTranscript("Restart the trader.", "en", 1.5, 0.05, -0.3, true), 1500, 0.06));
-    }
-
-    [Fact]
-    public void WhisperPrompt_IsVocabularyThenTheLastThingSaid()
-    {
-        string prompt = TalkText.WhisperPrompt("Klives, OmniTrader", "Shall I restart OmniTrader?");
-        Assert.Equal("Klives, OmniTrader. Shall I restart OmniTrader?", prompt);
-        Assert.StartsWith("Klives, KliveAgent", TalkText.WhisperPrompt(null, null));
-        Assert.Equal("Shall I?", TalkText.LastSentence("It is down. Shall I?"));
-    }
-
-    // ── Wire format ──
-
-    [Fact]
-    public void Wav_HeaderDescribesTheSamples_AndItsDurationReadsBack()
-    {
-        var pcm = new byte[TalkWire.CaptureBytesPerSecond / 2]; // 500 ms of 16 kHz mono PCM16
-        byte[] wav = TalkWire.Wav(pcm);
-        Assert.Equal(44 + pcm.Length, wav.Length);
-        Assert.Equal("RIFF", System.Text.Encoding.ASCII.GetString(wav, 0, 4));
-        Assert.Equal(16000, BinaryPrimitives.ReadInt32LittleEndian(wav.AsSpan(24)));
-        Assert.Equal(pcm.Length, BinaryPrimitives.ReadInt32LittleEndian(wav.AsSpan(40)));
-        Assert.Equal(500, TalkWire.WavDurationMs(wav));
-        Assert.Null(TalkWire.WavDurationMs(new byte[] { 1, 2, 3 }));
-    }
-
-    [Fact]
-    public void Frames_CarryTheirKindAndBigEndianIds()
-    {
-        byte[] speech = TalkWire.SpeechFrame(turn: 258, seq: 3, new byte[] { 9, 9 });
-        Assert.Equal(new byte[] { TalkWire.ServerSpeech, 1, 2, 0, 3, 9, 9 }, speech);
-
-        byte[] client = { TalkWire.ClientAudio, 0, 7, 10, 20 };
-        Assert.True(TalkWire.TryReadClientAudio(client, out int utt, out var samples));
-        Assert.Equal(7, utt);
-        Assert.Equal(new byte[] { 10, 20 }, samples.ToArray());
-        Assert.False(TalkWire.TryReadClientAudio(new byte[] { TalkWire.ServerSpeech, 0, 1 }, out _, out _));
-    }
-
-    [Fact]
-    public void Rms_SeparatesSilenceFromSpeech()
-    {
-        Assert.Equal(0, TalkWire.Rms(new byte[3200]));
-        Assert.True(TalkWire.Rms(Tone(0.3, 3200)) > 0.15);
-    }
-
-    internal static byte[] Tone(double amplitude, int bytes)
-    {
-        var pcm = new byte[bytes];
-        for (int i = 0; i < bytes / 2; i++)
-        {
-            short sample = (short)(Math.Sin(i * 2 * Math.PI * 220 / 16000) * amplitude * short.MaxValue);
-            BinaryPrimitives.WriteInt16LittleEndian(pcm.AsSpan(i * 2), sample);
-        }
-        return pcm;
     }
 }

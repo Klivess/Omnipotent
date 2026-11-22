@@ -223,6 +223,14 @@ public partial class KliveLLM
                         ResolveChatCompletionsEndpoint(AIRouterEndpoint), token, model);
                     break;
                 }
+            case LlmRouterIds.OpenAI:
+                {
+                    var (key, baseUrl) = await GetOpenAICredentialsAsync();
+                    string model = await GetStringOmniSetting("OpenAIModelID", DefaultOpenAIModel, false, true);
+                    config = new RemoteLLMProviderConfiguration(LLMProvider.OpenAI, OpenAIProviderOption,
+                        ResolveChatCompletionsEndpoint(baseUrl), key, model);
+                    break;
+                }
             case LlmRouterIds.HuggingFace:
                 {
                     string model = await GetStringOmniSetting("HuggingFaceModelID", DefaultHuggingFaceModel, false, true);

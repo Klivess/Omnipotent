@@ -21,11 +21,12 @@ namespace Omnipotent.Services.KliveLLM
         public const string OpenRouter = "openrouter";
         public const string OpenRouterFree = "openrouter-free";
         public const string AIRouter = "airouter";
+        public const string OpenAI = "openai";
         public const string HuggingFace = "huggingface";
         public const string Custom = "custom";
         public const string Local = "local";
 
-        public static readonly string[] BuiltIn = { OpenRouter, OpenRouterFree, AIRouter, HuggingFace, Custom, Local };
+        public static readonly string[] BuiltIn = { OpenRouter, OpenRouterFree, AIRouter, OpenAI, HuggingFace, Custom, Local };
 
         public static bool IsBuiltIn(string? id) => id != null && BuiltIn.Contains(id, StringComparer.OrdinalIgnoreCase);
     }
@@ -67,6 +68,7 @@ namespace Omnipotent.Services.KliveLLM
         {
             LlmRouterIds.OpenRouter or LlmRouterIds.OpenRouterFree => "OpenRouterLLMToken",
             LlmRouterIds.AIRouter => "AIRouterLLMToken",
+            LlmRouterIds.OpenAI => "OpenAILLMToken",
             LlmRouterIds.HuggingFace => "HuggingFaceLLMToken",
             LlmRouterIds.Custom => "CustomOpenAILLMToken",
             LlmRouterIds.Local => "",
@@ -80,6 +82,7 @@ namespace Omnipotent.Services.KliveLLM
             LlmRouterIds.OpenRouter => "OpenRouterModelID",
             LlmRouterIds.OpenRouterFree => "FreeOpenRouterModelID",
             LlmRouterIds.AIRouter => "AIRouterModelID",
+            LlmRouterIds.OpenAI => "OpenAIModelID",
             LlmRouterIds.HuggingFace => "HuggingFaceModelID",
             LlmRouterIds.Custom => "CustomOpenAIModelID",
             _ => null,
@@ -102,6 +105,8 @@ namespace Omnipotent.Services.KliveLLM
             new() { Id = LlmRouterIds.OpenRouter, Name = "OpenRouter", Kind = "openrouter", BuiltIn = true, Billing = LlmBilling.PerToken },
             new() { Id = LlmRouterIds.OpenRouterFree, Name = "OpenRouter (free)", Kind = "openrouter", BuiltIn = true, Billing = LlmBilling.Free,
                 Notes = "OpenRouter with FreeOpenRouterModelID: what useFreeModel calls have always used." },
+            new() { Id = LlmRouterIds.OpenAI, Name = "OpenAI", Kind = "openai", BuiltIn = true, Billing = LlmBilling.PerToken,
+                Notes = "OpenAI's own API (OpenAIBaseURL, default model OpenAIModelID). Its key also opens GPT-Live, KliveAgent's voice." },
             new() { Id = LlmRouterIds.HuggingFace, Name = "HuggingFace", Kind = "huggingface", BuiltIn = true, Billing = LlmBilling.PerToken },
             new() { Id = LlmRouterIds.Custom, Name = "Custom endpoint", Kind = "openai", BuiltIn = true, Billing = LlmBilling.PerToken,
                 Notes = "The OpenAI-compatible endpoint in CustomOpenAIEndpointURL." },
@@ -144,6 +149,7 @@ namespace Omnipotent.Services.KliveLLM
             KliveLLM.LLMProvider.OpenRouter => LlmRouterIds.OpenRouter,
             KliveLLM.LLMProvider.CustomOpenAI => LlmRouterIds.Custom,
             KliveLLM.LLMProvider.AIRouter => LlmRouterIds.AIRouter,
+            KliveLLM.LLMProvider.OpenAI => LlmRouterIds.OpenAI,
             _ => LlmRouterIds.HuggingFace,
         };
 
