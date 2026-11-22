@@ -23,8 +23,15 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
 
         public T? Payload<T>() => Job.PayloadJson == null ? default : JsonSerializer.Deserialize<T>(Job.PayloadJson, KernelJson.Options);
 
-        /// <summary>Records progress (shown live in the UI) and extends the lease.</summary>
-        public Task ReportProgressAsync(object progress) => heartbeat(JsonSerializer.Serialize(progress, KernelJson.Options));
+        /// <summary>Records progress (shown live in the UI) and extends the lease. A job that says where it is has reached
+        /// a point where it can wait, so this is also where it stands back for a request that is being answered
+        /// (<see cref="Storage.Sqlite.ForegroundIo"/>): that covers work that reads files or another database, which the
+        /// stores' own reads do not see.</summary>
+        public async Task ReportProgressAsync(object progress)
+        {
+            await Storage.Sqlite.ForegroundIo.YieldIfBackgroundAsync().ConfigureAwait(false);
+            await heartbeat(JsonSerializer.Serialize(progress, KernelJson.Options)).ConfigureAwait(false);
+        }
     }
 
     /// <summary>A job handler returns its result as JSON (or null).</summary>
@@ -56,6 +63,25 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
     public sealed record LaneOptions(Lane Lane, int Concurrency, TimeSpan LeaseDuration, TimeSpan IdlePoll, TimeSpan? StallAfter = null, int? MaxPerModule = null)
     {
         public int ModuleLimit => Math.Max(1, MaxPerModule ?? (Concurrency > 1 ? Concurrency - 1 : 1));
+
+        /// <summary>
+        /// Workers, beside the <see cref="Concurrency"/> ordinary ones, that take only kinds of job that have been running
+        /// short (<see cref="ExpressLimit"/>). However long the long jobs of a lane run, and however many of them there
+        /// are, the jobs that take a second (a scan every minute, the health check, the tail of new messages) always have
+        /// a worker. Without one, two long jobs were enough to stop a two-worker lane: on the server a scan due every
+        /// minute waited 35 minutes and 3 h 23 min, the tail of v2's messages 13 hours (21 Nov 2026).
+        /// </summary>
+        public int Express { get; init; }
+
+        /// <summary>A kind whose runs have lately taken longer than this is not taken by an express worker.</summary>
+        public TimeSpan ExpressLimit { get; init; } = TimeSpan.FromSeconds(30);
+
+        /// <summary>
+        /// How many workers of the lane a module that is working through a backlog (<see cref="JobQueue.BacklogJobs"/>)
+        /// may hold at once. One: a backlog is by definition not urgent, and on a host whose drive is the limit three
+        /// workers of text recognition got through the backlog no faster than one while everything else read more slowly.
+        /// </summary>
+        public int MaxPerBacklog { get; init; } = 1;
     }
 
     /// <summary>
@@ -96,14 +122,17 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         public void Start()
         {
             if (loops.Count > 0) throw new InvalidOperationException("Workers already started.");
+            LoadPace();
             foreach (var lane in lanes)
             {
-                for (int i = 0; i < Math.Max(1, lane.Concurrency); i++)
+                int ordinary = Math.Max(1, lane.Concurrency);
+                for (int i = 0; i < ordinary + Math.Max(0, lane.Express); i++)
                 {
-                    string owner = $"{ownerPrefix}:{lane.Lane}:{i}";
+                    bool express = i >= ordinary;
+                    string owner = express ? $"{ownerPrefix}:{lane.Lane}:x{i - ordinary}" : $"{ownerPrefix}:{lane.Lane}:{i}";
                     var options = lane;
                     // Owned long-running loops, awaited in DisposeAsync.
-                    loops.Add(Task.Factory.StartNew(() => RunLoopAsync(options, owner), CancellationToken.None,
+                    loops.Add(Task.Factory.StartNew(() => RunLoopAsync(options, owner, express), CancellationToken.None,
                         TaskCreationOptions.LongRunning, TaskScheduler.Default).Unwrap());
                 }
             }
@@ -114,7 +143,80 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             if (wake.TryGetValue(lane, out var sem) && sem.CurrentCount < 64) sem.Release();
         }
 
-        private async Task RunLoopAsync(LaneOptions lane, string owner)
+        /// <summary>How long the runs of each kind of job have lately taken (a moving average, in milliseconds), learned as
+        /// they run. A kind nobody has seen yet counts as short. What decides an express worker's choice is written down
+        /// (<see cref="SavePaceAsync"/>) and read back at the next start: without that, an express worker took every long
+        /// kind once more after each restart, and the server is restarted with every deploy.</summary>
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<(string Module, string Kind), double> typicalMs = new();
+
+        /// <summary>What of <see cref="typicalMs"/> the queue's store holds.</summary>
+        private readonly System.Collections.Concurrent.ConcurrentDictionary<(string Module, string Kind), double> savedMs = new();
+
+        private void LoadPace()
+        {
+            try
+            {
+                foreach (var (module, kind, ms) in queue.KindPace())
+                {
+                    typicalMs[(module, kind)] = ms;
+                    savedMs[(module, kind)] = ms;
+                }
+            }
+            catch (Microsoft.Data.Sqlite.SqliteException ex)
+            {
+                // Not knowing is safe: every kind counts as short until it has run once here.
+                log("[OmniscienceV3] could not read how long each kind of job takes; the lanes learn it again as jobs run.", ex);
+            }
+        }
+
+        /// <summary>
+        /// Writes down how long <paramref name="job"/>'s kind takes when that changes what an express worker of
+        /// <paramref name="lane"/> does with it: the kind has become long, has stopped being long, or is long and has
+        /// doubled or halved. A short kind that stays short is never written.
+        /// </summary>
+        private async Task SavePaceAsync(JobRecord job, LaneOptions lane)
+        {
+            var key = (job.ModuleId, job.Kind);
+            if (!typicalMs.TryGetValue(key, out double now)) return;
+            double limit = lane.ExpressLimit.TotalMilliseconds;
+            bool isLong = now >= limit;
+            if (savedMs.TryGetValue(key, out double saved))
+            {
+                bool wasLong = saved >= limit;
+                if (wasLong == isLong && !(isLong && (now >= saved * 2 || now <= saved / 2))) return;
+            }
+            else if (!isLong) return;
+            savedMs[key] = now;
+            try
+            {
+                await queue.SaveKindPaceAsync(job.ModuleId, job.Kind, now, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or ObjectDisposedException or InvalidOperationException)
+            {
+                // The lanes go on with what they know; only the next process starts without it.
+                savedMs.TryRemove(key, out _);
+                log($"[OmniscienceV3] could not keep how long {job.ModuleId}/{job.Kind} takes; it is learned again after a restart.", ex);
+            }
+        }
+
+        /// <summary>The kinds an express worker of <paramref name="lane"/> leaves to the ordinary workers.</summary>
+        public IReadOnlyCollection<(string Module, string Kind)> LongKinds(LaneOptions lane)
+        {
+            double limit = lane.ExpressLimit.TotalMilliseconds;
+            return typicalMs.Where(kv => kv.Value >= limit).Select(kv => kv.Key).ToList();
+        }
+
+        /// <summary>A run of <paramref name="job"/>'s kind ended after <paramref name="elapsed"/>: each new run counts as much
+        /// as all the runs before it together, so a kind that was slow once is short again after a few ordinary runs.</summary>
+        private void NoteRun(JobRecord job, TimeSpan elapsed) =>
+            typicalMs.AddOrUpdate((job.ModuleId, job.Kind), elapsed.TotalMilliseconds, (_, old) => old * 0.5 + elapsed.TotalMilliseconds * 0.5);
+
+        /// <summary>A run that is still going has already taken <paramref name="elapsed"/>: the kind is known to be at least
+        /// that long from now on, without waiting for it to end.</summary>
+        private void NoteRunning(JobRecord job, TimeSpan elapsed) =>
+            typicalMs.AddOrUpdate((job.ModuleId, job.Kind), elapsed.TotalMilliseconds, (_, old) => Math.Max(old, elapsed.TotalMilliseconds));
+
+        private async Task RunLoopAsync(LaneOptions lane, string owner, bool express = false)
         {
             var token = stopping.Token;
             while (!token.IsCancellationRequested)
@@ -123,7 +225,11 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                 try
                 {
                     await gate.WaitAsync(lane.Lane, token).ConfigureAwait(false);
-                    job = await queue.LeaseNextAsync(lane.Lane, owner, lane.LeaseDuration, token, lane.ModuleLimit).ConfigureAwait(false);
+                    // An express worker may hold one job of a module beside those its ordinary workers hold, so a module's
+                    // minute-by-minute work is not kept waiting by that module's own long job.
+                    job = express
+                        ? await queue.LeaseNextAsync(lane.Lane, owner, lane.LeaseDuration, token, lane.ModuleLimit + lane.Express, lane.MaxPerBacklog, LongKinds(lane)).ConfigureAwait(false)
+                        : await queue.LeaseNextAsync(lane.Lane, owner, lane.LeaseDuration, token, lane.ModuleLimit, lane.MaxPerBacklog).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
                 catch (Exception ex)
@@ -158,6 +264,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                         continue;
                     }
                     await RunJobAsync(job, lane, owner, token).ConfigureAwait(false);
+                    await SavePaceAsync(job, lane).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -241,12 +348,19 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             using var heartbeatTimer = new PeriodicTimer(beatEvery);
             var heartbeatLoop = HeartbeatLoopAsync(job, heartbeatTimer, beatEvery, () => Beat(null), jobCts.Token);
             running[job.JobId] = 0;
+            long began = System.Diagnostics.Stopwatch.GetTimestamp();
+            // How often the watch below looks up: often enough to notice, while it still runs, that this kind of job is a
+            // long one (so the lane's express worker stops taking it).
+            var look = TimeSpan.FromSeconds(30);
+            if (lane.ExpressLimit > TimeSpan.Zero && lane.ExpressLimit < look) look = lane.ExpressLimit;
             // On the pool, so a handler that blocks before its first await cannot keep the watch below from running. The
             // job's cancellation travels with the handler: every read it makes stops with it (AmbientCancellation).
             var jobToken = jobCts.Token;
             var run = Task.Run(() =>
             {
-                Storage.Sqlite.AmbientCancellation.Set(jobToken);
+                // A job of the interactive lane is a request somebody is waiting on, carried on in the queue: its reads are
+                // not made to stand back for other requests (ForegroundIo), its own included.
+                Storage.Sqlite.AmbientCancellation.Set(jobToken, foreground: lane.Lane == Lane.LlmInteractive);
                 return handler(context);
             });
             bool stopped = false, abandoned = false;
@@ -259,7 +373,13 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                         var quiet = System.Diagnostics.Stopwatch.GetElapsedTime(Volatile.Read(ref lastSign));
                         if (quiet >= stall) break;
                         var wait = stall - quiet;
-                        await Task.WhenAny(run, Task.Delay(wait < TimeSpan.FromSeconds(30) ? wait : TimeSpan.FromSeconds(30))).ConfigureAwait(false);
+                        await Task.WhenAny(run, Task.Delay(wait < look ? wait : look)).ConfigureAwait(false);
+                        var ran = System.Diagnostics.Stopwatch.GetElapsedTime(began);
+                        if (!run.IsCompleted && ran >= lane.ExpressLimit)
+                        {
+                            NoteRunning(job, ran);
+                            await SavePaceAsync(job, lane).ConfigureAwait(false);
+                        }
                     }
                     if (!run.IsCompleted && !jobCts.IsCancellationRequested)
                     {
@@ -331,8 +451,11 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
             }
             finally
             {
-                if (!abandoned)
+                var ran = System.Diagnostics.Stopwatch.GetElapsedTime(began);
+                if (abandoned) NoteRunning(job, ran);
+                else
                 {
+                    NoteRun(job, ran);
                     running.TryRemove(job.JobId, out _);
                     if (!jobCts.IsCancellationRequested) jobCts.Cancel();
                 }

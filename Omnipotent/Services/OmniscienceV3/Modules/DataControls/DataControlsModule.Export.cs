@@ -9,6 +9,21 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
 {
     public sealed partial class DataControlsModule
     {
+        /// <summary>How many of a person's messages one read of the export fetches.</summary>
+        internal const int ExportPage = 2_000;
+
+        /// <summary>
+        /// One page of one account's messages, oldest first, from where the page before ended (<c>$t</c>, <c>$r</c>: the
+        /// time and the row of its last message). It walks the (author, time) index, whose entries end in the row, so a
+        /// page reads its own rows and nothing else, and messages that share an instant are neither skipped nor repeated.
+        /// </summary>
+        internal const string ExportPageSql = """
+            SELECT m.message_id, m.conversation_id, m.sent_at_ms, m.content, m.reply_to_message_id, m.edited_at_ms, m.deleted_at_ms,
+                   (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.message_id), m.rowid
+            FROM messages m INDEXED BY ix_messages_author_time
+            WHERE m.author_identity_id=$i AND (m.sent_at_ms, m.rowid) > ($t, $r) ORDER BY m.sent_at_ms, m.rowid LIMIT $n
+            """;
+
         /// <summary>
         /// Writes everything Omniscience holds about one person to a file: who they are (accounts and names over time), every
         /// message they wrote, and every fact recorded about them. <paramref name="format"/> is <c>json</c> (one document) or
@@ -39,25 +54,26 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.DataControls
             string? Title(string conversation) => titles.TryGetValue(conversation, out var t) ? t
                 : titles[conversation] = corpus.Scalar<string>(null, "SELECT title FROM conversations WHERE conversation_id=$c", ("$c", conversation));
 
-            // Their messages, oldest first, a page at a time by (time, id).
+            // Their messages, oldest first, a page at a time along the (author, time) index, from where the page before ended.
+            // The pages used to be ordered by (time, message id): the index does not hold the id, so every page read and
+            // sorted everything the person wrote after the page before it. For someone with 140,000 messages that is
+            // seventy pages of up to 140,000 row reads each; on the server one export held its request, and the drive, for
+            // 3 h 10 min (21 Nov 2026).
             IEnumerable<(string Id, string Conversation, long At, string? Text, string? ReplyTo, long? Edited, long? Deleted, int Attachments)> Messages()
             {
                 foreach (var identity in identities)
                 {
-                    long after = long.MinValue;
-                    string afterId = "";
+                    long after = long.MinValue, afterRow = 0;
                     while (true)
                     {
                         ct.ThrowIfCancellationRequested();
-                        var page = corpus.Query(null, """
-                            SELECT m.message_id, m.conversation_id, m.sent_at_ms, m.content, m.reply_to_message_id, m.edited_at_ms, m.deleted_at_ms,
-                                   (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.message_id)
-                            FROM messages m WHERE m.author_identity_id=$i AND (m.sent_at_ms > $t OR (m.sent_at_ms = $t AND m.message_id > $m)) ORDER BY m.sent_at_ms, m.message_id LIMIT 2000
-                            """, r => (r.GetString(0), r.GetString(1), r.GetInt64(2), r.GetStringOrNull(3), r.GetStringOrNull(4), r.GetInt64OrNull(5), r.GetInt64OrNull(6), r.GetInt32(7)),
-                            ("$i", identity.Id), ("$t", after), ("$m", afterId));
-                        foreach (var m in page) yield return m;
-                        if (page.Count < 2000) break;
-                        (after, afterId) = (page[^1].Item3, page[^1].Item1);
+                        var page = corpus.Query(null, ExportPageSql,
+                            r => (Row: (r.GetString(0), r.GetString(1), r.GetInt64(2), r.GetStringOrNull(3), r.GetStringOrNull(4), r.GetInt64OrNull(5), r.GetInt64OrNull(6), r.GetInt32(7)),
+                                RowId: r.GetInt64(8)),
+                            ("$i", identity.Id), ("$t", after), ("$r", afterRow), ("$n", ExportPage));
+                        foreach (var m in page) yield return m.Row;
+                        if (page.Count < ExportPage) break;
+                        (after, afterRow) = (page[^1].Row.Item3, page[^1].RowId);
                     }
                 }
             }

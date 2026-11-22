@@ -62,7 +62,8 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
 
         public IEnumerable<SqliteStore> All => new[] { Corpus, Intel, Operator, Vectors };
 
-        public static async Task<OmniscienceStores> OpenAsync(StorePaths paths, IClock clock, CancellationToken ct = default, TimeSpan? lockWait = null)
+        /// <param name="log">Told when opening one store (its write-ahead log read back, its migrations applied) took long.</param>
+        public static async Task<OmniscienceStores> OpenAsync(StorePaths paths, IClock clock, CancellationToken ct = default, TimeSpan? lockWait = null, Action<string>? log = null)
         {
             Directory.CreateDirectory(paths.Root);
             Directory.CreateDirectory(paths.Media);
@@ -75,12 +76,20 @@ namespace Omnipotent.Services.OmniscienceV3.Storage
             var op = new SqliteStore("operator", paths.Operator, clock);
             var vectors = new SqliteStore("vectors", paths.Vectors, clock);
             var opened = new List<SqliteStore>();
+            var step = System.Diagnostics.Stopwatch.StartNew();
+            async Task OpenOneAsync(SqliteStore store, IReadOnlyList<Migration> migrations)
+            {
+                step.Restart();
+                await store.InitializeAsync(migrations, ct).ConfigureAwait(false);
+                opened.Add(store);
+                if (step.Elapsed >= TimeSpan.FromSeconds(5)) log?.Invoke($"[OmniscienceV3] start-up: opening {store.Name}.db took {step.Elapsed.TotalSeconds:0} s.");
+            }
             try
             {
-                await corpus.InitializeAsync(CorpusSchema.Migrations, ct).ConfigureAwait(false); opened.Add(corpus);
-                await intel.InitializeAsync(IntelSchema.Migrations, ct).ConfigureAwait(false); opened.Add(intel);
-                await op.InitializeAsync(OperatorSchema.Migrations, ct).ConfigureAwait(false); opened.Add(op);
-                await vectors.InitializeAsync(VectorSchema.Migrations, ct).ConfigureAwait(false); opened.Add(vectors);
+                await OpenOneAsync(corpus, CorpusSchema.Migrations).ConfigureAwait(false);
+                await OpenOneAsync(intel, IntelSchema.Migrations).ConfigureAwait(false);
+                await OpenOneAsync(op, OperatorSchema.Migrations).ConfigureAwait(false);
+                await OpenOneAsync(vectors, VectorSchema.Migrations).ConfigureAwait(false);
                 return new OmniscienceStores(paths, instanceLock, corpus, intel, op, vectors);
             }
             catch

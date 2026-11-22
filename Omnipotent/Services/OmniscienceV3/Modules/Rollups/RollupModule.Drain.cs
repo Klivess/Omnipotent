@@ -15,7 +15,22 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
     {
         private const int ChangeBatch = 1_000;
         private const int CellBatch = 250;
-        private static readonly TimeSpan Budget = TimeSpan.FromMinutes(20);
+
+        /// <summary>
+        /// How long one drain works before it ends and lets the lane's other work run (the next one carries on from the
+        /// cursor and from the cells still marked). It was twenty minutes and only looked at between batches of 250 cells:
+        /// on the server one batch took 23 to 46 minutes, so every drain ran one batch and one held its worker for six hours
+        /// (21 Nov 2026). The time is now looked at after every cell.
+        /// </summary>
+        internal static TimeSpan Budget { get; set; } = TimeSpan.FromMinutes(5);
+
+        /// <summary>While this many cells or more wait to be rebuilt, no further changes are turned into marks: building is
+        /// what takes the time, and marks made faster than cells are built only make the list to sort longer.</summary>
+        internal static int MarkWhileBelow { get; set; } = 2_000;
+
+        /// <summary>Batches of changes marked before the cells are built, when the drain is far behind: a day's cell is then
+        /// rebuilt once for everything in those batches, not once per batch that touched the day.</summary>
+        internal static int MarkAhead { get; set; } = 10;
 
         /// <summary>
         /// Turns corpus changes (and label changes from classification) into dirty cells, then rebuilds dirty cells, until
@@ -52,22 +67,34 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                 upper = Math.Min(maxSeq, classify);
             }
             int marked = 0, built = 0;
-            while (cursor < upper && sw.Elapsed < Budget)
+            // A drain takes one step at least (a batch of changes marked, a cell built) however little time it has: one
+            // that found its time already gone would otherwise end without having moved, and so would the next.
+            for (int step = 0; cursor < upper && (step == 0 || sw.Elapsed < Budget); step++)
             {
                 ct.ThrowIfCancellationRequested();
-                List<ChangeRecord> changes;
-                using (var cr = Context.Stores.Corpus.OpenRead())
-                    changes = cr.Query(null, """
-                        SELECT seq, at_ms, kind, entity_id, person_id, conversation_id, source_kind FROM change_log
-                        WHERE seq > $s AND seq <= $u AND kind IN ('message.insert','message.version','message.delete','reaction.change','attachment.add',
-                                                                   'person.merge','person.unmerge','person.erase','person.reanalyse','identity.upsert')
-                        ORDER BY seq LIMIT $l
-                        """, r => new ChangeRecord(r.GetInt64(0), r.GetInt64(1), r.GetString(2), r.GetString(3), r.GetStringOrNull(4), r.GetStringOrNull(5), r.GetString(6)),
-                        ("$s", cursor), ("$u", upper), ("$l", ChangeBatch));
-                long to = changes.Count < ChangeBatch ? upper : changes[^1].Seq;
-                marked += await MarkFromChangesAsync(changes, to, ct).ConfigureAwait(false);
-                await SetCursorAsync("changes", to, ct).ConfigureAwait(false);
-                cursor = to;
+                // Far behind, several batches of changes are marked before anything is built: the same day of a busy
+                // conversation, of a server and of the whole archive is touched by batch after batch, and building it after
+                // each one rebuilt it from all of that day's messages every time. With cells already waiting (a job before
+                // this one ran out of time) nothing more is marked until they are built.
+                int batches = Waiting() >= MarkWhileBelow ? 0 : upper - cursor > (long)ChangeBatch * MarkAhead ? MarkAhead : 1;
+                for (int b = 0; b < batches && cursor < upper && (b == 0 || sw.Elapsed < Budget); b++)
+                {
+                    if (b > 0 && Waiting() >= MarkWhileBelow) break;
+                    List<ChangeRecord> changes;
+                    using (var cr = Context.Stores.Corpus.OpenRead())
+                        changes = cr.Query(null, """
+                            SELECT seq, at_ms, kind, entity_id, person_id, conversation_id, source_kind FROM change_log
+                            WHERE seq > $s AND seq <= $u AND kind IN ('message.insert','message.version','message.delete','reaction.change','attachment.add',
+                                                                       'person.merge','person.unmerge','person.erase','person.reanalyse','identity.upsert')
+                            ORDER BY seq LIMIT $l
+                            """, r => new ChangeRecord(r.GetInt64(0), r.GetInt64(1), r.GetString(2), r.GetString(3), r.GetStringOrNull(4), r.GetStringOrNull(5), r.GetString(6)),
+                            ("$s", cursor), ("$u", upper), ("$l", ChangeBatch));
+                    long to = changes.Count < ChangeBatch ? upper : changes[^1].Seq;
+                    marked += await MarkFromChangesAsync(changes, to, ct).ConfigureAwait(false);
+                    await SetCursorAsync("changes", to, ct).ConfigureAwait(false);
+                    cursor = to;
+                    await job.ReportProgressAsync(new { cursor, upper, marked, built }).ConfigureAwait(false);
+                }
                 built += await BuildDirtyAsync(job, ct, Budget - sw.Elapsed).ConfigureAwait(false);
             }
             // Label changes after the fact (teacher signals, gold corrections, relabelled successors).
@@ -249,11 +276,18 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
 
         // ── building ─────────────────────────────────────────────────────────────
 
+        /// <summary>How many cells wait to be rebuilt.</summary>
+        private long Waiting()
+        {
+            using var c = Context.Stores.Intel.OpenRead();
+            return c.Scalar<long>(null, "SELECT COUNT(*) FROM rollup_dirty");
+        }
+
         private async Task<int> BuildDirtyAsync(JobContext job, CancellationToken ct, TimeSpan budget)
         {
             var sw = Stopwatch.StartNew();
             int built = 0;
-            while (sw.Elapsed < budget)
+            for (int round = 0; round == 0 || sw.Elapsed < budget; round++)
             {
                 ct.ThrowIfCancellationRequested();
                 List<(string Kind, string Key, string Day, long Seq)> batch;
@@ -263,6 +297,12 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Rollups
                 if (batch.Count == 0) break;
                 foreach (var cell in batch)
                 {
+                    // The time is looked at after every cell, and the job says where it is as it goes: a cell is a day of a
+                    // person, a conversation or the whole archive read from the corpus, and a batch of them can take the
+                    // better part of an hour.
+                    if (built > 0 && sw.Elapsed >= budget) return built;
+                    ct.ThrowIfCancellationRequested();
+                    if (built > 0 && built % 25 == 0) await job.ReportProgressAsync(new { built }).ConfigureAwait(false);
                     switch (cell.Kind)
                     {
                         case Cells.PersonAll: await ExpandPersonAsync(cell.Key, cell.Day, cell.Seq, ct).ConfigureAwait(false); break;

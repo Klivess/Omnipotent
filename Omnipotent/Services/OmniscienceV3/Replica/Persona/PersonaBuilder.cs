@@ -74,37 +74,100 @@ namespace Omnipotent.Services.OmniscienceV3.Replica
 
         public sealed record SliceResult(IReadOnlyList<PersonaItem> Items, int Dropped, string? Problem, string? Model, int Calls);
 
-        /// <summary>Extracts and verifies the persona items of one slice.</summary>
+        /// <summary>
+        /// Evidence tokens in one call, at most. A persona sheet comes out about half as long as the exchanges that go in:
+        /// on the server the one call that worked read 13,000 tokens and wrote 6,400, and the 92 that read 77,000 to
+        /// 187,000 (a slice filled the model's whole window) were all cut off at the ceiling or answered without the sheet,
+        /// twice each, two to five minutes of the model lane a time (21 Nov 2026). What bounds a call is what the model can
+        /// write back, not what it can read.
+        /// </summary>
+        internal static int EvidenceTokensPerCall { get; set; } = 10_000;
+
+        /// <summary>The most calls one slice is read in. A slice with more exchanges than that holds is read from parts
+        /// spread evenly over its span, so a busy period is still described from its beginning to its end.</summary>
+        internal static int MaxCallsPerSlice { get; set; } = 6;
+
+        /// <summary>What one call may write.</summary>
+        internal const int OutputTokens = 12_000;
+
+        /// <summary>
+        /// Extracts and verifies the persona items of one slice. The slice is read in as many calls as its exchanges need
+        /// (<see cref="EvidenceTokensPerCall"/>); every item cites exchanges of the call it came from, and the items of all
+        /// the calls are the slice's sheet.
+        /// </summary>
         public async Task<SliceResult> ExtractAsync(string name, SlicePlan slice, IReadOnlyList<ReplicaPair> slicePairs, Func<string, string?> resolvePartner,
             int tokenBudget, long? jobId, CancellationToken ct)
         {
             string system = SystemPrompt(name);
-            var refs = new Dictionary<string, ReplicaPair>(StringComparer.OrdinalIgnoreCase);
-            var sb = new StringBuilder();
-            sb.Append("Excerpts of ").Append(name).Append("'s chats (").Append(slicePairs.Count.ToString(CultureInfo.InvariantCulture)).Append(" exchanges, ")
-              .Append(Instant.ToUtcDateTime(slice.FromMs).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)).Append(" to ")
-              .Append(Instant.ToUtcDateTime(slice.ToMs).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)).Append("):\n\n");
             var estimator = llm.Llm.Estimator;
-            int used = estimator.Estimate(system) + 600, included = 0;
+            int perCall = Math.Max(1_000, Math.Min(tokenBudget, EvidenceTokensPerCall)), fixedCost = estimator.Estimate(system) + 600;
+            var parts = new List<List<ReplicaPair>>();
+            var current = new List<ReplicaPair>();
+            int used = fixedCost;
             foreach (var p in slicePairs)
             {
+                int cost = estimator.Estimate(p.Rendered) + 8;
+                if (current.Count > 0 && used + cost > perCall)
+                {
+                    parts.Add(current);
+                    current = new List<ReplicaPair>();
+                    used = fixedCost;
+                }
+                current.Add(p);
+                used += cost;
+            }
+            if (current.Count > 0) parts.Add(current);
+            if (parts.Count > MaxCallsPerSlice)
+            {
+                var all = parts;
+                parts = Enumerable.Range(0, MaxCallsPerSlice).Select(i => all[(int)((long)i * all.Count / MaxCallsPerSlice)]).ToList();
+            }
+            if (parts.Count == 0) parts.Add(new List<ReplicaPair>());
+
+            var items = new List<PersonaItem>();
+            int dropped = 0, calls = 0;
+            string? problem = null, model = null;
+            for (int k = 0; k < parts.Count; k++)
+            {
+                ct.ThrowIfCancellationRequested();
+                var part = await ExtractPartAsync(name, system, slice, k, parts.Count, parts[k], resolvePartner, jobId, ct).ConfigureAwait(false);
+                calls += part.Calls;
+                dropped += part.Dropped;
+                model ??= part.Model;
+                problem ??= part.Problem;
+                items.AddRange(part.Items);
+            }
+            // A part that could not be read is a problem only when nothing at all came of the slice.
+            return new SliceResult(items.DistinctBy(i => i.ItemId).ToList(), dropped, items.Count == 0 ? problem : null, model, calls);
+        }
+
+        /// <summary>One call: the persona items evidenced by <paramref name="pairs"/> (one part of the slice).</summary>
+        private async Task<SliceResult> ExtractPartAsync(string name, string system, SlicePlan slice, int part, int parts, IReadOnlyList<ReplicaPair> pairs,
+            Func<string, string?> resolvePartner, long? jobId, CancellationToken ct)
+        {
+            var refs = new Dictionary<string, ReplicaPair>(StringComparer.OrdinalIgnoreCase);
+            var sb = new StringBuilder();
+            sb.Append("Excerpts of ").Append(name).Append("'s chats (").Append(pairs.Count.ToString(CultureInfo.InvariantCulture)).Append(" exchanges, ")
+              .Append(Instant.ToUtcDateTime(slice.FromMs).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)).Append(" to ")
+              .Append(Instant.ToUtcDateTime(slice.ToMs).ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)).Append("):\n\n");
+            int included = 0;
+            foreach (var p in pairs)
+            {
                 string block = p.Rendered.Replace(ReplicaIndexer.SelfToken, name, StringComparison.Ordinal);
-                int cost = estimator.Estimate(block) + 8;
-                if (included > 0 && used + cost > tokenBudget) break;
                 string id = "e" + (included + 1).ToString(CultureInfo.InvariantCulture);
                 refs[id] = p;
                 sb.Append('[').Append(id).Append("] ").Append(block).Append("\n\n");
-                used += cost;
                 included++;
             }
             sb.Append("Write the persona sheet of ").Append(name).Append(" as JSON.");
             var request = new LlmRequest
             {
                 Purpose = "replica.persona",
-                SessionKey = ReplicaLlm.SessionKey(false, "persona", system + slice.ContentHash),
+                // A slice read in one call keeps the key it always had.
+                SessionKey = ReplicaLlm.SessionKey(false, "persona", system + slice.ContentHash + (parts > 1 ? "|" + part.ToString(CultureInfo.InvariantCulture) : "")),
                 SystemPrompt = system,
                 Turns = new[] { new LlmTurn("user", sb.ToString()) },
-                MaxOutputTokens = 6_000,
+                MaxOutputTokens = OutputTokens,
                 Sampling = new ModelSamplingParameters(Temperature: 0.2),
                 WorkClass = AIRouterWorkClass.Background,
                 OutputSchema = Schema,

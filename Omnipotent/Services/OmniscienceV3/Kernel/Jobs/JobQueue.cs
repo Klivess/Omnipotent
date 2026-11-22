@@ -76,10 +76,20 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         /// <summary>While other modules have work, a backlog still gets one lease in this many.</summary>
         public const int BacklogShare = 4;
 
-        /// <summary>A waiting job counts as one priority step higher for every ten minutes it has waited.</summary>
-        private const long AgeStepMs = 10 * 60 * 1000;
+        /// <summary>
+        /// A waiting job counts as one priority step higher for every five seconds it has waited: a priority is a head
+        /// start, not a right of way. The step was ten minutes, and with priorities from 30 to 300 that was no ageing at
+        /// all: on the server the health check (150) stood behind a scan (260) that is queued afresh every minute and ran
+        /// six times in three days, 6 to 16 hours late each time, and the deduction sweep (50, due every minute) ran three
+        /// times (21 Nov 2026). At five seconds a step, a job a hundred steps down runs at most eight minutes after a
+        /// stream of fresher work that outranks it, and a lane that cannot keep up serves its jobs oldest first.
+        /// </summary>
+        public const long AgeStepMs = 5_000;
 
         private const int AgeCap = 1_000;
+
+        /// <summary>How many priority levels of one module are looked at for a lease (its jobs rarely use more than three).</summary>
+        private const int MaxLevels = 8;
 
         /// <summary>Per lane: the backlog module served last, and how many leases went by since a backlog was served.</summary>
         private readonly Dictionary<Lane, (string? LastBacklog, int SinceBacklog)> rotation = new();
@@ -88,16 +98,20 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
 
         /// <summary>
         /// Leases the next job in <paramref name="lane"/>, or null when none is ready.
-        /// <para>Among modules with an ordinary amount of work the order is what it always was: highest priority first
-        /// (a job gains a step for every ten minutes it has waited), then earliest eligible, then oldest. A module with
-        /// more than <see cref="BacklogJobs"/> queued is a backlog, and a backlog does not compete on priority: it gets
-        /// the lane whenever nobody else has a job ready, and one lease in <see cref="BacklogShare"/> when somebody
-        /// does; several backlogs take turns. On the server 650,000 media jobs outranked everything else in two lanes,
-        /// so the deduction sweep, the projections and the tail of v2's messages waited behind all of them.</para>
+        /// <para>Among modules with an ordinary amount of work, jobs are compared by priority plus the time they have
+        /// waited (<see cref="AgeStepMs"/>), then earliest eligible, then oldest; within a module too, so a job of a
+        /// module's lower priority is not hidden for ever behind a higher one that keeps arriving. A module with more
+        /// than <see cref="BacklogJobs"/> queued is a backlog, and a backlog does not compete on priority: it gets the
+        /// lane whenever nobody else has a job ready, and one lease in <see cref="BacklogShare"/> when somebody does;
+        /// several backlogs take turns. On the server 650,000 media jobs outranked everything else in two lanes, so the
+        /// deduction sweep, the projections and the tail of v2's messages waited behind all of them.</para>
         /// <para><paramref name="maxPerModule"/> is how many jobs one module may hold leased in this lane at once, so a
-        /// module whose jobs are slow or stuck cannot occupy every worker.</para>
+        /// module whose jobs are slow or stuck cannot occupy every worker; <paramref name="maxPerBacklog"/> is the same
+        /// limit for a module that is working through a backlog. <paramref name="exclude"/> names kinds this worker does
+        /// not take (see <see cref="LaneOptions.Express"/>).</para>
         /// </summary>
-        public Task<JobRecord?> LeaseNextAsync(Lane lane, string owner, TimeSpan leaseDuration, CancellationToken ct = default, int maxPerModule = int.MaxValue) =>
+        public Task<JobRecord?> LeaseNextAsync(Lane lane, string owner, TimeSpan leaseDuration, CancellationToken ct = default, int maxPerModule = int.MaxValue,
+            int maxPerBacklog = int.MaxValue, IReadOnlyCollection<(string Module, string Kind)>? exclude = null) =>
             intel.WriteAsync<JobRecord?>((c, tx) =>
             {
                 long now = clock.NowMs;
@@ -107,39 +121,66 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
                     SELECT module_id, SUM(CASE WHEN state='queued' THEN n ELSE 0 END), SUM(CASE WHEN state='leased' THEN n ELSE 0 END)
                     FROM job_counts WHERE lane=$l AND state IN ('queued','leased') GROUP BY module_id ORDER BY module_id
                     """, r => (Module: r.GetString(0), Queued: r.GetInt64(1), Leased: r.GetInt64(2)), ("$l", laneName))
-                    .Where(m => m.Queued > 0 && m.Leased < maxPerModule).ToList();
+                    .Where(m => m.Queued > 0 && m.Leased < (m.Queued > BacklogJobs ? Math.Min(maxPerModule, maxPerBacklog) : maxPerModule)).ToList();
                 if (modules.Count == 0) return null;
 
-                Candidate? Best(string module) => c.Query(tx, """
-                    SELECT job_id, priority, not_before_ms, created_at_ms FROM jobs INDEXED BY ix_jobs_fair
-                    WHERE lane=$l AND state='queued' AND module_id=$m AND not_before_ms <= $now
-                    ORDER BY priority DESC, not_before_ms, job_id
-                    LIMIT 1
-                    """, r => (Candidate?)new Candidate(module, r.GetInt64(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3)),
-                    ("$l", laneName), ("$m", module), ("$now", now)).FirstOrDefault();
+                var excluded = exclude is { Count: > 0 }
+                    ? exclude.GroupBy(e => e.Module, StringComparer.Ordinal).ToDictionary(g => g.Key, g => g.Select(e => e.Kind).Distinct(StringComparer.Ordinal).ToList(), StringComparer.Ordinal)
+                    : null;
 
-                // The ordinary modules' best ready jobs, compared as one queue.
+                // A module's best ready job at each priority it has queued, highest first: one index seek per level.
+                // Kinds the worker does not take are left out (the kind is on the row, so a level made only of those is
+                // walked; a module is at most BacklogJobs deep here, and a backlog is passed over whole below).
+                IEnumerable<Candidate> Levels(string module, int levels)
+                {
+                    var args = new List<(string, object?)> { ("$l", laneName), ("$m", module), ("$now", now) };
+                    string notKinds = "";
+                    if (excluded != null && excluded.TryGetValue(module, out var kinds))
+                    {
+                        for (int i = 0; i < kinds.Count; i++) args.Add(("$x" + i.ToString(System.Globalization.CultureInfo.InvariantCulture), kinds[i]));
+                        notKinds = " AND kind NOT IN (" + string.Join(",", kinds.Select((_, i) => "$x" + i.ToString(System.Globalization.CultureInfo.InvariantCulture))) + ")";
+                    }
+                    int? below = null;
+                    for (int level = 0; level < levels; level++)
+                    {
+                        var p = below is { } b ? args.Append(("$below", (object?)b)).ToArray() : args.ToArray();
+                        var found = c.Query(tx, $"""
+                            SELECT job_id, priority, not_before_ms, created_at_ms FROM jobs INDEXED BY ix_jobs_fair
+                            WHERE lane=$l AND state='queued' AND module_id=$m AND not_before_ms <= $now{(below == null ? "" : " AND priority < $below")}{notKinds}
+                            ORDER BY priority DESC, not_before_ms, job_id
+                            LIMIT 1
+                            """, r => (Candidate?)new Candidate(module, r.GetInt64(0), r.GetInt32(1), r.GetInt64(2), r.GetInt64(3)), p).FirstOrDefault();
+                        if (found is not { } candidate) yield break; // nothing ready below this level
+                        yield return candidate;
+                        below = candidate.Priority;
+                    }
+                }
+
+                // The ordinary modules' ready jobs, compared as one queue.
                 Candidate? ordinary = null;
                 long ordinaryRank = long.MinValue;
                 foreach (var m in modules.Where(m => m.Queued <= BacklogJobs))
                 {
-                    if (Best(m.Module) is not { } candidate) continue; // everything it has queued is still backing off
-                    long rank = candidate.Priority + Math.Min(AgeCap, Math.Max(0, now - candidate.CreatedAtMs) / AgeStepMs);
-                    bool better = ordinary is not { } held || rank > ordinaryRank
-                                  || (rank == ordinaryRank && (candidate.NotBeforeMs < held.NotBeforeMs
-                                                              || (candidate.NotBeforeMs == held.NotBeforeMs && candidate.JobId < held.JobId)));
-                    if (better) (ordinary, ordinaryRank) = (candidate, rank);
+                    foreach (var candidate in Levels(m.Module, MaxLevels))
+                    {
+                        long rank = candidate.Priority + Math.Min(AgeCap, Math.Max(0, now - candidate.CreatedAtMs) / AgeStepMs);
+                        bool better = ordinary is not { } held || rank > ordinaryRank
+                                      || (rank == ordinaryRank && (candidate.NotBeforeMs < held.NotBeforeMs
+                                                                  || (candidate.NotBeforeMs == held.NotBeforeMs && candidate.JobId < held.JobId)));
+                        if (better) (ordinary, ordinaryRank) = (candidate, rank);
+                    }
                 }
 
-                // The backlogs, starting after the one served last.
+                // The backlogs, starting after the one served last. A backlog with a kind this worker does not take is
+                // passed over whole: finding its other kinds would mean walking every queued row of it.
                 Candidate? NextBacklog(string? last)
                 {
-                    var backlogs = modules.Where(m => m.Queued > BacklogJobs).Select(m => m.Module).ToList();
+                    var backlogs = modules.Where(m => m.Queued > BacklogJobs && (excluded == null || !excluded.ContainsKey(m.Module))).Select(m => m.Module).ToList();
                     if (backlogs.Count == 0) return null;
                     int from = last == null ? 0 : backlogs.FindIndex(b => string.CompareOrdinal(b, last) > 0);
                     if (from < 0) from = 0;
                     for (int i = 0; i < backlogs.Count; i++)
-                        if (Best(backlogs[(from + i) % backlogs.Count]) is { } candidate) return candidate;
+                        foreach (var candidate in Levels(backlogs[(from + i) % backlogs.Count], 1)) return candidate;
                     return null;
                 }
 
@@ -354,6 +395,20 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel.Jobs
         }
 
         /// <summary>Jobs per lane and state, from the counters the triggers keep (never a scan of the jobs table).</summary>
+        /// <summary>How long the runs of each kind of job have lately taken, as the lanes last saved it.</summary>
+        public IReadOnlyList<(string Module, string Kind, double TypicalMs)> KindPace()
+        {
+            using var c = intel.OpenRead();
+            return c.Query(null, "SELECT module_id, kind, typical_ms FROM job_kind_pace", r => (r.GetString(0), r.GetString(1), (double)r.GetInt64(2)));
+        }
+
+        /// <summary>Keeps how long a kind of job takes, for the lanes of the next process (see <see cref="KindPace"/>).</summary>
+        public Task SaveKindPaceAsync(string moduleId, string kind, double typicalMs, CancellationToken ct = default) =>
+            intel.WriteAsync((c, tx) => c.Exec(tx, """
+                INSERT INTO job_kind_pace(module_id, kind, typical_ms, updated_at_ms) VALUES($m,$k,$v,$t)
+                ON CONFLICT(module_id, kind) DO UPDATE SET typical_ms=excluded.typical_ms, updated_at_ms=excluded.updated_at_ms
+                """, ("$m", moduleId), ("$k", kind), ("$v", (long)Math.Min(typicalMs, long.MaxValue / 2)), ("$t", clock.NowMs)), ct);
+
         public IReadOnlyList<JobCount> Counts()
         {
             using var c = intel.OpenRead();

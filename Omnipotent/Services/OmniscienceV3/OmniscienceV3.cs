@@ -102,6 +102,18 @@ namespace Omnipotent.Services.OmniscienceV3
                 return;
             }
 
+            // The page shows the stage the start is in; the log keeps how long each one took, so a slow start can be read
+            // afterwards (the status only ever says where it is now).
+            var stageWatch = System.Diagnostics.Stopwatch.StartNew();
+            string stageNow = "Reading settings";
+            void Stage(string next)
+            {
+                if (stageWatch.Elapsed >= TimeSpan.FromSeconds(5)) LogSync($"OmniscienceV3 start-up: \"{stageNow}\" took {stageWatch.Elapsed.TotalSeconds:0} s.");
+                stageNow = next;
+                stageWatch.Restart();
+                host.SetStage(next);
+            }
+
             var runtime = await V3Runtime.StartAsync(new V3RuntimeOptions
             {
                 Paths = StorePaths.Default(),
@@ -111,7 +123,8 @@ namespace Omnipotent.Services.OmniscienceV3
                 LogError = LogErrorSync,
                 Modules = BuildModules(),
                 EncoderFactory = Ml.Encoders.SharedEncoder.Production(LogSync),
-            }, host.SetStage, stopping).ConfigureAwait(false);
+            }, Stage, stopping).ConfigureAwait(false);
+            Stage("Ready");
 
             if (!host.SetReady(runtime, clock.NowMs))
             {

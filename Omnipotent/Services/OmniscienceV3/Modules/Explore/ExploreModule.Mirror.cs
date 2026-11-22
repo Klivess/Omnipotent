@@ -17,7 +17,24 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
     public sealed partial class ExploreModule
     {
         private const int Batch = 5_000;
-        private static readonly TimeSpan Budget = TimeSpan.FromMinutes(15);
+
+        /// <summary>
+        /// Rows of the change log taken per step of the copy. A step ends with the cursor saved and a progress report, and
+        /// the time budget is looked at between steps: at 5,000 a step, one step took 22 minutes on the server and then
+        /// more than 55 (each message is several lookups on a slow drive), so the fifteen-minute budget was never seen, the
+        /// job said nothing for two hours, was stopped for "no progress" and began the same step again (21 Nov 2026).
+        /// </summary>
+        internal static int ChangeBatch { get; set; } = 500;
+
+        /// <summary>How long one mirror job works before it ends and lets the lane's other work run; the next one carries on
+        /// from the saved cursor.</summary>
+        internal static TimeSpan Budget { get; set; } = TimeSpan.FromMinutes(4);
+
+        /// <summary>Above this many jobs, the jobs dataset is copied whole only every <see cref="LargeJobsEvery"/>: the copy
+        /// reads every row of the table, and with a million jobs queued that was a gigabyte read every five minutes.</summary>
+        internal static long LargeJobs { get; set; } = 100_000;
+
+        internal static TimeSpan LargeJobsEvery { get; set; } = TimeSpan.FromHours(6);
         private static readonly string[] LabelColumns =
         {
             "language", "sentiment", "emotion", "toxicity", "humour", "dialogue_act", "modality", "politeness", "formality", "self_disclosure", "info_density",
@@ -30,19 +47,25 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             var ct = job.Cancellation;
             var sw = Stopwatch.StartNew();
             int messages = 0, events = 0, relations = 0;
+            long reached = 0, head = 0;
             await writeGate.WaitAsync(ct).ConfigureAwait(false);
             try
             {
                 long cursor = ReadState("changes") ?? 0, maxSeq;
                 using (var cr = Context.Stores.Corpus.OpenRead()) maxSeq = ChangeLog.MaxSeq(cr);
                 bool mapDirty = ReadState("person_map_seq") == null, erased = false;
-                while (cursor < maxSeq && sw.Elapsed < Budget)
+                // The copy takes the larger part of the job's time and leaves the rest to the label changes, whose outbox is
+                // only kept for a while: a copy that is weeks behind must not be what loses them.
+                var copyBudget = Budget * 0.6;
+                // Every pass of a job takes one step at least, whatever the time: a job that found its time already gone
+                // (a slow first read) would otherwise end without having moved, and so would the one after it.
+                for (int step = 0; cursor < maxSeq && (step == 0 || sw.Elapsed < copyBudget); step++)
                 {
                     ct.ThrowIfCancellationRequested();
                     List<(long Seq, string Kind, string Entity)> changes;
                     using (var cr = Context.Stores.Corpus.OpenRead())
                         changes = cr.Query(null, "SELECT seq, kind, entity_id FROM change_log WHERE seq > $s AND seq <= $m ORDER BY seq LIMIT $l",
-                            r => (r.GetInt64(0), r.GetString(1), r.GetString(2)), ("$s", cursor), ("$m", maxSeq), ("$l", Batch));
+                            r => (r.GetInt64(0), r.GetString(1), r.GetString(2)), ("$s", cursor), ("$m", maxSeq), ("$l", ChangeBatch));
                     if (changes.Count == 0) { cursor = maxSeq; break; }
                     var messageIds = changes.Where(c => c.Kind is ChangeKinds.MessageInsert or ChangeKinds.MessageVersion or ChangeKinds.MessageDelete or ChangeKinds.AttachmentAdd)
                         .Select(c => c.Kind == ChangeKinds.AttachmentAdd ? c.Entity.Split('#')[0] : c.Entity).Distinct().ToList();
@@ -65,11 +88,17 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                     await job.ReportProgressAsync(new { cursor, maxSeq, messages }).ConfigureAwait(false);
                 }
                 WriteState("changes", cursor);
+                (reached, head) = (cursor, maxSeq);
+                bool caughtUp = cursor >= maxSeq;
                 if (mapDirty) { RefreshPersonMap(); WriteState("person_map_seq", cursor); }
                 events += MirrorEventTables();
-                messages += MirrorLabelOutbox();
-                messages += MirrorZoneChanges();
-                relations += MirrorRelations();
+                // Label changes and zone changes write rows of the copy again, and neither pass has an end of its own: each
+                // works inside what is left of the job's time and carries on from its saved cursor in the next job. A
+                // person's zone change rewrites everything they wrote, so it waits until the copy itself has caught up (a
+                // row copied later carries the zone of that moment anyway).
+                messages += MirrorLabelOutbox(sw);
+                if (caughtUp && sw.Elapsed < Budget) messages += MirrorZoneChanges(sw);
+                relations += MirrorRelations(sw);
                 if (erased)
                 {
                     // The datasets copied from other modules are re-copied whole now, so what their modules purged leaves the
@@ -85,7 +114,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             {
                 writeGate.Release();
             }
-            return JsonSerializer.Serialize(new { messages, events, relations, version = Version });
+            return JsonSerializer.Serialize(new { messages, events, relations, version = Version, cursor = reached, maxSeq = head });
         }
 
         // ── messages ─────────────────────────────────────────────────────────────
@@ -230,27 +259,30 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             }
         }
 
-        private int MirrorLabelOutbox()
+        private int MirrorLabelOutbox(Stopwatch sw)
         {
             long cursor = ReadState("labels") ?? 0;
             int done = 0;
-            while (true)
+            for (int step = 0; step == 0 || sw.Elapsed < Budget; step++)
             {
                 List<(long Seq, string Id)> rows;
                 using (var c = Context.Stores.Intel.OpenRead())
                 {
                     if (c.Scalar<long>(null, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='classify_outbox'") == 0) return done;
-                    rows = c.Query(null, "SELECT seq, message_id FROM classify_outbox WHERE seq > $s ORDER BY seq LIMIT $l", r => (r.GetInt64(0), r.GetString(1)), ("$s", cursor), ("$l", Batch));
+                    rows = c.Query(null, "SELECT seq, message_id FROM classify_outbox WHERE seq > $s ORDER BY seq LIMIT $l", r => (r.GetInt64(0), r.GetString(1)), ("$s", cursor), ("$l", ChangeBatch));
                 }
                 if (rows.Count == 0) return done;
                 done += MirrorMessages(rows.Select(r => r.Id).Distinct().ToList());
                 cursor = rows[^1].Seq;
                 WriteState("labels", cursor);
             }
+            return done; // the budget is used: the next job carries on from the saved cursor
         }
 
-        /// <summary>People whose zone readings changed get their messages' subject-lens zone rewritten (re-mirrored).</summary>
-        private int MirrorZoneChanges()
+        /// <summary>People whose zone readings changed get their messages' subject-lens zone rewritten (re-mirrored). One
+        /// person at a time, oldest change first, for as long as the job's budget lasts: the cursor moves past a person only
+        /// when all of their messages are written again.</summary>
+        private int MirrorZoneChanges(Stopwatch sw)
         {
             long since = ReadState("zones") ?? 0;
             List<(string Person, long At)> changed;
@@ -259,15 +291,23 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                 if (c.Scalar<long>(null, "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='rollup_zones'") == 0) return 0;
                 changed = c.Query(null, "SELECT person_id, MAX(computed_at_ms) FROM rollup_zones WHERE computed_at_ms > $s GROUP BY person_id", r => (r.GetString(0), r.GetInt64(1)), ("$s", since));
             }
+            changed = changed.OrderBy(c => c.At).ThenBy(c => c.Person, StringComparer.Ordinal).ToList();
             int done = 0;
-            foreach (var (person, _) in changed)
+            for (int i = 0; i < changed.Count; i++)
             {
+                if (sw.Elapsed >= Budget)
+                {
+                    // Everyone before this one is done. People whose change carries the same instant as this one's are done
+                    // again next time rather than skipped.
+                    if (i > 0) WriteState("zones", Math.Max(since, changed[i].At - 1));
+                    return done;
+                }
                 List<string> ids;
                 using (var corpus = Context.Stores.Corpus.OpenRead())
-                    ids = RollupModule.IdentitiesOf(corpus, person).SelectMany(i => corpus.Query(null, "SELECT message_id FROM messages WHERE author_identity_id=$i", r => r.GetString(0), ("$i", i))).ToList();
+                    ids = RollupModule.IdentitiesOf(corpus, changed[i].Person).SelectMany(id => corpus.Query(null, "SELECT message_id FROM messages WHERE author_identity_id=$i", r => r.GetString(0), ("$i", id))).ToList();
                 foreach (var chunk in ids.Chunk(Batch)) done += MirrorMessages(chunk);
             }
-            if (changed.Count > 0) WriteState("zones", changed.Max(c => c.At));
+            if (changed.Count > 0) WriteState("zones", changed[^1].At);
             return done;
         }
 
@@ -442,11 +482,13 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
 
         // ── relations (rollup pair-days) ─────────────────────────────────────────
 
-        private int MirrorRelations()
+        private int MirrorRelations(Stopwatch sw)
         {
             long cursor = ReadState("rollup_changes") ?? 0;
             int done = 0;
-            while (true)
+            // At least one step each job (it follows the copy, whose own steps may have used the budget), then for as long
+            // as the budget lasts; the cursor is saved after every step.
+            for (int step = 0; step == 0 || sw.Elapsed < Budget; step++)
             {
                 List<(long Seq, string Person, string Day)> changes;
                 using (var c = Context.Stores.Intel.OpenRead())
@@ -488,6 +530,7 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                 cursor = changes[^1].Seq;
                 WriteState("rollup_changes", cursor);
             }
+            return done;
         }
 
         // ── engine datasets (every few minutes) ──────────────────────────────────
@@ -531,7 +574,10 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
             using (var c = Context.Stores.Intel.OpenRead())
             {
                 if (!IntelHas(c, "classify_concepts")) return 0;
-                hits = c.Query(null, "SELECT item_id, task, probability FROM labels WHERE item_kind='message' AND task LIKE 'concept:%'", r => (r.GetString(0), r.GetString(1), r.GetDouble(2)));
+                // The concept labels alone, through the index on the task: LIKE 'concept:%' could not use it (LIKE ignores
+                // case, the index does not), so every label of every message was read to find them, every five minutes.
+                hits = c.Query(null, "SELECT item_id, task, probability FROM labels INDEXED BY ix_labels_task_label WHERE task >= 'concept:' AND task < 'concept;' AND item_kind='message'",
+                    r => (r.GetString(0), r.GetString(1), r.GetDouble(2)));
                 names = c.Query(null, "SELECT concept_id, name FROM classify_concepts WHERE state IN ('active','applying')", r => (r.GetString(0), r.GetString(1))).ToDictionary(x => x.Item1, x => x.Item2);
             }
             Dictionary<string, (long At, string? Person, string Conv, string? Guild)> meta;
@@ -576,14 +622,28 @@ namespace Omnipotent.Services.OmniscienceV3.Modules.Explore
                 .AppendValue(x.Duration).AppendValue(x.Error).EndRow());
         }
 
+        /// <summary>
+        /// The jobs dataset is a whole copy of the jobs table. With an ordinary queue that is a few thousand rows every five
+        /// minutes; with a backlog it was every row of a million-row, gigabyte table, read from a drive that the same jobs
+        /// were waiting on (and one such copy was stopped after two hours without a sign of progress, 20 Nov 2026). Above
+        /// <see cref="LargeJobs"/> rows it is copied every <see cref="LargeJobsEvery"/> instead; what the pages count comes
+        /// from the queue's own counters, not from this copy. Returns the rows copied (0 when it was not due).
+        /// </summary>
         private int RebuildJobs()
         {
+            long now = Context.Clock.NowMs;
             List<(long Id, long Created, string Module, string Kind, string State, int Attempts, long? Duration, string? Error)> rows;
             using (var c = Context.Stores.Intel.OpenRead())
+            {
+                long total = c.Scalar<long?>(null, "SELECT SUM(n) FROM job_counts") ?? 0;
+                if (total > LargeJobs && ReadState("jobs.copied_at") is long last && now >= last && now - last < (long)LargeJobsEvery.TotalMilliseconds) return 0;
                 rows = c.Query(null, "SELECT job_id, created_at_ms, module_id, kind, state, attempts, finished_at_ms - started_at_ms, error_class FROM jobs",
                     r => (r.GetInt64(0), r.GetInt64(1), r.GetString(2), r.GetString(3), r.GetString(4), r.GetInt32(5), r.GetInt64OrNull(6), r.GetStringOrNull(7)));
-            return Rebuild("jobs", rows, (a, x) => a.CreateRow().AppendValue(x.Id.ToString(CultureInfo.InvariantCulture)).AppendValue(x.Created).AppendValue(x.Module)
+            }
+            int copied = Rebuild("jobs", rows, (a, x) => a.CreateRow().AppendValue(x.Id.ToString(CultureInfo.InvariantCulture)).AppendValue(x.Created).AppendValue(x.Module)
                 .AppendValue(x.Kind).AppendValue(x.State).AppendValue(x.Attempts).AppendValue(x.Duration).AppendValue(x.Error).EndRow());
+            WriteState("jobs.copied_at", now);
+            return copied;
         }
 
         private int AppendLlmCalls()

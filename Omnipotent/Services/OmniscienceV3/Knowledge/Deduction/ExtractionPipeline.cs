@@ -74,18 +74,41 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         private readonly Verifier verifier;
         private readonly EvidenceAssembler assembler;
         private readonly ExtractionOptions options;
+        private readonly Func<IReadOnlyCollection<string>> tracked;
         private const int MaxSplitDepth = 3;
 
-        public ExtractionPipeline(KnowledgeKit kit, ClaimStore claims, ExtractionOptions options)
+        /// <param name="tracked">The people who are read continuously (whom new messages are routed to). Default: the "tracked" tier.</param>
+        public ExtractionPipeline(KnowledgeKit kit, ClaimStore claims, ExtractionOptions options, Func<IReadOnlyCollection<string>>? tracked = null)
         {
             this.kit = kit;
             this.claims = claims;
             this.options = options;
+            this.tracked = tracked ?? (() => kit.Corpus.PersonsInTiers(new[] { "tracked" }));
             verifier = new Verifier(kit);
             assembler = new EvidenceAssembler(kit, options.Assembly);
         }
 
         public EvidenceAssembler Assembler => assembler;
+
+        /// <summary>How many anchors a job wants waiting in the person's queue before it plans its slices: several jobs' worth,
+        /// so most jobs find the queue full and look at no history at all.</summary>
+        internal static int QueueTarget { get; set; } = 600;
+
+        /// <summary>How long a job may spend looking through more of the person's history before it reads what it has. What is
+        /// left is looked through by the next job (or by the sweep, which keeps the queues topped up outside the model lane).</summary>
+        internal static TimeSpan TopUpBudget { get; set; } = TimeSpan.FromSeconds(60);
+
+        /// <summary>How much of the change log a job routes before it reads (the sweep routes the rest).</summary>
+        internal static int RouteChangesPerJob { get; set; } = 4_000;
+
+        internal static TimeSpan RouteBudgetPerJob { get; set; } = TimeSpan.FromSeconds(10);
+
+        /// <summary>How many of the person's messages the last run looked at to fill the queue (what finding its evidence cost).</summary>
+        internal int LookedAt { get; private set; }
+
+        /// <summary>The people whose queues gained something when the last run routed the change log: each needs a reading of
+        /// their own (the caller queues it).</summary>
+        public IReadOnlyCollection<string> RoutedTo { get; private set; } = Array.Empty<string>();
 
         private OmniLlm Llm => kit.Context.Llm ?? throw new JobFailureException(ErrorClass.Transient, "The LLM gateway is not available in this engine.");
 
@@ -106,34 +129,26 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             await CloseAbandonedRunsAsync(canonical, stats.RunId, started, ct).ConfigureAwait(false);
             await RecordRunAsync(stats, job.Job.JobId, started, null, ct).ConfigureAwait(false);
 
-            var ids = kit.Corpus.PersonIdsOf(canonical);
-            var identities = kit.Corpus.IdentitiesOf(ids).Select(i => i.IdentityId).ToList();
             long asOf = kit.Context.Clock.NowMs;
-            // The job says where it is while it works out what there is to read. For someone with a hundred thousand
-            // messages that takes a while, and until 20 Nov 2026 it said nothing before its first slice: five such jobs
-            // were stopped for "no progress" before they had read anything.
+            // What is waiting to be read about this person is a queue (EvidenceQueue), not something worked out here. The
+            // job used to begin by reading every message the person ever wrote, every reply to each and every mention: for
+            // the three busiest people that never ended (twelve runs of three to fifteen hours, no model call, 21 Nov 2026),
+            // and it was done again by every job. Now: what has arrived since the last look at the change log is routed,
+            // the queue is topped up from the person's history by a page or two when it runs low, and its head is read.
+            var queue = EvidenceQueue.For(kit);
             await job.ReportProgressAsync(new { person = canonical, stage = "evidence" }).ConfigureAwait(false);
-            var anchors = assembler.Anchors(identities, asOf).ToList();
+            if (await queue.RouteAsync(tracked(), ExtractionPrompt.Version, RouteChangesPerJob, RouteBudgetPerJob, ct).ConfigureAwait(false) is { } routed)
+                RoutedTo = routed.Persons;
+            var topUp = await queue.TopUpAsync(canonical, ExtractionPrompt.Version, QueueTarget, TopUpBudget, ct, job.ReportProgressAsync).ConfigureAwait(false);
+            LookedAt = topUp.Looked;
             ct.ThrowIfCancellationRequested();
-            await job.ReportProgressAsync(new { person = canonical, stage = "mentions", anchors = anchors.Count }).ConfigureAwait(false);
-            // Mentions by name or alias (not only @-mentions), scoped to the subject's own conversations.
-            var names = kit.Corpus.NamesOf(identities).SelectMany(n => new[] { n.Value, n.Value.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? "" })
-                .Concat(new Entities.AliasEngine(kit, new ReviewQueue(kit.Context.Stores, kit.Context.Clock)).Aliases(canonical, asOf).Where(a => a.Status is "accepted" or "confirmed").Select(a => a.Alias))
-                .Where(n => n.Length >= 3).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-            // Where they write, from the conversations of the anchors already in hand (no second pass over their messages),
-            // and where they are a member.
-            var conversations = anchors.Where(a => a.Relation == EvidenceRelation.Authored).Select(a => a.ConversationId)
-                .Concat(identities.SelectMany(MemberConversations)).Distinct(StringComparer.Ordinal).ToList();
-            var seen = anchors.Select(a => a.MessageId).ToHashSet(StringComparer.Ordinal);
-            anchors.AddRange(assembler.NameMentions(names, conversations, identities, asOf).Where(a => seen.Add(a.MessageId)));
-            anchors = anchors.OrderBy(a => a.SentAtMs).ThenBy(a => a.OrderKey).ThenBy(a => a.IngestSeq).ThenBy(a => a.MessageId, StringComparer.Ordinal).ToList();
-            ct.ThrowIfCancellationRequested();
-            var uncovered = assembler.Uncovered(canonical, anchors, ExtractionPrompt.Version);
-            stats.AlreadyRead = anchors.Count - uncovered.Count;
-            await job.ReportProgressAsync(new { person = canonical, stage = "planning", anchors = anchors.Count, unread = uncovered.Count }).ConfigureAwait(false);
+            var unread = queue.Head(canonical, QueueTarget);
+            stats.AlreadyRead = AlreadyRead(canonical);
+            await job.ReportProgressAsync(new { person = canonical, stage = "planning", anchors = unread.Count, unread = topUp.Queued, lookedAt = topUp.Looked, historyDone = topUp.Complete })
+                .ConfigureAwait(false);
             try
             {
-                await ReadAsync(canonical, asOf, uncovered, stats, new SliceRun(ct, job.Job.JobId, AIRouterWorkClass.Background, afterSlice), job.ReportProgressAsync).ConfigureAwait(false);
+                await ReadAsync(canonical, asOf, unread, stats, new SliceRun(ct, job.Job.JobId, AIRouterWorkClass.Background, afterSlice), job.ReportProgressAsync, queue).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -142,8 +157,17 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 await RecordRunAsync(stats, job.Job.JobId, started, kit.Context.Clock.NowMs, CancellationToken.None).ConfigureAwait(false);
                 throw;
             }
+            // More is left whenever the queue is not empty or the history has not been looked through to its end.
+            if (!topUp.Complete || queue.Count(canonical) > 0) stats.Pending = true;
             await RecordRunAsync(stats, job.Job.JobId, started, kit.Context.Clock.NowMs, ct).ConfigureAwait(false);
             return stats;
+        }
+
+        /// <summary>How many of the person's messages had been read before this run (the running count kept with their state).</summary>
+        private int AlreadyRead(string canonical)
+        {
+            using var c = kit.Context.Stores.Intel.OpenRead();
+            return (int)(c.Scalar<long?>(null, "SELECT covered_messages FROM kn_person_state WHERE person_id=$p", ("$p", canonical)) ?? 0);
         }
 
         /// <summary>Runs of this person still marked as running belong to an attempt that is gone (the service stopped, or
@@ -171,14 +195,17 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             var anchors = assembler.AnchorsAmong(messageIds, identities, asOf);
             var uncovered = assembler.Uncovered(canonical, anchors, ExtractionPrompt.Version);
             stats.AlreadyRead = anchors.Count - uncovered.Count;
-            await ReadAsync(canonical, asOf, uncovered, stats, new SliceRun(ct, null, AIRouterWorkClass.Interactive), progress).ConfigureAwait(false);
+            await ReadAsync(canonical, asOf, uncovered, stats, new SliceRun(ct, null, AIRouterWorkClass.Interactive), progress, null).ConfigureAwait(false);
             await RecordRunAsync(stats, null, started, kit.Context.Clock.NowMs, ct).ConfigureAwait(false);
             return stats;
         }
 
         /// <summary>Reads uncovered anchors: plans them oldest first, packs whole-conversation slices into the model's window
         /// and processes at most <see cref="ExtractionOptions.MaxSlicesPerJob"/> of them (the rest stay pending).</summary>
-        private async Task ReadAsync(string canonical, long asOf, IReadOnlyList<EvidenceAnchor> uncovered, ExtractionRunStats stats, SliceRun run, Func<object, Task> progress)
+        /// <param name="queue">The person's queue when the anchors came from it: an anchor that cannot be read any more (its
+        /// message is gone, or its author's analysis is switched off) is taken out, or it would head the queue for ever.</param>
+        private async Task ReadAsync(string canonical, long asOf, IReadOnlyList<EvidenceAnchor> uncovered, ExtractionRunStats stats, SliceRun run, Func<object, Task> progress,
+            EvidenceQueue? queue)
         {
             var ct = run.Ct;
             if (uncovered.Count == 0)
@@ -210,7 +237,14 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 ct.ThrowIfCancellationRequested();
                 var page = planned.Skip(prepared).Take(PlanPage).ToList();
                 prepared += page.Count;
-                foreach (var slice in assembler.Pack(canonical, assembler.Segments(page), budget, estimator)) slices.Add(slice with { Index = slices.Count });
+                var packed = assembler.Pack(canonical, assembler.Segments(page), budget, estimator);
+                if (queue != null)
+                {
+                    var readable = packed.SelectMany(s => s.AnchorIds).ToHashSet(StringComparer.Ordinal);
+                    var gone = page.Where(a => !readable.Contains(a.MessageId)).Select(a => a.MessageId).ToList();
+                    if (gone.Count > 0) await queue.DropAsync(canonical, gone, ct).ConfigureAwait(false);
+                }
+                foreach (var slice in packed) slices.Add(slice with { Index = slices.Count });
                 await progress(new { person = canonical, stage = "preparing", anchors = prepared, of = planned.Count, slices = slices.Count }).ConfigureAwait(false);
             }
             PreparedAnchors = prepared;
@@ -403,12 +437,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             foreach (var r in rejected) stats.Rejections[r.Reason] = stats.Rejections.GetValueOrDefault(r.Reason) + 1;
             foreach (var v in verified) stats.TouchedSubjects.Add(v.SubjectPersonId);
             foreach (var a in ages) stats.TouchedSubjects.Add(a.PersonId);
-        }
-
-        private IEnumerable<string> MemberConversations(string identity)
-        {
-            using var c = kit.Context.Stores.Corpus.OpenRead();
-            return c.Query(null, "SELECT conversation_id FROM conversation_members WHERE identity_id=$i", r => r.GetString(0), ("$i", identity));
         }
 
         /// <summary>The output ceiling of this run: the setting, or the model's own limit when that is lower.</summary>

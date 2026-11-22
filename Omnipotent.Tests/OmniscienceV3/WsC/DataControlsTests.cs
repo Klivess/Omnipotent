@@ -682,5 +682,61 @@ namespace Omnipotent.Tests.OmniscienceV3.WsC
             await Assert.ThrowsAsync<KeyNotFoundException>(() => data.ExportPersonAsync("p-nobody", "json", jsonPath, default));
             Assert.Equal(2, Scalar(h.Runtime.Stores.Operator, "SELECT COUNT(*) FROM audit_log WHERE action='person.export' AND target='p-ana'"));
         }
+
+        /// <summary>
+        /// On the server one export held its request, and the drive, for 3 h 10 min (21 Nov 2026): its pages were ordered by
+        /// (time, message id), which the (author, time) index cannot give, so every page read and sorted everything the
+        /// person wrote after the page before it. A page now walks the index from where the last one ended.
+        /// </summary>
+        [Fact]
+        public async Task Export_ReadsAPageAlongTheIndex_AndEveryMessageOnce_HoweverManyShareAnInstant()
+        {
+            await using var h = await SignalsHarness.StartAsync(datacontrols: true);
+            var data = h.Data!;
+            var corpus = h.Runtime.Stores.Corpus;
+            long t0 = h.Clock.NowMs - 30 * Day;
+
+            // 5,300 messages in bursts of 700 that share one instant (an import stamps a whole file with one time), written
+            // out of order: every page ends in the middle of a burst, where a page that begins "after the last time" drops
+            // the rest of the burst and one that begins "at the last time" writes it twice.
+            const int total = 5_300, burst = 700;
+            var order = Enumerable.Range(0, total).OrderBy(i => (i * 7919) % total).ToList();
+            await corpus.WriteAsync((c, tx) =>
+            {
+                foreach (int i in order)
+                {
+                    string id = "discord:x" + i.ToString(CultureInfo.InvariantCulture);
+                    long sent = t0 + (i / burst) * 60_000L;
+                    c.Exec(tx, """
+                        INSERT INTO messages(message_id, platform, platform_message_id, conversation_id, guild_id, author_identity_id, sent_at_ms, time_quality, order_key,
+                            current_version, content, first_source_kind, best_source_id, best_source_rank, ingested_at_ms, ingest_seq)
+                        VALUES($id,'discord',$pm,$c,'discord:g1',$a,$t,0,$t,1,$content,'import','test',0,$t,$seq)
+                        """, ("$id", id), ("$pm", id[8..]), ("$c", General), ("$a", i % 53 == 0 ? Ben : Ana), ("$t", sent), ("$content", "line " + i.ToString(CultureInfo.InvariantCulture)), ("$seq", i + 1));
+                }
+            });
+            int hers = Enumerable.Range(0, total).Count(i => i % 53 != 0);
+            Assert.True(hers > 2 * DataControlsModule.ExportPage);
+
+            string dir = Path.Combine(h.Runtime.Stores.Paths.Root, "exports");
+            Directory.CreateDirectory(dir);
+            string path = Path.Combine(dir, "ana.json");
+            Assert.Equal(((long)hers, 0L), await data.ExportPersonAsync("p-ana", "json", path, default));
+            using (var doc = JsonDocument.Parse(File.ReadAllText(path)))
+            {
+                var messages = doc.RootElement.GetProperty("messages").EnumerateArray().Select(m => (Id: m.GetProperty("messageId").GetString()!, At: m.GetProperty("sentAtMs").GetInt64())).ToList();
+                Assert.Equal(hers, messages.Count);
+                Assert.Equal(hers, messages.Select(m => m.Id).Distinct(StringComparer.Ordinal).Count());
+                Assert.DoesNotContain(messages, m => int.Parse(m.Id["discord:x".Length..], CultureInfo.InvariantCulture) % 53 == 0); // Ben's
+                Assert.Equal(messages.Select(m => m.At).OrderBy(t => t), messages.Select(m => m.At)); // oldest first
+            }
+
+            // The page is a walk of the index: no sort, and no read of the person's other messages.
+            using (var c = corpus.OpenRead())
+            {
+                var plan = c.Query(null, "EXPLAIN QUERY PLAN " + DataControlsModule.ExportPageSql, r => r.GetString(3), ("$i", Ana), ("$t", t0), ("$r", 0L), ("$n", DataControlsModule.ExportPage));
+                Assert.Contains(plan, p => p.Contains("ix_messages_author_time") && p.Contains("author_identity_id=?") && p.Contains("sent_at_ms"));
+                Assert.DoesNotContain(plan, p => p.Contains("TEMP B-TREE"));
+            }
+        }
     }
 }

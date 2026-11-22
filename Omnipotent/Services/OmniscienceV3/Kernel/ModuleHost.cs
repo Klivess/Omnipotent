@@ -25,8 +25,10 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
         /// </summary>
         public static IReadOnlyList<LaneOptions> DefaultLanes(int processors) => new[]
         {
-            new LaneOptions(Lane.Cpu, Math.Clamp(processors / 2, 2, 4), TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2), StallAfter: TimeSpan.FromHours(2)),
-            new LaneOptions(Lane.Io, 4, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2), StallAfter: TimeSpan.FromMinutes(30)),
+            // The two lanes that mix jobs of a second with jobs of an hour each keep one worker for the short ones
+            // (LaneOptions.Express): the long jobs of a lane can then never be what the health check waits for.
+            new LaneOptions(Lane.Cpu, Math.Clamp(processors / 2, 2, 4), TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2), StallAfter: TimeSpan.FromHours(2)) { Express = 1 },
+            new LaneOptions(Lane.Io, 4, TimeSpan.FromMinutes(2), TimeSpan.FromSeconds(2), StallAfter: TimeSpan.FromMinutes(30)) { Express = 1 },
             new LaneOptions(Lane.LlmBackground, 1, TimeSpan.FromMinutes(5), TimeSpan.FromSeconds(5), StallAfter: TimeSpan.FromMinutes(60)),
             // Klives started these himself and watches them: two of the same kind may run side by side.
             new LaneOptions(Lane.LlmInteractive, 2, TimeSpan.FromMinutes(5), TimeSpan.FromMilliseconds(500), StallAfter: TimeSpan.FromMinutes(60), MaxPerModule: 2),
@@ -86,6 +88,9 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
         private long lastAgingMs;
         private long lastPruneMs;
         private long lastCheckpointMs;
+        private long lastPacingMs;
+        private long pacingYields;
+        private TimeSpan pacingYielded;
         private int started;
 
         public ModuleHost(OmniscienceStores stores, IClock clock, KernelOptions options, Action<string> log,
@@ -178,12 +183,25 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             return result;
         }
 
+        /// <summary>A step of the start that takes this long is written to the log with how long it took.</summary>
+        internal static TimeSpan SlowStartStep { get; set; } = TimeSpan.FromSeconds(5);
+
         public async Task StartAsync(CancellationToken ct = default)
         {
             if (Interlocked.Exchange(ref started, 1) != 0) throw new InvalidOperationException("Kernel already started.");
             ordered = OrderByDependencies(modules);
 
-            await stores.Intel.ApplyMigrationsAsync(ordered.SelectMany(m => m.IntelMigrations), ct).ConfigureAwait(false);
+            // Each step that takes long says so: a start that took 35 minutes on the server (21 Nov 2026) left one line in
+            // the log when it began and one when it ended, and nothing to say where the time had gone.
+            var step = System.Diagnostics.Stopwatch.StartNew();
+            void Took(string what)
+            {
+                if (step.Elapsed >= SlowStartStep) log($"[OmniscienceV3] start-up: {what} took {step.Elapsed.TotalSeconds:0} s.");
+                step.Restart();
+            }
+
+            int migrated = await stores.Intel.ApplyMigrationsAsync(ordered.SelectMany(m => m.IntelMigrations), ct).ConfigureAwait(false);
+            Took(migrated > 0 ? $"applying {migrated} module migration(s) to intel.db" : "checking the modules' migrations");
             await EnsureModuleStateAsync(ct).ConfigureAwait(false);
 
             var context = new ModuleContext
@@ -193,7 +211,12 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
                 Encoder = Services.Encoder, Vectors = Services.Vectors,
             };
             Context = context;
-            foreach (var m in ordered) await m.InitializeAsync(context, ct).ConfigureAwait(false);
+            step.Restart();
+            foreach (var m in ordered)
+            {
+                await m.InitializeAsync(context, ct).ConfigureAwait(false);
+                Took($"initialising module {m.Manifest.Id}");
+            }
 
             // Crash recovery first: the instance lock means anything still leased belongs to a previous process,
             // so it is reclaimed before workers start instead of waiting for its lease to run out.
@@ -467,6 +490,37 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             await RunMaintenanceOnceAsync(ct).ConfigureAwait(false);
         }
 
+        /// <summary>How often the kernel says what its two pacing rules did.</summary>
+        internal static TimeSpan PacingReportEvery { get; set; } = TimeSpan.FromHours(1);
+
+        /// <summary>
+        /// Once an hour, one line on what the pacing rules did since the last one: how often and for how long jobs stood
+        /// back for requests (<see cref="Storage.Sqlite.ForegroundIo"/>), and which kinds the lanes have learned run long
+        /// and so keep off the express workers. Neither shows anywhere else, and both decide how fast the backlogs go
+        /// down. Nothing is written for an hour in which nothing waited and no kind is long.
+        /// </summary>
+        private void ReportPacing(long now)
+        {
+            if (lastPacingMs == 0)
+            {
+                // The first hour is counted from the first look, not from the start of the process's counters.
+                (lastPacingMs, pacingYields, pacingYielded) = (now, Storage.Sqlite.ForegroundIo.Yields, Storage.Sqlite.ForegroundIo.Yielded);
+                return;
+            }
+            if (now - lastPacingMs < (long)PacingReportEvery.TotalMilliseconds) return;
+            long yields = Storage.Sqlite.ForegroundIo.Yields;
+            var yielded = Storage.Sqlite.ForegroundIo.Yielded;
+            var longKinds = workers == null
+                ? new List<string>()
+                : options.Lanes.SelectMany(l => workers.LongKinds(l)).Select(k => k.Module + "/" + k.Kind).Distinct(StringComparer.Ordinal).OrderBy(k => k, StringComparer.Ordinal).ToList();
+            long waits = yields - pacingYields;
+            var waited = yielded - pacingYielded;
+            (lastPacingMs, pacingYields, pacingYielded) = (now, yields, yielded);
+            if (waits == 0 && longKinds.Count == 0) return;
+            log($"[OmniscienceV3] pacing: jobs stood back for requests {waits} time(s), {waited.TotalSeconds:0} s in all, since the last report; " +
+                $"kinds kept off the express workers because they run long: {(longKinds.Count == 0 ? "none" : string.Join(", ", longKinds))}.");
+        }
+
         public async Task RunMaintenanceOnceAsync(CancellationToken ct = default)
         {
             long now = clock.NowMs;
@@ -474,6 +528,7 @@ namespace Omnipotent.Services.OmniscienceV3.Kernel
             int reclaimed = await Jobs.ReclaimExpiredAsync(workers?.RunningJobIds, ct).ConfigureAwait(false);
             if (reclaimed > 0) log($"[OmniscienceV3] reclaimed {reclaimed} expired job lease(s).");
             await ReportLeftBehindAsync(ct).ConfigureAwait(false);
+            ReportPacing(now);
             if (options.PriorityAgeAfter > TimeSpan.Zero && now - lastAgingMs >= (long)options.PriorityAgeAfter.TotalMilliseconds)
             {
                 lastAgingMs = now;

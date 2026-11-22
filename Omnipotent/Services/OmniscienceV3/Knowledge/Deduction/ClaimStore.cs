@@ -49,13 +49,29 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                 foreach (var v in commit.Verified) InsertVerified(c, tx, v, commit.SourceSeq, now);
                 foreach (var r in commit.Rejected) InsertRejected(c, tx, r, commit.RunId, promptVersion, model, commit.SourceSeq, now);
                 foreach (var a in commit.AgeEvidence) UpsertAge(c, tx, a, commit.SourceSeq, now);
+                int newlyCovered = 0;
                 foreach (var (messageId, version) in commit.Anchors)
+                {
+                    if (c.Scalar<long?>(tx, "SELECT 1 FROM kn_coverage WHERE person_id=$p AND message_id=$m", ("$p", commit.CoveragePersonId), ("$m", messageId)) == null) newlyCovered++;
                     c.Exec(tx, """
                         INSERT INTO kn_coverage(person_id, message_id, message_version, prompt_version, run_id, outcome, covered_at_ms) VALUES($p,$m,$v,$pv,$r,$o,$t)
                         ON CONFLICT(person_id, message_id) DO UPDATE SET message_version=excluded.message_version, prompt_version=excluded.prompt_version,
                             run_id=excluded.run_id, outcome=excluded.outcome, covered_at_ms=excluded.covered_at_ms
                         """, ("$p", commit.CoveragePersonId), ("$m", messageId), ("$v", version), ("$pv", promptVersion), ("$r", commit.RunId),
                         ("$o", commit.CoverageOutcome), ("$t", now));
+                    // Read: it leaves the person's queue in the same transaction (Evidence.EvidenceQueue). An edit made
+                    // since it was queued carries a higher version and stays queued.
+                    c.Exec(tx, "DELETE FROM kn_evidence_queue WHERE person_id=$p AND message_id=$m AND version <= $v",
+                        ("$p", commit.CoveragePersonId), ("$m", messageId), ("$v", version));
+                }
+                // How many of the person's messages have been read is kept as a running count. It was recounted from the
+                // coverage table inside every state write, on the store's one writer: a count that grows with everything
+                // ever read about the person, while every other write to the store waits.
+                if (newlyCovered > 0)
+                {
+                    c.Exec(tx, "INSERT OR IGNORE INTO kn_person_state(person_id, tracked, pending, updated_at_ms) VALUES($p,0,0,$t)", ("$p", commit.CoveragePersonId), ("$t", now));
+                    c.Exec(tx, "UPDATE kn_person_state SET covered_messages = covered_messages + $n WHERE person_id=$p", ("$n", newlyCovered), ("$p", commit.CoveragePersonId));
+                }
                 // Claims of an earlier run about the same message versions are superseded by this run's reading of them.
                 foreach (var (messageId, version) in commit.Anchors)
                     c.Exec(tx, """
@@ -203,6 +219,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             stores.Intel.WriteAsync((c, tx) =>
             {
                 foreach (var id in claimIds) c.Exec(tx, "UPDATE kn_claims SET superseded=1 WHERE claim_id=$c", ("$c", id));
+                c.Exec(tx, "UPDATE kn_person_state SET covered_messages = MAX(0, covered_messages - 1) WHERE person_id IN (SELECT person_id FROM kn_coverage WHERE message_id=$m)", ("$m", messageId));
                 c.Exec(tx, "DELETE FROM kn_coverage WHERE message_id=$m", ("$m", messageId));
                 c.Exec(tx, "UPDATE kn_age_evidence SET status='retracted' WHERE message_id=$m AND status IN ('active','inconsistent')", ("$m", messageId));
             }, ct);

@@ -63,6 +63,19 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             // are answered with the last one. Queued behind a single lock, the dashboard's ten-second poll once piled up
             // for twenty minutes at a time.
             if (lastStatus is { } fresh && now - fresh.AtMs < (long)StatusMaxAge.TotalMilliseconds) return fresh.Dto with { NowMs = now };
+            // And nobody waits for a build at all while a recent snapshot is there: the page asks every ten seconds, each ask
+            // came later than the two seconds a snapshot counts as fresh, so each one built its own (a dozen small reads on a
+            // drive the jobs were reading too: a median of 1.2 s over 544 asks on 21 Nov 2026, and the four-second limit at
+            // the 95th percentile). The ask is answered with what the last one left, and the snapshot is brought up to date
+            // behind it for the next.
+            if (lastStatus is { } recent && now - recent.AtMs < (long)StatusServedFor.TotalMilliseconds)
+            {
+                // One at a time, and owned: the refresh in flight is kept (StatusRefresh), handles its own failure and is
+                // what the next ask finds finished.
+                if (Interlocked.CompareExchange(ref statusRefreshing, 1, 0) == 0)
+                    statusRefresh = Task.Run(() => RefreshStatus(rt));
+                return recent.Dto with { NowMs = now };
+            }
             bool taken = false;
             try
             {
@@ -80,6 +93,37 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             finally
             {
                 if (taken) Monitor.Exit(statusGate);
+            }
+        }
+
+        /// <summary>How long a snapshot is still given as the answer while a newer one is being built behind it. Older than
+        /// this (nobody has asked for a minute) and the ask waits for its own.</summary>
+        internal static TimeSpan StatusServedFor { get; set; } = TimeSpan.FromSeconds(60);
+
+        private int statusRefreshing;
+        private volatile Task statusRefresh = Task.CompletedTask;
+
+        /// <summary>The snapshot refresh that is running, or the last one that ran (never faulted: see <see cref="RefreshStatus"/>).</summary>
+        internal Task StatusRefresh => statusRefresh;
+
+        /// <summary>Builds the snapshot away from any request. A failure here is not reported: the next ask that finds the
+        /// snapshot too old builds its own and answers with the error.</summary>
+        private void RefreshStatus(V3Runtime rt)
+        {
+            try
+            {
+                long at = clock.NowMs;
+                var dto = BuildStatus(rt, at);
+                lastStatus = new StatusSnapshot(dto, at);
+            }
+            catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or ObjectDisposedException or InvalidOperationException)
+            {
+                // The engine is stopping, or a store was busy: the snapshot stays as it was.
+                return;
+            }
+            finally
+            {
+                Volatile.Write(ref statusRefreshing, 0);
             }
         }
 

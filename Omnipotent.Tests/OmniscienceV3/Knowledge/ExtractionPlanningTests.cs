@@ -14,6 +14,7 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
     /// to 4,000 anchors to read the first hundred or so, looked for the person's name once per 200 of their conversations
     /// (each time over the whole archive, reading the row of every match), and said nothing while it did.
     /// </summary>
+    [Collection(nameof(EngineKnobsCollection))]
     public class ExtractionPlanningTests
     {
         private static readonly long Now = Instant.FromUtc(new DateTime(2026, 11, 20, 12, 0, 0, DateTimeKind.Utc));
@@ -57,12 +58,13 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             // Four slices read, more left for the next job, as before.
             Assert.Equal(4, stats.Slices);
             Assert.True(stats.Pending);
-            // 1,600 of her messages wait to be read; slices were prepared for a few hundred of them, not for all (every one
-            // of which means reading the conversation around it).
-            Assert.InRange(pipeline.PreparedAnchors, stats.Messages, 800);
-            Assert.True(pipeline.PreparedAnchors < hers.Count / 2, $"prepared {pipeline.PreparedAnchors} of {hers.Count}");
+            // 1,600 of her messages wait to be read. The job looked at the oldest few hundred of them to find what to read
+            // (two pages of her history), not at all of them, and prepared slices for fewer still.
+            Assert.InRange(pipeline.LookedAt, stats.Messages, 2 * EvidenceQueue.PageSize);
+            Assert.True(pipeline.LookedAt < hers.Count / 2, $"looked at {pipeline.LookedAt} of {hers.Count}");
+            Assert.InRange(pipeline.PreparedAnchors, stats.Messages, ExtractionPipeline.QueueTarget);
 
-            // What it read is the oldest of what was unread: nothing was skipped by preparing less.
+            // What it read is the oldest of what was unread: nothing was skipped by looking at less.
             HashSet<string> covered;
             using (var intel = h.Stores.Intel.OpenRead())
                 covered = intel.Query(null, "SELECT message_id FROM kn_coverage WHERE person_id='dee'", r => r.GetString(0)).ToHashSet(StringComparer.Ordinal);
@@ -70,18 +72,96 @@ namespace Omnipotent.Tests.OmniscienceV3.Knowledge
             long newestRead = hers.Where(m => covered.Contains(m.Id)).Max(m => m.At), oldestUnread = hers.Where(m => !covered.Contains(m.Id)).Min(m => m.At);
             Assert.True(newestRead < oldestUnread);
 
-            // It says where it is from the start: finding the evidence, the mentions, the plan, the preparing, then each slice.
+            // It says where it is from the start: finding the evidence (a report per page), the plan, the preparing, then each slice.
             string[] stages = reports.Where(r => r.TryGetProperty("stage", out _)).Select(r => r.GetProperty("stage").GetString()!).ToArray();
-            Assert.Equal(new[] { "evidence", "mentions", "planning" }, stages.Take(3));
-            Assert.Contains("preparing", stages);
+            Assert.Equal("evidence", stages[0]);
+            Assert.Equal(new[] { "evidence", "planning", "preparing" }, stages.Distinct().ToArray());
             int firstSlice = reports.FindIndex(r => r.TryGetProperty("slice", out _));
             Assert.True(firstSlice >= 4, "the job reported four times or more before its first slice was read");
-            Assert.Equal(hers.Count, reports.First(r => r.TryGetProperty("unread", out _)).GetProperty("unread").GetInt32());
+            // What waits in her queue is what was planned from: several jobs' worth, not her whole history.
+            int waiting = reports.First(r => r.TryGetProperty("unread", out _)).GetProperty("unread").GetInt32();
+            Assert.InRange(waiting, stats.Messages, 2 * EvidenceQueue.PageSize);
 
-            // The next job carries on from there.
+            // The next job carries on from there, and what the first one read has left the queue.
             var next = await pipeline.RunAsync("dee", await JobAsync(h, new List<JsonElement>()));
             Assert.Equal(stats.Messages, next.AlreadyRead);
             Assert.Equal(4, next.Slices);
+            Assert.InRange(pipeline.LookedAt, 0, EvidenceQueue.PageSize); // one more page at most: most of what it needs was waiting
+            using (var intel = h.Stores.Intel.OpenRead())
+            {
+                var readNow = intel.Query(null, "SELECT message_id FROM kn_coverage WHERE person_id='dee'", r => r.GetString(0)).ToHashSet(StringComparer.Ordinal);
+                Assert.Equal(stats.Messages + next.Messages, readNow.Count);
+                Assert.Equal(0L, intel.Scalar<long>(null, "SELECT COUNT(*) FROM kn_evidence_queue q JOIN kn_coverage c ON c.person_id=q.person_id AND c.message_id=q.message_id WHERE q.person_id='dee'"));
+                Assert.True(hers.Where(m => readNow.Contains(m.Id)).Max(m => m.At) < hers.Where(m => !readNow.Contains(m.Id)).Min(m => m.At));
+            }
+        }
+
+        /// <summary>
+        /// The whole of someone's history is still read, a job at a time: every message they wrote, and every reply, mention
+        /// and naming of them, exactly what the full scan found. Job after job until nothing is pending.
+        /// </summary>
+        [Fact]
+        public async Task JobAfterJob_EverythingTheFullScanFound_IsRead_AndNothingTwice()
+        {
+            await using var h = await KnowledgeHarness.StartAsync(Now);
+            h.Llm.On("deduction.extract", _ => """{"claims":[]}""");
+            var corpus = new CorpusBuilder(h.Stores);
+            await corpus.PersonAsync("me", "Klives", self: true);
+            await corpus.PersonAsync("dee", "Dee Marsh", tier: "tracked");
+            await corpus.PersonAsync("sam", "Sam Okoro");
+            await corpus.ConversationAsync("discord:c-dee", "dm", "me", "dee");
+            await corpus.ConversationAsync("discord:c-trio", "group_dm", "me", "dee", "sam");
+            await corpus.ConversationAsync("discord:c-sam", "dm", "me", "sam");
+            var rnd = new Random(7);
+            var hers = new List<string>();
+            for (int i = 0; i < 420; i++)
+            {
+                long at = Now - 300L * 86_400_000 + i * 37 * Minute;
+                string conv = i % 4 == 0 ? "discord:c-trio" : "discord:c-dee";
+                string who = i % 3 == 0 ? "dee" : i % 3 == 1 ? "me" : conv == "discord:c-trio" ? "sam" : "me";
+                string? replyTo = who != "dee" && hers.Count > 0 && rnd.Next(4) == 0 ? hers[rnd.Next(hers.Count)] : null;
+                string text = who == "sam" && i % 16 == 0 ? $"has anyone heard from Dee Marsh today ({i})" : $"a line about nothing in particular, number {i}";
+                string id = await corpus.MessageAsync(who, conv, at, text, replyTo: replyTo);
+                if (who == "dee") hers.Add(id);
+            }
+            // Her name in a conversation she is not in is somebody else.
+            await corpus.MessageAsync("sam", "discord:c-sam", Now - 5 * Minute, "Dee Marsh is a common name where I come from");
+
+            // What the full scan made of her history (the code this replaced, still used by the tests).
+            var assembler = new EvidenceAssembler(h.Kit);
+            var identities = new[] { CorpusBuilder.Identity("dee") };
+            var full = assembler.Anchors(identities, Now).Select(a => a.MessageId).ToHashSet(StringComparer.Ordinal);
+            foreach (var a in assembler.NameMentions(new[] { "Dee Marsh", "Dee" }, new[] { "discord:c-dee", "discord:c-trio" }, identities, Now)) full.Add(a.MessageId);
+            Assert.True(full.Count > hers.Count, "replies and mentions are part of her evidence");
+
+            var before = (EvidenceQueue.PageSize, ExtractionPipeline.QueueTarget);
+            (EvidenceQueue.PageSize, ExtractionPipeline.QueueTarget) = (20, 30);
+            try
+            {
+                var pipeline = new ExtractionPipeline(h.Kit, new ClaimStore(h.Stores, h.Clock), new ExtractionOptions());
+                int jobs = 0, read = 0;
+                ExtractionRunStats stats;
+                do
+                {
+                    stats = await pipeline.RunAsync("dee", await JobAsync(h, new List<JsonElement>()));
+                    read += stats.Messages;
+                    Assert.True(++jobs < 60, "the reading never came to an end");
+                    Assert.InRange(pipeline.LookedAt, 0, 4 * 20); // never more than a few pages of her history in one job
+                } while (stats.Pending);
+
+                using var intel = h.Stores.Intel.OpenRead();
+                var covered = intel.Query(null, "SELECT message_id FROM kn_coverage WHERE person_id='dee'", r => r.GetString(0)).ToHashSet(StringComparer.Ordinal);
+                Assert.Empty(full.Except(covered));     // nothing the full scan found was missed
+                Assert.Empty(covered.Except(full));     // and nothing else was read as her evidence
+                Assert.Equal(covered.Count, read);      // each of them once
+                Assert.Equal(0L, intel.Scalar<long>(null, "SELECT COUNT(*) FROM kn_evidence_queue WHERE person_id='dee'"));
+                Assert.Equal((long)covered.Count, intel.Scalar<long>(null, "SELECT covered_messages FROM kn_person_state WHERE person_id='dee'"));
+                Assert.True(jobs > 3, "her history took several jobs, as it should");
+            }
+            finally
+            {
+                (EvidenceQueue.PageSize, ExtractionPipeline.QueueTarget) = before;
+            }
         }
 
         [Fact]

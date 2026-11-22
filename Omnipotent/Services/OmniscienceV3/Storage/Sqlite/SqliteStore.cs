@@ -88,6 +88,8 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
                     conn.Open();
                     conn.Exec(null, "PRAGMA query_only=ON; PRAGMA temp_store=MEMORY; PRAGMA cache_size=-32768; PRAGMA mmap_size=268435456; PRAGMA busy_timeout=10000;");
                     conn.StopWith(stopWith);
+                    // A job's reads give way to a request that is being answered (ForegroundIo); a request's never wait.
+                    if (ForegroundIo.Enabled && ForegroundIo.InBackground) conn.YieldToForeground();
                     return conn;
                 }
                 catch (ObjectDisposedException) when (attempt < 3)

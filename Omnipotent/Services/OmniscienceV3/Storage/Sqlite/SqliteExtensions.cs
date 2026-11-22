@@ -26,7 +26,8 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
         {
             // A read made by work that has been cancelled does not start, and one that is cut short says so as a
             // cancellation (see AmbientCancellation). Writes run on the writer's own thread, outside any such work.
-            if (tx == null) AmbientCancellation.ThrowIfCancelled();
+            // A job's read also waits here while a request is being answered (ForegroundIo).
+            if (tx == null) BeforeRead();
             try
             {
                 using var cmd = conn.Cmd(tx, sql, args);
@@ -41,9 +42,15 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
             }
         }
 
+        private static void BeforeRead()
+        {
+            AmbientCancellation.ThrowIfCancelled();
+            ForegroundIo.YieldIfBackground();
+        }
+
         public static List<T> Query<T>(this SqliteConnection conn, SqliteTransaction? tx, string sql, Func<SqliteDataReader, T> map, params (string Name, object? Value)[] args)
         {
-            if (tx == null) AmbientCancellation.ThrowIfCancelled();
+            if (tx == null) BeforeRead();
             try
             {
                 using var cmd = conn.Cmd(tx, sql, args);
@@ -62,7 +69,7 @@ namespace Omnipotent.Services.OmniscienceV3.Storage.Sqlite
         /// rest (a ranked list of which only the first few that pass a test are wanted). Returns the rows read.</summary>
         public static int Scan(this SqliteConnection conn, SqliteTransaction? tx, string sql, Func<SqliteDataReader, bool> row, params (string Name, object? Value)[] args)
         {
-            if (tx == null) AmbientCancellation.ThrowIfCancelled();
+            if (tx == null) BeforeRead();
             try
             {
                 using var cmd = conn.Cmd(tx, sql, args);

@@ -77,7 +77,7 @@ namespace Omnipotent.Services.OmniscienceV3
         {
             long started = options.Clock.NowMs;
             stage?.Invoke("Opening stores");
-            var stores = await OmniscienceStores.OpenAsync(options.Paths, options.Clock, ct, options.LockWait).ConfigureAwait(false);
+            var stores = await OmniscienceStores.OpenAsync(options.Paths, options.Clock, ct, options.LockWait, options.Log).ConfigureAwait(false);
             ModuleHost? host = null;
             IEmbeddingEncoder? encoder = null;
             IDisposable? ownedEncoder = null;
@@ -87,6 +87,7 @@ namespace Omnipotent.Services.OmniscienceV3
                 var llm = new OmniLlm(options.LlmClient, stores.Intel, options.Clock, new TokenEstimator());
                 var gate = new LlmBackgroundGate(llm);
                 var models = new ModelHub(options.Paths.Models, http, options.Clock, options.Log);
+                stage?.Invoke("Loading the vector index");
                 var vectors = new Ml.Vectors.VectorStore(stores.Vectors, options.Clock);
                 await vectors.InitializeAsync(ct).ConfigureAwait(false);
                 encoder = options.Encoder;

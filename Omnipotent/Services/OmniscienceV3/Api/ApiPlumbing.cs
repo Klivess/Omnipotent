@@ -336,11 +336,18 @@ namespace Omnipotent.Services.OmniscienceV3.Api
             }
         }
 
-        private Task GuardAsync(string path, HttpMethod method, Func<UserRequest, Task> handler, UserRequest req)
+        private async Task GuardAsync(string path, HttpMethod method, Func<UserRequest, Task> handler, UserRequest req)
         {
-            if (method != HttpMethod.Get) return HandleAsync(path, method, handler, req);
-            return Answers.RunAsync(AnswerKey(path, req), () => HandleAsync(path, method, handler, req),
-                (json, status) => WriteKeptAsync(req, json, status), () => WriteKeptAsync(req, AnswerGuard.PendingJson, HttpStatusCode.Accepted));
+            // Somebody is waiting for this answer: until it is given, the jobs' reads stand back (ForegroundIo). A read
+            // that is answered "pending" has been answered; its work carries on behind it like any other background work.
+            using var answering = Storage.Sqlite.ForegroundIo.Enter();
+            if (method != HttpMethod.Get)
+            {
+                await HandleAsync(path, method, handler, req).ConfigureAwait(false);
+                return;
+            }
+            await Answers.RunAsync(AnswerKey(path, req), () => HandleAsync(path, method, handler, req),
+                (json, status) => WriteKeptAsync(req, json, status), () => WriteKeptAsync(req, AnswerGuard.PendingJson, HttpStatusCode.Accepted)).ConfigureAwait(false);
         }
 
         /// <summary>Who asks, and for what: the route and its parameters in a fixed order.</summary>

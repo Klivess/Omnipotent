@@ -39,6 +39,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         public const string ReverifyKind = "reverify";
         public const string CalibrateKind = "calibrate";
         public const string SweepKind = "sweep";
+        /// <summary>Routes what the corpus change log has recorded to the people it is evidence about (<see cref="Evidence.EvidenceQueue"/>).</summary>
+        public const string RouteKind = "route";
 
         public const string TiersSetting = Id + ".tiers";
         public const string MaxOutputSetting = Id + ".max_output_tokens";
@@ -54,6 +56,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         private KnowledgeKit kit = null!;
         private ClaimStore claims = null!;
         private ReviewQueue review = null!;
+        private Evidence.EvidenceQueue evidence = null!;
         private IReadOnlyList<ITactic>? tactics;
 
         /// <summary>The slices one X17 run reads for each person, at most (the continuous job's fair rotation does not apply:
@@ -120,7 +123,13 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             kit = KnowledgeKit.For(context);
             claims = new ClaimStore(context.Stores, context.Clock);
             review = new ReviewQueue(context.Stores, context.Clock);
+            evidence = Evidence.EvidenceQueue.For(kit);
         }
+
+        /// <summary>The priority of the two jobs that keep the pipeline moving and take a second each (the sweep, and routing
+        /// new messages to the people they are about). The sweep stood at 50 in a lane where a scan at 260 is queued afresh
+        /// every minute: due every minute, it ran three times in its first three days on the server.</summary>
+        public const int HousekeepingPriority = 220;
 
         internal KnowledgeKit Kit => kit;
 
@@ -163,7 +172,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         {
             var jobs = new List<JobRequest>();
             var tracked = kit.Corpus.PersonsInTiers(Tiers()).ToHashSet(StringComparer.Ordinal);
-            HashSet<string>? trackedIdentities = null;
+            bool route = false;
             foreach (var d in context.Dirty)
             {
                 switch (d.Kind)
@@ -173,18 +182,22 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                         string canonical = kit.Corpus.Canonical(d.Id);
                         // Nothing is extracted about someone whose analysis is switched off (N20).
                         if (tracked.Contains(canonical) && !kit.Corpus.AnalysisOff.Person(canonical)) jobs.Add(Job(ExtractKind, "person", canonical, ExtractPriority));
+                        route = true;
                         break;
                     }
                     case "conversation":
-                    {
-                        trackedIdentities ??= kit.Corpus.IdentitiesOf(tracked.SelectMany(kit.Corpus.PersonIdsOf).ToList()).Select(i => i.IdentityId).ToHashSet(StringComparer.Ordinal);
-                        if (trackedIdentities.Count == 0) break;
-                        foreach (var identity in kit.Corpus.MembersOf(d.Id).Where(trackedIdentities.Contains))
-                            if (kit.Corpus.PersonOfIdentity(identity) is { } p && tracked.Contains(p)) jobs.Add(Job(ExtractKind, "person", p, ExtractPriority - 10));
+                        // A message in a conversation can be evidence about people who did not write it (a reply to them, a
+                        // mention, their name). Which people is worked out from the message by the routing job, which then
+                        // queues a reading for exactly those; every tracked member of the conversation used to be given a
+                        // job that looked through their whole history to find out.
+                        route = true;
                         break;
-                    }
                     case "message":
-                        jobs.Add(Job(ReverifyKind, "message", d.Id, 150));
+                        // No model work of its own (it queues the consolidations it causes), so it does not stand in the
+                        // model lane: on the server 2,795 of these, nearly all with nothing to do, were queued there ahead
+                        // of fourteen people's readings (21 Nov 2026).
+                        jobs.Add(Job(ReverifyKind, "message", d.Id, 150, lane: Lane.Cpu));
+                        route = true;
                         break;
                     case "consolidate":
                         jobs.Add(Job(ConsolidateKind, "person", kit.Corpus.Canonical(d.Id), 160));
@@ -199,13 +212,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                         if (tracked.Contains(canonical)) jobs.Add(Job(ExtractKind, "person", canonical, ExtractPriority + 5));
                         // The merged-away id (unmerged again, or the survivor) is consolidated too, so nothing stays orphaned (F264).
                         if (d.Id != canonical) jobs.Add(Job(ConsolidateKind, "person", d.Id, 160));
+                        route = true;
                         break;
                     }
                 }
             }
+            if (route) jobs.Add(Job(RouteKind, lane: Lane.Cpu, priority: HousekeepingPriority));
             foreach (var (name, _) in context.DueSchedules)
             {
-                if (name == "sweep") jobs.Add(Job(SweepKind, lane: Lane.Cpu, priority: 50));
+                if (name == "sweep") jobs.Add(Job(SweepKind, lane: Lane.Cpu, priority: HousekeepingPriority));
                 if (name == "calibrate") jobs.Add(Job(CalibrateKind, lane: Lane.Cpu, priority: 40));
             }
             if (context.VersionChanged)
@@ -225,8 +240,40 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             ReverifyKind => await ReverifyAsync(job).ConfigureAwait(false),
             CalibrateKind => await CalibrateAsync(job).ConfigureAwait(false),
             SweepKind => await SweepAsync(job).ConfigureAwait(false),
+            RouteKind => await RouteJobAsync(job).ConfigureAwait(false),
             _ => throw new JobFailureException(ErrorClass.Permanent, $"Unknown job kind '{job.Job.Kind}'."),
         };
+
+        /// <summary>How much of the change log one routing pass takes, and for how long at most (what is left is taken by the
+        /// next pass; the sweep starts one every minute).</summary>
+        internal static int RouteChangesPerPass { get; set; } = 20_000;
+
+        internal static TimeSpan RouteBudget { get; set; } = TimeSpan.FromSeconds(20);
+
+        /// <summary>
+        /// Routes what has arrived to the people it is evidence about, and queues a reading for each of them
+        /// (single-flight per person). Null when another pass is already running.
+        /// </summary>
+        private async Task<Evidence.EvidenceRouted?> RouteAndQueueAsync(CancellationToken ct)
+        {
+            var tracked = kit.Corpus.PersonsInTiers(Tiers());
+            var routed = await evidence.RouteAsync(tracked, ExtractionPrompt.Version, RouteChangesPerPass, RouteBudget, ct).ConfigureAwait(false);
+            if (routed == null) return null;
+            foreach (var person in routed.Persons)
+                if (!kit.Corpus.AnalysisOff.Person(person))
+                    await Context.Jobs.EnqueueAsync(Job(ExtractKind, "person", person, ExtractPriority), ct).ConfigureAwait(false);
+            return routed;
+        }
+
+        private async Task<string?> RouteJobAsync(JobContext job)
+        {
+            var routed = await RouteAndQueueAsync(job.Cancellation).ConfigureAwait(false);
+            return Result(new
+            {
+                cursor = routed?.Cursor, maxSeq = routed?.MaxSeq, changes = routed?.Changes ?? 0, queued = routed?.Added ?? 0, people = routed?.Persons.Count ?? 0,
+                busy = routed == null,
+            });
+        }
 
         private ExtractionOptions ExtractionSettings() => new()
         {
@@ -250,7 +297,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             // The Quality Lab's regression gate: a prompt version it blocked never extracts (N18).
             if (Quality.QualityModule.LatestGate(Context.Stores, "deduction.extract", ExtractionPrompt.Version) is { Decision: "block" } gate)
                 throw new JobFailureException(ErrorClass.Permanent, $"Prompt {ExtractionPrompt.Version} is blocked by the Quality Lab gate: {string.Join(" ", gate.Reasons)}");
-            var pipeline = new ExtractionPipeline(kit, claims, ExtractionSettings());
+            var pipeline = new ExtractionPipeline(kit, claims, ExtractionSettings(), () => kit.Corpus.PersonsInTiers(Tiers()));
             // Facts follow every slice, not the job: a job reads for hours, and when a later slice failed, the claims of
             // the slices before it were never consolidated. Two days in, the server held hundreds of verified claims and
             // not one fact.
@@ -267,6 +314,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             var stats = await pipeline.RunAsync(person, job, FactsAsync).ConfigureAwait(false);
             await SetStateAsync(person, tracked: true, pending: stats.Pending, extracted: true, error: null, ct: job.Cancellation).ConfigureAwait(false);
             await FactsAsync(stats).ConfigureAwait(false);
+            // What the job routed on its way in was evidence about other people too: each gets a reading of their own.
+            foreach (var other in pipeline.RoutedTo.Where(o => o != person && !kit.Corpus.AnalysisOff.Person(o)))
+                await Context.Jobs.EnqueueAsync(Job(ExtractKind, "person", other, ExtractPriority), job.Cancellation).ConfigureAwait(false);
             return Result(new
             {
                 person, stats.RunId, stats.Slices, stats.Messages, stats.ClaimsRaw, stats.ClaimsAgreed, stats.ClaimsVerified, stats.ClaimsRejected, stats.Refusals,
@@ -455,14 +505,31 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             }
             if (kit.Context.Policy is EvidencePolicyOracle oracle) foreach (var p in affected) oracle.Invalidate(p);
             var tracked = kit.Corpus.PersonsInTiers(Tiers()).ToHashSet(StringComparer.Ordinal);
-            long seq = kit.Corpus.MaxSeq();
             foreach (var p in affected)
             {
-                await ConsolidateAndProjectAsync(p, job, seq).ConfigureAwait(false);
+                // The consolidation is a job of its own, in the model lane (it may ask the model to group values): this job
+                // runs beside the others that only read and write, and makes no model call itself.
+                await Context.Jobs.EnqueueAsync(Job(ConsolidateKind, "person", p, 160), job.Cancellation).ConfigureAwait(false);
                 if (tracked.Contains(p)) await Context.Jobs.EnqueueAsync(Job(ExtractKind, "person", p, 140), job.Cancellation).ConfigureAwait(false);
             }
             return Result(new { messageId, claims = citing.Count, people = affected.Count, deleted = message?.DeletedAtMs != null, erased = message == null });
         }
+
+        /// <summary>
+        /// Closes the re-verifications left queued in the model lane that have nothing to do: the message they are about is
+        /// cited by no claim and by no age evidence, so there is nothing to supersede, relabel or consolidate (its new
+        /// version is read again through the evidence queue like any other change). On the server 2,795 of them stood ahead
+        /// of fourteen people's readings; new ones are planned outside the model lane. Returns how many were closed.
+        /// </summary>
+        private Task<int> CloseIdleReverificationsAsync(CancellationToken ct) => Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, """
+            UPDATE jobs SET state='cancelled', finished_at_ms=$now, error_message='Closed: no claim rests on this message, so there was nothing to re-verify.'
+            WHERE job_id IN (
+                SELECT j.job_id FROM jobs j INDEXED BY ix_jobs_module_state
+                WHERE j.module_id=$m AND j.state='queued' AND j.kind=$k AND j.lane='LlmBackground'
+                  AND NOT EXISTS (SELECT 1 FROM kn_claim_messages cm WHERE cm.message_id = j.subject_id)
+                  AND NOT EXISTS (SELECT 1 FROM kn_age_evidence a WHERE a.message_id = j.subject_id)
+                LIMIT 5000)
+            """, ("$now", Context.Clock.NowMs), ("$m", Id), ("$k", ReverifyKind)), ct);
 
         private int ClaimVersion(string claimId, string messageId)
         {
@@ -522,19 +589,35 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             return Result(new { samples = samples.Count, curves = fitted });
         }
 
-        /// <summary>Every minute: continue backlogs and start newly tracked people.</summary>
+        /// <summary>How long one sweep may spend looking through a person's history to top their queue up.</summary>
+        internal static TimeSpan SweepTopUpBudget { get; set; } = TimeSpan.FromSeconds(12);
+
+        /// <summary>Every minute: route what has arrived, keep the evidence queues topped up, continue backlogs and start
+        /// newly tracked people.</summary>
         private async Task<string?> SweepAsync(JobContext job)
         {
             var ct = job.Cancellation;
             var tracked = kit.Corpus.PersonsInTiers(Tiers());
+            int closed = await CloseIdleReverificationsAsync(ct).ConfigureAwait(false);
+            var routed = await RouteAndQueueAsync(ct).ConfigureAwait(false);
+
             Dictionary<string, (bool Tracked, bool Pending, long? LastExtract)> state;
+            Dictionary<string, long> waiting;
             using (var c = Context.Stores.Intel.OpenRead())
+            {
                 state = c.Query(null, "SELECT person_id, tracked, pending, last_extract_ms FROM kn_person_state", r => (r.GetString(0), r.GetInt32(1) == 1, r.GetInt32(2) == 1, r.GetInt64OrNull(3)))
                     .ToDictionary(x => x.Item1, x => (x.Item2, x.Item3, x.Item4), StringComparer.Ordinal);
+                waiting = c.Query(null, "SELECT person_id, COUNT(*) FROM kn_evidence_queue GROUP BY person_id", r => (r.GetString(0), r.GetInt64(1)))
+                    .ToDictionary(x => x.Item1, x => x.Item2, StringComparer.Ordinal);
+            }
+            var off = kit.Corpus.AnalysisOff;
             int enqueued = 0;
             foreach (var p in tracked)
             {
-                if (!state.TryGetValue(p, out var s) || s.Pending || s.LastExtract == null)
+                if (off.Person(p)) continue;
+                // Someone with anchors waiting is read whatever their state says: a job that failed after routing would
+                // otherwise leave them waiting for the next message about them.
+                if (!state.TryGetValue(p, out var s) || s.Pending || s.LastExtract == null || waiting.GetValueOrDefault(p) > 0)
                 {
                     await Context.Jobs.EnqueueAsync(Job(ExtractKind, "person", p, s.LastExtract == null ? ExtractPriority + 10 : ExtractPriority - 20), ct).ConfigureAwait(false);
                     enqueued++;
@@ -544,7 +627,21 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             foreach (var (p, s) in state.Where(kv => kv.Value.Tracked && !tracked.Contains(kv.Key)))
                 await SetStateAsync(p, tracked: false, pending: false, error: null, ct: ct).ConfigureAwait(false);
 
-            return Result(new { tracked = tracked.Count, enqueued });
+            // One person's queue is topped up from their history here, outside the model lane, so the job that reads them
+            // finds its anchors waiting: the person with the least waiting whose history is not at its end. A page or two a
+            // minute is far more than the model reads.
+            string? toppedUp = null;
+            int looked = 0;
+            foreach (var p in tracked.Where(p => !off.Person(p)).OrderBy(p => waiting.GetValueOrDefault(p)).ThenBy(p => p, StringComparer.Ordinal))
+            {
+                if (waiting.GetValueOrDefault(p) >= ExtractionPipeline.QueueTarget) break;
+                if (evidence.Complete(p, ExtractionPrompt.Version)) continue;
+                var topUp = await evidence.TopUpAsync(p, ExtractionPrompt.Version, ExtractionPipeline.QueueTarget, SweepTopUpBudget, ct, job.ReportProgressAsync).ConfigureAwait(false);
+                (toppedUp, looked) = (p, topUp.Looked);
+                break;
+            }
+
+            return Result(new { tracked = tracked.Count, enqueued, routed = routed?.Added ?? 0, routedChanges = routed?.Changes ?? 0, closedReverifications = closed, toppedUp, looked });
         }
 
         private async Task FlagAgeConflictsAsync(string person, long seq, CancellationToken ct)
@@ -581,7 +678,6 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                         last_extract_ms = CASE WHEN $x = 1 THEN $n ELSE last_extract_ms END,
                         last_consolidate_ms = CASE WHEN $c = 1 THEN $n ELSE last_consolidate_ms END,
                         last_detective_ms = CASE WHEN $d = 1 THEN $n ELSE last_detective_ms END,
-                        covered_messages = (SELECT COUNT(*) FROM kn_coverage WHERE person_id=$p),
                         prompt_version = $pv, last_error = $e, updated_at_ms = $n
                     WHERE person_id=$p
                     """, ("$t", tracked == null ? null : tracked.Value ? 1 : 0), ("$pe", pending == null ? null : pending.Value ? 1 : 0), ("$x", extracted ? 1 : 0),

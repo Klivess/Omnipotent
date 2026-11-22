@@ -257,6 +257,27 @@ CREATE TABLE module_problems(
   PRIMARY KEY(module_id, problem)
 ) WITHOUT ROWID;
 """),
+            // How long the runs of each kind of job take (Kernel.Jobs.LaneWorkers): what keeps the long kinds off a lane's
+            // express worker. Learned as jobs run; kept here so that it is known from the first job after a restart, when
+            // an express worker would otherwise take each long kind once more (a nightly backup: five hours).
+            // It starts with what the server showed on 21 and 22 Nov 2026 (updated_at_ms 0 marks those rows), so the very
+            // first start knows it too; every figure is replaced by what the lanes measure from then on.
+            new Migration(ModuleId, 6, "how long each kind of job takes", """
+CREATE TABLE job_kind_pace(
+  module_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  typical_ms INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(module_id, kind)
+) WITHOUT ROWID;
+INSERT INTO job_kind_pace(module_id, kind, typical_ms, updated_at_ms) VALUES
+  ('datacontrols', 'backup', 18000000, 0),
+  ('explore', 'mirror', 240000, 0),
+  ('rollups', 'drain', 300000, 0),
+  ('projections', 'daily', 1800000, 0),
+  ('ingest.discord_bot', 'backfill', 800000, 0),
+  ('knowledge.deduction', 'extract', 600000, 0);
+"""),
         };
     }
 }

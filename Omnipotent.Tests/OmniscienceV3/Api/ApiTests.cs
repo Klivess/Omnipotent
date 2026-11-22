@@ -357,6 +357,40 @@ namespace Omnipotent.Tests.OmniscienceV3.Api
             Assert.NotNull(s.Stream);
         }
 
+        /// <summary>
+        /// The engine page asks for the status every ten seconds. A snapshot counted as fresh for two, so every ask built
+        /// its own on a drive the jobs were reading too: a median of 1.2 s over 544 asks, and the four-second limit at the
+        /// 95th percentile (21 Nov 2026). An ask is now answered with the snapshot that is there, and that snapshot is
+        /// rebuilt behind it for the next one.
+        /// </summary>
+        [Fact]
+        public async Task Status_AskedAgain_IsAnsweredWithTheSnapshotThatIsThere_AndThatIsRebuiltBehindTheAnswer()
+        {
+            static long Queued(V3StatusDto s) => s.Lanes.Sum(l => l.Queued);
+            Task Enqueue(string subject) => rt.Host.Jobs.EnqueueAsync(new JobRequest { ModuleId = "test", Kind = "wait", SubjectKind = "person", SubjectId = subject });
+
+            long before = Queued(queries.Status());
+            await Enqueue("p1");
+
+            // The page's next ask, ten seconds on: answered at once with what the last ask left, under the engine's time now.
+            clock.Advance(TimeSpan.FromSeconds(10));
+            var second = queries.Status();
+            Assert.Equal(before, Queued(second));
+            Assert.Equal(clock.NowMs, second.NowMs);
+
+            // What it started behind the answer is what the ask after it gets.
+            await queries.StatusRefresh.WaitAsync(TimeSpan.FromSeconds(10));
+            await Enqueue("p2");
+            clock.Advance(TimeSpan.FromSeconds(10));
+            Assert.Equal(before + 1, Queued(queries.Status()));
+            await queries.StatusRefresh.WaitAsync(TimeSpan.FromSeconds(10));
+
+            // Nobody asked for over a minute: a snapshot that old is not an answer, and the ask builds its own.
+            await Enqueue("p3");
+            clock.Advance(EngineQueries.StatusServedFor + TimeSpan.FromSeconds(1));
+            Assert.Equal(before + 3, Queued(queries.Status()));
+        }
+
         [Fact]
         public void Host_AnswersAClassified503InEveryNonReadyPhase()
         {

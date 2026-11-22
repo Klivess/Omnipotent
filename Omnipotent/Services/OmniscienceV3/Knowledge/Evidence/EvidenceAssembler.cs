@@ -231,10 +231,13 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Evidence
         /// <summary>Anchors not yet covered at their current version by <paramref name="promptVersion"/>.</summary>
         public IReadOnlyList<EvidenceAnchor> Uncovered(string personId, IReadOnlyList<EvidenceAnchor> anchors, string promptVersion)
         {
+            if (anchors.Count == 0) return Array.Empty<EvidenceAnchor>();
+            // Asked about these anchors only: everything the person has ever had read (a row per message) used to be
+            // loaded to answer for a handful of them.
             Dictionary<string, (int Version, string Prompt)> covered;
             using (var c = Stores.Intel.OpenRead())
-                covered = c.Query(null, "SELECT message_id, message_version, prompt_version FROM kn_coverage WHERE person_id=$p",
-                        r => (Id: r.GetString(0), V: r.GetInt32(1), P: r.GetString(2)), ("$p", personId))
+                covered = c.QueryIn(null, "SELECT message_id, message_version, prompt_version FROM kn_coverage WHERE message_id IN ({keys}) AND person_id=$p",
+                        anchors.Select(a => a.MessageId).Distinct(StringComparer.Ordinal).ToList(), r => (Id: r.GetString(0), V: r.GetInt32(1), P: r.GetString(2)), 500, ("$p", personId))
                     .ToDictionary(x => x.Id, x => (x.V, x.P), StringComparer.Ordinal);
             return anchors.Where(a => !covered.TryGetValue(a.MessageId, out var cv) || cv.Version < a.Version || cv.Prompt != promptVersion).ToList();
         }

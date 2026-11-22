@@ -282,6 +282,52 @@ CREATE TABLE kn_value_groups(
   PRIMARY KEY(attribute, value_norm)
 );
 """),
+            // What is waiting to be read about each tracked person (Knowledge.Evidence.EvidenceQueue). An extraction job used
+            // to work this out afresh every time, from every message the person ever wrote: for the three busiest people
+            // that never finished, and the one worker of the model lane was held by it for a day (21 Nov 2026).
+            // kn_evidence_queue: the unread anchors, oldest first. kn_evidence_state: how far each person's history has
+            // been looked through. kn_evidence_convs: where each person writes (names are looked for there only).
+            // kn_evidence_cursor: how far the corpus change log has been routed into the queues.
+            new Migration(DeductionModule, 2, "evidence queue: unread anchors per person, history cursors, change-log routing", """
+CREATE TABLE kn_evidence_queue(
+  person_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  sent_at_ms INTEGER NOT NULL,
+  order_key INTEGER NOT NULL,
+  ingest_seq INTEGER NOT NULL,
+  conversation_id TEXT NOT NULL,
+  relation INTEGER NOT NULL,
+  queued_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(person_id, message_id)
+) WITHOUT ROWID;
+CREATE INDEX ix_kn_evidence_queue_order ON kn_evidence_queue(person_id, sent_at_ms, order_key, ingest_seq, message_id);
+
+CREATE TABLE kn_evidence_state(
+  person_id TEXT PRIMARY KEY,
+  prompt_version TEXT NOT NULL,
+  complete INTEGER NOT NULL DEFAULT 0,
+  state_json TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE kn_evidence_convs(
+  person_id TEXT NOT NULL,
+  conversation_id TEXT NOT NULL,
+  PRIMARY KEY(person_id, conversation_id)
+) WITHOUT ROWID;
+CREATE INDEX ix_kn_evidence_convs_conversation ON kn_evidence_convs(conversation_id);
+
+CREATE TABLE kn_evidence_cursor(
+  name TEXT PRIMARY KEY,
+  seq INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+) WITHOUT ROWID;
+
+-- An edited or erased message has its coverage removed, and its age evidence retracted, by message id alone.
+CREATE INDEX ix_kn_coverage_message ON kn_coverage(message_id);
+CREATE INDEX ix_kn_age_message ON kn_age_evidence(message_id);
+"""),
         };
 
         public static IReadOnlyList<Migration> Identity { get; } = new[]
