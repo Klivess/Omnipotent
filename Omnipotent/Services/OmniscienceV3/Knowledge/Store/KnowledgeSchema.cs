@@ -343,11 +343,23 @@ UPDATE assertions SET valid_from_earliest_ms=NULL, valid_from_latest_ms=NULL WHE
 UPDATE kn_assertion_dims SET valid_from_ms=NULL WHERE valid_from_ms=0;
 UPDATE kn_assertion_dims SET occurred_at_ms=COALESCE(first_evidence_at_ms, recorded_at_ms) WHERE occurred_at_ms=0;
 """),
+            // Until 22 Nov 2026 a fact's text was stored as the model wrote it, roster handles included ("meet with p9a05
+            // to understand the project system"; "p9a05" alone as somebody's friend). Whose a handle is has to be worked
+            // out from the people and the conversation of each claim, which is not a statement's work: this only asks
+            // for the job that does it (Deduction.HandleRepair), once.
+            new Migration(DeductionModule, 4, "the repair of roster handles in stored claims and facts is asked for", $"""
+INSERT OR IGNORE INTO module_dirty(module_id, subject_kind, subject_id, dirty_since_seq, dirty_at_ms)
+VALUES('{DeductionModule}', '{HandlesDirtyKind}', 'all', 0, CAST(strftime('%s','now') AS INTEGER) * 1000);
+"""),
         };
 
         /// <summary>The dirty kind that asks for a person's views to be built again from the facts as they are stored
         /// (<see cref="Deduction.DeductionModule.ViewsKind"/>).</summary>
         public const string ViewsDirtyKind = "views";
+
+        /// <summary>The dirty kind that starts the repair of roster handles in stored claims and facts
+        /// (<see cref="Deduction.DeductionModule.HandlesKind"/>).</summary>
+        public const string HandlesDirtyKind = "handles";
 
         public static IReadOnlyList<Migration> Identity { get; } = new[]
         {

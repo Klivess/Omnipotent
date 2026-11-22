@@ -36,6 +36,14 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
         public const string ReprojectKind = "reproject";
         /// <summary>A person's profile, timeline and plans built again from the store as it stands (no reading, no consolidation).</summary>
         public const string ViewsKind = "views";
+        /// <summary>Names put where stored claims and facts carry people's roster handles (<see cref="HandleRepair"/>).</summary>
+        public const string HandlesKind = "handles";
+
+        /// <summary>How long one job of the handles repair works before it queues the rest as the next job.</summary>
+        internal static TimeSpan HandlesBudget { get; set; } = TimeSpan.FromMinutes(4);
+
+        /// <summary>How many claims or facts the handles repair reads at a time.</summary>
+        internal static int HandlesPage { get; set; } = 2_000;
         public const string DetectiveKind = "detective";
         public const string HypothesesKind = "hypotheses";
         public const string ReverifyKind = "reverify";
@@ -211,6 +219,10 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
                         // Nothing is read or consolidated, so no model is asked: it does not stand in the model lane.
                         jobs.Add(Job(ViewsKind, "person", kit.Corpus.Canonical(d.Id), 90, lane: Lane.Cpu));
                         break;
+                    case KnowledgeSchema.HandlesDirtyKind:
+                        // From the first claim; the job carries its own place from there.
+                        jobs.Add(Job(HandlesKind, "place", "claims|", 80, lane: Lane.Cpu));
+                        break;
                     case "merge":
                     {
                         string canonical = kit.Corpus.Canonical(d.Id);
@@ -242,6 +254,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             ConsolidateKind => await ConsolidateJobAsync(job).ConfigureAwait(false),
             ReprojectKind => await ReprojectJobAsync(job).ConfigureAwait(false),
             ViewsKind => await ViewsJobAsync(job).ConfigureAwait(false),
+            HandlesKind => await HandlesJobAsync(job).ConfigureAwait(false),
             DetectiveKind => await DetectiveAsync(job).ConfigureAwait(false),
             HypothesesKind => await HypothesesAsync(job).ConfigureAwait(false),
             ReverifyKind => await ReverifyAsync(job).ConfigureAwait(false),
@@ -441,6 +454,47 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             await WriteProfileAsync(person, kit.Corpus.MaxSeq(), job.Cancellation).ConfigureAwait(false);
             await QueueProjectionsAsync(person, job.Cancellation).ConfigureAwait(false);
             return Result(new { person, rebuilt = new[] { "profile", "timeline", "plans" } });
+        }
+
+        /// <summary>
+        /// Goes through the stored claims, then the facts, the results of tactic runs and the reports of inquiries, a page
+        /// at a time, and puts names where they carry roster handles (<see cref="HandleRepair"/>). Its place travels in
+        /// the job's subject ("claims|&lt;after this id&gt;", then "facts|…" and so on): when its time is up it queues the
+        /// rest as the next job, so no run holds a worker for long and a restart loses a page at most. The people whose
+        /// facts changed have their views built again as it goes.
+        /// </summary>
+        private async Task<string?> HandlesJobAsync(JobContext job)
+        {
+            var ct = job.Cancellation;
+            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var repair = new HandleRepair(kit);
+            string place = job.Job.SubjectId is { Length: > 0 } given && given.Contains('|') ? given : "claims|";
+            int looked = 0, rewritten = 0, left = 0, people = 0;
+            while (true)
+            {
+                ct.ThrowIfCancellationRequested();
+                int bar = place.IndexOf('|');
+                string stage = place[..bar], after = place[(bar + 1)..];
+                int at = Math.Max(0, HandleRepair.Stages.ToList().IndexOf(stage));
+                stage = HandleRepair.Stages[at];
+                var step = await repair.StepAsync(stage, after, HandlesPage, ct).ConfigureAwait(false);
+                looked += step.Looked;
+                rewritten += step.Rewritten;
+                left += step.LeftAsHandles;
+                people += step.People.Count;
+                foreach (string person in step.People)
+                    await Context.Jobs.EnqueueAsync(Job(ViewsKind, "person", person, 90, lane: Lane.Cpu), ct).ConfigureAwait(false);
+                string? next = step.Next != null ? stage + "|" + step.Next : at + 1 < HandleRepair.Stages.Count ? HandleRepair.Stages[at + 1] + "|" : null;
+                await job.ReportProgressAsync(new { stage, looked, rewritten, leftAsHandles = left, people }).ConfigureAwait(false);
+                if (next == null) return Result(new { done = true, looked, rewritten, leftAsHandles = left, people });
+                place = next;
+                // Looked at after every page, and a job always reads one.
+                if (sw.Elapsed >= HandlesBudget)
+                {
+                    await Context.Jobs.EnqueueAsync(Job(HandlesKind, "place", place, 80, lane: Lane.Cpu), ct).ConfigureAwait(false);
+                    return Result(new { done = false, next = place, looked, rewritten, leftAsHandles = left, people });
+                }
+            }
         }
 
         /// <summary>Queues the timeline and the plans of a person to be projected again from the store.</summary>

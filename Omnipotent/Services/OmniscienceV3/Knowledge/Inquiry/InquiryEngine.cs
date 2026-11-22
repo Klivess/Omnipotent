@@ -657,8 +657,21 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Inquiry
 
         public static string InquiryId(TacticRunContext ctx) => NaturalKeys.Id("inq", ctx.RunId, 20);
 
+        /// <summary>
+        /// The report with people named where its text carries their roster handles. The dossier is built from stored facts,
+        /// and a fact's text has carried handles; the model then writes them into its reasoning. A report is read by Klives.
+        /// </summary>
+        private InquiryReportDto Named(InquiryReportDto report, InquirySpec spec)
+        {
+            string json = JsonSerializer.Serialize(report, KernelJson.Options);
+            if (!HandleText.MayHold(json)) return report;
+            string named = new HandleNamer(kit.Corpus, kit.Context.Stores).Json(json, spec.Subjects.Select(s => (string?)s.PersonId));
+            return ReferenceEquals(named, json) ? report : JsonSerializer.Deserialize<InquiryReportDto>(named, KernelJson.Options) ?? report;
+        }
+
         private async Task<InquiryReportDto> PersistAsync(TacticRunContext ctx, InquiryRequest req, InquirySpec spec, InquiryReportDto report, CancellationToken ct)
         {
+            report = Named(report, spec);
             long now = kit.Context.Clock.NowMs;
             string? assertionId = null;
             string? primary = spec.Subjects.FirstOrDefault()?.PersonId;

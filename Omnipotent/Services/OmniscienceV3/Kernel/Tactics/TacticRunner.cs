@@ -273,7 +273,7 @@ CREATE TABLE tactics_cursors(
             try
             {
                 var outputs = await tactic.RunAsync(context).ConfigureAwait(false);
-                await FinishAsync(runId, run.TacticKey, TacticRunStates.Succeeded, outputs, null, job.Cancellation).ConfigureAwait(false);
+                await FinishAsync(runId, run.TacticKey, TacticRunStates.Succeeded, outputs, null, job.Cancellation, run.InputJson).ConfigureAwait(false);
                 return JsonSerializer.Serialize(new { runId, outputs = outputs.Count }, KernelJson.Options);
             }
             catch (OperationCanceledException) when (runCts.IsCancellationRequested && !job.Cancellation.IsCancellationRequested)
@@ -336,15 +336,38 @@ CREATE TABLE tactics_cursors(
             await job.ReportProgressAsync(partial).ConfigureAwait(false);
         }
 
-        private async Task FinishAsync(string runId, string tacticKey, string state, IReadOnlyList<TacticOutput>? outputs, string? error, CancellationToken ct)
+        private async Task FinishAsync(string runId, string tacticKey, string state, IReadOnlyList<TacticOutput>? outputs, string? error, CancellationToken ct,
+            string? inputJson = null)
         {
             long now = Context.Clock.NowMs;
-            string? outputsJson = outputs == null ? null : JsonSerializer.Serialize(outputs, KernelJson.Options);
+            string? outputsJson = outputs == null ? null : NameThePeople(JsonSerializer.Serialize(outputs, KernelJson.Options), inputJson);
             bool changed = await Context.Stores.Intel.WriteAsync((c, tx) => c.Exec(tx, """
                 UPDATE tactic_runs SET state=$s, outputs_json=COALESCE($o, outputs_json), error=$e, finished_at_ms=$n
                 WHERE run_id=$r AND state NOT IN ('succeeded','failed','cancelled')
                 """, ("$s", state), ("$o", outputsJson), ("$e", error), ("$n", now), ("$r", runId)) == 1, ct).ConfigureAwait(false);
             if (changed) await PublishAsync(Topics.TacticFinished, runId, tacticKey, new { state, error, outputs = outputs?.Count ?? 0 }, ct).ConfigureAwait(false);
+        }
+
+        /// <summary>
+        /// A run's result as it is stored, with people named where its text carries their roster handles. A result is built
+        /// from stored facts and from what the model wrote about them, and both have carried handles ("show p9a05 a project
+        /// once made"): whatever tactic produced it, a result is read by Klives, not by a prompt. Whose a handle is, and
+        /// when it is left alone, is <see cref="Knowledge.Evidence.HandleNamer"/>'s to say. This never fails a run: a
+        /// result that cannot be gone through is stored as it came.
+        /// </summary>
+        private string NameThePeople(string outputsJson, string? inputJson)
+        {
+            if (!Knowledge.Evidence.HandleText.MayHold(outputsJson)) return outputsJson;
+            try
+            {
+                var namer = new Knowledge.Evidence.HandleNamer(Knowledge.KnowledgeKit.For(Context).Corpus, Context.Stores);
+                return namer.Json(outputsJson, namer.PeopleIn(inputJson));
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                Context.LogError("[OmniscienceV3] a tactic result was stored without its people named.", ex);
+                return outputsJson;
+            }
         }
 
         private Task PublishAsync(string topic, string runId, string tacticKey, object detail, CancellationToken ct) =>

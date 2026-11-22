@@ -38,6 +38,7 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             var def = Attributes.Get(raw.Attribute);
             string attribute = Attributes.TryGet(raw.Attribute, out var known) ? known.Id : Attributes.Other;
             string? other = attribute == Attributes.Other ? raw.AttributeOther?.Trim().ToLowerInvariant() : null;
+            if (other != null) other = Named(other, slice);
 
             // Evidence: every reference must exist in this slice and every quote must be found in that message version.
             if (raw.Evidence == null || raw.Evidence.Count == 0) return Reject(RejectReasons.NoEvidence, null);
@@ -143,7 +144,8 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             }
 
             long assertedAt = evidence.Max(e => e.SentAtMs);
-            string value = (raw.Value ?? raw.Entity?.Name ?? "").Trim();
+            // People are named in what Klives will read. The model is given handles and writes them into its prose as well.
+            string value = Named((raw.Value ?? raw.Entity?.Name ?? "").Trim(), slice);
             if (value.Length == 0 && objectPerson == null) return Reject(RejectReasons.InvalidClaim, "empty value");
             if (value.Length > 500) value = value[..500];
             var claim = new VerifiedClaim
@@ -188,6 +190,15 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             };
             return new VerifierOutcome(claim, null, null);
         }
+
+        /// <summary>The text with the handles of this slice's people replaced by their names: the name the site shows for the
+        /// person, else the first the roster has; "Klives" for the operator. A handle that is nobody's here is left alone.</summary>
+        private string Named(string text, EvidenceSlice slice) => HandleText.Named(text, handle =>
+        {
+            if (slice.Roster.PersonFor(handle) is not { } person) return null;
+            if (kit.Corpus.IsSelf(person)) return "Klives";
+            return kit.Corpus.DisplayName(person) is { Length: > 0 } shown ? shown : slice.Roster.NameFor(handle);
+        });
 
         private static VerifierOutcome Reject(string reason, string? detail) => new(null, reason, detail);
 

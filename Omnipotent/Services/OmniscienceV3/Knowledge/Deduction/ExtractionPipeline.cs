@@ -499,7 +499,9 @@ namespace Omnipotent.Services.OmniscienceV3.Knowledge.Deduction
             var first = messages.Count > 0 ? slice.ById(messages[0]) : null;
             string id = NaturalKeys.Id("cl", runId + "|r|" + slice.Index.ToString(CultureInfo.InvariantCulture) + "|" + (c.Id ?? "") + "|" + person + "|" + c.Attribute + "|" + NaturalKeys.Normalize(c.Value) + "|" + reason);
             // A sensitive or restricted value that never passed verification is not kept either: only the reason is.
-            string? value = Attributes.IsSensitive(c.Attribute ?? "") || Attributes.Get(c.Attribute).Sensitivity == AttributeSensitivity.RestrictedForMinors ? null : c.Value;
+            // Kept as it will be read: with the people named, not their handles (the id above is of the claim as it came).
+            string? value = Attributes.IsSensitive(c.Attribute ?? "") || Attributes.Get(c.Attribute).Sensitivity == AttributeSensitivity.RestrictedForMinors || c.Value == null
+                ? null : HandleText.Named(c.Value, slice.Roster.NameFor);
             return new RejectedClaim(id, person, Attributes.TryGet(c.Attribute, out var d) ? d.Id : Attributes.Other, value, reason, detail, messages, c.Probability,
                 c.Modality, c.SourceKind, first?.SentAtMs ?? 0, "", first?.ConversationId, first?.GuildId, first?.Platform, first?.AuthorPersonId);
         }
