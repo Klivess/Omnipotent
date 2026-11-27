@@ -24,10 +24,19 @@ namespace Omnipotent.Services.KliveBot_Discord.AutoGoat
 
         protected override async void ServiceMain()
         {
-            await Task.Delay(5000);
             try
             {
-                ((KliveBotDiscord)(await GetServicesByType<KliveBotDiscord>())[0]).Client.MessageCreated += AutoGoat_MessageCreated;
+                // KliveBot counts as started before its Discord client exists, so wait for the
+                // client itself rather than a fixed delay a slow start can outlast.
+                var bot = (KliveBotDiscord)(await GetServicesByType<KliveBotDiscord>())[0];
+                DiscordClient? client = await bot.WaitForClientAsync(TimeSpan.FromMinutes(2));
+                if (client == null)
+                {
+                    await ServiceLog("KliveBot's Discord client wasn't up within 2 minutes, so AutoGoat isn't watching.");
+                    await TerminateService();
+                    return;
+                }
+                client.MessageCreated += AutoGoat_MessageCreated;
                 ServiceLog(GetName() + " is now watching.");
             }
             catch (Exception e)

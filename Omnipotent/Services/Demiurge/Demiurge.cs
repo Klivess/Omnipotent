@@ -3465,7 +3465,10 @@ namespace Omnipotent.Services.Demiurge
                 // Bounded: see TryResolveServiceAsync. The retry timer below is the actual mechanism
                 // for "the bot starts after us", and it only ever ran because this returned.
                 var discord = await TryResolveServiceAsync<KliveBotDiscord>(TimeSpan.FromSeconds(30));
-                if (discord == null)
+                // KliveBot counts as started before its Discord client exists, and InitialiseAsync
+                // subscribes to that client at once; reached first, it threw on the null client
+                // after DiscordManager was set, which also turned every retry into a no-op.
+                if (discord == null || await discord.WaitForClientAsync(TimeSpan.FromSeconds(30)) == null)
                 {
                     ServiceLog("Demiurge: KliveBotDiscord not available yet — will retry Discord init periodically.");
                     ScheduleDiscordInitRetry();

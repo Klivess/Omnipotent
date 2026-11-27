@@ -5,6 +5,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using DSharpPlus;
 using DSharpPlus.Entities;
+using DSharpPlus.EventArgs;
 using Omnipotent.Data_Handling;
 using Omnipotent.Service_Manager;
 using Omnipotent.Services.KliveAPI;
@@ -43,36 +44,16 @@ namespace Omnipotent.Services.KAPIReachabilityMonitor
                 await GetDataHandler().CreateDirectory(OmniPaths.GetPath(OmniPaths.GlobalPaths.KAPIReachabilityMonitorDirectory));
                 state = await LoadState();
 
-                // One persistent handler for the "Resolved" button. Matching by a stable prefix means
-                // buttons keep working even on messages sent before a restart.
-                kliveBotDiscord.Client.ComponentInteractionCreated += async (s, e) =>
-                {
-                    try
-                    {
-                        if (e.Id != null && e.Id.StartsWith(ResolvedButtonId))
-                        {
-                            DiscordInteractionResponseBuilder builder = new();
-                            builder.WithContent("Resolved — thanks! KAPI reachability reminders for this IP change have been cleared.");
-                            await e.Interaction.CreateResponseAsync(InteractionResponseType.ChannelMessageWithSource, builder);
-
-                            state.PendingChange = null;
-                            await SaveState();
-                            await ServiceLog("Public IP change marked resolved by Klives.");
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        await ServiceLogError(ex, "Failed to handle KAPI reachability Resolved button.", false);
-                    }
-                };
-
-                // "Every startup till resolved": if there's an unresolved change, re-notify immediately.
+                // "Every startup till resolved": an unresolved change is due again, so the first
+                // check re-sends it.
                 if (state.PendingChange != null)
                 {
-                    await NotifyIpChange(state.PendingChange);
-                    state.PendingChange.LastNotifiedAt = DateTime.Now;
-                    await SaveState();
+                    state.PendingChange.LastNotifiedAt = DateTime.MinValue;
                 }
+
+                // KliveBot counts as started before its Discord client exists, so the Resolved
+                // button is wired once the client is there; the checks below don't wait for Discord.
+                _ = WireResolvedButtonAsync();
 
                 await ServiceLog("KAPI Reachability Monitor started.");
 
@@ -93,6 +74,53 @@ namespace Omnipotent.Services.KAPIReachabilityMonitor
             catch (Exception ex)
             {
                 await ServiceLogError(ex, "Error starting KAPI Reachability Monitor.");
+            }
+        }
+
+        private async Task WireResolvedButtonAsync()
+        {
+            try
+            {
+                DiscordClient? client = null;
+                while (client == null && IsServiceActive())
+                {
+                    client = await kliveBotDiscord.WaitForClientAsync(TimeSpan.FromMinutes(1));
+                }
+                if (client == null)
+                {
+                    return;
+                }
+
+                // One persistent handler; matching by a stable prefix keeps buttons on messages sent
+                // before a restart working. A restart runs ServiceMain again on this same instance,
+                // so the handler is dropped first to stay attached once.
+                client.ComponentInteractionCreated -= OnResolvedButtonPressed;
+                client.ComponentInteractionCreated += OnResolvedButtonPressed;
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Failed to wire the KAPI reachability Resolved button.", false);
+            }
+        }
+
+        private async Task OnResolvedButtonPressed(DiscordClient sender, ComponentInteractionCreateEventArgs e)
+        {
+            try
+            {
+                if (e.Id != null && e.Id.StartsWith(ResolvedButtonId))
+                {
+                    DiscordInteractionResponseBuilder builder = new();
+                    builder.WithContent("Resolved — thanks! KAPI reachability reminders for this IP change have been cleared.");
+                    await e.Interaction.CreateResponseAsync(InteractionResponseType.ChannelMessageWithSource, builder);
+
+                    state.PendingChange = null;
+                    await SaveState();
+                    await ServiceLog("Public IP change marked resolved by Klives.");
+                }
+            }
+            catch (Exception ex)
+            {
+                await ServiceLogError(ex, "Failed to handle KAPI reachability Resolved button.", false);
             }
         }
 
@@ -132,22 +160,34 @@ namespace Omnipotent.Services.KAPIReachabilityMonitor
                 }
 
                 state.LastKnownPublicIP = current;
-                await NotifyIpChange(state.PendingChange);
-                state.PendingChange.LastNotifiedAt = DateTime.Now;
+                bool notified = await NotifyIpChange(state.PendingChange);
+                // Unsent, the change stays due, so the next check sends it.
+                state.PendingChange.LastNotifiedAt = notified ? DateTime.Now : DateTime.MinValue;
                 await SaveState();
-                await ServiceLog($"Public IP changed to {current}. Notified Klives that DNS needs updating.");
+                await ServiceLog(notified
+                    ? $"Public IP changed to {current}. Notified Klives that DNS needs updating."
+                    : $"Public IP changed to {current}. KliveBot's Discord client isn't up yet, so Klives will be told on a later check.");
             }
             else if (state.PendingChange != null && (DateTime.Now - state.PendingChange.LastNotifiedAt) >= ReminderInterval)
             {
-                // "Every 6 hours till resolved" reminder.
-                await NotifyIpChange(state.PendingChange);
-                state.PendingChange.LastNotifiedAt = DateTime.Now;
-                await SaveState();
+                // "Every 6 hours till resolved" reminder, and the re-send due at startup.
+                if (await NotifyIpChange(state.PendingChange))
+                {
+                    state.PendingChange.LastNotifiedAt = DateTime.Now;
+                    await SaveState();
+                }
             }
         }
 
-        private async Task NotifyIpChange(PendingIpChange change)
+        // False, without sending, while KliveBot has no Discord client: SendMessageToKlives would
+        // wait for one with no limit and hold up the checks.
+        private async Task<bool> NotifyIpChange(PendingIpChange change)
         {
+            if (kliveBotDiscord.Client == null)
+            {
+                return false;
+            }
+
             var embed = KliveBotDiscord.MakeSimpleEmbed("KAPI Reachability: Public IP changed!",
                 $"The server's public IP has changed. **DNS needs updating** so the API stays reachable.\n\n" +
                 $"Old IP: `{change.OldIP}`\nNew IP: `{change.NewIP}`\n\n" +
@@ -155,6 +195,7 @@ namespace Omnipotent.Services.KAPIReachabilityMonitor
                 DiscordColor.Orange);
             embed.AddComponents(new DiscordButtonComponent(ButtonStyle.Success, ResolvedButtonId, "Resolved"));
             await kliveBotDiscord.SendMessageToKlives(embed);
+            return true;
         }
 
         private async Task CheckPortForwards()
@@ -177,10 +218,14 @@ namespace Omnipotent.Services.KAPIReachabilityMonitor
 
             if (added.Any())
             {
-                var embed = KliveBotDiscord.MakeSimpleEmbed("KAPI Reachability: Re-added port forwards",
-                    "UPnP mappings were missing and have been automatically re-forwarded:\n- " + string.Join("\n- ", added),
-                    DiscordColor.Green);
-                await kliveBotDiscord.SendMessageToKlives(embed);
+                // The repair is already done; without a Discord client the notice is only logged.
+                if (kliveBotDiscord.Client != null)
+                {
+                    var embed = KliveBotDiscord.MakeSimpleEmbed("KAPI Reachability: Re-added port forwards",
+                        "UPnP mappings were missing and have been automatically re-forwarded:\n- " + string.Join("\n- ", added),
+                        DiscordColor.Green);
+                    await kliveBotDiscord.SendMessageToKlives(embed);
+                }
                 await ServiceLog("Re-added missing UPnP port forwards: " + string.Join(", ", added));
             }
         }

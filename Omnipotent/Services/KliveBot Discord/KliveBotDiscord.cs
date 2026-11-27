@@ -204,6 +204,23 @@ namespace Omnipotent.Services.KliveBot_Discord
             }
         }
 
+        /// <summary>
+        /// The client once ServiceMain has built it, or null if it isn't built within
+        /// <paramref name="timeout"/> (token missing, bot crashed). This service counts as started
+        /// before its client exists, because ServiceMain still has to read the token and settings,
+        /// so a service that subscribes to client events at startup waits here instead of reading
+        /// Client, which is null for those first seconds.
+        /// </summary>
+        public async Task<DiscordClient?> WaitForClientAsync(TimeSpan timeout)
+        {
+            DateTime deadline = DateTime.UtcNow + timeout;
+            while (Client == null && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(100);
+            }
+            return Client;
+        }
+
         public async Task<DiscordMessage> SendMessageToKlives(DiscordMessageBuilder builder)
         {
             try
